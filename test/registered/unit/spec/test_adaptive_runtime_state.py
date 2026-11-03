@@ -49,10 +49,30 @@ class _FakeWorker:
 
 
 class _FakePolicy:
-    def __init__(self, candidate_steps: list[int] | None = None):
+    def __init__(
+        self,
+        candidate_steps: list[int] | None = None,
+        start_steps: list[int] | None = None,
+    ):
         self.candidate_steps = candidate_steps or [1, 3]
+        self.start_steps = start_steps or []
         self.cuda_graph_bs = None
         self.feedback_step = None
+        self.restricted_to = None
+
+    @property
+    def required_steps(self) -> list[int]:
+        return sorted(set(self.start_steps))
+
+    def prebuild_order(self) -> list[int]:
+        required = self.required_steps
+        return required + [s for s in self.candidate_steps if s not in required]
+
+    def restrict_candidates(self, allowed: set[int]) -> list[int]:
+        self.restricted_to = set(allowed)
+        dropped = [s for s in self.candidate_steps if s not in allowed]
+        self.candidate_steps = [s for s in self.candidate_steps if s in allowed]
+        return dropped
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self.cuda_graph_bs = cuda_graph_bs
@@ -131,39 +151,46 @@ class TestAdaptiveController(unittest.TestCase):
         ):
             controller.activate_step_by_batch(batch_size=8)
 
-    def test_memory_budget_defers_tiers_past_the_budget(self):
-        """Pre-building stops at the budget, counting the previous tier's cost
-        as the lower bound for the next; deferred tiers are built on activation,
-        once, and the initial registered tier is not charged."""
-        worker = _FakeWorker(initial_steps=3, cost_gb={1: 2.0, 5: 3.0, 7: 4.0})
-        policy = _FakePolicy(candidate_steps=[1, 3, 5, 7])
+    def test_memory_budget_builds_start_steps_and_stops_once_spent(self):
+        """The slots' start steps are built whatever the budget, since the first
+        batch routed to a slot activates them; optional steps are built in policy
+        order until the spent cost reaches the budget (the last one may overshoot),
+        and the policy is restricted to what was built."""
+        worker = _FakeWorker(initial_steps=3, cost_gb={0: 4.0, 1: 1.0, 5: 3.0, 7: 4.0})
+        policy = _FakePolicy(candidate_steps=[0, 1, 3, 5, 7], start_steps=[3, 1, 0])
         controller = AdaptiveController(worker, policy)
         controller.register(_make_state(3, gpu_memory_gb=100.0))
 
-        controller.init_states(memory_budget_gb=5.0)
+        controller.init_states(memory_budget_gb=3.0)
 
-        # 1 (2.0) fits; 5 fits since 2.0 + 2.0 <= 5; 7 does not since 5.0 >= 5.
-        self.assertEqual([c[0] for c in worker.build_calls], [1, 5])
+        # Required 0 and 1 cost 5.0 but are not charged; 5 is built because
+        # nothing was spent yet, after which the spent 3.0 stops 7.
+        self.assertEqual([c[0] for c in worker.build_calls], [0, 1, 5])
+        self.assertEqual(policy.restricted_to, {0, 1, 3, 5})
+        self.assertEqual(policy.candidate_steps, [0, 1, 3, 5])
         self.assertEqual(worker.applied_steps, [3])
 
-        policy.feedback_step = 7
-        controller.on_verify_complete([1], batch_size=1)
-        self.assertEqual([c[0] for c in worker.build_calls], [1, 5, 7])
-        self.assertEqual(worker.applied_steps, [3, 7])
-        controller.activate_step_by_batch(batch_size=8)
-        controller.on_verify_complete([1], batch_size=1)
-        self.assertEqual([c[0] for c in worker.build_calls], [1, 5, 7])
-
-    def test_zero_memory_budget_defers_every_other_tier(self):
-        worker = _FakeWorker(initial_steps=3, cost_gb={1: 0.0, 5: 0.0})
-        controller = AdaptiveController(worker, _FakePolicy(candidate_steps=[1, 3, 5]))
+    def test_zero_memory_budget_builds_only_required_states(self):
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakePolicy(candidate_steps=[0, 1, 3, 5], start_steps=[3, 0])
+        controller = AdaptiveController(worker, policy)
         controller.register(_make_state(3))
 
         controller.init_states(memory_budget_gb=0.0)
 
-        self.assertEqual(worker.build_calls, [])
-        controller.activate_step_by_batch(batch_size=8)
-        self.assertEqual([c[0] for c in worker.build_calls], [1])
+        self.assertEqual([c[0] for c in worker.build_calls], [0])
+        self.assertEqual(policy.candidate_steps, [0, 3])
+
+    def test_unset_budget_builds_every_candidate(self):
+        worker = _FakeWorker(initial_steps=3, cost_gb={1: 50.0, 5: 50.0})
+        policy = _FakePolicy(candidate_steps=[1, 3, 5], start_steps=[3])
+        controller = AdaptiveController(worker, policy)
+        controller.register(_make_state(3))
+
+        controller.init_states()
+
+        self.assertEqual([c[0] for c in worker.build_calls], [1, 5])
+        self.assertEqual(policy.candidate_steps, [1, 3, 5])
 
 
 if __name__ == "__main__":
