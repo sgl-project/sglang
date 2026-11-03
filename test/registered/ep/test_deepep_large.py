@@ -16,10 +16,10 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from test.manual.ep.test_elastic_scale import (
+from manual.ep.test_elastic_scale import (
     TestElasticScaleUp4To5To6CudaGraph as _TestElasticScaleUp4To5To6CudaGraph,
 )
-from test.manual.ep.test_nixl_ep import (
+from manual.ep.test_nixl_ep import (
     TestNixlMoeMooncakeElasticEP as _TestNixlMoeMooncakeElasticEP,
 )
 
