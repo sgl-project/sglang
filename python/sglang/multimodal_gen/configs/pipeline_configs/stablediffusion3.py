@@ -23,9 +23,9 @@ from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
     SpatialImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def sd3_clip_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
