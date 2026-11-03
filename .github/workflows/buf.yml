@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v[0-9]+.*"
     paths:
       - "proto/**"
       - ".github/workflows/buf.yml"
@@ -13,6 +15,7 @@ on:
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - "proto/**"
       - ".github/workflows/buf.yml"
@@ -36,6 +39,7 @@ jobs:
       - name: Set up Buf
         uses: bufbuild/buf-action@v1
         with:
+          version: 1.75.0
           setup_only: true
 
       - name: Build and lint protobuf schemas
@@ -45,11 +49,17 @@ jobs:
 
       - name: Check for breaking protobuf changes
         if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'buf skip breaking')
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          buf breaking proto --against "https://github.com/${{ github.repository }}.git#branch=${{ github.base_ref }},subdir=proto"
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+          base_dir="$(mktemp -d)"
+          trap 'rm -rf "${base_dir}"' EXIT
+          git archive "${BASE_SHA}" proto | tar -x -C "${base_dir}"
+          buf breaking proto --against "${base_dir}/proto"
 
       - name: Push module to Buf Schema Registry
-        if: (github.event_name == 'push' || github.event_name == 'release') && github.repository == 'sgl-project/sglang'
+        if: (github.event_name == 'push' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && github.repository == 'sgl-project/sglang'
         env:
           BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
         run: |
