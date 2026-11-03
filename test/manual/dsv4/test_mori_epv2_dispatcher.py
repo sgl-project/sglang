@@ -345,6 +345,9 @@ def main():
 def _run_tbo(rank, world_size):
     hidden_size, topk, experts_per_rank = 7168, 6, 48
     num_experts = world_size * experts_per_rank
+    adapter._max_dispatch_tokens_per_rank = (
+        envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get
+    )
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
@@ -376,6 +379,8 @@ def _run_tbo(rank, world_size):
     ):
         dispatcher = MaybeTboDeepEPDispatcher(**kwargs)
     assert len(dispatcher._inners) == 2
+    # weight_dtype alone auto-resolves to bf16; pin fp4 as main() does for FP4=1.
+    os.environ["SGLANG_MORI_DISPATCH_DTYPE"] = "fp4"
     for child in dispatcher._inners:
         child.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
     children = [child._get_impl() for child in dispatcher._inners]
@@ -390,13 +395,6 @@ def _run_tbo(rank, world_size):
     dispatch = children[0].dispatch_dtype.name
     assert dispatch == (_async_ll_fp4_dispatch() if async_ll else "fp4"), dispatch
     assert children[0].mori_op is not children[1].mori_op
-    probe_trim = os.environ.get("PROBE_TBO_TRIM", "0") == "1"
-    if probe_trim:
-        # Validation-only probe: keep the real shared TBO stream/dispatchers,
-        # but allow each child to consume metadata snapshotted immediately
-        # before its dispatch_a. Production remains conservatively gated off.
-        for child in children:
-            child._tbo_enabled = False
 
     fp4_lookup = _fp4_lookup()
     failures = torch.zeros(1, dtype=torch.int32)
@@ -445,7 +443,7 @@ def _run_tbo(rank, world_size):
                 assert output.recv_cap == min(
                     child._manual_recv_cap, child.mori_op.cfg.effective_max_recv
                 )
-            elif child._trim_recv and probe_trim and child._is_recv_layout_verified():
+            elif child._trim_recv and child._is_recv_layout_verified():
                 expected_cap = round_logical_recv_rows(
                     sum(child_token_counts[child_id]),
                     pow2_buckets=child._recv_cap_pow2_buckets,
@@ -530,7 +528,6 @@ def _run_tbo(rank, world_size):
     if rank == 0:
         summary = {
             "status": "PASS" if failures.item() == 0 else "FAIL",
-            "probe_trim": probe_trim,
             "direct_output": [output.expert_output is not None for output in outputs],
             "cuda_graph": use_graph,
             "mode": _deepep_mode().value,
