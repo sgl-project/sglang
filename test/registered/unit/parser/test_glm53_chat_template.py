@@ -478,8 +478,8 @@ class TestTemplateManagerPythonChatTemplate(CustomTestCase):
         )
 
 
-def _patch_hf_transformers_utils(get_tokenizer, get_config):
-    module = ModuleType("sglang.srt.utils.hf_transformers_utils")
+def _patch_hf_transformers(get_tokenizer, get_config):
+    module = ModuleType("sglang.srt.utils.hf_transformers")
     module.get_tokenizer = get_tokenizer
     module.get_config = get_config
     return patch.dict(sys.modules, {module.__name__: module})
@@ -498,7 +498,7 @@ class TestAutoParsersFromPythonChatTemplate(CustomTestCase):
         self.get_tokenizer = Mock(return_value=tokenizer)
         self.get_config = Mock(return_value=_hf_config(architecture))
         with (
-            _patch_hf_transformers_utils(self.get_tokenizer, self.get_config),
+            _patch_hf_transformers(self.get_tokenizer, self.get_config),
             self.assertLogs("sglang.srt.parser.template_detection", "INFO") as logs,
         ):
             resolve_auto_parsers(server_args)

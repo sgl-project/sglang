@@ -62,7 +62,7 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -122,10 +122,8 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    get_request_return_hidden_states_mode,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import get_request_return_hidden_states_mode
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -136,6 +134,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -205,7 +204,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
@@ -1194,6 +1193,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Multimodal inputs are not supported when --language-model-only "
                 "is set; the encoder is not loaded. Restart without the flag."
             )
+
+        # Reject audio early when audio_config is explicitly None (audio
+        # tower disabled, e.g. gemma-4-31B-it); otherwise the audio items
+        # reach the scheduler and get_audio_feature() kills it. Models that
+        # cannot process audio (no audio token, e.g. GLM-5.3-Flash) or
+        # define their audio config differently (e.g. Phi-4 MM) are not
+        # affected.
+        hf_config = self.model_config.hf_config
+        declares_audio = getattr(
+            getattr(self.mm_processor, "mm_tokens", None), "audio_token", None
+        )
+        if (
+            has_valid_data(obj.audio_data)
+            and declares_audio
+            and hasattr(hf_config, "audio_config")
+            and hf_config.audio_config is None
+        ):
+            raise ValueError(
+                f"Audio inputs are not supported by {self.served_model_name}"
+            )
+
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
