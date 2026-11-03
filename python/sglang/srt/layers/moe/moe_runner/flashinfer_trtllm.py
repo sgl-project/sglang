@@ -670,9 +670,14 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
     layer.trtllm_padded_hidden_size = (
         padded_hidden_size if padded_hidden_size != hidden_size else None
     )
+    # nvfp4_block_scale_interleave pads scale rows to 128 and columns to 4.
     layer.trtllm_fp4_layout_padded = (
         w13_weight.shape != layer.w13_weight.shape
         or w2_weight.shape != layer.w2_weight.shape
+        or any(
+            scale.shape[-2] % 128 or scale.shape[-1] % 4
+            for scale in (w13_weight_scale, w2_weight_scale)
+        )
     )
 
     (
@@ -764,7 +769,8 @@ def restore_fp4_moe_weights_from_flashinfer_trtllm(
 
     Every step is a byte permutation, so restoring and aligning again leaves
     experts that a weight update does not rewrite bit-identical. Only for
-    layouts that needed no padding.
+    layouts that needed no padding. Every permutation is built and checked
+    before any byte moves, so a failed check leaves the layer as it was.
     """
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
@@ -773,6 +779,7 @@ def restore_fp4_moe_weights_from_flashinfer_trtllm(
 
     epilogue_tile_m = 128
     is_gated = layer.moe_runner_config.is_gated
+    plans = []
     for weight_name, scale_name in (
         ("w13_weight", "w13_weight_scale"),
         ("w2_weight", "w2_weight_scale"),
@@ -801,20 +808,28 @@ def restore_fp4_moe_weights_from_flashinfer_trtllm(
                 cache_permute_indices, scale[0], epilogue_tile_m, num_elts_per_sf=16
             )
 
-        inverse = _inverse_permutation(weight_indices.to(weight.device))
-        weight.copy_(weight[:, inverse])
-
         sources_key = ("fp4_block_scale_interleave", tuple(scale.shape[1:]))
         sources = cache_permute_indices.get(sources_key)
         if sources is None:
             sources = _fp4_block_scale_interleave_sources(scale[0].shape, scale.device)
             cache_permute_indices[sources_key] = sources
-        permuted_rows = torch.empty_like(scale)
-        permuted_rows.view(scale.shape[0], -1)[:, sources] = scale.reshape(
-            scale.shape[0], -1
+        plans.append(
+            (
+                weight,
+                _inverse_permutation(weight_indices.to(weight.device)),
+                scale,
+                sources,
+                _inverse_permutation(scale_indices.to(scale.device)),
+            )
         )
-        inverse = _inverse_permutation(scale_indices.to(scale.device))
-        scale.copy_(permuted_rows[:, inverse])
+
+    # One expert at a time keeps the temporaries to a single expert's size.
+    for weight, weight_inverse, scale, sources, scale_inverse in plans:
+        permuted_rows = torch.empty_like(scale[0])
+        for expert in range(weight.shape[0]):
+            weight[expert].copy_(weight[expert][weight_inverse])
+            permuted_rows.view(-1)[sources] = scale[expert].reshape(-1)
+            scale[expert].copy_(permuted_rows[scale_inverse])
 
 
 def get_activation_type(activation: str, is_gated: bool = True) -> int:

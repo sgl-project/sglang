@@ -2712,6 +2712,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
+        # The restorable layouts below overwrite this with their name.
+        layer._fp4_moe_repack = None
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
@@ -3117,10 +3119,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         permute them twice. Restoring the checkpoint layout first keeps those
         experts bit-identical.
         """
-        repack = getattr(layer, "_fp4_moe_repack", None)
-        if repack is None or getattr(layer, "inference_moe_w13_interleaved", False):
+        if not hasattr(layer, "_fp4_moe_repack"):
+            # Not post-processed since loading or the last restore.
             return
-        layer._fp4_moe_repack = None
+        repack = layer._fp4_moe_repack
+        if repack is None or getattr(layer, "inference_moe_w13_interleaved", False):
+            logger.warning_once(
+                "This NVFP4 MoE layout cannot be restored before a weight update: "
+                "experts the update does not rewrite are post-processed twice. "
+                "Update every expert tensor, or serve with --moe-runner-backend "
+                "flashinfer_trtllm or flashinfer_cutlass."
+            )
+            return
         if repack == "trtllm":
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 restore_fp4_moe_weights_from_flashinfer_trtllm,
@@ -3129,15 +3139,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             restore_fp4_moe_weights_from_flashinfer_trtllm(
                 layer, self._cache_permute_indices
             )
-            return
-        for scale_name, swizzled_name in (
-            ("w13_weight_scale", "w13_blockscale_swizzled"),
-            ("w2_weight_scale", "w2_blockscale_swizzled"),
-        ):
-            scale = getattr(layer, scale_name)
-            # A separately allocated swizzled copy leaves the source scale intact.
-            if getattr(layer, swizzled_name, None) is scale:
-                scale.data.copy_(unswizzle_blockscale(scale.data))
+        else:
+            for scale_name, swizzled_name in (
+                ("w13_weight_scale", "w13_blockscale_swizzled"),
+                ("w2_weight_scale", "w2_blockscale_swizzled"),
+            ):
+                scale = getattr(layer, scale_name)
+                # A separately allocated swizzled copy leaves the source intact.
+                if getattr(layer, swizzled_name, None) is scale:
+                    scale.data.copy_(unswizzle_blockscale(scale.data))
+        # Cleared only once the layer is back in the checkpoint layout.
+        del layer._fp4_moe_repack
 
     @property
     def load_up_proj_weight_first(self) -> bool:

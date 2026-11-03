@@ -42,7 +42,7 @@ REPACKED = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
 BACKENDS = (MoeRunnerBackend.FLASHINFER_CUTLASS, MoeRunnerBackend.FLASHINFER_TRTLLM)
 
 
-def _raw_tensors(seed):
+def _raw_tensors(seed, hidden=HIDDEN):
     g = torch.Generator(device="cuda").manual_seed(seed)
 
     def u8(*shape):
@@ -52,12 +52,12 @@ def _raw_tensors(seed):
 
     rows = 2 * INTERMEDIATE
     return {
-        "w13_weight": u8(NUM_EXPERTS, rows, HIDDEN // 2),
-        "w13_weight_scale": u8(NUM_EXPERTS, rows, HIDDEN // 16).view(
+        "w13_weight": u8(NUM_EXPERTS, rows, hidden // 2),
+        "w13_weight_scale": u8(NUM_EXPERTS, rows, hidden // 16).view(
             torch.float8_e4m3fn
         ),
-        "w2_weight": u8(NUM_EXPERTS, HIDDEN, INTERMEDIATE // 2),
-        "w2_weight_scale": u8(NUM_EXPERTS, HIDDEN, INTERMEDIATE // 16).view(
+        "w2_weight": u8(NUM_EXPERTS, hidden, INTERMEDIATE // 2),
+        "w2_weight_scale": u8(NUM_EXPERTS, hidden, INTERMEDIATE // 16).view(
             torch.float8_e4m3fn
         ),
     }
@@ -181,6 +181,61 @@ class TestNvFp4MoeRestore(CustomTestCase):
                     self.assertTrue(
                         torch.equal(_bytes(layer, name), raw[name].view(torch.uint8))
                     )
+
+    def test_failed_restore_leaves_the_layer_untouched(self):
+        import flashinfer.fused_moe.core as fused_moe_core
+
+        def not_a_bijection(cache, tensor, epilogue_tile_m, **kwargs):
+            return torch.zeros(tensor.shape[0], dtype=torch.int64)
+
+        with self._backend(MoeRunnerBackend.FLASHINFER_TRTLLM):
+            layer = _layer(_raw_tensors(seed=4))
+            self._process(layer)
+            before = {name: _bytes(layer, name) for name in REPACKED}
+            # w13 plans fine; w2 fails its check after that.
+            with mock.patch.object(
+                fused_moe_core, "get_w2_permute_indices_with_cache", not_a_bijection
+            ):
+                with self.assertRaises(RuntimeError):
+                    layer.quant_method.restore_weights_before_loading(layer)
+            for name in REPACKED:
+                self.assertTrue(torch.equal(_bytes(layer, name), before[name]), name)
+            self.assertEqual(layer._fp4_moe_repack, "trtllm")
+
+    def test_padded_scale_layouts(self):
+        # hidden 192: w2 block-scale rows are not a multiple of 128, so the
+        # scale interleave/swizzle pads them.
+        raw = _raw_tensors(seed=5, hidden=192)
+        update = _raw_tensors(seed=6, hidden=192)
+
+        with self._backend(MoeRunnerBackend.FLASHINFER_TRTLLM):
+            layer = _layer(raw)
+            try:
+                self._process(layer)
+            except RuntimeError:
+                # The TRT-LLM aligner cannot store a padded interleave today.
+                pass
+            self.assertTrue(layer.trtllm_fp4_layout_padded)
+            self.assertIsNone(layer._fp4_moe_repack)
+
+        # CUTLASS keeps the padded w2 swizzle in a separate buffer, so the
+        # source scale stays in checkpoint layout and a partial update works.
+        with self._backend(MoeRunnerBackend.FLASHINFER_CUTLASS):
+            updated_raw = {name: t.clone() for name, t in raw.items()}
+            for name in REPACKED:
+                updated_raw[name][1] = update[name][1]
+            layer = _layer(raw)
+            self._process(layer)
+            expected = _layer(updated_raw)
+            self._process(expected)
+            layer.quant_method.restore_weights_before_loading(layer)
+            for name in REPACKED:
+                getattr(layer, name).data[1] = update[name][1]
+            self._process(layer)
+            for name in REPACKED + ("w2_blockscale_swizzled",):
+                self.assertTrue(
+                    torch.equal(_bytes(layer, name), _bytes(expected, name)), name
+                )
 
 
 if __name__ == "__main__":

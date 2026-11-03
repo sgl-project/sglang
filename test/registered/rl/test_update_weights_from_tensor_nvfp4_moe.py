@@ -77,7 +77,8 @@ class TestUpdateWeightsFromTensorNvFp4Moe(CustomTestCase):
         return {n: h for n, h in checksums.items() if ".mlp.experts." in n}
 
     def _update_weights(self, named_tensors: List[Tuple[str, torch.Tensor]]) -> dict:
-        requests.post(f"{self.url}/begin_weight_update", json={}, timeout=120)
+        begin = requests.post(f"{self.url}/begin_weight_update", json={}, timeout=120)
+        self.assertEqual(begin.status_code, 200, begin.text)
         resp = requests.post(
             f"{self.url}/update_weights_from_tensor",
             json={
@@ -88,7 +89,8 @@ class TestUpdateWeightsFromTensorNvFp4Moe(CustomTestCase):
             },
             timeout=600,
         )
-        requests.post(f"{self.url}/end_weight_update", json={}, timeout=600)
+        end = requests.post(f"{self.url}/end_weight_update", json={}, timeout=600)
+        self.assertEqual(end.status_code, 200, end.text)
         return resp.json()
 
     def test_same_bytes_partial_updates_keep_every_expert(self):
