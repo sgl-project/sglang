@@ -286,6 +286,10 @@ class AdaptiveSpeculativeParams:
             bs: AdaptiveStepSlot(initial_steps=initial_steps, cfg=slot_cfg)
             for bs, slot_cfg in self._slot_cfgs.items()
         }
+        # The step each slot starts on; current_steps drifts once feedback arrives.
+        self._slot_start_steps: dict[int, int] = {
+            bs: slot.current_steps for bs, slot in self._slots.items()
+        }
         self._cuda_graph_bs: list[int] | None = None
 
         first_slot = self._slots[self._bs_list[0]]
@@ -302,28 +306,28 @@ class AdaptiveSpeculativeParams:
         return sorted({s for p in self._slots.values() for s in p.candidate_steps})
 
     @property
-    def required_steps(self) -> list[int]:
+    def start_steps(self) -> list[int]:
         """Steps the slots start on; the first batch routed to a slot activates its step."""
-        return sorted({p.current_steps for p in self._slots.values()})
+        return sorted(set(self._slot_start_steps.values()))
 
     def prebuild_order(self) -> list[int]:
-        """Candidate steps in build priority: required steps, then the others by
+        """Candidate steps in build priority: start steps, then the others by
         hop distance from the nearest slot's start step (a slot moves one hop
         per update unless hysteresis is negative)."""
-        required = set(self.required_steps)
+        start = set(self.start_steps)
 
         def hops(step: int) -> int:
             return min(
                 abs(
-                    p.candidate_steps.index(step)
-                    - p.candidate_steps.index(p.current_steps)
+                    slot.candidate_steps.index(step)
+                    - slot.candidate_steps.index(self._slot_start_steps[bs])
                 )
-                for p in self._slots.values()
-                if step in p.candidate_steps
+                for bs, slot in self._slots.items()
+                if step in slot.candidate_steps
             )
 
-        optional = [s for s in self.candidate_steps if s not in required]
-        return sorted(required) + sorted(optional, key=lambda s: (hops(s), s))
+        optional = [s for s in self.candidate_steps if s not in start]
+        return sorted(start) + sorted(optional, key=lambda s: (hops(s), s))
 
     def restrict_candidates(self, allowed: set[int]) -> list[int]:
         """Drop the candidate steps outside *allowed* from every slot and return them.
@@ -337,13 +341,14 @@ class AdaptiveSpeculativeParams:
         slots: dict[int, AdaptiveStepSlot] = {}
         for bs, slot in self._slots.items():
             kept = [s for s in slot.candidate_steps if s in allowed]
-            if slot.current_steps not in kept:
+            start = self._slot_start_steps[bs]
+            if start not in kept:
                 raise ValueError(
-                    f"BS slot {bs} starts on steps={slot.current_steps}, "
+                    f"BS slot {bs} starts on steps={start}, "
                     f"which is not among the built states {sorted(allowed)}"
                 )
             slots[bs] = AdaptiveStepSlot(
-                initial_steps=slot.current_steps,
+                initial_steps=start,
                 cfg={**self._slot_cfgs[bs], "candidate_steps": kept},
             )
         self._slots = slots

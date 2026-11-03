@@ -3208,6 +3208,25 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
+    def test_negative_adaptive_memory_budget_is_rejected(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_adaptive_memory_budget_gb = -1.0
+        with self.assertRaisesRegex(
+            ValueError, "speculative-adaptive-memory-budget-gb must be >= 0"
+        ):
+            handle_speculative_decoding(args)
+
+    def test_adaptive_memory_budget_without_adaptive_warns(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_adaptive_memory_budget_gb = 2.0
+        with self.assertLogs(
+            "sglang.srt.arg_groups.speculative_hook", level="WARNING"
+        ) as logs:
+            handle_speculative_decoding(args)
+        self.assertTrue(
+            any("speculative-adaptive-memory-budget-gb" in line for line in logs.output)
+        )
+
 
 class TestAscendOpsArgs(CustomTestCase):
     def test_ascend_ops_rejected_by_waterfill_without_config(self):
