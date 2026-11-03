@@ -11,7 +11,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("is_hip,enabled", [(False, True), (True, False), (False, False)])
+@pytest.mark.parametrize(
+    "is_hip,enabled", [(False, True), (True, False), (False, False)]
+)
 def test_disabled_route_does_not_import_optional_kernel(monkeypatch, is_hip, enabled):
     monkeypatch.setattr(dsa_topk_backend, "_is_hip", is_hip)
     monkeypatch.setenv("SGLANG_DSA_TOPK_TRITON", "1" if enabled else "0")
