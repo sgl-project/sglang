@@ -348,16 +348,19 @@ class LoRAMemoryPool:
         )
 
     @staticmethod
-    def _has_dense_module(base_model: torch.nn.Module, module_name: str) -> bool:
-        """Whether a decoder layer has this linear outside the fused experts."""
+    def _get_dense_module_layer_ids(
+        base_model: torch.nn.Module, module_name: str
+    ) -> Set[int]:
+        """Decoder layers containing this linear outside the fused experts."""
         from sglang.srt.layers.linear import LinearBase
 
-        return any(
-            name.endswith(f".{module_name}")
-            and get_layer_id(name) is not None
-            and isinstance(unwrap_lora_layer(module), LinearBase)
+        return {
+            layer_id
             for name, module in base_model.named_modules()
-        )
+            if name.endswith(f".{module_name}")
+            and (layer_id := get_layer_id(name)) is not None
+            and isinstance(unwrap_lora_layer(module), LinearBase)
+        }
 
     @staticmethod
     def _has_moe_module(base_model: torch.nn.Module) -> bool:
@@ -622,10 +625,15 @@ class LoRAMemoryPool:
         # Cached once so the per-expert load path doesn't re-walk the HF
         # config for every adapter.
         self._num_experts_local: int = self._get_num_local_experts(base_model)
+        dense_layer_ids = {
+            name: self._get_dense_module_layer_ids(base_model, name)
+            for name in self.target_modules & {"gate_up_proj", "down_proj"}
+        }
 
         def alloc_per_layer(
             module_key: str,
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
+            layer_ids: Optional[Set[int]] = None,
         ) -> List[Optional[torch.Tensor]]:
             return [
                 (
@@ -637,6 +645,7 @@ class LoRAMemoryPool:
                         device=device,
                     )
                     if idx in self.lora_layer_ids
+                    and (layer_ids is None or idx in layer_ids)
                     else None
                 )
                 for idx in range(self.num_layer)
@@ -663,11 +672,12 @@ class LoRAMemoryPool:
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
                     # Hybrid models also need 3D buffers for their dense MLPs.
-                    if has_shared_experts or self._has_dense_module(
-                        base_model, module_name
-                    ):
+                    layer_ids = (
+                        None if has_shared_experts else dense_layer_ids[module_name]
+                    )
+                    if layer_ids is None or layer_ids:
                         buffer[module_name] = alloc_per_layer(
-                            module_name, get_lora_shape_fn
+                            module_name, get_lora_shape_fn, layer_ids
                         )
 
                     # MoE expert version (4D)

@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest import mock
 
@@ -290,7 +291,7 @@ class TestStagePool(CustomTestCase):
         """A dense prefix needs 3D buffers even without shared experts; off-stage
         layers must still be left unallocated."""
         config = SimpleNamespace(
-            num_hidden_layers=2,
+            num_hidden_layers=3,
             hidden_size=8,
             num_attention_heads=2,
             num_key_value_heads=2,
@@ -306,10 +307,11 @@ class TestStagePool(CustomTestCase):
         dense.down_proj = ReplicatedLinear(16, 8, bias=False)
         experts = FusedMoE.__new__(FusedMoE)
         torch.nn.Module.__init__(experts)
-        model.layers = torch.nn.ModuleList([dense, experts])
+        model.layers = torch.nn.ModuleList([dense, experts, deepcopy(dense)])
         for has_dense in (True, False):
             if not has_dense:
                 model.layers[0] = torch.nn.Module()
+                model.layers[2] = torch.nn.Module()
             with (
                 self.subTest(has_dense=has_dense),
                 get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1),
@@ -323,18 +325,20 @@ class TestStagePool(CustomTestCase):
                     base_model=model,
                     eviction_policy="lru",
                     lora_added_tokens_size=0,
-                    lora_layer_ids=[0],
+                    lora_layer_ids=[0, 1],
                     has_embed_tokens_lora=False,
                     has_lm_head_lora=False,
                 )
-            for buffer in (pool.A_buffer, pool.B_buffer):
-                for name in ("gate_up_proj", "down_proj"):
-                    self.assertEqual(name in buffer, has_dense)
-                    if has_dense:
-                        self.assertEqual(buffer[name][0].ndim, 3)
-                        self.assertIsNone(buffer[name][1])
-                    self.assertEqual(buffer[name + "_moe"][0].ndim, 4)
-                    self.assertIsNone(buffer[name + "_moe"][1])
+                for buffer in (pool.A_buffer, pool.B_buffer):
+                    for name in ("gate_up_proj", "down_proj"):
+                        self.assertEqual(name in buffer, has_dense)
+                        if has_dense:
+                            self.assertEqual(buffer[name][0].ndim, 3)
+                            self.assertIsNone(buffer[name][1])
+                            self.assertIsNone(buffer[name][2])
+                        self.assertEqual(buffer[name + "_moe"][0].ndim, 4)
+                        self.assertEqual(buffer[name + "_moe"][1].ndim, 4)
+                        self.assertIsNone(buffer[name + "_moe"][2])
 
     def test_each_stage_allocates_and_loads_only_its_part(self):
         first = _stage_pool(layers=[0, 1], embed_tokens=True)

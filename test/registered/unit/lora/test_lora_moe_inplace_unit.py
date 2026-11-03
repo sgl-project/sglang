@@ -76,22 +76,21 @@ class FusedMoEWithLoRAInplaceTest(CustomTestCase):
         base_layer.quant_method = CompressedTensorsFusedMoEMethod(None)
         base_layer.scheme = CompressedTensorsW8A8Fp8MoE(
             weight_quant=QuantizationArgs(
-                type="float", strategy="block", block_structure=[16, 16]
+                type="float", strategy="channel", dynamic=False
             ),
-            input_quant=QuantizationArgs(
-                type="float", strategy="group", group_size=16, dynamic=True
-            ),
+            input_quant=QuantizationArgs(type="float", strategy="token", dynamic=True),
         )
         base_layer.w13_weight = torch.zeros(8, 64, 64, dtype=torch.float8_e4m3fn)
         base_layer.w2_weight = torch.zeros(8, 64, 32, dtype=torch.float8_e4m3fn)
-        base_layer.w13_weight_scale = torch.ones(8, 4, 4)
-        base_layer.w2_weight_scale = torch.ones(8, 4, 2)
+        base_layer.w13_weight_scale = torch.ones(8, 64, 1)
+        base_layer.w2_weight_scale = torch.ones(8, 64, 1)
         base_layer.w13_input_scale = base_layer.w2_input_scale = None
 
         layer = FusedMoEWithLoRA(base_layer, types.SimpleNamespace(name="triton"))
 
         self.assertTrue(layer._quant_info.use_fp8_w8a8)
-        self.assertEqual(layer._quant_info.block_shape, [16, 16])
+        self.assertTrue(layer._quant_info.per_channel_quant)
+        self.assertIsNone(layer._quant_info.block_shape)
         self.assertIs(layer._quant_info.w13_weight, base_layer.w13_weight)
         self.assertIs(layer._quant_info.w2_weight, base_layer.w2_weight)
         self.assertIs(layer._quant_info.w13_scale, base_layer.w13_weight_scale)
