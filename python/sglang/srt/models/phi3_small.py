@@ -25,17 +25,17 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
+from sglang.srt.utils import add_prefix, get_compiler_backend, make_pp_layers
 
 
-@torch.jit.script
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 
 
-@torch.jit.script
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def gegelu(input, limit: Optional[float] = None):
-    a_gelu, a_linear = input[..., ::2], input[..., 1::2]
+    # Flatten the interleaved pairs to keep compiled indexing one-dimensional.
+    a_gelu, a_linear = input.reshape(-1, 2).unbind(-1)
     if limit is not None:
         a_gelu = torch.where(
             torch.isinf(a_gelu), a_gelu, a_gelu.clamp(min=None, max=limit)
@@ -46,7 +46,7 @@ def gegelu(input, limit: Optional[float] = None):
             a_linear.clamp(min=-limit, max=limit),
         )
     out_gelu = quick_gelu(a_gelu)
-    return out_gelu * (a_linear + 1)
+    return (out_gelu * (a_linear + 1)).view(*input.shape[:-1], input.shape[-1] // 2)
 
 
 class Phi3SmallMLP(nn.Module):

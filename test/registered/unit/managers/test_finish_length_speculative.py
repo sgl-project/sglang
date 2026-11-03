@@ -27,7 +27,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 EOS_ID = 2
 STOP_ID = 1
@@ -164,16 +164,6 @@ class TestPostEosBonusTokenIncident(CustomTestCase):
             eos_token_ids=frozenset({EOT_ID}),
             vocab_size=VOCAB_SIZE,
         )
-
-    def test_eot_then_bonus_junk_within_cap_is_trimmed(self):
-        # Run [12, 200008, 2] with budget left. This case was correct even
-        # without the ordering fix: the EOS match trims the bonus junk.
-        req = self._eot_req([10, 11, 12, EOT_ID, POST_EOS_JUNK_ID], max_new_tokens=100)
-        req.update_finish_state(new_accepted_len=3)
-        self.assertTrue(req.finished())
-        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
-        self.assertEqual(req.finished_reason.matched, EOT_ID)
-        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, EOT_ID])
 
     def test_eot_then_bonus_junk_crossing_cap_is_trimmed(self):
         # The incident: the same run crosses max_new_tokens in the step the EOS

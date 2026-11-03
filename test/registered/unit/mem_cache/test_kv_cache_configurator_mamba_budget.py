@@ -66,6 +66,9 @@ class TestMambaSpeculativeBudget(CustomTestCase):
         )
         planner = object.__new__(KVCacheConfigurator)
         planner.pp_size = planner.attn_dp_size = 1
+        planner.spec_aux_config = None
+        planner.is_hybrid_swa = False
+        planner.is_draft_worker = False
         planner.mambaish_config = SimpleNamespace(mamba2_cache_params=params)
         planner.hybrid_gdn_config = planner.mambaish_config
         planner.hybrid_kda_config = None
