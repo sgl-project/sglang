@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.lora.lokr import LoKrAdapter
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
 )
@@ -176,6 +177,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_path: str | None = None
         self.strength: float = 1.0
 
+        self.lokr_adapter: LoKrAdapter | None = None
         self.lora_A = None
         self.lora_B = None
         self.lora_output_offset = None
@@ -248,6 +250,9 @@ class BaseLayerWithLoRA(nn.Module):
         self, out: torch.Tensor, x: torch.Tensor, runtime_lora_scale: float
     ) -> torch.Tensor:
         """``out`` plus the active adapter's update for input ``x``."""
+        if self.lokr_adapter is not None:
+            delta = self.lokr_adapter(x) * self.strength * runtime_lora_scale
+            return out + delta.to(out.dtype)
         lora_A = self.lora_A
         lora_B = self.lora_B
         if isinstance(lora_B, DTensor):
@@ -284,7 +289,7 @@ class BaseLayerWithLoRA(nn.Module):
             return False
         if self.merged:
             return self.has_lora_output_offset
-        return self.lora_A is not None
+        return self.lora_A is not None or self.lokr_adapter is not None
 
     @staticmethod
     def _interleave_swiglu_rows(t: torch.Tensor) -> torch.Tensor:
@@ -336,6 +341,11 @@ class BaseLayerWithLoRA(nn.Module):
         if runtime_lora_scale == 0.0:
             return None
         x_2d = x.reshape(-1, x.shape[-1])
+        if self.lokr_adapter is not None:
+            delta = self.lokr_adapter(x_2d) * self.strength * runtime_lora_scale
+            if swiglu_rows:
+                delta = self._interleave_swiglu_rows(delta.T).T
+            return delta.to(torch.bfloat16).contiguous()
         delta = None
         if not self.merged:
             A, B = self._fused_lora_factors(device=x.device, swiglu_rows=swiglu_rows)
@@ -427,6 +437,10 @@ class BaseLayerWithLoRA(nn.Module):
                           If False, append to existing list (for multi-LoRA support).
             output_offset: Optional constant output term paired with this adapter
         """
+        if self.lokr_adapter is not None and not clear_existing:
+            raise ValueError(
+                "Cannot combine LoRA with LoKr; clear the existing adapter"
+            )
         lora_A_param = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
@@ -468,7 +482,19 @@ class BaseLayerWithLoRA(nn.Module):
         elif self.merged:
             self.unmerge_lora_weights()
 
+    def set_lokr_weights(
+        self, adapter: LoKrAdapter, lora_path: str | None, strength: float
+    ) -> None:
+        if self.merged:
+            self.unmerge_lora_weights()
+        self.clear_lora_weights()
+        self.lokr_adapter = adapter
+        self.lora_path = lora_path
+        self.strength = strength
+        self.disable_lora = False
+
     def clear_lora_weights(self) -> None:
+        self.lokr_adapter = None
         self.lora_weights_list.clear()
         # Also clear backward compatibility attributes
         self.lora_A = None
@@ -668,6 +694,8 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
+        if self.lokr_adapter is not None:
+            raise ValueError("LoKr currently supports dynamic mode only")
         if strength is not None:
             self.strength = strength
             if self.lora_weights_list:
