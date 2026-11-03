@@ -3335,6 +3335,35 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def test_python_only_literals_keep_the_tool_call(self):
+        """ast.literal_eval accepts these values, but json.dumps does not."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="inspect",
+                    parameters={"properties": {"value": {"type": "array"}}},
+                ),
+            )
+        ]
+        for raw in ('{"env:prod", "service:web"}', "[{1, 2}]", "b'abc'", "1j"):
+            with self.subTest(raw=raw):
+                text = (
+                    "<tool_call>inspect\n<arg_key>value</arg_key>\n"
+                    f"<arg_value>{raw}</arg_value>\n</tool_call>"
+                )
+                result = Glm4MoeDetector().detect_and_parse(text, tools)
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(json.loads(result.calls[0].parameters), {"value": raw})
+
+                detector = Glm4MoeDetector()
+                detector.parse_streaming_increment(text, tools)
+                # The chat endpoint serializes these arguments when a stream finishes.
+                self.assertEqual(
+                    json.loads(json.dumps(detector.prev_tool_call_arr[0]["arguments"])),
+                    {"value": raw},
+                )
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
