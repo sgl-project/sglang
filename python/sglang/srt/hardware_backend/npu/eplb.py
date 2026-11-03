@@ -27,13 +27,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.eplb.expert_distribution import _ExpertDistributionRecorderReal
-from sglang.srt.runtime_context import get_device, get_exec, get_parallel
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel, get_resources
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-
-
-_warmed_group = None
 
 
 def get_eplb_group():
@@ -56,8 +53,8 @@ def get_eplb_group():
 
 def _warmup_eplb_communication(group):
     """Join all ranks before migration can skip ranks without local transfers."""
-    global _warmed_group
-    if group is None or group is _warmed_group:
+    resources = get_resources()
+    if group is None or group is resources.npu_eplb_warmed_group:
         return
     world_size = dist.get_world_size(group)
     if world_size > 1:
@@ -76,7 +73,7 @@ def _warmup_eplb_communication(group):
             work.wait()
         # Keep the startup buffers alive until NPU communication completes.
         torch.npu.synchronize()
-    _warmed_group = group
+    resources.npu_eplb_warmed_group = group
 
 
 class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
