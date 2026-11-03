@@ -1,5 +1,6 @@
 """CPU coverage for Full host eviction after duplicate reclamation."""
 
+import sys
 from array import array
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -82,3 +83,7 @@ def test_host_eviction_skips_heap_only_when_target_is_satisfied(num_tokens):
         result.device_frees.clear()
         result.host_frees.clear()
         result.cache_actions.clear()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
