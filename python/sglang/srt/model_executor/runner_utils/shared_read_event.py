@@ -10,7 +10,7 @@ from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_cuda, is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.npu.graph_runner.shared_read_event import (
+    from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
         NPUSharedReadEvent,
     )
 
@@ -22,7 +22,7 @@ def make_external_event(
 ) -> Optional[Union[torch.cuda.Event, "NPUSharedReadEvent"]]:
     """Create a persistent external event, e.g., for CUDA graph capture."""
     if is_npu():
-        from sglang.srt.hardware_backend.npu.graph_runner.shared_read_event import (
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
             NPUSharedReadEvent,
         )
 
