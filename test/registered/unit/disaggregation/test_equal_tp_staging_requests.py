@@ -74,6 +74,31 @@ class ResponseWakeup(CustomTestCase):
 
 
 class ReviewRegression(CustomTestCase):
+    def test_first_staging_piece_binds_on_manager(self):
+        tree = ast.parse((ROOT / "mooncake/conn.py").read_text())
+        node = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_is_first_staging_piece"
+        )
+        manager = ast.ClassDef(
+            name="Manager", bases=[], keywords=[], body=[node], decorator_list=[]
+        )
+        env = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[manager], type_ignores=[])),
+                "manager",
+                "exec",
+            ),
+            env,
+        )
+        check = env["Manager"]()._is_first_staging_piece
+        strategy = NS(full_chunk_pages=8)
+        self.assertTrue(check(strategy, 0, 8))
+        self.assertFalse(check(strategy, 1, 7))
+        self.assertFalse(check(strategy, 8, 9))
+
     def test_send_failure_rolls_back_and_unknown_error_propagates(self):
         import threading
 

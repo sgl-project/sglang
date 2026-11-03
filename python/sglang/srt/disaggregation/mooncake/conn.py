@@ -608,6 +608,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             np.count_nonzero((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))
         )
 
+    @staticmethod
     def _is_first_staging_piece(strategy, start, num_pages):
         # Only the first piece of a grid slot may stage. Its actual length is
         # carried by STAGING_REQ and CHUNK_READY. Later pieces start inside
