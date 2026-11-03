@@ -13,25 +13,49 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+    SchedulerKvEventsPublisher,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+
+
+class _FakeReq(SimpleNamespace):
+    """A request stand-in compared and hashed by identity, like Req."""
+
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
 
 
 class _PendingCopy:
@@ -78,6 +102,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
+        scheduler.running_reqs = _RequestList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
@@ -105,6 +131,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.dllm_config = None
+        scheduler.uocr_runtime = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
@@ -299,6 +331,49 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.chunked_req, original_chunked_req)
 
+    def test_cache_flush_while_paused_is_published_before_resume(self):
+        """A cache flush during a retract pause (the weight-update window) must be
+        published by the paused loop, not held until continue_generation."""
+        scheduler = self._new_scheduler()
+        scheduler.tree_cache = RadixCache.create_simulated(enable_kv_cache_events=True)
+        scheduler.tree_cache.take_events()  # Drop the construction-time clear.
+        published = []
+        scheduler.kv_events_publisher = SchedulerKvEventsPublisher(
+            kv_events_config=None,
+            tree_cache=scheduler.tree_cache,
+            send_metrics_from_scheduler=None,
+            max_running_requests=1,
+            max_total_num_tokens=1,
+            get_stats=lambda: None,
+        )
+        scheduler.kv_events_publisher.enable_kv_cache_events = True
+        scheduler.kv_events_publisher.kv_event_publisher = SimpleNamespace(
+            publish=published.append
+        )
+        scheduler.grammar_manager = MagicMock(grammar_queue=[])
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
+        scheduler.draft_worker = None
+        scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        self.assertTrue(scheduler.flush_cache(empty_cache=False))
+        scheduler._record_scheduler_state_for_paused_engine()
+
+        self.assertEqual(
+            [type(e).__name__ for batch in published for e in batch.events],
+            ["AllBlocksCleared"],
+            "flush_cache while paused was not published by the paused loop",
+        )
+
     def test_inplace_does_not_drain_overlap_queue(self):
         """in_place should not process the overlap result_queue."""
         scheduler = self._new_scheduler()
@@ -367,6 +442,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             with_tensors=True,
         )
         scheduler.chunked_req = MagicMock()
+        scheduler.running_reqs.join([run_req_a, run_req_b, last_req])
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -374,6 +450,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(
             [entry["req"] for entry in requeue_log], [run_req_a, run_req_b, last_req]
         )
+        self.assertEqual(len(scheduler.running_reqs), 0)
         self.assertTrue(all(entry["is_retracted"] for entry in requeue_log))
         self.assertEqual(
             [req.retraction_count for req in (run_req_a, run_req_b, last_req)],
@@ -644,7 +721,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 
-        req = SimpleNamespace(
+        req = _FakeReq(
             finished=lambda: False,
             output_ids=[10, 11, 12],
             time_stats=MagicMock(),
@@ -673,7 +750,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 
         def _req(rid, req_pool_idx):
-            return SimpleNamespace(
+            return _FakeReq(
                 rid=rid,
                 finished=lambda: False,
                 output_ids=[7],
@@ -697,6 +774,38 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list
         ]
         self.assertEqual(held, [running, staged])
+
+    def test_retract_aborts_requests_the_recompute_cannot_rebuild(self):
+        for decode in (False, True):
+            with self.subTest(decode=decode):
+                scheduler = self._new_scheduler()
+                scheduler.disagg_decode_prealloc_queue = MagicMock()
+                scheduler.send_abort_output = MagicMock()
+                requeue_log = self._spy_requeue(scheduler)
+                if decode:
+                    scheduler.disaggregation_mode = DisaggregationMode.DECODE
+                    get_context().override("test", disaggregation_mode="decode")
+                plain, sent, unsent = map(self._make_req, ("plain", "sent", "unsent"))
+                for req in (plain, sent, unsent):
+                    req.output_ids.append(7)
+                sent.input_embeds = unsent.input_embeds = [[0.0]] * 3
+                sent.send_token_offset = 1
+                scheduler.running_batch = self._make_batch(
+                    scheduler, reqs=[plain, sent, unsent], with_tensors=True
+                )
+
+                scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+                aborted = [
+                    c.args[1] for c in scheduler.send_abort_output.call_args_list
+                ]
+                if decode:
+                    queue = scheduler.disagg_decode_prealloc_queue
+                    held = [c.args[0] for c in queue.hold_rebootstrap.call_args_list]
+                    self.assertEqual((aborted, held), ([sent, unsent], [plain]))
+                else:
+                    requeued = [entry["req"] for entry in requeue_log]
+                    self.assertEqual((aborted, requeued), ([sent], [plain, unsent]))
 
     def test_pd_decode_retract_completes_offload_before_free(self):
         """PD decode retract must not free KV an offload copy is still reading, and
@@ -786,6 +895,46 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
+
+    def test_pd_decode_abort_finishes_a_held_rebootstrap(self):
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc_queue.scheduler = scheduler
+        prealloc_queue.queue = []
+        prealloc_queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+        prealloc_queue.held_rebootstrap_reqs = _RequestList(
+            ListKind.PD_HELD, abort=prealloc_queue._abort_held
+        )
+        prealloc_queue.add = MagicMock()
+        scheduler.disagg_decode_prealloc_queue = prealloc_queue
+        transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer_queue.queue = []
+        transfer_queue._deferred_releases = []
+        scheduler.disagg_decode_transfer_queue = transfer_queue
+        scheduler.deferred_responses = MagicMock()
+        scheduler.mm_receiver = None
+        scheduler.grammar_manager = MagicMock()
+        scheduler.send_abort_output = MagicMock()
+        scheduler.enable_continuous_input_polling = False
+        scheduler._engine_paused = True
+        aborted, kept = self._make_req("aborted"), self._make_req("kept")
+        prealloc_queue.hold_rebootstrap(aborted)
+        prealloc_queue.hold_rebootstrap(kept)
+
+        scheduler.abort_request(AbortReq(rid="aborted"))
+
+        self.assertIsInstance(aborted.finished_reason, FINISH_ABORT)
+        self.assertIsNone(kept.finished_reason)
+        self.assertEqual(list(prealloc_queue.held_rebootstrap_reqs), [kept])
+        scheduler.tree_cache.finish.assert_called_once()
+        ((abort, sent_req), _) = scheduler.send_abort_output.call_args
+        self.assertEqual((abort.rid, sent_req), ("aborted", aborted))
+
+        scheduler.continue_generation(
+            ContinueGenerationReqInput(torch_empty_cache=False)
+        )
+        prealloc_queue.add.assert_called_once_with(kept, is_rebootstrap=True)
 
 
 if __name__ == "__main__":

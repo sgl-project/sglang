@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -340,8 +340,6 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
             )
-        # PDMux event polling across green-context streams is not validated;
-        # keep its overlap label at `none` without disabling forward timing.
         self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
             enabled=self.enable_metrics,
             query_forward_active=(
@@ -349,7 +347,6 @@ class SchedulerMetricsReporter:
                 if self.enable_metrics
                 and self.forward_pass_device_timer is not None
                 and self.scheduler.device == "cuda"
-                and not get_disagg().enable_pdmux
                 else None
             ),
         )
@@ -766,7 +763,7 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
+                f"#inflight-req: {len(self.scheduler.disagg_prefill_transfer_queue)}, "
             )
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
@@ -882,7 +879,7 @@ class SchedulerMetricsReporter:
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                    self.scheduler.disagg_prefill_transfer_queue, priority_enabled
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
@@ -1109,7 +1106,7 @@ class SchedulerMetricsReporter:
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                    self.scheduler.disagg_prefill_transfer_queue, priority_enabled
                 )
 
             # Streaming session metrics
@@ -1521,7 +1518,7 @@ class SchedulerMetricsReporter:
                 self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                self.scheduler.disagg_prefill_transfer_queue, priority_enabled
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)
@@ -1529,3 +1526,4 @@ class SchedulerMetricsReporter:
         # publishing so the gauges do not hold the last batch's values.
         self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)
+        self.scheduler.kv_events_publisher.emit_kv_metrics()

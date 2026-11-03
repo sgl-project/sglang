@@ -4,8 +4,13 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -14,6 +19,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
     truncate_weight_version_events,
+    weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -29,6 +35,7 @@ class _ReqStub:
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def record_weight_version_change(self, old_version):
         record_weight_version_events([self], old_version=old_version)
@@ -316,7 +323,11 @@ class _SchedulerStub:
         self.waiting_queue = waiting
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse
-        self._deferred_responses = None
+        self.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
@@ -483,7 +494,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v1"),
         ):
             accepted = Scheduler._set_or_validate_priority(scheduler, req)
@@ -503,10 +514,10 @@ class TestMakeAbortReq(CustomTestCase):
             WeightVersionEvent(old_version="v1", num_output_tokens=3)
         )
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v2"),
         ):
-            abort_req = _make_abort_req(req)
+            abort_req = make_abort_req(req)
 
         self.assertIsInstance(abort_req, AbortReq)
         self.assertEqual(abort_req.rid, "r0")
@@ -540,6 +551,50 @@ class TestBuildEndpointWeightVersionMetadata(CustomTestCase):
         """Responses without spans still report the legacy version alone."""
         metadata = build_endpoint_weight_version_metadata({"weight_version": "v2"})
         self.assertEqual(metadata, {"weight_version": "v2"})
+
+    def test_metadata_carries_prefill_spans_when_present(self):
+        """prefill_weight_versions rides along into endpoint metadata next to the output spans."""
+        prefill_spans = [{"version": "v1", "start": 0, "end": 5}]
+        metadata = build_endpoint_weight_version_metadata(
+            {
+                "weight_version": "v2",
+                "weight_versions": [{"version": "v2", "start": 0, "end": 3}],
+                "prefill_weight_versions": prefill_spans,
+                "prompt_tokens": 5,
+            }
+        )
+        self.assertEqual(metadata["prefill_weight_versions"], prefill_spans)
+        self.assertNotIn("prompt_tokens", metadata)
+
+
+class TestWeightVersionSpansToJson(CustomTestCase):
+    def test_spans_pass_through_unclamped_without_a_limit(self):
+        """Prefill spans keep their exact ends because no output-token limit applies."""
+        spans = [
+            WeightVersionSpan(version="v1", start=0, end=5),
+            WeightVersionSpan(version="v2", start=5, end=9),
+        ]
+        self.assertEqual(
+            weight_version_spans_to_json(spans),
+            [
+                {"version": "v1", "start": 0, "end": 5},
+                {"version": "v2", "start": 5, "end": 9},
+            ],
+        )
+
+    def test_ends_are_clamped_to_the_limit(self):
+        """With a limit every end is capped, matching the output-span clamp."""
+        spans = [
+            WeightVersionSpan(version="v1", start=0, end=5),
+            WeightVersionSpan(version="v2", start=5, end=9),
+        ]
+        self.assertEqual(
+            weight_version_spans_to_json(spans, end_limit=7),
+            [
+                {"version": "v1", "start": 0, "end": 5},
+                {"version": "v2", "start": 5, "end": 7},
+            ],
+        )
 
 
 class TestAddWeightVersionsToMetaInfo(CustomTestCase):

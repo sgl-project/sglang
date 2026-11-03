@@ -163,7 +163,6 @@ def _graph(epi, sampler, monkeypatch, rejection_noise=None):
         epilogue=epi,
         resolve_draft_sampler=lambda: sampler,
         tp_sync=_tp_sync(),
-        fused_argmax=False,
         block_verification=False,
         device="cuda",
         rejection_noise=rejection_noise,

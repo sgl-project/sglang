@@ -27,22 +27,19 @@ from typing import Callable, TypeVar
 
 import torch
 
+from sglang.kernels.arch import current_arch
+
 F = TypeVar("F", bound=Callable)
 
 
 def is_cuda_sm_at_least(
     min_sm: tuple[int, int], device: torch.device | int | None = None
 ) -> bool:
-    """True on a CUDA build whose ``device`` has compute capability >= ``min_sm``.
+    """True on NVIDIA CUDA when the GPU's compute capability is >= ``min_sm``.
 
-    ``torch.version.cuda`` rules out ROCm, whose capability is derived from the
-    gfx number (gfx1250 reports (12, 5)) and would clear a bare comparison.
+    ``device`` is ignored: all GPUs of a node are assumed to be the same model.
     """
-    return (
-        torch.version.cuda is not None
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device) >= min_sm
-    )
+    return current_arch().is_sm_at_least(*min_sm)
 
 
 def platform_key() -> str:

@@ -305,7 +305,7 @@ def test_hopper_combine_norm(num_tokens):
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 64])
 def test_hopper_mhc_stats_stream_graph(num_tokens):
     from sglang.srt.layers.layernorm import RMSNorm
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
     from sglang.srt.utils import is_sm90_supported

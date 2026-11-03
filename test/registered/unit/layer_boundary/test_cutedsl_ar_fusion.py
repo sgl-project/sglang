@@ -15,13 +15,14 @@ from sglang.srt.layers.layer_boundary import (
     NORM_QUANT_READOUT,
     PLAIN_ADD,
     Layout,
+    OutputContract,
     StageKind,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
     complete_owed,
 )
-from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attn_input_fusions,
     ffn_input_fusions,
@@ -38,7 +39,7 @@ from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_forward, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
@@ -179,7 +180,12 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
     ):
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
-                incoming=SimpleNamespace(residual=Layout(frozenset()))
+                incoming=SimpleNamespace(
+                    residual=Layout(frozenset()),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
+                )
             )
         }
         fusions = ffn_input_fusions(comm)
@@ -192,7 +198,10 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
                 incoming=SimpleNamespace(
-                    residual=Layout(frozenset({TokenAxis.ATTN_TP}))
+                    residual=Layout(frozenset({TokenAxis.ATTN_TP})),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
                 )
             )
         }

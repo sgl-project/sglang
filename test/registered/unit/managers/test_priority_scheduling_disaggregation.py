@@ -13,20 +13,22 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    FINISH_ABORT,
-    Req,
-    ReqKvInfo,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -34,6 +36,7 @@ from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -126,7 +129,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = self._new_req(priority=10)
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         ):
             scheduler._add_request_to_queue(req)
@@ -146,7 +149,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 req = self._new_req(priority=10)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(req)
@@ -174,7 +177,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 incoming = self._new_req(priority=priority)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(incoming)
@@ -234,7 +237,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             processed_tokens_counter=0,
         )
         queue.ensure_metadata_buffer = MagicMock(return_value=True)
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="req",
             disagg_kv_sender=object(),
             prefill_attempt_count=0,
@@ -243,7 +246,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             kv=SimpleNamespace(cache_protected_len=2),
             time_stats=MagicMock(),
         )
-        queue.queue = [req]
+        queue.queue = _RequestList(ListKind.PD_BOOTSTRAP)
+        queue.queue.join([req])
 
         with (
             patch(
@@ -263,7 +267,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue, req, result = self._pop_bootstrapping_swa_branch("write_through")
 
         self.assertEqual(result, [])
-        self.assertEqual(queue.queue, [req])
+        self.assertEqual(list(queue.queue), [req])
         self.assertEqual(req.prefill_attempt_count, 0)
         queue.ensure_metadata_buffer.assert_not_called()
 
@@ -273,7 +277,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 queue, req, result = self._pop_bootstrapping_swa_branch(write_policy)
 
                 self.assertEqual(result, [req])
-                self.assertEqual(queue.queue, [])
+                self.assertEqual(list(queue.queue), [])
                 self.assertEqual(req.prefill_attempt_count, 1)
                 queue.ensure_metadata_buffer.assert_called_once_with(req)
 
@@ -295,7 +299,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             "write_through", queue_cls=_Eager, is_retracted=True
         )
         self.assertEqual(result, [])
-        self.assertEqual(queue.queue, [req])
+        self.assertEqual(list(queue.queue), [req])
         queue.ensure_metadata_buffer.assert_not_called()
 
     def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
@@ -431,7 +435,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.chunked_req = None
+        empty_request_lists(scheduler)
         scheduler.mm_receiver = None
         scheduler.waiting_queue = [MagicMock(rid="req")]
         scheduler.beam_coordinator = MagicMock()
@@ -441,15 +445,11 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.output_streamer = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
-        scheduler.dllm_config = None
-        scheduler.grammar_manager = MagicMock()
-        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        scheduler.disagg_prefill_inflight_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
 
         with (
-            patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
+            patch("sglang.srt.managers.utils.get_serving") as get_serving,
             patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
         ):
             get_serving.return_value.weight_version = None
@@ -793,9 +793,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
 
                 prefill_len = len(Req.build_rebootstrap_payload(req)["input_ids"])
 
-                self.assertEqual(
-                    DecodePreallocQueue._pre_alloc_fill_len(req), prefill_len
-                )
+                self.assertEqual(pre_alloc_fill_len(req), prefill_len)
                 self.assertEqual(req.output_ids, output_ids)
 
 
