@@ -13,7 +13,13 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization import fp8_utils, halops_mxfp8_linear
+from sglang.srt.layers.quantization import (
+    fp8_utils,
+    halops_mxfp8,
+    halops_mxfp8_linear,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
 from sglang.srt.layers.quantization.halops_mxfp8 import (
     HALOPS_MODE,
     swizzle_scale_to_sfatom,
@@ -187,6 +193,86 @@ class TestFlashinferFallback(CustomTestCase):
                 weight_scale=weight_scale,
                 weight_scale_fallback=None,
             )
+
+
+class TestOfflineCheckpointScales(CustomTestCase):
+    """Load-time handling of a checkpoint that is already quantized.
+
+    The weights and scales come from disk, so nothing may re-quantize them, and
+    the SfAtom layout must be derived from the scale the checkpoint carries.
+    """
+
+    @staticmethod
+    def _layer(*, n, k, scale):
+        return SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.zeros((n, k), dtype=torch.float8_e4m3fn), requires_grad=False
+            ),
+            weight_scale_inv=torch.nn.Parameter(scale, requires_grad=False),
+        )
+
+    @staticmethod
+    def _method(**attrs):
+        # Bypass __init__: these cases drive the load-time scale prep only.
+        method = Fp8LinearMethod.__new__(Fp8LinearMethod)
+        for name, value in attrs.items():
+            setattr(method, name, value)
+        return method
+
+    def test_serialized_mxfp8_keeps_the_checkpoint_scale(self):
+        n, k = 2 * SF_ATOM_ROWS, 128
+        scale = torch.randint(120, 130, (n, k // SCALE_GROUP), dtype=torch.uint8)
+        layer = self._layer(n=n, k=k, scale=scale)
+        method = self._method(
+            use_mxfp8=True, mxfp8_dense_backend=Mxfp8DenseGemmBackend.HALOPS
+        )
+
+        with mock.patch.object(halops_mxfp8, "quantize_weight") as quantize_weight:
+            method._process_mxfp8_linear_weight_scale(layer)
+
+        # The checkpoint's own scale is relaid out, never re-derived from weights.
+        quantize_weight.assert_not_called()
+        self.assertTrue(torch.equal(layer.weight_scale_inv.data, scale))
+        self.assertTrue(
+            torch.equal(layer.weight_scale_inv_halops, _sfatom_reference_k4(scale))
+        )
+
+    def test_second_load_refreshes_the_derived_scale(self):
+        # update_weights_from_disk replaces weight_scale_inv and re-runs this
+        # step without recapturing CUDA graphs, so the cached SfAtom bytes must
+        # follow the new scale while staying in the storage the graphs captured.
+        n, k = SF_ATOM_ROWS, 4 * SCALE_GROUP
+        scale = torch.full((n, k // SCALE_GROUP), 127, dtype=torch.uint8)
+        layer = self._layer(n=n, k=k, scale=scale)
+        method = self._method(
+            use_mxfp8=True, mxfp8_dense_backend=Mxfp8DenseGemmBackend.HALOPS
+        )
+
+        method._process_mxfp8_linear_weight_scale(layer)
+        first = layer.weight_scale_inv_halops
+        self.assertTrue(torch.equal(first.data, _sfatom_reference_k4(scale)))
+
+        layer.weight_scale_inv.data.fill_(128)
+        method._process_mxfp8_linear_weight_scale(layer)
+
+        # UE8M0 byte 128 is a 2x multiplier where 127 was 1x.
+        self.assertTrue(torch.equal(first.data, _sfatom_reference_k4(scale)))
+        self.assertEqual(layer.weight_scale_inv_halops.data_ptr(), first.data_ptr())
+
+    def test_unaligned_n_keeps_only_the_checkpoint_scale(self):
+        n, k = SF_ATOM_ROWS + 64, 128
+        scale = torch.randint(120, 130, (n, k // SCALE_GROUP), dtype=torch.uint8)
+        layer = self._layer(n=n, k=k, scale=scale)
+        method = self._method(
+            use_mxfp8=True, mxfp8_dense_backend=Mxfp8DenseGemmBackend.HALOPS
+        )
+
+        method._process_mxfp8_linear_weight_scale(layer)
+
+        # No SfAtom layout exists; apply's FlashInfer fallback reads
+        # weight_scale_inv, which is still the checkpoint's own scale.
+        self.assertIsNone(layer.weight_scale_inv_halops)
+        self.assertTrue(torch.equal(layer.weight_scale_inv.data, scale))
 
 
 if __name__ == "__main__":

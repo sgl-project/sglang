@@ -270,6 +270,8 @@ uv pip install halops==0.1.0 \
 
 The wheel is cp312 Linux only (x86_64 and aarch64); selecting the backend without it raises an install hint.
 
+Both quantization paths work: `--quantization mxfp8` on a BF16 checkpoint (quantized at load), and a pre-quantized MXFP8 checkpoint, whose uint8 UE8M0 weight scales are used as they are.
+
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 
 <table>

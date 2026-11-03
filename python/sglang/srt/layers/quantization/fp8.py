@@ -1161,11 +1161,15 @@ class Fp8LinearMethod(LinearMethodBase):
             n, k = layer.weight.shape
             if not weight_supported(n=n, k=k):
                 layer.weight_scale_inv_halops = None
-            elif getattr(layer, "weight_scale_inv_halops", None) is None:
+            else:
                 if scale_u8 is None:
                     scale_u8 = layer.weight_scale_inv.data
-                layer.weight_scale_inv_halops = swizzle_scale_to_sfatom(
-                    scale_u8.contiguous().view(torch.uint8)
+                # Rebuild on every load: a weight update replaces weight_scale_inv,
+                # and copy_or_rebind_param keeps the storage CUDA graphs captured.
+                copy_or_rebind_param(
+                    layer,
+                    "weight_scale_inv_halops",
+                    swizzle_scale_to_sfatom(scale_u8.contiguous().view(torch.uint8)),
                 )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
