@@ -74,7 +74,6 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
-    ragged_capture_num_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
     DsparkSamplingAcceptGraph,
