@@ -46,6 +46,7 @@ def _engram():
     layer = Engram.__new__(Engram)
     nn.Module.__init__(layer)
     layer.embed = _Table()
+    layer.image_token_id = None
     layer.wkv = _Projection(8, 12, bias=False)
     layer.wkv.quant_method = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
     with torch.no_grad():
@@ -71,13 +72,15 @@ class TestEngramPrepare(CustomTestCase):
             dot *= torch.rsqrt(key.square().mean(-1) + layer.eps)
             gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
             expected = x + gate.unsqueeze(-1) * value.unsqueeze(1)
-            torch.testing.assert_close(layer.apply_prepared(x, kv), expected)
-            torch.testing.assert_close(layer(x, ids), expected)
+            torch.testing.assert_close(
+                layer.apply_prepared(x, kv, input_ids=ids[:, 0]), expected
+            )
+            torch.testing.assert_close(layer(x, ids, input_ids=ids[:, 0]), expected)
 
     def test_empty_rows_still_lookup_but_do_not_project(self):
         layer = _engram()
         ids, x = torch.empty(0, 2, dtype=torch.long), torch.empty(0, 2, 4)
-        self.assertIs(layer(x, ids), x)
+        self.assertIs(layer(x, ids, input_ids=ids[:, 0]), x)
         self.assertEqual(layer.embed.rows, [0])
 
     def test_only_stream_safe_projection_routes_are_admitted(self):
@@ -161,7 +164,7 @@ class TestEngramStreamDependencies(CustomTestCase):
                 active[0].frontier.add(f"kv{self.layer_id}")
                 return ids + self.layer_id
 
-            def apply_prepared(self, x, kv):
+            def apply_prepared(self, x, kv, *, input_ids):
                 if f"kv{self.layer_id}" not in active[0].frontier:
                     raise AssertionError("unfinished Engram projection")
                 return x + kv.sum().item()
@@ -193,7 +196,7 @@ class TestEngramStreamDependencies(CustomTestCase):
                 self.assertNotIn("kv3", moe.frontier)
                 self.assertEqual(moe.waits, 1)
                 main.wait_stream(moe)
-                output = prefetch.consume(1, layers[0][1], 5, prepared)
+                output = prefetch.consume(1, layers[0][1], 5, prepared, input_ids=None)
                 self.assertEqual(output, 5 + 2 * hashes.shape[0])
                 prepared.update(
                     prefetch.start(hashes, None, layer_ids=(3,), fence=fence)
@@ -205,7 +208,9 @@ class TestEngramStreamDependencies(CustomTestCase):
                 self.assertIn("kv3", moe.frontier)
                 self.assertEqual(moe.waits, 2)
                 main.wait_stream(moe)
-                output = prefetch.consume(3, layers[1][1], output * 2, prepared)
+                output = prefetch.consume(
+                    3, layers[1][1], output * 2, prepared, input_ids=None
+                )
                 self.assertEqual(
                     output, (5 + 2 * hashes.shape[0]) * 2 + 4 * hashes.shape[0]
                 )
@@ -305,7 +310,7 @@ class TestEngramStreamDependencies(CustomTestCase):
                     record_stream=lambda stream: records.append((name, stream)),
                 )
 
-            def apply_prepared(self, x, kv):
+            def apply_prepared(self, x, kv, *, input_ids):
                 if active[0] is not main or kv.name not in main.frontier:
                     raise AssertionError("gate reads unfinished side-stream KV")
                 return x + kv.value
@@ -321,11 +326,13 @@ class TestEngramStreamDependencies(CustomTestCase):
             for value in (2, 17):
                 main.frontier, side.frontier = {"hash"}, set()
                 prepared = prefetch.start(Hashes(value), None)
-                output = prefetch.consume(1, layers[0][1], 5, prepared)
+                output = prefetch.consume(1, layers[0][1], 5, prepared, input_ids=None)
                 self.assertEqual(output, 5 + value + 1)
                 self.assertNotIn("kv3", main.frontier)
                 # The second gate uses a residual updated by intervening layers.
-                output = prefetch.consume(3, layers[1][1], output * 2, prepared)
+                output = prefetch.consume(
+                    3, layers[1][1], output * 2, prepared, input_ids=None
+                )
                 self.assertEqual(output, (5 + value + 1) * 2 + value + 3)
                 self.assertFalse(prepared)
         self.assertEqual(

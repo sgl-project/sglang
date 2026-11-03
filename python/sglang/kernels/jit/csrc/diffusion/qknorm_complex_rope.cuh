@@ -2,8 +2,10 @@
 //
 // Eager chain reproduced for bf16 activations:
 //   RMSNorm(cast_x_before_out_mul=True): var = mean(float(x)^2) in aten's
-//   vectorized 128-wide fp32 mean order (lane t owns elements 4t..4t+3, sums
-//   them left to right, then a 32-lane shuffle tree with offsets 16,8,4,2,1),
+//   vectorized 128-wide fp32 mean order (aten lane t owns elements 4t..4t+3,
+//   sums them left to right, then a 32-lane shuffle tree with offsets
+//   16,8,4,2,1). Here 16 lanes hold a row, lane l owning aten lanes 2l and
+//   2l+1, so the tree is lane offsets 8,4,2,1 and then one in-thread add,
 //   inv = rsqrtf(var + eps), n = bf16(x * inv), o = bf16(n * w);
 //   complex RoPE on interleaved pairs: out = view_as_real(complex(o) * rope),
 //   with the FMA orientation PyTorch's complex64 multiply uses on this GPU
@@ -11,6 +13,7 @@
 // One launch handles the Q rows and the K rows (source -> destination, in place
 // when they alias), copies the cached prefix K/V into rows [0:P] of the
 // [B, P+S, H, 128] K/V buffers and, with kCopyV, the raw V rows into [P:P+S].
+// A half-warp per row with 16-byte accesses and 32-bit work indices.
 
 #pragma once
 
@@ -29,16 +32,17 @@ namespace sglang {
 namespace qknorm_complex_rope {
 
 constexpr int kHeadDim = 128;
-constexpr int kLaneElems = kHeadDim / device::kWarpThreads;  // 4 bf16 per lane
-constexpr uint32_t kThreads = 256;
-constexpr uint32_t kWarpsPerBlock = kThreads / device::kWarpThreads;
+constexpr int kRowLanes = 16;
+constexpr int kLaneElems = kHeadDim / kRowLanes;  // 8 bf16 per lane: aten lanes 2l and 2l+1
+constexpr uint32_t kThreads = 128;
+constexpr uint32_t kRowsPerBlock = kThreads / kRowLanes;
 constexpr uint32_t kMaxBlocks = 65535;
-constexpr int64_t kVecAlignBytes = 8;
+constexpr int64_t kVecAlignBytes = 16;
 
-static_assert(kLaneElems == 4, "the aten mean replica assumes four elements per lane");
+static_assert(kLaneElems == 8, "the aten mean replica assumes two 4-element groups per lane");
 
-using RowVec = device::AlignedVector<bf16_t, kLaneElems>;   // 8 bytes
-using RopeVec = device::AlignedVector<fp32_t, kLaneElems>;  // cos0 sin0 cos1 sin1
+using RowVec = device::AlignedVector<bf16_t, kLaneElems>;  // 16 bytes
+using RopeVec = device::AlignedVector<fp32_t, 4>;          // cos0 sin0 cos1 sin1
 
 /// Strided [B, T, H, 128] tensor: element (b, t, h, d) lives at ptr + b*batch_stride + t*token_stride + h*128 + d.
 struct Rows {
@@ -81,7 +85,7 @@ SGL_DEVICE bf16_t* row_ptr(const MutableRows& rows, int64_t b, int64_t t, int64_
   return rows.ptr + b * rows.batch_stride + t * rows.token_stride + h * kHeadDim;
 }
 
-/// \brief Normalize and rotate one 128-wide row; every lane owns 4 consecutive elements.
+/// \brief Normalize and rotate one 128-wide row held by a half-warp; lane l owns elements 8l..8l+7.
 template <bool kFuseRealSin>
 SGL_DEVICE void norm_rope_row(
     const bf16_t* __restrict__ src,
@@ -92,27 +96,37 @@ SGL_DEVICE void norm_rope_row(
     int lane) {
   RowVec x;
   RowVec w;
-  RopeVec r;
+  RopeVec r[2];
   x.load(src + lane * kLaneElems);
   w.load(weight + lane * kLaneElems);
-  r.load(rope_row + lane * kLaneElems);
+  r[0].load(rope_row + lane * kLaneElems);
+  r[1].load(rope_row + lane * kLaneElems + 4);
 
   float value[kLaneElems];
 #pragma unroll
   for (int i = 0; i < kLaneElems; ++i) {
     value[i] = device::cast<fp32_t>(x[i]);
   }
-  // aten vectorized mean: four squares combined left to right ...
-  float part = __fmul_rn(value[0], value[0]);
-  part = __fadd_rn(part, __fmul_rn(value[1], value[1]));
-  part = __fadd_rn(part, __fmul_rn(value[2], value[2]));
-  part = __fadd_rn(part, __fmul_rn(value[3], value[3]));
-  // ... then the 32-lane tree with decreasing offsets (matches shfl_down 16..1 for lane 0).
+  // aten vectorized mean: four squares combined left to right per aten lane ...
+  float part[2];
 #pragma unroll
-  for (int offset = device::kWarpThreads / 2; offset > 0; offset >>= 1) {
-    part = __fadd_rn(part, __shfl_xor_sync(0xffffffffu, part, offset));
+  for (int g = 0; g < 2; ++g) {
+    const float* v = value + 4 * g;
+    part[g] = __fmul_rn(v[0], v[0]);
+    part[g] = __fadd_rn(part[g], __fmul_rn(v[1], v[1]));
+    part[g] = __fadd_rn(part[g], __fmul_rn(v[2], v[2]));
+    part[g] = __fadd_rn(part[g], __fmul_rn(v[3], v[3]));
   }
-  const float variance = __fmul_rn(part, 1.0f / kHeadDim);
+  // ... then its tree: aten offsets 16,8,4,2 are lane offsets 8,4,2,1 within this half-warp, offset 1 the two groups.
+  const unsigned mask = 0xffffu << (threadIdx.x & kRowLanes);
+#pragma unroll
+  for (int offset = kRowLanes / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      part[g] = __fadd_rn(part[g], __shfl_xor_sync(mask, part[g], offset));
+    }
+  }
+  const float variance = __fmul_rn(__fadd_rn(part[0], part[1]), 1.0f / kHeadDim);
   const float inv = rsqrtf(__fadd_rn(variance, eps));
 
   // cast_x_before_out_mul: round after the normalize, then again after the weight.
@@ -128,8 +142,8 @@ SGL_DEVICE void norm_rope_row(
   for (int p = 0; p < kLaneElems / 2; ++p) {
     const float re = out_f32[2 * p];
     const float im = out_f32[2 * p + 1];
-    const float cos = r[2 * p];
-    const float sin = r[2 * p + 1];
+    const float cos = r[p / 2][2 * (p % 2)];
+    const float sin = r[p / 2][2 * (p % 2) + 1];
     const float out_re = __fmaf_rn(re, cos, -__fmul_rn(im, sin));
     float out_im;
     if constexpr (kFuseRealSin) {
@@ -149,61 +163,64 @@ SGL_DEVICE void copy_row(const bf16_t* __restrict__ src, bf16_t* __restrict__ ds
   v.store(dst + lane * kLaneElems);
 }
 
-/// Work list: Q rows, K rows, prefix-K copies, prefix-V copies, then (kCopyV) V copies. One warp per row.
+/// Work list: Q rows, K rows, prefix-K copies, prefix-V copies, then (kCopyV) V copies. One half-warp per row.
 template <bool kFuseRealSin, bool kCopyV>
 __global__ void kernel(const Params __grid_constant__ params) {
-  const int lane = threadIdx.x & (device::kWarpThreads - 1);
-  const uint32_t warp = threadIdx.x >> 5;
-  const int64_t heads = params.heads;
-  const int64_t seq = params.seq;
-  const int64_t prefix = params.prefix;
-  const int64_t rows_q = static_cast<int64_t>(params.batch) * seq * heads;
-  const int64_t rows_k = params.k_rows_enabled ? rows_q : 0;
-  const int64_t rows_p = params.k_rows_enabled ? static_cast<int64_t>(params.batch) * prefix * heads : 0;
-  const int64_t rows_v = kCopyV ? rows_q : 0;
-  const int64_t total = rows_q + rows_k + 2 * rows_p + rows_v;
-  const int64_t stride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
+  const int lane = threadIdx.x & (kRowLanes - 1);
+  const uint32_t slot = threadIdx.x / kRowLanes;
+  const uint32_t heads = params.heads;
+  const uint32_t seq = params.seq;
+  const uint32_t prefix = params.prefix;
+  const uint32_t rows_q = params.batch * seq * heads;
+  const uint32_t rows_k = params.k_rows_enabled ? rows_q : 0;
+  const uint32_t rows_p = params.k_rows_enabled ? params.batch * prefix * heads : 0;
+  const uint32_t rows_v = kCopyV ? rows_q : 0;
+  const uint32_t total = rows_q + rows_k + 2 * rows_p + rows_v;
+  const uint32_t stride = gridDim.x * kRowsPerBlock;
 
-  for (int64_t row = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp; row < total; row += stride) {
-    int64_t r = row;
+  // the shuffles are masked per half-warp, so the two rows of a warp may take different branches
+  for (uint32_t row = blockIdx.x * kRowsPerBlock + slot; row < total; row += stride) {
+    uint32_t r = row;
     if (r < rows_q) {
-      const int64_t h = r % heads, t = r / heads, s = t % seq, b = t / seq;
+      const uint32_t h = r % heads, t = r / heads, s = t % seq, b = t / seq;
       norm_rope_row<kFuseRealSin>(
           row_ptr(params.q_src, b, s, h),
           row_ptr(params.q_dst, b, s, h),
           params.q_weight,
-          params.rope + s * kHeadDim,
+          params.rope + int64_t{s} * kHeadDim,
           params.eps,
           lane);
       continue;
     }
     r -= rows_q;
     if (r < rows_k) {
-      const int64_t h = r % heads, t = r / heads, s = t % seq, b = t / seq;
+      const uint32_t h = r % heads, t = r / heads, s = t % seq, b = t / seq;
       norm_rope_row<kFuseRealSin>(
           row_ptr(params.k_src, b, s, h),
           row_ptr(params.k_dst, b, prefix + s, h),
           params.k_weight,
-          params.rope + s * kHeadDim,
+          params.rope + int64_t{s} * kHeadDim,
           params.eps,
           lane);
       continue;
     }
     r -= rows_k;
     if (r < rows_p) {
-      const int64_t h = r % heads, t = r / heads, p = t % prefix, b = t / prefix;
-      copy_row(params.k_prefix + ((b * prefix + p) * heads + h) * kHeadDim, row_ptr(params.k_dst, b, p, h), lane);
+      const uint32_t h = r % heads, t = r / heads, p = t % prefix, b = t / prefix;
+      copy_row(
+          params.k_prefix + ((int64_t{b} * prefix + p) * heads + h) * kHeadDim, row_ptr(params.k_dst, b, p, h), lane);
       continue;
     }
     r -= rows_p;
     if (r < rows_p) {
-      const int64_t h = r % heads, t = r / heads, p = t % prefix, b = t / prefix;
-      copy_row(params.v_prefix + ((b * prefix + p) * heads + h) * kHeadDim, row_ptr(params.v_dst, b, p, h), lane);
+      const uint32_t h = r % heads, t = r / heads, p = t % prefix, b = t / prefix;
+      copy_row(
+          params.v_prefix + ((int64_t{b} * prefix + p) * heads + h) * kHeadDim, row_ptr(params.v_dst, b, p, h), lane);
       continue;
     }
     if constexpr (kCopyV) {
       r -= rows_p;
-      const int64_t h = r % heads, t = r / heads, s = t % seq, b = t / seq;
+      const uint32_t h = r % heads, t = r / heads, s = t % seq, b = t / seq;
       copy_row(row_ptr(params.v_src, b, s, h), row_ptr(params.v_dst, b, prefix + s, h), lane);
     }
   }
@@ -224,7 +241,7 @@ struct Kernel {
     auto S = SymbolicSize{"seq"};
     auto H = SymbolicSize{"heads"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     auto Bx = SymbolicSize{"input_batch_stride"};
     auto Tx = SymbolicSize{"input_token_stride"};
     TensorMatcher({B, S, H, kHeadDim})
@@ -289,7 +306,7 @@ struct Kernel {
     auto Bvo = SymbolicSize{"v_out_batch_stride"}, Tvo = SymbolicSize{"v_out_token_stride"};
     auto Bv = SymbolicSize{"v_src_batch_stride"}, Tv = SymbolicSize{"v_src_token_stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     // TensorMatcher is not copyable, so verify inside the lambda; the member
     // template call on a dependent expression needs `template`.
     const auto verify_rows = [&](const tvm::ffi::TensorView& t, auto& rows, auto& batch_stride, auto& token_stride) {
@@ -348,7 +365,8 @@ struct Kernel {
  private:
   static void launch(const Params& params, int64_t rows, DLDevice device) {
     using namespace host;
-    const int64_t needed = div_ceil(rows, static_cast<int64_t>(kWarpsPerBlock));
+    CHECK_HOST(rows <= int64_t{UINT32_MAX}) << "qknorm_complex_rope indexes its rows with 32 bits";
+    const int64_t needed = div_ceil(rows, static_cast<int64_t>(kRowsPerBlock));
     const auto blocks = static_cast<uint32_t>(std::min<int64_t>(needed, kMaxBlocks));
     LaunchKernel(blocks, kThreads, device)(kernel<kFuseRealSin, kCopyV>, params);
   }

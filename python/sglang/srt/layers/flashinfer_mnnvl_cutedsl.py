@@ -41,7 +41,7 @@ _CUDA_BLOCK_THREADS = 1024
 _HT_NON_REDUCTION_WARPS = 2
 _HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
 
-_SUPPORTED_TP_SIZES = (2, 4, 8, 16)
+SUPPORTED_TP_SIZES = (2, 4, 8, 16)
 
 
 def _ht_shard_split(
@@ -320,6 +320,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         weight_bias: float,
         process_group: ProcessGroup,
         device: torch.device,
+        include_shared_expert: bool = True,
     ) -> None:
         if hidden_size <= 0 or top_k <= 0 or max_m <= 0:
             raise ValueError("hidden_size, top_k, and max_m must be positive")
@@ -334,9 +335,9 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.process_group = process_group
         # Cached: supports() runs per layer and must not re-enter c10d.
         self.tp_size = dist.get_world_size(process_group)
-        if self.tp_size not in _SUPPORTED_TP_SIZES:
+        if self.tp_size not in SUPPORTED_TP_SIZES:
             raise ValueError(
-                f"MNNVL CuTe DSL fusion supports tp_size in {_SUPPORTED_TP_SIZES}, "
+                f"MNNVL CuTe DSL fusion supports tp_size in {SUPPORTED_TP_SIZES}, "
                 f"got {self.tp_size}"
             )
         self.device = torch.device(device)
@@ -373,9 +374,10 @@ class FlashInferMNNVLCuteDSLARFusion:
                 hidden_size=self.hidden_size,
                 top_k=self.top_k,
             )
-            if get_spec().speculative_algorithm is None:
+            self.workspace_config = shaped_config
+            if include_shared_expert and get_spec().speculative_algorithm is None:
                 self.workspace_config = _with_early_finalize_shared_load(shaped_config)
-            else:
+            elif include_shared_expert:
                 # Early shared load is safe only for a single looping decode graph;
                 # alternating draft/verify replays can read an unfinished buffer.
                 logger.info(
@@ -383,7 +385,6 @@ class FlashInferMNNVLCuteDSLARFusion:
                     "CuTe DSL finalize presets on the safe (non-early-load) "
                     "ordering."
                 )
-                self.workspace_config = shaped_config
             self.workspace = workspace_type(
                 tp_size=self.tp_size,
                 tp_rank=dist.get_rank(process_group),
@@ -395,7 +396,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 rms_eps=self.rms_epsilon,
                 routed_scaling_factor=1.0,
                 weight_bias=self.weight_bias,
-                include_shared_expert=True,
+                include_shared_expert=include_shared_expert,
                 add_residual=True,
                 write_residual_output=True,
                 config=self.workspace_config,
@@ -422,7 +423,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         routed_output: torch.Tensor,
         expert_weights: torch.Tensor,
         permuted_indices: torch.Tensor,
-        gated_shared_output: torch.Tensor,
+        gated_shared_output: torch.Tensor | None,
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -491,6 +492,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     max_m: int,
     rms_epsilon: float,
     weight_bias: float,
+    include_shared_expert: bool = True,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
     global _WORKSPACE
@@ -518,5 +520,6 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
         weight_bias=weight_bias,
         process_group=get_parallel().tp_group.device_group,
         device=torch.device("cuda", torch.cuda.current_device()),
+        include_shared_expert=include_shared_expert,
     )
     return _WORKSPACE

@@ -11,13 +11,13 @@ from types import SimpleNamespace as NS
 import torch
 from torch import nn
 
+from sglang.srt.arg_groups.engram_config import EngramConfig, EngramLookup
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.layers.engram import (
     Engram,
@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.mega_moe import _wait_for_moe_prefetch
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
+    get_context,
     get_forward,
     get_parallel,
     get_stream,
@@ -113,6 +114,7 @@ def _check_graph(rank, quantized, mode):
         req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
         out_cache_loc=torch.ones(rows, device="cuda", dtype=torch.int64),
         dp_padding_mode=DpPaddingMode.MAX_LEN,
+        engram_staged_rows=None,
         spec_info=NS(draft_token_num=block),
     )
     set_dp_buffer_len(rows * world, rows, True, [rows] * world)
@@ -133,9 +135,13 @@ def _check_graph(rank, quantized, mode):
                 layer = by_id.get(layer_id)
                 if layer is not None:
                     if prefetched:
-                        x = prefetch.consume(layer_id, layer, x, prepared)
+                        x = prefetch.consume(
+                            layer_id, layer, x, prepared, input_ids=ids
+                        )
                     else:
-                        x = layer(x, hashes[:, layer.layer_hash_index], batch)
+                        x = layer(
+                            x, hashes[:, layer.layer_hash_index], batch, input_ids=ids
+                        )
                 if prefetched and layer_id + 1 in by_id:
                     prepared.update(
                         prefetch.start(
@@ -224,12 +230,13 @@ def _worker(rank, port):
         attn_dp_size=4,
         fp8_gemm_runner_backend="flashinfer_cutedsl",
     )
+    get_context().override(
+        "engram_prefetch_test",
+        engram_config=EngramConfig(lookup=EngramLookup.ALL_REDUCE),
+    )
     try:
         initialize_model_parallel()
-        with (
-            torch.no_grad(),
-            envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
-        ):
+        with torch.no_grad():
             for quantized in (False, True):
                 for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
                     _check_graph(rank, quantized, mode)
