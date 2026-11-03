@@ -519,6 +519,19 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _get_spec_sampling_verify_fn(
+    use_rejection_sampling: bool,
+    use_block_verification: bool = False,
+):
+    if use_rejection_sampling:
+        if use_block_verification:
+            return partial(chain_speculative_sampling_triton, block_verification=True)
+        return chain_speculative_sampling_triton
+    if tree_speculative_sampling_target_only is None:
+        raise RuntimeError("Target-only speculative sampling is unavailable")
+    return tree_speculative_sampling_target_only
+
+
 def _verify_uses_greedy(
     *,
     is_all_greedy: bool,
@@ -529,12 +542,10 @@ def _verify_uses_greedy(
 ) -> bool:
     """Whether EAGLE verify must commit argmax instead of taking the sampling path.
 
-    HIP has no CUDA/MUSA sampling-verify kernels, so it used to be listed here
-    unconditionally. Rejection sampling routes it through the pure-Triton chain
-    sampler instead, so only a HIP run without that still has to go greedy. Every
-    other platform reduces to the original predicate.
+    HIP uses the portable target-only or rejection-sampling Triton verifier, so
+    non-greedy requests stay on the sampling path.
     """
-    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
+    return is_all_greedy or is_cpu or is_xpu
 
 
 def _can_use_sparse_uno_tree_target_sampling(
@@ -775,12 +786,10 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        if use_rejection_sampling:
-            sampling_fn = chain_speculative_sampling_triton
-            if get_spec().speculative_use_block_verification:
-                sampling_fn = partial(sampling_fn, block_verification=True)
-        else:
-            sampling_fn = tree_speculative_sampling_target_only
+        sampling_fn = _get_spec_sampling_verify_fn(
+            use_rejection_sampling,
+            get_spec().speculative_use_block_verification,
+        )
 
         target_probs = sampling_softmax(
             next_token_logits,
@@ -794,6 +803,7 @@ def eagle_sample(
                 torch.repeat_interleave(
                     sampling_info.top_ks, verify_input.draft_token_num, dim=0
                 ),
+                max_top_k=sampling_info.max_bounded_top_k,
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
         if sampling_info.need_top_p_sampling:

@@ -125,6 +125,9 @@ class SamplingBatchInfo:
     # from the whole vocabulary. Any value >= the true max stays exact, so
     # filter_batch keeps it unchanged.
     max_top_k: Optional[int] = None
+    # Largest bounded top-k from host request metadata. TOP_K_ALL is excluded so
+    # mixed batches do not force a full-vocabulary device selection.
+    max_bounded_top_k: int = 0
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -209,6 +212,14 @@ class SamplingBatchInfo:
             for r in reqs
         )
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
+        max_bounded_top_k = max(
+            (
+                r.sampling_params.top_k
+                for r in reqs
+                if r.sampling_params.top_k != TOP_K_ALL
+            ),
+            default=0,
+        )
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"
             for r in reqs
@@ -312,6 +323,7 @@ class SamplingBatchInfo:
                 else None
             ),
             vocab_size=vocab_size,
+            max_bounded_top_k=max_bounded_top_k,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
@@ -643,6 +655,7 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        self.max_bounded_top_k = max(self.max_bounded_top_k, other.max_bounded_top_k)
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
         self.max_top_k = (
             None

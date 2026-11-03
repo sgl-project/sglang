@@ -24,6 +24,7 @@ import torch
 
 from sglang.kernels.ops.sampling import renorm as _platform
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils import is_hip
 
 try:
     import flashinfer.sampling as _flashinfer_sampling
@@ -74,6 +75,8 @@ def _top_k_renorm_prob(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     deterministic: Optional[bool] = None,
+    *,
+    max_top_k: Optional[int] = None,
 ) -> torch.Tensor:
     if deterministic is None:
         deterministic = renorm_deterministic()
@@ -81,6 +84,8 @@ def _top_k_renorm_prob(
         return _flashinfer_sampling.top_k_renorm_probs(
             probs, top_k, is_deterministic=True
         )
+    if is_hip():
+        return _platform.top_k_renorm_prob(probs, top_k, max_top_k=max_top_k)
     return _platform.top_k_renorm_prob(probs, top_k)
 
 
