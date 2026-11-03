@@ -1,17 +1,24 @@
 """Unit tests for srt/model_loader/weight_utils.py shard-index consistency."""
 
+import gc
 import io
 import json
 import os
 import pickle
 import tarfile
 import tempfile
+import threading
 import unittest
+import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.model_loader import weight_utils
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     _load_pt_file,
     filter_duplicate_safetensors_files,
@@ -307,6 +314,147 @@ class TestInitializeDummyWeights(CustomTestCase):
                 model.w13_weight_scale_inv, torch.full((4, 2), 127, dtype=torch.uint8)
             )
         )
+
+
+class TestPtWeightsIterator(CustomTestCase):
+    def test_consumed_checkpoint_storage_is_released(self):
+        """Copying later shards must not keep earlier checkpoint storage alive."""
+        # Exercise the default multithreaded PT path and the real copy consumer.
+        # Destination model parameters have separate storage, so their lifetime
+        # must not be confused with extra checkpoint storage held by Futures.
+        for num_threads in (1, 2):
+            with (
+                self.subTest(num_threads=num_threads),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                files = []
+                params = torch.nn.ParameterDict()
+                for index in range(12):
+                    name = f"weight_{index}"
+                    path = Path(tmp) / f"pytorch_model-{index:05d}.bin"
+                    torch.save({name: torch.full((256, 1024), float(index))}, path)
+                    params[name] = torch.nn.Parameter(torch.zeros(256, 1024))
+                    files.append(str(path))
+
+                refs = []
+                real_load = weight_utils._load_pt_file
+
+                def track_load(path):
+                    state = real_load(path)
+                    refs.extend(
+                        (weakref.ref(t), t.untyped_storage().nbytes())
+                        for t in state.values()
+                    )
+                    return state
+
+                loader = DefaultModelLoader(
+                    LoadConfig(
+                        load_format="pt",
+                        model_loader_extra_config={"num_threads": num_threads},
+                    )
+                )
+                source = DefaultModelLoader.Source(tmp, revision=None)
+                resolved = DefaultModelLoader.ResolvedSource(
+                    source, tmp, tuple(files), False
+                )
+                seen = set()
+                with patch.object(
+                    weight_utils, "_load_pt_file", side_effect=track_load
+                ):
+                    iterator = loader._get_weights_iterator(
+                        source, resolved_source=resolved
+                    )
+                    try:
+                        for name, weight in iterator:
+                            self.assertNotEqual(
+                                weight.data_ptr(), params[name].data_ptr()
+                            )
+                            weight_utils.default_weight_loader(params[name], weight)
+                            seen.add(name)
+                            if len(seen) == 8:
+                                gc.collect()
+                                live_bytes = sum(
+                                    size for ref, size in refs if ref() is not None
+                                )
+                                # Include the currently yielded shard; previously
+                                # consumed shards must no longer be retained.
+                                self.assertLessEqual(
+                                    live_bytes, (num_threads + 1) * 1024 * 1024
+                                )
+                    finally:
+                        iterator.close()
+                del weight
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref, _ in refs))
+                self.assertEqual(len(seen), len(files))
+                for index in range(12):
+                    self.assertTrue(torch.all(params[f"weight_{index}"] == index))
+
+    def test_slow_first_shard_and_early_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = []
+            for index in range(4):
+                path = Path(tmp) / f"{index}.bin"
+                torch.save({str(index): torch.full((16,), float(index))}, path)
+                files.append(str(path))
+            release_first = threading.Event()
+            first_started = threading.Event()
+            loaded = []
+            refs = []
+            real_load = weight_utils._load_pt_file
+
+            def gated_load(path):
+                if path == files[0]:
+                    first_started.set()
+                    if not release_first.wait(timeout=10):
+                        raise TimeoutError("First shard was never released")
+                state = real_load(path)
+                loaded.append(path)
+                refs.extend(weakref.ref(t) for t in state.values())
+                return state
+
+            with patch.object(weight_utils, "_load_pt_file", side_effect=gated_load):
+                iterator = weight_utils.multi_thread_pt_weights_iterator(files, 2)
+                try:
+                    name, weight = next(iterator)
+                    self.assertTrue(first_started.wait(timeout=10))
+                    self.assertEqual(name, "1")
+                    self.assertTrue(torch.all(weight == 1))
+                finally:
+                    release_first.set()
+                    iterator.close()
+            del weight
+            gc.collect()
+            self.assertCountEqual(loaded, files[:2])
+            self.assertTrue(all(ref() is None for ref in refs))
+
+    def test_consumer_can_retain_checkpoint_storage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = []
+            for index in range(4):
+                path = Path(tmp) / f"{index}.bin"
+                tensor = torch.arange(32) + index
+                torch.save({str(index): tensor, f"view_{index}": tensor[::2]}, path)
+                files.append(str(path))
+            retained = dict(weight_utils.multi_thread_pt_weights_iterator(files, 2))
+            gc.collect()
+            self.assertEqual(len(retained), 8)
+            for index in range(4):
+                torch.testing.assert_close(
+                    retained[str(index)], torch.arange(32) + index
+                )
+
+    def test_empty_checkpoint_list(self):
+        self.assertEqual(list(weight_utils.multi_thread_pt_weights_iterator([], 2)), [])
+
+    def test_load_error_is_propagated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError):
+                list(
+                    weight_utils.multi_thread_pt_weights_iterator(
+                        [str(Path(tmp) / "missing.bin")], 2
+                    )
+                )
 
 
 if __name__ == "__main__":
