@@ -291,7 +291,10 @@ def _get_tool_schema_defs(tools: List[Tool]) -> dict:
 
 
 def _get_tool_schema(tool: Tool) -> dict:
+    # Without "type", properties/required only apply to objects, so a named
+    # tool_choice array would also accept items like 0 or "x".
     return {
+        "type": "object",
         "properties": {
             "name": {"type": "string", "enum": [tool.function.name]},
             "parameters": (
