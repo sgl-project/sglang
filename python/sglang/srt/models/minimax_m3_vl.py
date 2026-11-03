@@ -53,7 +53,7 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 logger = logging.getLogger(__name__)
 
