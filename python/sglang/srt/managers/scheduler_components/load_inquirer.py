@@ -199,7 +199,7 @@ class SchedulerLoadInquirer:
             )
             ready_reqs = [
                 decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue
+                for decode_req in self.get_disagg_decode_prealloc_queue().queue.items()
                 if decode_req.waiting_for_input
             ]
             decode_prealloc_ready = len(ready_reqs)

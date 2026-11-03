@@ -14,8 +14,10 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -25,7 +27,9 @@ def _stage(first_rank: bool, succeeded, failed, prev=None):
     """A PP stage whose own receivers report `succeeded` / `failed` rids."""
     return SimpleNamespace(
         pp_group=SimpleNamespace(is_first_rank=first_rank),
-        disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+        disagg_decode_transfer_queue=SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING)
+        ),
         get_rids=lambda queue, is_send, *groups: (list(succeeded), list(failed)),
         _pp_recv_pyobj_from_prev_stage=lambda: prev,
     )
@@ -83,7 +87,7 @@ class _Receiver:
 
 def _decode_req(rid, poll):
     return SimpleNamespace(
-        req=SimpleNamespace(
+        req=FakeReq(
             rid=rid, bootstrap_room=7, return_logprob=False, finished_reason=None
         ),
         kv_receiver=_Receiver(poll),
@@ -96,7 +100,7 @@ def _decode_req(rid, poll):
 
 def _transfer_queue(decode_reqs):
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    queue.queue = list(decode_reqs)
+    queue.queue = decode_queue(ListKind.PD_RECEIVING, decode_reqs)
     queue.enable_staging = False
     queue.enable_host_receive = False
     queue.enable_deferred_kv_release = False
@@ -149,7 +153,7 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
 
         self.assertEqual(reqs, [admitted.req])
         self.assertEqual(outcomes, {"s": False, "f": True})
-        self.assertEqual(queue.queue, [not_yet_agreed])
+        self.assertEqual(list(queue.queue.items()), [not_yet_agreed])
         queue._commit_transfer_to_req.assert_called_once_with(admitted)
         queue._release_request.assert_called_once_with(failed_elsewhere)
         queue._record_transfer_failure.assert_called_once_with(
@@ -164,7 +168,7 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
 
         self.assertEqual(reqs, [])
         self.assertEqual(outcomes, {"f": True})
-        self.assertEqual(queue.queue, [])
+        self.assertEqual(list(queue.queue.items()), [])
 
     def test_non_pp_path_keeps_the_request_list(self):
         admitted = _decode_req("s", KVPoll.Success)

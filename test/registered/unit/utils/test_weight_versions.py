@@ -400,9 +400,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def test_records_on_hisparse_staging_requests(self):
         """Requests parked in the HiSparse staging queue are swept like any live request."""
         staging_req = _ReqStub(2)
-        coordinator = SimpleNamespace(
-            ack_staging_queue=[SimpleNamespace(req=staging_req)]
-        )
+        coordinator = SimpleNamespace(ack_staging_queue=[staging_req])
         scheduler = self._scheduler("v1", [], [], hisparse=coordinator)
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
