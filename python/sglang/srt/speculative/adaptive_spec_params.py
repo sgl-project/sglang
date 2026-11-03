@@ -9,7 +9,6 @@ import bisect
 import json
 import logging
 import math
-from functools import cached_property
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
@@ -280,14 +279,14 @@ class AdaptiveSpeculativeParams:
     ):
         cfg, bs_entries = _load_adaptive_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
-        self._slots: dict[int, AdaptiveStepSlot] = {}
+        self._slot_cfgs: dict[int, dict] = {
+            bs: {**cfg, **entry} for bs, entry in sorted(bs_entries.items())
+        }
+        self._slots: dict[int, AdaptiveStepSlot] = {
+            bs: AdaptiveStepSlot(initial_steps=initial_steps, cfg=slot_cfg)
+            for bs, slot_cfg in self._slot_cfgs.items()
+        }
         self._cuda_graph_bs: list[int] | None = None
-
-        for bs, entry in sorted(bs_entries.items()):
-            self._slots[bs] = AdaptiveStepSlot(
-                initial_steps=initial_steps,
-                cfg={**cfg, **entry},
-            )
 
         first_slot = self._slots[self._bs_list[0]]
         log_info_on_rank0(
@@ -297,10 +296,58 @@ class AdaptiveSpeculativeParams:
             f"candidate_steps={first_slot.candidate_steps}",
         )
 
-    @cached_property
+    @property
     def candidate_steps(self) -> list[int]:
         """Union of all BS slots' candidate steps."""
         return sorted({s for p in self._slots.values() for s in p.candidate_steps})
+
+    @property
+    def required_steps(self) -> list[int]:
+        """Steps the slots start on; the first batch routed to a slot activates its step."""
+        return sorted({p.current_steps for p in self._slots.values()})
+
+    def prebuild_order(self) -> list[int]:
+        """Candidate steps in build priority: required steps, then the others by
+        hop distance from the nearest slot's start step (a slot moves one hop
+        per update unless hysteresis is negative)."""
+        required = set(self.required_steps)
+
+        def hops(step: int) -> int:
+            return min(
+                abs(
+                    p.candidate_steps.index(step)
+                    - p.candidate_steps.index(p.current_steps)
+                )
+                for p in self._slots.values()
+                if step in p.candidate_steps
+            )
+
+        optional = [s for s in self.candidate_steps if s not in required]
+        return sorted(required) + sorted(optional, key=lambda s: (hops(s), s))
+
+    def restrict_candidates(self, allowed: set[int]) -> list[int]:
+        """Drop the candidate steps outside *allowed* from every slot and return them.
+
+        Slots are rebuilt from their config, so this is only valid before the
+        first verify feedback; every slot's start step must be allowed.
+        """
+        dropped = sorted(set(self.candidate_steps) - set(allowed))
+        if not dropped:
+            return []
+        slots: dict[int, AdaptiveStepSlot] = {}
+        for bs, slot in self._slots.items():
+            kept = [s for s in slot.candidate_steps if s in allowed]
+            if slot.current_steps not in kept:
+                raise ValueError(
+                    f"BS slot {bs} starts on steps={slot.current_steps}, "
+                    f"which is not among the built states {sorted(allowed)}"
+                )
+            slots[bs] = AdaptiveStepSlot(
+                initial_steps=slot.current_steps,
+                cfg={**self._slot_cfgs[bs], "candidate_steps": kept},
+            )
+        self._slots = slots
+        return dropped
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None

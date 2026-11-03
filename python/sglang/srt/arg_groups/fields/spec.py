@@ -243,11 +243,11 @@ class Spec(msgspec.Struct):
         Optional[float],
         Arg(
             help="GPU memory (GB) that adaptive speculative decoding may spend at "
-            "startup on CUDA graphs and attention backends for candidate step tiers "
-            "other than the initial one. Tiers are pre-built in ascending step "
-            "order until the budget is spent; the rest are built the first time "
-            "the policy switches to them, which stalls decode for the capture. "
-            "Unset pre-builds every tier.",
+            "startup on the runtime states (CUDA graphs and attention backends) of "
+            "candidate steps beyond the ones it must build: the initial step and "
+            "each batch-size slot's starting step. The other steps are built in "
+            "priority order until the budget is spent; steps that do not fit are "
+            "removed from the candidates for this launch. Unset builds every step.",
         ),
     ] = None
     spec_trace_dir: A[

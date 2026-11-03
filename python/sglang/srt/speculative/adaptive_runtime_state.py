@@ -74,6 +74,13 @@ class AdaptiveSpecPolicy(Protocol):
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
 
+    @property
+    def required_steps(self) -> list[int]: ...
+
+    def prebuild_order(self) -> list[int]: ...
+
+    def restrict_candidates(self, allowed: set[int]) -> list[int]: ...
+
 
 class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
@@ -87,9 +94,10 @@ class AdaptiveController:
          once during startup.
       2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
 
-    With a memory budget, init_states() pre-builds candidate tiers in ascending
-    step order until the budget is spent and defers the rest; a deferred tier is
-    built the first time the policy activates it.
+    With a memory budget, init_states() always builds the states the policy can
+    activate without feedback (the slots' start steps and the worker's initial
+    step), builds the others in the policy's priority order until the budget is
+    spent, and removes the rest from the policy's candidates for this launch.
     """
 
     def __init__(
@@ -100,7 +108,6 @@ class AdaptiveController:
         self.worker = worker
         self.params: AdaptiveSpecPolicy = policy
         self._states: dict[int, SpecRuntimeState] = {}
-        self._deferred_steps: set[int] = set()
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -121,34 +128,35 @@ class AdaptiveController:
     ) -> None:
         """Build and register runtime states for the candidate steps.
 
-        *memory_budget_gb* bounds the device memory spent on tiers beyond the
-        ones already registered; ``None`` pre-builds every tier.
+        *memory_budget_gb* bounds the device memory spent on states beyond the
+        required ones; ``None`` builds every candidate step.
         """
         self.params.set_cuda_graph_bs(cuda_graph_bs)
+        required = set(self.params.required_steps) | {self.worker.speculative_num_steps}
 
         spent_gb = 0.0
-        last_cost_gb = 0.0
-        for steps in self.candidate_steps:
+        for steps in self.params.prebuild_order():
             if steps in self._states:
                 continue
-            if memory_budget_gb is not None and (
-                spent_gb >= memory_budget_gb
-                # Cost grows with steps, so the previous tier's cost is a lower
-                # bound on this one; the first tier past the budget may still
-                # overshoot, since cost is only known after capture.
-                or spent_gb + last_cost_gb > memory_budget_gb
+            if (
+                steps not in required
+                and memory_budget_gb is not None
+                and spent_gb >= memory_budget_gb
             ):
-                self._deferred_steps.add(steps)
                 continue
-            last_cost_gb = self._build_state(steps).gpu_memory_gb
-            spent_gb += last_cost_gb
+            # Cost is known only after capture, so the last optional build may
+            # overshoot the budget by one state.
+            state = self._build_state(steps)
+            if steps not in required:
+                spent_gb += state.gpu_memory_gb
 
-        if self._deferred_steps:
+        dropped = self.params.restrict_candidates(set(self._states))
+        if dropped:
             log_info_on_rank0(
                 logger,
-                "Adaptive runtime states deferred to first use: "
-                f"steps={sorted(self._deferred_steps)}, "
-                f"pre-built={spent_gb:.2f}GB of budget={memory_budget_gb:.2f}GB",
+                f"Adaptive runtime states not built within the memory budget "
+                f"({memory_budget_gb:.2f}GB, spent {spent_gb:.2f}GB on optional "
+                f"states): steps={dropped}; removed from the candidates for this launch",
             )
 
         # Start on the initial step.
@@ -171,14 +179,6 @@ class AdaptiveController:
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)
-        if state is None and speculative_num_steps in self._deferred_steps:
-            logger.warning(
-                "Building deferred adaptive runtime state steps=%d on first use; "
-                "decode stalls until capture completes",
-                speculative_num_steps,
-            )
-            state = self._build_state(speculative_num_steps)
-            self._deferred_steps.discard(speculative_num_steps)
         if state is None:
             raise ValueError(
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
