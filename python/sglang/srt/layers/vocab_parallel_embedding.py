@@ -144,6 +144,25 @@ def get_masked_input_and_mask(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if (
+        _is_npu
+        and input_.device.type == "npu"
+        and input_.is_contiguous()
+        and input_.dtype in (torch.int32, torch.int64)
+    ):
+        from sglang.kernels.ops.embeddings.masked_input import (
+            get_masked_input_and_mask_npu,
+        )
+
+        return get_masked_input_and_mask_npu(
+            input_,
+            org_vocab_start_index,
+            org_vocab_end_index,
+            num_org_vocab_padding,
+            added_vocab_start_index,
+            added_vocab_end_index,
+        )
+
     # torch.compile will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
