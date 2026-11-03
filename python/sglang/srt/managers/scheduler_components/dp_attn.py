@@ -33,7 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,

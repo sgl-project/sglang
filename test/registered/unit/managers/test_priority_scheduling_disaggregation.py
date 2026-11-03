@@ -13,11 +13,12 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
@@ -27,6 +28,9 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -68,6 +72,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -430,6 +435,11 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         scheduler.chunked_req = None
         scheduler.mm_receiver = None
         scheduler.waiting_queue = [MagicMock(rid="req")]
@@ -437,12 +447,13 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
         scheduler.dllm_config = None
         scheduler.grammar_manager = MagicMock()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
 
@@ -791,9 +802,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
 
                 prefill_len = len(Req.build_rebootstrap_payload(req)["input_ids"])
 
-                self.assertEqual(
-                    DecodePreallocQueue._pre_alloc_fill_len(req), prefill_len
-                )
+                self.assertEqual(pre_alloc_fill_len(req), prefill_len)
                 self.assertEqual(req.output_ids, output_ids)
 
 

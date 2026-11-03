@@ -1654,7 +1654,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with self.assertRaisesRegex(ValueError, "moe-a2a-backend=none"):
             _nemotron_h_overrides(server_args, hf_config)
 
-    def test_nemotron_h_w4a16_moe_rejects_non_marlin_runner(self):
+    def test_nemotron_h_w4a16_moe_explicit_runner(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
         )
@@ -1667,10 +1667,62 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 }
             }
         )
-        server_args.moe_runner_backend = "flashinfer_trtllm"
+        cases = [
+            ("auto", "none", False, {"moe_runner_backend": "marlin"}, None),
+            ("auto", "none", True, {"moe_runner_backend": "marlin"}, None),
+            ("marlin", "none", False, {}, None),
+            ("marlin", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", False, None, "moe-runner-backend=marlin"),
+            ("flashinfer_trtllm", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutlass", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutedsl", "deepep", True, None, "moe-a2a-backend=none"),
+            ("flashinfer_cutedsl", "flashinfer", True, None, "moe-a2a-backend=none"),
+        ]
+        for runner, a2a, w4a16_enabled, expected, error in cases:
+            with (
+                self.subTest(runner=runner, a2a=a2a, w4a16_enabled=w4a16_enabled),
+                override_platform(is_sm100=True),
+                override_platform(is_blackwell=True),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_enabled),
+            ):
+                server_args.moe_runner_backend = runner
+                server_args.moe_a2a_backend = a2a
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _nemotron_h_overrides(server_args, hf_config)
+                else:
+                    self.assertEqual(
+                        _nemotron_h_overrides(server_args, hf_config),
+                        {
+                            "quantization": "modelopt_mixed",
+                            "attention_backend": "trtllm_mha",
+                            **expected,
+                        },
+                    )
 
-        with self.assertRaisesRegex(ValueError, "moe-runner-backend=marlin"):
-            _nemotron_h_overrides(server_args, hf_config)
+    def test_nemotron_h_w4a16_cutedsl_rejects_non_sm100(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_runner_backend = "flashinfer_cutedsl"
+        for is_blackwell in (False, True):
+            with (
+                self.subTest(is_blackwell=is_blackwell),
+                override_platform(is_sm100=False, is_blackwell=is_blackwell),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
+                self.assertRaisesRegex(ValueError, "SM100-family GPUs"),
+            ):
+                _nemotron_h_overrides(server_args, hf_config)
 
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
@@ -1921,6 +1973,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         with self.assertRaises(ValueError):
             _deterministic_attention_backend(view)
+
+    def test_deterministic_incompatible_phase_backend_raises(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        # A per-phase backend overrides --attention-backend for its phase, so a
+        # non-deterministic one must be refused even when the main backend is fine.
+        for field in ("prefill_attention_backend", "decode_attention_backend"):
+            with self.subTest(field=field):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        **{field: "aiter"},
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
+                    _deterministic_attention_backend(view)
+
+    def test_deterministic_compatible_phase_backends_are_accepted(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True,
+                attention_backend="triton",
+                prefill_attention_backend="triton",
+                decode_attention_backend="fa3",
+            )
+        )
+        self.assertEqual(_deterministic_attention_backend(view), {})
 
     def test_deterministic_ascend_is_left_alone(self):
         from sglang.srt.arg_groups.overrides import (
