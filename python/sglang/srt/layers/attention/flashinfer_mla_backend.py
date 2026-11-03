@@ -267,7 +267,9 @@ class _Fp8KvRowReader:
         """Compact ``[len(kv_rows), 1, dim]`` copy of the referenced rows."""
         from sglang.kernels.ops.kvcache.mla_kv_gather import gather_mla_kv_rows
 
-        return gather_mla_kv_rows(self.pool.get_key_buffer(layer_id), kv_rows, dtype)
+        return gather_mla_kv_rows(
+            self.pool.layer_router.read(layer_id).key(), kv_rows, dtype
+        )
 
     def refresh(
         self,
@@ -279,7 +281,7 @@ class _Fp8KvRowReader:
         """Refresh before each attention call; layers and TBO children share the shadow."""
         from sglang.kernels.ops.kvcache.mla_kv_gather import refresh_mla_kv_shadow
 
-        kv = self.pool.get_key_buffer(layer_id)
+        kv = self.pool.layer_router.read(layer_id).key()
         if (
             self._shadow is None
             or self._shadow.shape != kv.shape
@@ -812,7 +814,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         """Return KV data addressed by the compact or physical-index plan."""
         reader = self.fp8_kv_reader
         if reader is None or dtype == reader.pool.dtype:
-            return self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(dtype)
+            return self.kv_layers.read(layer.layer_id).key().to(dtype)
         if kv_rows is not None:
             return reader.gather(layer.layer_id, kv_rows, dtype)
         if graph_decode_bs is not None:
@@ -822,7 +824,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 self.kv_indptr[graph_decode_bs : graph_decode_bs + 1],
                 dtype,
             )
-        return self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(dtype)
+        return self.kv_layers.read(layer.layer_id).key().to(dtype)
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False

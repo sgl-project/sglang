@@ -76,7 +76,9 @@ class TestMLAKVGather(CustomTestCase):
             dtype=data.dtype,
             size=pool_rows - 64,
             page_size=64,
-            get_key_buffer=lambda layer_id: data,
+            layer_router=SimpleNamespace(
+                read=lambda layer_id: SimpleNamespace(key=lambda: data)
+            ),
         )
         backend = FlashInferMLAAttnBackend.__new__(FlashInferMLAAttnBackend)
         backend.token_to_kv_pool = pool
@@ -118,7 +120,11 @@ class TestMLAKVGather(CustomTestCase):
                     dtype=torch.float8_e4m3fn,
                     size=257 - page_size,
                     page_size=page_size,
-                    get_key_buffer=lambda layer_id: layers[layer_id],
+                    layer_router=SimpleNamespace(
+                        read=lambda layer_id: SimpleNamespace(
+                            key=lambda: layers[layer_id]
+                        )
+                    ),
                 )
                 reader = _Fp8KvRowReader(pool)
                 indices = torch.zeros(32, dtype=torch.int32, device="cuda")
