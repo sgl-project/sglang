@@ -86,7 +86,8 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
-      require-run-ci-extra: ${{ inputs.extra_only == true }}
+      # Extra is called by the NVIDIA/shared Extra workflow; Base is unchanged.
+      require-label: ${{ inputs.extra_only == true && 'run-ci-nv-extra' || '' }}
     secrets: inherit
 
   build-test:

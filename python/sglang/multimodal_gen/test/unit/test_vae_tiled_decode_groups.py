@@ -67,12 +67,22 @@ def test_tiled_decode_uses_its_sp_group(tmp_path):
     mp.spawn(_decode_in_sp_group, args=(rendezvous,), nprocs=4)
 
 
+def _scale(x, w):
+    # The loop's tensor-times-Python-float runs in fp32 op-math on CUDA, which
+    # is what _blend reproduces. ROCm's fp16 tensor-times-scalar kernel does not
+    # round the same way (it matches multiplying by the weight rounded to fp16),
+    # so on ROCm spell out the fp32 multiply the reference stands for.
+    if torch.version.hip is not None and x.dtype == torch.float16:
+        return (x.float() * w).to(x.dtype)
+    return x * w
+
+
 def _blend_per_slice(a, b, blend_extent, dim):
     blend_extent = min(a.shape[dim], b.shape[dim], blend_extent)
     for i in range(blend_extent):
         b.select(dim, i).copy_(
-            a.select(dim, a.shape[dim] - blend_extent + i) * (1 - i / blend_extent)
-            + b.select(dim, i) * (i / blend_extent)
+            _scale(a.select(dim, a.shape[dim] - blend_extent + i), 1 - i / blend_extent)
+            + _scale(b.select(dim, i), i / blend_extent)
         )
     return b
 
