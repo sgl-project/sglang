@@ -232,7 +232,7 @@ class TestDeepseekScalingRopeAiterGfx1250(CustomTestCase):
             torch.testing.assert_close(q_out, q_ref, atol=3e-2, rtol=2e-2)
             torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
 
-    def test_offsets_and_aliased_key_use_native(self) -> None:
+    def test_offsets_use_native(self) -> None:
         rope = self._small_rope()
         positions = torch.arange(4, device="cuda")
         q = torch.randn(4, 16, 64, dtype=torch.bfloat16, device="cuda")
@@ -243,10 +243,15 @@ class TestDeepseekScalingRopeAiterGfx1250(CustomTestCase):
         torch.testing.assert_close(q_out, q_ref, atol=3e-2, rtol=2e-2)
         torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
 
-        k_ref = rope.forward_native(positions, k.clone(), k.clone())[1]
-        k_in = k.clone()
-        k_out = rope(positions, k_in, k_in)[1]
-        torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
+    def test_key_passed_as_its_own_query(self) -> None:
+        # IndexerKPool's K-only path passes the rope slice of the key twice.
+        rope = self._small_rope()
+        positions = torch.arange(4, device="cuda")
+        key = torch.randn(4, 1, 128, dtype=torch.bfloat16, device="cuda")
+        k_rope = key[..., :64]
+        k_ref = rope.forward_native(positions, k_rope.clone(), k_rope.clone())[1]
+        rope(positions, k_rope, k_rope)
+        torch.testing.assert_close(key[..., :64], k_ref, atol=3e-2, rtol=2e-2)
 
     def test_force_native_keeps_native(self) -> None:
         exec_ctx = SimpleNamespace(

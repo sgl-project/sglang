@@ -410,9 +410,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # The cached-positions kernel takes no offsets, and being in place it
-        # would rotate a key passed as its own query twice.
-        if offsets is not None or query.data_ptr() == key.data_ptr():
+        if offsets is not None:
+            # The cached-positions kernel takes no offsets.
             return self.forward_native(positions, query, key, offsets)
 
         cached = self._aiter_cos_sin
