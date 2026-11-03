@@ -2366,6 +2366,10 @@ class AbortReq(BaseReq, kw_only=True):
         if self.rid is None:
             self.rid = ""
 
+    def matches(self, rid: str) -> bool:
+        """Whether this abort targets the request `rid`."""
+        return self.abort_all or rid.startswith(self.rid)
+
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
     """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""

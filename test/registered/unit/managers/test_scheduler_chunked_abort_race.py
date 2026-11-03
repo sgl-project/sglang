@@ -15,13 +15,10 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.managers.scheduler_components.deferred_responses import (  # noqa: E402
-    DeferredResponses,
-)
+from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -52,13 +49,11 @@ class _FakeReq:
 
 def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
+    empty_request_lists(sched)
     sched.enable_continuous_input_polling = False
     sched.result_queue = deque()
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
-    sched.waiting_queue = []
-    sched.dllm_config = None
-    sched.grammar_manager = Mock()
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
@@ -67,11 +62,6 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.last_batch = None
     sched.beam_coordinator = Mock()
     sched.output_streamer = Mock()
-    sched.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
-    )
     return sched
 
 
@@ -92,7 +82,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         req = _FakeReq("failed_load")
         req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched._release_aborted_request = Mock()
+        sched.release_aborted_request = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 
@@ -106,7 +96,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def test_aborted_chunked_beam_leader_retires_its_group(self):
         req = _FakeReq("beam_leader")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched._release_aborted_request = Mock()
+        sched.release_aborted_request = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 
