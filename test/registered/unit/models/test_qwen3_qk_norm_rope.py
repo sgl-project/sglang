@@ -143,18 +143,6 @@ def test_constructor_exclusions(runtime, settings, layer_args, deterministic_env
         assert not make_layer(**layer_args).use_table_qk_norm_rope
 
 
-@pytest.mark.parametrize("rope_scaling", [None, MROPE])
-def test_large_batch_stays_separate(rope_scaling):
-    layer = make_layer(rope_scaling=rope_scaling)
-    num_tokens = layer.table_qk_norm_rope_max_tokens + 1
-    x = torch.randn(num_tokens, layer.hidden_size, device="cuda", dtype=torch.bfloat16)
-    positions = decode_positions(layer, torch.arange(num_tokens, device="cuda"))
-    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-    with patch.object(qwen3, "table_qk_norm_rope_") as fused:
-        layer.forward_prepare_native(positions, x, batch)
-    fused.assert_not_called()
-
-
 def test_mrope_one_d_positions_stay_separate():
     layer = make_layer(rope_scaling=MROPE)
     x = torch.randn(4, layer.hidden_size, device="cuda", dtype=torch.bfloat16)

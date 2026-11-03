@@ -19,18 +19,20 @@ def _table_qk_norm_rope_kernel(
     row_stride,
     q_size,
     NHQ: tl.constexpr,
+    NH: tl.constexpr,
     D: tl.constexpr,
     EPS: tl.constexpr,
     MATCH_CUDA: tl.constexpr,
     BF16_TABLE: tl.constexpr,
     MROPE: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1)
+    heads = tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM)
 
     HALF: tl.constexpr = D // 2
-    half_ar = tl.arange(0, HALF)
-    d_ar = tl.arange(0, D)
+    half_ar = tl.arange(0, HALF)[None, :]
+    d_ar = tl.arange(0, D)[None, :]
     if MROPE:
         axis = tl.load(axis_map_ptr + half_ar)
         pos = tl.load(pos_ptr + axis * pos_stride + t).to(tl.int64)
@@ -39,47 +41,49 @@ def _table_qk_norm_rope_kernel(
     cos = tl.load(cos_sin_ptr + pos * D + half_ar)
     sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar)
 
-    is_q = h < NHQ
-    col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
-    w_ptr = tl.where(is_q, q_weight_ptr.to(tl.int64), k_weight_ptr.to(tl.int64)).to(
-        tl.pointer_type(tl.bfloat16)
-    )
+    is_q = (heads < NHQ)[:, None]
+    col0 = tl.where(heads < NHQ, heads * D, q_size + (heads - NHQ) * D).to(tl.int64)
+    row = (qkv_ptr + t * row_stride + col0)[:, None]
+    mask = (heads < NH)[:, None]
 
-    row = qkv_ptr + t * row_stride + col0
     if MATCH_CUDA:
-        lane = tl.arange(0, 32)
-        part = tl.full((32,), 0, tl.float32)
+        lane = tl.arange(0, 32)[None, :]
+        part = tl.full((HEADS_PER_PROGRAM, 32), 0, tl.float32)
         for i in tl.static_range(D // 32):
-            x = tl.load(row + lane * (D // 32) + i).to(tl.float32)
+            x = tl.load(row + lane * (D // 32) + i, mask=mask, other=0)
+            x = x.to(tl.float32)
             part = tl.fma(x, x, part)
-        inv = cuda_rsqrtf(tl.fma(tl.sum(part, 0), 1.0 / D, EPS))
+        inv = cuda_rsqrtf(tl.fma(tl.sum(part, 1), 1.0 / D, EPS))[:, None]
     else:
-        x = tl.load(row + d_ar).to(tl.float32)
-        ms = tl.sum(x * x, 0) / D
-        inv = 1.0 / tl.sqrt(ms + EPS)
-    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
-    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+        x = tl.load(row + d_ar, mask=mask, other=0).to(tl.float32)
+        ms = tl.sum(x * x, 1) / D
+        inv = (1.0 / tl.sqrt(ms + EPS))[:, None]
+    w1 = tl.where(
+        is_q, tl.load(q_weight_ptr + half_ar), tl.load(k_weight_ptr + half_ar)
+    ).to(tl.float32)
+    w2 = tl.where(
+        is_q,
+        tl.load(q_weight_ptr + HALF + half_ar),
+        tl.load(k_weight_ptr + HALF + half_ar),
+    ).to(tl.float32)
+    x1 = tl.load(row + half_ar, mask=mask, other=0).to(tl.float32) * inv * w1
+    x2 = tl.load(row + HALF + half_ar, mask=mask, other=0).to(tl.float32) * inv * w2
     x1 = x1.to(tl.bfloat16)
     x2 = x2.to(tl.bfloat16)
-    if BF16_TABLE:
-        # Same BF16 expression as triton_mrope_fused, so its codegen matches.
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-    else:
+    if not BF16_TABLE:
         x1 = x1.to(tl.float32)
         x2 = x2.to(tl.float32)
         cos = cos.to(tl.float32)
         sin = sin.to(tl.float32)
-        if MATCH_CUDA:
-            o1 = tl.fma(x1, cos, -mul_rn_f32(x2, sin))
-            o2 = tl.fma(x2, cos, mul_rn_f32(x1, sin))
-        else:
-            o1 = x1 * cos - x2 * sin
-            o2 = x2 * cos + x1 * sin
-    tl.store(row + half_ar, o1.to(tl.bfloat16))
-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
+    if MATCH_CUDA and not BF16_TABLE:
+        o1 = tl.fma(x1, cos, -mul_rn_f32(x2, sin))
+        o2 = tl.fma(x2, cos, mul_rn_f32(x1, sin))
+    else:
+        # A BF16 table uses triton_mrope_fused's expression, so its codegen matches.
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+    tl.store(row + half_ar, o1.to(tl.bfloat16), mask=mask)
+    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16), mask=mask)
 
 
 def table_qk_norm_rope_(
@@ -137,7 +141,16 @@ def table_qk_norm_rope_(
     T = qkv.shape[0]
     if T == 0:
         return
-    grid = (T, num_q_heads + num_k_heads)
+    num_heads = num_q_heads + num_k_heads
+    # Measured on B300: one head per program wins up to ~1k (token, head) rows,
+    # eight heads over four warps above that.
+    if not match_cuda:
+        heads_per_program, num_warps = 1, 4
+    elif T * num_heads <= 1024:
+        heads_per_program, num_warps = 1, 1
+    else:
+        heads_per_program, num_warps = 8, 4
+    grid = (T, triton.cdiv(num_heads, heads_per_program))
     _table_qk_norm_rope_kernel[grid](
         qkv,
         q_weight,
@@ -149,10 +162,12 @@ def table_qk_norm_rope_(
         qkv.stride(0),
         num_q_heads * head_dim,
         NHQ=num_q_heads,
+        NH=num_heads,
         D=head_dim,
         EPS=eps,
         MATCH_CUDA=match_cuda,
         BF16_TABLE=cos_sin_cache.dtype == torch.bfloat16,
         MROPE=axis_map is not None,
-        num_warps=1 if match_cuda else 4,
+        HEADS_PER_PROGRAM=heads_per_program,
+        num_warps=num_warps,
     )

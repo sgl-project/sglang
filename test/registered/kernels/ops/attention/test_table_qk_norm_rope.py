@@ -55,6 +55,7 @@ def inputs(d, batch, hq, hk, seed, padded=False, position_dtype=torch.int64):
         (1, 32, 8, False, torch.int64),
         (4, 8, 2, True, torch.int32),
         (32, 32, 8, False, torch.int64),
+        (129, 8, 2, True, torch.int64),
         (257, 7, 1, True, torch.int64),
     ],
 )
@@ -75,7 +76,9 @@ def test_cuda_sequence_is_bit_exact(d, batch, hq, hk, padded, pos_dtype):
 
 
 @pytest.mark.parametrize("layout", ["sections", "interleaved", "interleaved_glm"])
-@pytest.mark.parametrize("batch,hq,hk", [(1, 32, 8), (32, 8, 1), (257, 64, 8)])
+@pytest.mark.parametrize(
+    "batch,hq,hk", [(1, 32, 8), (32, 8, 1), (129, 12, 2), (257, 64, 8)]
+)
 def test_bf16_mrope_matches_triton_mrope(batch, hq, hk, layout):
     """A BF16 table with per-axis positions must reproduce the split MRoPE path."""
     d, section = 128, [24, 20, 20]
