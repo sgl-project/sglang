@@ -168,13 +168,7 @@ class ExpertDistributionRecorder(ABC):
         yield
 
     @contextmanager
-    def with_forward_pass(
-        self,
-        forward_pass_id: int,
-        forward_batch: ForwardBatch,
-        *,
-        enabled: bool = True,
-    ):
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield {}
 
     def on_select_experts(self, topk_ids: torch.Tensor):
@@ -254,18 +248,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._current_debug_name.with_value(debug_name)
 
     @contextmanager
-    def with_forward_pass(
-        self,
-        forward_pass_id: int,
-        forward_batch: ForwardBatch,
-        *,
-        enabled: bool = True,
-    ):
-        # Target and draft share counters. Exclude disabled passes before reset
-        # and append; disabling hooks alone does not skip the recorder lifecycle.
-        if self._disable_all or not enabled:
-            with self.disable_this_region():
-                yield {}
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        # Target and draft share counters. Skip reset and append when a disabled
+        # region encloses this pass.
+        if self._disable_all:
+            yield {}
             return
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):

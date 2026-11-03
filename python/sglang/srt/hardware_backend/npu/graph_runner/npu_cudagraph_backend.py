@@ -398,7 +398,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # Some capture callbacks call the model directly, bypassing
-        # ModelRunner.forward and its recording flag. Guard both warmups and
+        # ModelRunner.forward and its recording context. Guard both warmups and
         # capture here, including calls that do not enter capture_session.
         record_ctx = (
             get_global_expert_distribution_recorder().disable_this_region()
