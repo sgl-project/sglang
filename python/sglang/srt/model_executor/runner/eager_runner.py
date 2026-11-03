@@ -216,7 +216,8 @@ class EagerRunner(BaseRunner):
                 registry.max_num_tokens,
                 max_num_token,
             )
-            # Not pooled, so the buffers it replaces are freed.
+            # Not pooled, so the next regrow frees it. The startup registry
+            # stays pooled: the cuda-graph runners share its slots.
             registry = self._eager_registry = self._build_eager_registry(
                 max_num_token, share_pool=False
             )
