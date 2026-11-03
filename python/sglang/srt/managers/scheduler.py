@@ -1214,7 +1214,11 @@ class Scheduler(
                 ),
             )
         device_module = torch.get_device_module(model_runner.device)
-        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
+        self.schedule_stream = (
+            None
+            if use_mlx()
+            else device_module.Stream(priority=envs.SGLANG_PLB_STREAM_PRIORITY.get())
+        )
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream
@@ -1785,7 +1789,9 @@ class Scheduler(
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
-        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream: CudaStream = self.device_module.Stream(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )

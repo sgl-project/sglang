@@ -347,7 +347,9 @@ class FutureMap:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
-            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
+            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream(
+                priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+            )
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
