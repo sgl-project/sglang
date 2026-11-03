@@ -35,8 +35,10 @@ inline constexpr uint32_t kMaxWorldSize = 16;
  *    of the phase. Participant 0 adds 2^32 - (N - 1), the others add 1, so a grid adds
  *    exactly 2^32: the high half gains 1 and the low half returns to 0. The phase is
  *    bit 0 of the high half, so reading it is a 32-bit load and an `& 1`.
- *  - No partial sum carries into the high half, so every block of a grid reads the
- *    same phase no matter how late it starts.
+ *  - No partial sum carries into the high half, so the phase cannot change before
+ *    the last participant commits. A participant may commit only after every thread
+ *    it covers has read the phase: put a block barrier before the commit, and a
+ *    cluster barrier when other CTAs of the cluster read but do not commit.
  *  - `load` must come after the PDL wait: only completion of the previous grid makes
  *    its commits visible. A kernel that only reads the phase (a producer whose paired
  *    consumer commits) must sit between the previous commit and that consumer.

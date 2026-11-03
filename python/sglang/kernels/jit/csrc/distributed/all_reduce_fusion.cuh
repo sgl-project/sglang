@@ -55,6 +55,14 @@ using host::distributed::CommunicatorRef;
 using Lamport = device::distributed::LamportTrait<bf16_t, 8, /*kAtom=*/4>;
 using StageVec = device::AlignedVector<bf16x2_t, 4>;
 
+SGL_DEVICE void barrier_cluster_arrive_relaxed() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+
+SGL_DEVICE void barrier_cluster_wait() {
+  asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+}
+
 template <uint32_t kWorldSize, typename WeightT>
 struct MoeFinalizeAllReduceParams {
   bf16_t* out;                         // [num_tokens, kHiddenDim], output-only
@@ -395,6 +403,10 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
     }
   }
 
+  // Every CTA of the cluster has read the epoch before the leader may commit; the
+  // norm path gets the same ordering from its cluster.sync.
+  if constexpr (!kNorm) barrier_cluster_arrive_relaxed();
+
   // stage 2: poll own slots, reduce across ranks, [norm], write, reset markers
   void* poll_ptrs[kWorldSize];
 #pragma unroll
@@ -465,6 +477,7 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
         mhc_post_vec<kHiddenDim>(params, red[0], row_idx, hvec);
       }
     }
+    barrier_cluster_wait();
   } else {
     __shared__ float smem_sq[kClusterSize][kNumWarps];
     if constexpr (kMhc) {

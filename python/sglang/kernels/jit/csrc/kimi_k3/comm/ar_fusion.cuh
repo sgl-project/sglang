@@ -356,6 +356,9 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
     }
   }
 
+  // Every CTA of the cluster has read the phase before the leader commits; rows
+  // without the norm epilogue have no cluster.sync of their own.
+  cluster.sync();
   if (cluster_rank == 0 && tx == 0) params.push_counter->commit(row_idx, num_row_clusters);
 }
 
