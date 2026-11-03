@@ -104,4 +104,10 @@ See per_request_spec_opt_out_prefix_results.txt for the executed BF16/FP16
 diagnosis, raw-evidence hash, precision controls and reproduction commands.
 When reusing the stopped Pod, update OPT_OUT_EXPECTED_COMMIT in its startup
 command to the intended checked-out head before starting; the saved template
-may still pin 9dbdeaaf. The prepared runner deliberately rejects a stale pin.
+may still pin an earlier tested commit. The prepared runner deliberately rejects a stale pin.
+
+EAGLE3 follow-up
+---------------
+See per_request_spec_opt_out_eagle3_results.txt for the eager/graph lifecycle
+results, the reduced-vocabulary head fix, and exact reproduction commands.
+Use OPT_OUT_MODELS to cache the intended model pair, including .bin weights.

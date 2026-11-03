@@ -1,0 +1,116 @@
+EAGLE3 lifecycle verification, 2026-11-02/03 UTC
+===============================================
+
+Model pair: Qwen/Qwen3-1.7B (70d244cc86ccca08cf5af4e1e306ecf908b1ad5e)
+and AngelSlim/Qwen3-1.7B_eagle3 (94441b48acc5804677ae12259617c83323b543a9).
+H100 SXM, same pinned SGLang image as the resume checklist, BF16, TP1, Triton,
+page 16, 3 draft steps/topk 1/verify width 4, overlap enabled, fixed seed 0.
+Radix reuse disabled; cache flush between cases forces a drained allocator.
+
+Confirmed defects and fixes
+1. The preparation script cached safetensors but missed pytorch_model.bin for
+   this draft. Added .bin downloads. The first attempt failed before serving;
+   it is not a model correctness result.
+2. The draft checkpoint has tie_word_embeddings=true but a trained 32,000-row
+   lm_head and a 151,936-row target embedding vocabulary. The EAGLE3 constructor
+   tied these modules, which caused named-parameter loading to skip the separate
+   lm_head.weight and target embedding sharing to replace the draft head.
+   This is a pre-existing model-loading defect, not an opt-out-only failure:
+   the enabled-only control also accepted exactly one token in all 79 rounds.
+   Preserve a separate head whenever draft and target vocabularies differ.
+   Equal-vocabulary weight tying is retained.
+   Regression: reduced-head checkpoint weight loads, survives target embedding
+   sharing, and emits the reduced vocabulary shape; equal-vocabulary case stays
+   tied. Before fix: 1 failed, 1 passed; after fix both passed locally.
+
+Execution evidence
+Initial lifecycle and enabled-only control runs failed the final assertion
+"no enabled acceptance". They did not count as successful speculative coverage.
+No artificially forced acceptance or model-config override was used to pass.
+
+After production fix b751b5f3:
+- Eager lifecycle PASS: 38 actual mixed verify rounds, 659 draft state probes,
+  606 KV page checks, 21,878 idle pool checks.
+- Enabled rows accepted 1..4 tokens (68 draft-state observations); all 591
+  opted-out draft-state observations accepted exactly one token.
+- mixed -> all-opt-out -> mixed waves completed; max observed sequence 112.
+- Opted-out count-prompt output exactly matched its isolated run. Streaming
+  normal completion and both post-release reruns also matched all 80 token IDs.
+- Natural EOS ended with matched token 151645; explicit /abort_request ended
+  with finish_reason.type=abort; closing a streaming connection also released
+  its request. After each of these and normal streaming completion, later
+  requests reused BOTH the request row and overlapping physical KV slots.
+
+At 510d3f19 with LIFECYCLE_GRAPH=1 and
+SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1, the same lifecycle also PASSED:
+38 mixed rounds, 659 draft state probes, and 560 observed target-verify forward
+CUDA graph rounds containing opted-out requests. Opt-out post-verify processing
+still rejects replay and uses eager processing; forward graphs are separate.
+All four release/reuse assertions and the output comparisons above passed.
+
+What the draft-state probes check
+- All layers of this one-layer EAGLE3 draft, across the full committed prefix.
+- Existing committed K/V values and logical-to-physical mappings remain exactly
+  unchanged across successive observed iterations and across draft extend.
+- New committed slots have finite K/V values and no within-request aliasing.
+- new_seq_lens = old_seq_lens + accept_lens.
+- Draft-extend inputs equal retained prediction inputs; the next bonus token is
+  the last retained target token. Opt-out counts and acceptance-index sentinels
+  are checked by the existing verifier probe.
+These are direct state/invariant checks. They do not prove numerical equality
+of every new KV value against an independently recomputed draft reference.
+
+Reproduction
+Use the pinned image and Rust preflight from prepare_per_request_spec_opt_out_e2e.sh:
+  export OPT_OUT_EXPECTED_COMMIT=<reviewed full commit SHA>
+  export OPT_OUT_MODELS=Qwen/Qwen3-1.7B,AngelSlim/Qwen3-1.7B_eagle3
+  bash test/manual/spec/prepare_per_request_spec_opt_out_e2e.sh prepare
+  export PYTHONPATH=python:test/manual/spec
+  export SGLANG_CACHE_DIR=/workspace/sglang-47965-cache
+  export SGLANG_RUST_BUILD_MODE=never HF_HOME=/workspace/sglang-47965-hf
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  LIFECYCLE_RESULTS=/workspace/eagle3-eager timeout 900 \
+    python -u test/manual/spec/test_eagle3_opt_out_lifecycle.py
+  LIFECYCLE_RESULTS=/workspace/eagle3-graph LIFECYCLE_GRAPH=1 \
+    SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1 timeout 900 \
+    python -u test/manual/spec/test_eagle3_opt_out_lifecycle.py
+
+The model names can be overridden with LIFECYCLE_TARGET/LIFECYCLE_DRAFT, but
+changing the pair requires separate preparation and invalidates these results.
+The script cleans its server processes; the operator must download evidence
+and STOP the billable Pod. Do not treat script exit as Pod shutdown.
+
+Limitations
+Bounded dense TP1 case, topk=1 only, one small model pair. No HiSparse,
+distributed TP/PP/DP, tree topk>1, performance claim, or independent full-KV
+recomputation. Streaming checks cover this native /generate path. Keep PR draft.
+
+Validation and evidence
+Local focused suites after the head fix: 29 passed, 2 skipped, 25 subtests passed
+(7.27s). GPU/native seeded skips are local-only. H100 at 510d3f19: 41 passed,
+191 subtests passed, no skips (32.26s), covering reduced-head loading, opt-out,
+diagnostic, post-verify graphs, and API contract. GPU unit warnings: 21,
+including dependency deprecations; no empty-graph unit warning.
+
+The graph MODEL run emitted one "CUDA Graph is empty" warning during the
+initial ordinary warmup's post-verify capture. The dense Qwen3 model has no
+Mamba state: commit_mamba_states_after_verify returns immediately, while the
+post-verify runner still captures a separate commit graph. This is consistent
+with the previously documented production no-op commit path; it does not mean
+the target-forward graph was empty (560 actual rounds were observed). The
+warning is retained in the evidence, not suppressed or reported as eliminated.
+
+New/changed test files passed Ruff lint/format and diff checks. The existing
+llama_eagle3.py has pre-existing E402 import-layout findings and a pre-existing
+extra blank line flagged by formatting; those unrelated lines were not changed.
+Ruff excluding E402 passes for that file, and the added condition is formatted.
+
+Downloaded archive SHA-256:
+f190e74ca61e6aa7630201b2d0556095cda4c3d065411543b314fad5a80f2112
+Contains all attempts, full HTTP/SSE responses, trace JSONL, server/unit logs,
+model revisions, source hashes and the pre-fix executed patch. Final GPU tree
+was clean; executed model/harness/test hashes match the committed local files.
+
+Pod compute and container storage verified Not running, $0.00/hr, by
+2026-11-03 00:07:32 UTC. Conservative current-run cost estimate $1.18; cumulative
+including previous runs $4.17, below $10. Elapsed-time estimate, not final bill.
