@@ -554,5 +554,6 @@ POSITIONAL_FIELD_ORDER = (
     "return_aux_hidden_state_layer_ids",
     "enable_token_space_processor",
     "token_space_preprocess_cache_trust_url",
+    "enable_token_space_preprocess_cache",
 )
 # fmt: on
