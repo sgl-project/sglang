@@ -108,8 +108,7 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
         self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
-        # maybe_enable_silu_fp4_quant_fusion turns this on for NVFP4 projections;
-        # SiLU+mul and the down_proj input quantization then run as one kernel.
+        # Off unless the decoder layer enables the fused SiLU+mul+NVFP4 quant path.
         self._enable_silu_fp4_quant_fusion = False
         self._masked_m_cache: dict = {}
         self._down_input_scale_inv_1d = None

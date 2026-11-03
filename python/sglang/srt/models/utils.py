@@ -14,8 +14,6 @@
 from __future__ import annotations
 
 import itertools
-import logging
-import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -44,10 +42,14 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
+from sglang.srt.utils import (
+    get_current_device_stream_fast,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    print_info_once,
+)
 from sglang.srt.utils.custom_op import register_custom_op
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
@@ -394,11 +396,9 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
 
     Replaces the separate act_and_mul and per-token FP4 quantize kernels with
     one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
-    tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
-    linear method without AWQ and the FP4 GEMM backend is not Marlin;
-    kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    tuple. Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
     """
-    if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
+    if envs.SGLANG_DISABLE_SILU_FP4_QUANT_FUSION.get():
         return
     from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
@@ -424,7 +424,7 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
         return
     mlp._enable_silu_fp4_quant_fusion = True
     mlp.down_proj._accepts_prequantized_fp4 = True
-    logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
+    print_info_once("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
 def can_run_silu_fp4_quant_fusion(

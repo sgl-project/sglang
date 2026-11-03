@@ -189,7 +189,7 @@ class TestSiluFp4QuantFusionGates(CustomTestCase):
             self.assertFalse(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
 
     @staticmethod
-    def _enables_fusion(
+    def _fusion_turns_on(
         *, is_awq: bool, backend: Fp4GemmRunnerBackend, down_proj_k: int = 128
     ) -> bool:
         method = MagicMock(spec=ModelOptFp4LinearMethod, quant_mode="w4a4")
@@ -212,24 +212,24 @@ class TestSiluFp4QuantFusionGates(CustomTestCase):
 
     def test_turns_on_for_w4a4_on_a_native_fp4_backend(self):
         self.assertTrue(
-            self._enables_fusion(
+            self._fusion_turns_on(
                 is_awq=False, backend=Fp4GemmRunnerBackend.FLASHINFER_CUTLASS
             )
         )
 
     def test_stays_off_for_nvfp4_awq(self):
-        # The fused producer would skip AWQ's per-input-channel pre_quant_scale.
+        """The fused producer would skip AWQ's per-input-channel pre_quant_scale."""
         self.assertFalse(
-            self._enables_fusion(
+            self._fusion_turns_on(
                 is_awq=True, backend=Fp4GemmRunnerBackend.FLASHINFER_CUTLASS
             )
         )
 
     def test_stays_off_when_k_is_not_a_multiple_of_64(self):
-        """K = 1376 pads 86 scale columns to 88; the fused kernel never writes the
-        padding, so leftover NaN bytes there turned the whole GEMM output into NaN."""
+        """K = 1376 pads 86 scale columns to 88, which the fused kernel never writes;
+        a NaN byte left there makes the whole GEMM output NaN."""
         self.assertFalse(
-            self._enables_fusion(
+            self._fusion_turns_on(
                 is_awq=False,
                 backend=Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
                 down_proj_k=1376,
@@ -237,10 +237,10 @@ class TestSiluFp4QuantFusionGates(CustomTestCase):
         )
 
     def test_stays_off_for_the_marlin_backend(self):
-        # Marlin, the SM80-SM90 default, takes a floating-point input;
-        # handing it the (fp4, scale) tuple crashes the first forward.
+        """Marlin, the SM80-SM90 default, takes a floating-point input; the
+        (fp4, scale) tuple crashes its first forward."""
         self.assertFalse(
-            self._enables_fusion(is_awq=False, backend=Fp4GemmRunnerBackend.MARLIN)
+            self._fusion_turns_on(is_awq=False, backend=Fp4GemmRunnerBackend.MARLIN)
         )
 
 
