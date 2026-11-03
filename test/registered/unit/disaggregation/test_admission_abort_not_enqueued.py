@@ -34,6 +34,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.runtime_context import publish, reset_context
@@ -289,14 +290,14 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         sched = SimpleNamespace(
             uocr_runtime=None,
             disaggregation_mode=DisaggregationMode.NULL,
-            waiting_queue=[],
+            waiting_queue=WaitingQueue(),
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),
         )
         Scheduler._add_request_to_queue(sched, req)
-        self.assertEqual(sched.waiting_queue, [req])
+        self.assertEqual(list(sched.waiting_queue), [req])
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
     def test_retire_detaches_a_streaming_session(self):

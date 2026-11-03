@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 )
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 
@@ -37,7 +38,7 @@ def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> _RequestList:
 def empty_request_lists(scheduler: Scheduler) -> None:
     """Give a scheduler built with `Scheduler.__new__` every request list, empty;
     the test then fills the ones it needs."""
-    scheduler.waiting_queue = []
+    scheduler.waiting_queue = WaitingQueue(abort=scheduler._abort_waiting)
     scheduler.grammar_manager = SimpleNamespace(
         grammar_queue=_RequestList(ListKind.GRAMMAR)
     )

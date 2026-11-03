@@ -33,6 +33,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 )
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -188,7 +189,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         self.invariant_checker = Mock()
         self.uocr_runtime = None
-        self.waiting_queue = []
+        self.waiting_queue = WaitingQueue()
         self.cur_batch_for_debug = None
         self._engine_paused = False
         self._pause_started_at = None
@@ -317,9 +318,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         batch = self.ready_batches.popleft() if self.ready_batches else None
         if batch is not None:
             self.actions.append((self.iteration, "prepare_batch", batch.forward_iter))
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in batch.reqs
-            ]
+            self.waiting_queue.leave(batch.reqs)
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     def run_batch(self, batch):
@@ -583,7 +582,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     req.disagg_kv_sender = SimpleNamespace(
                         poll=lambda: KVPoll.WaitingForInput
                     )
-                scheduler.waiting_queue = [head, paced]
+                scheduler.waiting_queue.replace([head, paced])
                 retries.poll_miss(paced.rid)
 
                 with _single_rank_gloo_group():
@@ -917,7 +916,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         result = super().run_batch(batch)
                         if batch.forward_iter == 1:
                             self.ready_batches.append(second)
-                            self.waiting_queue.extend(second.reqs)
+                            self.waiting_queue.join(second.reqs)
                         return result
 
                     def get_new_batch_prefill(self, running_batch):
@@ -1176,7 +1175,7 @@ class TestPrefillResultPolling(CustomTestCase):
                             and item.rid == "100"
                             for item in inputs
                         ):
-                            self.waiting_queue.extend(other.reqs)
+                            self.waiting_queue.join(other.reqs)
 
                 pause_at = 2 if yield_before_pause else (1 if depth == 1 else 3)
                 ready_at = {**{batch.forward_iter: 20 for batch in chunks}, 100: 7}
@@ -1217,7 +1216,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 self.assertEqual(
                     release_steps, [3 if depth == 1 or yield_before_pause else 5]
                 )
-                self.assertEqual(scheduler.waiting_queue, [req])
+                self.assertEqual(list(scheduler.waiting_queue), [req])
                 self.assertEqual(req.prefill_attempt_count, 1)
                 self.assertEqual(req.inflight_steps, 0)
                 self.assertEqual(list(req.output_ids), [])

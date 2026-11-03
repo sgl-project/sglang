@@ -79,7 +79,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     empty_request_lists(s)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
-    s.waiting_queue = waiting_queue
+    s.waiting_queue.join(waiting_queue)
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
@@ -119,7 +119,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.tree_cache.finish.assert_called_once_with(
             candidate.cache_request_handle, CacheRequestOutcome.ABORT
         )
-        self.assertEqual(s.waiting_queue, [])
+        self.assertEqual(list(s.waiting_queue), [])
 
 
 class TestWaitingTimeout(CustomTestCase):

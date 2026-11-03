@@ -15,6 +15,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.runtime_context import get_context
@@ -65,7 +66,8 @@ class TestHeldRowAdmission(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = waiting
+        s.waiting_queue = WaitingQueue()
+        s.waiting_queue.join(waiting)
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
         s.policy = Mock()

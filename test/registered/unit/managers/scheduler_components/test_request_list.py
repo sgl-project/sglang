@@ -42,7 +42,6 @@ _OWNERS = (
 # Fields annotated as holding requests that are not a `RequestList`. Only
 # shrinks: a list that migrates leaves it.
 _NOT_YET_LISTS = {
-    "Scheduler.waiting_queue",
     # Shares its entries with `queue`.
     "DecodePreallocQueue.pending_reqs",
     # A subset of `waiting_queue`.

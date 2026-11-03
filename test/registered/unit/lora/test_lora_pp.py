@@ -35,6 +35,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 )
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -115,6 +116,8 @@ class TestAllPPLoras(CustomTestCase):
 
         short, long = request("short", 5), request("long", 100)
         waiting = request("waiting", 100)
+        waiting_queue = WaitingQueue()
+        waiting_queue.join([waiting])
         first, second = _batch(short), _batch(long)
         for batch in (first, second):
             batch.batch_is_full = False
@@ -129,7 +132,7 @@ class TestAllPPLoras(CustomTestCase):
             running_mbs=[first, second],
             mbs=[first, second],
             running_reqs=_RequestList(ListKind.DECODING),
-            waiting_queue=[waiting],
+            waiting_queue=waiting_queue,
             lora_drainer=LoRADrainer(max_loras_per_batch=2, max_wait_time_secs=3),
             enable_lora=True,
             enable_lora_overlap_loading=False,

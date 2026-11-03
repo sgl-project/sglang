@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -354,7 +355,7 @@ class TestAllocationIntegration(CustomTestCase):
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
             clear_pending_chunk_send=Mock(),
             prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
-            waiting_queue=[],
+            waiting_queue=WaitingQueue(),
             disagg_prefill_bootstrap_queue=SimpleNamespace(
                 queue=_RequestList(ListKind.PD_BOOTSTRAP)
             ),
@@ -371,7 +372,7 @@ class TestAllocationIntegration(CustomTestCase):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                 scheduler, req, launched
             )
-            self.assertEqual(scheduler.waiting_queue, [req])
+            self.assertEqual(list(scheduler.waiting_queue), [req])
             self.assertEqual(list(launched), [])
             self.assertEqual(list(scheduler.disagg_prefill_bootstrap_queue.queue), [])
             self.assertEqual(req.prefill_attempt_count, 2)
@@ -389,7 +390,7 @@ class TestAllocationIntegration(CustomTestCase):
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                     scheduler, req, launched
                 )
-            self.assertEqual(scheduler.waiting_queue, [])
+            self.assertEqual(list(scheduler.waiting_queue), [])
             self.assertEqual(list(launched), [])
             self.assertEqual(
                 list(scheduler.disagg_prefill_bootstrap_queue.queue), [req]
@@ -434,7 +435,7 @@ class TestAllocationIntegration(CustomTestCase):
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
             clear_pending_chunk_send=Mock(),
             prefill_launched_reqs=Mock(),
-            waiting_queue=[],
+            waiting_queue=WaitingQueue(),
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
@@ -450,7 +451,7 @@ class TestAllocationIntegration(CustomTestCase):
                 scheduler, req, scheduler.prefill_launched_reqs
             )
 
-        self.assertEqual(scheduler.waiting_queue, [req])
+        self.assertEqual(list(scheduler.waiting_queue), [req])
         self.assertIsNotNone(req.multimodal_inputs)
         req.multimodal_inputs.release_features.assert_not_called()
         scheduler.tree_cache.finish.assert_called_once_with(

@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -579,7 +580,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
         scheduler.chunked_req = None
-        scheduler.waiting_queue = []
+        scheduler.waiting_queue = WaitingQueue()
         scheduler.disagg_prefill_transfer_queue = []
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(

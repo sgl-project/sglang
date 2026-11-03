@@ -173,7 +173,7 @@ class TestRequestListsCheck(CustomTestCase):
     def test_fails_a_request_in_two_lists(self):
         req = _req("a")
         self.s.running_reqs.join([req])
-        self.s.waiting_queue.append(req)
+        self.s.waiting_queue.join([req])
 
         with self.assertRaisesRegex(RuntimeError, "a is in both WAITING and DECODING"):
             self.check(ScheduleBatch(reqs=[]))
@@ -189,7 +189,7 @@ class TestRequestListsCheck(CustomTestCase):
         decoding, retracted, chunk = _req("r"), _req("w"), _req("c")
         self._start_running([decoding])
         self.s.running_batch.reqs += [retracted, chunk]
-        self.s.waiting_queue.append(retracted)
+        self.s.waiting_queue.join([retracted])
         self.s.chunked_req = chunk
 
         with self.assertRaisesRegex(
@@ -400,7 +400,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = True
         s.is_hybrid_swa = False
-        s.waiting_queue = [waiting]
+        s.waiting_queue.join([waiting])
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
         s.policy = Mock()

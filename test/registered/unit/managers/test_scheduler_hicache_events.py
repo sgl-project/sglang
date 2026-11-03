@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 
@@ -108,7 +109,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
-        s.waiting_queue = []
+        s.waiting_queue = WaitingQueue()
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()

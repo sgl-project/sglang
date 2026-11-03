@@ -36,6 +36,7 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
@@ -138,7 +139,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.dllm_config = None
         scheduler.uocr_runtime = None
         scheduler.server_args = MagicMock()
-        scheduler.waiting_queue = []
+        scheduler.waiting_queue = WaitingQueue()
         # pause_generation zeros gen_throughput and flushes KV events.
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -762,13 +763,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         staged = _req("staged", 1)
         unstaged = _req("unstaged", None)
         scheduler.running_batch.reqs = [running]
-        scheduler.waiting_queue = [staged, unstaged]
+        scheduler.waiting_queue.join([staged, unstaged])
 
         with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertEqual(mock_retract_all.call_args.kwargs["reqs"], [running, staged])
-        self.assertEqual(scheduler.waiting_queue, [unstaged])
+        self.assertEqual(list(scheduler.waiting_queue), [unstaged])
         held = [
             c.args[0]
             for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list

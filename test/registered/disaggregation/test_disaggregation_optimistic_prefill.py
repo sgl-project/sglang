@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -473,7 +474,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
 
         scheduler = SimpleNamespace(
             tree_cache=tree,
-            waiting_queue=[],
+            waiting_queue=WaitingQueue(),
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
