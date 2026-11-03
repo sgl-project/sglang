@@ -304,6 +304,18 @@ def pad_mm_token_pairs(
     return padded_ids
 
 
+def _mm_placeholder_token_id(
+    mm_inputs: MultimodalInputs, modality: Modality
+) -> Optional[int]:
+    if modality == Modality.IMAGE:
+        return mm_inputs.im_token_id
+    if modality == Modality.VIDEO:
+        return mm_inputs.video_token_id
+    if modality == Modality.AUDIO:
+        return mm_inputs.audio_token_id
+    return None
+
+
 def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
     """Pad inclusive per-item offsets without mutating the input token array."""
     assert_int64_array(input_ids, "input_ids")
@@ -320,14 +332,8 @@ def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
     for item in mm_inputs.mm_items:
         items_by_modality[item.modality].append(item)
 
-    token_id_map = {
-        Modality.IMAGE: mm_inputs.im_token_id,
-        Modality.AUDIO: mm_inputs.audio_token_id,
-        Modality.VIDEO: mm_inputs.video_token_id,
-    }
-
     for modality, items in items_by_modality.items():
-        token_id = token_id_map.get(modality)
+        token_id = _mm_placeholder_token_id(mm_inputs=mm_inputs, modality=modality)
 
         if not items or token_id is None:
             continue
@@ -449,11 +455,7 @@ def _fill_mm_placeholder_token_ids(
         if mask is None:
             continue
         token_ids = (
-            {
-                Modality.IMAGE: mm_inputs.im_token_id,
-                Modality.VIDEO: mm_inputs.video_token_id,
-                Modality.AUDIO: mm_inputs.audio_token_id,
-            }[modality]
+            _mm_placeholder_token_id(mm_inputs=mm_inputs, modality=modality)
             for mm_inputs in mm_inputs_list
         )
         token_id = next((t for t in token_ids if t is not None), None)
@@ -572,7 +574,12 @@ def embed_mm_inputs(
     # Models can read input_ids again after this routine (e.g. Qwen4-Exp's per-layer
     # N-gram embedding hashes it), so multimodal positions get their placeholder token
     # id, as in the HF reference, rather than the clamped pad value.
-    _fill_mm_placeholder_token_ids(input_ids, mm_inputs_list, modalities, masks)
+    _fill_mm_placeholder_token_ids(
+        input_ids=input_ids,
+        mm_inputs_list=mm_inputs_list,
+        modalities=modalities,
+        masks=masks,
+    )
     vocab_size = input_embedding.num_embeddings
     # Important: clamp after getting original multimodal regions
     # Clamp input ids. This is because the input_ids for the multimodal tokens are
