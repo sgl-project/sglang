@@ -158,9 +158,6 @@ jobs:
       # Node-local HF hub cache on every compute node, read-only in containers.
       # Loading from /share_nfs is too slow (16-24 min for a 1.5 TB checkpoint).
       HF_CACHE: /var/tmp/sglang-ci/model_coverage
-      # The login-node python is externally managed; pip installs to ~/.local.
-      PIP_BREAK_SYSTEM_PACKAGES: "1"
-      PIP_USER: "1"
       FRAMEWORK: sglang
       HW: mi355x
       MODEL: ${{ matrix.config.model }}
@@ -226,9 +223,9 @@ jobs:
       - name: Launch MI355X benchmark
         timeout-minutes: 180
         env:
-          # Manual dispatch input wins; otherwise use the latest image resolved
-          # by the setup job; otherwise the launcher falls back to the recipe default.
-          IMAGE_OVERRIDE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
+          # The only source of the image: the dispatch input, else the latest
+          # image (or the pinned fallback) resolved by the setup job.
+          IMAGE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
         run: bash scripts/ci/slurm/launch_mi355x.sh
 
       - name: Pack logs
@@ -259,7 +256,6 @@ jobs:
       - name: Process results
         if: always()
         run: |
-          pip install tabulate pyyaml -q
           for result_file in ${{ github.workspace }}/${RESULT_FILENAME}_*.json; do
             [ -f "$result_file" ] || continue
             basename_file=$(basename "$result_file")

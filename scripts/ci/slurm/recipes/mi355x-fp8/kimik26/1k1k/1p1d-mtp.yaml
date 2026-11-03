@@ -53,7 +53,6 @@ mtp:
   draft_model: lightseekorg/kimi-k2.6-eagle3.1-mla
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
   # Kimi uses split attention backends (aiter prefill / triton decode), not a
   # single --attention-backend.
   prefill_attention_backend: aiter

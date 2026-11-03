@@ -14,7 +14,7 @@
 #   HF_CACHE           - HF hub cache root on every compute node (same path on
 #                        each, holding models--<org>--<name>); mounted read-only
 #                        into the containers at the same path
-#   MODEL_PREFIX       - short prefix, e.g. dsv4flash
+#   IMAGE              - ROCm SGLang Docker image for every container
 #   PRECISION          - fp8 / fp4
 #   ISL, OSL           - input / output sequence lengths for the sweep
 #   CONFIG_FILE        - path to the recipe YAML (relative to repo root)
@@ -50,7 +50,7 @@ set -x
 
 : "${MODEL:?}"
 : "${HF_CACHE:?}"
-: "${MODEL_PREFIX:?}"
+: "${IMAGE:?}"
 : "${PRECISION:?}"
 : "${ISL:?}"
 : "${OSL:?}"
@@ -105,9 +105,6 @@ esac
 # ---------------------------------------------------------------------------
 # Parse the recipe (runtime + bench + topology) into shell vars.
 # ---------------------------------------------------------------------------
-# Ensure PyYAML is available to the host python used for parsing.
-python3 -c 'import yaml' 2>/dev/null || pip install pyyaml -q 2>/dev/null \
-    || pip install --user pyyaml -q 2>/dev/null || true
 
 # Emit KEY=value lines and eval them (robust single-level command substitution;
 # avoids a nested read<<EOF/$(<<PY) heredoc that misparses on some shells).
@@ -121,7 +118,6 @@ def emit(k, v): print(f"{k}={v}")
 # strings). eval treats the RHS as a single shell word. Existing emits stay
 # space-free so the EP<=8 recipes are byte-identical.
 def emitq(k, v): print(f"{k}={shlex.quote(str(v))}")
-emit("IMAGE", rt["image"])
 # Attention backend: single (`attention_backend`) or split
 # (`prefill_attention_backend`/`decode_attention_backend`). Empty when absent so
 # the flag is dropped for a model that omits it.
@@ -215,10 +211,6 @@ if [[ -z "$RECIPE_VARS" ]]; then
     exit 1
 fi
 eval "$RECIPE_VARS"
-# Optional image override from workflow_dispatch input.
-if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
-    IMAGE="$IMAGE_OVERRIDE"
-fi
 
 # Nodes per engine: an engine whose TP exceeds one node's GPU count spans
 # ceil(TP/GPUS_PER_NODE) nodes and needs torch-dist multi-node init. EP<=8
