@@ -269,6 +269,16 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   const auto push_ptr = params.push_ws_mc + r * stride_bytes + phase_stride_bytes;
   const auto poll_ptr = params.push_ws_local + phase_stride_bytes;
 
+  // The leader commits for the whole cluster, so every CTA must have read the phase
+  // first. Rows ascend: a cluster whose first row is normed passes a cluster.sync in
+  // the row loop; the others arrive here (the asm waits for the phase load) and the
+  // leader waits right before its commit.
+  const bool order_phase_read = row_idx >= params.num_norm_rows;  // cluster-uniform
+  if (order_phase_read) {
+    asm volatile("" ::"r"(phase));
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+  }
+
   // stage 1: multicast staging (grid-stride); kFinalize computes each vector
   // in place of the load
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
@@ -356,9 +366,7 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
     }
   }
 
-  // Every CTA of the cluster has read the phase before the leader commits; rows
-  // without the norm epilogue have no cluster.sync of their own.
-  cluster.sync();
+  if (order_phase_read) asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
   if (cluster_rank == 0 && tx == 0) params.push_counter->commit(row_idx, num_row_clusters);
 }
 
