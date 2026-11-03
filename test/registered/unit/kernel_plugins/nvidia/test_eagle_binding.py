@@ -138,6 +138,7 @@ def _model(**entries):
         "draft_extend": None,
         "begin_draft_round": None,
         "graph_variants": None,
+        "speculative_runtime_hooks": None,
         **entries,
     }
     model.__dict__["_megakernel"] = runtime._InstalledMegakernel(

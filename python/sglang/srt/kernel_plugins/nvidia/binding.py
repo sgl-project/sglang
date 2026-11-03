@@ -1294,9 +1294,7 @@ def bind_speculative_runtime_hooks(
         return defaults
 
     built = built_megakernel(model)
-    factory = (
-        None if built is None else getattr(built, "speculative_runtime_hooks", None)
-    )
+    factory = None if built is None else built.speculative_runtime_hooks
     megakernel_agree(
         factory is not None,
         what="speculative runtime hooks factory presence",

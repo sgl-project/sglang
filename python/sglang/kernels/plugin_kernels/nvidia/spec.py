@@ -393,12 +393,12 @@ class BuiltMegakernel(Protocol):
     ForwardBatch.attention_kv_len_lower_bound, and picks alike on every rank. Other
     runners and batch sizes capture as they would without these variants.
 
-    A target built object may additionally expose ``speculative_runtime_hooks`` as
-    a factory that receives SGLang's stock bundle and returns a bundle. SGLang reads
-    it with ``getattr`` for compatibility with older providers, selects it only
-    under the independent runtime-optimization master switch, and otherwise keeps
-    the caller's stock strategies unchanged. A provider may replace only the local
-    key builder within post-verify; the runtime runner remains authoritative.
+    Every built object must define ``speculative_runtime_hooks``, with ``None``
+    when it provides no factory. A target's factory receives SGLang's stock bundle
+    and returns a bundle. SGLang selects it only under the independent
+    runtime-optimization master switch and otherwise keeps the caller's stock
+    strategies unchanged. A provider may replace only the local key builder within
+    post-verify; the runtime runner remains authoritative.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
@@ -407,8 +407,7 @@ class BuiltMegakernel(Protocol):
     draft_extend: Optional[Callable]
     begin_draft_round: Optional[Callable]
     graph_variants: Optional[Mapping[str, Any]]
-    # Optional and read with getattr by SGLang so providers written against older
-    # API versions remain valid.
+    # Required member; None when the provider does not offer a factory.
     speculative_runtime_hooks: Optional[HooksFactory]
 
     def summary(self) -> str:
