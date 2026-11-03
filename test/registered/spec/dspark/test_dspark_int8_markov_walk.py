@@ -21,10 +21,7 @@ register_cuda_ci(est_time=200, stage="extra-a", runner_config="1-gpu-large")
 TARGET_MODEL = "Qwen/Qwen3-4B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_4b_block7"
 GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-# The greedy batches start in the buckets of each kernel: wgmma (bs 5..32) and
-# small_batch (bs 3, then bs 1).
 NUM_PROMPTS = 32
-NUM_SMALL_BATCH = 3
 NUM_SEQUENTIAL = 8
 NUM_SAMPLED = 16
 MAX_NEW_TOKENS = 256
@@ -101,13 +98,12 @@ def _generate(prompts: list[str], sampling_params: list[dict]) -> list[dict]:
 
 
 def _greedy_outputs(prompts: list[str]) -> list[str]:
-    """Batches of NUM_PROMPTS and NUM_SMALL_BATCH, then NUM_SEQUENTIAL prompts
-    at bs = 1; under deterministic inference all are batch-invariant."""
+    """A batch of NUM_PROMPTS, then NUM_SEQUENTIAL prompts at bs = 1; under
+    deterministic inference both are batch-invariant."""
     params = {"temperature": 0.0, "max_new_tokens": MAX_NEW_TOKENS}
     batch = _generate(prompts, [params] * len(prompts))
-    small = _generate(prompts[:NUM_SMALL_BATCH], [params] * NUM_SMALL_BATCH)
     single = [_generate([p], [params])[0] for p in prompts[:NUM_SEQUENTIAL]]
-    return [out["text"] for out in batch + small + single]
+    return [out["text"] for out in batch + single]
 
 
 def _sampling_accept_length(prompts: list[str]) -> float:

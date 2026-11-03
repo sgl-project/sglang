@@ -2,8 +2,7 @@
 """One DSpark draft walk (gamma markov steps over [bs, gamma, V] base logits) per
 call, three implementations:
 
-* int8_walk: the fused int8 walk -- anchor copy and one cooperative launch of the
-  kernel MarkovWalker.walk picks for bs;
+* int8_walk: the fused int8 walk -- anchor copy and one cooperative launch;
 * default: draft_markov_block keeping the step logits (MarkovSampleStep per step),
   the default draft;
 * greedy_draft: draft_markov_block with SGLANG_DSPARK_USE_GREEDY_DRAFT
@@ -11,8 +10,8 @@ call, three implementations:
 
 Every weight, logit and output tensor is an input cloned per CUDA-graph
 iteration, so W1 / W2 (77.8 MB each in bf16 at V = 151936, 38.9 MB of int8 W2)
-are as cold in L2 as after the target forward. V = 248320 takes the
-big-vocabulary layout, wgmma at every bs.
+are as cold in L2 as after the target forward. V = 248320 streams more of W2
+from L2.
 """
 
 import msgspec
@@ -35,11 +34,8 @@ class _NoTpSync:
         return values
 
 
-# Per kernel: the weights it reads, cloned per iteration with its state.
-_KERNEL_WEIGHTS = {
-    "small_batch": ("row_scale", "frag", "w1q"),
-    "wgmma": ("row_scale", "w2_res", "w2_str", "w1f"),
-}
+# The weights the kernel reads, cloned per iteration with its state.
+_KERNEL_WEIGHTS = ("row_scale", "w2_res", "w2_str", "w1f")
 
 
 @cache_once
@@ -109,13 +105,12 @@ def _int8_walk(
     state,
     **weights,
 ):
-    bs = anchor.shape[0]
-    anchors = walker.anchor_buf[:bs]
+    anchors = walker.anchor_buf[: anchor.shape[0]]
     anchors.copy_(anchor)
     # the per-iteration clones of the weights and of the state replace the walker's
     mw.markov_walk(
         weights=msgspec.structs.replace(walker.weights, **weights),
-        states=msgspec.structs.replace(walker.states, **{walker.kernel_for(bs): state}),
+        state=msgspec.structs.replace(walker.state, buffer=state),
         base_logits=base_logits,
         anchor=anchors,
         temps=temps,
@@ -163,11 +158,10 @@ def benchmark(vocab: int, num_steps: int, bs: int, mode: str, impl: str):
         ),
     )
     if impl == "int8_walk":
-        kind = walker.kernel_for(bs)
         weights = msgspec.structs.asdict(walker.weights)
         inputs.update(
-            state=msgspec.structs.asdict(walker.states)[kind].clone(),
-            **{name: weights[name] for name in _KERNEL_WEIGHTS[kind]},
+            state=walker.state.buffer.clone(),
+            **{name: weights[name] for name in _KERNEL_WEIGHTS},
         )
         fn = lambda **kw: _int8_walk(walker, **kw)  # noqa: E731
     else:

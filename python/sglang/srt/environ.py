@@ -568,7 +568,7 @@ class Envs:
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
-    # Walk a vanilla rank-256 markov head with the fused int8 kernels in the folded
+    # Walk a vanilla rank-256 markov head with the fused int8 kernel in the folded
     # draft graph (sm_90, graph buckets bs <= 64); near-tie draft tokens can differ
     # from the bf16 walk.
     SGLANG_DSPARK_OPT_INT8_MARKOV_WALK = EnvBool(False)
