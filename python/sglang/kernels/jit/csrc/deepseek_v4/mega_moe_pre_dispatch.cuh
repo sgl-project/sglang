@@ -273,13 +273,18 @@ struct MegaMoEPreDispatchKernel {
     RuntimeCheck(hidden % 8u == 0, "hidden must be a multiple of 8 (16B bf16 loads)");
     const auto num_chunks = hidden / 8u;
     const bool one_chunk_per_thread = num_chunks <= kMaxBlockThreads;
-    const bool two_chunks_per_thread =
-        one_chunk_per_thread && num_chunks % (2u * device::kWarpThreads) == 0 && top_k <= num_chunks / 2u &&
-        2u * num_chunks > static_cast<uint32_t>(max_threads_per_sm(device.unwrap().device_id));
-    const bool four_chunks_per_thread = two_chunks_per_thread && num_chunks % (4u * device::kWarpThreads) == 0 &&
-                                        top_k <= num_chunks / 4u &&
-                                        num_tokens >= 6u * runtime::get_sm_count(device.unwrap().device_id);
-    const uint32_t chunks_per_thread = four_chunks_per_thread ? 4u : (two_chunks_per_thread ? 2u : 1u);
+    const auto device_id = device.unwrap().device_id;
+    const auto fits = [&](uint32_t n) {
+      return num_chunks % (n * device::kWarpThreads) == 0 && top_k <= num_chunks / n;
+    };
+    uint32_t chunks_per_thread = 1;
+    if (one_chunk_per_thread && 2u * num_chunks > static_cast<uint32_t>(max_threads_per_sm(device_id))) {
+      if (fits(4u) && num_tokens >= 6u * runtime::get_sm_count(device_id)) {
+        chunks_per_thread = 4;
+      } else if (fits(2u)) {
+        chunks_per_thread = 2;
+      }
+    }
     const auto block_size = std::min(num_chunks, kMaxBlockThreads) / chunks_per_thread;
     // The quant group absmax is a full-warp-mask shuffle, so either the row fits
     // one iteration or its tail iteration is entered by whole warps.
@@ -329,10 +334,10 @@ struct MegaMoEPreDispatchKernel {
     };
 
     if (num_total_blocks == 0) return;
-    const auto kernel = four_chunks_per_thread  ? kernel_four_chunks
-                        : two_chunks_per_thread ? kernel_two_chunks
-                        : one_chunk_per_thread  ? kernel_one_chunk
-                                                : kernel_multi_chunk;
+    const auto kernel = !one_chunk_per_thread    ? kernel_multi_chunk
+                        : chunks_per_thread == 4 ? kernel_four_chunks
+                        : chunks_per_thread == 2 ? kernel_two_chunks
+                                                 : kernel_one_chunk;
     LaunchKernel(num_total_blocks, block_size, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
