@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     create_async_shm_materializer,
 )
@@ -102,8 +103,8 @@ class UocrSchedulerRuntime:
         """Parked windows whose predecessor finished, to queue in this order."""
         return self._prefetch.take_released()
 
-    def request_lists(self) -> Dict[str, List[Req]]:
-        return {"uocr_parked": self._prefetch.held_reqs()}
+    def request_lists(self) -> Dict[ListKind, List[Req]]:
+        return {ListKind.UOCR_PARKED: self._prefetch.held_reqs()}
 
     def on_req_dropped(self, req: Req) -> None:
         """Release reuse and prefetch state of a request aborted before running."""

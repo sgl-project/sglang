@@ -198,7 +198,37 @@ def _update_expert_weights_raw(
 
 
 def create_temp_buffers(sample_tensors):
-    return [torch.empty_like(tensor) for tensor in sample_tensors]
+    return [
+        (
+            torch.empty_like(t)
+            if _is_dense(t[0])
+            else torch.empty_like(t, memory_format=torch.contiguous_format)
+        )
+        for t in sample_tensors
+    ]
+
+
+def _is_dense(t: torch.Tensor) -> bool:
+    """Whether `t` covers its memory without gaps, so P2P can move it as is."""
+    expected = 1
+    for stride, size in sorted(zip(t.stride(), t.shape)):
+        if size == 1:
+            continue
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
+def _int64_view(t: torch.Tensor) -> Optional[torch.Tensor]:
+    size = t.element_size()
+    if t.dim() == 0 or t.stride(-1) != 1 or t.shape[-1] * size % 8:
+        return None
+    if any(stride * size % 8 for stride in t.stride()[:-1]):
+        return None
+    if t.storage_offset() * size % 8:
+        return None
+    return t.view(torch.int64)
 
 
 def update_expert_weights_single_layer(
@@ -238,6 +268,20 @@ def update_expert_weights_single_layer(
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
+    # Sends need each expert's slice dense; stage tensors whose slices are not
+    # (e.g. Mega MoE weights localized across locality domains), moving them
+    # through int64 views when every layout allows it.
+    routed_experts_weights = list(routed_experts_weights)
+    temp_buffers = list(temp_buffers)
+    send_weights = list(routed_experts_weights)
+    for i, weight in enumerate(routed_experts_weights):
+        if _is_dense(weight[0]):
+            continue
+        send = torch.empty_like(weight, memory_format=torch.contiguous_format)
+        views = [_int64_view(t) for t in (weight, temp_buffers[i], send)]
+        if all(v is not None for v in views):
+            routed_experts_weights[i], temp_buffers[i], send = views
+        send_weights[i] = send.copy_(routed_experts_weights[i])
 
     self_node_id = rank // num_gpu_per_node
 
@@ -421,9 +465,7 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(
-                            routed_experts_weights, i, src_expert_location
-                        ),
+                        tensor=_get_tensor(send_weights, i, src_expert_location),
                         peer=dst_rank,
                     )
                     for dst_rank in all_dst_ranks
