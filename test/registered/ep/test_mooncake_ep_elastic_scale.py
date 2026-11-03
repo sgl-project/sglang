@@ -151,7 +151,7 @@ class TestMooncakeElasticEpScale(CustomTestCase):
         cls.dist_init_addr = f"127.0.0.1:{cls.dist_port}"
         cls._owned_processes = []
         cls._prometheus_tempdir = tempfile.TemporaryDirectory(
-            prefix="sglang-mooncake-elastic-metrics-"
+            prefix="sglang-mooncake-metrics-"
         )
 
         # Keep each worker's ordinal equal to its local CUDA ordinal. The CI

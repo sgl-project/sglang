@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_exec, get_parallel, get_resources
+from sglang.srt.runtime_context import get_parallel, get_resources
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -89,10 +89,8 @@ class EPBuffer:
 
     @staticmethod
     def is_elastic_ep_enabled() -> bool:
-        moe = get_exec().moe
-        return (
-            moe.moe_a2a_backend == "mooncake" and moe.elastic_ep_backend == "mooncake"
-        )
+        # Change this to False to use the legacy Buffer implementation for debugging.
+        return True
 
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
@@ -187,8 +185,8 @@ class EPBuffer:
             tcp_store = get_global_tcp_store()
             if tcp_store is None:
                 raise RuntimeError(
-                    "Elastic Mooncake EP requires the global TCPStore. "
-                    "Enable the Mooncake A2A and elastic Mooncake backends."
+                    "Mooncake EP requires the global TCPStore initialized during "
+                    "distributed setup."
                 )
 
             state.buffer = Buffer.create_elastic(
@@ -245,10 +243,6 @@ class _MooncakeEPDispatcherImpl:
         self._elastic_state = (
             ElasticEPStateManager.instance() if self._elastic_ep else None
         )
-        if self._elastic_ep and self._elastic_state is None:
-            raise RuntimeError(
-                "Elastic EP state must be initialized before MoE dispatch."
-            )
         self._mask_buffer = (
             torch.empty_like(self._elastic_state.active_ranks)
             if self._elastic_state is not None
@@ -349,7 +343,6 @@ class _MooncakeEPDispatcherImpl:
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
-        active_ranks = self._get_active_ranks()
         if self._elastic_ep:
             dispatch_num_experts = (
                 EPBuffer.get_dispatch_ep_size() * self.num_local_experts
@@ -364,6 +357,7 @@ class _MooncakeEPDispatcherImpl:
                 return_recv_hook=self.return_recv_hook,
             )
         else:
+            active_ranks = self._get_active_ranks()
             result = buffer.dispatch(
                 hidden_states,
                 topk_ids,
@@ -402,7 +396,6 @@ class _MooncakeEPDispatcherImpl:
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        active_ranks = self._get_active_ranks()
         if self._elastic_ep:
             combined_hidden_states, event, hook = buffer.combine(
                 hidden_states,
@@ -412,10 +405,14 @@ class _MooncakeEPDispatcherImpl:
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )
-            buffer.query_mask_buffer(self._mask_buffer)
-            rank_bound = EPBuffer.get_dispatch_ep_size()
-            active_ranks[:rank_bound].copy_(1 - self._mask_buffer[:rank_bound])
+            if self._elastic_state is not None:
+                buffer.query_mask_buffer(self._mask_buffer)
+                rank_bound = EPBuffer.get_dispatch_ep_size()
+                self._elastic_state.active_ranks[:rank_bound].copy_(
+                    1 - self._mask_buffer[:rank_bound]
+                )
         else:
+            active_ranks = self._get_active_ranks()
             combined_hidden_states, event, hook = buffer.combine(
                 hidden_states,
                 topk_ids,

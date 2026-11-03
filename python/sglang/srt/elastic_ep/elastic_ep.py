@@ -160,10 +160,7 @@ class ElasticEPStateManager:
 
             if get_exec().moe.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
-            elif (
-                get_exec().moe.moe_a2a_backend == "mooncake"
-                and get_exec().moe.elastic_ep_backend == "mooncake"
-            ):
+            elif get_exec().moe.moe_a2a_backend == "mooncake":
                 cls._on_scale = cls._on_scale_mooncake
 
             inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
@@ -400,8 +397,7 @@ def _refresh_ep_members() -> None:
 
     buffer = EPBuffer.get_existing_buffer()
     if buffer is not None:
-        moe = get_exec().moe
-        if moe.moe_a2a_backend == "mooncake" and moe.elastic_ep_backend == "mooncake":
+        if EPBuffer.is_elastic_ep_enabled():
             # Elastic Mooncake grows through on_scale() and the dispatcher's
             # lazy connect path. Do not call the legacy PG-backed refresh API.
             return

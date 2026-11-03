@@ -2482,12 +2482,6 @@ def init_distributed_environment(
         backend,
     )
     if not torch.distributed.is_initialized():
-        elastic_mooncake_a2a = False
-        if moe_a2a_backend == "mooncake":
-            from sglang.srt.runtime_context import get_exec
-
-            elastic_mooncake_a2a = get_exec().moe.elastic_ep_backend == "mooncake"
-
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
@@ -2526,8 +2520,8 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Create a global TCPStore for NIXL and elastic Mooncake peer metadata.
-        if moe_a2a_backend == "nixl" or elastic_mooncake_a2a:
+        # Create a global TCPStore for NIXL and Mooncake EP peer metadata.
+        if moe_a2a_backend in ("nixl", "mooncake"):
             _create_global_tcp_store(
                 rank,
                 world_size,
