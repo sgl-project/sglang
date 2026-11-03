@@ -1,8 +1,9 @@
 # SGLang P/D with an external Engram owner
 
-This example uses the owner protocol from
-[vLLM #64082](https://github.com/vllm-project/vllm/pull/64082). Install that
-draft in a separate vLLM environment and set `VLLM_PYTHON` to its Python
+This example uses the owner from the
+[vLLM VMM port](https://github.com/foraxe/vllm/tree/nyx/engram-vmm-port-6b3488cc)
+(intended for [vLLM #64082](https://github.com/vllm-project/vllm/pull/64082)).
+Install that branch in a separate vLLM environment and set `VLLM_PYTHON` to its Python
 executable. SGLang workers import the same immutable generation but keep
 their native NIXL P/D KV transfer and router. This four-GPU recipe uses P TP2
 on GPUs 0/1 and D TP2 on GPUs 2/3.

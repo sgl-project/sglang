@@ -1105,7 +1105,7 @@ class EngramEmbedding(nn.Module):
         column_bounds: tuple[int, ...],
         config: EngramConfig,
     ) -> None:
-        from sglang.srt.layers.engram_external import attach_table
+        from sglang.srt.engram_share.vmm.external import attach_table
 
         assert config.shared_host_endpoint is not None
         assert config.shared_host_token_file is not None

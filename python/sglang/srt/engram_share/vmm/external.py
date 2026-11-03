@@ -12,7 +12,7 @@ import threading
 from contextlib import suppress
 from pathlib import Path
 
-from sglang.srt.layers.engram_shared_vmm import (
+from sglang.srt.engram_share.vmm.mapping import (
     IncompleteTableImportCleanup,
     TableHandles,
     TableMapping,

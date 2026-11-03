@@ -28,7 +28,7 @@ run() {
 case "$role" in
   owner)
     run "${VLLM_PYTHON:-python}" \
-      -m vllm.models.deepseek_v41.nvidia.ops.shared_engram_owner \
+      -m vllm.distributed.engram_share.vmm.owner \
       --model-dir "$MODEL_DIR" \
       --listen-host "${OWNER_BIND_HOST:-127.0.0.1}" \
       --listen-port "$owner_port" \

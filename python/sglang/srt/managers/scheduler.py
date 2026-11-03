@@ -2041,7 +2041,7 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         engram_config = get_exec().offload.engram_config
         if engram_config is not None and engram_config.placement == "external":
-            from sglang.srt.layers.engram_external import close_attached_tables
+            from sglang.srt.engram_share.vmm.external import close_attached_tables
 
             close_attached_tables()
         if self.hisparse_coordinator is not None:

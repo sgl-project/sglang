@@ -12,7 +12,8 @@ from safetensors.torch import save_file
 
 from sglang.srt.arg_groups.engram_config import EngramConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.layers import engram_external, engram_shared_vmm
+from sglang.srt.engram_share.vmm import external as engram_external
+from sglang.srt.engram_share.vmm import mapping as engram_shared_vmm
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
