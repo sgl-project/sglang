@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
