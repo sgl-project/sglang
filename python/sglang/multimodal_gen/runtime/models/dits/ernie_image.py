@@ -44,9 +44,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
     gather_seq,
-    shard_like,
-    shard_seq,
+    shard_seq_prefix,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     USPAttention,
@@ -216,9 +216,9 @@ class ErnieImageSelfAttention(nn.Module):
 
         tp_size = get_tp_world_size()
         self.num_local_heads = num_heads // tp_size
-        assert num_heads % tp_size == 0, (
-            f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
-        )
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
 
         self.to_q = ColumnParallelLinear(
             hidden_size,
@@ -753,16 +753,15 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         rotary_pos_emb = self.pos_embed(all_ids)
         rope_cos, rope_sin = _precompute_rope_cos_sin(rotary_pos_emb, dtype)
         if use_sp:
-            image_tokens, plan = shard_seq(x[:, :N_img])
-            x = torch.cat((image_tokens, x[:, N_img:]), dim=1)
-
-            def local_rope(full):
-                full = full.view(B, N_img + Tmax, -1)
-                return torch.cat(
-                    (shard_like(full[:, :N_img], plan), full[:, N_img:]), dim=1
-                ).reshape(-1, full.shape[-1])
-
-            rope_cos, rope_sin = local_rope(rope_cos), local_rope(rope_sin)
+            plan = build_shard_plan(N_img)
+            x = shard_seq_prefix(x, N_img, plan, dim=1)
+            # Preserve global positions while sharding the image prefix.
+            rope_cos, rope_sin = (
+                shard_seq_prefix(
+                    rope.view(B, N_img + Tmax, -1), N_img, plan, dim=1
+                ).flatten(0, 1)
+                for rope in (rope_cos, rope_sin)
+            )
         rope_cache = torch.cat((rope_cos, rope_sin), dim=-1).contiguous()
         rope_positions = torch.arange(
             rope_cache.shape[0], device=device, dtype=torch.long
