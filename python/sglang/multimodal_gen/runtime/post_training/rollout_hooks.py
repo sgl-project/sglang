@@ -132,12 +132,13 @@ def init_rollout_env_if_enabled(
         return
 
     if collect_env:
+        # pos/neg_cond_kwargs are placeholders: finalize_rollout_if_enabled
+        # unconditionally overwrites them with the SP-gathered CPU copy, so
+        # copying them to CPU here would just be a wasted host sync.
         env = RolloutDenoisingEnv(
             image_kwargs=_kwargs_to_cpu(image_kwargs),
-            pos_cond_kwargs=_kwargs_to_cpu(pos_cond_kwargs),
-            neg_cond_kwargs=(
-                _kwargs_to_cpu(neg_cond_kwargs) if neg_cond_kwargs else None
-            ),
+            pos_cond_kwargs=pos_cond_kwargs,
+            neg_cond_kwargs=neg_cond_kwargs if neg_cond_kwargs else None,
             guidance=guidance.detach().cpu() if guidance is not None else None,
         )
         pos_src = pos_cond_kwargs
