@@ -123,7 +123,7 @@ cd python
 cp pyproject_cpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 uv pip install --upgrade pip setuptools
-uv pip install .
+uv pip install .  # If installing sgl-diffusion, please use: uv pip install ".[diffusion]"
 
 # Build the CPU backend kernels
 cd sglang/kernels/aot
@@ -148,7 +148,7 @@ Notes:
 
 - If you encounter code compilation issues during the `sgl-kernel` building process,
     please check your `gcc` and `g++` versions and upgrade them if they are outdated.
-    It is recommended to use `gcc-13` and `g++-13` as they have been verified
+    It is recommended to use `gcc-15` and `g++-15` as they have been verified
     in the official Docker container.
 
 - The system library path is typically located in one of the following directories:

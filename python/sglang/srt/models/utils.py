@@ -32,9 +32,13 @@ from sglang.kernels.ops.layernorm.norm import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
@@ -296,10 +300,24 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16
-        and not isinstance(pool, SWAKVPool)
+        and pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
+    ) or (
+        _is_hip
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+        and not _window_writes_translated(pool)
+    )
+
+
+def _window_writes_translated(pool) -> bool:
+    """Whether the pool's window layers write at ids of their own that only the
+    pool's write door derives (a unified pool's window view). The fused store
+    maps window slots through `full_to_swa_index_mapping`, which such a pool
+    does not have, so it would write window layers at the owner's ids."""
+    router = pool.layer_router
+    window = router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+    return window is not None and router.view(window.name).requires_physical_write_loc
 
 
 def create_fused_set_kv_buffer_arg(
@@ -309,9 +327,8 @@ def create_fused_set_kv_buffer_arg(
 ):
     layer_id = layer.layer_id
     token_to_kv_pool = get_token_to_kv_pool()
-
-    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
-    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+    kv = get_kv_layers().read(layer_id)
+    k_buffer, v_buffer = kv.key(), kv.value()
 
     if not _is_hip:
         # CUDA path.
@@ -331,7 +348,8 @@ def create_fused_set_kv_buffer_arg(
         # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
         full_to_swa = (
             token_to_kv_pool.full_to_swa_index_mapping
-            if isinstance(token_to_kv_pool, SWAKVPool)
+            if token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+            is not None
             else None
         )
         slot_mapping_swa = (
@@ -347,11 +365,11 @@ def create_fused_set_kv_buffer_arg(
             key_cache = k_buffer
             value_cache = v_buffer
         else:
-            key_cache = k_buffer.view(
-                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            key_cache = paged_kv_view(
+                k_buffer, page_size, layer.tp_k_head_num, layer.qk_head_dim
             )
-            value_cache = v_buffer.view(
-                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            value_cache = paged_kv_view(
+                v_buffer, page_size, layer.tp_v_head_num, layer.v_head_dim
             )
         return {
             "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),

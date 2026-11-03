@@ -28,7 +28,7 @@ from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.kernels.spec import KernelBackend, PlatformInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _CUDA = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
@@ -459,7 +459,7 @@ def test_trace_labels_explicit_backend(monkeypatch):
 
 
 def test_deprecated_alias_contract(monkeypatch):
-    from sglang.srt.layers.utils import MultiPlatformOp
+    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
     assert issubclass(MultiPlatformOp, BaseFusedOp)
 
@@ -489,7 +489,7 @@ def test_deprecated_alias_keeps_legacy_platform_defaults(monkeypatch):
     """Old MultiPlatformOp defined per-platform default methods (hip/musa ->
     cuda, npu/xpu/cpu -> native); plugin code may call them directly, and a
     subclass without forward_cuda must still raise on CUDA like before."""
-    from sglang.srt.layers.utils import MultiPlatformOp
+    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)

@@ -1,4 +1,3 @@
-import inspect
 import math
 from typing import List, Optional, Union
 
@@ -11,6 +10,9 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    retrieve_timesteps,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -89,72 +91,6 @@ def retrieve_latents(
         return encoder_output
 
 
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
-def retrieve_timesteps(
-    scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
-    **kwargs,
-):
-    r"""
-    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
-    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
-
-    Args:
-        scheduler (`SchedulerMixin`):
-            The scheduler to get timesteps from.
-        num_inference_steps (`int`):
-            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
-            must be `None`.
-        device (`str` or `torch.device`, *optional*):
-            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
-            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
-            `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
-            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
-            `num_inference_steps` and `timesteps` must be `None`.
-
-    Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
-        second element is the number of inference steps.
-    """
-    if timesteps is not None and sigmas is not None:
-        raise ValueError(
-            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
-        )
-    if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
-        if not accepts_timesteps:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" timestep schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
-        if not accept_sigmas:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" sigmas schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
-
-
 class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
     def __init__(
         self,
@@ -186,6 +122,8 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vl_processor = processor
         self.tokenizer_max_length = 1024
         self.latent_channels = self.vae.z_dim if getattr(self, "vae", None) else 16
+        # (dtype, device) -> latent mean/std, uploaded once
+        self.latent_stats = {}
 
         self.prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
         self.prompt_template_encode_start_idx = 34
@@ -204,7 +142,6 @@ colors, textures, atmosphere, and so on\n - Identify the text clearly visible in
 explanation, and highlight it in the caption with quotation marks\n3. Maintain authenticity and accuracy:\n - Avoid
 generalizations\n - Describe all visible information in the image, while do not add information not explicitly shown in
 the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
-        self.default_sample_size = 128
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -384,16 +321,18 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 image_latents = retrieve_latents(
                     self.vae.encode(image), generator=generator, sample_mode="argmax"
                 )
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
+        stats_key = (image_latents.dtype, image_latents.device)
+        if stats_key not in self.latent_stats:
+            self.latent_stats[stats_key] = tuple(
+                torch.tensor(values)
+                .view(1, self.latent_channels, 1, 1, 1)
+                .to(image_latents.device, image_latents.dtype)
+                for values in (
+                    self.vae.config.latents_mean,
+                    self.vae.config.latents_std,
+                )
+            )
+        latents_mean, latents_std = self.latent_stats[stats_key]
         image_latents = (image_latents - latents_mean) / latents_std
         return image_latents
 

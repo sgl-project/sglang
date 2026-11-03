@@ -3,7 +3,11 @@ import itertools
 import pytest
 import torch
 
-from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
+from sglang.kernels.ops.elementwise.elementwise import (
+    fused_gate_sigmoid_mul,
+    fused_gate_sigmoid_mul_add,
+)
+from sglang.kernels.ops.moe.shared_expert_gate import shared_expert_gate
 from sglang.srt.utils import get_device
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -67,6 +71,50 @@ def test_inplace_semantics():
     fused_gate_sigmoid_mul_add(hs, gw, so, fhs)
 
     assert fhs.data_ptr() == original_ptr
+
+
+@pytest.mark.parametrize("weight_scale", [0.0, 0.02, 1.0])
+def test_shared_gate_fp32_and_changed_input_graph_replay(weight_scale):
+    if torch.version.hip or torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("The standalone shared gate uses CUDA PDL (SM90+).")
+    hidden = torch.randn(1, 2560, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(2560, device=DEVICE, dtype=torch.bfloat16) * weight_scale
+    shared = torch.randn_like(hidden)
+    routed = torch.randn_like(hidden)
+    gate = torch.empty(1, device=DEVICE, dtype=torch.float32)
+    combined = torch.empty_like(hidden)
+
+    def run():
+        shared_expert_gate(hidden, weight, out=gate)
+        gated = fused_gate_sigmoid_mul(hidden, weight, shared)
+        combined.copy_(routed)
+        fused_gate_sigmoid_mul_add(hidden, weight, shared, combined)
+        return gated
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gated = run()
+    for _ in range(3):
+        hidden.normal_()
+        shared.normal_()
+        routed.normal_()
+        graph.replay()
+        expected_gate = torch.sigmoid((hidden.float() * weight.float()).sum(-1))
+        torch.testing.assert_close(gate, expected_gate, rtol=1e-5, atol=1e-6)
+        # Both full-output variants consume the same FP32 gate without
+        # rounding the gated shared branch before the final add.
+        torch.testing.assert_close(
+            gated, (gate[:, None] * shared.float()).to(hidden.dtype), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            combined,
+            torch.addcmul(routed.float(), gate[:, None], shared.float()).to(
+                hidden.dtype
+            ),
+            rtol=0,
+            atol=0,
+        )
 
 
 if __name__ == "__main__":

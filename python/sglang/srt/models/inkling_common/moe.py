@@ -56,7 +56,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
 
@@ -718,7 +718,6 @@ def _build_inkling_shared_experts(
     if n_shared_experts <= 0:
         return None
     # The shared dense MLP is reconstructed by the full-TP all-reduce in forward.
-    parallel = get_parallel()
     if shared_expert_sink:
         shared_prefix = add_prefix("shared_experts", prefix)
         shared_sink_serves_fp4 = InklingBatchDenseMLP._resolve_fp4_strategy(
@@ -746,11 +745,22 @@ def _build_inkling_shared_experts(
             prefix=shared_prefix,
             quant_config=quant_config,
             inference_moe_w13_interleaved=inference_moe_w13_interleaved,
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
+            parallel_group="tp",
             tp_group=get_parallel().tp_group,
         )
-        return InklingBatchDenseMLP(
+        sink_cls = InklingBatchDenseMLP
+        if get_lora().enable_lora:
+            from sglang.srt.models.inkling_common.lora import (
+                InklingBatchDenseMLPWithLoRA,
+                InklingBatchDenseMLPWithLoRAV2,
+            )
+
+            sink_cls = (
+                InklingBatchDenseMLPWithLoRAV2
+                if get_lora().lora_backend == "triton_v2"
+                else InklingBatchDenseMLPWithLoRA
+            )
+        return sink_cls(
             **dense_kwargs,
             linearized_bf16=(
                 lora_compatible_layout_enabled()
@@ -765,8 +775,7 @@ def _build_inkling_shared_experts(
         layer_id=layer_id,
         prefix=add_prefix("shared_experts", prefix),
         quant_config=quant_config,
-        tp_rank=parallel.tp_rank,
-        tp_size=parallel.tp_size,
+        parallel_group="tp",
         tp_group=get_parallel().tp_group,
     )
 
@@ -1021,7 +1030,7 @@ class InklingMoE(nn.Module):
         topk_weights, topk_ids, shared_gammas, packed_topk_ids = self.gate(x)
 
         allow_lora_overlap = True
-        if lora_compatible_layout_enabled():
+        if lora_compatible_layout_enabled() and get_lora().lora_backend != "triton_v2":
             # ===== TO BE REFACTORED ====
             from sglang.srt.lora.trtllm_lora_temp.inkling_dense import (
                 allow_inkling_moe_two_stream,

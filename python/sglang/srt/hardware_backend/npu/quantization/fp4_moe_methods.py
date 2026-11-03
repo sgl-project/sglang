@@ -171,10 +171,7 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
-                {
-                    "normal_dispatcher_output_dtype": "bf16",
-                    "low_latency_dispatcher_output_dtype": "mxfp8",
-                }
+                dict(self.w13_kernel.DISPATCHER_QUANT_CONFIG)
             )
 
     def apply(self, layer: torch.nn.Module, dispatch_output: "DispatchOutput"):

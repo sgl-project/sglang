@@ -10,6 +10,7 @@ from typing import Tuple
 import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
@@ -83,6 +84,10 @@ class _DummyKVCache(KVCache):
 class _DummyModel:
     """Minimal stand-in so that `inspect.signature(model.forward)` and
     `getattr(model, ...)` calls in ModelRunner.__init__ don't crash."""
+
+    # The model loader sets this on every Torch model, and the graph runners
+    # read it during warmup. No Torch MoE layers exist here, so nothing is fused.
+    shared_experts_config = SharedExpertsConfig()
 
     @staticmethod
     def forward():
@@ -210,7 +215,7 @@ class MlxModelRunnerStub(ModelRunner):
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
         else:
-            requested_per_worker = requested // get_parallel().attn_dp_size
+            requested_per_worker = max(1, requested // get_parallel().attn_dp_size)
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = self._explicit_aux_state_size_per_worker()
@@ -296,10 +301,6 @@ class MlxModelRunnerStub(ModelRunner):
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
-                # With the radix cache disabled no tree component exists to
-                # release auxiliary slots, so the pool owns their release
-                # (see MlxAuxiliaryStateReqToTokenPool docstring).
-                owns_auxiliary_state_release=get_memory().disable_radix_cache,
             )
         else:
             self.req_to_token_pool = ReqToTokenPool(
@@ -322,6 +323,9 @@ class MlxModelRunnerStub(ModelRunner):
             kvcache=dummy_kv,
             need_sort=False,
         )
+        if isinstance(self.req_to_token_pool, MlxAuxiliaryStateReqToTokenPool):
+            # The radix cache's state component reaches the slots here.
+            self.token_to_kv_pool_allocator.state = self.req_to_token_pool.state
 
         # No CUDA graphs, no attention backend
         self.decode_cuda_graph_runner = None
@@ -336,7 +340,7 @@ class MlxModelRunnerStub(ModelRunner):
             f"zero GPU KV cache allocation)"
         )
 
-    def alloc_memory_pool(self, memory_pool_config=None):
+    def alloc_memory_pool(self, memory_pool_config=None, *, draft_parallel_layout=None):
         """No-op: MLX manages its own KV cache."""
         pass
 

@@ -14,7 +14,10 @@ def process_npu_arch35_mxfp8_linear_weights(
     UE8M0 checkpoints (scales already powers of two) only need re-layout:
     the 128-group scale can be duplicated to its 1x32 sub-groups exactly.
     Plain block-FP8 checkpoints carry arbitrary fp32 scales, so the payload
-    must be dequantized and requantized via npu_dynamic_mx_quant instead.
+    must be dequantized and requantized via npu_dynamic_mx_quant instead
+    (lossy; the caller gates this path behind
+    SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 and otherwise falls back to the
+    Triton emulation kernel with the untouched checkpoint layout).
     """
     if scale_fmt == "ue8m0":
         _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)

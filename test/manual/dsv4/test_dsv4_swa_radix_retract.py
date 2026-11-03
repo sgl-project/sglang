@@ -1,13 +1,13 @@
 """DSV4 stress test for SWA radix cache + tombstone + retract interaction.
 
-Regression test for the former SWA `cache_unfinished_req` assertion:
+Regression test for the former SWA `checkpoint` assertion:
     assert old_prefix_len <= len(new_indices)
 The unified cache reads `req.kv.cache_protected_len` and tolerates page_size - 1
 of alignment slack, so this reproduces the historical trip conditions rather
 than a line that still exists.
 
 Trip conditions (all required):
-  1. Fork-only SWA leaf early-release on (`SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1`)
+  1. Early SWA release of the prefill lock on (`SGLANG_OPT_RELEASE_PREFILL_SWA=1`)
   2. Multiple requests share a long prefix (so one req's tombstoned leaf
      poisons match_prefix for others walking the same radix path).
   3. Memory pressure forces retract while at least one req has tombstoned

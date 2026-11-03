@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.moe.router import (
+from sglang.kernels.ops.gemm.router_gate_matvec import (
     ROUTER_GATE_MATVEC_MAX_M,
     router_gate_matvec,
 )
@@ -19,27 +19,23 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
-from sglang.srt.distributed import (
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -47,12 +43,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_topk
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.multi_gate import (
     create_multi_gate_mm_indices,
     multi_gate_triton_kernel,
@@ -166,8 +161,6 @@ class DsV3MLA(DeepseekV2AttentionMLA):
             alt_stream,
             skip_rope,
         )
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
         self.gated_attention_proj_granularity_type = getattr(
             config, "gated_attention_proj_granularity_type", None
         )
@@ -179,8 +172,7 @@ class DsV3MLA(DeepseekV2AttentionMLA):
                 bias=False,
                 prefix=f"{prefix}.output_gate",
                 quant_config=None,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
         elif self.gated_attention_proj_granularity_type == "element_wise":
             self.g_proj = ColumnParallelLinear(
@@ -188,8 +180,7 @@ class DsV3MLA(DeepseekV2AttentionMLA):
                 self.num_heads * self.v_head_dim,
                 bias=False,
                 prefix=f"{prefix}.output_gate",
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
         else:
             self.g_proj = None
@@ -309,14 +300,13 @@ class BailingMLP(nn.Module):
         prefix: str = "",
         swiglu_limit: Optional[float] = None,
         padded_intermediate_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
 
         self.config = config
         self.swiglu_limit = swiglu_limit
-        self.tp_size = tp_size if tp_size is not None else get_parallel().tp_size
 
         self.intermediate_size = intermediate_size
         self.padded_intermediate_size = padded_intermediate_size or intermediate_size
@@ -327,8 +317,7 @@ class BailingMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             self.padded_intermediate_size,
@@ -337,15 +326,15 @@ class BailingMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
 
+        group = self.gate_up_proj.tp_group
+        tp_size = group.world_size if group is not None else 1
+
         if self.padded_intermediate_size > self.intermediate_size:
-            self.padded_size_per_partition = (
-                self.padded_intermediate_size // self.tp_size
-            )
-            self.effective_size_per_partition = self.intermediate_size // self.tp_size
+            self.padded_size_per_partition = self.padded_intermediate_size // tp_size
+            self.effective_size_per_partition = self.intermediate_size // tp_size
             self.pad_size_per_partition = (
                 self.padded_size_per_partition - self.effective_size_per_partition
             )
@@ -455,7 +444,6 @@ class BailingMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
         prefix: str = "moe",
-        num_fused_shared_experts: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
@@ -476,7 +464,7 @@ class BailingMoE(nn.Module):
         self.score_function = getattr(config, "score_function", None)
         self.multi_gate = is_bailing_multi_gate_enabled(config)
 
-        self.num_fused_shared_experts = num_fused_shared_experts
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         expert_swiglu_limit_list = getattr(config, "expert_swiglu_limit_list", None)
         share_expert_swiglu_limit_list = getattr(
@@ -489,13 +477,13 @@ class BailingMoE(nn.Module):
             share_expert_swiglu_limit_list, layer_id
         )
 
-        # Run the MoE gate in bf16. ling-v3's config sets router_dtype="fp32",
-        # but on Hopper that fp32 gate GEMM falls back to a slow sm80 (Ampere)
-        # no-tensor-core path (~7% of decode GPU time). bf16 uses Hopper tensor
-        # cores; the top-k selection re-casts gating logits back to fp32
-        # (see layers/moe/topk.py), so routing stays fp32-stable. Validated on
-        # ling-v3 TP4: accuracy-neutral (greedy), ~17% bs=1 TPOT improvement.
-        self.router_dtype = torch.bfloat16
+        # bf16 here perturbs routing enough to cause output variance, so the
+        # gate dtype follows the checkpoint config; absent means fp32.
+        router_dtype = getattr(config, "router_dtype", None)
+        if router_dtype is None or router_dtype == "fp32":
+            self.router_dtype = torch.float32
+        else:
+            self.router_dtype = torch.bfloat16
 
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -572,8 +560,7 @@ class BailingMoE(nn.Module):
         # Non-A2A EP (standard): each GPU computes shared expert, outputs are summed
         # via all_reduce → scale down by 1/ep_size to avoid double counting.
         # Note: A2A EP (DeepEP) + fused shared experts is impossible (expert routing
-        # breaks for the extra shared expert ID), so it's auto-disabled in
-        # determine_num_fused_shared_experts().
+        # breaks for the extra shared expert ID), so the fusion veto disables it.
         fused_shared_experts_scaling_factor = None
         if self.moe_ep_size > 1 and self.num_fused_shared_experts > 0:
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
@@ -591,7 +578,7 @@ class BailingMoE(nn.Module):
             gemm1_clamp_limit=self.expert_swiglu_limit,
         )
         self.topk = TopK(
-            top_k=self.top_k + self.num_fused_shared_experts,
+            top_k=self.top_k,
             layer_id=self.layer_id,
             use_grouped_topk=self.use_grouped_topk,
             renormalize=self.norm_expert_prob,
@@ -604,21 +591,24 @@ class BailingMoE(nn.Module):
             apply_routed_scaling_factor_on_output=(
                 self.experts.should_fuse_routed_scaling_factor_in_topk
             ),
-            num_fused_shared_experts=self.num_fused_shared_experts,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             is_fp4_experts=(
                 quant_config is not None
                 and getattr(quant_config, "is_fp4_experts", False)
             ),
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         # Whether to apply routed_scaling_factor at model layer.
         # For A2A MoE paths (e.g., DeepEP), the runner/post_permute does not apply it,
-        # so apply it here unless the selected runner fuses it into TopK weights.
+        # so apply it here unless top-k already folded it into the routed weights.
         # This scales only routed expert output; shared experts are added unscaled.
         self._apply_routed_scaling_factor_on_output = (
             self._enable_a2a_moe
-            and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            and not is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
             and self.routed_scaling_factor is not None
             and self.routed_scaling_factor != 1.0
         )
@@ -633,10 +623,8 @@ class BailingMoE(nn.Module):
             # because MoE output is already complete after EP combine.
             # Using tp_size=1 ensures shared output is also complete,
             # so no all-reduce is needed at the MoE level.
-            shared_tp_kwargs = {}
             shared_tp_size = self.tp_size
             if self._enable_a2a_moe:
-                shared_tp_kwargs = dict(tp_rank=0, tp_size=1)
                 shared_tp_size = 1
             padded_intermediate_size = self._compute_padded_intermediate_size(
                 intermediate_size, quant_config, shared_tp_size
@@ -650,7 +638,7 @@ class BailingMoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 swiglu_limit=self.share_expert_swiglu_limit,
                 padded_intermediate_size=padded_intermediate_size,
-                **shared_tp_kwargs,
+                parallel_group="replicated" if self._enable_a2a_moe else "tp",
             )
         else:
             self.shared_experts = None
@@ -751,18 +739,6 @@ class BailingMoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-
-        if self.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
         return final_hidden_states
 
     def _forward_shared_experts(
@@ -858,10 +834,6 @@ class BailingMoE(nn.Module):
                 hidden_states,
                 router_logits,
                 dynamic_expert_bias=dynamic_expert_bias,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -978,6 +950,7 @@ class BailingMoEAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=False,
         )
         if hasattr(config, "rotary_dim"):
             self.rotary_dim = config.rotary_dim
@@ -1039,7 +1012,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
         prefix: str = "layer",
-        num_fused_shared_experts: int = 0,
         is_nextn: bool = False,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
@@ -1096,21 +1068,9 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
-        is_moe_layer = is_nextn or (
-            not (self.expert_num == 1)
-            and (self.layer_id >= config.first_k_dense_replace)
-        )
-        self.is_layer_sparse = is_moe_layer
-        is_previous_moe_layer = not (self.expert_num == 1) and (
-            self.layer_id - 1 >= config.first_k_dense_replace
-        )
-        is_next_layer_sparse = not (self.expert_num == 1) and (
-            self.layer_id + 1 >= config.first_k_dense_replace
-        )
-        if is_dense_ffn_fully_dp():
-            mlp_tp_rank, mlp_tp_size = 0, 1
-        else:
-            mlp_tp_rank, mlp_tp_size = None, None
+        attn, ffn = self.stage_facts(config, self.layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
+        mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
 
         if self.expert_num == 1:
             self.mlp = BailingMLP(
@@ -1119,8 +1079,8 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
+                reduce_results=False,
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
@@ -1129,7 +1089,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     layer_id=self.layer_id,
                     prefix=prefix,
-                    num_fused_shared_experts=num_fused_shared_experts,
                     alt_stream=alt_stream,
                 )
             else:
@@ -1139,16 +1098,16 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     config=config,
                     quant_config=quant_config,
                     prefix=prefix,
-                    tp_rank=mlp_tp_rank,
-                    tp_size=mlp_tp_size,
+                    parallel_group=mlp_parallel_group,
+                    reduce_results=False,
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(),
+                attn,
                 self.input_layernorm,
                 {
                     "qkv_latent_func": self.attention.prepare_qkv_latent
@@ -1156,19 +1115,25 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     else None
                 },
             ),
-            (
-                declare_ffn(
-                    sparse=is_moe_layer,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int, is_nextn: bool = False):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        is_moe_layer = is_nextn or (
+            not (config.num_experts == 1) and (layer_id >= config.first_k_dense_replace)
+        )
+        is_next_layer_sparse = not (config.num_experts == 1) and (
+            layer_id + 1 >= config.first_k_dense_replace
+        )
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_moe_layer,
+                next_layer_sparse=is_next_layer_sparse,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     @torch.inference_mode()
@@ -1210,17 +1175,16 @@ class BailingMoELinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if not (
-                is_dense_ffn_fully_dp()
-                and (not self.is_layer_sparse)
-                and hidden_states.shape[0] == 0
-            ):
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch=forward_batch,
-                )
-        hidden_states = ffn_exit.finish(hidden_states)
+        if not (
+            is_dense_ffn_fully_dp()
+            and (not self.is_layer_sparse)
+            and hidden_states.shape[0] == 0
+        ):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch=forward_batch,
+            )
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
@@ -1240,7 +1204,6 @@ class BailingMoELinearModel(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        num_fused_shared_experts: int = 0,
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
@@ -1288,7 +1251,6 @@ class BailingMoELinearModel(nn.Module):
             decoder_kwargs = {
                 "quant_config": quant_config,
                 "layer_id": layer_idx,
-                "num_fused_shared_experts": num_fused_shared_experts,
             }
             return BailingMoELinearDecoderLayer(
                 layer_config,
@@ -1301,6 +1263,9 @@ class BailingMoELinearModel(nn.Module):
             self.num_layers,
             layer_fn,
             prefix=f"{prefix}.layers",
+            stage_facts=lambda idx: BailingMoELinearDecoderLayer.stage_facts(
+                config, idx
+            ),
         )
 
         linear_layer_nums = sum(
@@ -1421,14 +1386,14 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        # Determine num_fused_shared_experts
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        self.log_shared_experts_fusion()
 
         self.model = BailingMoELinearModel(
             self.config,
             quant_config,
             prefix=add_prefix("model", prefix),
-            num_fused_shared_experts=self.num_fused_shared_experts,
         )
 
         if self.pp_group.is_last_rank:
@@ -1549,26 +1514,25 @@ class BailingMoeV3ForCausalLM(nn.Module):
                     )
         return None
 
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = (
-            0
-            if is_shared_experts_fusion_disabled()
-            else _get_bailing_num_shared_experts(self.config)
-        )
-        if self.num_fused_shared_experts == 0:
-            return
-
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        num_shared_experts = _get_bailing_num_shared_experts(hf_config)
         # Safety check: current CUDA implementation only supports num_fused_shared_experts == 1.
         # The grouped_topk_gpu and _post_process_topk_ids functions only handle the last column,
         # which is incorrect when num_fused_shared_experts > 1.
         # AMD platform with aiter handles this correctly via fused_append_shared_experts kernel.
-        if self.num_fused_shared_experts > 1 and not _is_hip:
+        if num_shared_experts > 1 and not _is_hip:
             raise ValueError(
-                f"num_fused_shared_experts > 1 ({self.num_fused_shared_experts}) is not "
+                f"num_fused_shared_experts > 1 ({num_shared_experts}) is not "
                 f"supported on CUDA platform. The current TopK implementation only handles "
                 f"one fused shared expert. AMD platform with aiter supports multiple shared experts."
             )
+        return num_shared_experts
 
+    def log_shared_experts_fusion(self):
+        if self.num_fused_shared_experts == 0:
+            return
         moe_ep_size = get_parallel().moe_ep_size
         if moe_ep_size > 1:
             log_info_on_rank0(

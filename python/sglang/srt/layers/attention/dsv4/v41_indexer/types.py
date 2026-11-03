@@ -1,11 +1,13 @@
-"""The inputs and outputs of the V4.1 indexer backends."""
+"""The inputs of the V4.1 indexer backends, including the selection buffers they fill."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Protocol, TypeVar
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, TypeVar
 
 import msgspec
 import torch
+
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -22,26 +24,12 @@ def get_tail_row_indices(
     for n, t in zip(full_rows_per_request, tail_rows_per_request):
         rows.extend(range(start + n - t, start + n))
         start += n
-    device = torch.device(device)
-    if device.type != "cuda":
-        return torch.tensor(rows, dtype=torch.int64, device=device)
-    staged = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
-    return staged.to(device, non_blocking=True)
+    return async_h2d(rows, dtype=torch.int64, device=device)
 
 
 class CandidateMetadata:
     def tail(self, rows_per_request: List[int]) -> CandidateMetadata:
         raise NotImplementedError(f"{type(self).__name__} is not a prefill publish")
-
-
-class Selection(msgspec.Struct, frozen=True):
-    page_indices: torch.Tensor  # index-K pool slots, ascending
-    raw_indices: Optional[torch.Tensor]  # the same picks as compressed positions
-
-    def reset(self) -> None:
-        self.page_indices.fill_(-1)
-        if self.raw_indices is not None:
-            self.raw_indices.fill_(-1)
 
 
 class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -59,6 +47,14 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # rank's rows are an interleaved subset of the batch's.
     req_rows: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor  # [requests] req_to_token row of each request
+    # [columns] int64 index-K pool slot of each flattened-K column, from
+    # scoring.prefill_k_slots; gathered once with a non-speculative extend's
+    # metadata, per layer otherwise.
+    k_slots: torch.Tensor
+    # ratio -> scoring.PrefillIndexPlan, filled by the first layer of each ratio and
+    # reused by the rest of the forward; None when the metadata has no snapshot, so
+    # every layer builds its own.
+    index_plans: Optional[Dict[int, object]]
     # [rows, pages] int32 at the KV page size; the index-K pool pages it with
     # expand_index_page_table.
     kv_page_table: torch.Tensor
@@ -67,6 +63,17 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     seq_lens_cpu: Optional[List[int]]
     rows_per_request: Optional[List[int]]
     rows_per_request_device: Optional[torch.Tensor]
+
+    # The selection, unordered, -1 padded: [rows, topk] int32 request-local
+    # compressed positions, and the same picks as index-K pool slots, which is
+    # None when this forward's attention reads only the positions (sparse prefill).
+    out_raw_indices: torch.Tensor
+    out_page_indices: Optional[torch.Tensor]
+
+    def reset_outputs(self) -> None:
+        self.out_raw_indices.fill_(-1)
+        if self.out_page_indices is not None:
+            self.out_page_indices.fill_(-1)
 
 
 class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -83,6 +90,12 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
     paged_metadata: PagedIndexerMetadata
     is_verify: bool
 
+    # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
+    out_page_indices: torch.Tensor
+
+    def reset_outputs(self) -> None:
+        self.out_page_indices.fill_(-1)
+
 
 class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     """An extend under the prefill graph: projected queries, paged index K."""
@@ -91,7 +104,10 @@ class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     layer_id: int
     q: torch.Tensor  # [rows, heads, 128] bf16, roped
     weights: torch.Tensor  # [rows, heads] bf16 head weights
-    paged_metadata: PagedIndexerMetadata
+    index_page_size: int  # index-K pool page size at this ratio
+    # The selection as pool slots and as request-local compressed positions.
+    out_page_indices: torch.Tensor
+    out_raw_indices: torch.Tensor
 
 
 Metadata = TypeVar("Metadata", bound=CandidateMetadata)
@@ -100,30 +116,16 @@ Metadata = TypeVar("Metadata", bound=CandidateMetadata)
 class PrefillCandidates(Protocol[Metadata]):
     """The attention backend keeps a publish alive and hands it back unread."""
 
-    def publish_prefill(
-        self,
-        inputs: PrefillInputs,
-        out: Selection,
-    ) -> Optional[Metadata]: ...
+    def publish_prefill(self, inputs: PrefillInputs) -> Optional[Metadata]: ...
 
     def consume_prefill(
-        self,
-        inputs: PrefillInputs,
-        published: Optional[Metadata],
-        out: Selection,
+        self, inputs: PrefillInputs, published: Optional[Metadata]
     ) -> None: ...
 
 
 class DecodeCandidates(Protocol[Metadata]):
-    def publish_decode(
-        self,
-        inputs: DecodeInputs,
-        out: Selection,
-    ) -> Optional[Metadata]: ...
+    def publish_decode(self, inputs: DecodeInputs) -> Optional[Metadata]: ...
 
     def consume_decode(
-        self,
-        inputs: DecodeInputs,
-        published: Optional[Metadata],
-        out: Selection,
+        self, inputs: DecodeInputs, published: Optional[Metadata]
     ) -> None: ...

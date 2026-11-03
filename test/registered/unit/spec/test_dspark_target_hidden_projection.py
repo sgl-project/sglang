@@ -4,7 +4,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.models.dspark import DSparkDraftMixin
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -14,7 +15,14 @@ from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWork
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
 
 
 class _Attention:
@@ -22,7 +30,7 @@ class _Attention:
     head_dim = 3
 
     def __init__(self) -> None:
-        self.attn = SimpleNamespace(k_scale=0.5, v_scale=0.25)
+        self.attn = SimpleNamespace(layer_id=0, k_scale=0.5, v_scale=0.25)
         self.input = None
 
     def kv_proj_only(self, hidden_states: torch.Tensor):
@@ -70,11 +78,6 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             worker.spec_v2_attn_backends, (target.model_runner.attn_backend,)
         )
 
-    def test_single_aux_hidden_state_is_returned_without_copy(self) -> None:
-        hidden_states = torch.empty(2, 3)
-
-        self.assertIs(hidden_states, pack_aux_hidden_states([hidden_states]))
-
     def test_preprojected_hidden_is_not_projected_again(self) -> None:
         attention = _Attention()
         draft_model = SimpleNamespace(
@@ -88,10 +91,13 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         draft_model.write_target_hidden_kv = MethodType(
             DSparkDraftMixin.write_target_hidden_kv, draft_model
         )
-        pool = SimpleNamespace(set_kv_buffer=mock.Mock())
+        pool = _routed(SimpleNamespace(set_kv_buffer=mock.Mock()))
         injector = TargetHiddenKvInjector(
             draft_model=draft_model,
-            draft_model_runner=SimpleNamespace(token_to_kv_pool=pool),
+            draft_model_runner=SimpleNamespace(
+                token_to_kv_pool=pool,
+                runner_ids=SimpleNamespace(),
+            ),
             model_runner=SimpleNamespace(device=torch.device("cpu")),
             device=torch.device("cpu"),
             verify_num_draft_tokens=2,

@@ -143,7 +143,7 @@ class Observability(msgspec.Struct):
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint. Set replay_endpoint (e.g. tcp://*:5558) to let routers re-fetch dropped batches; /server_info advertises its port.",
     ] = None
     load_publish_endpoint: A[
         Optional[str],

@@ -6,7 +6,10 @@ and a realtime session always lands on the same replica it started on.
 
 import itertools
 
+import pytest
+
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
 )
@@ -35,13 +38,19 @@ def test_dp1_always_selects_replica_zero():
     assert {_select_replica([_req()], 1, counter) for _ in range(5)} == {0}
 
 
-def test_session_requests_stick_to_one_replica():
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+def test_session_requests_stick_to_one_replica(dp_size):
     counter = itertools.count()
     session_req = _req(realtime_session_id="session-abc")
-    picks = {_select_replica([session_req], 4, counter) for _ in range(8)}
+    release_req = ReleaseRealtimeSessionReq(session_id="session-abc")
+    picks = {
+        _select_replica(req, dp_size, counter)
+        for req in [session_req, [session_req], release_req, release_req]
+    }
     assert len(picks) == 1
     # and the counter was never consumed by session traffic
-    assert _select_replica([_req()], 4, counter) == 0
+    assert next(counter) == 0
+    assert not isinstance(release_req, _CONTROL_REQ_TYPES)
 
 
 def test_control_reqs_are_recognized():

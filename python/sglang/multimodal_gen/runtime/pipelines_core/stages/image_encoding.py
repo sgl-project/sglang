@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     normalize,
     numpy_to_pt,
     pil_to_numpy,
+    preprocess_image,
 )
 
 logger = init_logger(__name__)
@@ -188,6 +189,20 @@ class ImageEncodingStage(PipelineStage):
             )
 
         return postprocess_funcs[0](outputs, image_inputs)
+
+    @staticmethod
+    def _prepare_text_encoder_inputs(image_inputs) -> dict[str, Any]:
+        inputs = {
+            "input_ids": image_inputs.input_ids,
+            "attention_mask": image_inputs.attention_mask,
+            "pixel_values": image_inputs.pixel_values,
+            "image_grid_thw": image_inputs.image_grid_thw,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if "mm_token_type_ids" in image_inputs:
+            inputs["mm_token_type_ids"] = image_inputs["mm_token_type_ids"]
+        return inputs
 
     @staticmethod
     def _split_text_conditioning_output(output):
@@ -335,21 +350,11 @@ class ImageEncodingStage(PipelineStage):
                         )
                     with set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.text_encoder(
-                            input_ids=image_inputs.input_ids,
-                            attention_mask=image_inputs.attention_mask,
-                            pixel_values=image_inputs.pixel_values,
-                            image_grid_thw=image_inputs.image_grid_thw,
-                            output_hidden_states=True,
-                            use_cache=False,
+                            **self._prepare_text_encoder_inputs(image_inputs)
                         )
                         if batch.do_classifier_free_guidance:
                             neg_outputs = self.text_encoder(
-                                input_ids=neg_image_inputs.input_ids,
-                                attention_mask=neg_image_inputs.attention_mask,
-                                pixel_values=neg_image_inputs.pixel_values,
-                                image_grid_thw=neg_image_inputs.image_grid_thw,
-                                output_hidden_states=True,
-                                use_cache=False,
+                                **self._prepare_text_encoder_inputs(neg_image_inputs)
                             )
 
                 prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
@@ -1101,8 +1106,9 @@ class ImageVAEEncodingStage(PipelineStage):
         image: torch.Tensor | PIL.Image.Image,
     ) -> torch.Tensor:
         if isinstance(image, PIL.Image.Image):
-            image = pil_to_numpy(image)  # to np
-            image = numpy_to_pt(image)  # to pt
+            if image.mode == "RGB":
+                return preprocess_image(image, device=get_local_torch_device())
+            image = numpy_to_pt(pil_to_numpy(image))
 
         do_normalize = True
         if image.min() < 0:

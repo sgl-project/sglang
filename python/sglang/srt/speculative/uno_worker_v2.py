@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -32,7 +33,6 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
-from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     pack_uno_tree_result,
@@ -297,7 +297,7 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_token_num=self.forward_width,
         )
 
-        return ForwardBatch(
+        forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=len(prefix_lens),
             input_ids=input_ids,
@@ -312,6 +312,8 @@ class UnoWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
         )
+        self.model_runner.runner_ids.bind_own_plan(forward_batch)
+        return forward_batch
 
     def _run_target_block(
         self,
@@ -812,7 +814,10 @@ class UnoWorkerV2(BaseSpecWorker):
             else contextlib.nullcontext()
         )
         attn_context = (
-            forward_context(ForwardContext(attn_backend=self._uno_draft_attn_backend))
+            forward_context(
+                ForwardContext(attn_backend=self._uno_draft_attn_backend),
+                forward_batch=forward_batch,
+            )
             if self.tree_mode
             else contextlib.nullcontext()
         )

@@ -15,6 +15,11 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 PAD_SLOT_ID = -1
 
 
+# Tokens per program of _causal_conv1d_fwd_kernel; a block_table enumerates
+# (sequence, chunk) pairs in these units.
+CAUSAL_CONV1D_FWD_BLOCK_M = 8
+
+
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -26,6 +31,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     has_initial_states_ptr,
     query_start_loc_ptr,
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+    block_table_ptr,  # (num_blocks, 2) int32 (seq, chunk) rows; USE_BLOCK_TABLE only
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
@@ -55,6 +61,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_BLOCK_TABLE: tl.constexpr = False,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -68,9 +75,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # one program handles one chunk in a single sequence
     # rather than mixing sequences - to make updating initial_states across sequences efficiently
 
-    # single-sequence id
-    idx_seq = tl.program_id(0)
-    chunk_offset = tl.program_id(1)
+    if USE_BLOCK_TABLE:
+        # CUDA-graph safe launch: the grid is a fixed upper bound on the
+        # (sequence, BLOCK_M-chunk) pairs of a token bucket and each program
+        # reads its pair from the table; padded rows carry pad_slot_id.
+        idx_block = tl.program_id(0)
+        idx_seq = tl.load(block_table_ptr + idx_block * 2)
+        chunk_offset = tl.load(block_table_ptr + idx_block * 2 + 1)
+    else:
+        # single-sequence id
+        idx_seq = tl.program_id(0)
+        chunk_offset = tl.program_id(1)
 
     # BLOCK_N elements along the feature-dimension (channel)
     idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -402,6 +417,7 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    block_table: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -515,6 +531,9 @@ def causal_conv1d_fn(
         assert is_channel_last, "Need to run in channel-last layout"
 
     def grid(META):
+        if block_table is not None:
+            # (num_blocks, 1, feature blocks): no host-side sequence lengths.
+            return (block_table.shape[0], 1, triton.cdiv(dim, META["BLOCK_N"]))
         max_seq_len = max(seq_lens_cpu)
         return (
             len(seq_lens_cpu),  # batch_size
@@ -532,6 +551,7 @@ def causal_conv1d_fn(
         has_initial_state,
         query_start_loc,
         out,
+        block_table,
         # Matrix dimensions
         dim,
         cu_seqlen,
@@ -560,8 +580,9 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=8,
+        BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
         BLOCK_N=256,
+        USE_BLOCK_TABLE=block_table is not None,
         num_stages=2,
     )
     return out
@@ -643,6 +664,8 @@ def _causal_conv1d_update_kernel(
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    DEDUP_CONV_WINDOW: tl.constexpr = False,
+    NP2_WINDOW_COLS: tl.constexpr = 1,
 ):
     # ruff: noqa: E501
     if USE_GDC:
@@ -811,6 +834,34 @@ def _causal_conv1d_update_kernel(
     x_base_1d = x_base  # starting of chunk [BLOCK_N]
     mask_x_1d = idx_feats < dim
 
+    if SAVE_INTERMEDIATE and DEDUP_CONV_WINDOW:
+        tl.static_assert(KERNEL_WIDTH == 4)
+        tl.static_assert(not HAS_EAGLE_TREE_CUSTOM_ATTN_MASK)
+        # Deduplicated window (KERNEL_WIDTH == 4, linear chain): step t's window is
+        # columns t..t+2 of one shared per-channel row
+        # [state[1], state[2], x_0, ..., x_{seqlen-1}]. Write those seqlen + 2
+        # columns as one [BLOCK_N, NP2_WINDOW_COLS] tile instead of three
+        # lane-strided stores per token; the bytes are the same.
+        idx_c = tl.arange(0, NP2_WINDOW_COLS)
+        x_win = tl.load(
+            x_base[:, None] + ((idx_c - 2) * stride_x_token)[None, :],
+            mask_w[:, None] & ((idx_c >= 2) & (idx_c < seqlen + 2))[None, :],
+            other=0.0,
+        )
+        win = tl.where(
+            (idx_c == 0)[None, :],
+            col1[:, None],
+            tl.where((idx_c == 1)[None, :], col2[:, None], x_win),
+        )
+        tl.store(
+            intermediate_conv_window_ptr
+            + intermediate_state_batch_coord * stride_inter_seq
+            + (idx_feats * stride_inter_dim)[:, None]
+            + (idx_c * stride_inter_win)[None, :],
+            win,
+            mask=mask_w[:, None] & (idx_c < seqlen + 2)[None, :],
+        )
+
     # STEP 5: compute each token
     for idx_token in tl.static_range(seqlen):
         acc = acc_preload
@@ -956,7 +1007,7 @@ def _causal_conv1d_update_kernel(
                 col1 = col2
                 col2 = matrix_x
 
-            if SAVE_INTERMEDIATE:
+            if SAVE_INTERMEDIATE and not DEDUP_CONV_WINDOW:
                 # Save the window state after consuming this token
                 # Layout: [seq(cache line), step, dim, win(K-1)]
                 base_ptr = (
@@ -1114,6 +1165,19 @@ def causal_conv1d_update(
         )
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+    # In a width-4 linear chain, step t's window is columns t..t+2 of the row
+    # [state[1], state[2], x_0, ..., x_{seqlen-1}]. When the window view's step
+    # stride equals its window stride s, the per-token stores write column t + w
+    # of that row at (t + w) * s, and one store of the whole row writes column c
+    # at c * s: the same addresses and values for any layout with these strides
+    # (MambaPool's deduplicated view is one). The kernel then writes the row as
+    # one tile. Tree verify and other widths keep the per-token stores.
+    dedup_conv_window = (
+        intermediate_conv_window is not None
+        and retrieve_next_token is None
+        and width == 4
+        and stride_inter_step == stride_inter_win
+    )
 
     # prepare retrieve next token buffer strides if provided
     if retrieve_next_token is not None:
@@ -1203,6 +1267,10 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        DEDUP_CONV_WINDOW=dedup_conv_window,
+        NP2_WINDOW_COLS=(
+            triton.next_power_of_2(seqlen + width - 2) if dedup_conv_window else 1
+        ),
         **pdl_kwargs,
     )
     if unsqueeze:

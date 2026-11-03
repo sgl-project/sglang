@@ -68,6 +68,10 @@ class Serving(msgspec.Struct):
         str,
         "App is behind a path based routing proxy.",
     ] = ""
+    enable_http_worker_reuseport: A[
+        bool,
+        "Give each Uvicorn HTTP worker its own SO_REUSEPORT listener.",
+    ] = False
     smg_grpc_mode: A[
         bool,
         "Use the legacy SMG gRPC server (smg-grpc-servicer) instead of the HTTP "
@@ -80,7 +84,8 @@ class Serving(msgspec.Struct):
         Optional[int],
         "Port for the native gRPC server, started alongside HTTP. Setting this "
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. In legacy --smg-grpc-mode this is the SMG server port and "
+        "default. Follower nodes expose GetServerInfo only. "
+        "In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
     grpc_response_timeout_secs: A[
@@ -95,7 +100,9 @@ class Serving(msgspec.Struct):
         "Start a locally managed sidecar against the native gRPC server. "
         "The selected module must expose main(argv) and read the resolved "
         "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
-        "or SGLANG_GRPC_PORT.",
+        "or SGLANG_GRPC_PORT. With SGLANG_RUST_SERVER, every node that hosts a "
+        "Rust listener runs one sidecar, with SGLANG_GRPC_ENDPOINT set to that "
+        "node's first listener (--grpc-port).",
     ] = None
     sidecar_args: A[
         Optional[List[str]],
@@ -183,9 +190,9 @@ class Serving(msgspec.Struct):
         "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
     ] = None
     file_storage_path: A[
-        str,
+        Optional[str],
         "The path of the file storage in backend.",
-    ] = "sglang_storage"
+    ] = None
     enable_cache_report: A[
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",

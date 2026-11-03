@@ -63,7 +63,10 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        elif layer_name == "DeepseekV4DecoderLayer":
+        # Other model families do not need to import the V4 implementation.
+        from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayerBase
+
+        if isinstance(layers[0], DeepseekV4DecoderLayerBase):
             return OperationsStrategy.concat(
                 [
                     _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
@@ -72,8 +75,7 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
 
 
 def _assert_all_same(items: List):

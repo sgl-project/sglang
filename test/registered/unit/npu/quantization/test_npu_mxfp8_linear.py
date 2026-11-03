@@ -6,7 +6,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=1, suite="base-a-test-npu")
 
 # Load the quantization package first so `base_config`, `moe_methods`, and
 # `linear_method_npu` initialize in dependency order. Importing
@@ -65,10 +65,11 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         )
         self.assertTrue(layer.weight_scale_inv.format_ue8m0)
 
-    def test_rejects_non_ue8m0_scale_format(self):
-        with self.assertRaisesRegex(ValueError, "scale_fmt='ue8m0'"):
+    def test_rejects_unaligned_non_ue8m0_weight(self):
+        layer = SimpleNamespace(weight=torch.empty(128, 65, dtype=torch.float8_e4m3fn))
+        with self.assertRaisesRegex(ValueError, "requires K to be divisible by 64"):
             process_npu_arch35_mxfp8_linear_weights(
-                SimpleNamespace(), [128, 128], scale_fmt="float32"
+                layer, [128, 128], scale_fmt="float32"
             )
 
     def test_rejects_non_fp8_weight(self):

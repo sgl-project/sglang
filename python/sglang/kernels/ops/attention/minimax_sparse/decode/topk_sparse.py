@@ -6,6 +6,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.runtime_context import get_platform
+
+from ..common.tile_ptr import tile_ptrs_1d, tile_ptrs_2d
 from ..common.utils import (
     check_sparse_kv_fp8,
     robust_allocator,
@@ -13,29 +16,20 @@ from ..common.utils import (
     unit_scale,
 )
 
+_SPARSE_DECODE_HEURISTICS = {
+    "BLOCK_SIZE_H": lambda args: max(
+        16, triton.next_power_of_2(args["gqa_group_size"])
+    ),
+    "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
+    "HAS_SINK": lambda args: args["sink_ptr"] is not None,
+    "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
+    "HAS_HISPARSE_SLOTS": lambda args: args["hisparse_slots_ptr"] is not None,
+}
 
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "HAS_SINK": lambda args: args["sink_ptr"] is not None,
-        "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
-        "HAS_HISPARSE_SLOTS": lambda args: args["hisparse_slots_ptr"] is not None,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [4, 8]
-        for ns in [2, 3, 4, 5]
-    ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
-)
+
 @triton.jit
-def _gqa_share_sparse_decode_kernel(
+def _gqa_share_sparse_decode_kernel_impl(
     q_ptr,  # Q: b x qh x d
     sink_ptr,  # Sink: qh x d
     k_cache_ptr,  # K paged: max_slots x kh x d
@@ -88,13 +82,17 @@ def _gqa_share_sparse_decode_kernel(
     BATCH_SIZE_BUCKET: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    PAGED_CONTIG: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGED: tl.constexpr,
+    WIDEN_F16: tl.constexpr,
     HAS_HISPARSE_SLOTS: tl.constexpr,
 ):
+    # PAGED and PAGED_CONTIG require page_size % block_size == 0. WIDEN_F16 computes in fp16.
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
     # the grid size = batch_size * NUM_TOPK_CHUNKS.
@@ -127,41 +125,50 @@ def _gqa_share_sparse_decode_kernel(
     # init statistics — kept at -inf so empty chunks (chunk_start >= real_topk)
     # naturally fall out as weight=0 in the merge step.
     if HAS_SINK and pid_c == 0:
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_q_h, stride_q_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
+        q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+            q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+            gqa_group_size,
+            head_dim,
+            stride_q_h,
+            stride_q_d,
+            0,
+            0,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_D,
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
-        sink_ptrs = tl.make_block_ptr(
-            base=sink_ptr + pid_h * stride_sink_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_sink_h, stride_sink_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
+        q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
+        sink_ptrs, sink_ptrs_mask = tile_ptrs_2d(
+            sink_ptr + pid_h * stride_sink_h,
+            gqa_group_size,
+            head_dim,
+            stride_sink_h,
+            stride_sink_d,
+            0,
+            0,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_D,
         )
-        sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
-            tl.float32
-        )
+        sink = tl.load(sink_ptrs, mask=sink_ptrs_mask, other=0.0).to(tl.float32)
         qsink = tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale  # (BLOCK_SIZE_H,)
         m_i = qsink
         lse_i = qsink
     else:
         m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
         lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_q_h, stride_q_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
+        q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+            q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+            gqa_group_size,
+            head_dim,
+            stride_q_h,
+            stride_q_d,
+            0,
+            0,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_D,
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+        q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
+    if WIDEN_F16:
+        q = q.to(tl.float16)
     acc_o = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_D), 0, dtype=tl.float32)
     # only iterate over this chunk's topk slice. the load must respect the
     # per-chunk start offset.
@@ -173,35 +180,57 @@ def _gqa_share_sparse_decode_kernel(
         cur_idx_ptr = cur_idx_ptr + stride_ti_t
         pos = c + off_n
         pos_mask = pos < seq_len
-        if HAS_HISPARSE_SLOTS:
-            slots = tl.load(
-                hisparse_slots_ptr
-                + pid_kh * hisparse_slots_stride_h
-                + pid_b * hisparse_slots_stride_b
-                + hisparse_topk_counter * BLOCK_SIZE_N
-                + off_n,
-                mask=off_n < BLOCK_SIZE_N,
-                other=0,
-            ).to(tl.int64)
-            hisparse_topk_counter = hisparse_topk_counter + 1
+        if PAGED:
+            slot0 = tl.load(req_to_token_ptr + sid * stride_r2t_b + c).to(tl.int64)
+            slots = (slot0 + max_slots) % max_slots + off_n
+            k = tl.load(
+                k_cache_ptr
+                + slots[:, None] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_d[None, :] * stride_k_d,
+                mask=pos_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            k = tl.trans(k)
         else:
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
-        # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
-        k_off = (
-            slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_off,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
+            if HAS_HISPARSE_SLOTS:
+                slots = tl.load(
+                    hisparse_slots_ptr
+                    + pid_kh * hisparse_slots_stride_h
+                    + pid_b * hisparse_slots_stride_b
+                    + hisparse_topk_counter * BLOCK_SIZE_N
+                    + off_n,
+                    mask=off_n < BLOCK_SIZE_N,
+                    other=0,
+                ).to(tl.int64)
+                hisparse_topk_counter = hisparse_topk_counter + 1
+                slots = (slots + max_slots) % max_slots  # safety against negative
+            elif PAGED_CONTIG:
+                # A block lies inside one page, and slots are contiguous within a page,
+                # so the block's first slot fixes the whole tile.
+                base_slot = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + c, mask=c < seq_len, other=0
+                ).to(tl.int64)
+                base_slot = (base_slot + max_slots) % max_slots
+                slots = base_slot + off_n.to(tl.int64)
+            else:
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+            # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
+            k_off = (
+                slots[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_off,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
         if IS_FP8:
             # fp8 KV cache: with bf16/fp16 Q this widens K to the compute dtype
             # (unit-scaled cache -> exact inverse dequant; k_scale covers
@@ -258,24 +287,47 @@ def _gqa_share_sparse_decode_kernel(
     )
     acc_o = acc_o * scale[:, None]
     # save partial output and lse for the merge step
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    o_ptrs, o_ptrs_mask = tile_ptrs_2d(
+        o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
+        gqa_group_size,
+        head_dim,
+        stride_o_h,
+        stride_o_d,
+        0,
+        0,
+        BLOCK_SIZE_H,
+        BLOCK_SIZE_D,
     )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
-    lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
-        shape=(gqa_group_size,),
-        strides=(stride_l_h,),
-        offsets=(0,),
-        block_shape=(BLOCK_SIZE_H,),
-        order=(0,),
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), mask=o_ptrs_mask)
+    lse_ptrs, lse_ptrs_mask = tile_ptrs_1d(
+        lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
+        gqa_group_size,
+        stride_l_h,
+        0,
+        BLOCK_SIZE_H,
     )
-    tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
+    tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), mask=lse_ptrs_mask)
+
+
+_gqa_share_sparse_decode_kernel = triton.heuristics(_SPARSE_DECODE_HEURISTICS)(
+    triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=nw, num_stages=ns)
+            for nw in [4, 8]
+            for ns in [2, 3, 4, 5]
+        ],
+        key=[
+            "BATCH_SIZE_BUCKET",
+            "gqa_group_size",
+            "head_dim",
+            "BLOCK_SIZE_N",
+            "HAS_SINK",
+        ],
+    )(_gqa_share_sparse_decode_kernel_impl)
+)
+_gqa_share_sparse_decode_pinned = triton.heuristics(_SPARSE_DECODE_HEURISTICS)(
+    _gqa_share_sparse_decode_kernel_impl
+)
 
 
 @triton.heuristics(
@@ -301,16 +353,19 @@ def _merge_topk_attn_out_kernel(
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(NUM_TOPK_CHUNKS, head_dim),
-        strides=(stride_o_c, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(NUM_TOPK_CHUNKS, BLOCK_SIZE_D),
-        order=(1, 0),
+    o_ptrs, o_ptrs_mask = tile_ptrs_2d(
+        o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
+        NUM_TOPK_CHUNKS,
+        head_dim,
+        stride_o_c,
+        stride_o_d,
+        0,
+        0,
+        NUM_TOPK_CHUNKS,
+        BLOCK_SIZE_D,
     )
     lse_ptrs = lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c
-    o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
+    o = tl.load(o_ptrs, mask=o_ptrs_mask, other=0.0)
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     # standard flash-decoding merge in linear (not log2) space, matching the
     # decode kernel which uses tl.exp / tl.log.
@@ -335,6 +390,7 @@ def flash_decode_with_gqa_share_sparse(
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
+    page_size: int = 0,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -353,6 +409,9 @@ def flash_decode_with_gqa_share_sparse(
         f"block_size must be a power of 2, but got {block_size}"
     )
     # assert slot_ids.max() < max_slots, f"get slot_ids {slot_ids}, but kv_cache shape is {kv_cache.shape}"
+    # A selected block cannot straddle a page boundary under this condition, so its
+    # slots are contiguous. page_size == 0 means unknown: keep the gather.
+    paged_contig = page_size >= block_size and page_size % block_size == 0
     max_kv_len = req_to_token.shape[1]
     # gqa
     assert num_q_heads % num_kv_heads == 0
@@ -393,7 +452,14 @@ def flash_decode_with_gqa_share_sparse(
     )
     # launch attention kernel
     grid = (batch_size * NUM_TOPK_CHUNKS, num_kv_heads)
-    _gqa_share_sparse_decode_kernel[grid](
+    # The pinned launch and its fp16 widening were tuned together on Hopper.
+    hopper = get_platform().is_sm90
+    paged = hopper and paged_contig and hisparse_slots is None
+    kernel = (
+        _gqa_share_sparse_decode_pinned if paged else _gqa_share_sparse_decode_kernel
+    )
+    pinned_cfg = dict(num_warps=8, num_stages=2) if paged else {}
+    kernel[grid](
         q,
         sink,
         k_cache,
@@ -439,8 +505,12 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(1),
         lse_partial.stride(2),
         BLOCK_SIZE_N=block_size,
+        PAGED_CONTIG=paged_contig,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        PAGED=paged,
+        WIDEN_F16=paged and is_fp8 and q.dtype != torch.float8_e4m3fn,
+        **pinned_cfg,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)

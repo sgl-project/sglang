@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -45,8 +45,6 @@ def init_uno_lora_manager(
         dtype=model_runner.dtype,
         server_args=model_runner.server_args,
         lora_backend="uno_cublas",  # fast path
-        tp_size=get_parallel().tp_size,
-        tp_rank=get_parallel().tp_rank,
         # Infer these from the one trained adapter.
         max_lora_rank=None,
         target_modules=None,
