@@ -38,6 +38,7 @@ class ListKind(enum.Enum):
     GRAMMAR = enum.auto()
     DLLM = enum.auto()
     UOCR_PARKED = enum.auto()
+    UOCR_RELEASED = enum.auto()
     DEFERRED = enum.auto()
 
 

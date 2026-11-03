@@ -2580,6 +2580,7 @@ class Scheduler(
             decode_graph_io=lambda: resolve_uocr_decode_graph_io(
                 runner.decode_cuda_graph_runner
             ),
+            abort_windows=self._abort_uocr_doc_windows,
         )
         self.resolve_forward_inputs = self.uocr_runtime.resolve_forward_inputs
 
@@ -5696,6 +5697,7 @@ class Scheduler(
                 ListKind.PD_HELD,
                 # Counted by uocr blocks_flush below.
                 ListKind.UOCR_PARKED,
+                ListKind.UOCR_RELEASED,
                 # Finished, and held only on the output rank; all ranks must agree.
                 ListKind.DEFERRED,
             }
@@ -6029,15 +6031,6 @@ class Scheduler(
         for i, req in enumerate(self.waiting_queue):
             if recv_req.matches(req.rid):
                 to_del.append(i)
-
-        if self.uocr_runtime is not None:
-            # Parked document windows are off the waiting queue; abort them alike.
-            self._abort_uocr_doc_windows(
-                self.uocr_runtime.drop_parked(
-                    "" if recv_req.abort_all else recv_req.rid
-                ),
-                finished_reason=recv_req.finished_reason,
-            )
 
         # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):

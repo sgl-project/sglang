@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import DocPrefetch
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
@@ -34,6 +35,7 @@ _OWNERS = (
     DllmManager,
     HiSparseCoordinator,
     UocrSchedulerRuntime,
+    DocPrefetch,
     DeferredResponses,
 )
 
