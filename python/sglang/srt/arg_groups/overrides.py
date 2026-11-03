@@ -1093,7 +1093,7 @@ def _deterministic_rocm_rccl_check(view: Any) -> dict:
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
-    from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+    from sglang.srt.arg_groups.choices import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
     # A per-phase backend takes priority over --attention-backend for its phase,
     # so it has to be one of the deterministic backends too.
@@ -1529,7 +1529,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     # load with gate and up exchanged. Leave the backend at "auto" and let
     # create_moe_runner resolve it to ASCEND.
     if view.quantization == "mxfp8" and not get_platform().is_npu:
-        from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
+        from sglang.srt.arg_groups.choices import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
