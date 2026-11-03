@@ -7,10 +7,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,

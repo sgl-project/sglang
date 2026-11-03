@@ -121,8 +121,7 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
