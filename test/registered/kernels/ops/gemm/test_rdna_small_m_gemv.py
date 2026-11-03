@@ -1,8 +1,9 @@
 """Tests the RDNA split-K bf16 GEMV used for single-row decode projections on gfx1151.
 
-The shape gate is exercised on every ROCm GPU (the arch check is patched out, so the
-accept/reject rules are covered on hosts without a gfx1151 device); the kernel is
-compared against an fp32 reference and rocBLAS on the shapes that occur in decode.
+The shape gate is exercised on every ROCm GPU (the arch check and the ROCm generation
+are patched out, so the accept/reject rules are covered on hosts without a gfx1151 device
+running the stack the constants were tuned on); the kernel is compared against an fp32
+reference and rocBLAS on the shapes that occur in decode.
 """
 
 import unittest
@@ -24,10 +25,33 @@ DECODE_SHAPES = [(4096, 1024), (1024, 2048), (6144, 1024), (1024, 3072)]
 class TestGate(CustomTestCase):
     def setUp(self):
         # The gate's last condition is the gfx1151 arch check; pin it so the shape and
-        # dtype rules are testable on hosts without that device.
+        # dtype rules are testable on hosts without that device. The ROCm generation is
+        # pinned as well: the constants were tuned against the 7.2 baseline, and the gate
+        # is off from 7.3 on, so an unpinned runner would reject every accepted shape.
         patcher = mock.patch.object(splitk, "is_gfx1151_supported", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        version_patcher = mock.patch.object(
+            splitk, "get_hip_version", return_value=(7, 2, 0)
+        )
+        version_patcher.start()
+        self.addCleanup(version_patcher.stop)
+        splitk._baseline_is_slow.cache_clear()
+        self.addCleanup(splitk._baseline_is_slow.cache_clear)
+
+    def test_version_gate(self):
+        # The kernel only wins against the 7.2.x baseline; on 7.13 the stock BLAS reaches
+        # 205-242 GB/s and split-K loses on every gated shape, so the wide routing stops
+        # at the last generation we measured.
+        self.assertTrue(splitk.use_rdna_splitk_gemv(1, 4096, 1024, torch.bfloat16))
+        for version in [(7, 3, 0), (7, 13, 0), (8, 0, 0)]:
+            with self.subTest(version=version):
+                with mock.patch.object(splitk, "get_hip_version", return_value=version):
+                    splitk._baseline_is_slow.cache_clear()
+                    self.assertFalse(
+                        splitk.use_rdna_splitk_gemv(1, 4096, 1024, torch.bfloat16)
+                    )
+        splitk._baseline_is_slow.cache_clear()
 
     def test_accepts_decode_shapes(self):
         for n, k in DECODE_SHAPES:
