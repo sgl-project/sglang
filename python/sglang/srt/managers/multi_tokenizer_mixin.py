@@ -176,36 +176,6 @@ def _extract_pooled_hidden_states_by_index(output: BatchEmbeddingOutput, i: int)
     return [states[i]]
 
 
-def _handle_output_by_index(output, i):
-    if not isinstance(
-        output, (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput)
-    ):
-        return output
-
-    split_fields = {
-        field.name: _extract_field_by_index(
-            output,
-            field.name,
-            i,
-            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
-        )
-        for field in _cached_output_fields(type(output))
-        if field.name not in _NOT_SPLIT_FIELDS
-    }
-    if isinstance(output, BatchEmbeddingOutput):
-        split_fields["pooled_hidden_states"] = _extract_pooled_hidden_states_by_index(
-            output, i
-        )
-    else:
-        split_fields.update(_extract_output_ids_by_indices(output, [i]))
-    return type(output)(
-        rids=[output.rids[i]],
-        placeholder_tokens_idx=None,
-        placeholder_tokens_val=None,
-        **split_fields,
-    )
-
-
 class _CannotSplitBatch(Exception):
     pass
 
@@ -289,6 +259,36 @@ _NOT_SPLIT_FIELDS = frozenset(
         "pooled_hidden_states",
     }
 )
+
+
+def _handle_output_by_index(output, i):
+    if not isinstance(
+        output, (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput)
+    ):
+        return output
+
+    split_fields = {
+        field.name: _extract_field_by_index(
+            output,
+            field.name,
+            i,
+            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
+        )
+        for field in _cached_output_fields(type(output))
+        if field.name not in _NOT_SPLIT_FIELDS
+    }
+    if isinstance(output, BatchEmbeddingOutput):
+        split_fields["pooled_hidden_states"] = _extract_pooled_hidden_states_by_index(
+            output, i
+        )
+    else:
+        split_fields.update(_extract_output_ids_by_indices(output, [i]))
+    return type(output)(
+        rids=[output.rids[i]],
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        **split_fields,
+    )
 
 
 def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:

@@ -2439,7 +2439,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.tokenizer_ipc_name is not None:
             # Send to router which will broadcast to all workers
             # (router also handles forwarding to scheduler for non-abort modes)
-            await self._broadcast_pause_continue(obj)
+            await self._pause_continue_through_router(obj)
             if obj.mode == "abort":
                 # Abort polling: only the originator checks its own lock state
                 await self._abort_all_until_unlocked()
@@ -2464,7 +2464,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         if self.tokenizer_ipc_name is not None:
-            await self._broadcast_pause_continue(obj)
+            await self._pause_continue_through_router(obj)
             return
 
         async with self.is_pause_cond:
@@ -2472,7 +2472,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
 
-    async def _broadcast_pause_continue(
+    async def _pause_continue_through_router(
         self, obj: Union[PauseGenerationReqInput, ContinueGenerationReqInput]
     ):
         loop = asyncio.get_event_loop()

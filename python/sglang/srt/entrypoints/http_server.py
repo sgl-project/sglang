@@ -48,6 +48,7 @@ import numpy as np
 import orjson
 import requests
 import setproctitle
+import torch
 import uvicorn
 import uvloop
 from fastapi import (
@@ -273,8 +274,6 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     # Launch multi-tokenizer manager process
     setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
-    import torch
-
     torch.set_num_threads(1)
     tokenizer_worker_class = get_tokenizer_worker_class(server_args)
     tokenizer_manager = tokenizer_worker_class(server_args, port_args)
