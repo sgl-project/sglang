@@ -99,6 +99,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 prefill_attention_backend="trtllm_mla",
                 decode_attention_backend="cutedsl_mla",
             )
+            if cfg.speculative_algorithm == "DFLASH":
+                # trtllm_mla refuses DCP target verify, so verify must run on
+                # the cutedsl_mla decode backend, same as DSPARK above.
+                overrides["speculative_attention_mode"] = "decode"
         elif decode_backend == "aiter":
             _require_kimi_k3_aiter_gluon_dcp_support()
             # Override prefill backend to aiter by default
