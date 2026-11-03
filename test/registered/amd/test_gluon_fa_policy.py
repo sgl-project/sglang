@@ -163,14 +163,17 @@ def test_resolver_reports_persistent_scheduler():
         (65536, 65536, None, False, 65536, NumericalMode.LOCAL_GUARDED),
     ],
 )
-def test_resolver_guarded_boundaries(sq, sk, scale, forced, num_cus, expected):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_resolver_guarded_boundaries(sq, sk, scale, forced, num_cus, expected, dtype):
     config = LaunchConfig("pingpong", 256, 64, 8, True, "") if forced else None
     policy = resolve_execution_policy(
-        *_meta_inputs(sq=sq, sk=sk),
+        *_meta_inputs(sq=sq, sk=sk, dtype=dtype),
         softmax_scale=scale,
         launch_config=config,
         num_cus=num_cus,
     )
+    if dtype == torch.float16 and expected == NumericalMode.GUARDED:
+        expected = NumericalMode.LOCAL_GUARDED
     assert policy.numerical_mode == expected
     assert policy.softmax_scale == (128**-0.5 if scale is None else scale)
 
@@ -181,11 +184,13 @@ def test_resolver_guarded_dtype_and_head_contract(dtype, head_size):
     policy = resolve_execution_policy(
         *_meta_inputs(dtype=dtype, head_size=head_size), num_cus=256
     )
-    expected = (
-        NumericalMode.GUARDED
-        if dtype == torch.bfloat16 and head_size == 128
-        else NumericalMode.ONLINE
-    )
+    expected = NumericalMode.ONLINE
+    if head_size == 128:
+        expected = (
+            NumericalMode.GUARDED
+            if dtype == torch.bfloat16
+            else NumericalMode.LOCAL_GUARDED
+        )
     assert policy.numerical_mode == expected
 
 

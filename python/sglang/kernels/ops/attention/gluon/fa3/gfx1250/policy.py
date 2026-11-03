@@ -294,11 +294,14 @@ def resolve_execution_policy(
     if (
         launch_config is None
         and config.schedule == "pingpong"
-        and query.dtype == torch.bfloat16
         and head_size == 128
         and min(seqlen_q, seqlen_k) >= 65_536
         and seqlen_k < 2**31
         and scale == head_size**-0.5
     ):
-        mode = NumericalMode.GUARDED
+        mode = (
+            NumericalMode.GUARDED
+            if query.dtype == torch.bfloat16
+            else NumericalMode.LOCAL_GUARDED
+        )
     return ExecutionPolicy(config, mode, scale)

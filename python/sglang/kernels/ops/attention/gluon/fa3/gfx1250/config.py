@@ -40,6 +40,7 @@ class _AttentionConfig:
     NUM_WARPS: gl.constexpr
     FAST_EXP: gl.constexpr
     NORM_EXP: gl.constexpr
+    LOCAL_SHIFT: gl.constexpr
     FULL_TDM_WAIT: gl.constexpr
     query_axis: gl.constexpr
 
@@ -66,6 +67,7 @@ class _AttentionConfig:
         norm_exp=False,
         full_tdm_wait=False,
         pipeline=False,
+        local_shift=False,
     ):
         self.SEQLEN_Q = (
             seqlen_q if isinstance(seqlen_q, gl.tensor) else gl.constexpr(seqlen_q)
@@ -80,6 +82,7 @@ class _AttentionConfig:
         self.NUM_WARPS = gl.constexpr(num_warps)
         self.FAST_EXP = gl.constexpr(fast_exp)
         self.NORM_EXP = gl.constexpr(norm_exp)
+        self.LOCAL_SHIFT = gl.constexpr(local_shift)
         self.FULL_TDM_WAIT = gl.constexpr(full_tdm_wait)
         # Keep nearby long-sequence query tiles on the same head to improve
         # K/V cache reuse across workgroups.

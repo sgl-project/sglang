@@ -41,6 +41,8 @@ from triton.experimental import gluon
 
 from sglang.kernels.ops.attention.gluon.fa3.gfx1250.config import _AttentionConfig
 from sglang.kernels.ops.attention.gluon.fa3.gfx1250.pipeline import (
+    _local_probability_sums,
+    fixed_shift_needs_retry,
     process_fixed_shift,
     process_online,
     process_short,
@@ -63,6 +65,7 @@ _ROUTE_STABLE = gl.constexpr(2)
 # The two bounded algorithms share an entry point; stable fallback keeps its
 # own register allocation. These are launch routes, not guard flag values.
 _ROUTE_NORM_OR_FUSED_EXP = gl.constexpr(3)
+_ROUTE_LOCAL_RETRY = gl.constexpr(4)
 
 
 @gluon.jit
@@ -311,7 +314,23 @@ class _AttentionProgram:
 
     @gluon.jit
     def softmax_part0(self, scores, row_max):
-        if self.cfg.NORM_EXP:
+        if self.cfg.LOCAL_SHIFT:
+            # Select the first tile's maximum once; all later tiles reuse it.
+            new_row_max = gl.where(row_max == float("-inf"), gl.max(scores, 1), row_max)
+            probabilities = gl.exp2(
+                gl.fma(
+                    scores,
+                    self.softmax_scale_log2,
+                    -new_row_max[:, None] * self.softmax_scale_log2,
+                )
+            )
+            alpha = gl.full(
+                [self.cfg.BLOCK_M],
+                1.0,
+                gl.float32,
+                gl.SliceLayout(1, self.cfg.qk_layout),
+            )
+        elif self.cfg.NORM_EXP:
             # The norm guard bounds scaled logits by 32, so this fixed shift
             # keeps every exponent in [-64, 0] without online rescaling.
             probabilities = gl.exp2(scores * self.softmax_scale_log2 - 32.0)
@@ -365,7 +384,12 @@ class _AttentionProgram:
 
     @gluon.jit
     def softmax_part1(self, probabilities, row_sum, accumulator, alpha):
-        if self.cfg.NORM_EXP:
+        if self.cfg.LOCAL_SHIFT:
+            unrounded = probabilities
+            probabilities = probabilities.to(self.q.dtype, fp_downcast_rounding="rtne")
+            tile_sum = _local_probability_sums(unrounded, self.cfg)
+            row_sum = row_sum + tile_sum
+        elif self.cfg.NORM_EXP:
             # Use the same rounded probabilities for PV and the denominator.
             probabilities, rounded = _round_norm_probabilities(probabilities)
             tile_sum = gl.sum(rounded, 1)
@@ -556,11 +580,14 @@ def _attention_forward_pingpong(
     USE_OUTPUT_BUFFER: gl.constexpr = True,
     FAST_EXP: gl.constexpr = False,
     NORM_EXP: gl.constexpr = False,
+    LOCAL_SHIFT: gl.constexpr = False,
+    retry_ptr=None,
 ):
     NUM_BUFFERS: gl.constexpr = 2
     NUM_WARPS: gl.constexpr = 8
+    FIXED_SHIFT: gl.constexpr = NORM_EXP or LOCAL_SHIFT
     REBALANCE_SOFTMAX: gl.constexpr = (
-        HEAD_SIZE == 128 and BLOCK_M == 256 and BLOCK_N == 64 and not NORM_EXP
+        HEAD_SIZE == 128 and BLOCK_M == 256 and BLOCK_N == 64 and not FIXED_SHIFT
     )
     # Move half of the score shift into stage1 to balance the two scalar
     # stages without extending the lifetime of the probability fragments.
@@ -578,6 +605,7 @@ def _attention_forward_pingpong(
         NUM_WARPS,
         FAST_EXP,
         NORM_EXP,
+        local_shift=LOCAL_SHIFT,
     )
     program = _AttentionProgram.create(
         cfg,
@@ -620,12 +648,17 @@ def _attention_forward_pingpong(
         dtype=gl.float32,
         layout=gl.SliceLayout(1, cfg.pv_layout),
     )
-    row_sum = gl.full(
-        [BLOCK_M],
-        0.0 if NORM_EXP else 1.0,
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
+    if LOCAL_SHIFT:
+        row_sum = _local_probability_sums(
+            gl.zeros([BLOCK_M, BLOCK_N], gl.float32, cfg.qk_layout), cfg
+        )
+    else:
+        row_sum = gl.full(
+            [BLOCK_M],
+            0.0 if NORM_EXP else 1.0,
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
     accumulator = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
 
     program.prefetch_k(0, 0)
@@ -655,10 +688,14 @@ def _attention_forward_pingpong(
             )
             program.prefetch_k(next_k_start, (iteration + 1) % NUM_BUFFERS)
             # Balance scalar work while keeping exponentiation in stage3.
-            if NORM_EXP:
+            if FIXED_SHIFT:
                 norm_left_scores = gl.amd.slice(scores, [BLOCK_M, BLOCK_N // 2], [0, 0])
                 norm_shifted_left = gl.fma(
-                    norm_left_scores, program.softmax_scale_log2, -32.0
+                    norm_left_scores,
+                    program.softmax_scale_log2,
+                    -row_max[:, None] * program.softmax_scale_log2
+                    if LOCAL_SHIFT
+                    else -32.0,
                 )
             if REBALANCE_SOFTMAX:
                 max_delta, new_row_max = program.softmax_prepare(scores, row_max)
@@ -680,13 +717,19 @@ def _attention_forward_pingpong(
 
         gl.amd.cdna5.tdm.async_wait(2)
         with gl.amd.warp_pipeline_stage("stage3"):
-            if NORM_EXP:
+            if FIXED_SHIFT:
                 norm_left = gl.exp2(norm_shifted_left)
                 norm_right_scores = gl.amd.slice(
                     scores, [BLOCK_M, BLOCK_N // 2], [0, BLOCK_N // 2]
                 )
                 norm_right = gl.exp2(
-                    gl.fma(norm_right_scores, program.softmax_scale_log2, -32.0)
+                    gl.fma(
+                        norm_right_scores,
+                        program.softmax_scale_log2,
+                        -row_max[:, None] * program.softmax_scale_log2
+                        if LOCAL_SHIFT
+                        else -32.0,
+                    )
                 )
                 probabilities = (
                     gl.join(norm_left, norm_right)
@@ -779,7 +822,18 @@ def _attention_forward_pingpong(
     v = program.load_v(iteration % NUM_BUFFERS, 0)
     accumulator = program.pv(probabilities, v, accumulator)
 
+    if LOCAL_SHIFT:
+        row_sum = gl.convert_layout(
+            gl.sum(row_sum, 1), gl.SliceLayout(1, cfg.pv_layout)
+        )
     output = accumulator * (1.0 / row_sum)[:, None]
+    if LOCAL_SHIFT:
+        bad = fixed_shift_needs_retry(program, output, row_max, row_sum)
+        index = gl.program_id(0) + gl.num_programs(0) * (
+            gl.program_id(1) + gl.num_programs(1) * gl.program_id(2)
+        )
+        # Every launch overwrites every flag, including CUDA graph replays.
+        gl.store(retry_ptr + index, bad.to(gl.int32))
     if USE_TDM_OUTPUT:
         # Let the allocator reuse the dead K/V storage for output staging.
         program.k_buffer._keep_alive()
@@ -792,7 +846,7 @@ def _attention_forward_pingpong(
 # Specialize tensor strides as in TokenSpeed so TDM address arithmetic folds
 # at compile time. Shape specialization already distinguishes these launches.
 @gluon.jit
-def _attention_forward_norm_selected(
+def _attention_forward_guard_selected(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -825,7 +879,13 @@ def _attention_forward_norm_selected(
     USE_QUERY_BUFFER: gl.constexpr = True,
     USE_OUTPUT_BUFFER: gl.constexpr = True,
 ):
-    bits = gl.load(invalid_ptr)
+    if ROUTE == _ROUTE_LOCAL_RETRY:
+        index = gl.program_id(0) + gl.num_programs(0) * (
+            gl.program_id(1) + gl.num_programs(1) * gl.program_id(2)
+        )
+        bits = gl.load(invalid_ptr + index)
+    else:
+        bits = gl.load(invalid_ptr)
     forward_args = (
         q_ptr,
         k_ptr,
@@ -884,6 +944,7 @@ def _attention_forward_norm_selected(
             ((ROUTE == _ROUTE_NORM) & ((bits & _NORM_UNSAFE) == 0))
             | ((ROUTE == _ROUTE_FUSED_EXP) & (bits == _NORM_UNSAFE))
             | ((ROUTE == _ROUTE_STABLE) & (bits == (_NORM_UNSAFE | _FUSED_EXP_UNSAFE)))
+            | ((ROUTE == _ROUTE_LOCAL_RETRY) & (bits != 0))
         )
         if selected:
             _attention_forward_pingpong(
@@ -1060,7 +1121,7 @@ def _launch_norm_guarded_attention(query, key, value, output, invalid, softmax_s
         255 * output.stride(1) + 127 * output.stride(3) + 1
     ) * output.element_size()
     for route in (_ROUTE_NORM_OR_FUSED_EXP.value, _ROUTE_STABLE.value):
-        _attention_forward_norm_selected[grid](
+        _attention_forward_guard_selected[grid](
             query,
             key,
             value,
@@ -1181,33 +1242,25 @@ def flash_attention(
                 query, key, value, output, invalid, softmax_scale
             )
             return output
-        kernel[grid](
-            query,
-            key,
-            value,
-            output,
-            query.stride(0),
-            query.stride(2),
-            query.stride(1),
-            query.stride(3),
-            key.stride(0),
-            key.stride(2),
-            key.stride(1),
-            key.stride(3),
-            value.stride(0),
-            value.stride(2),
-            value.stride(1),
-            value.stride(3),
-            output.stride(0),
-            output.stride(2),
-            output.stride(1),
-            output.stride(3),
+        strides = tuple(
+            stride
+            for tensor in (query, key, value, output)
+            for stride in (
+                tensor.stride(0),
+                tensor.stride(2),
+                tensor.stride(1),
+                tensor.stride(3),
+            )
+        )
+        shape_args = (
             softmax_scale,
             seqlen_q,
             seqlen_k,
             config.block_m,
             config.block_n,
             head_size,
+        )
+        launch_options = dict(
             TDM_OUTPUT=config.tdm_output,
             USE_QUERY_BUFFER=query_tile_bytes <= 2**31,
             USE_OUTPUT_BUFFER=output_tile_bytes <= 2**31,
@@ -1215,8 +1268,37 @@ def flash_attention(
             waves_per_eu=2 if config.schedule == "pingpong" else 1,
             llvm_fn_attrs=config.llvm_fn_attrs,
             enable_fp_fusion=True,
+        )
+        local_shift = (
+            config.schedule == "pingpong"
+            and policy.numerical_mode == NumericalMode.LOCAL_GUARDED
+        )
+        if local_shift:
+            retry = torch.empty(math.prod(grid), dtype=torch.int32, device=query.device)
+            pipeline_options = dict(LOCAL_SHIFT=True, retry_ptr=retry)
+        kernel[grid](
+            query,
+            key,
+            value,
+            output,
+            *strides,
+            *shape_args,
+            **launch_options,
             **pipeline_options,
         )
+        if local_shift:
+            # Keep the online retry out of the fast kernel's register allocation.
+            _attention_forward_guard_selected[grid](
+                query,
+                key,
+                value,
+                output,
+                retry,
+                *strides,
+                *shape_args,
+                _ROUTE_LOCAL_RETRY.value,
+                **launch_options,
+            )
     return output
 
 

@@ -478,6 +478,7 @@ def _assert_norm_attention_fp64(query, key, value, output):
         ("value-high", GuardFlag.NONE),
         ("extreme", GuardFlag.NORM_UNSAFE | GuardFlag.FUSED_EXP_UNSAFE),
         ("constant", GuardFlag.NONE),
+        ("rounding-boundary", GuardFlag.NONE),
     ],
 )
 def test_norm_guarded_attention_matches_fp64(seqlen_k, case, expected_bits):
@@ -510,12 +511,18 @@ def test_norm_guarded_attention_matches_fp64(seqlen_k, case, expected_bits):
         key[..., 0] = 15.0
     elif case == "extreme":
         query[-1, -1, -1, -1] = 66048
+    elif case == "rounding-boundary":
+        # Summing unrounded probabilities introduces a 0.39% bias here.
+        query.fill_(1)
+        key.fill_(0.00034332275390625)
+        key[:, :64].zero_()
     constants = {
         "tiny-value": 2**-60,
         "large-value": float(2**70),
         "value-low": 2**-32,
         "value-high": float(2**64),
         "constant": 1.0,
+        "rounding-boundary": 1.0,
     }
     if case in constants:
         value.fill_(constants[case])
@@ -1076,3 +1083,70 @@ if __name__ == "__main__":
     if not _is_gfx1250():
         raise RuntimeError("The MI45x numerical suite requires an AMD gfx1250 GPU")
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("seqlen", [65_536, 65_537])
+@pytest.mark.parametrize("storage_offset", [0, 1])
+def test_long_fp16_recomputes_on_graph_replay(seqlen, storage_offset):
+    """Exercise automatic long dispatch, tail rows, and per-workgroup retries."""
+    from sglang.kernels.ops.attention.gluon.fa3.gfx1250.forward import flash_attention
+
+    torch.manual_seed(41972)
+    inputs = [
+        torch.empty(
+            2 * seqlen * 3 * 128 + storage_offset, device="cuda", dtype=torch.float16
+        )[storage_offset:]
+        .view(2, seqlen, 3, 128)
+        .normal_()
+        for _ in range(3)
+    ]
+    query, key, value = inputs
+    original = [tensor.clone() for tensor in inputs]
+    flash_attention(*inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = flash_attention(*inputs)
+    rows = [0, 255, 256, seqlen // 2, seqlen - 1]
+    for case in (
+        "random",
+        "late-key",
+        "single-query",
+        "zero-values",
+        "finite-denominator-overflow",
+        "large-uniform",
+        "random",
+    ):
+        for tensor, saved in zip(inputs, original):
+            tensor.copy_(saved)
+        if case in (
+            "late-key",
+            "single-query",
+            "zero-values",
+            "finite-denominator-overflow",
+        ):
+            query.fill_(1)
+            if case == "single-query":
+                query.zero_()
+                query[1, seqlen // 2, 2].fill_(1)
+            key.zero_()
+            key[:, -1].fill_(2 if case == "finite-denominator-overflow" else 16)
+            value.zero_()
+            if case != "zero-values":
+                value[:, -1].fill_(1)
+        elif case == "large-uniform":
+            query.fill_(60000)
+            query[1].neg_()
+            key.fill_(60000)
+            value.fill_(1)
+        # Sample query rows, but include every key in the independent FP64 oracle.
+        expected = _fp64_attention(query[:, rows], key, value, 128**-0.5)
+        rms = expected.square().mean().sqrt().item()
+        for _ in range(20):
+            graph.replay()
+            assert torch.isfinite(output).all()
+            actual = output[:, rows].double()
+            assert (actual - expected).square().mean().sqrt() <= 0.001 * rms + 1e-12
+            torch.testing.assert_close(
+                actual, expected, rtol=0.01, atol=0.01 * max(rms, 1e-7)
+            )

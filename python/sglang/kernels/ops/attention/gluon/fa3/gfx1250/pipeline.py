@@ -161,9 +161,8 @@ def _retry_online(program):
 
 
 @gluon.jit
-def process_fixed_shift(program):
-    """Retry the complete workgroup when the first-tile shift is unsafe."""
-    output, row_max, row_sum = _process_pipeline(program, True)
+def fixed_shift_needs_retry(program, output, row_max, row_sum):
+    """Check every valid row, including overflow in probability conversion/PV."""
     output_limit: gl.constexpr = (
         65504.0
         if program.output_ptr.dtype.element_ty == gl.float16
@@ -176,7 +175,14 @@ def process_fixed_shift(program):
     rows = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
     query_start = gl.program_id(cfg.query_axis) * cfg.BLOCK_M
     valid_rows = query_start + rows < cfg.SEQLEN_Q
-    bad = gl.sum((~valid & valid_rows).to(gl.int32), axis=0) > 0
+    return gl.sum((~valid & valid_rows).to(gl.int32), axis=0) > 0
+
+
+@gluon.jit
+def process_fixed_shift(program):
+    """Retry the complete workgroup when the first-tile shift is unsafe."""
+    output, row_max, row_sum = _process_pipeline(program, True)
+    bad = fixed_shift_needs_retry(program, output, row_max, row_sum)
     program.store_output(output)
     if bad:
         _retry_online(program)
