@@ -3,9 +3,9 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/pass_manager.py
 
 from torch import fx as fx
+from torch._inductor.custom_graph_pass import CustomGraphPass
 
 from sglang.srt.compilation.inductor_pass import (
-    CustomGraphPass,
     InductorPass,
     SGLangInductorPass,
     get_pass_context,

@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
 )
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -53,6 +54,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.scheduler_test_utils import decode_queue
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -422,7 +424,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # `not decode_req.is_rebootstrap` gate in pop_preallocated).
         decode_req.is_rebootstrap = False
 
-        queue.queue = [decode_req]
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
