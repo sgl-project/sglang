@@ -7,15 +7,12 @@ from typing import Callable, Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.utils import is_npu
 
-if is_npu():
-    # Ascend does not map the generic libdevice stubs to CANN implementations.
-    from triton.language.extra.cann import libdevice
-else:
-    from triton.language.extra import libdevice
+_is_npu = is_npu()
 
 # Measured fastest for 1-64 rows, where the per-block Philox work sets latency.
 _BLOCK = 1024
@@ -243,12 +240,17 @@ def _launch_partial(
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
-    per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole.
+    per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
+    without ``gather_logits`` the kept logits stay on the shard.
     ``has_sampled_rows=False`` argmaxes every row."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
         if inputs_on_cuda(**kwargs):
+            if _is_npu:
+                from sgl_kernel_npu.operators.sample import markov_sample_step_triton
+
+                return markov_sample_step_triton(**kwargs)
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
 
@@ -276,10 +278,10 @@ class MarkovSampleStep:
         assert vocab_start % 4 == 0, vocab_start
         if logits_out is not None:
             assert logits_out.dtype == step_dtype and logits_out.stride(1) == 1
-            if gather is None:
+            if gather_logits is None:
                 assert logits_out.shape == base_logits.shape
             else:
-                assert gather_logits is not None
+                assert gather is not None
                 assert logits_out.shape[0] == base_logits.shape[0]
 
     @classmethod
@@ -320,7 +322,7 @@ class MarkovSampleStep:
             step_dtype=step_dtype,
             has_sampled_rows=has_sampled_rows,
         )
-        if gather is not None and logits_out is not None:
+        if gather_logits is not None and logits_out is not None:
             local = torch.empty(
                 base_logits.shape, device=base_logits.device, dtype=step_dtype
             )
@@ -384,7 +386,7 @@ class MarkovSampleStep:
         value = base_logits.to(torch.float32, copy=True)
         value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
-        if gather is not None and logits_out is not None:
+        if gather_logits is not None and logits_out is not None:
             full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
             return cls.torch(
                 base_logits=full,
