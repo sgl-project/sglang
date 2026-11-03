@@ -113,21 +113,20 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -1992,6 +1991,10 @@ class MQALayer(MqaAttentionBase):
         q = self._compute_q_b(q_for_wqb, positions, q_out)
         if self.indexer is not None:
             # Forked above, right after q_lora; recorded here, after the Q chain.
+            # TP-row-sharded index scoring all-gathers on stream_sources. Until
+            # its join below, neither the main nor KV stream may issue an
+            # attention-TP collective: all ranks must keep the same communicator
+            # ordering, even though the indexer overlaps local Q/KV work.
             with torch.cuda.stream(stream_sources):
                 attn_backend.forward_low_ratio_sources(
                     layer=self,

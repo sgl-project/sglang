@@ -161,6 +161,33 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
         )
         self.assertEqual(result, [single])
 
+    def test_unindexed_mistral_pair_filters_only_the_consolidated_file(self):
+        model = os.path.join(self.folder, "model.safetensors")
+        consolidated = os.path.join(self.folder, "consolidated.safetensors")
+        cases = (
+            ([consolidated, model], [model]),
+            ([model, consolidated], [model]),
+            (
+                [
+                    os.path.join(self.folder, "first.safetensors"),
+                    os.path.join(self.folder, "second.safetensors"),
+                ],
+                [
+                    os.path.join(self.folder, "first.safetensors"),
+                    os.path.join(self.folder, "second.safetensors"),
+                ],
+            ),
+        )
+
+        for weight_files, expected in cases:
+            with self.subTest(weight_files=weight_files):
+                result = filter_duplicate_safetensors_files(
+                    hf_weights_files=weight_files,
+                    hf_folder=self.folder,
+                    index_file=INDEX_NAME,
+                )
+                self.assertCountEqual(result, expected)
+
 
 class TestMaybeAddMtpSafetensors(CustomTestCase):
     def test_remote_mtp_guards(self):
