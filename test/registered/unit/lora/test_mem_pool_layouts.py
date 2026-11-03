@@ -57,6 +57,7 @@ _HF_CONFIG = dict(
     num_attention_heads=8,
     num_key_value_heads=8,
     head_dim=8,
+    linear_num_value_heads=8,
     intermediate_size=256,
     moe_intermediate_size=192,
 )
@@ -134,6 +135,8 @@ class _HiddenDimModel(torch.nn.Module):
         if module_name == "in_proj_qkvz":
             # linear-attention packed input projection (column-parallel)
             return cfg.hidden_size, 4 * cfg.hidden_size
+        if module_name == "in_proj_ba":
+            return cfg.hidden_size, 2 * cfg.linear_num_value_heads
         raise NotImplementedError(module_name)
 
 
@@ -230,11 +233,15 @@ class TestShardingGroups(unittest.TestCase):
                 ("A", "o_proj"): (2, 8, 64),
                 ("B", "qkv_proj"): (2, 192, 8),
                 ("B", "in_proj_qkvz"): (2, 256, 8),
+                ("A", "in_proj_ba"): (2, 16, 64),
+                ("B", "in_proj_ba"): (2, 16, 8),
             },
             2: {
                 ("A", "o_proj"): (2, 8, 32),
                 ("B", "qkv_proj"): (2, 96, 8),
                 ("B", "in_proj_qkvz"): (2, 128, 8),
+                ("A", "in_proj_ba"): (2, 16, 64),
+                ("B", "in_proj_ba"): (2, 8, 8),
             },
         }
         for attn_tp_size, expected in cases.items():

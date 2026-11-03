@@ -4763,6 +4763,10 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    # GatedDeltaNet packed input and output projections.
+    "in_proj_qkvz",
+    "in_proj_ba",
+    "out_proj",
     "embed_tokens",
     "lm_head",
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).

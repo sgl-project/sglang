@@ -320,6 +320,13 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         "out_proj": "out_proj",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
@@ -358,6 +365,7 @@ def get_stacked_multiply(
     stacked_rank = {
         "qkv_proj": 3,
         "in_proj_qkvz": 4,  # GDN packed input projection
+        "in_proj_ba": 2,  # GDN packed b/a input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
         "gate_up_proj_shared_moe": 2,
@@ -423,6 +431,7 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
     }
 )
 
@@ -437,6 +446,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "up_proj",
         "gate_up_proj",
         "down_proj",
