@@ -708,6 +708,12 @@ def init_mori_epv2_op(
                 "a MORI build with EPv2 AsyncLL (EpDispatchCombineConfig.async_ll)"
             )
         cfg_kwargs.update(async_ll=True, async_ll_transport=async_ll_transport)
+        # TBO issues both micro-batches' ops on the compute stream; on the SDMA queue
+        # every op shares, each recv would also wait for the other op's send. MORI
+        # builds without the field (ROCm/mori#892) keep their own queue choice.
+        cfg_fields = EpDispatchCombineConfig.__dataclass_fields__
+        if async_ll_transport == "sdma" and "async_ll_own_sdma_queue" in cfg_fields:
+            cfg_kwargs.update(async_ll_own_sdma_queue=True)
     cfg = EpDispatchCombineConfig(
         **cfg_kwargs,
         # Only the hip backend has the AsyncLL kernels; gfx950 defaults to flydsl,
@@ -755,6 +761,11 @@ def init_mori_epv2_op(
         f"combine_mode={cfg.combine_mode} launch_config={launch_config} "
         f"schedule={cfg.schedule} async_ll={async_ll}"
         + (f" async_ll_transport={async_ll_transport}" if async_ll else "")
+        + (
+            f" own_sdma_queue={cfg_kwargs.get('async_ll_own_sdma_queue', False)}"
+            if async_ll
+            else ""
+        )
     )
     return op
 
