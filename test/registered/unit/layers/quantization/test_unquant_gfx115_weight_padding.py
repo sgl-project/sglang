@@ -1,5 +1,5 @@
 """
-Unit tests for the gfx11 row-stride pad on unquantized linear and lm_head weights.
+Unit tests for the gfx115x row-stride pad on unquantized linear and lm_head weights.
 
 The pad must change only the row stride: same shape, same values, same outputs.
 It applies to linear weights and the LM head (tied or not), never to an untied
@@ -41,9 +41,9 @@ _VOCAB, _HIDDEN, _PADDED_STRIDE = 256, 1024, 1024 + 64
 _BF16_RTOL, _BF16_ATOL = 1.6e-2, 1e-2
 
 
-def _on_gfx11():
+def _on_gfx115():
     # _is_cpu is cleared so a CPU runner with AMX does not take the AMX packing branch.
-    return patch.multiple(unquant, _is_gfx11=True, _is_cpu=False)
+    return patch.multiple(unquant, _is_gfx115=True, _is_cpu=False)
 
 
 def _publish(*, tp_size: int, device: str = "cpu") -> None:
@@ -86,7 +86,7 @@ def _postprocess(model: torch.nn.Module) -> None:
     DefaultModelLoader.postprocess_weights(model, torch.device("cpu"))
 
 
-class TestGfx11WeightPadding(CustomTestCase):
+class TestGfx115WeightPadding(CustomTestCase):
     def setUp(self):
         torch.manual_seed(0)
         _publish(tp_size=1)
@@ -105,15 +105,15 @@ class TestGfx11WeightPadding(CustomTestCase):
         for (k, itemsize), pad in cases.items():
             with self.subTest(k=k, itemsize=itemsize):
                 self.assertEqual(
-                    unquant._gfx11_row_pad_elems(k=k, itemsize=itemsize), pad
+                    unquant._gfx115_row_pad_elems(k=k, itemsize=itemsize), pad
                 )
 
     def test_pad_changes_only_the_row_stride(self):
         weight = torch.randn(192, 4096, dtype=torch.bfloat16)
         bias = torch.randn(192, dtype=torch.bfloat16)
         x = torch.randn(3, 4096, dtype=torch.bfloat16)
-        with _on_gfx11():
-            padded = unquant.maybe_pad_weight_for_gfx11(weight)
+        with _on_gfx115():
+            padded = unquant.maybe_pad_weight_for_gfx115(weight)
 
         self.assertEqual(padded.shape, weight.shape)
         self.assertEqual(padded.stride(), (4096 + 64, 1))
@@ -127,27 +127,27 @@ class TestGfx11WeightPadding(CustomTestCase):
 
     def test_gate_leaves_weight_untouched(self):
         weight = torch.randn(64, 4096, dtype=torch.bfloat16)
-        with patch.object(unquant, "_is_gfx11", False), self.subTest("not gfx11"):
-            self.assertIs(unquant.maybe_pad_weight_for_gfx11(weight), weight)
-        with _on_gfx11(), envs.SGLANG_DISABLE_GFX11_WEIGHT_PADDING.override(True):
+        with patch.object(unquant, "_is_gfx115", False), self.subTest("not gfx115x"):
+            self.assertIs(unquant.maybe_pad_weight_for_gfx115(weight), weight)
+        with _on_gfx115(), envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.override(True):
             with self.subTest("opted out"):
-                self.assertIs(unquant.maybe_pad_weight_for_gfx11(weight), weight)
-        with _on_gfx11():
-            padded = unquant.maybe_pad_weight_for_gfx11(weight)
+                self.assertIs(unquant.maybe_pad_weight_for_gfx115(weight), weight)
+        with _on_gfx115():
+            padded = unquant.maybe_pad_weight_for_gfx115(weight)
             with self.subTest("already padded"):
-                self.assertIs(unquant.maybe_pad_weight_for_gfx11(padded), padded)
+                self.assertIs(unquant.maybe_pad_weight_for_gfx115(padded), padded)
             fp32 = torch.randn(64, 512, dtype=torch.float32)
             with self.subTest("fp32, a 2 KiB row but unmeasured"):
-                self.assertIs(unquant.maybe_pad_weight_for_gfx11(fp32), fp32)
+                self.assertIs(unquant.maybe_pad_weight_for_gfx115(fp32), fp32)
             transposed = torch.randn(4096, 64, dtype=torch.bfloat16).t()
             with self.subTest("non-contiguous"):
                 self.assertIs(
-                    unquant.maybe_pad_weight_for_gfx11(transposed), transposed
+                    unquant.maybe_pad_weight_for_gfx115(transposed), transposed
                 )
 
     def test_untied_input_embedding_is_not_padded(self):
         model = _CausalLM(tie="none")
-        with _on_gfx11():
+        with _on_gfx115():
             _postprocess(model)
 
         self.assertTrue(model.model.embed_tokens.weight.is_contiguous())
@@ -160,7 +160,7 @@ class TestGfx11WeightPadding(CustomTestCase):
             with self.subTest(tie=tie):
                 model = _CausalLM(tie=tie)
                 expected_rows = model.model.embed_tokens.weight[ids].clone()
-                with _on_gfx11():
+                with _on_gfx115():
                     _postprocess(model)
                     storage = model.lm_head.weight.data_ptr()
                     # A weight update re-runs postprocessing on the same model.
@@ -176,26 +176,26 @@ class TestGfx11WeightPadding(CustomTestCase):
     def test_quantized_head_is_not_padded(self):
         model = _CausalLM(tie="none")
         model.lm_head.quant_method = _OpaqueHeadMethod()
-        with _on_gfx11():
+        with _on_gfx115():
             _postprocess(model)
 
         self.assertTrue(model.lm_head.weight.is_contiguous())
 
     def test_padding_logs_at_info_only_on_the_first_load(self):
         model = _CausalLM(tie="module")
-        with _on_gfx11(), patch.object(unquant, "_gfx11_padding_logged", False):
+        with _on_gfx115(), patch.object(unquant, "_gfx115_padding_logged", False):
             with self.assertLogs(unquant.logger, level="DEBUG") as logs:
                 for _ in range(3):
                     _postprocess(model)
 
-        levels = [r.levelname for r in logs.records if "gfx11" in r.getMessage()]
+        levels = [r.levelname for r in logs.records if "gfx115x" in r.getMessage()]
         self.assertEqual(levels, ["INFO", "DEBUG", "DEBUG"])
 
     def test_reload_writes_into_padded_storage(self):
         layer = ColumnParallelLinear(
             _HIDDEN, 64, bias=False, params_dtype=torch.bfloat16
         )
-        with _on_gfx11():
+        with _on_gfx115():
             layer.quant_method.process_weights_after_loading(layer)
             storage = layer.weight.data_ptr()
             fresh = torch.randn(64, _HIDDEN, dtype=torch.bfloat16)
@@ -207,7 +207,7 @@ class TestGfx11WeightPadding(CustomTestCase):
         self.assertTrue(torch.equal(layer.weight, fresh))
 
 
-class TestGfx11WeightPaddingShards(CustomTestCase):
+class TestGfx115WeightPaddingShards(CustomTestCase):
     def setUp(self):
         _publish(tp_size=4)
         self.addCleanup(reset_context)
@@ -216,7 +216,7 @@ class TestGfx11WeightPaddingShards(CustomTestCase):
         """K = 3072 aliases (6 KiB rows), but a TP=4 row shard holds K = 768 (1.5 KiB)."""
         row = RowParallelLinear(3072, 64, bias=False, params_dtype=torch.bfloat16)
         column = ColumnParallelLinear(3072, 64, bias=False, params_dtype=torch.bfloat16)
-        with _on_gfx11():
+        with _on_gfx115():
             for layer in (row, column):
                 layer.quant_method.process_weights_after_loading(layer)
 
@@ -251,7 +251,7 @@ class TestGfx11WeightPaddingShards(CustomTestCase):
         for kind, (make, shards) in cases.items():
             with self.subTest(kind=kind):
                 padded, reference = make(), make()
-                with _on_gfx11():
+                with _on_gfx115():
                     padded.quant_method.process_weights_after_loading(padded)
                     storage = padded.weight.data_ptr()
                     for shard_id, shape in shards.items():
@@ -266,8 +266,8 @@ class TestGfx11WeightPaddingShards(CustomTestCase):
                 self.assertTrue(torch.equal(padded.weight, reference.weight))
 
 
-@unittest.skipUnless(unquant._is_gfx11, "needs an AMD gfx11 GPU")
-class TestGfx11WeightPaddingOnDevice(CustomTestCase):
+@unittest.skipUnless(unquant._is_gfx115, "needs an AMD gfx115x GPU")
+class TestGfx115WeightPaddingOnDevice(CustomTestCase):
     """hipBLASLt and the embedding gather read the padded stride correctly."""
 
     def setUp(self):
