@@ -533,13 +533,16 @@ def get_available_gpu_memory(
         else:
             nodes = None
 
+        # Each worker's share of the free memory, including any container limit
+        n_numa_node = len(nodes) if nodes else len(get_cpu_ids_by_node())
+        free_gpu_memory = get_free_cpu_memory() / n_numa_node
+
+        # Nodes can differ in capacity, so also fit within the smallest one
         if nodes:
-            free_gpu_memory = min(get_numa_node_available_bytes(n) for n in nodes)
-        else:
-            # No NUMA information, e.g. on non-Linux systems
-            total_free_memory = get_free_cpu_memory()
-            n_numa_node: int = len(get_cpu_ids_by_node())
-            free_gpu_memory = round(total_free_memory / n_numa_node, 3)
+            free_gpu_memory = min(
+                free_gpu_memory,
+                min(get_numa_node_available_bytes(n) for n in nodes),
+            )
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
