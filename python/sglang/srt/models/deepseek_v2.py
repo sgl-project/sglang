@@ -1226,7 +1226,7 @@ class DeepseekV2MoE(nn.Module):
             )
             if router_logits_partials is not None:
                 topk_kwargs["router_logits_partials"] = router_logits_partials
-            if use_vision_topk:
+            if use_vision_topk and not getattr(self, "is_hash", False):
                 topk_output = vision_topk(
                     self,
                     router_logits,
@@ -1415,7 +1415,7 @@ class DeepseekV2MoE(nn.Module):
             )
             if router_logits_partials is not None:
                 topk_kwargs["router_logits_partials"] = router_logits_partials
-            if use_vision_topk:
+            if use_vision_topk and not getattr(self, "is_hash", False):
                 topk_output = vision_topk(
                     self,
                     router_logits,
