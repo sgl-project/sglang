@@ -22,11 +22,8 @@ from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    FINISH_ABORT,
-    Req,
-    ReqKvInfo,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
