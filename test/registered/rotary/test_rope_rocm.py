@@ -1,8 +1,12 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding, rope_variant
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding import base as rotary_base
+from sglang.srt.layers.rotary_embedding import rope_variant
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -187,18 +191,7 @@ class TestDeepseekScalingRopeAiterGfx1250(CustomTestCase):
                     self._run_case(is_neox, num_tokens, num_heads)
 
     def test_rebuilds_after_cache_growth(self) -> None:
-        rope = rope_variant.DeepseekScalingRotaryEmbedding(
-            64,
-            64,
-            256,
-            50000,
-            False,
-            1.0,
-            torch.bfloat16,
-            mscale=1.0,
-            mscale_all_dim=1.0,
-            device="cuda",
-        ).to("cuda")
+        rope = self._small_rope()
         q = torch.randn(4, 16, 64, dtype=torch.bfloat16, device="cuda")
         k = torch.randn(4, 1, 64, dtype=torch.bfloat16, device="cuda")
         rope(torch.arange(4, device="cuda"), q.clone(), k.clone())
@@ -212,6 +205,59 @@ class TestDeepseekScalingRopeAiterGfx1250(CustomTestCase):
         self.assertIs(rope._aiter_cos_sin[0], rope.cos_sin_cache)
         torch.testing.assert_close(q_out, q_ref, atol=3e-2, rtol=2e-2)
         torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
+
+    def _small_rope(self) -> rope_variant.DeepseekScalingRotaryEmbedding:
+        return rope_variant.DeepseekScalingRotaryEmbedding(
+            64,
+            64,
+            256,
+            50000,
+            False,
+            1.0,
+            torch.bfloat16,
+            mscale=1.0,
+            mscale_all_dim=1.0,
+            device="cuda",
+        ).to("cuda")
+
+    def test_rebuilds_on_dtype_change(self) -> None:
+        rope = self._small_rope()
+        positions = torch.arange(4, device="cuda")
+        for dtype in (torch.bfloat16, torch.float16, torch.bfloat16):
+            q = torch.randn(4, 16, 64, dtype=dtype, device="cuda")
+            k = torch.randn(4, 1, 64, dtype=dtype, device="cuda")
+            q_ref, k_ref = rope.forward_native(positions, q.clone(), k.clone())
+            q_out, k_out = rope(positions, q.clone(), k.clone())
+            self.assertEqual(rope._aiter_cos_sin[1].dtype, dtype)
+            torch.testing.assert_close(q_out, q_ref, atol=3e-2, rtol=2e-2)
+            torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
+
+    def test_offsets_and_aliased_key_use_native(self) -> None:
+        rope = self._small_rope()
+        positions = torch.arange(4, device="cuda")
+        q = torch.randn(4, 16, 64, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(4, 1, 64, dtype=torch.bfloat16, device="cuda")
+        offsets = torch.full((4,), 7, device="cuda")
+        q_ref, k_ref = rope.forward_native(positions, q.clone(), k.clone(), offsets)
+        q_out, k_out = rope(positions, q.clone(), k.clone(), offsets)
+        torch.testing.assert_close(q_out, q_ref, atol=3e-2, rtol=2e-2)
+        torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
+
+        k_ref = rope.forward_native(positions, k.clone(), k.clone())[1]
+        k_in = k.clone()
+        k_out = rope(positions, k_in, k_in)[1]
+        torch.testing.assert_close(k_out, k_ref, atol=3e-2, rtol=2e-2)
+
+    def test_force_native_keeps_native(self) -> None:
+        exec_ctx = SimpleNamespace(
+            deterministic=SimpleNamespace(rl_on_policy_target="fsdp")
+        )
+        with (
+            patch.object(rotary_base, "publish_role", return_value="rollout"),
+            patch.object(rotary_base, "get_exec", return_value=exec_ctx),
+        ):
+            rope = self._small_rope()
+        self.assertEqual(rope._forward_method, rope.forward_native)
 
 
 if __name__ == "__main__":

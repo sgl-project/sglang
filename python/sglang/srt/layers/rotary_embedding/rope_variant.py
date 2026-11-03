@@ -386,7 +386,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         self._aiter_cos_sin = None
-        if _use_aiter_rope_gfx1250:
+        if _use_aiter_rope_gfx1250 and not self._force_native:
             self._forward_method = self._forward_aiter_cached
         elif _is_hip:
             self._forward_method = self.forward_native
@@ -410,11 +410,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """aiter's cached-positions rope kernel, in place, on this module's own
-        cos_sin_cache. The module stays sglang's because ROCm MLA decode paths
-        read cos_sin_cache, which aiter's rope module does not have."""
-        if offsets is not None:
-            # The cached-positions kernel takes no offsets.
+        # The cached-positions kernel takes no offsets, and being in place it
+        # would rotate a key passed as its own query twice.
+        if offsets is not None or query.data_ptr() == key.data_ptr():
             return self.forward_native(positions, query, key, offsets)
 
         cached = self._aiter_cos_sin
