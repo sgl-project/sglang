@@ -1,6 +1,6 @@
 """Unit tests for modelopt_fp4 checkpoints that quantize Qwen3.5 attention.
 
-Covers three things:
+Covers four things:
   1. ModelOptFp4Config.is_layer_excluded() decides per prefix whether attention is
      quantized or kept in BF16.
   2. RadixAttention registers k_scale/v_scale when built with a quant_config that
@@ -8,16 +8,20 @@ Covers three things:
      load into and silently fall back to 1.0.
   3. QWEN3_5_KV_SCALE_MAPPER remaps the checkpoint's baked KV-scale names onto the
      RadixAttention parameter names.
-  4. The dense-MLP SiLU+FP4 fusion stays off where down_proj cannot take its
-     (fp4, scale) tuple: NVFP4 AWQ, sequence parallelism, a LoRA-wrapped down_proj.
+  4. The dense-MLP SiLU+FP4 fusion turns on for NVFP4 W4A4 and stays off where
+     down_proj cannot take its (fp4, scale) tuple: NVFP4 AWQ, the Marlin FP4 GEMM
+     backend, sequence parallelism, a LoRA-wrapped down_proj.
 """
 
+import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.quantization import fp4_utils
+from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -183,17 +187,45 @@ class TestSiluFp4QuantFusionGates(CustomTestCase):
         with get_forward().scoped(sp_active=True):
             self.assertFalse(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
 
-    def test_stays_off_for_nvfp4_awq(self):
-        # The fused producer would skip AWQ's per-input-channel pre_quant_scale.
+    @staticmethod
+    def _enables_fusion(*, is_awq: bool, backend: Fp4GemmRunnerBackend) -> bool:
         method = MagicMock(spec=ModelOptFp4LinearMethod, quant_mode="w4a4")
-        method.quant_config = SimpleNamespace(is_awq=True)
+        method.quant_config = SimpleNamespace(is_awq=is_awq)
         mlp = SimpleNamespace(
             _enable_silu_fp4_quant_fusion=False,
             gate_up_proj=SimpleNamespace(quant_method=method),
             down_proj=SimpleNamespace(quant_method=method),
         )
-        maybe_enable_silu_fp4_quant_fusion(mlp)
-        self.assertFalse(mlp._enable_silu_fp4_quant_fusion)
+        # A stand-in FlashInfer keeps the result independent of the installed one.
+        flashinfer = SimpleNamespace(silu_and_mul_scaled_nvfp4_experts_quantize=None)
+        with (
+            patch.dict(sys.modules, {"flashinfer": flashinfer}),
+            patch.object(fp4_utils, "FP4_GEMM_RUNNER_BACKEND", backend),
+        ):
+            maybe_enable_silu_fp4_quant_fusion(mlp)
+        return mlp._enable_silu_fp4_quant_fusion
+
+    def test_turns_on_for_w4a4_on_a_native_fp4_backend(self):
+        self.assertTrue(
+            self._enables_fusion(
+                is_awq=False, backend=Fp4GemmRunnerBackend.FLASHINFER_CUTLASS
+            )
+        )
+
+    def test_stays_off_for_nvfp4_awq(self):
+        # The fused producer would skip AWQ's per-input-channel pre_quant_scale.
+        self.assertFalse(
+            self._enables_fusion(
+                is_awq=True, backend=Fp4GemmRunnerBackend.FLASHINFER_CUTLASS
+            )
+        )
+
+    def test_stays_off_for_the_marlin_backend(self):
+        # Marlin, the SM80-SM90 default, takes a floating-point input;
+        # handing it the (fp4, scale) tuple crashes the first forward.
+        self.assertFalse(
+            self._enables_fusion(is_awq=False, backend=Fp4GemmRunnerBackend.MARLIN)
+        )
 
 
 if __name__ == "__main__":

@@ -395,10 +395,12 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
     Replaces the separate act_and_mul and per-token FP4 quantize kernels with
     one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
     tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
-    linear method without AWQ; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    linear method without AWQ and the FP4 GEMM backend is not Marlin;
+    kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
     """
     if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
         return
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 
     if not (
@@ -409,6 +411,9 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
         return
     # The fused producer does not apply AWQ's per-input-channel scale.
     if mlp.down_proj.quant_method.quant_config.is_awq:
+        return
+    # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
+    if get_fp4_gemm_runner_backend().is_marlin():
         return
     try:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
