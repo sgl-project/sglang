@@ -589,5 +589,6 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
     "token_space_preprocess_cache_trust_url",
+    "enable_token_space_preprocess_cache",
 )
 # fmt: on
