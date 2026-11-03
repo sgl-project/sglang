@@ -11,7 +11,7 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.gemm.sm120_nvfp4_moe import nvfp4_moe_swiglu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="nightly", runner_config="1-gpu-small")
 
 # (num_experts, top_k, hidden, intermediate): Qwen3.8-Flash-Next, Qwen3-30B-A3B.
 SHAPES = [(512, 10, 2560, 640), (128, 8, 2048, 768)]
