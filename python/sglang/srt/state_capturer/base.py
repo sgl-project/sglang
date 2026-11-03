@@ -136,6 +136,8 @@ class BaseTopkCapturer:
         self.num_layers = num_layers
         self.topk_size = topk_size
         self._pre_read_hooks: List[Callable[[], None]] = []
+        # Rows of host-tier KV slots (hierarchical cache); see alloc_host_tier_cache.
+        self.host_tier_cache: Optional[BaseHostCache] = None
 
         self.host_cache = BaseHostCache(
             num_tokens, num_layers, topk_size, name=name, device=device
@@ -155,8 +157,21 @@ class BaseTopkCapturer:
         """Run hook before every get_topk, to land pending row copies."""
         self._pre_read_hooks.append(hook)
 
+    def alloc_host_tier_cache(self, num_tokens: int, device: str) -> BaseHostCache:
+        """Allocate rows for num_tokens host-tier KV slots, freed with the capturer."""
+        self.host_tier_cache = BaseHostCache(
+            num_tokens=num_tokens,
+            num_layers=self.num_layers,
+            topk_size=self.topk_size,
+            name=f"{self.host_cache.name}_hicache",
+            device=device,
+        )
+        return self.host_tier_cache
+
     def destroy(self):
         self.host_cache.destroy()
+        if self.host_tier_cache is not None:
+            self.host_tier_cache.destroy()
 
     def _get_local_slice(
         self,
