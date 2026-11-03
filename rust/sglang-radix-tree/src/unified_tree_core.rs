@@ -420,6 +420,7 @@ pub enum PoolName {
     Draft,
     DraftIndexer,
     DraftSwa,
+    DraftMamba,
 }
 
 /// Result of a HiCache pool transfer.
