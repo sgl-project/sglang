@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     EXTRA_TARGET_LATENT_FRAMES,
     CausalDecodeQueue,
+    CosmosDreamsPrepareStage,
     CosmosDreamsRolloutStage,
     _RolloutContext,
     actions_for_frames,
@@ -889,6 +890,35 @@ class TestCosmosDreamsKVBuffer(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "history_max_frames"):
             stage._rollout(batch)
 
+    def test_frustum_requires_an_image_and_complete_archive(self):
+        """The selected working set assumes the archive retains every past
+        frame; sliding and image-free requests must fail before entering it.
+        """
+        stage = object.__new__(CosmosDreamsPrepareStage)
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(frustum_geometry={}), num_frames=9
+        )
+        for profile, has_image, message in (
+            (None, True, "history_mode='full'"),
+            (SimpleNamespace(history_mode="sliding"), True, "history_mode='full'"),
+            (SimpleNamespace(history_mode="full"), False, "conditioning image"),
+            (
+                SimpleNamespace(history_mode="full", window_frames=1, sink_frames=0),
+                True,
+                "whole rollout",
+            ),
+        ):
+            with self.subTest(profile=profile, has_image=has_image):
+                stage.profile = profile
+                with self.assertRaisesRegex(ValueError, message):
+                    stage._frustum_selector(
+                        batch, rows=None, target_frame=3, has_image=has_image
+                    )
+        batch.sampling_params.frustum_geometry = None
+        self.assertIsNone(
+            stage._frustum_selector(batch, rows=None, target_frame=3, has_image=False)
+        )
+
     def test_clean_forward_commits_resident_suffix_instead_of_noise(self):
         cache = CosmosDreamsKVCache(
             [(torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1))],
@@ -1069,9 +1099,9 @@ class TestCosmosDreamsKVBuffer(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "selected history exceeds"):
             working.load_selected(archive, list(range(6)), tokens_per_frame=2)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA gather stream")
-    def test_frustum_gather_orders_archive_writes_reads_and_working_set_reuse(self):
-        """Delay both producer and gather so missing ready/reuse dependencies
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA copy stream")
+    def test_frustum_copy_orders_archive_writes_reads_and_working_set_reuse(self):
+        """Delay both producer and copies so missing ready/reuse dependencies
         corrupt snapshots. Keep all comparisons off the host until completion.
         """
 
@@ -1103,38 +1133,46 @@ class TestCosmosDreamsKVBuffer(CustomTestCase):
             max_current_frames=2,
             max_history_frames=5,
         )
-        original_select = torch.index_select
+        original_copy = torch.Tensor.copy_
+        selections = ([0, 2, 5], [1, 3], [], [0, 4, 5])
 
-        def delayed_select(source, *args, **kwargs):
-            if source.is_cuda and torch.cuda.current_stream() == working._stream:
-                torch.cuda._sleep(1_000_000)
-            return original_select(source, *args, **kwargs)
+        def delayed_copy(dest, source, *args, **kwargs):
+            if (
+                dest.is_cuda
+                and torch.cuda.current_stream(dest.device) == working._stream
+            ):
+                torch.cuda._sleep(5_000_000)
+            return original_copy(dest, source, *args, **kwargs)
 
         snapshots = []
-        with archive, working, mock.patch.object(torch, "index_select", delayed_select):
+        with archive, working, mock.patch.object(torch.Tensor, "copy_", delayed_copy):
             for frame in range(1, 7):
                 torch.cuda._sleep(1_000_000)
                 self._stage(archive, pairs(float(frame), "cuda"))
                 archive.commit(2)
-            for ids in ([0, 2, 5], [1, 3], [], [0, 4, 5]):
+            for ids in selections:
                 working.load_selected(archive, ids, tokens_per_frame=2)
-                # Pressure the allocating stream after the indices leave scope.
                 for _ in range(4):
-                    torch.zeros(len(ids) * 2, dtype=torch.long, device="cuda")
-                    self._stage(working, pairs(-100.0, "cuda"))
-                torch.cuda._sleep(1_000_000)
+                    views = self._stage(working, pairs(-100.0, "cuda"))
+                    # Observe the actual attention inputs, without adding a
+                    # second ready wait through cache.__getitem__.
+                    snapshots.append(
+                        ([tuple(t.clone() for t in pair) for pair in views], ids)
+                    )
+                # The next copy must not overtake these preceding readers.
+                torch.cuda._sleep(20_000_000)
                 snapshots.append(
-                    ([tuple(t.clone() for t in working[i]) for i in range(3)], ids)
+                    ([tuple(t.clone() for t in pair) for pair in views], ids)
                 )
         for actual, ids in snapshots:
             expected = [
                 tuple(
                     torch.cat(
-                        [pairs(float(frame + 1), "cpu")[layer][kind] for frame in ids],
+                        [pairs(0.0, "cpu")[layer][kind]]
+                        + [pairs(float(frame + 1), "cpu")[layer][kind] for frame in ids]
+                        + [pairs(-100.0, "cpu")[layer][kind]],
                         dim=1,
                     )
-                    if ids
-                    else torch.empty(1, 0, 2, 8)
                     for kind in range(2)
                 )
                 for layer in range(3)
@@ -1223,26 +1261,46 @@ class TestCosmosDreamsKVBuffer(CustomTestCase):
                         for a, b in zip(actual_pair, expected_pair):
                             torch.testing.assert_close(a.cpu(), b, rtol=0, atol=0)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA compaction stream")
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA side stream")
     def test_exception_drains_side_stream_before_request_buffers_are_released(self):
-        cache = CosmosDreamsKVCache(
-            [(torch.zeros(1, 1, 1, 1, device="cuda"),) * 2],
-            tokens_per_frame=1,
-            sink_frames=0,
-            window_frames=1,
-            max_current_frames=1,
-        )
+        text = [(torch.zeros(1, 1, 1, 1, device="cuda"),) * 2]
         clean = [(torch.ones(1, 1, 1, 1, device="cuda"),) * 2]
-        self._stage(cache, clean)
-        cache.commit(1)
-        with self.assertRaisesRegex(RuntimeError, "request failed"):
-            with cache:
-                with torch.cuda.stream(cache._stream):
-                    torch.cuda._sleep(50_000_000)
-                self._stage(cache, clean)
-                cache.commit(1)
-                raise RuntimeError("request failed")
-        self.assertTrue(cache._stream.query())
+        for gather in (False, True):
+            with self.subTest(gather=gather):
+                archive = CosmosDreamsKVCache(
+                    text,
+                    tokens_per_frame=1,
+                    sink_frames=0,
+                    window_frames=2 if gather else 1,
+                    max_history_frames=1,
+                    max_current_frames=1,
+                )
+                self._stage(archive, clean)
+                archive.commit(1)
+                cache = (
+                    CosmosDreamsKVCache(
+                        text,
+                        tokens_per_frame=1,
+                        sink_frames=0,
+                        window_frames=2,
+                        max_history_frames=1,
+                        max_current_frames=1,
+                    )
+                    if gather
+                    else archive
+                )
+                with self.assertRaisesRegex(RuntimeError, "request failed"):
+                    with cache:
+                        if gather:
+                            cache.load_selected(archive, [0], tokens_per_frame=1)
+                        else:
+                            self._stage(cache, clean)
+                            cache.commit(1)
+                        with torch.cuda.stream(cache._stream):
+                            torch.cuda._sleep(50_000_000)
+                        raise RuntimeError("request failed")
+                self.assertTrue(cache._stream.query())
+                self.assertFalse(any(cache._pending))
 
 
 UNIFIED_FIELDS = [

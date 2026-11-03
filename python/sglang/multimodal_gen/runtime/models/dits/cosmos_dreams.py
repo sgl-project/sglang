@@ -164,7 +164,7 @@ class CosmosDreamsKVCache(Sequence[KVPair]):
         frame_ids: Sequence[int],
         tokens_per_frame: int,
     ) -> None:
-        """Gather a chunk's selected history once, ready one layer at a time."""
+        """Copy a chunk's selected history once, ready one layer at a time."""
         ids = list(frame_ids)
         stored = archive.history_tokens // tokens_per_frame
         if ids != sorted(set(ids)) or (ids and (ids[0] < 0 or ids[-1] >= stored)):
@@ -176,33 +176,33 @@ class CosmosDreamsKVCache(Sequence[KVPair]):
         if count > self.history_capacity:
             raise ValueError("Cosmos-Dreams selected history exceeds its capacity.")
         device = self._buffers[0].device
-        positions = torch.tensor(
-            [
-                archive.text_tokens + frame * tokens_per_frame + token
-                for frame in ids
-                for token in range(tokens_per_frame)
-            ],
-            dtype=torch.long,
-            device=device,
-        )
+        spans = []
+        for frame in ids:
+            if spans and frame == spans[-1][1]:
+                spans[-1][1] += 1
+            else:
+                spans.append([frame, frame + 1])
         if device.type == "cuda":
             if self._stream is None:
                 self._stream = get_stream("cosmos3_kv_gather")
                 self._ready = [torch.cuda.Event() for _ in self._buffers]
-            # Protect archive writes, the indices upload and the preceding
-            # chunk's reads before reusing this working set.
+            # Protect archive writes and the preceding chunk's reads before
+            # reusing this working set.
             self._stream.wait_stream(torch.cuda.current_stream(device))
-            positions.record_stream(self._stream)
         with torch.cuda.stream(self._stream):
             for index, (source, dest) in enumerate(
                 zip(archive._buffers, self._buffers, strict=True)
             ):
-                torch.index_select(
-                    source,
-                    2,
-                    positions,
-                    out=dest[:, :, self.text_tokens : self.text_tokens + count],
-                )
+                dest_start = self.text_tokens
+                for start, end in spans:
+                    source_start = archive.text_tokens + start * tokens_per_frame
+                    tokens = (end - start) * tokens_per_frame
+                    for kind in range(2):
+                        dest[kind, :, dest_start : dest_start + tokens].copy_(
+                            source[kind, :, source_start : source_start + tokens],
+                            non_blocking=True,
+                        )
+                    dest_start += tokens
                 if self._stream is not None:
                     self._ready[index].record()
         if self._stream is not None:
@@ -232,14 +232,22 @@ class CosmosDreamsKVCache(Sequence[KVPair]):
             self._stream.wait_stream(torch.cuda.current_stream(self._buffers[0].device))
         with torch.cuda.stream(self._stream):
             for index, buffer in enumerate(self._buffers):
-                if tail_old:
-                    # copy_ cannot compact overlapping source/destination views.
-                    scratch = self._scratch[:, :, :tail_old]
-                    scratch.copy_(buffer[:, :, old_start : old_start + tail_old])
-                    buffer[:, :, dest_start : dest_start + tail_old].copy_(scratch)
-                buffer[:, :, new_dest : new_dest + frame_tokens].copy_(
-                    buffer[:, :, new_start : new_start + frame_tokens]
-                )
+                # Copy K/V separately so each slice is contiguous.
+                for kind in range(2):
+                    if tail_old:
+                        # The source and destination overlap; stage via scratch.
+                        scratch = self._scratch[kind, :, :tail_old]
+                        scratch.copy_(
+                            buffer[kind, :, old_start : old_start + tail_old],
+                            non_blocking=True,
+                        )
+                        buffer[kind, :, dest_start : dest_start + tail_old].copy_(
+                            scratch, non_blocking=True
+                        )
+                    buffer[kind, :, new_dest : new_dest + frame_tokens].copy_(
+                        buffer[kind, :, new_start : new_start + frame_tokens],
+                        non_blocking=True,
+                    )
                 if self._stream is not None:
                     self._ready[index].record()
         if self._stream is not None:
