@@ -49,7 +49,11 @@ class TestEmbedBindBeforePoolProfiling(unittest.TestCase):
         server_args = SimpleNamespace()
         target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
-                model_config=SimpleNamespace(context_len=8192)
+                model_config=SimpleNamespace(context_len=8192),
+                # __init__ resolves the draft parallel layout from the
+                # target runner spec; a None draft model config falls back to
+                # the legacy spec for the algorithm (no model class needed).
+                spec_aux_config=SimpleNamespace(draft_model_config=None),
             ),
             random_seed=1,
         )
