@@ -377,6 +377,7 @@ class TestDisaggregationWire(unittest.TestCase):
             state_item_lens=[[32]],
             state_layer_ids=[[]],
             aux_data_ptrs=[],
+            kv_item_lens=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -420,6 +421,64 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertFalse(manager.state_strides_validated)
         self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
+
+    def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
+        """A decode KV pool with another page stride is rejected at registration.
+
+        The sender writes decode pages at ``page * prefill_item_len``, so a
+        different layout (e.g. DSA FP8 KV: 656 B/token with flashmla_*, 576 with
+        trtllm) silently corrupts the decode KV. A PP stage judges only its layers.
+        """
+        flashmla, trtllm = 656 * 64, 576 * 64
+        cases = [
+            # (prefill lens, start layer, decode lens, mla, prefill/decode TP, rejected)
+            ([flashmla] * 4, 0, [trtllm] * 4, True, (1, 1), True),
+            ([trtllm] * 2, 2, [flashmla] * 2 + [trtllm] * 2, True, (1, 1), False),
+            ([trtllm] * 2, 2, [trtllm] * 2 + [flashmla] * 2, True, (1, 1), True),
+            # TP-sliced MHA reslices heads, so its item length differs by design.
+            ([4096] * 4, 0, [2048] * 4, False, (2, 4), False),
+        ]
+        for src_lens, start, dst_lens, mla, (src_tp, dst_tp), rejected in cases:
+            with self.subTest(src_lens=src_lens, start=start, dst_lens=dst_lens):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    kv_data_ptrs=[0x1000 + i for i in range(len(src_lens))],
+                    kv_item_lens=src_lens,
+                    kv_layer_ids=[],
+                    page_size=64,
+                    num_draft_entries=0,
+                    prefill_start_layer=start,
+                    state_types=[],
+                    aux_data_ptrs=[],
+                )
+                manager.is_mla_backend = mla
+                manager.is_hybrid_mla_backend = False
+                manager.attn_tp_size = src_tp
+                manager.pp_size = 2 if start else 1
+                manager.session_lock = threading.Lock()
+                manager.failed_sessions = set()
+                manager.session_failures = defaultdict(int)
+                manager.failed_session_probes = {}
+                manager.state_layout_rejections = {}
+                manager.state_strides_validated = set()
+                manager.decode_kv_args_table = {}
+                info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_kv_ptrs=[0x2000 + i for i in range(len(dst_lens))],
+                    dst_kv_item_lens=dst_lens,
+                    dst_kv_layer_ids=[],
+                    dst_attn_tp_size=dst_tp,
+                    requires_dcp_relayout=False,
+                    dst_aux_ptrs=[],
+                )
+                with get_context().override_server_args(enable_unified_memory=False):
+                    mismatch = manager._publish_peer_registration("decode", info)
+                if not rejected:
+                    self.assertIsNone(mismatch)
+                    continue
+                self.assertIn("PD KV layout mismatch", mismatch)
+                self.assertIn(f"prefill={src_lens[0]} decode={dst_lens[-1]}", mismatch)
+                self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
 
     def test_mooncake_unpublished_state_metadata_keeps_the_transfer_check(self):
         """An unpublished component cannot be judged; keep the transfer check."""
