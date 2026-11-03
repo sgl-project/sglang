@@ -50,6 +50,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     get_request_skip_softmax_params,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_deepsymm_ring import (
+    deepsymm_ring_attn,
+    deepsymm_ring_precision,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_attn_backend,
     get_component_attn_backend_context,
@@ -1592,14 +1596,33 @@ class USPAttention(nn.Module):
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
-            out = ring_attn(
-                q,
-                k,
-                v,
-                attn_impl=self.attn_impl,
-                is_causal=self.causal,
-                dropout_p=self.dropout_p,
+            deepsymm_precision = (
+                deepsymm_ring_precision(
+                    q,
+                    self.attn_impl,
+                    causal=self.causal,
+                    is_cross_attention=self.is_cross_attention,
+                )
+                if q.is_xpu
+                else None
             )
+            if deepsymm_precision is not None:
+                out = deepsymm_ring_attn(
+                    q,
+                    k,
+                    v,
+                    ring_group=get_sp_group().ring_group,
+                    precision=deepsymm_precision,
+                )
+            else:
+                out = ring_attn(
+                    q,
+                    k,
+                    v,
+                    attn_impl=self.attn_impl,
+                    is_causal=self.causal,
+                    dropout_p=self.dropout_p,
+                )
         else:
             # -> [B, S, H_local, D]
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
