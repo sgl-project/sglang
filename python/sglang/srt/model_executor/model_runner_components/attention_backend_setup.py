@@ -98,19 +98,6 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             decode_attention_backend_str="mamba2",
         )
 
-    if (
-        get_parallel().dcp_enabled
-        and get_memory().enable_hierarchical_cache
-        and not model_runner.use_mla_backend
-    ):
-        from sglang.srt.model_executor.model_runner_components.layer_setup import (
-            check_mha_dcp_kv_heads,
-        )
-
-        check_mha_dcp_kv_heads(
-            model=model_runner.model, kv_pool=model_runner.token_to_kv_pool
-        )
-
     server_args = model_runner.server_args
 
     # Already resolved and stamped on the runner before this call.

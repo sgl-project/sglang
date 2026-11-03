@@ -581,6 +581,7 @@ def test_hicache_transfer_mha(layout: str, element_dim: int) -> None:
     _run_transfer_roundtrip_mha(layout, element_dim)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="GQA DCP HiCache requires CUDA")
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -675,12 +676,6 @@ def test_gqa_dcp_kv_roundtrip(dtype, layout, io, dcp_size, dcp_rank):
     finally:
         torch.cuda.synchronize()
         host.destroy()
-
-
-@pytest.mark.parametrize("io", ["kernel", "direct"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e5m2])
-def test_gqa_dcp_layer_first_roundtrip(dtype, io):
-    test_gqa_dcp_kv_roundtrip(dtype, "layer_first", io, dcp_size=4, dcp_rank=3)
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
