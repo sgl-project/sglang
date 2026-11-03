@@ -109,7 +109,7 @@ jobs:
           touch "${GITHUB_WORKSPACE}/github_summary.md"
           TEST_EXIT_CODE=0
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
-            -e PYTHONPATH=/root/miles:/opt/tilelang \
+            -e PYTHONPATH=/root/miles:/sgl-workspace/sglang/python:/opt/tilelang \
             -e CI=true \
             -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --cadence nightly \
