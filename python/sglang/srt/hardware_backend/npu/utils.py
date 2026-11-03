@@ -336,12 +336,9 @@ def get_indexer_weight_stream():
     return indexer_weight_stream
 
 
-def prewarm_aicpu(storage_backend: Optional[str]):
+def prewarm_aicpu():
     """Start custom AiCPU after HCCL is ready and before MemFabric maps memory."""
     from sglang.srt.runtime_context import get_parallel
-
-    if storage_backend != "npu_memcache":
-        return
 
     tp_group = get_parallel().tp_group
     device = tp_group.device

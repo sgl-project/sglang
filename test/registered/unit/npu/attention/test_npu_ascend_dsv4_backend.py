@@ -730,12 +730,6 @@ class TestAicpuPrewarm(unittest.TestCase):
         self.get_parallel = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_other_storage_backends_do_not_prewarm(self):
-        for storage in (None, "file", "mooncake"):
-            with self.subTest(storage=storage):
-                prewarm_aicpu(storage)
-        self.get_parallel.assert_not_called()
-
     def test_hccl_finishes_before_metadata_on_a3_and_a5(self):
         for arch35 in (False, True):
             events = []
@@ -762,7 +756,7 @@ class TestAicpuPrewarm(unittest.TestCase):
                 all_reduce.side_effect = lambda *a, **kw: events.append("hccl")
                 npu.synchronize.side_effect = lambda device: events.append("aicpu_sync")
 
-                prewarm_aicpu("npu_memcache")
+                prewarm_aicpu()
 
                 self.assertEqual(
                     events, ["hccl", "hccl_sync", "metadata", "aicpu_sync"]
@@ -804,7 +798,7 @@ class TestAicpuPrewarm(unittest.TestCase):
                 )
                 failed_call.side_effect = RuntimeError("HCCL initialization failed")
                 with self.assertRaisesRegex(RuntimeError, "HCCL initialization failed"):
-                    prewarm_aicpu("npu_memcache")
+                    prewarm_aicpu()
                 ops.npu_sparse_attn_sharedkv_metadata.assert_not_called()
                 ops.npu_kv_quant_sparse_attn_sharedkv_metadata.assert_not_called()
 

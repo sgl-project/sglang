@@ -835,10 +835,10 @@ class Scheduler(
             )  # only switch allocator if is mix mode
 
     def prewarm_aicpu_on_npu(self):
-        if _is_npu:
+        if _is_npu and self.server_args.hicache_storage_backend == "npu_memcache":
             from sglang.srt.hardware_backend.npu.utils import prewarm_aicpu
 
-            prewarm_aicpu(self.server_args.hicache_storage_backend)
+            prewarm_aicpu()
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
