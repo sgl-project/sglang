@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -23,7 +24,8 @@ _FLOAT4_BYTES = 16
 
 @cache_once
 def _jit_vdn_delta_factors_module() -> Module:
-    if torch.cuda.get_device_capability()[0] < 8:
+    cuda = current_arch().cuda
+    if cuda is not None and cuda.major < 8:
         raise RuntimeError(
             "vdn_delta_factors needs SM80 or later (2 x 70 KB shared memory per SM)"
         )
@@ -80,7 +82,7 @@ def can_use_vdn_delta_factors(
         and not torch.version.hip
         and dtype is torch.float32
         and head_dim == HEAD_DIM
-        and torch.cuda.get_device_capability(device)[0] >= 8
+        and current_arch().is_sm_at_least(8)
     )
 
 

@@ -37,12 +37,15 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
-from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
+    ep_joiner_of,
+    ep_scale_joiner_of,
     model_config_of,
+    resolving_view,
+)
+from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_result,
-    resolving_view,
 )
 from sglang.srt.arg_groups.validation_hook import (
     validate_mps_model_config,
@@ -94,10 +97,6 @@ def _real_kv_hash_modes():
 
     return list(RealKvHashMode)
 
-
-# Compatibility re-exports for callers importing through server_args.
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg  # noqa: F401
-from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
 
 # Public choice lists and plugin registration helpers.
 from sglang.srt.arg_groups.choices import (  # noqa: F401
@@ -182,18 +181,6 @@ from sglang.srt.arg_groups.fields.spec import (
     Spec,
 )
 from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
-from sglang.srt.lora.lora_registry import LoRARef  # noqa: F401
-from sglang.srt.model_executor.cuda_graph_config import (  # noqa: F401
-    CudaGraphConfig,
-    parse_cuda_graph_config_arg,
-)
-from sglang.srt.utils.common import (  # noqa: F401
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
 
 # Re-exported like the imports above, but resolved on first use: importing them
 # eagerly is what the choices helpers avoid, and most processes never read them.
