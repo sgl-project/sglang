@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.deferred_responses import (
@@ -24,6 +24,14 @@ class FakeReq(SimpleNamespace):
 
     __eq__ = object.__eq__
     __hash__ = object.__hash__
+
+
+def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> _RequestList:
+    """A PD decode queue of `kind` holding `decode_reqs`, each a wrapper with
+    `.req`."""
+    queue = _RequestList(kind, req_of=lambda x: x.req)
+    queue.join(decode_reqs)
+    return queue
 
 
 def empty_request_lists(scheduler: Scheduler) -> None:

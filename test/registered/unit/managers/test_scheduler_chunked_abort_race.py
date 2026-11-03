@@ -15,7 +15,8 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
+from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
 
