@@ -93,6 +93,7 @@ class TestRequestReceiverCompatibility(CustomTestCase):
             last_batch=object(),
             scripted_scheduler_hook=None,
             scheduler_stage_metrics=None,
+            uocr_runtime=None,
         )
         for mode in (False, True):
             with self.subTest(rust_server_mode=mode):

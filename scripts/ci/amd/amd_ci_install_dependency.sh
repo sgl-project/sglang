@@ -408,6 +408,17 @@ elif [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]
     NEED_REBUILD="true"
 elif [[ "${IMAGE_AITER_VERSION}" == "${REPO_AITER_COMMIT}" ]]; then
     echo "[CI-AITER-CHECK] AITER version matches"
+elif [[ ( "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ) && "${IMAGE_AITER_VERSION}" =~ \+g([0-9a-f]+) ]]; then
+    # Version carries the short commit it was built from (e.g. v0.1.26.dev144+g285579b62.d20261027).
+    # Compare it with the Dockerfile pin, so an image older than a pin bump gets the pinned AITER.
+    IMAGE_AITER_HASH="${BASH_REMATCH[1]}"
+    if [[ "${REPO_AITER_COMMIT}" == "${IMAGE_AITER_HASH}"* ]]; then
+        echo "[CI-AITER-CHECK] AITER commit matches: image=${IMAGE_AITER_HASH}, repo=${REPO_AITER_COMMIT} → skipping rebuild"
+    else
+        echo "[CI-AITER-CHECK] AITER commit mismatch: image=${IMAGE_AITER_HASH} (${IMAGE_AITER_VERSION}), repo=${REPO_AITER_COMMIT}"
+        echo "[CI-AITER-CHECK] The CI image was likely built before the Dockerfile AITER pin changed → rebuilding AITER at ${REPO_AITER_COMMIT} (this adds significant job time)"
+        NEED_REBUILD="true"
+    fi
 elif [[ "${IMAGE_AITER_VERSION}" =~ (dev|\+g[0-9a-f]+) ]]; then
     # Dev/patched version (contains 'dev' or git hash) → preserve it
     echo "[CI-AITER-CHECK] Dev/patched version detected: ${IMAGE_AITER_VERSION} → skipping rebuild"
@@ -445,8 +456,19 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         pip install -r requirements.txt
     "
 
+    # gfx942/gfx950: re-apply the Dockerfile's AITER patches, the v4 fp4 indexer
+    # fix and the grouped dsv4 decode .co (built from ROCm/aiter#5195's).
+    if [[ "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
+            sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
+            cp /sglang-checkout/python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co hsa/gfx950/mla_v4/
+        "
+    fi
+
     # Re-apply the Dockerfile torch.Stream patch after re-clone (ROCm/aiter#4817).
-    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
+    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" || "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
         docker exec -i ci_sglang python3 - <<'PY'
 from pathlib import Path
 p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
@@ -477,10 +499,20 @@ PY
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
     # The image already has the Dockerfile-pinned Triton; compile against it.
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
-    "
+    # gfx942/gfx950 use the Dockerfile's install command, without its
+    # PREBUILD_KERNELS=1 step (~2h per arch, past the job timeouts); kernels
+    # JIT-compile on first use.
+    if [[ "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${IMAGE_GFX} pip install --config-settings editable_mode=compat -e .
+        "
+    else
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        "
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi

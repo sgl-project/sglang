@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.configs import NanbeigeConfig
+from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -487,17 +487,6 @@ class NanbeigeForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        assert False, "NanbeigeModel does not support split_prefill."
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

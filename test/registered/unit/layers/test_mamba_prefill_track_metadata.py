@@ -16,11 +16,8 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -460,7 +457,7 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
                 enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
             )
         )
-        # reuse: the process's indices under SGLANG_Q35MF_MKH_N3B, None without it
+        # reuse: the process's indices under SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS, None without it
         with (
             patch.object(spec_utils, "get_exec", return_value=settings),
             patch.object(spec_utils, "_VERIFY_TRACK_INDICES", reuse),
