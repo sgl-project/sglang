@@ -561,6 +561,8 @@ class SamplingBatchInfo:
                     )
                 )
         if self.synthid_state is not None:
+            # Forward copies retain this metadata until their CUDA work completes.
+            self.synthid_state = dataclasses.replace(self.synthid_state)
             self.synthid_state.filter_batch(keep_indices_device, keep_indices)
         for name in (
             "watermark_keys",
@@ -669,6 +671,7 @@ class SamplingBatchInfo:
                 raise ValueError(
                     "Cannot merge batches with mismatched SynthID watermark state."
                 )
+            self.synthid_state = dataclasses.replace(self.synthid_state)
             self.synthid_state.merge_batch(other.synthid_state)
         for name in (
             "watermark_keys",
