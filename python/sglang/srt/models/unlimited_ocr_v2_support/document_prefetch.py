@@ -196,12 +196,14 @@ class DocPrefetch:
         # Vision runs on every TP rank in lockstep; it is not encoded out of step.
         self._encode_ahead = early is not None and tp_size == 1
         # Follow-ups waiting for their predecessor.
-        self._parked = _RequestList(ListKind.UOCR_PARKED, abort=self._abort_parked)
+        self._parked = _RequestList(
+            ListKind.UOCR_PARKED, abort=lambda r: self._abort(self._parked, r)
+        )
         # Completion tokens of finished predecessors whose follow-up has not arrived.
         self._finished: Dict[str, int] = {}
         # Follow-ups whose predecessor finished, for the scheduler to queue.
         self._released = _RequestList(
-            ListKind.UOCR_RELEASED, abort=self._abort_released
+            ListKind.UOCR_RELEASED, abort=lambda r: self._abort(self._released, r)
         )
 
     def park(self, req: Req) -> bool:
@@ -263,13 +265,7 @@ class DocPrefetch:
             ListKind.UOCR_RELEASED: self._released,
         }
 
-    def _abort_parked(self, recv_req: AbortReq) -> None:
-        self._abort_from(self._parked, recv_req)
-
-    def _abort_released(self, recv_req: AbortReq) -> None:
-        self._abort_from(self._released, recv_req)
-
-    def _abort_from(self, windows: RequestList, recv_req: AbortReq) -> None:
+    def _abort(self, windows: RequestList, recv_req: AbortReq) -> None:
         aborted = windows.take(lambda r: recv_req.matches(r.rid))
         for r in aborted:
             self.release_early(r.rid)

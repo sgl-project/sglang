@@ -1075,9 +1075,6 @@ class HiSparseCoordinator:
     def request_lists(self) -> Dict[ListKind, RequestList]:
         return {ListKind.HISPARSE_STAGING: self.ack_staging_queue}
 
-    def has_ongoing_staging(self) -> bool:
-        return len(self.ack_staging_queue) > 0
-
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []
         if len(self.ack_staging_queue) == 0:
