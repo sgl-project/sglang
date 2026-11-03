@@ -107,6 +107,22 @@ class ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme(ModelSlimKVCacheScheme):
             *q.shape[:-1], q.shape[-1] // 32
         )
 
+    def prepare_query(self, query, scale_layout):
+        query, q_scale = self.quantize_query(query)
+        q_heads = query.shape[-2]
+        kv_heads = self.cache_layout.local_kv_heads
+        groups = q_heads // kv_heads
+        scale_pairs = q_scale.shape[-1] // 2
+        q_scale = q_scale.reshape(query.shape[0], q_heads, scale_pairs, 2)
+        # Use the layout selected once for the shared QFA metadata plan.
+        if scale_layout == "N2TGD":
+            q_scale = (
+                q_scale.view(query.shape[0], kv_heads, groups, scale_pairs, 2)
+                .permute(1, 0, 2, 3, 4)
+                .contiguous()
+            )
+        return query, q_scale
+
     def quantize_cache(self, k, v):
         import torch_npu
 
