@@ -25,15 +25,14 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.deferred_responses import (
-    DeferredResponses,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -77,11 +76,7 @@ def _batch(reqs):
 
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
-    s.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
-    )
+    empty_request_lists(s)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
     s.waiting_queue = waiting_queue
@@ -100,7 +95,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
 class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -158,7 +153,7 @@ class TestQueuedAbort(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -174,14 +169,14 @@ class TestQueuedAbort(CustomTestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
-        s._release_aborted_request = MagicMock()
+        s.release_aborted_request = MagicMock()
 
         s.abort_request(AbortReq(rid="queued"))
         s.abort_request(AbortReq(abort_all=True))
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
-        s._release_aborted_request.assert_called_once_with(req)
+        s.release_aborted_request.assert_called_once_with(req)
 
 
 class TestRunningTimeout(CustomTestCase):

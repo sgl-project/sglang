@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    RequestList,
+    _RequestList,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.deferred_output import ResponseCompletion
@@ -31,22 +36,22 @@ class DeferredResponses:
         self.disaggregation_mode = disaggregation_mode
         self.output_streamer = output_streamer
         self.send_abort = send_abort
-        self.held: Dict[str, Tuple[Req, ResponseCompletion]] = {}
+        # (req, completion) per held response.
+        self.held = _RequestList(
+            ListKind.DEFERRED, abort=self._abort, req_of=lambda x: x[0]
+        )
 
-    def held_reqs(self) -> List[Req]:
-        return [req for req, _ in self.held.values()]
-
-    def request_lists(self) -> Dict[str, List[Req]]:
-        return {"deferred": self.held_reqs()}
+    def request_lists(self) -> Dict[ListKind, RequestList]:
+        return {ListKind.DEFERRED: self.held}
 
     def defer(self, req: Req, completion: ResponseCompletion) -> None:
         if self.disaggregation_mode != DisaggregationMode.NULL:
             raise ValueError("deferred responses do not support PD disaggregation")
         if not req.finished() or req.finished_output:
             raise ValueError("only finished, unstreamed responses can be deferred")
-        if req.rid in self.held:
+        if any(held.rid == req.rid for held in self.held):
             raise ValueError(f"response {req.rid!r} is already deferred")
-        self.held[req.rid] = (req, completion)
+        self.held.join([(req, completion)])
         req.defer_output = True
         self.output_streamer.defer_outputs = True
 
@@ -54,15 +59,15 @@ class DeferredResponses:
         if not self.held:
             return
         ready = []
-        for rid, (req, completion) in list(self.held.items()):
+        for req, completion in self.held.items():
             if not completion.done():
                 continue
-            del self.held[rid]
+            self.held.leave([req])
             req.defer_output = False
             try:
                 completion.result()
             except Exception as exc:
-                logger.exception("Deferred response failed for %s", rid)
+                logger.exception("Deferred response failed for %s", req.rid)
                 self._abort_response(
                     req, FINISH_ABORT(str(exc), status_code=500).to_json()
                 )
@@ -83,12 +88,12 @@ class DeferredResponses:
         req.finished_output = True
         self.send_abort(req, finished_reason)
 
-    def abort(self, recv_req: AbortReq) -> None:
-        for rid, (req, completion) in list(self.held.items()):
-            if recv_req.abort_all or rid.startswith(recv_req.rid):
-                del self.held[rid]
+    def _abort(self, recv_req: AbortReq) -> None:
+        for req, completion in self.held.items():
+            if recv_req.matches(req.rid):
+                self.held.leave([req])
                 try:
                     completion.cancel()
                 except Exception:
-                    logger.exception("Failed to cancel deferred work for %s", rid)
+                    logger.exception("Failed to cancel deferred work for %s", req.rid)
                 self._abort_response(req, recv_req.finished_reason)

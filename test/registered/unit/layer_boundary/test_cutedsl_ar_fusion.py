@@ -22,7 +22,7 @@ from sglang.srt.layers.layer_boundary import (
     UnreducedOutput,
     complete_owed,
 )
-from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attn_input_fusions,
     ffn_input_fusions,
