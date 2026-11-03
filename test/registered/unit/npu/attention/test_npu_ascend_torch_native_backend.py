@@ -4,6 +4,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_torch_native_bac
 
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -853,13 +854,59 @@ def encoder_decoder_reference(
 
 
 class TestEncoderDecoderGraph(unittest.TestCase):
+    def test_eager_reads_all_tokens_beyond_graph_limit(self):
+        torch.manual_seed(42)
+        query = torch.randn(1, 2, 64)
+        keys = torch.randn(16, 2, 64)
+        values = torch.randn_like(keys)
+        table = torch.randperm(16).reshape(2, 8)
+        rows = torch.tensor([1])
+        lengths = torch.tensor([4])
+        encoder_lengths = torch.tensor([3])
+        for cross in (False, True):
+            output = AscendTorchNativeAttnBackend().run_sdpa_forward_decode(
+                query,
+                torch.empty_like(query),
+                keys,
+                values,
+                table,
+                rows,
+                lengths,
+                encoder_lens=encoder_lengths,
+                is_cross_attention=cross,
+                scaling=0.125,
+                max_kv_tokens=2,
+            )
+            expected = encoder_decoder_reference(
+                query,
+                keys,
+                values,
+                table,
+                rows,
+                lengths,
+                encoder_lengths,
+                cross,
+                0.125,
+            )
+            torch.testing.assert_close(output, expected)
+
     def test_graph_spans_match_independent_reference(self):
         """Graph SDPA must use encoder offsets and ignore poisoned padding slots."""
-        for cross in (False, True):
+        for cross, max_kv_tokens in (
+            (False, None),
+            (False, 3),
+            (False, 20),
+            (True, None),
+            (True, 2),
+            (True, 20),
+        ):
             for kv_heads in (2, 4):
                 for value_dimension in (40, 64):
                     with self.subTest(
-                        cross=cross, kv_heads=kv_heads, value_dimension=value_dimension
+                        cross=cross,
+                        kv_heads=kv_heads,
+                        value_dimension=value_dimension,
+                        max_kv_tokens=max_kv_tokens,
                     ):
                         torch.manual_seed(42)
                         query = torch.randn(3, 4, 64)
@@ -879,20 +926,36 @@ class TestEncoderDecoderGraph(unittest.TestCase):
                             (torch.zeros(1, dtype=torch.long), torch.randperm(80) + 1)
                         )
                         output = torch.empty(3, 4, value_dimension)
-                        actual = AscendTorchNativeAttnBackend().run_sdpa_forward_decode(
-                            query,
-                            output,
-                            keys,
-                            values,
-                            table,
-                            rows,
-                            lengths,
-                            encoder_lens=encoder_lengths,
-                            is_cross_attention=cross,
-                            scaling=0.17,
-                            enable_gqa=kv_heads != 4,
-                            full_to_swa_mapping=mapping,
-                            is_encoder_decoder_graph=True,
+                        with patch(
+                            "sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend.scaled_dot_product_attention",
+                            wraps=scaled_dot_product_attention,
+                        ) as attention:
+                            actual = (
+                                AscendTorchNativeAttnBackend().run_sdpa_forward_decode(
+                                    query,
+                                    output,
+                                    keys,
+                                    values,
+                                    table,
+                                    rows,
+                                    lengths,
+                                    encoder_lens=encoder_lengths,
+                                    is_cross_attention=cross,
+                                    scaling=0.17,
+                                    enable_gqa=kv_heads != 4,
+                                    full_to_swa_mapping=mapping,
+                                    is_encoder_decoder_graph=True,
+                                    max_kv_tokens=max_kv_tokens,
+                                )
+                            )
+                        expected_span = (
+                            min(12, max_kv_tokens) if max_kv_tokens is not None else 12
+                        )
+                        self.assertEqual(
+                            attention.call_args.args[1].shape[-2], expected_span
+                        )
+                        self.assertEqual(
+                            attention.call_args.args[2].shape[-2], expected_span
                         )
                         expected = encoder_decoder_reference(
                             query,
@@ -917,8 +980,13 @@ class TestEncoderDecoderGraph(unittest.TestCase):
     )
     def test_graph_replay_updates_requests_lengths_and_kv(self):
         """Replay must follow live request rows and cache contents after slot reuse."""
-        for cross in (False, True):
-            with self.subTest(cross=cross):
+        for cross, max_kv_tokens in (
+            (False, None),
+            (False, 4),
+            (True, None),
+            (True, 4),
+        ):
+            with self.subTest(cross=cross, max_kv_tokens=max_kv_tokens):
                 torch.manual_seed(42)
                 query = torch.randn(3, 2, 64, device="npu", dtype=torch.float16)
                 keys = torch.randn(81, 2, 64, device="npu", dtype=torch.float16)
@@ -946,6 +1014,7 @@ class TestEncoderDecoderGraph(unittest.TestCase):
                         is_cross_attention=cross,
                         scaling=0.125,
                         is_encoder_decoder_graph=True,
+                        max_kv_tokens=max_kv_tokens,
                     )
                 torch.npu.synchronize()
                 graph = torch.npu.NPUGraph()
@@ -962,13 +1031,14 @@ class TestEncoderDecoderGraph(unittest.TestCase):
                         is_cross_attention=cross,
                         scaling=0.125,
                         is_encoder_decoder_graph=True,
+                        max_kv_tokens=max_kv_tokens,
                     )
-                for step in range(3):
+                for step, active_length in enumerate((2, 3, 4, 2)):
                     rows.copy_(
                         torch.tensor([3, 2 if step != 1 else 1, 0], device="npu")
                     )
-                    lengths[0] = 2 + step
-                    encoder_lengths[0] = 2 + step
+                    lengths[0] = active_length
+                    encoder_lengths[0] = active_length
                     table[3, :8].copy_(torch.randperm(80, device="npu")[:8] + 1)
                     query.add_(0.05)
                     values.mul_(0.95)

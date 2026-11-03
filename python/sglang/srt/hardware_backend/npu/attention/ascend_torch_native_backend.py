@@ -231,6 +231,7 @@ class AscendTorchNativeAttnBackend:
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
         is_encoder_decoder_graph: bool = False,
+        max_kv_tokens: int | None = None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -254,9 +255,10 @@ class AscendTorchNativeAttnBackend:
 
         if is_encoder_decoder_graph:
             assert encoder_lens is not None and logit_cap == 0 and not causal
-            positions = torch.arange(req_to_token.shape[1], device=query.device)[
-                None, :
-            ]
+            cache_span = req_to_token.shape[1]
+            if max_kv_tokens is not None:
+                cache_span = min(cache_span, max_kv_tokens)
+            positions = torch.arange(cache_span, device=query.device)[None, :]
             if is_cross_attention:
                 columns = positions
                 lengths = encoder_lens

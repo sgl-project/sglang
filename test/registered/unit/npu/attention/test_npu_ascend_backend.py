@@ -5,7 +5,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -30,6 +30,7 @@ for _ in (
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
+    _encoder_decoder_graph_limits,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
@@ -37,6 +38,36 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
     AscendTorchNativeAttnBackend,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+
+
+class TestEncoderDecoderGraphLimits(unittest.TestCase):
+    def test_config_limits_and_unsupported_execution_fallback(self):
+        config = SimpleNamespace(max_target_positions=448, max_source_positions=1500)
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(is_encoder_decoder=True, hf_config=config),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        )
+        parallel = SimpleNamespace(tp_size=1, pp_size=1, dp_size=1)
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+            return_value=parallel,
+        ):
+            self.assertEqual(_encoder_decoder_graph_limits(runner), (448, 1500))
+            for invalid in (None, 0, -1, True, 1.5):
+                config.max_target_positions = invalid
+                self.assertEqual(_encoder_decoder_graph_limits(runner), (None, 1500))
+            del config.max_target_positions
+            self.assertEqual(_encoder_decoder_graph_limits(runner), (None, 1500))
+            config.max_target_positions = 448
+            for field in ("tp_size", "pp_size", "dp_size"):
+                setattr(parallel, field, 2)
+                self.assertEqual(_encoder_decoder_graph_limits(runner), (None, None))
+                setattr(parallel, field, 1)
+            runner.spec_algorithm.is_none = lambda: False
+            self.assertEqual(_encoder_decoder_graph_limits(runner), (None, None))
+            runner.spec_algorithm.is_none = lambda: True
+            runner.model_config.is_encoder_decoder = False
+            self.assertEqual(_encoder_decoder_graph_limits(runner), (None, None))
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -586,6 +617,7 @@ class TestEncoderDecoderGraphRouting(unittest.TestCase):
         )
         backend.graph_mode = backend.enable_torch_compile = True
         backend.native_attn = AscendTorchNativeAttnBackend()
+        backend.encoder_decoder_graph_max_tokens = (2, 3)
         backend.req_to_token_pool = SimpleNamespace(req_to_token=table)
         backend.token_to_kv_pool = SimpleNamespace(
             get_key_buffer=lambda layer_id: keys[layer_id],
