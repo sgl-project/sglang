@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_npu,
     monkey_patch_p2p_access_check,
 )
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import register_sgl_tp_rank
 
@@ -109,6 +110,8 @@ def init_parallel_runtime(
             "through here."
         )
     _PARALLEL_INITIALISED = True
+    # Foundry binds this rank's allocation region before any communicator.
+    get_foundry_adapter().before_parallel_init(device)
 
     tic = time.perf_counter()
     logger.info("Init parallel begin.")
