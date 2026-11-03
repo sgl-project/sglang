@@ -573,7 +573,7 @@ def _recompute_w_u_fwd_kernel(
             last_idx = min(i_t * BT + BT, T) - 1
 
             b_gn = tl.load(
-                gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
+                gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=o_k < K, other=0.0
             )
             b_kg = b_k * exp2(b_gn - b_gk)
 
