@@ -473,7 +473,7 @@ class FutureMap:
                 "HiSparse staging only supports EAGLE-family and DSPARK speculative inputs."
             )
 
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
         return EagleDraftInput(

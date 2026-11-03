@@ -29,7 +29,8 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillKVBuffer,
     use_dsv4_q8kv8_sparse_prefill,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.k_cache_reference import (
