@@ -629,8 +629,9 @@ struct Sm120Nvfp4MoeSwiglu {
 
     const DLDevice device = dev.unwrap();
     const auto main_kernel = k::persistent_main<E, TopK, H, I>;
-    static const uint32_t grid =
-        runtime::get_sm_count(device.device_id) * runtime::get_blocks_per_sm(main_kernel, k::kThreads, k::kMainSmem);
+    // Occupancy depends only on the kernel; the SM count is cached per device.
+    static const uint32_t blocks_per_sm = runtime::get_blocks_per_sm(main_kernel, k::kThreads, k::kMainSmem);
+    const uint32_t grid = runtime::get_sm_count(device.device_id) * blocks_per_sm;
     const uint32_t prologue_grid =
         1 + static_cast<uint32_t>((T * (H / 8) + k::kPrologueThreads - 1) / k::kPrologueThreads);
     LaunchKernel(prologue_grid, k::kPrologueThreads, device)(k::prologue<E, TopK, H, I>, p);
