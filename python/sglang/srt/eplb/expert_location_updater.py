@@ -213,9 +213,10 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
-    group=None,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    # Explicit groups must preserve the WORLD rank order used by the slot maps.
+    # None selects WORLD. Callers supplying a group must ensure its membership
+    # and rank order match WORLD; placement maps and peers use WORLD ranks.
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
