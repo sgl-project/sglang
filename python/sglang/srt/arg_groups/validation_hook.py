@@ -172,6 +172,27 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     )
 
 
+def check_hw_governor_server_args(cfg: Any) -> None:
+    from sglang.srt.managers.hw_governor.governor import validate_hw_governor_args
+
+    # The leader rank samples only its own stage's GPUs and broadcasts advice
+    # within one waiting queue; PP stages and DP-attention groups would diverge.
+    assert cfg.pp_size == 1, (
+        "--enable-hw-governor is not supported with pipeline parallelism"
+    )
+    assert not attn_dp_enabled_of(cfg), (
+        "--enable-hw-governor is not supported with DP attention (--attn-dp-size)"
+    )
+    assert cfg.hw_telemetry_interval_ms > 0, (
+        f"--hw-telemetry-interval-ms must be positive, got {cfg.hw_telemetry_interval_ms}"
+    )
+    validate_hw_governor_args(
+        source_spec=cfg.hw_telemetry_source,
+        policy_spec=cfg.hw_governor_policy,
+        policy_config=cfg.hw_governor_config,
+    )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -198,6 +219,9 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
+
+    if cfg.enable_hw_governor:
+        check_hw_governor_server_args(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "

@@ -135,6 +135,10 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.hw_governor.governor import (
+    HardwareGovernor,
+    create_hw_governor,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -168,6 +172,7 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
+    HwGovernorAdviceReq,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -719,6 +724,7 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.maybe_init_hw_governor()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1482,7 +1488,10 @@ class Scheduler(
         return True
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
-        if self.prefill_decode_interval == 0 or batch is None:
+        interval = self.prefill_decode_interval
+        if self.hw_governor is not None:
+            interval = self.hw_governor.prefill_decode_interval(interval)
+        if interval == 0 or batch is None:
             return
 
         # DP attention synchronizes this flag across ranks. This keeps every
@@ -1494,7 +1503,7 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            self._prefill_decode_interval_remaining = interval
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
@@ -1543,6 +1552,25 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+
+    def maybe_init_hw_governor(self) -> None:
+        """Bridge GPU telemetry into the prefill and concurrency knobs (--enable-hw-governor)."""
+        self.hw_governor: Optional[HardwareGovernor] = None
+        if get_schedule().enable_hw_governor:
+            self.hw_governor = create_hw_governor(
+                page_size=self.page_size,
+                device_id=get_device().gpu_id,
+                tp_group=self.tp_group,
+                source_spec=get_schedule().hw_telemetry_source,
+                policy_spec=get_schedule().hw_governor_policy,
+                policy_config=get_schedule().hw_governor_config,
+                interval_ms=get_schedule().hw_telemetry_interval_ms,
+                metrics_collector=(
+                    self.metrics_collector
+                    if self.metrics_reporter.enable_metrics
+                    else None
+                ),
+            )
 
     def init_soft_watchdog(self):
         if (x := get_device().soft_watchdog_timeout) is not None:
@@ -1982,6 +2010,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (HwGovernorAdviceReq, self.handle_hw_governor_advice),
                 (GetHiCacheL3LayoutReq, self.get_hicache_l3_cache_layout),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -2046,6 +2075,8 @@ class Scheduler(
             self.decode_offload_manager.release_host_resources()
         destroy_global_experts_capturer()
         destroy_global_indexer_capturer()
+        if self.hw_governor is not None:
+            self.hw_governor.shutdown()
 
         rank_consensus_checker.shutdown()
 
@@ -2268,6 +2299,8 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         ):
             local_reqs = self._poll_timeout_aborts()
+            if self.hw_governor is not None:
+                local_reqs.extend(self.hw_governor.poll_advice())
         recv_start_ns = time.monotonic_ns()
         self._deferred_input_requests.extend(
             self.request_receiver.recv_requests(local_reqs=local_reqs)
@@ -4231,7 +4264,10 @@ class Scheduler(
         running_batch: Optional[ScheduleBatch] = None,
         num_held_rows: int = 0,
     ) -> int:
-        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
+        running_cap = get_parallel().pp_max_micro_batch_size
+        if self.hw_governor is not None:
+            running_cap = self.hw_governor.max_running_requests(running_cap)
+        pp_budget = running_cap - running_bs
         # Rows the counted requests may occupy: the free rows, plus the rows that
         # counted requests already hold (a continuing chunk, a session borrow),
         # minus the rows promised to beam members.
@@ -4361,6 +4397,12 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        max_prefill_tokens = self.max_prefill_tokens
+        if self.hw_governor is not None:
+            chunked_prefill_size = self.hw_governor.chunked_prefill_size(
+                chunked_prefill_size
+            )
+            max_prefill_tokens = self.hw_governor.max_prefill_tokens(max_prefill_tokens)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4376,7 +4418,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
@@ -5939,6 +5981,10 @@ class Scheduler(
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
+
+    def handle_hw_governor_advice(self, recv_req: HwGovernorAdviceReq) -> None:
+        """Apply the leader's hardware-governor decision; every rank sees it at the same step."""
+        self.hw_governor.apply_advice(recv_req)
 
     def save_remote_model(self, **kwargs):
         self.weight_updater.save_remote_model(kwargs)

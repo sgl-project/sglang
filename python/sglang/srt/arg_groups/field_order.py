@@ -559,5 +559,10 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "enable_hw_governor",
+    "hw_telemetry_source",
+    "hw_telemetry_interval_ms",
+    "hw_governor_policy",
+    "hw_governor_config",
 )
 # fmt: on

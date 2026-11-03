@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    HwGovernorAdviceReq,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -92,16 +93,19 @@ class SchedulerRequestReceiver:
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
-        self, local_reqs: Optional[List[AbortReq]] = None
+        self, local_reqs: Optional[List[Union[AbortReq, HwGovernorAdviceReq]]] = None
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks.
 
-        local_reqs are aborts the caller decided on this rank; they ride the
-        same broadcast as the pulled requests.
+        local_reqs are requests the caller decided on this rank (timeout aborts,
+        hardware-governor advice); they ride the same broadcast as the pulled
+        requests.
         """
         return self._recv_requests(local_reqs)
 
-    def _recv_requests(self, local_reqs: Optional[List[AbortReq]]) -> List:
+    def _recv_requests(
+        self, local_reqs: Optional[List[Union[AbortReq, HwGovernorAdviceReq]]]
+    ) -> List:
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
 
@@ -115,7 +119,9 @@ class SchedulerRequestReceiver:
 
         return recv_reqs
 
-    def _recv_and_broadcast(self, local_reqs: Optional[List[AbortReq]]) -> List:
+    def _recv_and_broadcast(
+        self, local_reqs: Optional[List[Union[AbortReq, HwGovernorAdviceReq]]]
+    ) -> List:
         recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:

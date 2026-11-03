@@ -402,6 +402,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.is_hybrid_swa = False
         s.waiting_queue = [waiting]
         s.min_free_slots_delayer = None
+        s.hw_governor = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
         s.policy = Mock()
         s.disagg_prefill_bootstrap_queue = None

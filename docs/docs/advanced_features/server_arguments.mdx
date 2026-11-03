@@ -634,6 +634,36 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-hw-governor`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Scale existing scheduling knobs (chunked prefill size, max prefill tokens, max running requests, prefill-decode interval) from GPU power, temperature and clock telemetry. The leader rank samples telemetry in a background thread and broadcasts each decision so every rank applies it at the same step. Overrides only shrink sizes and lengthen the interval. Not supported with pipeline parallelism or DP attention.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hw-telemetry-source`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Telemetry source for `--enable-hw-governor`: `nvml` (in-process NVML) or a `package.module:ClassName` subclass of `sglang.srt.managers.hw_governor.TelemetrySource`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`nvml`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hw-telemetry-interval-ms`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Telemetry sampling period of `--enable-hw-governor`, in milliseconds.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`500.0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hw-governor-policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Policy for `--enable-hw-governor`: `stepwise` (trip rules select a ladder of knob overrides) or a `package.module:ClassName` subclass of `sglang.srt.managers.hw_governor.GovernorPolicy`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`stepwise`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hw-governor-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON config for `--hw-governor-policy`. For `stepwise`: `rules` (each a `metric` among `gpu_temp_c`, `temp_margin_c`, `power_w`, `power_ratio`, `sm_clock_ratio` with `trip`/`clear`, or `clock_event_reasons` with `any_of`), `levels` (knob overrides; `chunked_prefill_size`, `max_prefill_tokens`, `max_running_requests` are fractions of the configured value, `prefill_decode_interval` is a minimum in decode rounds), `escalate_after_s` and `recover_after_s`. Unset keys take the built-in defaults.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
+    </tr>
 </tbody>
 </table>
 
