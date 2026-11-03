@@ -1241,6 +1241,10 @@ if HAS_CUTEDSL:
                 cute.arch.cluster_arrive_relaxed()
                 cute.arch.cluster_wait()
             if cutlass.const_expr(self.ar_world_size > 0):
+                # Every thread has read `epoch` before the commit: two rows sync only per
+                # row, and a token with no local expert skips the RMSNorm barriers. With
+                # cluster_size > 1 the cluster barrier above already orders the peer CTAs.
+                cute.arch.barrier()
                 # One participant per worker (the cluster's first CTA).
                 if cta_rank == 0 and tidx == 0:
                     num_workers = cute.arch.grid_dim()[0] // self.cluster_size
