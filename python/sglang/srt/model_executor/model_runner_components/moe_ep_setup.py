@@ -76,29 +76,16 @@ def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
 
 
 def prebuild_deepep_v2_buffer(*, model) -> None:
-    """Build the deepep_v2 ElasticBuffer at deployment time.
-
-    No-op unless the a2a backend is deepep_v2. The buffer is process-wide and
-    shared by every MoE layer, so the first deepep_v2 dispatcher builds it. The
-    per-rank cap is validated in validate_deepep_v2_dispatch_token_budget at
-    server-args time.
-    """
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
+    """Build the deepep_v2 ElasticBuffer if still unbuilt (elastic-EP joiners, after
+    the rendezvous); the cap is checked in validate_deepep_v2_dispatch_token_budget."""
+    from sglang.srt.layers.moe.token_dispatcher.base import prebuild_dispatchers
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if not get_moe_a2a_backend().is_deepep_v2():
         return
 
-    for module in model.modules():
-        if isinstance(module, FusedMoE) and isinstance(
-            module.dispatcher, DeepEPv2Dispatcher
-        ):
-            module.dispatcher.prebuild()
-            log_info_on_rank0(
-                logger, "Prebuilt the DeepEP-V2 ElasticBuffer at startup."
-            )
-            return
+    if prebuild_dispatchers(model):
+        log_info_on_rank0(logger, "Prebuilt the DeepEP-V2 ElasticBuffer at startup.")
 
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
