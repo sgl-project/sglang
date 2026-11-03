@@ -1544,8 +1544,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
     def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
-        # The scheduler only reads it when logprobs are requested; a non-int or
-        # negative value garbles the batch and torch.topk fails past the vocab size.
+        # Invalid counts can corrupt the batch or fail torch.topk past the vocab size.
         top_logprobs_num = obj.top_logprobs_num
         if not obj.return_logprob or top_logprobs_num is None:
             return
@@ -1614,7 +1613,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
-                top_logprobs_num=obj.top_logprobs_num,
+                # A logprob batch gathers every request's count, including disabled ones.
+                top_logprobs_num=obj.top_logprobs_num if obj.return_logprob else 0,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
                 sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",

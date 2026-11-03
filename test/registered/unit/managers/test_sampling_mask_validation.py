@@ -3,11 +3,13 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,21 +73,31 @@ class TestSamplingMaskValidation(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "top_logprobs"):
                         self.manager._validate_one_request(req, req.input_ids)
 
-    def test_top_logprobs_num_is_validated_per_item_in_a_mixed_batch(self):
-        """The batch path validates obj[i], so each item's own flag decides."""
+    def test_mixed_batch_forwards_zero_count_for_logprob_disabled_items(self):
+        """Disabled items must not contribute their raw count to a shared topk."""
         self.manager.model_config.vocab_size = 32
+        self.manager.preferred_sampling_params = None
+        self.manager.sampling_params_class = SamplingParams
+        self.manager.tokenizer = None
+        self.manager.fake_bootstrap_room_counter = 0
         req = GenerateReqInput(
             input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9]],
             sampling_params={},
-            return_logprob=[True, False, True],
-            top_logprobs_num=[33, 33, 5],
+            return_logprob=[True, False, False],
+            top_logprobs_num=[5, 33, "many"],
         )
         req.normalize_batch_and_arguments()
-        with self.assertRaisesRegex(ValueError, "top_logprobs"):
-            self.manager._validate_one_request(req[0], req[0].input_ids)
-        # logprobs are off for this item, so its count is never read
-        self.manager._validate_one_request(req[1], req[1].input_ids)
-        self.manager._validate_one_request(req[2], req[2].input_ids)
+        self.manager.rid_to_state = {
+            rid: SimpleNamespace(time_stats=APIServerReqTimeStats()) for rid in req.rid
+        }
+        forwarded_counts = []
+        for i in range(3):
+            self.manager._validate_one_request(req[i], req[i].input_ids)
+            tokenized_request = self.manager._create_tokenized_object(
+                req[i], "", req[i].input_ids
+            )
+            forwarded_counts.append(tokenized_request.top_logprobs_num)
+        self.assertEqual(forwarded_counts, [5, 0, 0])
 
     def test_accepts_hard_exclusion(self):
         class BoundMask(DisallowedTokensLogitsProcessor):
