@@ -832,3 +832,109 @@ def get_embedding_and_mask(
         )
     embedding = _adjust_embedding_length(embedding, num_mm_tokens_in_input_ids, logger)
     return embedding, special_multimodal_mask, input_ids
+
+
+def _get_precomputed_embedding_indices(
+    input_ids: torch.Tensor,
+    prefix_lengths: List[int],
+    extend_lengths: List[int],
+    items_offsets: List[List[Tuple[int, int]]],
+    *,
+    valid_num_tokens: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    # Callers can omit text-only requests from the multimodal lists. In that
+    # case their packed batch positions cannot be recovered from these lists.
+    num_tokens = input_ids.numel() if valid_num_tokens is None else valid_num_tokens
+    if (
+        len(prefix_lengths) != len(extend_lengths)
+        or len(items_offsets) != len(extend_lengths)
+        or not 0 <= num_tokens <= input_ids.numel()
+        or sum(extend_lengths) != num_tokens
+    ):
+        return None
+
+    indices = []
+    batch_start = 0
+    for prefix, length, offsets in zip(prefix_lengths, extend_lengths, items_offsets):
+        previous_end = -1
+        for start, end in offsets:
+            if start < 0 or end < start or start <= previous_end:
+                return None
+            previous_end = end
+            left, right = max(start, prefix), min(end + 1, prefix + length)
+            if left < right:
+                indices.extend(
+                    range(batch_start + left - prefix, batch_start + right - prefix)
+                )
+        batch_start += length
+    return torch.tensor(indices, dtype=torch.int64)
+
+
+def _select_precomputed_embedding_segments(indices, segments, token_indices):
+    """Select CPU embedding slices and their destination positions in a CP shard."""
+    local_positions = {token: index for index, token in enumerate(token_indices)}
+    selected_indices = []
+    selected_segments = []
+    positions = iter(indices.tolist())
+    for embedding, start, end in segments:
+        run_start = None
+        for source in range(start, end):
+            destination = local_positions.get(next(positions))
+            if destination is not None:
+                selected_indices.append(destination)
+                if run_start is None:
+                    run_start = source
+            elif run_start is not None:
+                selected_segments.append((embedding, run_start, source))
+                run_start = None
+        if run_start is not None:
+            selected_segments.append((embedding, run_start, end))
+    return torch.tensor(selected_indices, dtype=torch.int64), selected_segments
+
+
+def _collect_precomputed_embedding_segments(
+    items, items_size, prefix_length, extend_length, items_offset_list
+):
+    """Select existing CPU embedding views for the active prefill chunk."""
+    if not all(
+        isinstance(item.precomputed_embeddings, torch.Tensor)
+        and item.precomputed_embeddings.device.type == "cpu"
+        and item.precomputed_embeddings.ndim == 2
+        for item in items
+    ):
+        return None
+    if host_offload_event is not None:
+        host_offload_event.synchronize()
+    segments = []
+    for i in range(len(prefix_length)):
+        for item in items[items_size[i] : items_size[i + 1]]:
+            embedding = item.precomputed_embeddings
+            _, start, end = get_embedding_chunk(
+                embedding, prefix_length[i], extend_length[i], item.offsets
+            )
+            if start < end:
+                segments.append((embedding, start, end))
+    return segments
+
+
+def _scatter_precomputed_embedding_segments_direct_h2d(
+    input_embeds, target_indices, segments
+):
+    num_tokens = sum(end - start for _, start, end in segments)
+    if num_tokens != target_indices.numel():
+        raise ValueError("Precomputed embedding rows differ from destination positions")
+    if not num_tokens:
+        return
+    staging = torch.empty(
+        (num_tokens, input_embeds.shape[-1]),
+        dtype=input_embeds.dtype,
+        device="cpu",
+        pin_memory=input_embeds.is_cuda,
+    )
+    cursor = 0
+    for embedding, start, end in segments:
+        staging[cursor : cursor + end - start].copy_(embedding[start:end])
+        cursor += end - start
+    input_embeds[target_indices.to(input_embeds.device, non_blocking=True)] = (
+        staging.to(input_embeds.device, non_blocking=input_embeds.is_cuda)
+    )

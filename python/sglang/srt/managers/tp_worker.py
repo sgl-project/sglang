@@ -65,6 +65,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -78,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 class BaseTpWorker(ABC):
     @abstractmethod
+    @profile_method("sglang.worker.forward_batch")
     def forward_batch_generation(self, forward_batch: ForwardBatch):
         pass
 

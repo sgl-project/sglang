@@ -68,6 +68,8 @@ import torch
 import torch.distributed
 from torch.distributed import barrier
 
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
+
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
@@ -4932,6 +4934,14 @@ class Scheduler(
         """Run a batch."""
         self._on_step_launch(batch)
 
+        return self._run_batch(batch, pp_proxy_tensors)
+
+    @profile_method("sglang.scheduler.run_batch")
+    def _run_batch(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)

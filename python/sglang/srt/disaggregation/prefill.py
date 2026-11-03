@@ -105,6 +105,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.common import async_d2h
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -676,6 +677,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
+    @profile_method("sglang.scheduler.prepare_prefill_batch")
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
         running_batch: ScheduleBatch,
@@ -967,6 +969,7 @@ class SchedulerDisaggregationPrefillMixin:
             raise RuntimeError("Prefill result copy must be submitted before polling")
         return state == 2
 
+    @profile_method("sglang.scheduler.process_prefill_result")
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -1229,6 +1232,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.disagg_kv_sender.abort()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    @profile_method("sglang.scheduler.poll_prefill_transfer")
     def process_disagg_prefill_transfer_queue(
         self: Scheduler, rids_to_check: Optional[Dict[str, bool]] = None
     ) -> List[Req]:

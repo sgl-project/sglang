@@ -448,6 +448,7 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    cp_metadata=None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -475,6 +476,7 @@ def embed_mm_inputs(
 
     # deepstack_embeddings: per-modality
     modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+    direct_h2d_merges = []
 
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
@@ -493,22 +495,6 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            # Sorted for the searchsorted lookup in _get_multimodal_mask.
-            pad_values = sorted(
-                value for item in items for value in item.padding_values()
-            )
-            if input_ids.device.type == "cuda":
-                # Pinned staging keeps the placeholder copy asynchronous on CUDA.
-                placeholder_cpu = torch.tensor(
-                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
-                )
-                placeholder_tensor = placeholder_cpu.to(
-                    input_ids.device, non_blocking=True
-                )
-            else:
-                placeholder_tensor = torch.as_tensor(
-                    pad_values, device=input_ids.device
-                )
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []
@@ -523,6 +509,43 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
+            if cp_metadata is not None and not any(use_deepstack.values()):
+                indices = mm_schedule._get_precomputed_embedding_indices(
+                    input_ids,
+                    extend_prefix_lens,
+                    extend_seq_lens,
+                    items_offsets,
+                    valid_num_tokens=sum(cp_metadata.lengths),
+                )
+                segments = mm_schedule._collect_precomputed_embedding_segments(
+                    items,
+                    items_size,
+                    extend_prefix_lens,
+                    extend_seq_lens,
+                    items_offsets,
+                )
+                if (
+                    indices is not None
+                    and segments is not None
+                    and sum(end - start for _, start, end in segments)
+                    == indices.numel()
+                ):
+                    direct_h2d_merges.append((indices, segments))
+                    continue
+
+            pad_values = sorted(value for item in items for value in item.padding_values())
+            if input_ids.device.type == "cuda":
+                # Pinned staging keeps the placeholder copy asynchronous on CUDA.
+                placeholder_cpu = torch.tensor(
+                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
+                )
+                placeholder_tensor = placeholder_cpu.to(
+                    input_ids.device, non_blocking=True
+                )
+            else:
+                placeholder_tensor = torch.as_tensor(
+                    pad_values, device=input_ids.device
+                )
             embedding, mask, input_ids = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
@@ -553,6 +576,31 @@ def embed_mm_inputs(
     # There values are useless because their embeddings will be replaced by vision embeddings anyway.
     input_ids.clamp_(min=0, max=vocab_size - 1)
     input_embeds = input_embedding(input_ids)
+
+    if (
+        cp_metadata is not None
+        and cp_metadata.current is None
+        and not embeddings
+        and direct_h2d_merges
+        and not any(use_deepstack.values())
+    ):
+        layout = cp_metadata.layout_names["contiguous"]
+        plan = cp_metadata.gather_scatter_plans[layout]
+        token_indices = plan.reduce_indices.narrow(
+            0, cp_metadata.rank * plan.padded_rows, plan.local_rows
+        )
+        input_embeds = input_embeds.index_select(0, token_indices)
+        direct_h2d_merges = [
+            mm_schedule._select_precomputed_embedding_segments(
+                indices, segments, cp_metadata.contiguous[cp_metadata.rank]
+            )
+            for indices, segments in direct_h2d_merges
+        ]
+        cp_metadata.current = layout
+    for indices, segments in direct_h2d_merges:
+        mm_schedule._scatter_precomputed_embedding_segments_direct_h2d(
+            input_embeds, indices, segments
+        )
 
     # deepstack embedding
     if use_deepstack:
@@ -623,6 +671,11 @@ def _embed_mm_inputs_with_split(
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
+            cp_metadata=(
+                forward_batch.prefill_cp_metadata
+                if forward_batch.input_embeds is None
+                else None
+            ),
             **embed_kwargs,
         )
 
@@ -667,6 +720,11 @@ def _embed_mm_inputs_with_split(
             extend_prefix_lens=sub_prefix_lens,
             extend_seq_lens=sub_seq_lens,
             input_ids=sub_input_ids,
+            cp_metadata=(
+                forward_batch.prefill_cp_metadata
+                if forward_batch.input_embeds is None
+                else None
+            ),
             **embed_kwargs,
         )
 
@@ -774,6 +832,11 @@ def prepare_mm_inputs(
                         data_embedding_func_mapping=data_embedding_funcs,
                         placeholder_tokens=placeholder_tokens,
                         use_deepstack=use_deepstack,
+                        cp_metadata=(
+                            forward_batch.prefill_cp_metadata
+                            if forward_batch.input_embeds is None
+                            else None
+                        ),
                     )
 
             # add for qwen3_vl deepstack
