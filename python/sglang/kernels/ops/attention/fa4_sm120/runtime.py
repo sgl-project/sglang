@@ -105,7 +105,7 @@ class _VarlenLaunchPlan:
 
 
 @dataclass(frozen=True)
-class _PagedDecodeLaunchPlan:
+class _PagedLaunchPlan:
     compiled_fn: Callable
     compile_key: tuple
     actual_num_splits: int
@@ -1021,7 +1021,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def __init__(self) -> None:
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
-        self._paged_plans: OrderedDict[tuple, _PagedDecodeLaunchPlan] = OrderedDict()
+        self._paged_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
+        self._paged_prefill_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
         self._paged_workspaces: OrderedDict[
             tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
@@ -1257,7 +1258,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def _paged_workspace(
         self,
-        plan: _PagedDecodeLaunchPlan,
+        plan: _PagedLaunchPlan,
         q: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1319,7 +1320,47 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             head_dims in LOW_HD_DECODE_SHAPES or head_dims == (256, 256)
         ) and effective_q_rows <= 16
 
-    def try_paged_decode(
+    @staticmethod
+    def _paged_prefill_key(base_key: tuple, max_seqlen_k: int) -> tuple:
+        # get_fwd_tile_size reads the exact seqlen_k, total rows and batch; the
+        # base key holds the rest, so prefill plans key on max_seqlen_k itself.
+        return (*base_key, max_seqlen_k)
+
+    def _paged_decode_plan(
+        self,
+        base_key: tuple,
+        *,
+        max_seqlen_k: int,
+        window_size_left: Optional[int],
+        window_size_right: Optional[int],
+    ) -> Optional[_PagedLaunchPlan]:
+        tile_mn = self._paged_plan_tiles.get(base_key)
+        if tile_mn is None:
+            return None
+        self._paged_plan_tiles.move_to_end(base_key)
+        selection_key = self._paged_selection_key(
+            base_key,
+            *tile_mn,
+            max_seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        plan = self._paged_plans.get(selection_key)
+        if plan is None:
+            return None
+        self._paged_plans.move_to_end(selection_key)
+        return plan
+
+    def _paged_prefill_plan(
+        self, base_key: tuple, *, max_seqlen_k: int
+    ) -> Optional[_PagedLaunchPlan]:
+        key = self._paged_prefill_key(base_key, max_seqlen_k)
+        plan = self._paged_prefill_plans.get(key)
+        if plan is not None:
+            self._paged_prefill_plans.move_to_end(key)
+        return plan
+
+    def try_paged(
         self,
         *,
         arch: int,
@@ -1377,12 +1418,11 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         effective_q_rows = actual_max_seqlen_q * (
             qhead_per_kvhead if actual_pack_gqa else 1
         )
-        if not self._supports_cached_paged_decode(
+        is_decode = self._supports_cached_paged_decode(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
-        ):
-            return None
+        )
         causal, window_size_left, window_size_right = _resolve_causal_local_window(
             causal,
             window_size_left,
@@ -1404,21 +1444,17 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             pack_gqa=actual_pack_gqa,
             requested_num_splits=requested_num_splits,
         )
-        tile_mn = self._paged_plan_tiles.get(base_key)
-        if tile_mn is None:
-            return None
-        self._paged_plan_tiles.move_to_end(base_key)
-        selection_key = self._paged_selection_key(
-            base_key,
-            *tile_mn,
-            actual_max_seqlen_k,
-            window_size_left,
-            window_size_right,
-        )
-        plan = self._paged_plans.get(selection_key)
+        if is_decode:
+            plan = self._paged_decode_plan(
+                base_key,
+                max_seqlen_k=actual_max_seqlen_k,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+            )
+        else:
+            plan = self._paged_prefill_plan(base_key, max_seqlen_k=actual_max_seqlen_k)
         if plan is None:
             return None
-        self._paged_plans.move_to_end(selection_key)
         if out is None:
             out = torch.empty(
                 expected_out_shape,
@@ -1469,7 +1505,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             )
         return out, None
 
-    def register_paged_decode(
+    def register_paged(
         self,
         *,
         arch: int,
@@ -1498,11 +1534,13 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     ) -> None:
         qhead_per_kvhead = q.shape[1] // k.shape[-2]
         effective_q_rows = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
-        if not self._supports_cached_paged_decode(
+        is_decode = self._supports_cached_paged_decode(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
-        ):
+        )
+        # A prefill plan replays one launch; SplitKV prefill keeps the generic path.
+        if not is_decode and actual_num_splits != 1:
             return
         base_key = self._paged_base_key(
             arch=arch,
@@ -1520,6 +1558,18 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             pack_gqa=pack_gqa,
             requested_num_splits=requested_num_splits,
         )
+        if not is_decode:
+            self._register_paged_prefill_plan(
+                self._paged_prefill_key(base_key, max_seqlen_k),
+                _PagedLaunchPlan(
+                    compiled_fn=compiled_fn,
+                    compile_key=compile_key,
+                    actual_num_splits=1,
+                    compiled_combine=None,
+                    partial_dtype=q.dtype,
+                ),
+            )
+            return
         selection_key = self._paged_selection_key(
             base_key,
             tile_m,
@@ -1537,7 +1587,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             ]
             for key in stale_selection_keys:
                 del self._paged_plans[key]
-        self._paged_plans[selection_key] = _PagedDecodeLaunchPlan(
+        self._paged_plans[selection_key] = _PagedLaunchPlan(
             compiled_fn=compiled_fn,
             compile_key=compile_key,
             actual_num_splits=actual_num_splits,
@@ -1589,6 +1639,12 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             ),
         )
 
+    def _register_paged_prefill_plan(self, key: tuple, plan: _PagedLaunchPlan) -> None:
+        self._paged_prefill_plans[key] = plan
+        self._paged_prefill_plans.move_to_end(key)
+        while len(self._paged_prefill_plans) > _LAUNCH_PLAN_CAPACITY:
+            self._paged_prefill_plans.popitem(last=False)
+
     def _cache_workspace_view(
         self,
         key: tuple,
@@ -1620,6 +1676,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     def clear_launch_plans(self) -> None:
         self._varlen_plans.clear()
         self._paged_plans.clear()
+        self._paged_prefill_plans.clear()
         self._paged_plan_tiles.clear()
         self._paged_workspaces.clear()
         self._paged_workspace_views.clear()

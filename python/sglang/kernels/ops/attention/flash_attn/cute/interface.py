@@ -29,7 +29,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
     get_forward_host,
-    try_cached_paged_decode,
+    try_cached_paged,
     try_cached_varlen,
 )
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging, utils
@@ -413,9 +413,14 @@ def _flash_attn_fwd(
     arch = _get_device_arch() if _arch is None else _arch
     arch_forward_host = get_forward_host(arch)
     requested_num_splits = num_splits
+    # Launch plans key on the default tile choice; explicit tiles bypass them.
+    uses_default_tiles = (
+        tile_mn is None and mma_pv_is_rs is None and intra_wg_overlap is None
+    )
     if (
         not fake_mode
         and arch_forward_host is not None
+        and uses_default_tiles
         and not return_lse
         and lse is None
         and softcap in (None, 0.0)
@@ -439,7 +444,7 @@ def _flash_attn_fwd(
             )
         )
     ):
-        fast_result = try_cached_paged_decode(
+        fast_result = try_cached_paged(
             arch=arch,
             q=q,
             k=k,
@@ -1833,6 +1838,7 @@ def _flash_attn_fwd(
         )
     if (
         not fake_mode
+        and uses_default_tiles
         and not torch.cuda.is_current_stream_capturing()
         and arch_forward_host is not None
         and q is not None
@@ -1872,7 +1878,7 @@ def _flash_attn_fwd(
                 None,
             )
             compiled_combine = _flash_attn_fwd_combine.compile_cache[combine_key]
-        arch_forward_host.register_paged_decode(
+        arch_forward_host.register_paged(
             arch=arch,
             compiled_fn=compiled_fwd,
             compile_key=compile_key,
