@@ -775,12 +775,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU.
-        # NOTE: the AMX fused_experts_cpu kernel only supports top-8 expert
-        # selection and gated activations; models that fall back to the
-        # torch-native MoE path (e.g. relu2 activation, as used by Nemotron-H
-        # which selects top-6 experts) must keep RAW weights, otherwise the
-        # native einsum reads VNNI-packed bytes as if unpacked and routes to
-        # garbage. Only pack when the AMX path will actually consume them.
         if (
             _is_cpu
             and _is_cpu_amx_available

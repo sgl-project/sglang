@@ -330,15 +330,12 @@ class NemotronHMoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # aten::mm.dtype is not implemented by the CPU backend in some PyTorch
-        # builds.  CPU inference still needs fp32 router logits for topk, so
-        # explicitly upcast inputs before matmul instead of using out_dtype.
+        # builds. CPU inference still needs fp32 router logits for sigmoid/topk.
         if hidden_states.device.type == "cpu":
-            # The gate is an unquantized ReplicatedLinear whose weight is
-            # VNNI-packed in place at load time when CPU+AMX is available
-            # (UnquantizedLinearMethod.process_weights_after_loading). A raw
-            # torch.mm would read the packed bytes as if unpacked and produce
-            # garbage logits, so route through the AMX gemm that understands
-            # the packed layout; otherwise fall back to a plain fp32 matmul.
+            # On CPU+AMX, gate weights are VNNI-packed at load time. Route
+            # through the packed linear kernel so bytes are interpreted with
+            # the correct layout; raw torch.mm on packed weights yields bad
+            # routing logits.
             from sglang.srt.utils import use_intel_amx_backend
 
             if use_intel_amx_backend(self.gate):
