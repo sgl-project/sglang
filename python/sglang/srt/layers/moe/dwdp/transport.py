@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.dwdp.layout import (
     MnnvlHandleSet,
 )
 from sglang.srt.utils.cuda_vmm_utils import (
+    VmmAllocationOutOfMemory,
     VmmReservation,
     align_down,
     align_up,
@@ -51,40 +52,73 @@ def _copy_local_weights_to_handles(
     handles: Dict[Tuple[int, str], int] = {}
     sizes: Dict[Tuple[int, str], int] = {}
 
-    for layer_idx, name in sorted_keys:
-        param = local_params[(layer_idx, name)]
-        spec = layer_weight_specs[layer_idx][name]
+    reservation = None
+    try:
+        for layer_idx, name in sorted_keys:
+            param = local_params[(layer_idx, name)]
+            spec = layer_weight_specs[layer_idx][name]
 
-        local_start_bytes = layout.local_expert_start * spec.expert_bytes
-        local_end_bytes = layout.local_expert_end * spec.expert_bytes
-        page_start = align_down(local_start_bytes, granularity)
-        page_end = align_up(local_end_bytes, granularity)
-        phys_size = page_end - page_start
-        data_offset = local_start_bytes - page_start
+            local_start_bytes = layout.local_expert_start * spec.expert_bytes
+            local_end_bytes = layout.local_expert_end * spec.expert_bytes
+            page_start = align_down(local_start_bytes, granularity)
+            page_end = align_up(local_end_bytes, granularity)
+            phys_size = page_end - page_start
+            data_offset = local_start_bytes - page_start
 
-        reservation = VmmReservation(phys_size, prop, device_id, alignment=granularity)
-        handle = int(reservation.map(0, phys_size, retain_handle=True))
+            reservation = VmmReservation(
+                phys_size, prop, device_id, alignment=granularity
+            )
+            try:
+                handle = int(reservation.map(0, phys_size, retain_handle=True))
+            except VmmAllocationOutOfMemory:
+                with torch.cuda.device(device_id):
+                    torch.cuda.empty_cache()
+                handle = int(reservation.map(0, phys_size, retain_handle=True))
+            handles[(layer_idx, name)] = handle
 
-        nbytes = param.numel() * param.element_size()
-        check_drv(
-            cuda.cuMemcpyDtoD(reservation.base + data_offset, param.data_ptr(), nbytes),
-            "cuMemcpyDtoD",
-        )
-        torch.cuda.synchronize()
+            nbytes = param.numel() * param.element_size()
+            check_drv(
+                cuda.cuMemcpyDtoD(
+                    reservation.base + data_offset, param.data_ptr(), nbytes
+                ),
+                "cuMemcpyDtoD",
+            )
+            torch.cuda.synchronize()
 
-        reservation.close(release_handles=False)
+            reservation.close(release_handles=False)
+            reservation = None
 
-        param.untyped_storage().resize_(0)
+            param.untyped_storage().resize_(0)
 
-        handles[(layer_idx, name)] = handle
-        sizes[(layer_idx, name)] = phys_size
+            sizes[(layer_idx, name)] = phys_size
 
-        logger.debug(
-            f"Phase 1: layer={layer_idx}, name={name}, "
-            f"phys_size={phys_size}, data_offset={data_offset}"
-        )
+            logger.debug(
+                f"Phase 1: layer={layer_idx}, name={name}, "
+                f"phys_size={phys_size}, data_offset={data_offset}"
+            )
 
-    torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
+
+    except BaseException as error:
+        cleanup_errors = []
+        if reservation is not None:
+            try:
+                reservation.close(release_handles=False)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        for handle in handles.values():
+            try:
+                check_drv(
+                    cuda.cuMemRelease(handle), "cuMemRelease(local weights rollback)"
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            error.add_note(
+                f"{len(cleanup_errors)} local weight rollback operation(s) also failed"
+            )
+            raise error from cleanup_errors[0]
+        raise
 
     return handles, sizes
 
