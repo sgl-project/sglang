@@ -301,7 +301,9 @@ class CustomAllReduceV2:
         # Semaphores are indexed by block, so capacity only bounds a grid; at
         # least one per SM, the persistent width every pull kernel stays within.
         num_sm = torch.cuda.get_device_properties(self.device).multi_processor_count
-        self.num_semaphores = max(num_sm, cfg.num_pull_blocks) if self.pull_enabled else 0
+        self.num_semaphores = (
+            max(num_sm, cfg.num_pull_blocks) if self.pull_enabled else 0
+        )
         sem_bytes = _SEMAPHORE_BYTES * self.num_semaphores
         total_bytes = push_bytes + pull_bytes + sem_bytes
         pull_offset = push_bytes
@@ -348,7 +350,9 @@ class CustomAllReduceV2:
                 self.rank,
                 self.world_size,
                 workspaces=slice_all([pull_bytes], pull_offset),
-                semaphores=slice_all([self.num_semaphores, _SEMAPHORE_BYTES], sem_offset),
+                semaphores=slice_all(
+                    [self.num_semaphores, _SEMAPHORE_BYTES], sem_offset
+                ),
                 mc_workspace=mc_at(pull_offset),
                 mc_semaphore=mc_at(sem_offset),
                 default_blocks=cfg.num_pull_blocks,

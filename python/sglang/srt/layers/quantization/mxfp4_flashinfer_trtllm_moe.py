@@ -630,7 +630,6 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     comm = _fused_all_reduce_comm
     if comm is None or comm.world_size != get_parallel().tp_size:
         return False
-    return (
-        num_tokens <= 384
-        and all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
+    return num_tokens <= 384 and all_reduce_fusion.fits_push_slot(
+        comm.max_push_size, num_tokens, hidden_dim
     )

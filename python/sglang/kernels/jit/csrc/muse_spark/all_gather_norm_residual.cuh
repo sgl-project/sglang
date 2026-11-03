@@ -35,7 +35,6 @@ SGL_DEVICE fp32x2_t fma_pair(fp32x2_t a, fp32x2_t b, fp32x2_t c) {
   return {fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y)};
 }
 
-
 template <uint32_t kNLocal, int kNumThreads>
 SGL_DEVICE void push_local_slice(const Params& params, uint32_t half_off) {
   const uint32_t num_local = params.num_rows * kNLocal;
