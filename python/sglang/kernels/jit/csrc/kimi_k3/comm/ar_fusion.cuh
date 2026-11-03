@@ -423,8 +423,7 @@ __launch_bounds__(kPullBlockSize, 1) void all_reduce_pull_res_kernel(const __gri
   const auto tx = threadIdx.x;
   const auto bx = blockIdx.x;
   // The arrival must follow the PDL wait: it asserts the producer grid has flushed.
-  const auto barrier =
-      device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size);
+  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size);
   device::PDLWaitPrimary<kUsePDL>();
   barrier.arrive_relaxed();
   __syncthreads();
@@ -471,8 +470,7 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
   const auto tx = threadIdx.x;
   const auto bx = blockIdx.x;
   // The arrival must follow the PDL wait: it asserts the producer grid has flushed.
-  const auto barrier =
-      device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size);
+  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size);
   device::PDLWaitPrimary<kUsePDL>();
   barrier.arrive_relaxed();
   __syncthreads();

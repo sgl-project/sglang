@@ -248,8 +248,7 @@ struct BeamAllReduceNorm {
         .workspace = push.get_workspace<World>(bytes)};
     auto kernel = next ? beam_ar::kernel<World, Hidden, Cluster, TopK, true>
                        : beam_ar::kernel<World, Hidden, Cluster, TopK, false>;
-    LaunchKernel(dim3(n, Cluster), Hidden / 8 / Cluster, input.device())
-        .enable_pdl(true)(kernel, p);
+    LaunchKernel(dim3(n, Cluster), Hidden / 8 / Cluster, input.device()).enable_pdl(true)(kernel, p);
   }
 };
 }  // namespace sglang
