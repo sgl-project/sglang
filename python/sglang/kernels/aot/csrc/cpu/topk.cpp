@@ -402,17 +402,34 @@ void biased_grouped_topk_kernel_impl(
 
 #if defined(CPU_CAPABILITY_AVX512)
       if (renormalize || apply_scaling_factor) {
-        __mmask16 mask = (1ULL << TOPK) - 1;
-        __m512 x = _mm512_maskz_loadu_ps(mask, topk_weights + i * TOPK);
-        if (renormalize) {
-          float sum = _mm512_reduce_add_ps(x);
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value / sum);
-          __m512 y = _mm512_mul_ps(x, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+        if constexpr (TOPK <= 16) {
+          __mmask16 mask = (1ULL << TOPK) - 1;
+          __m512 x = _mm512_maskz_loadu_ps(mask, topk_weights + i * TOPK);
+          if (renormalize) {
+            float sum = _mm512_reduce_add_ps(x);
+            __m512 vscale = _mm512_set1_ps(scaling_factor_value / sum);
+            __m512 y = _mm512_mul_ps(x, vscale);
+            _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+          } else {
+            __m512 vscale = _mm512_set1_ps(scaling_factor_value);
+            __m512 y = _mm512_mul_ps(x, vscale);
+            _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+          }
         } else {
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value);
-          __m512 y = _mm512_mul_ps(x, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+          if (renormalize) {
+            float sum = 0.f;
+            for (int64_t j = 0; j < TOPK; ++j) {
+              sum += topk_weights[i * TOPK + j];
+            }
+            float scale = scaling_factor_value / sum;
+            for (int64_t j = 0; j < TOPK; ++j) {
+              topk_weights[i * TOPK + j] *= scale;
+            }
+          } else {
+            for (int64_t j = 0; j < TOPK; ++j) {
+              topk_weights[i * TOPK + j] *= scaling_factor_value;
+            }
+          }
         }
       }
 #else
@@ -768,8 +785,29 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
             TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
         }
         break;
+      case 22:
+        switch (num_experts) {
+          case 128:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(128, 22);
+            break;
+          case 192:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(192, 22);
+            break;
+          case 256:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 22);
+            break;
+          case 384:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 22);
+            break;
+          case 512:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(512, 22);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        }
+        break;
       default:
-        TORCH_CHECK(false, "Unexpected topk: ", topk, ". Supported values: 6, 8");
+        TORCH_CHECK(false, "Unexpected topk: ", topk, ". Supported values: 6, 8, 22");
     }
   });
   return std::make_tuple(topk_weights, topk_ids);
