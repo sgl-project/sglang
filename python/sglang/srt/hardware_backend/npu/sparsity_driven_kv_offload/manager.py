@@ -17,7 +17,6 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
     load_copy_sfa_operator,
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     fill_request_block_table,
     prepare_prefill_gather_rows,
@@ -26,7 +25,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
     sparse_batch_capacity,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    get_offload_sparse_kv_indexer_impl,
     get_sparse_kv_budget,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
@@ -121,23 +119,7 @@ class SparseKVCacheManager:
         )
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
-        self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-        if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
-            from sglang.srt.runtime_context import get_spec
-
-            spec = get_spec()
-            if (
-                spec.speculative_eagle_topk != 1
-                or spec.speculative_num_draft_tokens != 4
-            ):
-                raise ValueError(
-                    "Experimental native MTP requires a Q4 chain with topk=1."
-                )
-        if (
-            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-        ):
-            raise ValueError("Experimental Q4 LIM does not support fused pre-metadata.")
+        self.copy_sfa_enabled = False
         self.max_context_len = copy_sfa_host_row_stride(
             self.logical_max_context_len, self.copy_sfa_enabled
         )
@@ -179,7 +161,7 @@ class SparseKVCacheManager:
             graph_batch_capacity=self.batch_capacity,
         )
         self.device_cache_size = self.budget.cache_tokens
-        self.indexer_impl = get_offload_sparse_kv_indexer_impl()
+        self.indexer_impl = "legacy"
         self.use_lru = (
             self.device_cache_size > self.sparse_context_len
             and self.indexer_impl != "lim"
@@ -365,7 +347,7 @@ class SparseKVCacheManager:
                         dtype=torch.int32,
                         device=self.device,
                     )
-                    if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
+                    if self.copy_sfa_enabled:
                         self.mtp_attn_out = torch.empty(
                             (
                                 self.batch_capacity * 4,

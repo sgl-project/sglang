@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch_npu
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
     normalize_batch_topk_indices,
@@ -49,7 +48,7 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
 
 def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
     manager = backend.sparse_kv_manager
-    if not envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get() or manager is None:
+    if manager is None or not manager.copy_sfa_enabled:
         return False
     if (
         not forward_batch.forward_mode.is_decode()

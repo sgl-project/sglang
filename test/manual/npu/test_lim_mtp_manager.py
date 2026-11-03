@@ -13,10 +13,10 @@ pytest.importorskip("torch_npu")
 from sgl_kernel_npu.sparsity_driven_kv_offload import free_shm
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
     forward_sparsity_driven_kv_offload,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     resolve_sparse_kv_budget,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
