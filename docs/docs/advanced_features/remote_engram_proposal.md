@@ -55,7 +55,10 @@ These options require the matching external runtime and have not been qualified
 for all graph, cancellation, or model configurations. It is not a self-contained installation,
 nor does this draft provide the owner, NIXL GET implementation or setup script.
 The experimental runtime validates checkpoint identity and registered table
-metadata. With the experimental runtime, one same-version H20 1P1D smoke ran
+metadata. The following smoke and C8 measurements used this draft at commit
+`a4edaf95a27657069ac32f417e0857e926a1cf62`, before its later main-branch
+update; the updated head has not been remeasured. With the experimental runtime,
+one same-version H20 1P1D smoke ran
 the real model with 16K input and produced 64 output tokens matching a prior
 reference output exactly. The P used TP8/CP8, bounded replay disabled and the
 remote reader; D used DP8, a native per-node host table and DSpark. Mooncake
@@ -66,8 +69,8 @@ external dependencies.
 
 A subsequent paired C8 test used three rounds of 32 measured requests per arm
 with 16K input and 64 output tokens on the same two H20 nodes. The Shared P
-used 16 QPs and the experimental READ plan/prefetch; Native P used the current
-per-node local CPU table. Both used the same D process, Mooncake KV, model
+used 16 QPs and the experimental READ plan/prefetch; Native P used the
+per-node local CPU table available at that tested revision. Both used the same D process, Mooncake KV, model
 version, prompt sets, and bounded replay disabled. Median-of-round TTFT p50 was
 5159.83 ms Native and 5204.95 ms Shared (+0.87%); output throughput was 94.33
 and 93.52 tokens/s (-0.85%). All 96 paired input and output hashes matched,
