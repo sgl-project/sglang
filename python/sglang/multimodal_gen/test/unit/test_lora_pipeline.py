@@ -491,6 +491,62 @@ def test_view_merge_restores_exact_base_after_strength_changes(dtype, offloaded)
     assert not layer.merged
 
 
+def test_disabled_merge_skips_snapshot_and_preserves_dynamic_adapter():
+    base = torch.nn.Linear(2, 2, bias=False)
+    original = base.weight.detach().clone()
+    pipeline = _make_pipeline(_make_layer())
+    pipeline.modules["transformer"].add_module("linear", base)
+    pipeline.lora_initialized = False
+    pipeline.allow_merge = False
+    pipeline.exclude_lora_layers = []
+    pipeline.lora_rank = pipeline.lora_alpha = None
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", target="transformer")
+    layer = pipeline.lora_layers["linear"]
+    assert layer.cpu_weight is None
+    x = torch.ones(1, 2)
+    torch.testing.assert_close(layer(x), base(x) + 2)
+
+    for mode in ("auto", "merge"):
+        with pytest.raises(RuntimeError, match="merge is disabled"):
+            pipeline.set_lora("adapter", merge_mode=mode)
+    with pytest.raises(RuntimeError, match="merge is disabled"):
+        pipeline.merge_lora_weights()
+    with pytest.raises(RuntimeError, match="merge is disabled"):
+        layer.set_lora_weights(
+            torch.zeros(1, 2), torch.zeros(2, 1), clear_existing=True
+        )
+    with pytest.raises(RuntimeError, match="merge is disabled"):
+        layer.merge_lora_weights(strength=0.0)
+    with pytest.raises(RuntimeError, match="merge is disabled"):
+        layer.compute_merged_weight()
+    with pytest.raises(RuntimeError, match="merge is disabled"):
+        layer.install_merged_weight(original + 1, original)
+
+    assert not layer.merged
+    assert layer.cpu_weight is None
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+    torch.testing.assert_close(layer(x), base(x) + 2)
+
+
+@pytest.mark.parametrize("snapshot_base", [False, True])
+def test_disabled_merge_offload_binding_keeps_only_manager_view(snapshot_base):
+    base = torch.nn.Linear(2, 2, bias=False)
+    layer = wrap_with_lora_layer(base, allow_merge=False, snapshot_base=snapshot_base)
+    pipeline = _make_pipeline(layer)
+    stored = torch.randn_like(base.weight)
+    pipeline._bind_lora_offload_view(
+        pipeline.modules["transformer"],
+        "linear",
+        layer,
+        {"linear.weight": stored},
+        snapshot_base=snapshot_base,
+    )
+    assert layer.cpu_weight is None
+    assert base._packed_weight_cpu.data_ptr() == stored.data_ptr()
+
+
 def test_cached_merge_restores_untouched_base_view():
     base = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
     original = base.weight.detach().clone()

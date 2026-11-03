@@ -162,6 +162,8 @@ class LoRAPipeline(ComposedPipelineBase):
     Pipeline that supports injecting LoRA adapters into the diffusion transformer.
     """
 
+    allow_merge: bool = True
+
     # Type annotations for instance attributes (initialized in __init__)
     # [lora_nickname][target_LoRA_weight_name_in_SGLang_dit] = weight
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
@@ -224,6 +226,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_nickname = "default"
 
         # Initialize from server_args
+        self.allow_merge = self.allow_merge and not self.server_args.disable_lora_merge
         self.device = get_local_torch_device()
         self.exclude_lora_layers = (
             self.server_args.pipeline_config.dit_config.arch_config.exclude_lora_layers
@@ -438,6 +441,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 lora_rank=self.lora_rank,
                 lora_alpha=self.lora_alpha,
                 snapshot_base=snapshot_base,
+                allow_merge=self.allow_merge,
             )
             if lora_layer is not None:
                 self._bind_lora_offload_view(
@@ -489,8 +493,9 @@ class LoRAPipeline(ComposedPipelineBase):
         if weight is None:
             return
         data = weight.detach()
-        lora_layer.cpu_weight = data.clone() if snapshot_base else data
-        lora_layer._base_is_view = not snapshot_base
+        if lora_layer.allow_merge:
+            lora_layer.cpu_weight = data.clone() if snapshot_base else data
+            lora_layer._base_is_view = not snapshot_base
         base = lora_layer.base_layer
         base._offload_root = module
         base._offload_param_prefix = name
@@ -525,7 +530,7 @@ class LoRAPipeline(ComposedPipelineBase):
         """
         Unified method to convert the transformer to a LoRA transformer.
 
-        snapshot_base=False keeps CPU-backed unmerge snapshots as zero-copy
+        When merging is allowed, snapshot_base=False keeps CPU-backed snapshots as zero-copy
         views of the base weights instead of clones (38 GB of anonymous memory
         on H3's DiT). Resident accelerator layers still retain owned CPU
         snapshots because they cannot be rebound to the CPU merge cache.
@@ -724,6 +729,10 @@ class LoRAPipeline(ComposedPipelineBase):
         if merge_mode not in LORA_MERGE_MODES:
             raise ValueError(
                 f"Invalid LoRA merge mode: {merge_mode}. Valid modes: {LORA_MERGE_MODES}"
+            )
+        if not self.allow_merge and merge_mode != "dynamic":
+            raise RuntimeError(
+                "LoRA merge is disabled for this pipeline; use dynamic mode"
             )
         return merge_mode
 
@@ -1122,8 +1131,8 @@ class LoRAPipeline(ComposedPipelineBase):
         stop costing anonymous host memory; pass it only for the startup
         (static) adapter, where the merged combination is stable.
         """
-        self._invalidate_lora_conditioning()
         merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
+        self._invalidate_lora_conditioning()
 
         # Normalize inputs to lists for multi-LoRA support
         lora_nicknames, lora_paths, strengths, targets, lora_alphas = (
@@ -1514,6 +1523,8 @@ class LoRAPipeline(ComposedPipelineBase):
                     "transformer_2", "critic".
             strength: LoRA strength for merge, default 1.0.
         """
+        if not self.allow_merge:
+            raise RuntimeError("LoRA merge is disabled for this pipeline")
         self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
         if error:

@@ -400,6 +400,7 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
     lora_alpha: int | None = None  # Override training alpha when metadata omits it
     lora_merge_mode: str = "auto"
+    disable_lora_merge: bool = False
     lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
@@ -686,6 +687,13 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        if self.disable_lora_merge:
+            if (
+                self.is_arg_explicitly_set("lora_merge_mode")
+                and self.lora_merge_mode != "dynamic"
+            ):
+                raise ValueError("--disable-lora-merge requires dynamic LoRA mode")
+            self.lora_merge_mode = "dynamic"
         self._normalize_component_residency()
         self._adjust_cpu_offload_components()
         auto_tuner = ServerArgsAutoTuner(self)
@@ -3219,6 +3227,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 "the update, e.g. distilled LoRAs); merge always merges into base "
                 "weights; dynamic always applies LoRA at forward time."
             ),
+        )
+        parser.add_argument(
+            "--disable-lora-merge",
+            action="store_true",
+            help="Use dynamic LoRA only and skip the base-weight backup for unmerging.",
         )
         parser.add_argument(
             "--lora-weight-name",

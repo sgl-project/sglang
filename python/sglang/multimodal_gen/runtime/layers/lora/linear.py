@@ -149,6 +149,8 @@ class BaseLayerWithLoRA(nn.Module):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         snapshot_base: bool = True,
+        *,
+        allow_merge: bool = True,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
@@ -160,7 +162,10 @@ class BaseLayerWithLoRA(nn.Module):
         # valid only while every merge on this layer is a copy-merge (the
         # merged-store path), which never writes the base storage. H3's DiT
         # backup alone is 38 GB of anonymous memory under clone().
-        if snapshot_base:
+        if not allow_merge:
+            self.cpu_weight = None
+            self._base_is_view = False
+        elif snapshot_base:
             self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
             self._base_is_view = False
         else:
@@ -190,6 +195,14 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
+    @property
+    def allow_merge(self) -> bool:
+        return self.cpu_weight is not None
+
+    def _require_merge_allowed(self) -> None:
+        if not self.allow_merge:
+            raise RuntimeError("LoRA merge is disabled for this layer")
+
     def _scale_lora_delta(
         self, delta: torch.Tensor, runtime_lora_scale: float
     ) -> torch.Tensor:
@@ -217,6 +230,8 @@ class BaseLayerWithLoRA(nn.Module):
     @property
     def can_merge_base_weight(self) -> bool:
         """Whether a LoRA delta may safely replace the stored base weight."""
+        if not self.allow_merge:
+            return False
         weight = self.weight
         if not (weight.dtype.is_floating_point or weight.dtype.is_complex):
             return False
@@ -427,6 +442,8 @@ class BaseLayerWithLoRA(nn.Module):
                           If False, append to existing list (for multi-LoRA support).
             output_offset: Optional constant output term paired with this adapter
         """
+        if merge_weights:
+            self._require_merge_allowed()
         lora_A_param = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
@@ -608,6 +625,7 @@ class BaseLayerWithLoRA(nn.Module):
         when the policy says so, rounded back once — so the bytes are
         identical to what merge_lora_weights would have left in place.
         """
+        self._require_merge_allowed()
         base = self.weight.data
         target_dtype = base.dtype
         work = base.detach().to(get_local_torch_device())
@@ -661,6 +679,7 @@ class BaseLayerWithLoRA(nn.Module):
         unmerge snapshot is the untouched base view — zero-copy, because
         nothing wrote the base storage.
         """
+        self._require_merge_allowed()
         self.weight.data = merged
         self.merged = True
         self.cpu_weight = base_view.detach()
@@ -668,6 +687,7 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
+        self._require_merge_allowed()
         if strength is not None:
             self.strength = strength
             if self.lora_weights_list:
@@ -1065,6 +1085,8 @@ def wrap_with_lora_layer(
     lora_rank: int | None = None,
     lora_alpha: int | None = None,
     snapshot_base: bool = True,
+    *,
+    allow_merge: bool = True,
 ) -> BaseLayerWithLoRA | None:
     """
     transform the given layer to its corresponding LoRA layer
@@ -1091,6 +1113,7 @@ def wrap_with_lora_layer(
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 snapshot_base=effective_snapshot_base,
+                allow_merge=allow_merge,
             )
             return ret
     return None

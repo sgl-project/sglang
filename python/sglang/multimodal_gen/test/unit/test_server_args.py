@@ -772,6 +772,28 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
 
                 self.assertEqual(server_args.served_model_name, expected)
 
+    def test_disable_lora_merge_selects_dynamic_mode(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = ["--model-path", "/fake", "--disable-lora-merge"]
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+        ):
+            args = ServerArgs.from_cli_args(*parser.parse_known_args(argv))
+        self.assertTrue(args.disable_lora_merge)
+        self.assertEqual(args.lora_merge_mode, "dynamic")
+        with self.assertRaisesRegex(ValueError, "requires dynamic"):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "disable_lora_merge": True,
+                    "lora_merge_mode": "merge",
+                }
+            )
+
     def test_dit_layerwise_offload_cli_arg(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
