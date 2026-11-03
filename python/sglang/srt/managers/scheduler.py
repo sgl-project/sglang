@@ -836,11 +836,9 @@ class Scheduler(
 
     def prewarm_aicpu_on_npu(self):
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import prewarm_dsv4_aicpu
+            from sglang.srt.hardware_backend.npu.utils import prewarm_aicpu
 
-            prewarm_dsv4_aicpu(
-                self.model_config, self.server_args.hicache_storage_backend
-            )
+            prewarm_aicpu(self.server_args.hicache_storage_backend)
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)

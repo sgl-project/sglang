@@ -75,7 +75,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
-from sglang.srt.hardware_backend.npu.utils import prewarm_dsv4_aicpu
+from sglang.srt.hardware_backend.npu.utils import prewarm_aicpu
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -718,53 +718,32 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         self.assertEqual(kwargs, {})
 
 
-class TestDsv4AicpuPrewarm(unittest.TestCase):
+class TestAicpuPrewarm(unittest.TestCase):
     def setUp(self):
-        self.config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
-            num_attention_heads=64,
-            head_dim=512,
-            sliding_window_size=128,
-        )
         self.tp_group = SimpleNamespace(
             device="cpu", device_group=object(), device_module=MagicMock()
         )
-        self.parallel = SimpleNamespace(
-            tp_size=8, attn_tp_size=1, tp_group=self.tp_group
-        )
+        self.parallel = SimpleNamespace(tp_group=self.tp_group)
         patcher = patch(
             "sglang.srt.runtime_context.get_parallel", return_value=self.parallel
         )
         self.get_parallel = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_other_models_and_storage_backends_do_not_prewarm(self):
-        for storage, architecture in (
-            (None, "DeepseekV4ForCausalLM"),
-            ("file", "DeepseekV4ForCausalLM"),
-            ("npu_memcache", "DeepseekV3ForCausalLM"),
-            ("npu_memcache", "Qwen3ForCausalLM"),
-        ):
-            with self.subTest(storage=storage, architecture=architecture):
-                self.config.hf_config.architectures = [architecture]
-                prewarm_dsv4_aicpu(self.config, storage)
+    def test_other_storage_backends_do_not_prewarm(self):
+        for storage in (None, "file", "mooncake"):
+            with self.subTest(storage=storage):
+                prewarm_aicpu(storage)
         self.get_parallel.assert_not_called()
 
     def test_hccl_finishes_before_metadata_on_a3_and_a5(self):
-        for arch35, attn_tp_size, window in (
-            (False, 1, 128),
-            (False, 8, None),
-            (True, 1, 256),
-            (True, 8, 128),
-        ):
+        for arch35 in (False, True):
             events = []
-            self.parallel.attn_tp_size = attn_tp_size
-            self.config.sliding_window_size = window
             self.tp_group.device_module.synchronize.side_effect = lambda: events.append(
                 "hccl_sync"
             )
             with (
-                self.subTest(arch35=arch35, attn_tp_size=attn_tp_size, window=window),
+                self.subTest(arch35=arch35),
                 patch(
                     "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
                     return_value=arch35,
@@ -783,7 +762,7 @@ class TestDsv4AicpuPrewarm(unittest.TestCase):
                 all_reduce.side_effect = lambda *a, **kw: events.append("hccl")
                 npu.synchronize.side_effect = lambda device: events.append("aicpu_sync")
 
-                prewarm_dsv4_aicpu(self.config, "npu_memcache")
+                prewarm_aicpu("npu_memcache")
 
                 self.assertEqual(
                     events, ["hccl", "hccl_sync", "metadata", "aicpu_sync"]
@@ -794,15 +773,13 @@ class TestDsv4AicpuPrewarm(unittest.TestCase):
                 )
                 metadata_op.assert_called_once()
                 kwargs = metadata_op.call_args.kwargs
-                self.assertEqual(kwargs["num_heads_q"], 64 // attn_tp_size)
+                self.assertEqual(kwargs["num_heads_q"], 64)
                 self.assertEqual(kwargs["num_heads_kv"], 1)
                 self.assertEqual(kwargs["head_dim"], 512)
                 self.assertEqual(kwargs["batch_size"], 1)
                 self.assertEqual(kwargs["cu_seqlens_q"].tolist(), [0, 1])
                 self.assertEqual(kwargs["seqused_kv"].tolist(), [1])
-                self.assertEqual(
-                    kwargs["ori_win_left"], (128 if window is None else window) - 1
-                )
+                self.assertEqual(kwargs["ori_win_left"], 127)
                 self.assertEqual(kwargs["cmp_ratio"], 1)
                 self.assertFalse(kwargs["has_cmp_kv"])
                 if arch35:
@@ -827,7 +804,7 @@ class TestDsv4AicpuPrewarm(unittest.TestCase):
                 )
                 failed_call.side_effect = RuntimeError("HCCL initialization failed")
                 with self.assertRaisesRegex(RuntimeError, "HCCL initialization failed"):
-                    prewarm_dsv4_aicpu(self.config, "npu_memcache")
+                    prewarm_aicpu("npu_memcache")
                 ops.npu_sparse_attn_sharedkv_metadata.assert_not_called()
                 ops.npu_kv_quant_sparse_attn_sharedkv_metadata.assert_not_called()
 
