@@ -193,8 +193,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable overlap schedule for consecutive prefill batches</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DISABLE_OVERLAP_AFTER_PREFILL`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process a prefill step's result before scheduling the next step, for TTFT (formerly `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP`, which still works with a deprecation warning)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
     </tr>
     <tr>
@@ -1910,6 +1910,11 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_PAGED_PREFILL_ASM</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let gfx950 fp8 hd256 chunked prefill read the KV pool in place through AITER's paged-varlen ASM kernel, instead of gathering the prefix into a contiguous buffer first. The ASM kernel is compiled for a 4D LINEAR <code>[N, 64, H, D]</code> KV cache, so it serves <code>--page-size 64</code> on the NHD pool and nothing else; at any other page size this variable has no effect whichever way it is set. Where it does apply, the gain grows with context and is flat to marginally negative at moderate ISL, so set it to <code>false</code> for workloads that are not long-context.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_DECODE_PARTITION_BUCKETS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Launch AITER <code>paged_attention_ragged</code> decode with fewer partitions for batches of short requests, through one decode CUDA graph per sequence-length bucket. Set to <code>false</code> to keep <code>max_num_partitions</code> for every decode.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>

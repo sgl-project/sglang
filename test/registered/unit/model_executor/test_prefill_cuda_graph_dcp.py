@@ -15,7 +15,7 @@ import torch
 
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -103,6 +103,7 @@ class TestDcpReplayMetadata(unittest.TestCase):
             return _metadata(num_tokens=5)
 
         attn_backend = SimpleNamespace(
+            skips_prefill_metadata_on_idle_dp_rank=False,
             req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((1, 8))),
             token_to_kv_pool=SimpleNamespace(
                 get_kv_buffer_shape=lambda: (torch.Size([64, 1, 6]), None)

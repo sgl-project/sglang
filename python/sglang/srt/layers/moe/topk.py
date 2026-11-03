@@ -176,11 +176,12 @@ def _use_rocm_triton_softmax_topk(
     num_shared_topk_slots: int,
     packed_out: Optional[torch.Tensor],
 ) -> bool:
-    """Use the lower-latency Triton router for Qwen3.5 decode-sized rows."""
+    """Use the lower-latency Triton router for Qwen3.5 and Qwen3-Next
+    decode-sized rows."""
     return (
         _use_aiter
         and _is_gfx95
-        and hidden_states.shape[1] == 4096
+        and hidden_states.shape[1] in (2048, 4096)
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[0] <= 128
         and gating_output.shape[1] == 512
@@ -1359,19 +1360,20 @@ def fused_topk(
                 )
         # ===== TO BE REFACTORED ====
         elif packed_out is not None:
-            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
-            # writes topk_weights/topk_ids AND the FlashInfer packed topk in one launch.
-            from sglang.kernels.ops.lora.moe.trtllm_lora_temp.topk_softmax_pack import (
-                topk_softmax_pack,
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): the router
+            # also writes the FlashInfer packed topk in the same launch.
+            from sglang.kernels.ops.moe.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
             )
 
-            topk_softmax_pack(
-                topk_weights,
-                topk_ids,
-                packed_out,
+            topk_weights, topk_ids = _jit_moe_fused_gate(
                 gating_output,
-                renormalize,
+                None,
+                topk,
+                scoring_func="softmax",
+                renormalize=renormalize,
                 num_token_non_padded=num_token_non_padded,
+                packed_out=packed_out,
             )
         # ===== END TO BE REFACTORED ====
         elif _is_cuda or use_rocm_triton:
@@ -2100,6 +2102,36 @@ def biased_grouped_topk_gpu(
             num_expert_group=num_expert_group,
             topk_group=topk_group,
         )
+    if _is_cuda and not dynamic_bias and num_expert_group and num_expert_group > 1:
+        # One-warp-per-token CUDA router (same selection as flashinfer's
+        # fused_topk_deepseek, ties to the lowest id); shared columns carry
+        # fused_shared_expert_weight like the branch below.
+        from sglang.kernels.ops.moe import moe_route_warp
+
+        if moe_route_warp.covered(
+            gating_output.dtype,
+            gating_output.shape[1],
+            topk,
+            "sigmoid",
+            num_fused_shared_experts,
+            num_expert_group,
+            topk_group,
+            gating_output.device.index,
+        ) and moe_route_warp.bias_layout_ok(correction_bias):
+            return moe_route_warp.moe_route_warp(
+                gating_output,
+                correction_bias,
+                topk,
+                scoring_func="sigmoid",
+                num_fused_shared_experts=num_fused_shared_experts,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=bool(
+                    apply_routed_scaling_factor_on_output
+                ),
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
     if (
         _is_cuda
         and fused_topk_deepseek is not None
@@ -2264,30 +2296,6 @@ def biased_grouped_topk_gpu(
             )
         )
         if _jit_gate_ok:
-            # ===== TO BE REFACTORED ====
-            _use_jit_bf16_gate = False
-            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
-
-                _use_jit_bf16_gate = (
-                    lora_envs.SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE.get()
-                    and lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
-                )
-            if _use_jit_bf16_gate:
-                from sglang.kernels.ops.lora.moe.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
-                    kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
-                )
-
-                # bf16 pass-through: skip the two host-side fp32 upcast kernels.
-                return _kimi_k2_moe_fused_gate(
-                    gating_output,
-                    correction_bias,
-                    topk=topk,
-                    renormalize=renormalize,
-                    routed_scaling_factor=routed_scaling_factor,
-                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                )
-            # ===== END TO BE REFACTORED ====
             from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate
 
             # Pass BF16 logits through untouched for the automatic radix-select
@@ -3244,26 +3252,16 @@ def select_experts(
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
-def precomputed_topk_postprocess_is_noop(
-    topk_config: TopKConfig,
-    num_token_non_padded: Optional[torch.Tensor] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-) -> bool:
-    """Whether :func:`build_precomputed_topk_output` can stand in for
-    :func:`select_experts`' post-processing.
+def can_postprocess_precomputed_topk(topk_config: TopKConfig) -> bool:
+    """Whether post-processing needs only the fused router's weights and IDs.
 
-    A router that produces (weights, ids) itself -- e.g. K3's fused gate+top-k
-    kernel -- skips select_experts entirely, so it must not skip the work
-    select_experts does *after* the top-k: the EPLB logical->physical remap, the
-    padded-region mask, and the shared-expert append.  This returns True only
-    when all of those reduce to no-ops, leaving just the capture hook and the
-    distribution recorder (which the builder below still runs).
+    Placement and padding use the ordinary post-processing below. Shared slots
+    and routing simulation also need the full logits, which the merged front
+    does not return.
     """
     return (
         _is_cuda
         and topk_config.num_shared_topk_slots == 0
-        and num_token_non_padded is None
-        and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
     )
@@ -3274,14 +3272,33 @@ def build_precomputed_topk_output(
     topk_ids: torch.Tensor,
     topk_config: TopKConfig,
     layer_id: int,
+    *,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
-    """Wrap a router's own (weights, ids) as a STANDARD top-k output, running the
-    capture hook and the expert-distribution recorder that select_experts would.
+    """Finish precomputed logical routes through select_experts' post-processing.
 
-    Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
+    The caller must supply already-scaled weights and exclude shared slots and
+    routing simulation. Fake dispatch changes logits *before* top-k selection,
+    so it must use the ordinary router rather than this entry point.
     """
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    if num_token_non_padded is None and expert_location_dispatch_info is None:
+        capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+        return StandardTopKOutput(topk_weights, topk_ids, None)
+    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        topk_config=topk_config,
+        router_logits=None,
+        layer_id=layer_id,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+    )
+    if recorder_topk_ids is not None:
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_topk_ids
+        )
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.
     return StandardTopKOutput(topk_weights, topk_ids, None)
