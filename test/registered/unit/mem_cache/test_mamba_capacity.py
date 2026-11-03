@@ -7,6 +7,10 @@ from sglang.srt.disaggregation.decode import (
     DecodeReqToTokenPool,
     HybridMambaDecodeReqToTokenPool,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
@@ -14,6 +18,7 @@ from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -226,7 +231,7 @@ class TestMambaCapacity(unittest.TestCase):
     def test_pd_preallocation_leaves_blocked_request_queued(self):
         pool, held = make_pool(1)
         cache = make_cache(pool, held, 0)
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="blocked",
             origin_input_ids=[1],
             output_ids=[],
@@ -241,7 +246,8 @@ class TestMambaCapacity(unittest.TestCase):
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = []
-        queue.retracted_queue = [req]
+        queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+        queue.retracted_queue.join([req])
         queue.req_to_token_pool = pool
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
@@ -287,7 +293,7 @@ class TestMambaCapacity(unittest.TestCase):
             ),
         ):
             self.assertEqual(queue.resume_retracted_reqs(), [])
-        self.assertEqual(queue.retracted_queue, [req])
+        self.assertEqual(list(queue.retracted_queue), [req])
         self.assertTrue(req.is_retracted)
         queue._pre_alloc.assert_not_called()
 
