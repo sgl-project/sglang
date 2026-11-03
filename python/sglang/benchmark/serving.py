@@ -2430,13 +2430,13 @@ def cli_main():
         "--random-input-len",
         type=int,
         default=1024,
-        help="Number of input tokens per request, used only for random and image dataset.",
+        help="Number of input tokens per request, used only for random, image, and video datasets.",
     )
     parser.add_argument(
         "--random-output-len",
         default=1024,
         type=int,
-        help="Number of output tokens per request, used only for random and image dataset.",
+        help="Number of output tokens per request, used only for random, image, and video datasets.",
     )
     parser.add_argument(
         "--random-range-ratio",
