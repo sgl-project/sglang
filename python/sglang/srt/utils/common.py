@@ -516,6 +516,7 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
+        # This file contain numa nodes with compute cores
         has_cpu_path = "/sys/devices/system/node/has_cpu"
         if mem_bind_env:
             nodes = parse_node_list(mem_bind_env)
