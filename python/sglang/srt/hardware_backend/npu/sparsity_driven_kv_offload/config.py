@@ -51,7 +51,7 @@ def is_sparsity_driven_kv_offload_enabled(
     model_config: ModelConfig,
     use_mla_backend: bool,
 ) -> bool:
-    indexer_impl = get_sparse_kv_indexer_impl()
+    indexer_impl = get_offload_sparse_kv_indexer_impl()
     if (
         envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
         and not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
@@ -108,7 +108,7 @@ def is_sparsity_driven_kv_offload_enabled(
     return True
 
 
-def get_sparse_kv_indexer_impl() -> str:
+def get_offload_sparse_kv_indexer_impl() -> str:
     value = envs.SGLANG_NPU_SPARSE_KV_INDEXER.get()
     if value not in ("legacy", "lim"):
         raise ValueError(
@@ -195,7 +195,7 @@ def get_sparse_kv_budget(
         kv_bytes_per_token=kv_bytes_per_token,
         cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
         hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
-        indexer_impl=get_sparse_kv_indexer_impl(),
+        indexer_impl=get_offload_sparse_kv_indexer_impl(),
         copy_sfa=envs.SGLANG_NPU_ENABLE_COPY_SFA.get(),
         copy_sfa_query_heads=copy_sfa_query_heads,
         mtp_full_visible=envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get(),

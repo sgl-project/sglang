@@ -26,8 +26,8 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
     sparse_batch_capacity,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    get_offload_sparse_kv_indexer_impl,
     get_sparse_kv_budget,
-    get_sparse_kv_indexer_impl,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
     copy_sfa_host_row_stride,
@@ -179,7 +179,7 @@ class SparseKVCacheManager:
             graph_batch_capacity=self.batch_capacity,
         )
         self.device_cache_size = self.budget.cache_tokens
-        self.indexer_impl = get_sparse_kv_indexer_impl()
+        self.indexer_impl = get_offload_sparse_kv_indexer_impl()
         self.use_lru = (
             self.device_cache_size > self.sparse_context_len
             and self.indexer_impl != "lim"

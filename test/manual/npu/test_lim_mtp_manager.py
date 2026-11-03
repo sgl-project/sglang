@@ -145,7 +145,7 @@ def test_real_manager_mtp_owner_share_lifecycle(
             )
             stack.enter_context(
                 patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.get_sparse_kv_indexer_impl",
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.get_offload_sparse_kv_indexer_impl",
                     return_value="lim",
                 )
             )
