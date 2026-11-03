@@ -9,13 +9,15 @@
 //!   `json_schema` array restricting the output to tool calls. It validates
 //!   `tool_choice`/`tools` agreement first.
 //! - [`parse_chat_tool_calls`] strips the model's tool-call markers out of a
-//!   finished response. Streaming responses use Dynamo's
-//!   `apply_tool_calling_jail` directly in `chat.rs`.
+//!   finished response, or reads the `json_schema` array when that constraint
+//!   applied. Streaming responses use Dynamo's `apply_tool_calling_jail`
+//!   directly in `chat.rs`.
 //!
 //! [`chat_delta`] builds the stream deltas these paths emit, and
 //! [`chat_finish_reason`] maps the scheduler's finish reason onto the OpenAI
 //! wire values.
 
+use sglang_processor::dynamo_parsers::json::{JsonParserConfig, try_tool_call_parse_basic_json};
 use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use sglang_processor::dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionMessageToolCall,
@@ -72,16 +74,31 @@ pub(super) fn chat_delta(
 /// the content passes through untouched. With a parser, a successful parse
 /// returns the leftover non-tool text and the calls; `parallel_tool_calls`
 /// false truncates the batch to the first call, mirroring Python.
+///
+/// `uses_tool_call_json_schema` means the output follows the schema of
+/// [`apply_tool_constraint`] and not the parser's format, so the bare JSON is
+/// read first, as Dynamo's streaming jail reads it.
 pub(super) async fn parse_chat_tool_calls(
     content: String,
     parser: Option<&str>,
     tools: Option<&[ToolDefinition]>,
     parallel_tool_calls: bool,
+    uses_tool_call_json_schema: bool,
 ) -> (String, Option<Vec<ChatCompletionMessageToolCall>>) {
     let Some(parser) = parser else {
         return (content, None);
     };
-    match parse_tool_calls(parser, &content, tools).await {
+    let bare_json = JsonParserConfig {
+        bare_json_mode: true,
+        ..Default::default()
+    };
+    let parsed = match uses_tool_call_json_schema
+        .then(|| try_tool_call_parse_basic_json(&content, &bare_json, tools))
+    {
+        Some(Ok(parsed)) if !parsed.0.is_empty() => Ok(parsed),
+        _ => parse_tool_calls(parser, &content, tools).await,
+    };
+    match parsed {
         Ok((mut calls, normal)) if !calls.is_empty() => {
             if !parallel_tool_calls {
                 calls.truncate(1);
@@ -381,6 +398,7 @@ mod tests {
             Some("qwen"),
             None,
             true,
+            false,
         )
         .await;
         assert!(content.is_empty());
@@ -390,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn unary_parse_without_a_parser_passes_content_through() {
         let (content, calls) =
-            parse_chat_tool_calls("<|python_tag|>call".into(), None, None, true).await;
+            parse_chat_tool_calls("<|python_tag|>call".into(), None, None, true, false).await;
         assert_eq!(content, "<|python_tag|>call");
         assert!(calls.is_none());
     }

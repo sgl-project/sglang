@@ -333,6 +333,12 @@ async fn chat_completions(
             reasoning_options,
             tool_parser: parser,
             tools,
+            // `tool_constraint` gives these choices a JSON schema when it builds no tag.
+            uses_tool_call_json_schema: !uses_tool_call_structural_tag
+                && matches!(
+                    tool_choice,
+                    DynamoToolChoice::Required | DynamoToolChoice::Named(_)
+                ),
         },
     };
     if stream {
@@ -556,6 +562,7 @@ pub(super) enum OutputParsing {
         reasoning_options: ReasoningOptions,
         tool_parser: Option<String>,
         tools: Option<Vec<ToolDefinition>>,
+        uses_tool_call_json_schema: bool,
     },
     /// recipe over the output token ids, in place of both parsers.
     DeepSeek(DeepSeekOutputOptions),
@@ -622,6 +629,7 @@ pub(super) async fn unary_chat(
                 reasoning_options,
                 tool_parser,
                 tools,
+                uses_tool_call_json_schema,
             } => {
                 // Split reasoning markers out of the content first (Python splits
                 // before tool-call parsing too), then parse tool calls on the clean
@@ -637,6 +645,7 @@ pub(super) async fn unary_chat(
                     tool_parser.as_deref(),
                     tools.as_deref(),
                     parallel_tool_calls,
+                    *uses_tool_call_json_schema,
                 )
                 .await;
                 let finish_reason = match tool_calls {
@@ -703,6 +712,7 @@ pub(super) fn chat_event_stream(
             reasoning_options,
             tool_parser,
             tools,
+            ..
         } => (
             reasoning_parser,
             reasoning_options,
@@ -1314,6 +1324,7 @@ mod tests {
             reasoning_options: ReasoningOptions::default(),
             tool_parser: None,
             tools: None,
+            uses_tool_call_json_schema: false,
         }
     }
 
