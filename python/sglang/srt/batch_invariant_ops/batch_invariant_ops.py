@@ -278,12 +278,21 @@ def _matmul_persistent_deepgemm(
     K, N = b.shape
     out = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
-    # DeepGEMM 0.2 defaults BF16 GEMMs to cuBLASLt, whose reduction can
-    # depend on the batch size. Older wheels always use the invariant kernel.
+    # DeepGEMM 0.2+ and upstream deep_gemm 2.8.x default BF16 GEMMs to
+    # cuBLASLt, whose split-K reduction depends on the batch size. sgl-deep-gemm
+    # exposes get_deterministic_algorithms(), whereas upstream deep_gemm wheels
+    # only expose use_deterministic_algorithms(bool); older wheels expose neither.
+    use_deterministic = getattr(deep_gemm, "use_deterministic_algorithms", None)
     get_deterministic = getattr(deep_gemm, "get_deterministic_algorithms", None)
-    deterministic = get_deterministic() if get_deterministic else True
-    if not deterministic:
-        deep_gemm.use_deterministic_algorithms(True)
+    restore_nondeterministic = False
+    if use_deterministic is not None:
+        if get_deterministic is not None:
+            if not get_deterministic():
+                use_deterministic(True)
+                restore_nondeterministic = True
+        else:
+            use_deterministic(True)
+            restore_nondeterministic = not _batch_invariant_MODE
     try:
         deep_gemm.bf16_gemm_nn(a, b, out)
     except RuntimeError as e:
@@ -294,8 +303,8 @@ def _matmul_persistent_deepgemm(
             f"for small matrices. Original error: {e}"
         ) from e
     finally:
-        if not deterministic:
-            deep_gemm.use_deterministic_algorithms(False)
+        if restore_nondeterministic:
+            use_deterministic(False)
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -1163,6 +1172,15 @@ _batch_invariant_LIB = None
 _original_torch_bmm = None
 
 
+def _sync_deepgemm_deterministic_mode(enabled: bool) -> None:
+    if not ENABLE_JIT_DEEPGEMM:
+        return
+    dg = globals().get("deep_gemm")
+    use_deterministic = getattr(dg, "use_deterministic_algorithms", None)
+    if use_deterministic is not None:
+        use_deterministic(enabled)
+
+
 def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
@@ -1175,6 +1193,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     dispatch_key = get_dispatch_device_backend()
 
     _batch_invariant_MODE = True
+    _sync_deepgemm_deterministic_mode(True)
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
     if not _is_npu:
@@ -1235,6 +1254,7 @@ def disable_batch_invariant_mode():
         torch.bmm = _original_torch_bmm
         _original_torch_bmm = None
     _batch_invariant_MODE = False
+    _sync_deepgemm_deterministic_mode(False)
     _batch_invariant_LIB = None
 
 
@@ -1242,14 +1262,20 @@ def disable_batch_invariant_mode():
 def set_batch_invariant_mode(enabled: bool = True):
     global _batch_invariant_MODE, _batch_invariant_LIB
     old_data = (_batch_invariant_MODE, _batch_invariant_LIB)
+    dg = globals().get("deep_gemm") if ENABLE_JIT_DEEPGEMM else None
+    get_det = getattr(dg, "get_deterministic_algorithms", None)
+    old_dg_det = get_det() if get_det is not None else _batch_invariant_MODE
     if enabled:
         enable_batch_invariant_mode()
     else:
         disable_batch_invariant_mode()
-    yield
-    if _batch_invariant_LIB is not None:
-        _batch_invariant_LIB._destroy()
-    _batch_invariant_MODE, _batch_invariant_LIB = old_data
+    try:
+        yield
+    finally:
+        if _batch_invariant_LIB is not None:
+            _batch_invariant_LIB._destroy()
+        _batch_invariant_MODE, _batch_invariant_LIB = old_data
+        _sync_deepgemm_deterministic_mode(old_dg_det)
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])
