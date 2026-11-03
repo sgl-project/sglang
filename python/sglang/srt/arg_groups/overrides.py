@@ -33,12 +33,7 @@ from sglang.srt.arg_groups.arg_utils import (
     resolvable_fields,
     with_fallback,
 )
-
-# Compatibility re-exports; model providers import model_override_base directly.
-from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
-    _MODEL_OVERRIDE_FNS,
-    _PREDICATE_OVERRIDE_FNS,
-    MODEL_OVERRIDES,
+from sglang.srt.arg_groups.model_override_base import (
     ResolvedView,
     ResolvingConfig,
     _declaration_overlay,
@@ -47,10 +42,8 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
-    mamba_extra_buffer_of,
     model_config_of,
     record_of,
-    register_model_override,
     register_model_override_predicate,
     resolved_view,
     resolving_view,
@@ -948,6 +941,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
@@ -1099,7 +1093,7 @@ def _deterministic_rocm_rccl_check(view: Any) -> dict:
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
-    from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+    from sglang.srt.arg_groups.choices import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
     # A per-phase backend takes priority over --attention-backend for its phase,
     # so it has to be one of the deterministic backends too.
@@ -1535,7 +1529,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     # load with gate and up exchanged. Leave the backend at "auto" and let
     # create_moe_runner resolve it to ASCEND.
     if view.quantization == "mxfp8" and not get_platform().is_npu:
-        from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
+        from sglang.srt.arg_groups.choices import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
@@ -1712,7 +1706,7 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 @register_post_process
 def _gguf_quantization(view: Any) -> dict:
-    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+    from sglang.srt.utils.hf_transformers import check_gguf_file
 
     if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
         view.model_path
@@ -1957,7 +1951,7 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
     # model never loads an HF config) is honored as-is; otherwise the memo
     # is only kept once the record is resolved, because `page_size` below
     # is resolution-written.
-    from sglang.srt.arg_groups.overrides import model_config_of
+    from sglang.srt.arg_groups.model_override_base import model_config_of
 
     if not hasattr(server_args, "_mamba_cache_chunk_size"):
         try:

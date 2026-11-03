@@ -38,7 +38,7 @@ from sglang.kernels.ops.lora.dense.kv_b_lora_absorbed import (
 from sglang.srt.environ import envs
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, csgmv_segment_grid_size
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 

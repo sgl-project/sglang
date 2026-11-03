@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import torch
 
@@ -38,6 +39,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_lora,
     get_model,
     get_parallel,
     get_spec,
@@ -59,13 +61,17 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         num_experts: int,
         num_resident: int,
         graphs: bool = False,
+        auto_size: bool = False,
     ):
         torch.nn.Module.__init__(self)
         self.base_method = base_method
         self.format = expert_format
         self.num_experts = num_experts
         self.num_resident = num_resident
-        self.policy = LRUPolicy(num_resident)
+        # --paged-experts-num-resident auto: built with K = top_k; the model runner sizes K once
+        # the KV cache is allocated (sizing.ExpertSlotSizing).
+        self.auto_size = auto_size
+        self._slot_pool = None  # holds the K = top_k tables until sizing frees them
         self.checkpoint_params = ()  # found once the base method has created them
         self.contract = None  # follows from the runner the base method builds
         self.store = None  # built once the contract is known
@@ -87,8 +93,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     ):
         # The GPU table has K rows. The loader below sends all E experts to the host store,
         # so the native expert-id remap never sees ids >= K.
-        layer.num_local_experts = self.num_resident
-        layer._num_local_routed = layer._num_global_routed = self.num_resident
+        self._set_num_slots(layer, self.num_resident)
         self.native_loader = extra.get("weight_loader")
         self.base_method.create_weights(
             layer=layer,
@@ -145,11 +150,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         return weight_loader
 
     def create_moe_runner(self, layer, moe_runner_config):
-        self.base_method.create_moe_runner(
-            layer=layer,
-            moe_runner_config=runner_config(moe_runner_config, self.num_resident),
-        )
-        self.runner = runner_of(self.base_method, layer)
+        self.moe_runner_config = moe_runner_config  # rebuilt with the final K
+        self._create_runner(layer)
         self.contract = contract_for(self.runner)
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
         # A store that only stages the checkpoint layout for a repack need not be pinned.
@@ -173,6 +175,61 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             repacks=self.contract.repacks,
             unpaged=self.format.unpaged,
         )
+        if not self.auto_size:
+            self._build(layer)
+            return
+        # Sizing frees the K = top_k tables. In a pool of their own, that gives their memory
+        # back; between the weights, it would leave holes the slots cannot use. The executors
+        # are built once, for the final K (``materialize``).
+        device = getattr(layer, next(iter(self.store.host))).device
+        slab, self._slot_pool = pooled_empty(
+            _slot_table_bytes(self, self.num_resident), device
+        )
+        self._place(layer, self.num_resident, slab, 0)
+
+    def release_slots(self, layer) -> None:
+        """Free the slot tables; the host store holds every expert."""
+        for name in self.store.host:
+            param = getattr(layer, name)
+            param.data = param.data.new_empty((0, *param.shape[1:]))
+        self._slot_pool = None
+
+    def materialize(self, layer, num_resident: int, slab, offset: int) -> int:
+        """Lay the slot tables for ``num_resident`` experts out in ``slab`` from ``offset``
+        and rebuild what depends on K; return the offset after them."""
+        offset = self._place(layer, num_resident, slab, offset)
+        self.num_resident = num_resident
+        self._set_num_slots(layer, num_resident)
+        self._create_runner(layer)
+        self._build(layer)
+        return offset
+
+    def _set_num_slots(self, layer, num_slots: int) -> None:
+        layer.num_local_experts = num_slots
+        layer._num_local_routed = layer._num_global_routed = num_slots
+
+    def _create_runner(self, layer) -> None:
+        self.base_method.create_moe_runner(
+            layer=layer,
+            moe_runner_config=runner_config(self.moe_runner_config, self.num_resident),
+        )
+        self.runner = runner_of(self.base_method, layer)
+
+    def _place(self, layer, num_resident: int, slab, offset: int) -> int:
+        """Point the slot tables at ``slab`` from ``offset`` and fill them with experts
+        0..K-1 from the host store (as the post-load step leaves them)."""
+        for name, host in self.store.host.items():
+            param = getattr(layer, name)
+            nbytes = num_resident * _row_bytes(host)
+            table = slab[offset : offset + nbytes].view(host.dtype)
+            param.data = table.view(num_resident, *host.shape[1:])
+            param.data.copy_(host[:num_resident])
+            offset += -(-nbytes // _ALIGN) * _ALIGN
+        return offset
+
+    def _build(self, layer):
+        """The executors and, with CUDA graphs, the device residency, for the final K."""
+        self.policy = LRUPolicy(self.num_resident)
         residency = None
         if self.graphs:
             residency = DeviceResidency(
@@ -257,32 +314,72 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     _run_eager_into = eager_on_graph(True)(_run_eager_into_impl)
 
 
+# The slot tables of all layers share one allocation under auto; each starts at this alignment.
+_ALIGN = 256
+
+
+def _row_bytes(host: torch.Tensor) -> int:
+    """One expert's row of a host-store tensor."""
+    return host[0].numel() * host.element_size()
+
+
+def _slot_table_bytes(method, num_resident: int) -> int:
+    """A layer's slot tables for ``num_resident`` experts, each padded to ``_ALIGN``."""
+    return sum(
+        -(-num_resident * _row_bytes(h) // _ALIGN) * _ALIGN
+        for h in method.store.host.values()
+    )
+
+
+def pooled_empty(nbytes: int, device: torch.device):
+    """``(uint8 tensor, pool)``: on CUDA the tensor lives in a memory pool of its own, whose
+    segments go back to the driver once both are dropped (``None`` pool elsewhere)."""
+    if device.type != "cuda":
+        return torch.empty(nbytes, dtype=torch.uint8, device=device), None
+    pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(pool):
+        return torch.empty(nbytes, dtype=torch.uint8, device=device), pool
+
+
 def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
     expert_format = format_for(layer, base_method)
     check_paged_experts_compat(layer=layer, expert_format=expert_format)
     num_experts = layer.num_local_experts
-    num_resident = min(get_exec().moe.paged_experts_num_resident, num_experts)
-    if check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
-        # A full decode graph cannot break out for host-planned waves.
-        _cap_decode_capture_batch_sizes(max(1, num_resident // _router_top_k(layer)))
+    requested = _requested_num_resident()  # None: auto
+    num_resident = min(
+        requested if requested is not None else _router_top_k(layer), num_experts
+    )
+    if requested is not None:  # auto caps once K is sized
+        _cap_decode_capture_batch_sizes(num_resident // _router_top_k(layer))
     return PagedExpertsMoEMethod(
         base_method=base_method,
         expert_format=expert_format,
         num_experts=num_experts,
         num_resident=num_resident,
         graphs=not cuda_graph_fully_disabled(),
+        auto_size=requested is None,
     )
 
 
+def _requested_num_resident() -> Optional[int]:
+    """--paged-experts-num-resident: a count, or None for auto (also the string 'auto', which
+    a Python caller may pass: the CLI parser does not run on it)."""
+    requested = get_exec().moe.paged_experts_num_resident
+    return None if requested == "auto" else requested
+
+
 def _cap_decode_capture_batch_sizes(max_bs: int) -> None:
-    """Capture full decode graphs only at batch sizes whose routed entries fit the K slots,
-    the steps the device executor serves; larger batches run without a graph. The cap itself
-    is captured, so batches up to it pad to a graph. Every MoE layer calls this; only the
-    first changes the config."""
+    """With full decode graphs, which cannot break out for host-planned waves, capture only
+    batch sizes whose routed entries fit the K slots (``max_bs``, at least 1), the steps the
+    device executor serves; larger batches run without a graph. The cap itself is captured,
+    so batches up to it pad to a graph. It only ever lowers the sizes: the smallest cap of
+    any layer wins."""
+    if not check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
+        return
     decode = get_exec().graph.cuda_graph_config.decode
     if not decode.bs:
         return
-    cap = min(max_bs, max(decode.bs))
+    cap = min(max(1, max_bs), max(decode.bs))
     capture_bs = sorted({bs for bs in decode.bs if bs <= cap} | {cap})
     if capture_bs != list(decode.bs):
         logger.info(
@@ -324,14 +421,23 @@ def check_paged_experts_compat(layer, expert_format) -> None:
         problems.append(
             "--load-format dummy is not supported: the host store needs real weights"
         )
-    num_resident = get_exec().moe.paged_experts_num_resident
+    num_resident = _requested_num_resident()
     top_k = _router_top_k(layer)
-    if num_resident is None:
-        problems.append("--paged-experts-num-resident is required")
-    elif num_resident < top_k:
+    if num_resident is not None and num_resident < top_k:
         problems.append(
             f"--paged-experts-num-resident must be at least the router's top-k ({top_k})"
         )
+    if num_resident is None:
+        # These bind the slot tables before auto sizes them, or allocate them elsewhere.
+        for flag, enabled in (
+            ("--enable-memory-saver", get_exec().features.enable_memory_saver),
+            ("--enable-lora", get_lora().enable_lora),
+            ("--enable-nvidia-megakernel", get_exec().kernel.enable_nvidia_megakernel),
+        ):
+            if enabled:
+                problems.append(
+                    f"{flag} needs an explicit --paged-experts-num-resident, not auto"
+                )
     if expert_format is None:
         problems.append(
             f"{type(layer.quant_method).__name__} experts are not supported; supported are "

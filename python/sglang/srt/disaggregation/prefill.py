@@ -44,10 +44,9 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     staging_grid_tokens,
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    FAKE_BOOTSTRAP_HOST,
     CustomizedInfoError,
-    DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -107,7 +106,8 @@ from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.common import async_d2h
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
@@ -1021,7 +1021,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.inflight_middle_chunks <= 0:
+            if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
 
                 # Its KV never landed: abort instead of sending it to decode.
@@ -1084,6 +1084,7 @@ class SchedulerDisaggregationPrefillMixin:
                     i, req, logits_output
                 )
                 self.checkpoint_disagg_prefill(req)
+                self.prefill_launched_reqs.leave([req])
                 self.disagg_prefill_transfer_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -1128,16 +1129,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             else:
                 # being chunked reqs' prefill is not finished
-                req.inflight_middle_chunks -= 1
-
-                # Still chunking iff its next chunk was launched: either it is
-                # still self.chunked_req, or its final chunk (extend_end
-                # reaching the end of the input) is in flight. A yielded req
-                # is neither, so do its deferred release here.
-                still_chunking = self.chunked_req is req or (
-                    req.extend_end is not None
-                    and req.extend_end >= len(req.origin_input_ids)
-                )
+                # Still chunking while it holds the chunked slot or has another
+                # step in flight; otherwise it yielded, and this was its last step.
+                still_chunking = self.chunked_req is req or req.inflight_steps > 1
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
                 if is_aborted(req):
@@ -1148,7 +1142,9 @@ class SchedulerDisaggregationPrefillMixin:
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                if req.pending_bootstrap and not still_chunking:
+                # Only a yield leaves the chunked slot before the final chunk; the
+                # yield is not undone by a bootstrap that completes meanwhile.
+                if not still_chunking:
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -1387,6 +1383,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
+        self.prefill_launched_reqs.leave([req])
         self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
@@ -1495,9 +1492,11 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
-                    # Retract may drain every result, leaving no handler to requeue.
-                    if not self.enable_overlap or req.inflight_middle_chunks == 0:
+                    if req.inflight_steps == 0:
                         self.optimistic_release_and_requeue(req)
+                    else:
+                        # Requeued once its last step in flight is processed.
+                        self.prefill_launched_reqs.join([req])
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
@@ -1937,6 +1936,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self.prefill_launched_reqs.leave([req])
             self.disagg_prefill_bootstrap_queue.queue.append(req)
         else:
             req.prefill_attempt_count += 1
@@ -1948,4 +1948,5 @@ class SchedulerDisaggregationPrefillMixin:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
+            self.prefill_launched_reqs.leave([req])
             self.waiting_queue.insert(0, req)
