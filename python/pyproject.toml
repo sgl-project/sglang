@@ -162,6 +162,13 @@ fastokens = [
   "fastokens>=0.3.2",
 ]
 
+# --cuda-graph-persistence (docs/advanced_features/cuda_graph_persistence).
+# foundry-core publishes Linux x86_64 wheels only.
+# TODO(xenshinu): require >=0.1.0 once foundry-core 0.1.0 is released.
+foundry = [
+  "foundry-core>=0.1.0rc4,<0.2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 test = [
   "accelerate",
   "addict",
