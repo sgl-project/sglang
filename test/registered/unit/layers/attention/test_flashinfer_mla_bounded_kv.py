@@ -20,6 +20,9 @@ def _load_backend():
     # module so the tests exercise the real metadata builders and forward paths.
     dependencies = {
         "sglang.kernels.ops.attention.utils": {"assert_buffer_fits": Mock()},
+        "sglang.kernels.ops.speculative.cache_locs": {
+            "generate_draft_decode_kv_indices": Mock(),
+        },
         "sglang.srt.layers.attention.base_attn_backend": {"AttentionBackend": object},
         "sglang.srt.layers.dcp": {
             "DecodeContextParallelMetadata": object,
@@ -29,7 +32,6 @@ def _load_backend():
         "sglang.srt.mem_cache.memory_pool": {"KVWriteLoc": Mock()},
         "sglang.srt.model_executor.forward_batch_info": {
             "ForwardBatch": object,
-            "ForwardMode": Mock(),
         },
         "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph": {
             "is_in_breakable_cuda_graph": lambda: False,
@@ -44,7 +46,6 @@ def _load_backend():
         "sglang.srt.speculative.spec_utils": {
             "draft_kv_indices_buffer_width": Mock(),
             "draft_kv_indices_used_len": Mock(),
-            "generate_draft_decode_kv_indices": Mock(),
         },
     }
     stubs = {}
@@ -93,8 +94,11 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             dtype=dtype,
             size=256 - page_size,
             page_size=page_size,
-            get_key_buffer=lambda layer_id: buffers[layer_id],
+            layer_router=SimpleNamespace(
+                read=lambda layer_id: SimpleNamespace(key=lambda: buffers[layer_id])
+            ),
         )
+        backend.kv_layers = backend.token_to_kv_pool.layer_router
         reader_type = self.module._Fp8KvRowReader
         backend.fp8_kv_reader = (
             reader_type(backend.token_to_kv_pool)
@@ -114,7 +118,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
         backend.cuda_graph_kv_indices = torch.zeros(32, dtype=torch.int32)
         if rows is None:
             rows = torch.tensor([7, 2, 7, 0, 19], dtype=torch.int32)
-        backend.kv_index_translator = SimpleNamespace(
+        backend.runner_ids = SimpleNamespace(
             pack_read_stream=lambda *args, out, **kwargs: out.copy_(rows) is not None,
             needs_read_translate=False,
         )
@@ -153,7 +157,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             seq_lens_sum=5,
             batch_size=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-            kv_loc_plan=object(),
+            iteration_ids=object(),
             extend_prefix_lens=torch.tensor([1, 0], dtype=torch.int32),
             extend_prefix_lens_cpu=[1, 0],
             seq_lens_cpu=None,
@@ -189,9 +193,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             self._batch(decode=True),
         )
         kv_inputs = backend.decode_wrapper.run.call_args.args[2:4]
-        expected = backend.token_to_kv_pool.get_key_buffer(0).to(torch.bfloat16)[
-            rows.long()
-        ]
+        expected = backend.kv_layers.read(0).key().to(torch.bfloat16)[rows.long()]
         torch.testing.assert_close(
             torch.cat(kv_inputs, dim=-1), expected, rtol=0, atol=0
         )
@@ -245,7 +247,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                     kv = backend._mla_kv_buffer(
                         SimpleNamespace(layer_id=0), compact, torch.bfloat16
                     )
-                    full = backend.token_to_kv_pool.get_key_buffer(0).to(torch.bfloat16)
+                    full = backend.kv_layers.read(0).key().to(torch.bfloat16)
                     torch.testing.assert_close(
                         kv[plan_ids.long()], full[rows.long()], rtol=0, atol=0
                     )
@@ -352,9 +354,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                 with patch.object(
                     backend.fp8_kv_reader,
                     "refresh",
-                    return_value=backend.token_to_kv_pool.get_key_buffer(0).to(
-                        torch.bfloat16
-                    ),
+                    return_value=backend.kv_layers.read(0).key().to(torch.bfloat16),
                 ) as refresh:
                     backend.forward_decode(
                         torch.zeros(2, 1, 8, dtype=torch.bfloat16),
