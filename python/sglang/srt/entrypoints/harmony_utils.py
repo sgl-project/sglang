@@ -275,7 +275,71 @@ def render_for_completion(messages: list[Message]) -> list[int]:
     token_ids = get_encoding().render_conversation_for_completion(
         conversation, Role.ASSISTANT
     )
+    if any(
+        message.author.role == Role.ASSISTANT and message.recipient
+        for message in messages
+    ):
+        return _use_legacy_tool_call_headers(token_ids)
     return token_ids
+
+
+def _use_legacy_tool_call_headers(token_ids: list[int]) -> list[int]:
+    """Preserve GPT-OSS tool replay prompts across the oss-harmony migration.
+
+    oss-harmony renders commentary recipients after the channel and prefixes
+    content types with <|constrain|>. Keep the headers produced by
+    openai-harmony 0.0.4, which GPT-OSS already consumes in tool histories.
+    Adapted from vLLM's migration: https://github.com/vllm-project/vllm/pull/55128.
+    """
+    encoding = get_encoding()
+    start, channel_token, constrain, message = (
+        encoding.encode(token, allowed_special="all")[0]
+        for token in ("<|start|>", "<|channel|>", "<|constrain|>", "<|message|>")
+    )
+    result = token_ids.copy()
+    index = 0
+    while True:
+        try:
+            index = result.index(start, index)
+        except ValueError:
+            break
+        try:
+            header_end = result.index(message, index + 1)
+            channel_index = result.index(channel_token, index + 1, header_end)
+        except ValueError:
+            index += 1
+            continue
+
+        author = encoding.decode(result[index + 1 : channel_index])
+        try:
+            constrain_index = result.index(constrain, channel_index + 1, header_end)
+        except ValueError:
+            constrain_index = header_end
+        channel_and_recipient = encoding.decode(
+            result[channel_index + 1 : constrain_index]
+        ).rstrip()
+        channel, _, recipient = channel_and_recipient.partition(" to=")
+        if author.startswith("assistant to=") and constrain_index < header_end:
+            recipient = author.removeprefix("assistant to=")
+        elif author != "assistant" or channel != "commentary":
+            recipient = ""
+        if not recipient:
+            index = header_end + 1
+            continue
+
+        content_type = encoding.decode(result[constrain_index + 1 : header_end])
+        legacy_channel = f"{channel} {content_type}" if content_type else channel
+        # Header fragments are plain text, so skip expensive special-token checks.
+        legacy_header = (
+            [start]
+            + encoding.encode(f"assistant to={recipient}", disallowed_special=())
+            + [channel_token]
+            + encoding.encode(legacy_channel, disallowed_special=())
+            + [message]
+        )
+        result[index : header_end + 1] = legacy_header
+        index += len(legacy_header)
+    return result
 
 
 def get_stop_tokens_for_assistant_actions() -> list[int]:

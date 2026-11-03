@@ -25,6 +25,24 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+SGLang's Python serving runtime uses `oss-harmony`, which bundles the GPT-OSS vocabulary for offline loading.
+When upgrading an existing Python environment, uninstall `openai-harmony` before
+installing the updated SGLang package. Both distributions provide the
+`openai_harmony` module and must not be installed together:
+
+```bash
+python -m pip uninstall openai-harmony
+```
+
+The optional demo Python tool uses `gpt-oss`, which still declares an
+`openai-harmony` dependency. In your Python 3.12 environment, exclude that
+dependency when installing `gpt-oss` with `uv`:
+
+```bash
+printf 'openai-harmony\n' > harmony-excludes.txt
+uv pip install --excludes harmony-excludes.txt gpt-oss
+```
+
 ## 3.Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
