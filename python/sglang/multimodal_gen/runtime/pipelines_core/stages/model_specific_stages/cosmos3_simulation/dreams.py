@@ -872,11 +872,13 @@ class CausalDecodeQueue:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         try:
-            self.stream.synchronize()
-        finally:
             self.vae.reset_causal_decode_state()
             if exc_type is not None:
                 self.outputs.clear()
+        finally:
+            # Drain last: freeing pinned outputs records host-allocator events
+            # on this stream, so they must land before the final sync.
+            self.stream.synchronize()
 
     def _denormalize(self, latents: torch.Tensor) -> torch.Tensor:
         return denormalize_vae_latents(latents, self._mean, self._std)
@@ -1119,9 +1121,10 @@ class CosmosDreamsPrepareStage(PipelineStage):
             return None
         if self.profile is None or self.profile.history_mode != HISTORY_MODE_FULL:
             raise ValueError(
-                "Cosmos-Dreams frustum_geometry needs history_mode='full' without "
-                "kv_cache_inference_size/attention_sink_size: retrieval reads the "
-                "complete committed archive."
+                "Cosmos-Dreams frustum_geometry reads the complete committed archive: "
+                "set history_mode='full' in the pipeline config (the default 'auto' "
+                "slides when the export records a K/V window) and leave "
+                "kv_cache_inference_size/attention_sink_size unset."
             )
         if not has_image:
             raise ValueError(
