@@ -499,6 +499,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
+    # Rank-consistent decode graph variant input; see ScheduleBatch.
+    dp_decode_graph_max_seq_len: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
     # Current layer-stack invocation; each TBO child owns a separate stream.
@@ -1024,6 +1026,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
+            dp_decode_graph_max_seq_len=batch.dp_decode_graph_max_seq_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
