@@ -1077,8 +1077,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         req.extend_end = end
                         self.chunked_req = req if end < 12 else None
                         batch.chunked_req = self.chunked_req
-                        if self.chunked_req is not None:
-                            req.inflight_middle_chunks += 1
+                        batch.chunked_req = req if end < 12 else None
                         return super().run_batch(batch)
 
                     def checkpoint_disagg_prefill(self, req):
@@ -1118,7 +1117,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
                 # Pause must not take a cache snapshot that resume repeats.
                 self.assertEqual(checkpoint_ends, [4, 8, 12])
-                self.assertEqual(req.inflight_middle_chunks, 0)
+                self.assertEqual(req.inflight_steps, 0)
                 self.assertEqual(list(req.output_ids), [11])
                 self.assertEqual(scheduler.disagg_prefill_transfer_queue, [req])
                 self.assertEqual(scheduler.result_processes, {4: 1, 8: 1, 12: 1})
@@ -1155,7 +1154,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
                             self.chunked_req = batch.chunked_req = req
-                            req.inflight_middle_chunks += 1
+                            batch.chunked_req = req
                         return super().run_batch(batch)
 
                     def process_input_requests(self, inputs):
@@ -1185,7 +1184,8 @@ class TestPrefillResultPolling(CustomTestCase):
                 release_steps = []
 
                 def release(req, tree_cache, checkpoint):
-                    self.assertEqual(req.inflight_middle_chunks, 0)
+                    # Only the step being processed still carries it.
+                    self.assertLessEqual(req.inflight_steps, 1)
                     release_steps.append(scheduler.iteration)
                     req.kv.req_pool_idx = None
                     req.kv.mark_kv_released()
@@ -1207,7 +1207,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
                 self.assertEqual(scheduler.waiting_queue, [req])
                 self.assertEqual(req.prefill_attempt_count, 1)
-                self.assertEqual(req.inflight_middle_chunks, 0)
+                self.assertEqual(req.inflight_steps, 0)
                 self.assertEqual(list(req.output_ids), [])
                 self.assertIsNone(scheduler.chunked_req)
                 self.assertEqual(

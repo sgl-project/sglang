@@ -67,7 +67,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_xpu,
 )
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
 

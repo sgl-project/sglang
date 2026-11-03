@@ -2,11 +2,11 @@ name: Nightly Test (AMD MI355X Disagg)
 
 # Self-hosted runners on the amd-sglang login node salloc two or four MI355X
 # nodes and run the Docker harness (prefill + decode over MORI, a standalone
-# load balancer, then an sglang.bench_serving concurrency sweep) via
+# load balancer, then an sglang.benchmark.serving concurrency sweep) via
 # scripts/ci/slurm/launch_mi355x.sh.
 on:
   schedule:
-    - cron: '0 7 * * *'
+    - cron: '0 4 * * *'  # 12:00 UTC+8
   workflow_dispatch:
     inputs:
       image:
