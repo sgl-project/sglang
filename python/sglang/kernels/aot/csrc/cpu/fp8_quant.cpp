@@ -173,21 +173,32 @@ void mxfp8_group_quant_kernel_impl(
   });
 }
 
+inline void check_fp8_quant_input(const at::Tensor& input, const char* op_name) {
+  TORCH_CHECK(input.device().is_cpu(), op_name, ": input must be a CPU tensor");
+  TORCH_CHECK(input.is_contiguous(), op_name, ": input must be contiguous");
+  TORCH_CHECK(input.dim() == 2, op_name, ": input must be 2D");
+  const auto input_dtype = input.scalar_type();
+  TORCH_CHECK(
+      input_dtype == at::kBFloat16 || input_dtype == at::kHalf || input_dtype == at::kFloat,
+      op_name,
+      ": input must be bfloat16, float16, or float32");
+}
+
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor>
-per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, double eps) {
-  TORCH_CHECK(input.device().is_cpu(), "per_token_group_quant_fp8_cpu: input must be a CPU tensor");
-  TORCH_CHECK(input.is_contiguous(), "per_token_group_quant_fp8_cpu: input must be contiguous");
-  TORCH_CHECK(input.dim() >= 2, "per_token_group_quant_fp8_cpu: input must have at least 2 dimensions");
-  TORCH_CHECK(group_size > 0, "per_token_group_quant_fp8_cpu: group_size must be positive");
+sgl_per_token_group_quant_8bit_cpu(const at::Tensor& input, int64_t group_size, double eps) {
+  TORCH_CHECK(input.device().is_cpu(), "sgl_per_token_group_quant_8bit_cpu: input must be a CPU tensor");
+  TORCH_CHECK(input.is_contiguous(), "sgl_per_token_group_quant_8bit_cpu: input must be contiguous");
+  TORCH_CHECK(input.dim() >= 2, "sgl_per_token_group_quant_8bit_cpu: input must have at least 2 dimensions");
+  TORCH_CHECK(group_size > 0, "sgl_per_token_group_quant_8bit_cpu: group_size must be positive");
   TORCH_CHECK(
       input.size(-1) % group_size == 0,
-      "per_token_group_quant_fp8_cpu: input last dimension must be divisible by group_size");
-  TORCH_CHECK(eps > 0.0, "per_token_group_quant_fp8_cpu: eps must be positive");
+      "sgl_per_token_group_quant_8bit_cpu: input last dimension must be divisible by group_size");
+  TORCH_CHECK(eps > 0.0, "sgl_per_token_group_quant_8bit_cpu: eps must be positive");
 
   const auto input_dtype = input.scalar_type();
-  TORCH_CHECK(input_dtype == at::kBFloat16, "per_token_group_quant_fp8_cpu: input must be bfloat16");
+  TORCH_CHECK(input_dtype == at::kBFloat16, "sgl_per_token_group_quant_8bit_cpu: input must be bfloat16");
 
   const int64_t num_groups = input.numel() / group_size;
   auto quantized = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
@@ -206,84 +217,69 @@ per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, doubl
   return std::make_tuple(quantized, scales);
 }
 
-std::tuple<at::Tensor, at::Tensor> scaled_fp8_quant_cpu(
-    const at::Tensor& input,
-    const std::optional<at::Tensor>& scale_opt,
-    int64_t num_token_padding,
-    bool use_per_token_if_dynamic) {
-  TORCH_CHECK(input.device().is_cpu(), "scaled_fp8_quant_cpu: input must be a CPU tensor");
-  TORCH_CHECK(input.is_contiguous(), "scaled_fp8_quant_cpu: input must be contiguous");
-  TORCH_CHECK(input.dim() == 2, "scaled_fp8_quant_cpu: input must be 2D");
-  TORCH_CHECK(num_token_padding >= 0, "scaled_fp8_quant_cpu: num_token_padding must be non-negative");
-
-  const auto input_dtype = input.scalar_type();
-  TORCH_CHECK(
-      input_dtype == at::kBFloat16 || input_dtype == at::kHalf || input_dtype == at::kFloat,
-      "scaled_fp8_quant_cpu: input must be bfloat16, float16, or float32");
+std::tuple<at::Tensor, at::Tensor> sgl_per_token_quant_fp8_cpu(const at::Tensor& input) {
+  check_fp8_quant_input(input, "sgl_per_token_quant_fp8_cpu");
 
   const int64_t num_rows = input.size(0);
   const int64_t row_size = input.size(1);
-  const int64_t output_rows = std::max(num_rows, num_token_padding);
+  auto output = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
+  auto scale = at::empty({num_rows, 1}, input.options().dtype(at::kFloat));
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, input.scalar_type(), "sgl_per_token_quant_fp8_cpu", [&] {
+    per_token_group_quant_fp8_kernel_impl<scalar_t>(
+        output.data_ptr<at::Float8_e4m3fn>(),
+        scale.data_ptr<float>(),
+        input.data_ptr<scalar_t>(),
+        num_rows,
+        row_size,
+        1.0e-12f);
+  });
+  return std::make_tuple(output, scale);
+}
+
+// A given `scale` means static quantization; otherwise the per-tensor scale is computed.
+std::tuple<at::Tensor, at::Tensor>
+sgl_per_tensor_quant_fp8_cpu(const at::Tensor& input, const std::optional<at::Tensor>& scale_opt) {
+  check_fp8_quant_input(input, "sgl_per_tensor_quant_fp8_cpu");
+
+  const int64_t num_rows = input.size(0);
+  const int64_t row_size = input.size(1);
   const bool is_static = scale_opt.has_value();
   at::Tensor scale;
   float static_scale = 0.0f;
   if (is_static) {
     scale = scale_opt.value();
-    TORCH_CHECK(scale.device().is_cpu(), "scaled_fp8_quant_cpu: scale must be a CPU tensor");
-    TORCH_CHECK(scale.numel() == 1, "scaled_fp8_quant_cpu: static scale must be scalar");
+    TORCH_CHECK(scale.device().is_cpu(), "sgl_per_tensor_quant_fp8_cpu: scale must be a CPU tensor");
+    TORCH_CHECK(scale.numel() == 1, "sgl_per_tensor_quant_fp8_cpu: static scale must be scalar");
     static_scale = scale.item<float>();
-  } else if (use_per_token_if_dynamic) {
-    scale = at::empty({num_rows, 1}, input.options().dtype(at::kFloat));
   } else {
     scale = at::empty({1}, input.options().dtype(at::kFloat));
   }
-  auto quantized_input = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
+  auto output = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, input_dtype, "scaled_fp8_quant_cpu", [&] {
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, input.scalar_type(), "sgl_per_tensor_quant_fp8_cpu", [&] {
     const scalar_t* input_data = input.data_ptr<scalar_t>();
-    auto* output_data = quantized_input.data_ptr<at::Float8_e4m3fn>();
+    auto* output_data = output.data_ptr<at::Float8_e4m3fn>();
     if (is_static) {
       static_per_tensor_quant_fp8_kernel_impl<scalar_t>(output_data, input_data, num_rows, row_size, static_scale);
-    } else if (use_per_token_if_dynamic) {
-      per_token_group_quant_fp8_kernel_impl<scalar_t>(
-          output_data, scale.data_ptr<float>(), input_data, num_rows, row_size, 1.0e-12f);
     } else {
       dynamic_per_tensor_quant_fp8_kernel_impl<scalar_t>(
           output_data, scale.data_ptr<float>(), input_data, num_rows, row_size);
     }
   });
-
-  if (output_rows == num_rows) {
-    return std::make_tuple(quantized_input, scale);
-  }
-
-  auto output = at::zeros({output_rows, row_size}, input.options().dtype(at::kFloat8_e4m3fn));
-  output.narrow(0, 0, num_rows).copy_(quantized_input);
-  if (!is_static && use_per_token_if_dynamic) {
-    auto padded_scale = at::zeros({output_rows, 1}, input.options().dtype(at::kFloat));
-    padded_scale.narrow(0, 0, num_rows).copy_(scale);
-    scale = padded_scale;
-  }
   return std::make_tuple(output, scale);
 }
 
 std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& input) {
-  TORCH_CHECK(input.device().is_cpu(), "mxfp8_group_quantize_cpu: input must be a CPU tensor");
-  TORCH_CHECK(input.is_contiguous(), "mxfp8_group_quantize_cpu: input must be contiguous");
-  TORCH_CHECK(input.dim() == 2, "mxfp8_group_quantize_cpu: input must be 2D");
+  check_fp8_quant_input(input, "mxfp8_group_quantize_cpu");
   TORCH_CHECK(
       input.size(1) % kMXFP8GroupSize == 0, "mxfp8_group_quantize_cpu: input K dimension must be divisible by 32");
-
-  const auto input_dtype = input.scalar_type();
-  TORCH_CHECK(
-      input_dtype == at::kBFloat16 || input_dtype == at::kHalf || input_dtype == at::kFloat,
-      "mxfp8_group_quantize_cpu: input must be bfloat16, float16, or float32");
 
   const int64_t num_groups = input.numel() / kMXFP8GroupSize;
   auto scale = at::empty({input.size(0), input.size(1) / kMXFP8GroupSize}, input.options().dtype(at::kByte));
   auto output = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, input_dtype, "mxfp8_group_quantize_cpu", [&] {
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, input.scalar_type(), "mxfp8_group_quantize_cpu", [&] {
     mxfp8_group_quant_kernel_impl<scalar_t>(
         output.data_ptr<at::Float8_e4m3fn>(), scale.data_ptr<uint8_t>(), input.data_ptr<scalar_t>(), num_groups);
   });

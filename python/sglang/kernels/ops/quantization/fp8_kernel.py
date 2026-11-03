@@ -829,7 +829,9 @@ elif _is_cpu:
         assert not scale_ue8m0
         assert not fuse_silu_and_mul
         assert masked_m is None
-        return torch.ops.sgl_kernel.per_token_group_quant_fp8_cpu(x, group_size, eps)
+        return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_cpu(
+            x, group_size, eps
+        )
 else:
     per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
@@ -910,8 +912,8 @@ def static_quant_fp8(
     assert x_s.numel() == 1, "only supports per-tensor scale"
 
     if _is_cpu:
-        x_q_2d, scale = torch.ops.sgl_kernel.scaled_fp8_quant_cpu(
-            x.reshape(-1, x.shape[-1]), x_s, 0, False
+        x_q_2d, scale = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
+            x.reshape(-1, x.shape[-1]), x_s
         )
         x_q = x_q_2d.reshape(x.shape)
         if repeat_scale:
@@ -1255,6 +1257,34 @@ if _is_hip:
 
         return output, scale
 
+elif _is_cpu:
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        per_token = scale is None and use_per_token_if_dynamic
+        if per_token:
+            output, scale = torch.ops.sgl_kernel.sgl_per_token_quant_fp8_cpu(input)
+        else:
+            output, scale = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
+                input, scale
+            )
+
+        num_rows = input.shape[0]
+        if num_token_padding and num_token_padding > num_rows:
+            padded = output.new_zeros((num_token_padding, input.shape[1]))
+            padded[:num_rows] = output
+            output = padded
+            if per_token:
+                padded_scale = scale.new_zeros((num_token_padding, 1))
+                padded_scale[:num_rows] = scale
+                scale = padded_scale
+        return output, scale
+
 else:
 
     def scaled_fp8_quant(
@@ -1264,14 +1294,6 @@ else:
         use_per_token_if_dynamic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-        if _is_cpu:
-            return torch.ops.sgl_kernel.scaled_fp8_quant_cpu(
-                input,
-                scale,
-                0 if num_token_padding is None else num_token_padding,
-                use_per_token_if_dynamic,
-            )
-
         shape = input.shape
         if num_token_padding:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
