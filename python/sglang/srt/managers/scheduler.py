@@ -3413,15 +3413,14 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
         )
+        # After validation, which may truncate the prompt; before returning.
+        self.init_req_max_new_tokens(req)
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)

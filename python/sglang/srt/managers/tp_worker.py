@@ -38,7 +38,10 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    max_schedulable_input_len,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -570,7 +573,9 @@ class TpModelWorker(BaseTpWorker):
             self.model_config.context_len - 1,
             kv_capacity - 1,
         )
-        max_req_input_len = max_req_len - 5
+        max_req_input_len = max_schedulable_input_len(
+            max_req_len, kv_capacity, max(get_schedule().page_size or 1, 1)
+        )
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (
