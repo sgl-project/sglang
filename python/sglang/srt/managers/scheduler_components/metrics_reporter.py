@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -1526,3 +1526,4 @@ class SchedulerMetricsReporter:
         # publishing so the gauges do not hold the last batch's values.
         self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)
+        self.scheduler.kv_events_publisher.emit_kv_metrics()
