@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import copy
 import json
 import math
 import time
@@ -33,10 +34,16 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
+    assign_layer_devices,
+    module_weight_bytes,
+    place_model,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
     modeling_fm_modules,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+    NEOChatConfig,
     NEOLLMConfig,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
@@ -1372,3 +1379,89 @@ def test_sensenova_u1_timestep_frequencies_are_built_once():
         for _ in range(3):
             torch.testing.assert_close(embed(t, 2 * half), expected, atol=0, rtol=0)
     assert exp.call_count == 1
+
+
+def test_sensenova_u1_layer_split_balances_bytes_with_primary_weights():
+    devices = [torch.device("meta", 0), torch.device("meta", 1)]
+    assignment = assign_layer_devices(
+        layer_weight_bytes=[8] * 42, primary_weight_bytes=24, devices=devices
+    )
+
+    # The primary device also holds the 24 non-layer bytes, so it takes fewer layers.
+    assert assignment == [devices[0]] * 19 + [devices[1]] * 23
+
+
+@pytest.mark.skipif(
+    not torch.accelerator.is_available() or torch.accelerator.device_count() < 2,
+    reason="needs two accelerator devices",
+)
+@torch.inference_mode()
+def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
+    """A decoder split over two devices must give the single-device outputs and KV cache."""
+    llm_config = dict(
+        architectures=["Qwen3ForCausalLM"],
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=2048,
+        num_hidden_layers=6,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        max_position_embeddings=64,
+        max_position_embeddings_hw=64,
+    )
+    config = NEOChatConfig(
+        llm_config=llm_config,
+        vision_config=dict(hidden_size=16, llm_hidden_size=32),
+        template="neo1_0",
+        downsample_ratio=0.5,
+        fm_head_dim=16,
+        fm_head_layers=2,
+        fm_head_mlp_ratio=1,
+        use_pixel_head=True,
+        add_noise_scale_embedding=True,
+        concat_time_token_num=0,
+        time_schedule="standard",
+        time_shift_type="exponential",
+        base_shift=0.5,
+        max_shift=1.15,
+        base_image_seq_len=64,
+        max_image_seq_len=4096,
+        noise_scale=1.0,
+        noise_scale_mode="resolution",
+        noise_scale_base_image_seq_len=64,
+        noise_scale_max_value=16.0,
+    )
+    config.llm_config._attn_implementation = "eager"
+    model = NEOChatModel(config).to(torch.bfloat16).eval()
+    device = torch.device(torch.accelerator.current_accelerator().type, 0)
+    reference = copy.deepcopy(model).to(device)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.loader.WEIGHT_MEMORY_FRACTION",
+        0.6 * module_weight_bytes(model) / current_platform.get_device_total_memory(0),
+    )
+    split = place_model(model=model, device=device)
+    layer_devices = [
+        next(layer.parameters()).device for layer in split.language_model.model.layers
+    ]
+    # Wide FFN layers put the split mid-stack: layers on both devices, then back for the norm.
+    assert layer_devices[0] == device and layer_devices[-1] != device
+
+    tokens = torch.tensor([[1, 2, 3]], device=device)
+    image = torch.randn(1, 4, 32, device=device, dtype=torch.bfloat16)
+    indexes = torch.tensor([[[3, 3, 3, 3], [0, 0, 1, 1], [0, 1, 0, 1]]], device=device)
+    outputs = []
+    for candidate in (reference, split):
+        prefix = candidate.language_model(input_ids=tokens, use_cache=True)
+        denoise = candidate.language_model.model(
+            inputs_embeds=image,
+            indexes=indexes,
+            past_key_values=prefix.past_key_values,
+            attention_mask={"full_attention": None},
+            use_cache=True,
+            update_cache=False,
+            image_gen_indicators=torch.ones(1, 4, dtype=torch.bool, device=device),
+        )
+        keys = [layer.keys.to(device) for layer in prefix.past_key_values.layers]
+        outputs.append((prefix.logits, denoise.last_hidden_state, keys))
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)

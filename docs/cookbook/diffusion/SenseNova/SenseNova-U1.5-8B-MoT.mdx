@@ -113,6 +113,17 @@ when their requirements are not met. Run one complete warmup request before
 benchmarking because the fused MLP packs its gate and up projection weights on
 first use.
 
+### 5.3 Intel Arc Pro B60 (BMG)
+
+The BF16 weights (32.7 GiB) do not fit one 24 GB card, so expose two cards; the
+loader splits the decoder layers between them automatically:
+
+```bash Command
+ZE_AFFINITY_MASK=0,1 sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000
+```
+
 ## 6. Benchmark
 
 ### 6.1 Speedup benchmark

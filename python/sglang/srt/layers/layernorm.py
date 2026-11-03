@@ -973,7 +973,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.variance_size_override is not None:
+        # XPU rmsnorm kernels apply the weight before rounding; HF rounding needs native.
+        if self.variance_size_override is not None or self.cast_x_before_out_mul:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if residual is not None:
