@@ -29,7 +29,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   registered serving spec -> mm_tokens, IO threads, item split; none -> the defaults
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
-  cache budget without --token-space-preprocess-cache-trust-url -> the core caches nothing
+  budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
   adjacent images -> two offsets from mm_spans, not one scanned run
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
@@ -616,10 +616,10 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         self.addCleanup(processor.shutdown)
         configure.assert_called_once_with(["media.example.com"], 7)
 
-    def test_served_core_caches_only_when_urls_are_trusted(self):
-        """Cache keys are media URLs, so a budget alone must not let a changed URL hit."""
-        for trust_url in (False, True):
-            with self.subTest(trust_url=trust_url):
+    def test_served_core_caches_only_when_enabled(self):
+        """The switch picks the cache: a budget or trusted URLs alone must not turn it on."""
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
                 reset_context()
                 self.addCleanup(reset_context)
                 server_args = ServerArgs(
@@ -629,7 +629,8 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                     enable_token_space_processor=True,
                     mm_processor_worker_num=1,
                     mm_preprocess_cache_size_mb=8,
-                    token_space_preprocess_cache_trust_url=trust_url,
+                    token_space_preprocess_cache_trust_url=True,
+                    enable_token_space_preprocess_cache=enabled,
                 )
                 publish(server_args, role="test")
                 processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
@@ -638,7 +639,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 self.addCleanup(processor.shutdown)
                 self.assertIs(
                     processor._core._item_feature_cache,
-                    processor._mm_preprocess_cache if trust_url else None,
+                    processor._mm_preprocess_cache if enabled else None,
                 )
 
     def test_chat_media_reach_a_partially_expanded_request(self):

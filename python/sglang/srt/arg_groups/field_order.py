@@ -566,5 +566,6 @@ POSITIONAL_FIELD_ORDER = (
     "remote_instance_weight_loader_start_seed_via_nixl",
     "enable_token_space_processor",
     "token_space_preprocess_cache_trust_url",
+    "enable_token_space_preprocess_cache",
 )
 # fmt: on

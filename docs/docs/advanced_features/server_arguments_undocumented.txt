@@ -39,6 +39,7 @@
 --enable-scattered-sconv
 --enable-session-radix-cache
 --enable-shared-experts-attn-tp
+--enable-token-space-preprocess-cache
 --enable-tp-lm-head-all-to-all
 --enable-w4a4-mxfp4-megamoe
 --flexkv-config-file

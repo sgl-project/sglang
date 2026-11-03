@@ -142,7 +142,7 @@ class TokenSpaceSGLangProcessor:
             # Its keys are media URLs, so it is used only when they are trusted.
             item_feature_cache=(
                 self._mm_preprocess_cache
-                if mm.token_space_preprocess_cache_trust_url
+                if mm.enable_token_space_preprocess_cache
                 else None
             ),
         )

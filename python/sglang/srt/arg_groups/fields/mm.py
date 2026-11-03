@@ -124,9 +124,15 @@ class Mm(msgspec.Struct):
     ] = False
     token_space_preprocess_cache_trust_url: A[
         bool,
-        "Key the token-space preprocess cache by each media's URL, path or inline "
-        "data instead of its content, so a hit skips the download. The token-space "
-        "cache stays off without it; only enable it when URLs name immutable media.",
+        "Let the token-space preprocess cache key each media by its URL, path or "
+        "inline data instead of its content, so a hit skips the download. Only set "
+        "it when URLs name immutable media.",
+    ] = False
+    enable_token_space_preprocess_cache: A[
+        bool,
+        "Cache the token-space processor's features per media, keyed by its source, "
+        "in memory within --mm-preprocess-cache-size-mb. Requires "
+        "--token-space-preprocess-cache-trust-url.",
     ] = False
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
