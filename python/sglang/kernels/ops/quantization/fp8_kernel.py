@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
+    is_sm90_supported,
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -37,6 +38,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_sm90 = _is_cuda and is_sm90_supported()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
@@ -577,16 +579,32 @@ def _run_per_token_group_quant_8bit_kernel(
     """Quantize into caller-owned ``x_q`` / ``x_s``.
 
     CUDA routes to the JIT per_token_group_quant kernel; MUSA stays on the AOT
-    v2 op (the JIT kernel is CUDA-only), and the fp32-pow-2 storage flavor of
-    row-major UE8M0 (float32 ``x_s``, deep_gemm ``ceil_to_ue8m0`` convention)
-    stays on the JIT v2 baseline — per_token_group_quant only packs UE8M0 as
-    int32. The kernel bakes the quant constants in at compile time, so
-    drifted constants are rejected loudly here instead of silently quantizing
+    v2 op (the JIT kernel is CUDA-only). FP32 power-of-two scales use the
+    trait-driven kernel for contiguous BF16 group32 on Hopper, and keep the
+    JIT v2 path for the other cases. The kernel bakes the quant constants in
+    at compile time, so drifted constants are rejected here instead of quantizing
     with different ones; unsupported shapes/layouts error inside its host
     checks. Whole-row (per-token) quantization is a different op:
     ``sglang_per_token_quant_fp8``.
     """
-    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
+    if (
+        scale_ue8m0
+        and x_s.dtype == torch.float32
+        and not _is_musa
+        and not (
+            _is_sm90
+            and x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x.is_contiguous()
+            and x_s.is_contiguous()
+            and x_q.dtype == fp8_dtype
+            and group_size == 32
+            and eps == 1e-10
+            and (fp8_min, fp8_max) == (-448.0, 448.0)
+            and not fuse_silu_and_mul
+            and masked_m is None
+        )
+    ):
         from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
             per_token_group_quant_8bit_v2,
         )

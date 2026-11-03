@@ -2,7 +2,7 @@
 
 ``sglang.kernels.ops.quantization.per_token_group_quant`` is the default CUDA
 path. This kernel still serves the row-major UE8M0 layout stored as fp32
-power-of-two scales, which per_token_group_quant does not produce (see
+power-of-two scales outside the Hopper BF16 group32 fast path (see
 ``fp8_kernel._run_per_token_group_quant_8bit_kernel``), and is the perf baseline
 for the per_token_group_quant benchmarks.
 """

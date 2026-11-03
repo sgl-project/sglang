@@ -28,6 +28,7 @@ def _jit_module(
     out_dtype: torch.dtype,
     group_size: int,
     scale_ue8m0: bool,
+    scale_packed: bool,
     row_major: bool,
     aligned: bool,
     fuse_silu_and_mul: bool,
@@ -39,6 +40,23 @@ def _jit_module(
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
     assert group_size in _SUPPORTED_GROUP_SIZES
+    if (
+        scale_ue8m0
+        and not scale_packed
+        and not (
+            in_dtype == torch.bfloat16
+            and out_dtype == torch.float8_e4m3fn
+            and group_size == 32
+            and row_major
+            and not fuse_silu_and_mul
+            and not masked_layout
+            and not sorted_layout
+        )
+    ):
+        raise ValueError(
+            "FP32 power-of-two scales require flat BF16 input, FP8 output, "
+            "group_size=32 and row-major scales without fused activation"
+        )
     if silu_and_mul_mode not in ("legacy", "dense"):
         raise ValueError(f"Unknown silu_and_mul_mode: {silu_and_mul_mode}")
     dense = silu_and_mul_mode == "dense"
@@ -59,6 +77,7 @@ def _jit_module(
         out_dtype,
         group_size,
         scale_ue8m0,
+        scale_packed,
         row_major,
         aligned,
         fuse_silu_and_mul,
@@ -95,8 +114,6 @@ def _infer_scale_layout(
         aligned = num_groups % 4 == 0
         return row_major, aligned
     if output_s.dtype == torch.float32:
-        if scale_ue8m0:
-            raise ValueError("scale_ue8m0=True requires an int32-packed output_s")
         return row_major, True
     raise ValueError(f"Unsupported output_s dtype {output_s.dtype}")
 
@@ -126,6 +143,7 @@ def _per_token_group_quant_custom_op(
         output_q.dtype,
         int(group_size),
         bool(scale_ue8m0),
+        output_s.dtype == torch.int32,
         row_major,
         aligned,
         bool(fuse_silu_and_mul),
@@ -134,6 +152,32 @@ def _per_token_group_quant_custom_op(
         sorted_token_ids is not None,
         silu_and_mul_mode,
     )
+    if (
+        scale_ue8m0
+        and output_s.dtype == torch.float32
+        and input.ndim == 2
+        and input.is_contiguous()
+        and output_q.is_contiguous()
+        and output_s.is_contiguous()
+        and input.data_ptr() % 32 == 16
+    ):
+        # v2 accepts 16B-aligned views; the trait kernel requires 32B.
+        # Keep the pointer check inside the opaque custom op for torch.compile.
+        from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+            per_token_group_quant_8bit_v2,
+        )
+
+        per_token_group_quant_8bit_v2(
+            input,
+            output_q,
+            output_s,
+            group_size,
+            1e-10,
+            -448.0,
+            448.0,
+            scale_ue8m0=True,
+        )
+        return
     if masked_m is not None:
         module.per_token_group_quant(
             input, output_q, output_s, masked_m, int(expected_m or -1)
@@ -228,7 +272,13 @@ def per_token_group_quant(
       float32 transposed  -> col-major fp32 scales (TMA-aligned view)
       int32 transposed    -> col-major UE8M0 bytes packed 4-per-int32
       int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
-    The packed layouts require ``scale_ue8m0=True``.
+    The packed layouts require ``scale_ue8m0=True``. With a supplied contiguous
+    float32 buffer, this flag instead stores the power-of-two scales as FP32.
+    That combination supports contiguous 2D BF16 inputs, FP8 output and groups
+    of 32, without fused activation, masking or sorted rows. Automatic
+    allocation with ``scale_ue8m0=True`` continues to produce packed scales.
+    The FP32 power-of-two flavor retains v2's NaN-to-negative-saturation
+    behavior; the packed BF16 path continues to preserve NaNs.
 
     With ``fuse_silu_and_mul=True``, ``silu_and_mul_mode="dense"`` matches the
     dense CUDA activation: FP32 SiLU and multiply, then one source-dtype round

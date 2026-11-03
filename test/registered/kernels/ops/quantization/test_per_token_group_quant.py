@@ -27,6 +27,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
@@ -85,6 +86,131 @@ def ref_fp8_ue8m0(x, gs):
     quant_scale = ((127 + 127 - exp) << 23).view(torch.float32)  # 2^(127 - (exp-127))
     q = _quantize(x, gs, quant_scale, fp8_dtype, -FMAX, FMAX)
     return q, exp.to(torch.uint8)
+
+
+def ref_fp8_fp32_pow2(x, gs=32):
+    """FP32 power-of-two storage, including the v2 NaN sanitization contract."""
+    xf = x.float().unflatten(-1, (-1, gs))
+    # CUDA fmax ignores NaNs when reducing the absmax.
+    amax = torch.nan_to_num(xf.abs(), nan=0.0, posinf=float("inf")).amax(-1)
+    raw = (amax.clamp_min(EPS) * (1.0 / FMAX)).contiguous()
+    bits = raw.view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
+    scale = (exp << 23).view(torch.float32)
+    multiplier = ((254 - exp) << 23).view(torch.float32)
+    scaled = xf * multiplier.unsqueeze(-1)
+    # v2 clamps with fmin(fmax(value, -448), 448), mapping NaN to -448.
+    scaled = torch.nan_to_num(scaled, nan=-FMAX, posinf=FMAX, neginf=-FMAX)
+    q = scaled.clamp(-FMAX, FMAX).to(fp8_dtype).flatten(-2)
+    return q, scale
+
+
+def _check_fp32_pow2(x, public=False):
+    q_ref, s_ref = ref_fp8_fp32_pow2(x)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.full((x.shape[0], x.shape[1] // 32), torch.nan, device=x.device)
+    if public:
+        sglang_per_token_group_quant_fp8(
+            x, 32, scale_ue8m0=True, output_q=q, output_s=s
+        )
+    else:
+        per_token_group_quant(x, q, s, 32, scale_ue8m0=True)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("public", [False, True])
+@pytest.mark.parametrize(
+    "shape", [(0, 5120), (1, 32), (7, 96), (33, 160), (128, 1536), (4096, 5120)]
+)
+def test_fp32_pow2_group32(shape, public):
+    torch.manual_seed(42)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    _check_fp32_pow2(x, public)
+
+
+@pytest.mark.parametrize("offset", [8, 16])
+def test_fp32_pow2_public_offset_view(offset):
+    # v2 admits a 16B-aligned view; the trait kernel requires 32B alignment.
+    x = torch.randn(3 * 160 + offset, device="cuda", dtype=torch.bfloat16)
+    _check_fp32_pow2(x[offset:].view(3, 160), public=True)
+
+
+@pytest.mark.parametrize("mixed_groups", [False, True])
+def test_fp32_pow2_all_bf16_encodings(mixed_groups):
+    # Includes signed zero, subnormals, exponent boundaries, infinities and
+    # every NaN encoding. Uniform groups exercise the full scale range;
+    # shuffled groups put small values next to large values and non-finites.
+    values = torch.arange(65536, device="cuda").to(torch.int16).view(torch.bfloat16)
+    if mixed_groups:
+        torch.manual_seed(42)
+        x = values[torch.randperm(65536, device="cuda")].view(-1, 32)
+    else:
+        x = values[:, None].expand(-1, 32).contiguous()
+    _check_fp32_pow2(x)
+
+
+def test_fp32_pow2_graph_replay():
+    x = torch.zeros(33, 160, device="cuda", dtype=torch.bfloat16)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.empty(33, 5, device="cuda")
+
+    def run():
+        sglang_per_token_group_quant_fp8(
+            x, 32, scale_ue8m0=True, output_q=q, output_s=s
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for poison in (float("nan"), float("inf"), -float("inf"), 0.0):
+        x.normal_()
+        x[0, :32] = poison
+        graph.replay()
+        q_ref, s_ref = ref_fp8_fp32_pow2(x)
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("offset", [0, 8])
+def test_fp32_pow2_compile(offset):
+    # Dispatch must remain traceable, including the 16B-aligned v2 fallback.
+    def quantize(x):
+        return sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
+
+    storage = torch.randn(33 * 160 + offset, device="cuda", dtype=torch.bfloat16)
+    x = storage[offset:].view(33, 160)
+    compiled = torch.compile(quantize, backend="eager", fullgraph=True)
+    q, s = compiled(x)
+    q_ref, s_ref = ref_fp8_fp32_pow2(x)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize(
+    "dtype,group_size",
+    [(torch.float16, 32), (torch.float32, 32), (torch.bfloat16, 128)],
+)
+def test_fp32_pow2_rejects_unsupported_combinations(dtype, group_size):
+    x = torch.zeros(3, 128, device="cuda", dtype=dtype)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.empty(3, 128 // group_size, device="cuda")
+    with pytest.raises(ValueError, match="FP32 power-of-two scales require"):
+        per_token_group_quant(x, q, s, group_size, scale_ue8m0=True)
+
+
+@pytest.mark.parametrize(
+    "dtype,group_size", [(torch.float16, 32), (torch.bfloat16, 128)]
+)
+def test_fp32_pow2_public_fallback(dtype, group_size):
+    x = torch.zeros(3, 128, device="cuda", dtype=dtype)
+    x[1] = torch.finfo(dtype).tiny
+    x[2] = torch.finfo(dtype).max
+    q, s = sglang_per_token_group_quant_fp8(x, group_size, scale_ue8m0=True)
+    q_ref, s_ref = ref_fp8_fp32_pow2(x, group_size)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
 
 
 def _decode_packed_exp(s_int32: torch.Tensor, ng: int) -> torch.Tensor:
