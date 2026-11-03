@@ -50,7 +50,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
-    is_npu,
     offloader,
 )
 from sglang.srt.utils.common import print_warning_once, torch_release
@@ -734,10 +733,7 @@ def dispatch_w8a8_block_fp8_linear(
             act_scale_ue8m0=act_scale_ue8m0,
         )
 
-    if (
-        weight_block_size == [32, 32]
-        and is_npu_arch35()
-    ):
+    if weight_block_size == [32, 32] and is_npu_arch35():
         return npu_w8a8_mxfp8_linear
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.

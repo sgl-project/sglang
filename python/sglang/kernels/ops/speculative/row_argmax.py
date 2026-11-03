@@ -125,7 +125,9 @@ def _npu_medium_argmax_partial_kernel(
 
 
 @triton.jit
-def _npu_medium_argmax_final_kernel(PV, PI, OUT, SPLITS: tl.constexpr, BLOCK: tl.constexpr):
+def _npu_medium_argmax_final_kernel(
+    PV, PI, OUT, SPLITS: tl.constexpr, BLOCK: tl.constexpr
+):
     row = tl.program_id(0)
     part = tl.arange(0, BLOCK)
     v = tl.load(PV + row * SPLITS + part, part < SPLITS, float("-inf"))

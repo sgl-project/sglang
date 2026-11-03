@@ -1432,9 +1432,7 @@ class LowRatioCompressAscendBackendMixin:
             descale_k=None,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_q=None,
-            seqused_k=(self._dsv41_qli_kv_lens(forward_batch) // ratio).to(
-                torch.int32
-            ),
+            seqused_k=(self._dsv41_qli_kv_lens(forward_batch) // ratio).to(torch.int32),
             # Only mask_mode=3 with cmp_ratio != 1 needs it; consumers are
             # ratio-1 layers.
             cmp_residual_k=None,
@@ -1675,13 +1673,9 @@ class LowRatioCompressAscendBackendMixin:
         valid_len = torch.clamp(positions + 1, max=topk)
         # Dead rows (batch padding / idle slots): see _dsv41_live_row_mask; the
         # final-length mirror tells an idle dummy verify window from a live one.
-        live_rows = self._dsv41_live_rows_for(
-            fm, forward_batch, t
-        )
+        live_rows = self._dsv41_live_rows_for(fm, forward_batch, t)
         if live_rows is not None:
-            valid_len = torch.where(
-                live_rows, valid_len, torch.zeros_like(valid_len)
-            )
+            valid_len = torch.where(live_rows, valid_len, torch.zeros_like(valid_len))
         window_start = positions - valid_len + 1
         ids = window_start.unsqueeze(1) + offsets.unsqueeze(0)
         valid = offsets.unsqueeze(0) < valid_len.unsqueeze(1)
@@ -3147,18 +3141,15 @@ class DeepseekV4AscendAttnBackend(
             # CPU mirror of the kv buffer written below, from its CPU source — the
             # host metadata op reads this instead of a D2H sync.
             fm.seq_lens_cpu_int = self._seq_lens_cpu_int_view(ctx.bs)
-            fm.seq_lens_cpu_int.copy_(
-                ctx.final_seq_lens_cpu[: ctx.bs].clamp(min=1)
-            )
+            fm.seq_lens_cpu_int.copy_(ctx.final_seq_lens_cpu[: ctx.bs].clamp(min=1))
         # Refresh the live-row mask the captured graphs read; this is the only
         # live mask the replay's in-graph length recompute sees.
         mask_buf = getattr(fm, "dsv41_live_mask_buf", None)
         if mask_buf is not None:
             if ctx.graph_mode.is_target_verify():
-                per_req = (
-                    ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(torch.int64)
-                    > int(ctx.tokens_per_bs)
-                )
+                per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
+                    torch.int64
+                ) > int(ctx.tokens_per_bs)
                 mask = per_req.repeat_interleave(int(ctx.tokens_per_bs))
             else:
                 mask = ctx.live_seq_lens_cpu[: ctx.bs].to(torch.int64) > 0

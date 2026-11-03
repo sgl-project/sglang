@@ -1409,11 +1409,11 @@ class TestVerifyGraphGuards(unittest.TestCase):
         for name in self._REFRESHES:
             setattr(backend, name, (lambda ctx, _n=name: calls.append(_n)))
         verify_calls = []
-        backend._refresh_graph_dsv41_verify_1d = (
-            lambda ctx: verify_calls.append("refresh")
+        backend._refresh_graph_dsv41_verify_1d = lambda ctx: verify_calls.append(
+            "refresh"
         )
-        backend._clear_graph_dsv41_verify_metadata = (
-            lambda ctx: verify_calls.append("clear")
+        backend._clear_graph_dsv41_verify_metadata = lambda ctx: verify_calls.append(
+            "clear"
         )
         ctx = SimpleNamespace(
             fm=backend.forward_metadata,
@@ -1964,7 +1964,9 @@ class TestQliKvLens(unittest.TestCase):
             seq_lens_cpu_int=torch.tensor([9, 8], dtype=torch.int32),
             kernel_metadata={},
         )
-        batch = _batch(positions=[6, 5], out_cache_loc=[0, 0], seq_lens=[6, 5], batch_size=2)
+        batch = _batch(
+            positions=[6, 5], out_cache_loc=[0, 0], seq_lens=[6, 5], batch_size=2
+        )
         batch.forward_mode = _Mode("decode")
         backend._dsv41_index_kernel_metadata(batch)
         # Decode ignores the final mirror.
@@ -2108,7 +2110,11 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         # Replay into the captured buffers and compare.
         positions, out_cache_loc = self._WINDOW
         ctx = self._ctx(
-            metadata, bs=2, live=[6, 5], positions=positions, out_cache_loc=out_cache_loc
+            metadata,
+            bs=2,
+            live=[6, 5],
+            positions=positions,
+            out_cache_loc=out_cache_loc,
         )
         backend._refresh_graph_dsv41_verify_1d(ctx)
         self.assertEqual(metadata.c1_loc.tolist(), eager.c1_loc.tolist())
@@ -2161,7 +2167,11 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         metadata.block_tables[0, 0] = 11
         positions, out_cache_loc = self._WINDOW
         ctx = self._ctx(
-            metadata, bs=2, live=[6, 5], positions=positions, out_cache_loc=out_cache_loc
+            metadata,
+            bs=2,
+            live=[6, 5],
+            positions=positions,
+            out_cache_loc=out_cache_loc,
         )
         backend._refresh_graph_dsv41_verify_1d(ctx)
         # ratio 2 pages 1:1 with the full table; ratio 1 doubles every full page.
