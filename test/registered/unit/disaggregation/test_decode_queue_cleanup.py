@@ -20,9 +20,11 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -126,11 +128,12 @@ class TestHeldDestinationPublication(CustomTestCase):
         )
         event = SimpleNamespace(query=MagicMock(return_value=True))
         entry = SimpleNamespace(
+            req=FakeReq(),
             kv_receiver=receiver,
             pending_metadata=(event, ("pages", 3, None), {}),
             is_rebootstrap=False,
         )
-        queue.queue = [entry]
+        queue.queue = decode_queue(ListKind.PD_RECEIVING, [entry])
         return queue, entry, event, receiver
 
     def test_waits_for_every_rank_and_sends_once(self):
@@ -203,7 +206,7 @@ class _GateReceiver:
 
 def _gated_decode_req(poll, restore_status):
     return SimpleNamespace(
-        req=SimpleNamespace(rid="r", bootstrap_room=7, return_logprob=False),
+        req=FakeReq(rid="r", bootstrap_room=7, return_logprob=False),
         kv_receiver=_GateReceiver(poll),
         metadata_buffer_index=3,
         hicache_restore_status=restore_status,
@@ -241,7 +244,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
     ):
         def make_queue(decode_req, peer_poll):
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-            queue.queue = [decode_req]
+            queue.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
             queue.enable_staging = False
             queue.enable_host_receive = False
             queue.enable_deferred_kv_release = False
@@ -278,7 +281,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.FAILED)
         queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
         self.assertEqual(queue.pop_transferred(), [])
-        self.assertEqual(queue.queue, [])
+        self.assertEqual(list(queue.queue.items()), [])
         queue._commit_transfer_to_req.assert_not_called()
         queue._record_transfer_failure.assert_called_once_with("HiCache restore failed")
         mock_prepare_abort.assert_called_once()
@@ -298,7 +301,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         decode_req = _gated_decode_req(KVPoll.Transferring, HiCacheRestoreResult.FAILED)
         queue = make_queue(decode_req, peer_poll=KVPoll.Success)
         self.assertEqual(queue.pop_transferred(), [])
-        self.assertEqual(queue.queue, [decode_req])
+        self.assertEqual(list(queue.queue.items()), [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
 
@@ -338,7 +341,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.gloo_group = object()
-        queue.queue = list(decode_reqs)
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
@@ -369,7 +372,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
             translate_kv_indices_for_transfer=lambda indices: indices,
         )
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+        )
         queue.tree_cache = MagicMock()
         queue.scheduler = MagicMock(
             enable_priority_scheduling=False,
@@ -382,7 +387,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
 
     @staticmethod
     def _decode_req(receiver):
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="deferred",
             origin_input_ids=[1] * 5,
             output_ids=[],
@@ -490,7 +495,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.pop_preallocated()
         queue._submit_prefill_recompute.assert_not_called()
         transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        transfer.queue = [decode_req]
+        transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
         transfer.gloo_group = object()
         transfer.scheduler = queue.scheduler
         with patch(

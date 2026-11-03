@@ -374,6 +374,21 @@ def _build_deepseek_v4_device_pool_group(
     )
 
 
+def _build_kv_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if not isinstance(kvcache, DSATokenToKVPool):
+        raise ValueError(
+            "The direct external linker supports only DSA among single KV "
+            f"pools, got {type(kvcache).__name__}."
+        )
+    return _build_dsa_device_pool_group(kvcache, page_size, mtp_draft_device_pools)
+
+
 def _build_dsa_device_pool_group(
     kvcache: Any,
     page_size: int,

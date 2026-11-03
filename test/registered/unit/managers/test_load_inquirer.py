@@ -1,8 +1,9 @@
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from sglang.srt.disaggregation.decode import DecodeRequest
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
@@ -11,8 +12,14 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -63,10 +70,8 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             get_chunked_req=lambda: chunked_req,
             get_recent_cache_hit_rate=lambda: 0.75,
             get_stats=None,
-            get_disagg_prefill_bootstrap_queue=None,
-            get_disagg_prefill_transfer_queue=None,
+            get_request_lists=None,
             get_disagg_decode_prealloc_queue=None,
-            get_disagg_decode_transfer_queue=None,
             get_spec_total_num_accept_tokens=None,
             get_spec_total_num_forward_ct=None,
             get_total_prefill_uncached_tokens=None,
@@ -108,6 +113,50 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                 inquirer.get_waiting_storage_span.assert_called_once_with(
                     CacheRequestHandle("waiting", 0)
                 )
+
+    def test_decode_loads_count_prealloc_requests_waiting_for_input(self):
+        """A preallocated request whose input has arrived is ready, with its tokens."""
+        ready, pending = FakeReq(seqlen=30), FakeReq(seqlen=70)
+        prealloc = decode_queue(
+            ListKind.PD_PREALLOC,
+            [
+                DecodeRequest(req=ready, kv_receiver=None, waiting_for_input=True),
+                DecodeRequest(req=pending, kv_receiver=None),
+            ],
+        )
+        inquirer = replace(
+            self.make_inquirer(disaggregation_mode=DisaggregationMode.DECODE),
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_kv_token_stats=lambda: (0, 0.0)
+                )
+            ),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            get_running_batch=lambda: SimpleNamespace(reqs=[]),
+            get_stats=SchedulerStats,
+            get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(queue=prealloc),
+            get_request_lists=lambda: {
+                ListKind.WAITING: [],
+                ListKind.PD_PREALLOC: prealloc,
+                ListKind.PD_RECEIVING: decode_queue(ListKind.PD_RECEIVING),
+                ListKind.PD_RETRACTED: _RequestList(ListKind.PD_RETRACTED),
+            },
+            get_total_prefill_uncached_tokens=lambda: 0,
+            get_total_prefill_busy_us=lambda: 0,
+            get_decode_moment_totals=lambda: (0,),
+        )
+        module = "sglang.srt.managers.scheduler_components.load_inquirer"
+        with (
+            patch(
+                f"{module}.get_lora", return_value=SimpleNamespace(enable_lora=False)
+            ),
+            patch(f"{module}.get_parallel", return_value=SimpleNamespace(dp_rank=0)),
+        ):
+            loads = inquirer.get_loads()
+
+        self.assertEqual(loads.disaggregation.decode_prealloc_queue_reqs, 2)
+        self.assertEqual(loads.queues.prealloc_ready, 1)
+        self.assertEqual(loads.num_prealloc_ready_tokens, 30)
 
     def test_storage_exclusion_requires_per_request_matching(self):
         for prefix_matched, expected in ((True, 60), (False, 65)):
@@ -188,6 +237,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             metrics_reporter=SimpleNamespace(recent_cache_hit_rate=0.75),
             waiting_queue=[req],
             chunked_req=None,
+            request_lists=None,
         )
 
         Scheduler.init_load_inquirer(scheduler)
