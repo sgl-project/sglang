@@ -130,7 +130,7 @@ from sglang.srt.runtime_context import (
     get_observability,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
-from sglang.srt.utils.common import ceil_align, get_device_module
+from sglang.srt.utils.common import ceil_align, get_device_module, is_npu
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -2273,7 +2273,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _align_c128_storage_prefetch(
         self, last_host_node_id: NodeId, prefetch_key: RadixKey
     ) -> RadixKey:
-        """Align the span to C128 storage groups when the component is present."""
+        """Align C128 storage groups on NPU only; return the key unchanged otherwise."""
+        if not is_npu():
+            return prefetch_key
         c128_component = self.components.get(ComponentType.C128)
         if c128_component is None:
             return prefetch_key
