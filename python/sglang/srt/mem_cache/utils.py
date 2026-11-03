@@ -180,7 +180,13 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
 def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
     """Hash tokens with the legacy salt seed; omit extra_key."""
     namespace = (node.key.extra_key, node.key.cache_salt)
-    if namespace == (None, None):
+    reuse_storage_hashes = namespace == (None, None)
+    from sglang.srt.layers.cp.base import is_cp_sharded_padded
+
+    if is_cp_sharded_padded():
+        # Storage hashes cover groups; events need their physical-page chain.
+        reuse_storage_hashes = False
+    if reuse_storage_hashes:
         return compute_node_hash_values(node, page_size)
 
     if node.event_hash_value is not None:

@@ -61,6 +61,7 @@ class TestBufferModeSidecar(unittest.TestCase):
 
                 controller = SimpleNamespace(
                     page_size=2,
+                    logical_page_size=2,
                     storage_backend=SimpleNamespace(batch_exists=lambda *_: 2),
                     prefetch_hits_sync_groups=[],
                     _all_reduce=reduce,
@@ -156,6 +157,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                     controller = SimpleNamespace(
                         storage_backend=backend,
                         page_size=2,
+                        logical_page_size=2,
                         prefetch_hits_sync_groups=[],
                         _all_reduce=capture,
                     )
@@ -237,6 +239,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         controller = SimpleNamespace(
             storage_backend=None,
             page_size=2,
+            logical_page_size=2,
             prefetch_hits_sync_groups=[],
             _all_reduce=lambda values, *_: None,
         )

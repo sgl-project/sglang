@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
-from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_indices
+from sglang.srt.layers.cp.utils import (
+    from_cp_sharded,
+    get_cp_sharded_padded,
+    get_cp_sharded_padded_cache_indices,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -138,7 +142,10 @@ class FullComponent(TreeComponent):
         while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
             if full_host is not None:
-                kv_host_hit += len(full_host)
+                global_tokens = len(full_host)
+                if is_cp_sharded_padded():
+                    global_tokens = from_cp_sharded(global_tokens)
+                kv_host_hit += global_tokens
             node = node.parent
         if kv_host_hit > 0:
             return result._replace(
@@ -166,10 +173,13 @@ class FullComponent(TreeComponent):
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()
         if child_cd.host_value is not None:
+            host_split = split_len
+            if is_cp_sharded_padded():
+                host_split = get_cp_sharded_padded(host_split)
             new_parent.component_data[ct].host_value = child_cd.host_value[
-                :split_len
+                :host_split
             ].clone()
-            child_cd.host_value = child_cd.host_value[split_len:].clone()
+            child_cd.host_value = child_cd.host_value[host_split:].clone()
 
     def evict_component(
         self,
@@ -459,6 +469,8 @@ class FullComponent(TreeComponent):
                 n = self.tree_core.node_by_id(nid)
                 cd = n.component_data[ct]
                 n_len = len(cd.host_value)
+                if is_cp_sharded_padded():
+                    n_len = from_cp_sharded(n_len)
                 cd.value = device_indices[offset : offset + n_len].clone()
                 offset += n_len
                 # Full uses leaf sets, not LRU. A value materialized under

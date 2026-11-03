@@ -170,6 +170,8 @@ pub struct Node<K: ChildKeyType> {
     /// The page key labelling the edge from the parent (also this node's key in the
     /// parent's `children`); empty for the root.
     pub key: K,
+    /// CP size used to compare local host rows with the node token span.
+    pub(crate) cp_size: Option<usize>,
     /// Per-(component × tier) value state, indexed by `ValueSlotIdx` (device
     /// slots first, host after); device states also sit at plain component
     /// indices.
@@ -418,6 +420,7 @@ impl<K: ChildKeyType> Node<K> {
             namespace: KeyNamespace::default(),
             children: ChildMap::with_hasher(RandomState::new()),
             key: K::default(),
+            cp_size: None,
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
@@ -445,6 +448,7 @@ impl<K: ChildKeyType> Node<K> {
             namespace: KeyNamespace::default(),
             children: ChildMap::with_hasher(RandomState::new()),
             key,
+            cp_size: None,
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
@@ -566,8 +570,15 @@ impl<K: ChildKeyType> Node<K> {
                 self.id
             );
         } else {
+            let mut value_len = value.size()[0] as usize;
+            if let Some(cp_size) = self.cp_size {
+                // Host slots store local rows; the key spans all CP ranks.
+                if slot.is_host() {
+                    value_len *= cp_size;
+                }
+            }
             assert_eq!(
-                value.size()[0] as usize,
+                value_len,
                 self.key.atom_len(),
                 "set_value: {:?}/{} value length differs from the key on node {}",
                 slot.component_type(),

@@ -745,6 +745,7 @@ class TestDcpStorage(unittest.TestCase):
             cc = HybridCacheController.__new__(HybridCacheController)
             cc.storage_backend = backend
             cc.page_size = 128
+            cc.logical_page_size = 128
             cc.prefetch_hits_sync_groups = []
             op = PrefetchOperation(
                 CacheRequestHandle("test", 0), tokens, pool_transfers=[transfer]

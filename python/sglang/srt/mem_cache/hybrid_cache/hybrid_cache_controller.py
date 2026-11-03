@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
 )
@@ -207,6 +209,7 @@ class PrefetchOperation(StorageOperation):
         self.request_id = handle.rid
         self._lock = threading.Lock()
         self._terminated_flag = False
+        # Rank-local hit span: page_size rows per stored key.
         self.storage_hit_count = 0
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
@@ -1568,7 +1571,9 @@ class HybridCacheController(BaseHiCacheController):
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         hash_value = get_storage_hash_str(
-            operation.token_ids, operation.last_hash, page_size=self.page_size
+            operation.token_ids,
+            operation.last_hash,
+            page_size=self.logical_page_size,
         )
         operation.all_hash_values = hash_value
 
@@ -1872,6 +1877,8 @@ class HybridCacheController(BaseHiCacheController):
         operation.hash_value = original_hashes[trim_pages:]
         operation.prefetch_kv_page_offset += trim_pages
         operation.storage_hit_count -= trim_tokens
+        if is_cp_sharded_padded():
+            trim_tokens = from_cp_sharded(trim_tokens)
         operation.storage_start += trim_tokens
 
     def _page_backup(self, operation):

@@ -115,6 +115,17 @@ def get_cp_sharded_padded_cache_transfer_indices(value):
     return torch.where(value > 0, local.to(value.dtype), value)
 
 
+def get_cp_sharded_padded_owned_indices(value):
+    """Filter positive cache rows owned by this rank and return local rows."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    value = value[value > 0]
+    shifted = value.to(torch.int64) + (c - 1) * p
+    local = get_cp_sharded_padded_cache_transfer_indices(value.to(torch.int64))
+    return local[(shifted // p) % c == strategy.cp_rank]
+
+
 def get_cp_sharded_padded_allocation_lengths(value):
     """Convert request endpoints to reserved local capacity for allocation."""
     strategy = get_cp_strategy()

@@ -15,6 +15,7 @@ use crate::unified_lru_list::PriorityKey;
 use crate::unified_tree_core::{
     CacheActions, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
     MatchPrefixParams, MatchResult, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
+    from_cp_sharded, get_cp_sharded_padded,
 };
 
 /// FULL attention component driver; owns the FULL device/host value slots.
@@ -72,7 +73,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     result.best_match_node_id, node.id, result.last_device_node_id
                 )
             });
-            kv_host_hit += node.host_value_len(FULL);
+            kv_host_hit += from_cp_sharded(node.host_value_len(FULL), tree_core.cp_size);
             node_idx = parent;
         }
         if kv_host_hit > 0 {
@@ -98,7 +99,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             Node::redistribute_child_device_value(new_parent, child, FULL, split_len);
         }
         if child.has_host_value(FULL) {
-            Node::redistribute_child_host_value(new_parent, child, FULL, split_len);
+            Node::redistribute_child_host_value(
+                new_parent,
+                child,
+                FULL,
+                get_cp_sharded_padded(split_len as usize, tree_core.cp_size) as i64,
+            );
         }
     }
 
@@ -520,7 +526,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                             .resolve(loaded_id)
                             .expect("load-back transfers must reference live nodes");
                         let loaded = tree_core.arena.node_mut(loaded_idx);
-                        let n_len = loaded.host_value_len(FULL) as i64;
+                        let n_len =
+                            from_cp_sharded(loaded.host_value_len(FULL), tree_core.cp_size) as i64;
                         loaded
                             .set_device_value(FULL, device_indices.narrow(0, offset, n_len).copy());
                         let locked = loaded.device_lock_ref(FULL) > 0;

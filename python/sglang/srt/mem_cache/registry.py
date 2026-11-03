@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
+    get_parallel,
     get_serving,
 )
 
@@ -300,14 +301,17 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     # UnifiedRadixCache itself aligns and frees CP groups; its subclasses, other
-    # radix trees, host and session caching, external-linker loads and
-    # streaming-session tails may align and free pages.
+    # radix trees, host caching under pipeline parallelism, session caching,
+    # external-linker loads and streaming-session tails may align and free pages.
     if is_cp_sharded_padded() and (
         (
             not cache.disable
             and (
                 type(cache) is not UnifiedRadixCache
-                or get_memory().enable_hierarchical_cache
+                or (
+                    get_memory().enable_hierarchical_cache
+                    and get_parallel().pp_size > 1
+                )
                 or get_memory().enable_session_radix_cache
                 or get_memory().enable_unified_cache_external_linker
             )
@@ -316,9 +320,10 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     ):
         raise ValueError(
             "A sharded --cp-kv-layout supports radix caching only on "
-            "UnifiedRadixCache itself, not its subclasses, and without "
-            "hierarchical caching, session radix caching or the unified-cache "
-            "external linker; it does not support streaming sessions."
+            "UnifiedRadixCache itself, not its subclasses, and without session "
+            "radix caching, the unified-cache external linker or hierarchical "
+            "caching under pipeline parallelism; it does not support streaming "
+            "sessions."
         )
 
     if get_serving().enable_streaming_session and not isinstance(

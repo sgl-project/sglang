@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.kv_events import (
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
@@ -171,10 +172,18 @@ class KVCacheEventRecorder:
 
     def _node_event_hash_values(self, node: Any) -> list:
         """Hash values to publish for ``node``, computing them if not yet set."""
-        if node.hash_value is None:
+        needs_storage_hash = node.hash_value is None
+        if is_cp_sharded_padded():
+            # Event recording must not populate the separate storage-group chain.
+            needs_storage_hash = False
+        if needs_storage_hash:
             node.hash_value = compute_node_hash_values(node, self.page_size)
         if node.key.extra_key is None and node.key.cache_salt is None:
-            return node.hash_value
+            hash_values = node.hash_value
+            if is_cp_sharded_padded():
+                # Router events chain physical pages, not storage groups.
+                hash_values = compute_node_event_hash_values(node, self.page_size)
+            return hash_values
         return compute_node_event_hash_values(node, self.page_size)
 
     def _parent_block_hash(self, node: Any) -> Optional[int]:
@@ -187,7 +196,13 @@ class KVCacheEventRecorder:
         parent = node.parent
         if parent is None or parent.parent is None:
             return None
-        if node.key.extra_key is not None or node.key.cache_salt is not None:
+        use_event_hash = (
+            node.key.extra_key is not None or node.key.cache_salt is not None
+        )
+        if is_cp_sharded_padded():
+            # The parent link must use the same physical-page event chain.
+            use_event_hash = True
+        if use_event_hash:
             parent_hash_values = parent.event_hash_value
             assert parent_hash_values is not None
         else:
