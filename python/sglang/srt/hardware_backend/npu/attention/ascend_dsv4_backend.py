@@ -20,8 +20,9 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 

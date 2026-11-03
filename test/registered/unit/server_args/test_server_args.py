@@ -208,8 +208,8 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
         draft_arch="DFlash2DraftModel",
         **options,
     ):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
-        from sglang.srt.arg_groups.overrides import resolving_view
 
         inputs = dict(
             model_path="dummy",
@@ -1847,10 +1847,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     def _resolve(kv_cache_dtype, **kw):
         from types import SimpleNamespace
 
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_split_backend_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
 
         hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
         defaults = dict(
@@ -2102,7 +2100,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         handle_attention_backend_compatibility(args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
@@ -2114,7 +2112,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         handle_attention_backend_compatibility(args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
@@ -3275,7 +3273,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertTrue(server_args.disable_shared_experts_fusion)
         self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
@@ -3290,7 +3288,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
@@ -3306,7 +3304,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "megamoe")
         self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
@@ -3904,7 +3902,7 @@ class TestDeepEPv2Args(CustomTestCase):
             handle_a2a_moe(args)
 
     def test_declarations_resolve_ep_size_and_fusion(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         args = self._args(moe_runner_backend="auto", tp_size=2)
         handle_a2a_moe(args)
@@ -3912,7 +3910,7 @@ class TestDeepEPv2Args(CustomTestCase):
         self.assertTrue(resolved_view(args).disable_shared_experts_fusion)
 
     def test_auto_runner_defaults_to_deep_gemm(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         args = self._args(moe_runner_backend="auto")
         handle_a2a_moe(args)
@@ -4957,10 +4955,8 @@ class TestDcpKvEventContract(CustomTestCase):
     def test_kv_event_block_size_widens_a_single_token_page(self):
         # page_size=1 + DCP is a real deployment shape: the allocator is still
         # paged, at dcp_size.
-        from sglang.srt.arg_groups.overrides import (
-            kv_event_block_size_of,
-            resolving_view,
-        )
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.overrides import kv_event_block_size_of
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
@@ -5492,6 +5488,17 @@ class TestPrefillWeightVersionCompatibility(CustomTestCase):
         with envs.SGLANG_RUST_SERVER.override(True):
             with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
                 handle_cache_compatibility(args)
+
+
+class TestPagedExpertsNumResident(unittest.TestCase):
+    def test_takes_auto_or_a_positive_count(self):
+        from sglang.srt.arg_groups.fields.exec_ import _paged_experts_num_resident
+
+        self.assertIsNone(_paged_experts_num_resident("auto"))
+        self.assertEqual(_paged_experts_num_resident("12"), 12)
+        for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                _paged_experts_num_resident(bad)
 
 
 if __name__ == "__main__":
