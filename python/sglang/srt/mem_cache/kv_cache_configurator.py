@@ -2591,9 +2591,16 @@ class KVCacheConfigurator:
                     offload_layout_from_config,
                 )
 
+                num_request_slots = req_to_token_pool.req_to_token.shape[0]
+                budgeted_slots = get_schedule().max_running_requests + 1
+                if num_request_slots > budgeted_slots:
+                    raise RuntimeError(
+                        f"QSA K/V offload: {num_request_slots} request slots exceed "
+                        f"the {budgeted_slots} its GPU hot-cache budget holds"
+                    )
                 extra_args["kv_offload_layout"] = offload_layout_from_config(
                     hf_config=self.model_config.hf_config,
-                    num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                    num_request_slots=num_request_slots,
                     page_size=self.pool_page_size,
                 )
         token_to_kv_pool = pool_class(
