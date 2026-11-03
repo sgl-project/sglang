@@ -34,7 +34,7 @@ from sglang.srt.models.dflash import (
 )
 from sglang.srt.models.dspark import DSparkDraftMixin, DSparkDraftModel
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 
 class DFlashMLAAttention(nn.Module):

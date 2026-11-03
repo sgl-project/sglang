@@ -33,18 +33,6 @@ class _DummyTokenizer:
 
 def _patch_hf_transformers(get_tokenizer, get_config=None):
     module = ModuleType("sglang.srt.utils.hf_transformers")
-
-
-class MistralCommonBackend(_DummyTokenizer):
-    pass
-
-
-_MISTRAL_COMMON_PLACEHOLDER = "<!-- audio/image multimodal -->"
-
-
-
-def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
-    module = ModuleType("sglang.srt.utils.hf_transformers_utils")
     module.get_tokenizer = get_tokenizer
     if get_config is not None:
         module.get_config = get_config
