@@ -255,6 +255,8 @@ class FullComponent(TreeComponent):
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
+        if tracker[self.component_type] >= num_tokens:
+            return
         heap = [
             (self.session_ref_eviction_strategy(n), n)
             for n in self.tree_core.evictable_host_leaves
