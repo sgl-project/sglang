@@ -300,6 +300,8 @@ class DecodeKVCacheOffloadManager:
         while finish_count > 0:
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+            if self.cache_controller.topk_rows is not None:
+                self.cache_controller.topk_rows.apply_writes(1)
             for ack_id in ack.node_ids:
                 (
                     req,

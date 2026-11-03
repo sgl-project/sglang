@@ -383,6 +383,13 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        # Capturer rows (routed experts, indexer top-k) follow their KV through
+        # the host tier; None without a capturer.
+        from sglang.srt.mem_cache.hicache_topk_rows import HostTopkRows
+
+        self.topk_rows = HostTopkRows.create(
+            self.mem_pool_host.size, device=str(self.device)
+        )
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -913,6 +920,8 @@ class HiCacheController:
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
+        if self.topk_rows is not None:
+            self.topk_rows.reset()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -999,6 +1008,12 @@ class HiCacheController:
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
+        if self.topk_rows is not None:
+            self.topk_rows.on_write(
+                op.device_indices,
+                op.host_indices,
+                self.l2_transfer_engine.device_to_host_stream,
+            )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "write"), completion.finish_event
@@ -1147,6 +1162,12 @@ class HiCacheController:
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
+        if self.topk_rows is not None:
+            self.topk_rows.on_load(
+                op.device_indices,
+                op.host_indices,
+                self.l2_transfer_engine.host_to_device_stream,
+            )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event

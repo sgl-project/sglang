@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from typing import Optional
+from typing import Callable, List, Optional
 
 import torch
 
@@ -135,6 +135,7 @@ class BaseTopkCapturer:
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
+        self._pre_read_hooks: List[Callable[[], None]] = []
 
         self.host_cache = BaseHostCache(
             num_tokens, num_layers, topk_size, name=name, device=device
@@ -149,6 +150,10 @@ class BaseTopkCapturer:
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
+
+    def add_pre_read_hook(self, hook: Callable[[], None]) -> None:
+        """Run hook before every get_topk, to land pending row copies."""
+        self._pre_read_hooks.append(hook)
 
     def destroy(self):
         self.host_cache.destroy()
@@ -179,6 +184,8 @@ class BaseTopkCapturer:
     ) -> torch.Tensor:
         if start_len < 0:
             raise ValueError(f"{start_len=} must be non-negative")
+        for hook in self._pre_read_hooks:
+            hook()
         start_len = min(start_len, seqlen - 1)
         cache_pool_idx = (
             req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
