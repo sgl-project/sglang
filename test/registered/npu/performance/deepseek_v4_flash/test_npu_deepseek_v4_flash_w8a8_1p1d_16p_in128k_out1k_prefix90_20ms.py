@@ -224,6 +224,30 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "router_args": ["--policy", "cache_aware"],
     "router_envs": {},
 }
+class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
+    TestNpuPerfMultiNodePdSepTestCaseBase
+):
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
+
+    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
+    dataset_name = "generated-shared-prefix"
+    max_concurrency = 54
+    num_prompts = 90
+    input_len = 131072
+    output_len = 1024
+    random_range_ratio = 1
+    seed = 1
+    repeat_rate = 0.9
+    request_rate = 3
+    warmup_requests = 16
+    tpot = 20
+    output_token_throughput = 964.864
+    ttft = 7000
+
+    def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms(self):
+        """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
+        self.run_throughput()
 
 class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(TestNpuPerfMultiNodePdSepTestCaseBase):
     """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
@@ -238,9 +262,15 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(TestNpuPerfMultiN
     # num_prompts = 20
     # max_concurrency = 10
     random_range_ratio = 1
-    request_rate = 3
-    repeat_rate = 0.9
-    dp = 16
+    request_rate = 0
+    # Use raw /v1/completions instead of the chat API: the shared-prefix rows
+    # are natural-text continuations, and the chat template turns them into a
+    # digit-heavy assistant QA task that collapses DSPARK draft acceptance.
+    api_type = "raw"
+    # Fill the shared prefix on every DP rank before the scored run, otherwise
+    # most requests pay a cold 128k prefill and blow the TTFT baseline.
+    warmup_dp = 16
+    warmup_shape = 1
     pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
     output_token_throughput = 964.864
