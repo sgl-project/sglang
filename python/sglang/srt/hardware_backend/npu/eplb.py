@@ -21,17 +21,12 @@ Import torch_npu only when an NPU operation actually needs it.
 from __future__ import annotations
 
 from collections import deque
-from contextlib import contextmanager
-from functools import wraps
 from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed as dist
 
-from sglang.srt.eplb.expert_distribution import (
-    _ExpertDistributionRecorderReal,
-    get_global_expert_distribution_recorder,
-)
+from sglang.srt.eplb.expert_distribution import _ExpertDistributionRecorderReal
 from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
 if TYPE_CHECKING:
@@ -84,23 +79,8 @@ def _warmup_eplb_communication(group):
     _warmed_group = group
 
 
-def isolate_draft_expert_recording(forward):
-    """Disable NPU draft recording before the shared forward context resets it."""
-
-    @wraps(forward)
-    def wrapped(runner, *args, **kwargs):
-        # Draft and target share a recorder. Use the runner role: a draft forward
-        # can also have TARGET_VERIFY mode, so forward mode alone is insufficient.
-        if runner.is_draft_worker:
-            with get_global_expert_distribution_recorder().disable_this_region():
-                return forward(runner, *args, **kwargs)
-        return forward(runner, *args, **kwargs)
-
-    return wrapped
-
-
 class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
-    """Keep NPU draft passes out of target statistics and reuse TP communication."""
+    """Use compatible TP communication for NPU expert statistics and migration."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -109,16 +89,6 @@ class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
             _warmup_eplb_communication(group)
         # Reuse the existing accumulator; only its communication group changes.
         self._accumulator._communication_group = group
-
-    @contextmanager
-    def with_forward_pass(self, forward_pass_id, forward_batch):
-        # Suppressing hooks alone still appends draft zero rows, evicting target
-        # records from the rolling window. Skip reset and append as well.
-        if self._disable_all:
-            yield {}
-        else:
-            with super().with_forward_pass(forward_pass_id, forward_batch) as outputs:
-                yield outputs
 
 
 def update_expert_weights_with_staging(

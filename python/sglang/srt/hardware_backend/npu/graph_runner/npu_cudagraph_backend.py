@@ -29,8 +29,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
-from sglang.srt.hardware_backend.npu.eplb import isolate_draft_expert_recording
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -390,14 +390,24 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         finally:
             self._capture_stream = None
 
-    @property
-    def is_draft_worker(self) -> bool:
-        return self._decode_runner.model_runner.is_draft_worker
-
-    # Single-graph multi-step draft capture calls this directly, without a
-    # capture_session. Guard the model callbacks at their common entry point.
-    @isolate_draft_expert_recording
     def capture_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        capture_inputs: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
+    ) -> None:
+        # Capture bypasses ModelRunner.forward, including its recording flag.
+        # Cover warmups and direct calls from multi-step draft graph capture.
+        record_ctx = (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if self._decode_runner.model_runner.is_draft_worker
+            else empty_context()
+        )
+        with record_ctx:
+            self._capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
+
+    def _capture_one(
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
