@@ -257,7 +257,7 @@ class TestTentTransferEngine(CustomTestCase):
             config["transports"]["rdma"],
             {"enable": True, "numa_penalties": [1.0, 2.0, 10.0]},
         )
-        self.assertFalse(config["transports"]["nvlink"]["enable"])
+        self.assertTrue(config["transports"]["nvlink"]["enable"])
 
     def test_metrics_port_is_unique_per_gpu_and_off_without_gpu_id(self):
         for gpu_id in (0, 3):
@@ -280,12 +280,14 @@ class TestTentTransferEngine(CustomTestCase):
             engine, _ = self._engine()
         self.assertTrue(engine.engine.config["transports"]["tcp"]["enable"])
         self.assertFalse(engine.engine.config["transports"]["rdma"]["enable"])
+        self.assertFalse(engine.engine.config["transports"]["nvlink"]["enable"])
 
     def test_force_tcp_disables_rdma_and_drops_whitelist(self):
         with patch.dict("os.environ", {"MC_FORCE_TCP": "1"}):
             engine, _ = self._engine(ib_device="mlx5_0")
         config = engine.engine.config
         self.assertFalse(config["transports"]["rdma"]["enable"])
+        self.assertFalse(config["transports"]["nvlink"]["enable"])
         self.assertTrue(config["transports"]["tcp"]["enable"])
         self.assertNotIn("topology", config)
 

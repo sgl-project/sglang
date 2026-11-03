@@ -77,13 +77,14 @@ def _build_tent_config(
             if gpu_id is not None
             else {"enabled": False}
         ),
-        # Pin the data path: same-host peers must not silently fall back to NVLink/SHM.
+        # Same-host GPU peers use NVLink; TENT skips it across machines and
+        # uses RDMA. SHM stays off. TCP mode disables both device transports.
         "transports": {
             "rdma": {"enable": not force_tcp},
             "tcp": {"enable": force_tcp},
             "hp_tcp": {"enable": False},
             "shm": {"enable": False},
-            "nvlink": {"enable": False},
+            "nvlink": {"enable": not force_tcp},
             "mnnvl": {"enable": False},
             "gds": {"enable": False},
             "io_uring": {"enable": False},
