@@ -232,9 +232,13 @@ def schedule_verify_lens_topk_triton(
         G_P2=triton.next_power_of_2(max(gamma, 1)),
     )
     if budget > 0 and n > 0:
-        BLOCK_C = 64
-        BLOCK_CP = 256
-        grid = (triton.cdiv(n, BLOCK_C),)
+        if confidence.device.type == "npu":
+            # Bound the pairwise comparison tile by Ascend UB; every candidate
+            # is still ranked against the full candidate set in the cp loop.
+            block_c, block_cp = 16, 32
+        else:
+            block_c, block_cp = 64, 256
+        grid = (triton.cdiv(n, block_c),)
         _schedule_topk_selected_extra_kernel[grid](
             survival,
             selected_extra,
@@ -242,8 +246,8 @@ def schedule_verify_lens_topk_triton(
             cols,
             n,
             float(cfg.survival_eps),
-            BLOCK_C=BLOCK_C,
-            BLOCK_CP=BLOCK_CP,
+            BLOCK_C=block_c,
+            BLOCK_CP=block_cp,
         )
 
     verify_lens = torch.empty(num_requests, dtype=torch.int32, device=device)

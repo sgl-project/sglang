@@ -190,6 +190,25 @@ class TestVerifyCompressPositions(unittest.TestCase):
 
         self.assertEqual(dst.tolist(), [8, 0])
 
+    def test_ragged_rows_use_their_own_verify_length(self):
+        backend = self._backend()
+        # Row 0 verifies 3 tokens (live 2 -> positions 3,4,5; group closes at 4)
+        # and row 1 verifies 2 tokens (live 7 -> 8,9; group closes at 8). The
+        # packed q rows are 3 + 2 tokens, not 2 * 3.
+        positions = torch.tensor([10, 11, 12, 20, 21], dtype=torch.int64)
+        dst = torch.full((3,), -1, dtype=torch.int64)
+
+        backend._fill_verify_positions_cmp_padding_one(
+            positions,
+            dst,
+            ratio=4,
+            seq_lens_cpu=torch.tensor([5, 9], dtype=torch.int32),
+            n_draft=3,
+            row_lens_cpu=[3, 2],
+        )
+
+        self.assertEqual(dst.tolist(), [8, 17, 0])
+
     def test_device_path_matches_reference_across_boundaries_and_padding(self):
         cases = (
             # Existing C4 and C128 boundary examples.
@@ -1023,6 +1042,26 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
         custom_ops.indexer_compress_epilog.assert_not_called()
+
+
+class TestRaggedVerifyGraphCapability(unittest.TestCase):
+    """The opt-in lives on the backend class, so a dropped flag would silently
+    send compact ragged verify back to eager (the runner has no other way to
+    notice). Mirrors the CUDA-side capability test."""
+
+    def test_generic_ascend_backend_does_not_opt_in(self):
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+            AscendAttnBackend,
+        )
+
+        self.assertFalse(AscendAttnBackend.supports_ragged_verify_graph)
+        self.assertFalse(AscendAttnBackend.requires_uniform_ragged_capture)
+
+    def test_dsv4_backend_declares_ragged_verify_graph_support(self):
+        self.assertTrue(DeepseekV4AscendAttnBackend.supports_ragged_verify_graph)
+        # Its graph metadata is keyed by batch size, so tiers must capture
+        # full-width rows to stay distinguishable.
+        self.assertTrue(DeepseekV4AscendAttnBackend.requires_uniform_ragged_capture)
 
 
 if __name__ == "__main__":

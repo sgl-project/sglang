@@ -810,9 +810,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_is_deepseek_v4()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.captured_req_width
+        if (
+            envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
+            or self._requires_uniform_ragged_capture()
+        ):
+            return max(1, num_tokens // self.captured_req_width)
         return min(num_tokens, self.max_bs)
+
+    def _requires_uniform_ragged_capture(self) -> bool:
+        """True when any wrapped backend bakes per-tier geometry into its graphs."""
+        attn_backend = getattr(self, "attn_backend", None)
+        backends = getattr(attn_backend, "attn_backend_list", None) or [attn_backend]
+        return any(
+            getattr(backend, "requires_uniform_ragged_capture", False)
+            for backend in backends
+        )
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:

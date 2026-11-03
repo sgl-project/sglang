@@ -106,6 +106,12 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Backends that bake the per-tier q layout into graph metadata (cu_seqlens,
+    # seqused, compressor boundary positions) cannot share one metadata slot
+    # across tiers whose slot count collides. They capture full-width rows only
+    # (slots = tier // draft width), which makes (slots, tier) unique; batches
+    # whose live rows are narrower fall back to eager.
+    requires_uniform_ragged_capture: bool = False
     # Whether target verify runs correctly under decode context parallelism:
     # each rank reads its shard of the DCP-widened pages with the global causal
     # bound and returns its LSE for the cross-rank merge.

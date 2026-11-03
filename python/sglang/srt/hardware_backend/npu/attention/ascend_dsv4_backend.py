@@ -40,6 +40,42 @@ _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
+def _ragged_verify_layout(forward_batch: ForwardBatch):
+    """Layout riding the batch's spec input, or None (mirrors the runner helper).
+
+    Kept local so this module does not import ``sglang.srt.speculative`` at load
+    time (NPU unit tests stub that package).
+    """
+    spec_info = getattr(forward_batch, "spec_info", None)
+    return getattr(spec_info, "ragged_verify_layout", None)
+
+
+def _ragged_verify_lens_cpu(forward_batch: ForwardBatch) -> Optional[list[int]]:
+    """Per-row verify lengths of a compact ragged verify batch, else None.
+
+    Uniform-width verify (static ragged mode, EAGLE, NGRAM) has no layout and
+    keeps the historical ``rows = tokens // n_draft`` geometry.
+    """
+    layout = _ragged_verify_layout(forward_batch)
+    if layout is None or layout.verify_lens_cpu is None:
+        return None
+    return [int(v) for v in layout.verify_lens_cpu]
+
+
+def _verify_lens_from_seq_lens(
+    final_lens_cpu, live_lens_cpu, rows: int
+) -> Optional[list[int]]:
+    """Row verify length = final KV length - live prefix, from CPU mirrors."""
+    if live_lens_cpu is None:
+        return None
+    final = final_lens_cpu[:rows]
+    final = final.tolist() if hasattr(final, "tolist") else list(final)
+    live = list(live_lens_cpu)[:rows]
+    if len(final) < rows or len(live) < rows:
+        return None
+    return [int(f) - int(l) for f, l in zip(final, live)]
+
+
 def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
@@ -931,6 +967,16 @@ class C4IndexerAscendBackendMixin:
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
 ):
+    # The target-verify graph replays DSpark's compact ragged layouts; only the
+    # tier-filled geometry is served (the decode graph runner's ragged-verify
+    # admission keeps a trimmed tier on the eager path).
+    supports_ragged_verify_graph = True
+    # Graph metadata is keyed by batch size and bakes the tier's q layout, so
+    # tiers whose slot counts collide (e.g. 4 slots for both a 6-token and a
+    # 12-token tier) would overwrite each other. Capturing full-width rows keeps
+    # ``slots = tier // draft width`` unique.
+    requires_uniform_ragged_capture = True
+
     _DSV4_CP_LOCAL_FIELDS = (
         "actual_seq_lengths_q",
         "actual_seq_lengths_q_pa",
@@ -1917,21 +1963,47 @@ class DeepseekV4AscendAttnBackend(
                 if forward_batch.forward_mode.is_target_verify()
                 else self.speculative_num_draft_tokens
             )
-            actual_q = torch.arange(
-                n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
+            layout = (
+                _ragged_verify_layout(forward_batch)
+                if forward_batch.forward_mode.is_target_verify()
+                else None
             )
-            fm.actual_seq_lengths_q = actual_q
-            fm.actual_seq_lengths_q_pa = torch.cat(
-                [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
-                dim=0,
-            )
-            fm.actual_seq_lengths_q_pa_cpu = torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.int32),
-                    torch.arange(n_draft, B * n_draft + 1, n_draft, dtype=torch.int32),
-                ],
-                dim=0,
-            )
+            if layout is not None:
+                # Compact ragged verify: rows pack a variable number of tokens,
+                # so cu_seqlens is the layout's q indptr, not an arange.
+                fm.actual_seq_lengths_q_pa = layout.qo_indptr_device.to(torch.int32)
+                fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:].clone()
+                lens_cpu = layout.verify_lens_cpu
+                if lens_cpu is not None:
+                    cu_cpu = [0]
+                    for length in lens_cpu:
+                        cu_cpu.append(cu_cpu[-1] + int(length))
+                    fm.actual_seq_lengths_q_pa_cpu = torch.tensor(
+                        cu_cpu, dtype=torch.int32
+                    )
+                else:
+                    fm.actual_seq_lengths_q_pa_cpu = None
+            else:
+                actual_q = torch.arange(
+                    n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
+                )
+                fm.actual_seq_lengths_q = actual_q
+                fm.actual_seq_lengths_q_pa = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32, device=device),
+                        actual_q,
+                    ],
+                    dim=0,
+                )
+                fm.actual_seq_lengths_q_pa_cpu = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32),
+                        torch.arange(
+                            n_draft, B * n_draft + 1, n_draft, dtype=torch.int32
+                        ),
+                    ],
+                    dim=0,
+                )
         else:
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
@@ -2242,6 +2314,20 @@ class DeepseekV4AscendAttnBackend(
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
         # already pass expanded lengths and are not incremented again.
         verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
+        row_lens_cpu = _ragged_verify_lens_cpu(forward_batch)
+        if row_lens_cpu is None and _ragged_verify_layout(forward_batch) is not None:
+            # Device-only layout: derive each row's verify window from the CPU
+            # mirrors of the final and live KV lengths.
+            row_lens_cpu = _verify_lens_from_seq_lens(
+                verify_seq_lens_cpu,
+                getattr(forward_batch.spec_info, "live_seq_lens_cpu", None),
+                bs,
+            )
+        if row_lens_cpu is not None and len(row_lens_cpu) != bs:
+            raise RuntimeError(
+                "ragged verify metadata/layout mismatch: "
+                f"lens={len(row_lens_cpu)}, bs={bs}"
+            )
         padding_sizes = {}
         for ratio in (4, 128):
             if ratio not in self._dsv4_compress_ratios:
@@ -2250,12 +2336,21 @@ class DeepseekV4AscendAttnBackend(
             padding_sizes[ratio] = padding_size
             padding = torch.zeros(padding_size, dtype=torch.int64, device=device)
             self._fill_verify_positions_cmp_padding_one(
-                positions, padding, ratio, verify_seq_lens_cpu, n_draft=n_draft
+                positions,
+                padding,
+                ratio,
+                verify_seq_lens_cpu,
+                n_draft=n_draft,
+                row_lens_cpu=row_lens_cpu,
             )
             setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
         fm.start_pos = forward_batch.seq_lens.to(torch.int32)
         valid = forward_batch.seq_lens[:bs] > 0
-        fm.seqused = valid.to(torch.int32) * int(n_draft)
+        if row_lens_cpu is not None:
+            lens = torch.tensor(row_lens_cpu, dtype=torch.int32, device=device)
+        else:
+            lens = torch.full((bs,), n_draft, dtype=torch.int32, device=device)
+        fm.seqused = valid.to(torch.int32) * lens
         fm.dsv4_max_input_capacity = max(1, n_draft)
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
@@ -2283,32 +2378,49 @@ class DeepseekV4AscendAttnBackend(
         ratio: int,
         seq_lens_cpu: torch.Tensor,
         n_draft: int,
+        row_lens_cpu: Optional[list[int]] = None,
     ) -> None:
+        """Compact the boundary token of each verify group into ``dst``.
+
+        ``seq_lens_cpu`` holds the FINAL KV length per row; each row verifies the
+        last ``row_lens_cpu[row]`` tokens. Uniform callers omit ``row_lens_cpu``
+        and keep the historical ``tokens // n_draft`` slot geometry.
+        """
         dst.zero_()
         if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
             return
 
         n_draft = int(n_draft)
-        request_num = positions.shape[0] // n_draft
-        if request_num == 0:
+        if row_lens_cpu is None:
+            rows = positions.shape[0] // n_draft
+            row_lens_cpu = [n_draft] * rows
+        rows = len(row_lens_cpu)
+        if rows == 0:
             return
-        seq_lens_cpu = seq_lens_cpu[:request_num]
+        seq_lens_cpu = seq_lens_cpu[:rows]
         if seq_lens_cpu.device.type != "cpu":
             seq_lens_cpu = seq_lens_cpu.cpu()
+        finals = [int(v) for v in seq_lens_cpu.flatten().tolist()]
 
-        start_positions = seq_lens_cpu - n_draft + 1
-        abs_positions = start_positions.view(-1, 1) + torch.arange(
-            n_draft, dtype=start_positions.dtype
-        ).view(1, -1)
-        boundary_mask = (abs_positions % ratio == 0) & (seq_lens_cpu.view(-1, 1) > 0)
-        indices = torch.nonzero(boundary_mask.flatten(), as_tuple=False).flatten()
+        indices = []
+        cursor = 0
+        for row, length in enumerate(row_lens_cpu):
+            length = int(length)
+            live = finals[row] - length
+            if live > 0:
+                for offset in range(length):
+                    if (live + offset + 1) % ratio == 0:
+                        indices.append(cursor + offset)
+            cursor += length
 
-        if indices.numel() == 0:
+        if not indices:
             return
         # This tiny H2D copy runs on the verify metadata path. Keep it blocking:
         # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
         # surface later as an unrelated CopyKernel stream failure.
-        indices = indices[: dst.numel()].to(device=positions.device)
+        indices = torch.tensor(
+            indices[: dst.numel()], dtype=torch.int64, device=positions.device
+        )
         # ``indices`` selects the final token of each newly completed group.
         # The compressed KV applies RoPE at the group's first token, matching
         # the decode path and ``comp_pos = (position // ratio) * ratio``.
@@ -2327,6 +2439,17 @@ class DeepseekV4AscendAttnBackend(
 
         n_draft = int(spec_info.draft_token_num)
         seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
+        row_lens_cpu = None
+        layout = getattr(spec_info, "ragged_verify_layout", None)
+        if layout is not None:
+            if layout.verify_lens_cpu is not None:
+                row_lens_cpu = [int(v) for v in layout.verify_lens_cpu]
+            elif seq_lens_cpu is not None:
+                row_lens_cpu = _verify_lens_from_seq_lens(
+                    seq_lens_cpu,
+                    getattr(spec_info, "live_seq_lens_cpu", None),
+                    int(layout.bs),
+                )
         if seq_lens_cpu is None:
             seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)
             if seq_lens_cpu is None:
@@ -2334,13 +2457,24 @@ class DeepseekV4AscendAttnBackend(
                     "DSV4 verify buffer refresh requires seq_lens_cpu_int on "
                     "forward metadata or seq_lens_cpu on spec_info."
                 )
-            seq_lens_cpu = seq_lens_cpu + n_draft
+            if row_lens_cpu is None:
+                seq_lens_cpu = seq_lens_cpu + n_draft
 
         self._fill_verify_positions_cmp_padding_one(
-            positions, c4_positions, 4, seq_lens_cpu, n_draft=n_draft
+            positions,
+            c4_positions,
+            4,
+            seq_lens_cpu,
+            n_draft=n_draft,
+            row_lens_cpu=row_lens_cpu,
         )
         self._fill_verify_positions_cmp_padding_one(
-            positions, c128_positions, 128, seq_lens_cpu, n_draft=n_draft
+            positions,
+            c128_positions,
+            128,
+            seq_lens_cpu,
+            n_draft=n_draft,
+            row_lens_cpu=row_lens_cpu,
         )
 
 
