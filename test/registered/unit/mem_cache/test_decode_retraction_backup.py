@@ -52,6 +52,7 @@ from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftPlan,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
@@ -247,7 +248,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         )
 
     def _admit_req(self, env, num_tokens: int):
-        req = SimpleNamespace(rid="request", kv=ReqKvInfo(), seqlen=num_tokens + 1)
+        req = FakeReq(rid="request", kv=ReqKvInfo(), seqlen=num_tokens + 1)
         self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
         source_indices = env.allocator.alloc(num_tokens)
         self.assertIsNotNone(source_indices)
