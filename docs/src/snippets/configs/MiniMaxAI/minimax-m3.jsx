@@ -266,14 +266,9 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      // GB300: decode runs on trtllm_mha (FlashInfer trtllm-gen paged decode,
-      // ~2x faster than fa4 on M3's decode shapes; see the cookbook page's
-      // per-phase note). --attention-backend fa4 still serves prefill (fa4
-      // wins there) and keys the page-128 auto-force MSA needs; trtllm_mha
-      // accepts page 128 via trtllm-gen's dynamic tokens-per-page kernels
-      // (flashinfer >= 0.6.12), allowed in-tree since sglang v0.5.22 — the
-      // recipe image above satisfies this. B200/GB200 (different or
-      // unbenchmarked shard geometry) intentionally keep fa4-only.
+      // GB300: decode uses FlashInfer trtllm-gen (trtllm_mha, ~2x faster than fa4
+      // on M3's decode shapes) while fa4 keeps serving prefill. Needs sglang >= 0.5.22
+      // and flashinfer >= 0.6.12 (the recipe image has both); B200/GB200 keep fa4-only.
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
