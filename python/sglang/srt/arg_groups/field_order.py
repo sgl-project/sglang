@@ -285,7 +285,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_multi_layer_eagle",
     "speculative_adaptive",
     "speculative_adaptive_config",
-    "speculative_adaptive_memory_budget_gb",
     "decoupled_spec_bind_endpoint",
     "decoupled_spec_connect_endpoints",
     "decoupled_spec_rank",
@@ -589,5 +588,6 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "speculative_adaptive_memory_budget_gb",
 )
 # fmt: on
