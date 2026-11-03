@@ -67,7 +67,6 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
-    prewarm_dsv4_aicpu,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
@@ -76,6 +75,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.srt.hardware_backend.npu.utils import prewarm_dsv4_aicpu
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -718,141 +718,124 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         self.assertEqual(kwargs, {})
 
 
-class TestDsv4BackendPrewarm(unittest.TestCase):
-    _BACKEND = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
-
+class TestDsv4AicpuPrewarm(unittest.TestCase):
     def setUp(self):
-        self.runner = SimpleNamespace(
-            server_args=SimpleNamespace(hicache_storage_backend="npu_memcache"),
-            is_draft_worker=False,
-            model_config=SimpleNamespace(
-                num_attention_heads=64,
-                head_dim=512,
-                index_topk=512,
-                index_n_heads=16,
-                index_head_dim=128,
-                compress_ratios=(4, 128),
-                sliding_window_size=128,
-            ),
-            spec_algorithm=None,
-            decode_num_tokens_per_req=lambda: 1,
+        self.config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+            num_attention_heads=64,
+            head_dim=512,
+            sliding_window_size=128,
         )
+        self.tp_group = SimpleNamespace(
+            device="cpu", device_group=object(), device_module=MagicMock()
+        )
+        self.parallel = SimpleNamespace(
+            tp_size=8, attn_tp_size=1, tp_group=self.tp_group
+        )
+        patcher = patch(
+            "sglang.srt.runtime_context.get_parallel", return_value=self.parallel
+        )
+        self.get_parallel = patcher.start()
+        self.addCleanup(patcher.stop)
 
-        def init_parent(backend, model_runner, speculative_step_id=0):
-            backend.forward_metadata = None
-            backend.token_to_kv_pool = SimpleNamespace(compress_state_pools=[])
-
-        for patcher in (
-            patch(
-                f"{self._BACKEND}.AscendAttnBackend.__init__",
-                autospec=True,
-                side_effect=init_parent,
-            ),
-            patch(
-                f"{self._BACKEND}.get_parallel",
-                return_value=SimpleNamespace(
-                    attn_tp_size=8, tp_group=SimpleNamespace(device="npu:0")
-                ),
-            ),
+    def test_other_models_and_storage_backends_do_not_prewarm(self):
+        for storage, architecture in (
+            (None, "DeepseekV4ForCausalLM"),
+            ("file", "DeepseekV4ForCausalLM"),
+            ("npu_memcache", "DeepseekV3ForCausalLM"),
+            ("npu_memcache", "Qwen3ForCausalLM"),
         ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
+            with self.subTest(storage=storage, architecture=architecture):
+                self.config.hf_config.architectures = [architecture]
+                prewarm_dsv4_aicpu(self.config, storage)
+        self.get_parallel.assert_not_called()
 
-    def test_target_prewarm_runs_once_after_metadata_fields_are_ready(self):
-        def prewarm(backend, device):
-            self.assertTrue(backend._dsv4_has_c4)
-            self.assertTrue(backend._dsv4_has_c128)
-            self.assertEqual(backend._dsv4_q_head_num, 8)
-            self.assertEqual(device, "npu:0")
-
-        with patch(f"{self._BACKEND}.prewarm_dsv4_aicpu", side_effect=prewarm) as op:
-            DeepseekV4AscendAttnBackend(self.runner)
-            DeepseekV4AscendAttnBackend(self.runner)
-        op.assert_called_once()
-
-    def test_other_storage_and_draft_backends_do_not_prewarm(self):
-        for storage, draft in ((None, False), ("file", False), ("npu_memcache", True)):
+    def test_hccl_finishes_before_metadata_on_a3_and_a5(self):
+        for arch35, attn_tp_size, window in (
+            (False, 1, 128),
+            (False, 8, None),
+            (True, 1, 256),
+            (True, 8, 128),
+        ):
+            events = []
+            self.parallel.attn_tp_size = attn_tp_size
+            self.config.sliding_window_size = window
+            self.tp_group.device_module.synchronize.side_effect = lambda: events.append(
+                "hccl_sync"
+            )
             with (
-                self.subTest(storage=storage, draft=draft),
-                patch(f"{self._BACKEND}.prewarm_dsv4_aicpu") as op,
+                self.subTest(arch35=arch35, attn_tp_size=attn_tp_size, window=window),
+                patch(
+                    "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                    return_value=arch35,
+                ),
+                patch("torch.ops.custom", MagicMock(), create=True) as ops,
+                patch("torch.npu", MagicMock(), create=True) as npu,
+                patch("torch.distributed.all_reduce") as all_reduce,
             ):
-                self.runner.server_args.hicache_storage_backend = storage
-                self.runner.is_draft_worker = draft
-                DeepseekV4AscendAttnBackend(self.runner)
-                op.assert_not_called()
+                op_name = (
+                    "npu_kv_quant_sparse_attn_sharedkv_metadata"
+                    if arch35
+                    else "npu_sparse_attn_sharedkv_metadata"
+                )
+                metadata_op = getattr(ops, op_name)
+                metadata_op.side_effect = lambda **kw: events.append("metadata")
+                all_reduce.side_effect = lambda *a, **kw: events.append("hccl")
+                npu.synchronize.side_effect = lambda device: events.append("aicpu_sync")
 
-    def test_failed_prewarm_is_not_marked_complete(self):
-        with patch(f"{self._BACKEND}.prewarm_dsv4_aicpu", side_effect=RuntimeError):
-            with self.assertRaises(RuntimeError):
-                DeepseekV4AscendAttnBackend(self.runner)
-        self.assertFalse(getattr(self.runner, "_dsv4_aicpu_prewarmed", False))
+                prewarm_dsv4_aicpu(self.config, "npu_memcache")
+
+                self.assertEqual(
+                    events, ["hccl", "hccl_sync", "metadata", "aicpu_sync"]
+                )
+                all_reduce.assert_called_once()
+                self.assertIs(
+                    all_reduce.call_args.kwargs["group"], self.tp_group.device_group
+                )
+                metadata_op.assert_called_once()
+                kwargs = metadata_op.call_args.kwargs
+                self.assertEqual(kwargs["num_heads_q"], 64 // attn_tp_size)
+                self.assertEqual(kwargs["num_heads_kv"], 1)
+                self.assertEqual(kwargs["head_dim"], 512)
+                self.assertEqual(kwargs["batch_size"], 1)
+                self.assertEqual(kwargs["cu_seqlens_q"].tolist(), [0, 1])
+                self.assertEqual(kwargs["seqused_kv"].tolist(), [1])
+                self.assertEqual(
+                    kwargs["ori_win_left"], (128 if window is None else window) - 1
+                )
+                self.assertEqual(kwargs["cmp_ratio"], 1)
+                self.assertFalse(kwargs["has_cmp_kv"])
+                if arch35:
+                    self.assertEqual(kwargs["kv_quant_mode"], 1)
+                    self.assertEqual(kwargs["tile_size"], 64)
+                    self.assertEqual(kwargs["rope_head_dim"], 64)
+                    ops.npu_sparse_attn_sharedkv_metadata.assert_not_called()
+                else:
+                    self.assertNotIn("kv_quant_mode", kwargs)
+                    ops.npu_kv_quant_sparse_attn_sharedkv_metadata.assert_not_called()
+                npu.synchronize.assert_called_once_with("cpu")
+
+    def test_hccl_failure_prevents_aicpu_startup(self):
+        for fail_sync in (False, True):
+            with (
+                self.subTest(fail_sync=fail_sync),
+                patch("torch.distributed.all_reduce") as all_reduce,
+                patch("torch.ops.custom", MagicMock(), create=True) as ops,
+            ):
+                failed_call = (
+                    self.tp_group.device_module.synchronize if fail_sync else all_reduce
+                )
+                failed_call.side_effect = RuntimeError("HCCL initialization failed")
+                with self.assertRaisesRegex(RuntimeError, "HCCL initialization failed"):
+                    prewarm_dsv4_aicpu(self.config, "npu_memcache")
+                ops.npu_sparse_attn_sharedkv_metadata.assert_not_called()
+                ops.npu_kv_quant_sparse_attn_sharedkv_metadata.assert_not_called()
 
 
 class TestSparseAttentionMetadata(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
-
-    def test_prewarm_initializes_all_metadata_before_synchronizing(self):
-        for is_arch35, metadata_op_name in (
-            (False, "npu_sparse_attn_sharedkv_metadata"),
-            (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
-        ):
-            events = []
-            tp_group = SimpleNamespace(device_group=object(), device_module=MagicMock())
-            tp_group.device_module.synchronize.side_effect = lambda: events.append(
-                "hccl_sync"
-            )
-            with (
-                self.subTest(is_arch35=is_arch35),
-                patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
-                patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
-                patch("torch.npu", MagicMock(), create=True) as npu,
-                patch("torch.distributed.all_reduce") as all_reduce,
-                patch(
-                    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.get_parallel",
-                    return_value=SimpleNamespace(tp_group=tp_group),
-                ),
-            ):
-                backend = DeepseekV4AscendAttnBackend.__new__(
-                    DeepseekV4AscendAttnBackend
-                )
-                # No forward request or KV buffers exist during startup.
-                backend.forward_metadata = None
-                backend._is_dspark_draft_worker = False
-                backend._dsv4_sliding_window_size = 128
-                backend._dsv4_q_head_num = 64
-                backend._dsv4_kv_head_num = 1
-                backend._dsv4_head_dim = 512
-                backend._dsv4_has_c4 = True
-                backend._dsv4_has_c128 = True
-                backend._dsv4_index_topk = 512
-                backend._dsv4_index_n_heads = 16
-                backend._dsv4_index_head_dim = 128
-
-                metadata_op = getattr(custom_ops, metadata_op_name)
-                metadata_op.side_effect = lambda **kw: events.append(kw["cmp_ratio"])
-                custom_ops.npu_quant_lightning_indexer_metadata.side_effect = (
-                    lambda **kw: events.append("indexer")
-                )
-                npu.synchronize.side_effect = lambda device: events.append("sync")
-                all_reduce.side_effect = lambda *a, **kw: events.append("hccl")
-
-                prewarm_dsv4_aicpu(backend, "cpu")
-
-                self.assertEqual(
-                    events, ["hccl", "hccl_sync", 1, 4, "indexer", 128, "sync"]
-                )
-                all_reduce.assert_called_once()
-                self.assertIs(
-                    all_reduce.call_args.kwargs["group"], tp_group.device_group
-                )
-                npu.synchronize.assert_called_once_with("cpu")
-                for call in metadata_op.call_args_list:
-                    self.assertEqual(call.kwargs["batch_size"], 1)
-                    self.assertEqual(call.kwargs["cu_seqlens_q"].tolist(), [0, 1])
-                    self.assertEqual(call.kwargs["seqused_kv"].tolist(), [1])
-                self.assertIsNone(backend.forward_metadata)
 
     def test_device_metadata_receives_sequence_lengths(self):
         cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)

@@ -16,6 +16,7 @@ from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -334,6 +335,56 @@ def get_indexer_weight_stream():
     if indexer_weight_stream is None:
         indexer_weight_stream = torch.npu.Stream()
     return indexer_weight_stream
+
+
+def prewarm_dsv4_aicpu(model_config: "ModelConfig", storage_backend: Optional[str]):
+    """Start custom AiCPU after HCCL is ready and before MemFabric maps memory."""
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.runtime_context import get_parallel
+
+    if storage_backend != "npu_memcache" or not is_deepseek_v4(model_config.hf_config):
+        return
+
+    parallel = get_parallel()
+    tp_group = parallel.tp_group
+    device = tp_group.device
+    logger.info("DSV4 AiCPU prewarm: initializing HCCL on the TP group")
+    # Group creation is lazy. Materialize the formal communicator first so
+    # later HCCL startup cannot restart HCCP after custom AiCPU has started.
+    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(warmup_tensor, group=tp_group.device_group)
+    tp_group.device_module.synchronize()
+
+    # A single-token metadata op starts custom AiCPU without a model, KV
+    # buffers or an attention backend. Delaying this until after MemFabric
+    # maps host memory can make custom AiCPU startup fail in halMemBindSibling.
+    if is_npu_arch35():
+        metadata_op = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata
+        quant_kwargs = dict(kv_quant_mode=1, tile_size=64, rope_head_dim=64)
+    else:
+        metadata_op = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
+        quant_kwargs = {}
+    window = model_config.sliding_window_size
+    _metadata = metadata_op(
+        batch_size=1,
+        num_heads_q=model_config.num_attention_heads // parallel.attn_tp_size,
+        num_heads_kv=1,
+        head_dim=model_config.head_dim,
+        has_ori_kv=True,
+        has_cmp_kv=False,
+        cu_seqlens_q=torch.arange(2, dtype=torch.int32, device=device),
+        seqused_kv=torch.ones(1, dtype=torch.int32, device=device),
+        cmp_ratio=1,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+        ori_win_left=(window if window is not None else 128) - 1,
+        ori_win_right=0,
+        layout_q="TND",
+        layout_kv="PA_ND",
+        **quant_kwargs,
+    )
+    torch.npu.synchronize(device)
+    logger.info("DSV4 AiCPU prewarm complete")
 
 
 def init_zbal(world_size, gpu_id, world_rank, do_check=True):
