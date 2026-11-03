@@ -231,7 +231,7 @@ class DocPrefetch:
         return True
 
     def on_window_finished(self, req: Req) -> None:
-        """Mark the follow-up of a finished ``req`` released, budget capped.
+        """Mark every follow-up of a finished ``req`` released, budget capped.
 
         Called from the KV-release path after the window's KV was retained; the
         scheduler queues released windows with ``take_released``. A retracted
