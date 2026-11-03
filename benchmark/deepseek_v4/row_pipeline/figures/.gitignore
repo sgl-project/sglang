@@ -1,0 +1,4 @@
+*.png
+*.pdf
+figure_manifest.json
+__pycache__/
