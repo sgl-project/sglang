@@ -39,7 +39,10 @@ class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
 @unittest.skipUnless(is_cuda(), "requires CUDA stochastic verification")
 class TestNgramForceGreedyVerify(NgramServerBase):
     attention_backend = "flashinfer"
-    extra_args = ["--disable-radix-cache"]
+    extra_args = [
+        "--disable-radix-cache",
+        "--enable-deterministic-inference",
+    ]
 
     @classmethod
     def setUpClass(cls):
