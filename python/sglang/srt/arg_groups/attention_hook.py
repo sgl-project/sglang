@@ -306,6 +306,9 @@ def handle_linear_attn_backend(server_args: Any):
             "defaulting --linear-attn-decode-backend to flashinfer."
         )
 
+    if cfg.enable_gdn_replayssm_ucache:
+        _check_gdn_replayssm_ucache(server_args)
+
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
 
@@ -332,9 +335,12 @@ def handle_linear_attn_backend(server_args: Any):
             "(FlashKDA stays on prefill)."
         )
 
+    # The u-cache verify replaces the FlashInfer bf16-state decode/verify kernels
+    # (plain decode never runs under it), while FlashInfer prefill takes fp16 state.
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
+        and not cfg.enable_gdn_replayssm_ucache
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -367,6 +373,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
+        and not cfg.enable_gdn_replayssm_ucache
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -521,6 +528,105 @@ def handle_linear_attn_backend(server_args: Any):
                 "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
+
+
+# Branch-only Qwen3.8 GDN knobs that would route a target verify through their own
+# conv or in-projection path; read raw at their call sites, so mirrored here.
+_Q38_GDN_VERIFY_KNOBS = ("Q38_GDN_FRONT", "Q38_GDN_INPROJ_CONV", "Q38_GDN_PDL")
+
+
+def _check_gdn_replayssm_ucache(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    flag = "--enable-gdn-replayssm-ucache"
+    _check_gdn_replayssm_ucache_model(server_args, flag=flag)
+    _check_gdn_replayssm_ucache_spec(cfg, flag=flag)
+    _check_gdn_replayssm_ucache_cache(cfg, flag=flag)
+    _check_gdn_replayssm_ucache_megakernel(flag=flag)
+    if cfg.mamba_ssm_dtype is None:
+        logger.info(f"{flag}: setting --mamba-ssm-dtype float16 (UMMA fp16 state).")
+        declare_resolution(
+            server_args, "_handle_linear_attn_backend", mamba_ssm_dtype="float16"
+        )
+    elif cfg.mamba_ssm_dtype != "float16":
+        raise ValueError(
+            f"{flag} requires --mamba-ssm-dtype float16 (the UMMA kernels keep an "
+            f"fp16 state pool); got {cfg.mamba_ssm_dtype!r}."
+        )
+
+
+def _check_gdn_replayssm_ucache_model(server_args: Any, *, flag: str) -> None:
+    import torch
+
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+    model_config = model_config_of(server_args)
+    if hybrid_gdn_config(model_config) is None or uses_kda_attention(
+        model_config.hf_config
+    ):
+        raise ValueError(f"{flag} requires a GDN hybrid linear-attention model.")
+    if not get_platform().is_cuda or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        raise ValueError(f"{flag} requires an SM100 or SM107 CUDA GPU.")
+
+
+def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if cfg.speculative_algorithm is None:
+        raise ValueError(f"{flag} requires speculative decoding (it is a verify path).")
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            f"{flag} requires a linear draft chain (--speculative-eagle-topk in "
+            f"{{None, 1}}); got {cfg.speculative_eagle_topk!r}."
+        )
+    num_draft_tokens = cfg.speculative_num_draft_tokens
+    if num_draft_tokens is not None and not 1 <= num_draft_tokens <= 8:
+        raise ValueError(
+            f"{flag} supports 1 to 8 draft tokens per verify; got "
+            f"--speculative-num-draft-tokens={num_draft_tokens}."
+        )
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        raise ValueError(f"{flag} requires SGLANG_RAGGED_VERIFY_MODE=static.")
+    if pp_spec_stable_rows_enabled():
+        raise ValueError(f"{flag} does not support SGLANG_ENABLE_PP_SPEC.")
+    if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
+        raise ValueError(
+            f"{flag} is mutually exclusive with --enable-linear-replayssm and "
+            "--enable-linear-replayssm-spec."
+        )
+
+
+def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
+    # TODO(ameynaik-hub): prefix-cache snapshots via FlashInfer's
+    # gdn_prefix_materialize, then drop the --disable-radix-cache requirement.
+    if not cfg.disable_radix_cache:
+        raise ValueError(
+            f"{flag} requires --disable-radix-cache: prefix-cache snapshots of a "
+            "deferred-fold state are not supported yet."
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            f"{flag} does not support --enable-mixed-chunk: decode rows of a mixed "
+            "batch would read the checkpoint without its unfolded window."
+        )
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            f"{flag} does not support PD disaggregation; got "
+            f"--disaggregation-mode={cfg.disaggregation_mode!r}."
+        )
+
+
+def _check_gdn_replayssm_ucache_megakernel(*, flag: str) -> None:
+    if envs.SGLANG_Q38C_MK_GDN.get():
+        raise ValueError(f"{flag} cannot run with SGLANG_Q38C_MK_GDN.")
+    for name in _Q38_GDN_VERIFY_KNOBS:
+        if os.environ.get(name, "0") == "1":
+            raise ValueError(f"{flag} cannot run with {name}=1.")
 
 
 def handle_multi_item_scoring(server_args: Any):

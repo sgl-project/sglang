@@ -596,6 +596,19 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    enable_gdn_replayssm_ucache: A[
+        bool,
+        "Enable the deferred-fold GDN ReplaySSM target verify on FlashInfer's "
+        "u-cache kernels (gated_delta_rule_mtp_ucache_flush_umma, SM100; the Rubin "
+        "build on SM107). Each verify reads the fp16 checkpoint plus a per-slot "
+        "window of up to 16 committed (k, u, g) records and folds a full window "
+        "into the checkpoint inside the same launch, so the state is written "
+        "about once every 4 verifies instead of every step. Numerics differ from "
+        "the per-step fold (16-bit ring records, one rounding per fold). Requires "
+        "a GDN hybrid model, a linear draft chain with at most 8 draft tokens, "
+        "--mamba-ssm-dtype float16, --disable-radix-cache, no mixed chunk and "
+        "no PD disaggregation; needs FlashInfer >= 0.7.3.",
+    ] = False
 
 
 class ExecGraph(msgspec.Struct):

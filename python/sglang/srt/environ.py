@@ -338,6 +338,8 @@ class Envs:
     SGLANG_PLE_PREFILL_CONV_CHUNK_SIZE = EnvInt(0)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
+    # Q38C megakernel GDN target verify; its call sites still read it raw as "1".
+    SGLANG_Q38C_MK_GDN = EnvBool(False)
     # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
     SGLANG_Q38_ROUTER_FRONT = EnvBool(False)
     SGLANG_Q38_ROUTER_HYBRID = EnvBool(False)
