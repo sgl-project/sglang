@@ -53,12 +53,15 @@ class TestUpdateWeightsFromTensorNvFp4Moe(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.url = DEFAULT_URL_FOR_TEST
-        # Leave free memory for the checker's snapshot round trip.
+        other_args = ["--mem-fraction-static", "0.6"]
+        if get_device_sm() >= 120:
+            # SM100 resolves auto to the TRT-LLM layout; SM120 serves CUTLASS.
+            other_args += ["--moe-runner-backend", "flashinfer_cutlass"]
         cls.process = popen_launch_server(
             _MODEL_NAME,
             cls.url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--mem-fraction-static", "0.6"],
+            other_args=other_args,
         )
 
     @classmethod
