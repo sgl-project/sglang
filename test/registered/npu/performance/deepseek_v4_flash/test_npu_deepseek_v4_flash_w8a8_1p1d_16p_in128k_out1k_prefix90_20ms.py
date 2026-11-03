@@ -4,7 +4,7 @@ from pathlib import Path
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    TestNpuPerfMultiNodePdSepTestCaseBase, 
+    TestNpuPerfMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
