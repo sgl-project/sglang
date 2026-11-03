@@ -41,15 +41,19 @@ def test_npu_vit_graph_keys_and_buffer_ownership():
     """Distinct layouts get distinct graphs; capture/replay preserve caller data."""
     module = _load_npu_graph_runner_module()
     runner = module.ViTNpuGraphRunner(
-        SimpleNamespace(blocks=[_Block()], device=torch.device("cpu"), dtype=torch.float32)
+        SimpleNamespace(
+            blocks=[_Block()], device=torch.device("cpu"), dtype=torch.float32
+        )
     )
 
-    def capture(key):
+    def capture(graph_key):
         # Simulate in-place capture and a static output reused by replay.
-        runner.block_input[key].add_(10)
-        runner.block_output[key] = runner.block_input[key].clone()
-        runner.block_graphs[key] = SimpleNamespace(
-            replay=lambda: runner.block_output[key].copy_(runner.block_input[key] + 10)
+        runner.block_input[graph_key].add_(10)
+        runner.block_output[graph_key] = runner.block_input[graph_key].clone()
+        runner.block_graphs[graph_key] = SimpleNamespace(
+            replay=lambda: runner.block_output[graph_key].copy_(
+                runner.block_input[graph_key] + 10
+            )
         )
 
     runner._create_graph = capture
