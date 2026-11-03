@@ -354,7 +354,7 @@ class AscendAttnBackend(AttentionBackend):
             cache_layout is not None and cache_layout.layout == "gqa_mxfp8"
         )
         if self.use_quant_flash_attn:
-            from cann_ops_transformer.ops import (
+            from sgl_kernel_npu.operators.attention import (
                 quant_flash_attn,
                 quant_flash_attn_metadata,
             )
