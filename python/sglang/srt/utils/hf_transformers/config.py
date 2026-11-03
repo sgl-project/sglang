@@ -19,6 +19,7 @@ from typing import Dict, Optional, Tuple
 
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+from transformers.utils.hub import resolve_revision
 
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import (
@@ -375,16 +376,26 @@ def get_config(
         model_config_parser = "mistral" if is_mistral_model(model) else "hf"
 
     parser = get_model_config_parser(model_config_parser)
+    resolved_revision = resolve_revision(
+        model,
+        revision,
+        cache_dir=kwargs.get("cache_dir"),
+        local_files_only=kwargs.get("local_files_only", False),
+        token=kwargs.get("token"),
+    )
     try:
         config = parser.parse(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            model,
+            trust_remote_code=trust_remote_code,
+            revision=resolved_revision,
+            **kwargs,
         )
     except (OSError, ValueError):
         # A Kev LoRA checkpoint has no model config. It serves the text backbone
         # of the base its head.pt pins.
         from sglang.srt.configs.model_config import load_pointer_adapter
 
-        meta = load_pointer_adapter(model, revision)
+        meta = load_pointer_adapter(model, resolved_revision)
         if meta is None:
             raise
         base = parser.parse(
@@ -432,4 +443,6 @@ def get_config(
             )
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
+    # Transformers no longer retains the resolved revision on the config.
+    config._commit_hash = getattr(resolved_revision, "resolved", resolved_revision)
     return config
