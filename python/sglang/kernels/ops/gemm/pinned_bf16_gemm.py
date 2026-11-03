@@ -5,15 +5,18 @@ idle. When a GEMM runs without split-K, every output element is one fp32
 accumulator over K in ascending order followed by one rounding to BF16, so other
 split-K-free cuBLASLt algorithms of the same build often give the same bits while
 using the GPU better. ``benchmark/kernels/pinned_bf16_gemm/tune_pinned_bf16_gemm.py``
-searches them per (N, K, M) and writes the fastest one that matches torch.mm bit for
-bit into a JSON table for one GPU model and cuBLASLt version.
+searches them per (N, K, M), keeps only algorithms that accumulate K in the same
+order as torch.mm (``order_check_operands``: equal bits on inputs where any other
+order changes the BF16 result), and writes the fastest into a JSON table for one
+GPU model and cuBLASLt version.
 
 ``SGLANG_OPT_BF16_GEMM_TABLE=<table.json>`` enables the table. On the first eager
 call, a table recorded for another GPU or cuBLASLt version is ignored. The first
 eager call for each weight shape (N, K) re-checks all of that shape's entries
-bitwise against torch.mm on the real weight; an entry that differs is dropped with
-a warning. Shapes outside the table, and shapes not checked yet while a CUDA graph
-is being captured, return ``None`` and the caller keeps its own call.
+bitwise against torch.mm on the real weight with plain inputs, as a guard against
+a table from another build; an entry that differs is dropped with a warning.
+Shapes outside the table, and shapes not checked yet while a CUDA graph is being
+captured, return ``None`` and the caller keeps its own call.
 """
 
 from __future__ import annotations
@@ -38,6 +41,9 @@ _ALGO_WORDS = 8
 # One row of `enumerate_algos`: the algo words, workspace bytes, split-K count.
 _ROW_WORDS = _ALGO_WORDS + 2
 _SELF_CHECK_SEEDS = (1, 2, 3)
+# Magnitude of the cancelling product pair in `order_check_operands`: fp32 has a
+# 24-bit significand, so while a partial sum holds 2^24 it rounds every O(1) term.
+_ORDER_CHECK_PLANT = float(2**24)
 
 # A table entry as a callable (x, w, out) -> out.
 _Runner = Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
@@ -124,18 +130,49 @@ def _runner_for(entry: dict) -> Optional[_Runner]:
     return lambda x, w, out: run_algo(x, w, algo, ws, out=out)
 
 
-def _matches_torch(w: torch.Tensor, m: int, runner: _Runner) -> bool:
+def gives_torch_bits(runner: _Runner, x: torch.Tensor, w: torch.Tensor) -> bool:
+    ref = torch.mm(x, w.t())
+    return torch.equal(ref.view(torch.int16), runner(x, w, None).view(torch.int16))
+
+
+def matches_torch(w: torch.Tensor, m: int, runner: _Runner) -> bool:
+    """In-process re-check of a table entry against weight ``w`` on plain inputs."""
     for seed in _SELF_CHECK_SEEDS:
         g = torch.Generator(device=w.device)
         g.manual_seed(seed)
         x = torch.randn(
             m, w.shape[1], device=w.device, dtype=torch.bfloat16, generator=g
         )
-        ref = torch.mm(x, w.t())
-        got = runner(x, w, None)
-        if not torch.equal(ref.view(torch.int16), got.view(torch.int16)):
+        if not gives_torch_bits(runner, x, w):
             return False
     return True
+
+
+def order_check_operands(
+    m: int, n: int, k: int, device: torch.device, seed: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """BF16 x [m, k] and w [n, k] that expose any change of accumulation order.
+
+    On plain inputs a kernel that adds K in another order than torch.mm's still
+    rounds to the same BF16 in nearly every output, because the fp32 differences
+    are far below a BF16 ulp. Here every output n has a +2^24 and a -2^24 product
+    (at two random k of w's row, for every row where x has equal signs there) that
+    cancel exactly, so the result is O(sqrt(K)) while each O(1) term added between
+    the two is rounded to 2^24's fp32 ulp. Which terms fall between them depends on
+    the order, so another order changes many outputs, and the same order changes
+    none.
+    """
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+    x = torch.randint(0, 2, (m, k), device=device, generator=g).to(torch.bfloat16)
+    x = x * 2 - 1
+    w = torch.randn(n, k, device=device, generator=g).to(torch.bfloat16)
+    rows = torch.arange(n, device=device)
+    i = torch.randint(0, k, (n,), device=device, generator=g)
+    j = (i + torch.randint(1, k, (n,), device=device, generator=g)) % k
+    w[rows, i] = _ORDER_CHECK_PLANT * x[0, i]
+    w[rows, j] = -_ORDER_CHECK_PLANT * x[0, j]
+    return x, w
 
 
 def _drop_warning(n: int, k: int, m: int) -> None:
@@ -196,7 +233,7 @@ def _check_shape(w: torch.Tensor, entries: List[Tuple[int, _Runner]]) -> None:
     n, k = w.shape
     active = 0
     for m, runner in entries:
-        if _matches_torch(w, m, runner):
+        if matches_torch(w, m, runner):
             _table[(n, k, m)] = runner
             active += 1
         else:

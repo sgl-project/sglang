@@ -2,9 +2,10 @@
 
 For every (N, K) weight shape and every M, the tuner times all split-K-free
 cuBLASLt algorithms (and the heuristic's own top choices) on the packed
-problem, takes the fastest few, keeps those whose output is bitwise equal to
-torch.mm on three random inputs, and times them against torch.mm with a cold
-L2 under CUDA graph replay. An (N, K, M) entry is written when the best exact
+problem, takes the fastest few, keeps those that accumulate K in the same order
+as torch.mm (bitwise equal on ``order_check_operands``, where any other order
+changes the BF16 result), and times them against torch.mm with a cold L2
+under CUDA graph replay. An (N, K, M) entry is written when the best exact
 algorithm beats torch.mm by at least --min-speedup.
 
 Shapes are the unquantized linears of the served model after tensor-parallel
@@ -29,6 +30,8 @@ from sglang.kernels.jit.benchmark.marker import do_bench
 from sglang.kernels.ops.gemm.pinned_bf16_gemm import (
     cublaslt_version,
     enumerate_algos,
+    gives_torch_bits,
+    order_check_operands,
     run_algo,
     table_device_name,
 )
@@ -54,13 +57,8 @@ def _quick_us(fn, reps: int) -> float:
 
 def tune_one(n: int, k: int, m: int, args) -> dict:
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
-    inputs = []
-    for seed in (1, 2, 3):
-        g = torch.Generator(device="cuda")
-        g.manual_seed(seed)
-        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, generator=g)
-        inputs.append((x, torch.mm(x, w.t())))
-    x0 = inputs[0][0]
+    x0 = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    checks = [order_check_operands(m, n, k, w.device, seed) for seed in (1, 2)]
     out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
 
     rows = enumerate_algos(m, n, k, args.max_workspace_mb << 20)
@@ -77,13 +75,11 @@ def tune_one(n: int, k: int, m: int, args) -> dict:
     best = None
     num_exact = 0
     for _, algo, ws, splits in quick[: args.top]:
-        exact = all(
-            torch.equal(
-                run_algo(x, w, algo, ws).view(torch.int16), ref.view(torch.int16)
-            )
-            for x, ref in inputs
-        )
-        if not exact:
+
+        def runner(x_, w_, out_, algo=algo, ws=ws):
+            return run_algo(x_, w_, algo, ws, out=out_)
+
+        if not all(gives_torch_bits(runner, x_, w_) for x_, w_ in checks):
             continue
         num_exact += 1
         us = _bench_us(lambda x_, w_: run_algo(x_, w_, algo, ws), x0, w)
