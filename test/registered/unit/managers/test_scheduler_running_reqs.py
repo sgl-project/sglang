@@ -35,7 +35,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.scheduler_request_lists import empty_request_lists
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

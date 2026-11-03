@@ -39,7 +39,7 @@ from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import FakeReq, empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )

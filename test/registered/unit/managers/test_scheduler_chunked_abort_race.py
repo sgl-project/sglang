@@ -17,7 +17,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.scheduler_request_lists import empty_request_lists  # noqa: E402
+from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 

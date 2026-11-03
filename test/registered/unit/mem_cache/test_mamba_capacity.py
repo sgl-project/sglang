@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

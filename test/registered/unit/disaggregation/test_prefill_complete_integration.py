@@ -38,7 +38,7 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")

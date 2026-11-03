@@ -32,7 +32,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")

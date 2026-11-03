@@ -27,7 +27,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import empty_request_lists
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
