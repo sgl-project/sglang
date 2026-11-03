@@ -26,11 +26,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.configs.lfm3 import Lfm3Config
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
+from sglang.srt.configs.lfm3 import Lfm3Config
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.output import OutputTransform
