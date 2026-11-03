@@ -16,8 +16,8 @@ the raw value must be restored once replay finishes.
 
 import unittest
 from dataclasses import fields
-from unittest.mock import patch
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -85,6 +85,12 @@ def _extend_runner(raw_bs, *, keep_hidden_in_place=False):
     )
     runner.require_mlp_tp_gather = runner.require_gathered_buffer = False
     runner.keep_hidden_in_place = keep_hidden_in_place
+    runner._prepared_next_draft = runner._copy_plans = False
+    runner.in_graph_metadata_prep_done = None
+    runner.kv_reuse_guard = None
+    runner._runtime_optimization = False
+    runner._pd_reuse_needs_full_replay = False
+    runner._planned_inputs = {}
     runner.captured_req_width, runner.capture_bs = width, [1, 2]
     runner.seq_len_fill_value = 1
     runner.extend_seq_lens_cpu = [width] * 2
@@ -294,6 +300,64 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 runner.execute(forward_batch, select_index)
                 self.assertEqual(keys[0].attention_variant, label)
 
+    def test_draft_extend_shared_read_fence_and_kv_reuse(self):
+        cases = (
+            # External markers let shared reads finish before KV writes.
+            (SharedReadEnds.IN_REPLAY, True, False, True, "marker", True),
+            # Devices without external events wait until replay completes.
+            (SharedReadEnds.IN_REPLAY, False, False, True, "event", False),
+            (SharedReadEnds.PRE_REPLAY, False, False, True, "event", True),
+            # An allocator without guarded reuse cannot release the WAR fence early.
+            (SharedReadEnds.IN_REPLAY, True, True, False, "event", False),
+            (SharedReadEnds.PRE_REPLAY, False, True, False, "event", False),
+            # UNKNOWN includes a hybrid backend with an unaudited GDN child.
+            (SharedReadEnds.UNKNOWN, True, False, True, None, False),
+        )
+        for declared, marker, full_replay, guarded, published, kv_pending in cases:
+            with self.subTest(
+                declared=declared, marker=marker, full_replay=full_replay
+            ):
+                runner, forward_batch, select_index = _extend_runner(1)
+                runner._runtime_optimization = True
+                runner._pd_reuse_needs_full_replay = full_replay
+                marker_event = object() if marker else None
+                runner.in_graph_metadata_prep_done = marker_event
+                runner.model_runner.shared_read_done_event = object()
+                runner.draft_extend_attn_backend.shared_read_ends = lambda fm: declared
+                order, guards = [], []
+
+                def new_event():
+                    return SimpleNamespace(record=lambda: order.append("event"))
+
+                runner.device_module = SimpleNamespace(Event=new_event)
+                runner.kv_reuse_guard = (
+                    SimpleNamespace(set_reuse_guard_event=guards.append)
+                    if guarded
+                    else None
+                )
+                out = SimpleNamespace(
+                    next_token_logits=torch.zeros((2, 4)),
+                    hidden_states=torch.zeros((2, 2)),
+                )
+                runner._replay_graph = lambda key, fb: order.append("replay") or out
+                runner.execute(forward_batch, select_index)
+                read_done = runner.model_runner.shared_read_done_event
+                if published is None:
+                    self.assertIsNone(read_done)
+                elif published == "marker":
+                    self.assertIs(read_done, marker_event)
+                else:
+                    self.assertIsNotNone(read_done)
+                    self.assertIsNot(read_done, marker_event)
+                if guarded:
+                    self.assertEqual(len(guards), 1)
+                    self.assertEqual(guards[0] is not None, kv_pending)
+                if declared is SharedReadEnds.PRE_REPLAY and not full_replay:
+                    self.assertEqual(order, ["event", "replay", "event"])
+                elif published == "event" or kv_pending:
+                    self.assertEqual(order, ["replay", "event"])
+                else:
+                    self.assertEqual(order, ["replay"])
 
     def test_padded_replay_keeps_seq_lens_sum_consistent(self):
         # raw_bs=2 < CAPTURE_BS=4: the batch is padded with fake rows of length
@@ -347,7 +411,6 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 msg=observation.phase,
             )
         self.assertEqual(forward_batch.seq_lens_sum, sum(seq_lens))
-
 
     def test_none_seq_lens_sum_is_preserved(self):
         # seq_lens_sum may be intentionally absent; padding must keep it None

@@ -225,6 +225,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if fm == ForwardMode.EXTEND:
             return SharedReadEnds.PRE_REPLAY
+        # Only metadata prep reads req_to_token in a draft-extend graph; the
+        # model kernels consume the backend-owned page table after it.
+        if (
+            fm.is_draft_extend_v2()
+            and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+        ):
+            return SharedReadEnds.IN_REPLAY
         return super().shared_read_ends(fm)
 
     def __init__(
