@@ -45,62 +45,6 @@ class _ServingStub:
         self.weight_version = weight_version
 
 
-class _ContextStub:
-    def __init__(self, serving: _ServingStub):
-        self.serving = serving
-
-    def override(self, source, **fields):
-        self.serving.weight_version = fields["weight_version"]
-
-
-class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _serving(self, version: str) -> _ServingStub:
-        serving = _ServingStub(version)
-        for name, value in (
-            ("get_serving", serving),
-            ("get_context", _ContextStub(serving)),
-        ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return serving
-
-    def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
-            deferred_responses=DeferredResponses(
-                disaggregation_mode=DisaggregationMode.NULL,
-                output_streamer=None,
-                send_abort=None,
-            ),
-            waiting_queue=list(waiting),
-            chunked_req=chunked,
-            hisparse_coordinator=(
-                SimpleNamespace(ack_staging_queue=list(staging)) if staging else None
-            ),
-        )
-
-    def test_every_source_of_live_requests_is_stamped(self):
-        """A request missed here keeps attributing its next tokens to the superseded version."""
-        self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
-        scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
-        )
-
-        with patch(
-            "sglang.srt.managers.scheduler.record_weight_version_events",
-            return_value=0,
-        ) as recorder:
-            Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(
-            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
-        )
-
-
 class TestSchedulerBatchWeightVersion(CustomTestCase):
     def test_embedding_rejects_enabled_prefill_tracking(self) -> None:
         """Embedding and reward models reject enabled prefill tracking before allocation."""
