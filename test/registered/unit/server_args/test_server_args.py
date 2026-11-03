@@ -5619,6 +5619,14 @@ class TestRingCPEPD(unittest.TestCase):
                 )
                 self.assertEqual(args.moe_a2a_backend, backend)
 
+    def test_prefill_split_defaults_and_explicit_override(self):
+        for strategy in (None, "zigzag", "interleave"):
+            with self.subTest(strategy=strategy):
+                options = ["--cp-strategy", strategy] if strategy else []
+                args = self._ring_args(*options, world=4)
+                self._validate(args)
+                self.assertEqual(args.cp_strategy, strategy)
+
     def test_epd_multimodal_cp_keeps_supported_moe_combinations(self):
         for world in (2, 4):
             for backend in ("none", "deepep", "megamoe"):

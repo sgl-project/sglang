@@ -527,7 +527,7 @@ class AttentionBackend(ABC):
         self.residual_exchange = None
         self.prefill_cp_mode = (
             "in-seq-split"
-            if get_parallel().cp_strategy in (None, "zigzag")
+            if get_parallel().cp_strategy == "zigzag"
             else "round-robin-split"
         )
         self.kv_index_translator = runner.kv_index_translator
