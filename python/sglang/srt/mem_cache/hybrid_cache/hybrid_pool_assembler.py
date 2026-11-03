@@ -2233,6 +2233,13 @@ class _MiniMaxSparseStrategy(StackStrategy):
     def matches(self, kvcache, components):
         return self.owns(kvcache) and components == {ComponentType.FULL}
 
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_minimax_m3_nvfp4_device_pool_group,
+        )
+
+        return _build_minimax_m3_nvfp4_device_pool_group(kvcache, params, page_size)
+
     def build(
         self,
         *,
