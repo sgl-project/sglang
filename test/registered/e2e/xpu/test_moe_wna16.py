@@ -29,7 +29,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
     CompressedTensorsW8A8Fp8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+from sglang.srt.layers.quantization.fp8_utils import (
+    can_use_xpu_fp8_moe,
+    mxfp8_group_quantize,
+)
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -86,7 +89,11 @@ class TestXpuMoeWna16(CustomTestCase):
         runner_config=None,
     ):
         config = runner_config or MoeRunnerConfig()
-        activation_fn = {"silu": F.silu, "gelu": F.gelu}[config.activation]
+        activation_fn = {
+            "silu": F.silu,
+            "gelu": F.gelu,
+            "situ": lambda x: 4.0 * torch.tanh(x / 4.0) * torch.sigmoid(x),
+        }[config.activation]
         x = dispatch_output.hidden_states.float().cpu()
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         topk_weights = topk_weights.float().cpu()
@@ -492,6 +499,23 @@ class TestXpuMoeWna16(CustomTestCase):
                 method.apply(fp8_layer, dispatch_output)
                 mock_fp8_run.assert_called_once()
 
+    def test_xpu_fp8_moe_activation_support(self):
+        cases = (
+            ("silu", True, True),
+            ("gelu_tanh", True, True),
+            ("relu2", False, True),
+            ("gelu", True, False),
+            ("situ", True, False),
+            ("unsupported", True, False),
+            ("silu", False, False),
+            ("gelu_tanh", False, False),
+            ("relu2", True, False),
+        )
+        for activation, is_gated, expected in cases:
+            with self.subTest(activation=activation, is_gated=is_gated):
+                config = MoeRunnerConfig(activation=activation, is_gated=is_gated)
+                self.assertEqual(can_use_xpu_fp8_moe(config, None), expected)
+
     def test_compressed_tensors_runner_config_fallback(self):
         from sgl_kernel import fused_experts
 
@@ -502,6 +526,7 @@ class TestXpuMoeWna16(CustomTestCase):
             MoeRunnerConfig(inplace=False, apply_router_weight_on_input=True),
             MoeRunnerConfig(inplace=False, no_combine=True),
             MoeRunnerConfig(inplace=False, activation="gelu"),
+            MoeRunnerConfig(inplace=False, activation="situ"),
         )
         for config in configs:
             with self.subTest(

@@ -235,6 +235,7 @@ def get_default_config(
                         "num_stages": 2 if _is_hip else 4,
                     }
         else:
+            # Block-wise quant: BLOCK_SIZE_K must be divisible by block_shape[1]
             # XPU dot requires at least 16 columns, even for one-row MXFP8 groups.
             config = {
                 "BLOCK_SIZE_M": 64,

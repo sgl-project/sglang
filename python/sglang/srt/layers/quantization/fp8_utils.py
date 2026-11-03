@@ -814,7 +814,8 @@ def can_use_xpu_fp8_moe(
         (use_mxfp8 or weight_block_size in (None, [128, 128]))
         and not config.apply_router_weight_on_input
         and not config.no_combine
-        and config.activation != "gelu"
+        and (config.activation, config.is_gated)
+        in (("silu", True), ("gelu_tanh", True), ("relu2", False))
     )
 
 

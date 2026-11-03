@@ -168,6 +168,7 @@ block-FP8 passes `[128, 128]` instead.
 The native path supports gated SiLU, gated tanh-approximated GELU
 (`gelu_tanh`), non-gated squared ReLU, GPT-OSS SwiGLU, and DeepSeek-V4
 SwiGLU with limit 10. Expert biases and routed scaling are supported.
+Other activation/gating combinations use Triton, subject to its own support.
 
 For ordinary FP8, per-channel scales, other block shapes, input-side router
 weighting, uncombined expert outputs, and exact GELU use the existing Triton
