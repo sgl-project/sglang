@@ -544,9 +544,10 @@ class GroupCoordinator:
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
-            self.torch_symm_mem_comm = TorchSymmMemCommunicator(
+            self.torch_symm_mem_comm = TorchSymmMemCommunicator.get(
                 group=self.cpu_group,
                 device=self.device,
+                enable_all_reduce=True,
             )
 
         # Create communicator for other hardware backends
