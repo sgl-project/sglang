@@ -2039,6 +2039,11 @@ class Scheduler(
             self.uocr_runtime.close()
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        engram_config = get_exec().offload.engram_config
+        if engram_config is not None and engram_config.placement == "external":
+            from sglang.srt.engram_share.vmm.external import close_attached_tables
+
+            close_attached_tables()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
