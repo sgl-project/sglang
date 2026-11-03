@@ -11,10 +11,10 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt.utils.common import get_device_core_count
+from sglang.srt.utils.common import ceil_div, get_device_core_count
 
-# quack-kernels 0.6.4 launches SM120 GEMMs with programmatic dependent launch but
-# never waits on the prior grid (0.6.5 adds the wait); drop once quack >= 0.6.5.
+# quack 0.6.4's SM120 GEMM launches with PDL but never waits on the prior grid, so it
+# may read its input early; fixed in 0.6.5 (Dao-AILab/quack@60d8808), drop then.
 _POST_INIT_ATTRS = (("use_pdl", False),)
 # quack 0.6.4's SM120 cooperative tile widths, widest first so ties keep it.
 _TILE_N_CHOICES = (192, 160, 128)
@@ -39,7 +39,7 @@ def _tile_shape(m: int, n: int, num_sms: int) -> tuple[int, int]:
     # Least wave-quantized work per SM; ties keep the taller, then wider tile.
     # 64-row tiles only within one wave; measured slower past it (Qwen3-0.6B, SM120).
     def num_tiles(tile_m: int, tile_n: int) -> int:
-        return -(-m // tile_m) * -(-n // tile_n)
+        return ceil_div(m, tile_m) * ceil_div(n, tile_n)
 
     shapes = [(128, tile_n) for tile_n in _TILE_N_CHOICES]
     shapes += [
@@ -47,7 +47,7 @@ def _tile_shape(m: int, n: int, num_sms: int) -> tuple[int, int]:
     ]
 
     def work_per_sm(shape: tuple[int, int]) -> int:
-        return -(-num_tiles(*shape) // num_sms) * shape[0] * shape[1]
+        return ceil_div(num_tiles(*shape), num_sms) * shape[0] * shape[1]
 
     return min(shapes, key=work_per_sm)
 

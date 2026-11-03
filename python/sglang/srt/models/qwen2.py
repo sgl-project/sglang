@@ -114,7 +114,9 @@ class Qwen2MLP(nn.Module):
             envs.SGLANG_ENABLE_QUACK_SWIGLU_GEMM.get()
             and get_platform().is_sm120
             and quant_config is None
+            # Batch invariance overrides aten::mm, which the fused GEMM never calls.
             and not deterministic.enable_deterministic_inference
+            # On-policy RL must match the trainer's unfused bf16 SwiGLU bit for bit.
             and deterministic.rl_on_policy_target is None
         )
 
