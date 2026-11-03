@@ -13,7 +13,7 @@ HEADS, HEAD_DIM = 4, 8
 
 
 class TestFlashAttnSingleSequence(unittest.TestCase):
-    def _run(self, bounds, *, padding=True, max_seqlen=None):
+    def _run(self, bounds, *, padding=True, max_seqlen=None, writes_out=True):
         total = bounds[-1]
         q, k, v = (torch.randn(total, HEADS, HEAD_DIM) for _ in range(3))
         impl = SimpleNamespace(
@@ -26,9 +26,9 @@ class TestFlashAttnSingleSequence(unittest.TestCase):
 
         def fake(q, k, v, *, cu_seqlens_q, out=None, **kwargs):
             calls.append((tuple(q.shape), cu_seqlens_q, kwargs))
-            if out is None:
+            if out is None or not writes_out:
                 return torch.ones_like(q)
-            out.fill_(1)
+            return out.fill_(1)
 
         with (
             patch.object(flash_attn, "fa_ver", 3),
@@ -56,6 +56,13 @@ class TestFlashAttnSingleSequence(unittest.TestCase):
         output, [(shape, cu, kwargs)] = self._run((0, 10, 16))
         self.assertEqual(shape, (1, 10, HEADS, HEAD_DIM))
         self.assertIsNone(cu)
+        self.assertTrue((output[:10] == 1).all())
+        self.assertTrue((output[10:] == 0).all())
+
+    def test_fallback_that_ignores_out_still_fills_the_live_rows(self):
+        """A kernel that returns a fresh tensor instead of writing `out` must
+        not leave the live rows uninitialized."""
+        output, _ = self._run((0, 10, 16), writes_out=False)
         self.assertTrue((output[:10] == 1).all())
         self.assertTrue((output[10:] == 0).all())
 

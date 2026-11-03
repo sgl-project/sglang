@@ -624,7 +624,7 @@ class FlashAttentionImpl(AttentionImpl):
             # skip-softmax path leaves them; no live row attends to them.
             output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
             output[used:].zero_()
-            flash_attn_varlen_func(
+            live = flash_attn_varlen_func(
                 query[None, :used],
                 key[None, :used],
                 value[None, :used],
@@ -637,6 +637,11 @@ class FlashAttentionImpl(AttentionImpl):
                 ver=fa_ver,
                 out=output[None, :used],
             )
+            # The FA2 fallback (no sgl-kernel FA3, e.g. CUDA < 12.3) ignores
+            # `out` and returns a fresh tensor.
+            live = live[0] if isinstance(live, tuple) else live
+            if live.data_ptr() != output.data_ptr():
+                output[:used] = live[0]
             return output
         output = flash_attn_varlen_func(
             query,
