@@ -598,6 +598,10 @@ def fused_moe_kernel(
                     a_scale, b_scale = b_scale, a_scale
                 if BLOCK_SIZE_N > group_n:
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                elif swap_ab:
+                    # After the swap, a_scale is the scalar weight block scale
+                    # and b_scale contains per-token scales along the last axis.
+                    accumulator += tl.dot(a, b) * (a_scale * b_scale[None, :])
                 else:
                     accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
             else:
@@ -894,7 +898,7 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
-            padded_size = padding_size
+            padded_size = 0 if _use_aiter else padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
             A, A_scale = scaled_fp8_quant(
                 A, A_scale, use_per_token_if_dynamic=per_channel_quant
