@@ -129,6 +129,7 @@ class PrefillStats:
     log_device_hit_tokens: int = 0
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
+    log_state_miss_tokens: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
 
@@ -149,6 +150,7 @@ class PrefillStats:
             log_device_hit_tokens=adder.log_device_hit_tokens,
             log_host_hit_tokens=adder.log_host_hit_tokens,
             log_storage_hit_tokens=adder.log_storage_hit_tokens,
+            log_state_miss_tokens=adder.log_state_miss_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -841,6 +843,7 @@ class SchedulerMetricsReporter:
                 device_hit_tokens=prefill_stats.log_device_hit_tokens,
                 host_hit_tokens=prefill_stats.log_host_hit_tokens,
                 storage_hit_tokens=prefill_stats.log_storage_hit_tokens,
+                state_miss_tokens=prefill_stats.log_state_miss_tokens,
             )
 
             # Basics
