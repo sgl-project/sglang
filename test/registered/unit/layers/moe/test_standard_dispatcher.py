@@ -6,9 +6,11 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.moe.topk as topk_module
+from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.base import prebuild_dispatchers
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
@@ -26,6 +28,104 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0, runner_backend=None):
+    dispatcher = object.__new__(StandardDispatcher)
+    dispatcher.moe_ep_size = 2
+    dispatcher.moe_ep_rank = moe_ep_rank
+    dispatcher.num_experts = 8 + num_shared
+    dispatcher.num_local_shared_experts = num_shared
+    dispatcher.num_local_routed_experts = 4
+    dispatcher.num_local_experts = 4 + num_shared
+    dispatcher.skip_local_expert_mapping = False
+    dispatcher.runner_backend = runner_backend
+    dispatcher.use_aiter_moe_runner = False
+    dispatcher.local_expert_mapping = None
+    dispatcher.expert_mask_gpu = None
+    return dispatcher
+
+
+class TestStandardDispatcherPrebuild(CustomTestCase):
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.standard.get_device",
+                return_value="cpu",
+            )
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.standard."
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+
+    def test_prebuilt_mapping_matches_the_first_dispatch(self):
+        """A mapping built before graph capture must equal the one the first EP
+        dispatch builds, and a later dispatch or prebuild must keep it, so a
+        captured dispatch never records the mapping's fill (EP2 garbage routing)."""
+        topk_ids = torch.tensor([[0, 5], [8, 3]], dtype=torch.int32)
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones_like(topk_ids, dtype=torch.float32),
+            topk_ids=topk_ids,
+            router_logits=None,
+        )
+        for rank in (0, 1):
+            with self.subTest(moe_ep_rank=rank):
+                lazy = _ep_dispatcher(moe_ep_rank=rank, num_shared=1)
+                lazy.dispatch(torch.ones((2, 4)), topk_output)
+                eager = _ep_dispatcher(moe_ep_rank=rank, num_shared=1)
+                self.assertTrue(eager.prebuild_pending)
+                eager.prebuild()
+                self.assertFalse(eager.prebuild_pending)
+                self.assertTrue(
+                    torch.equal(eager.local_expert_mapping, lazy.local_expert_mapping)
+                )
+                mapping = eager.local_expert_mapping
+                eager.prebuild()
+                out = eager.dispatch(torch.ones((2, 4)), topk_output)
+                self.assertIs(eager.local_expert_mapping, mapping)
+                local = mapping[topk_ids.long()]
+                self.assertTrue(torch.equal(out.topk_output.topk_ids, local))
+
+    def test_layouts_without_the_mapping_stay_unbuilt(self):
+        """Layouts whose dispatch never builds the mapping must not get one,
+        since a set mapping changes how dispatch routes."""
+        cases = {
+            "ep1": dict(moe_ep_size=1),
+            "global_ids": dict(skip_local_expert_mapping=True),
+        }
+        for name, fields in cases.items():
+            with self.subTest(case=name):
+                dispatcher = _ep_dispatcher(moe_ep_rank=0)
+                for field, value in fields.items():
+                    setattr(dispatcher, field, value)
+                self.assertFalse(dispatcher.prebuild_pending)
+                dispatcher.prebuild()
+                self.assertIsNone(dispatcher.local_expert_mapping)
+
+    def test_model_walk_prebuilds_every_dispatcher(self):
+        """Every dispatcher a module holds must be prebuilt, whatever the
+        attribute is named, including the two-batch-overlap wrapper's inners."""
+        plain = _ep_dispatcher(moe_ep_rank=0)
+        inners = [_ep_dispatcher(moe_ep_rank=1), _ep_dispatcher(moe_ep_rank=1)]
+        wrapper = object.__new__(MaybeTboDeepEPDispatcher)
+        wrapper._inners = inners
+        model = torch.nn.Module()
+        model.moe = torch.nn.Module()
+        model.moe.dispatcher = plain
+        model.custom = torch.nn.Module()
+        model.custom.deepep_dispatcher = wrapper
+        # A LoRA wrapper shares its base layer's dispatcher.
+        model.lora = torch.nn.Module()
+        model.lora.dispatcher = plain
+
+        self.assertEqual(prebuild_dispatchers(model), 2)
+        for dispatcher in [plain, *inners]:
+            self.assertIsNotNone(dispatcher.local_expert_mapping)
+        self.assertEqual(prebuild_dispatchers(model), 0)
 
 
 class TestLayerRunnerDispatch(CustomTestCase):
