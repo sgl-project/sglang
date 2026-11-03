@@ -60,6 +60,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     prepare_for_draft,
     prepare_for_draft_extend,
@@ -1092,6 +1093,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=self.topk == 1
+        )
 
     @property
     def last_shared_read_runner(self):

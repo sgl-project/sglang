@@ -167,7 +167,9 @@ def _eager(batch, verify_input, logits, sim_rng):
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
         batch,
-        SimpleNamespace(next_token_logits=logits.clone()),
+        SimpleNamespace(
+            next_token_logits=logits.clone(), next_token_logits_vocab_shard=None
+        ),
         simulated_acc_len_rng=sim_rng,
     )
     new_seq_lens, bonus_tokens, _, _ = prepare_verify_commit_outputs(
@@ -218,7 +220,10 @@ class TestPostVerifyGraphs(CustomTestCase):
             )
             target_worker = SimpleNamespace(
                 forward_batch_generation=lambda **_: SimpleNamespace(
-                    logits_output=SimpleNamespace(next_token_logits=torch.zeros(7, 8))
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros(7, 8),
+                        next_token_logits_vocab_shard=None,
+                    )
                 ),
                 model_runner=SimpleNamespace(
                     watermark_state=None,
@@ -264,7 +269,10 @@ class TestPostVerifyGraphs(CustomTestCase):
             target_worker=_target_worker(),
             simulated_acc_len_rng=simulated_acc_len_generator(0),
         )
-        logits_output = SimpleNamespace(next_token_logits=torch.zeros((7, 8)))
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros((7, 8)),
+            next_token_logits_vocab_shard=None,
+        )
 
         def key(can_run_cuda_graph=True, topk=1, **changes):
             info = dict(
@@ -278,7 +286,11 @@ class TestPostVerifyGraphs(CustomTestCase):
                 need_top_k_sampling=True,
                 need_top_p_sampling=True,
             )
-            fields = dict(has_grammar=False, hisparse_coordinator=None)
+            fields = dict(
+                has_grammar=False,
+                hisparse_coordinator=None,
+                return_logprob=False,
+            )
             for name, value in changes.items():
                 (info if name in info else fields)[name] = value
             batch = SimpleNamespace(
@@ -411,16 +423,30 @@ class TestPostVerifyGraphs(CustomTestCase):
             mamba_track_indices=None,
             has_grammar=False,
             hisparse_coordinator=None,
+            return_logprob=False,
         )
         verify_input = SimpleNamespace(
             topk=1, draft_probs=None, draft_token_num=7, max_tree_depth=7
         )
-        logits = SimpleNamespace(next_token_logits=torch.zeros((7, 8)))
+        logits = SimpleNamespace(
+            next_token_logits=torch.zeros((7, 8)),
+            next_token_logits_vocab_shard=None,
+        )
         keys = {
             graphs._key(verify_batch, verify_input, logits, True, max_top_k)
             for max_top_k in (20, None)
         }
         self.assertEqual(len(keys), 2)
+
+        # a per-batch logits format: shards reuse the full logits' storage
+        shards = SimpleNamespace(
+            next_token_logits=logits.next_token_logits,
+            next_token_logits_vocab_shard=object(),
+        )
+        self.assertNotEqual(
+            graphs._key(verify_batch, verify_input, logits, True, 20),
+            graphs._key(verify_batch, verify_input, shards, True, 20),
+        )
 
     def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
         """With SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST a sampled verify result goes to
@@ -513,7 +539,10 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     got = graphs.run(
                         batch=batch,
                         verify_input=verify_input,
-                        logits_output=SimpleNamespace(next_token_logits=logits_buf),
+                        logits_output=SimpleNamespace(
+                            next_token_logits=logits_buf,
+                            next_token_logits_vocab_shard=None,
+                        ),
                         can_run_cuda_graph=graphed,
                     )
                     graphs.join()

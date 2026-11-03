@@ -46,6 +46,45 @@ from sglang.srt.utils.common import is_npu
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 
+
+_SHARDED_VERIFY_TARGET_MODEL_CLASSES = frozenset(
+    {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+
+
+def bind_eagle_runtime_hooks(
+    target_worker: Any,
+    *,
+    supports_sharded_verify: bool,
+) -> None:
+    """Bind once after target initialization and before any EAGLE graph capture."""
+    model = getattr(target_worker.model_runner, "model", None)
+    if model is None:
+        return
+    from sglang.srt.layers.logits_processor import LogitsProcessor
+
+    processors = [
+        module for module in model.modules() if isinstance(module, LogitsProcessor)
+    ]
+    if (
+        supports_sharded_verify
+        and type(model).__name__ in _SHARDED_VERIFY_TARGET_MODEL_CLASSES
+        and len(processors) == 1
+    ):
+        # Only callers whose post-verify consumer understands the shard marker
+        # and validated outer target models opt in. Exact class-name matching
+        # deliberately excludes MTP draft models and unvalidated subclasses.
+        enable = getattr(processors[0], "enable_sharded_verify", None)
+        if callable(enable):
+            # Without a binding key policy only native greedy keys exist.
+            enable(temperature_keys=False)
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
