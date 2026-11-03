@@ -1575,7 +1575,7 @@ class Scheduler(
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
         self.disagg_prefill_transfer_queue = _RequestList(
-            ListKind.PD_SENDING, abort=self.abort_disagg_prefill_transfer_reqs
+            ListKind.PD_SENDING, abort=self._abort_prefill_transfer
         )
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None

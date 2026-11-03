@@ -6,7 +6,7 @@ Test Coverage:
 - process_req_with_grammar: dispatch by constraint type (json, regex, ebnf,
   structural_tag), no-constraint requests, no-backend error, cache hits,
   cached invalid grammar abort
-- abort_requests: single abort, abort all, future cancellation
+- abort: single abort, abort all, future cancellation
 - get_ready_grammar_requests: future completion, invalid grammar handling,
   timeout with max poll iterations, aborted request handling, queue cleanup
 
@@ -469,7 +469,7 @@ class TestAbortRequests(unittest.TestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    """Test abort_requests handling."""
+    """Test grammar queue abort handling."""
 
     def _make_mgr_with_queue(self):
         scheduler = _make_scheduler()
@@ -491,7 +491,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.abort_all = False
         abort_req.rid = "req-123"
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         future.cancel.assert_called_once()
         req.set_finish_with_abort.assert_called_once()
 
@@ -505,7 +505,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.abort_all = False
         abort_req.rid = "req-123"
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         req.set_finish_with_abort.assert_not_called()
 
     def test_abort_all(self):
@@ -521,7 +521,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.abort_all = True
         abort_req.rid = ""
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         for req in reqs:
             req.set_finish_with_abort.assert_called_once()
 
@@ -531,7 +531,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req = MagicMock()
         abort_req.abort_all = True
         abort_req.rid = ""
-        mgr.abort_requests(abort_req)  # Should not raise
+        mgr.grammar_queue.abort(abort_req)  # Should not raise
 
     def test_abort_prefix_match(self):
         """rid.startswith means prefix matching, not exact matching."""
@@ -544,7 +544,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.abort_all = False
         abort_req.rid = "req-123"
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         req.set_finish_with_abort.assert_called_once()
 
 

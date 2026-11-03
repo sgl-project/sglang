@@ -36,7 +36,7 @@ class GrammarManager:
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
         self.server_args = scheduler.server_args
-        self.grammar_queue = _RequestList(ListKind.GRAMMAR, abort=self.abort_requests)
+        self.grammar_queue = _RequestList(ListKind.GRAMMAR, abort=self._abort)
         if not get_serving().skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
                 self.server_args,
@@ -115,7 +115,7 @@ class GrammarManager:
             )
         return data
 
-    def abort_requests(self, recv_req: AbortReq):
+    def _abort(self, recv_req: AbortReq) -> None:
         # Abort method 2: call `set_finish_with_abort`
         # The request will still run one prefill forward pass.
         # In this case, we change the input_ids to be only one token to make this prefill cheap.

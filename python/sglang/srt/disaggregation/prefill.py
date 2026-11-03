@@ -213,7 +213,7 @@ class PrefillBootstrapQueue:
         self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
-        self.queue = _RequestList(ListKind.PD_BOOTSTRAP, abort=self.abort_requests)
+        self.queue = _RequestList(ListKind.PD_BOOTSTRAP, abort=self._abort)
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         # Each rank owns a subset of logical KV pages, so capacity widens by N.
@@ -481,7 +481,7 @@ class PrefillBootstrapQueue:
         for req in reqs:
             self.add(req, num_kv_heads)
 
-    def abort_requests(self, recv_req: AbortReq) -> None:
+    def _abort(self, recv_req: AbortReq) -> None:
         # Abort requests that have not yet been bootstrapped
         for req in self.queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
@@ -1218,7 +1218,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self.maybe_send_health_check_signal()
 
-    def abort_disagg_prefill_transfer_reqs(self: Scheduler, recv_req: AbortReq) -> None:
+    def _abort_prefill_transfer(self: Scheduler, recv_req: AbortReq) -> None:
         # Abort in-flight requests
         for req in self.disagg_prefill_transfer_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
