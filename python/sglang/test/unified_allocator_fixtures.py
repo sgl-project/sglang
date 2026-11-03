@@ -9,25 +9,59 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.chain import ChainRoles
+from sglang.srt.mem_cache.kv.alloc.pricing import (
+    ChainSnapshot,
+    FloatChain,
+    TokenEnds,
+    snapshot_chain,
+)
+from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
+from sglang.srt.mem_cache.kv.decl import (
+    MHAGeometry,
+    MLAGeometry,
+    StateGeometry,
+    kv_layer_decls,
+)
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.memory.arena import ArenaBand, KVArena
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    MLASubPoolSpec,
-    UnifiedKVPool,
-    UnifiedMHATokenToKVPool,
-    UnifiedPoolBundle,
-    UnifiedSWAKVPool,
-    init_unified_mamba_pools,
-    init_unified_mamba_swa_pools,
-    init_unified_swa_pools,
-)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.tree_slots import tree_slots_of
+
+
+def chain_snapshot(allocator) -> ChainSnapshot:
+    """A unified chain allocator's band snapshot, as its pricing reads it."""
+    return snapshot_chain(
+        allocator.bands,
+        page_size=allocator.page_size,
+        total_bytes=allocator.arena.total_bytes,
+    )
+
+
+def token_ends(allocator) -> TokenEnds:
+    """The pricing constants of a chain of two token ends."""
+    return allocator._policy._ends(allocator)
+
+
+def float_chain(allocator) -> FloatChain:
+    """The roles of a chain whose window floats between two ends."""
+    roles = allocator.roles
+    return FloatChain(owner=roles.owner, window=roles.window, state=roles.state)
+
+
+def pin_every_band(allocator, busy) -> None:
+    """Register ``busy`` as a pin source over every band of a chain allocator,
+    as PD and HiCache register theirs over every sub-pool."""
+    allocator.add_pin_source(tuple(m.sub_pool_name for m in allocator.members), busy)
 
 
 def setup_allocator_context():
@@ -41,7 +75,7 @@ def setup_allocator_context():
 def build_swa_pool(*, page_size=1, lazy=True, ratio=(1, 1), total_bytes=None):
     """Full + SWA composite over real CPU pools, 100 pages per side."""
     full_layers, swa_layers = ratio
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -74,7 +108,7 @@ def build_tri_pool(*, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8)):
         dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
         layers=[0],
     )
-    bundle = init_unified_mamba_swa_pools(
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -110,10 +144,18 @@ def build_tri_pool(*, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8)):
 class FakeKVCache:
     """buf[p] == virtual id stored at physical slot p (-1 free); moves copy it."""
 
-    def __init__(self, max_slots: int):
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+    def __init__(self, source, name=None):
+        # A bare size for a pool no arena moves; else the band of ``source``
+        # (a test arena) whose unit moves this buffer follows.
+        if name is None:
+            size = source
+        else:
+            size = source.num_entries(name)
+            source.follow(name, self)
+        # buf[p] == virtual id currently stored at physical slot p (-1 if free).
+        self.buf = torch.full((size,), -1, dtype=torch.int64)
 
-    def move_physical_pages(
+    def move_units(
         self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
     ):
         slots = torch.arange(page_size, device=dst_pages.device)
@@ -124,22 +166,107 @@ class FakeKVCache:
 
 class FakeUnifiedSWAKVPool:
     class _SubKV(FakeKVCache):
-        def __init__(self, max_slots):
-            super().__init__(max_slots)
+        def __init__(self, arena, name):
+            super().__init__(arena, name)
             self.allocator = None
 
         def attach_allocator(self, allocator):
             self.allocator = allocator
 
-    def __init__(self, shared_pool: UnifiedKVPool):
-        self.full_kv_pool = self._SubKV(shared_pool.max_slots("full"))
-        self.swa_kv_pool = self._SubKV(shared_pool.max_slots("swa"))
-        self._full_allocator = None
-        self._swa_allocator = None
+    def __init__(self, arena: KVArena):
+        self.full_kv_pool = self._SubKV(arena, "full")
+        self.swa_kv_pool = self._SubKV(arena, "swa")
 
-    def attach_allocators(self, *, full_allocator, swa_allocator):
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
+
+class SpecArena(KVArena):
+    """A test's arena that also remembers the specs it was laid out from."""
+
+    def __init__(self, specs, **kwargs):
+        super().__init__(**kwargs)
+        self._specs = {s.name: s for s in specs}
+        self._followers: Dict[str, list] = {}
+
+    def spec(self, name: str):
+        return self._specs[name]
+
+    def follow(self, name: str, fake) -> None:
+        """Let a fake view's payload follow this band's unit moves."""
+        self._followers.setdefault(name, []).append(fake)
+
+    def move_units(self, name, dst, src) -> None:
+        super().move_units(name, dst, src)
+        for fake in self._followers.get(name, ()):
+            fake.move_units(dst, src, self.band(name).unit_entries)
+
+
+def arena_of(
+    sub_pool_specs,
+    *,
+    total_bytes: int,
+    device,
+    page_size: int = 1,
+    enable_memory_saver: bool = False,
+    post_capture_active: bool = False,
+    fused_draft: Optional[FusedDraftPlacement] = None,
+) -> SpecArena:
+    """An arena over hand-built sub-pool specs, as a plan of them lays it out:
+    a state sub-pool's unit is one entry, every other one's a page."""
+    for s in sub_pool_specs:
+        expected = None if fused_draft is None else fused_draft.region(s.name)
+        assert s.draft_region is expected, (
+            f"sub-pool {s.name!r}: draft_region {s.draft_region} does not match "
+            f"the fused draft placement's {expected}"
+        )
+    bands = [
+        ArenaBand(
+            name=s.name,
+            entry_bytes=s.entry_bytes(),
+            unit_entries=1 if isinstance(s, MambaSubPoolSpec) else page_size,
+            grow_direction=s.grow_direction,
+            zero_on_handout=s.zero_units_on_handout,
+        )
+        for s in sub_pool_specs
+    ]
+    return SpecArena(
+        sub_pool_specs,
+        bands=bands,
+        total_bytes=total_bytes,
+        sink_bytes=max(b.unit_bytes for b in bands),
+        device=device,
+        enable_memory_saver=enable_memory_saver,
+        backed_after_capture=post_capture_active,
+    )
+
+
+def storage_parts(storage) -> SimpleNamespace:
+    """A built KV storage's parts, under the names the runtime holds them by."""
+    allocator = storage.allocator
+    return SimpleNamespace(
+        storage=storage,
+        token_to_kv_pool_allocator=allocator,
+        token_to_kv_pool=allocator.get_kvcache(),
+        arena=allocator.arena,
+        req_to_token_pool=storage.requests,
+    )
+
+
+def plan_stand_in(arena: SpecArena, fused_draft=None) -> SimpleNamespace:
+    """What draft binding reads of a plan, over a test arena's specs."""
+    return SimpleNamespace(
+        fused_draft=fused_draft,
+        sub_pool=lambda name: SimpleNamespace(spec=arena.spec(name)),
+    )
+
+
+def stand_in_views(roles: ChainRoles, kvcache, state=None) -> Dict[str, object]:
+    """The sub-pool views a test's stand-in KV pool holds, by sub-pool name:
+    what `ChainAllocator` takes as `views`."""
+    views = {roles.owner: kvcache.full_kv_pool}
+    if roles.window is not None:
+        views[roles.window] = kvcache.swa_kv_pool
+    if roles.state is not None:
+        views[roles.state] = state
+    return views
 
 
 def tri_sub_pool_specs(
@@ -200,7 +327,10 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA),
+                window=128 * page_size if window is None else window,
+            ),
         )
     )
     slots = allocator.alloc(occupancy * page_size)
@@ -234,10 +364,13 @@ def build_tri_cache(
             token_to_kv_pool_allocator=a,
             page_size=page_size,
             sliding_window_size=128 * page_size,
-            tree_components=(
-                (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
-                if state_cache
-                else (ComponentType.FULL, ComponentType.SWA)
+            tree_slots=tree_slots_of(
+                (
+                    (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+                    if state_cache
+                    else (ComponentType.FULL, ComponentType.SWA)
+                ),
+                window=128 * page_size,
             ),
             enable_session_radix_cache=sessions,
         )
@@ -246,12 +379,12 @@ def build_tri_cache(
 
 
 class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
-    """A small test model for the unified pool factories.
+    """A small test model for the unified pool builder.
 
-    ``chain`` picks the factory: "swa" (full + window), "mamba" (full + state)
-    or "tri" (full + window + state). ``byte_budget`` is the factory's byte
-    budget: the whole buffer for "swa", the token side for the state chains
-    (their state slots ride on top); without it the token capacities size it.
+    ``chain`` names its kinds: "swa" (full + window), "mamba" (full + state) or
+    "tri" (full + window + state); the layer ids given per kind must match.
+    ``byte_budget`` is the token side's byte budget (state slots ride on top);
+    without it the token capacities size the buffer.
     """
 
     chain: str
@@ -307,75 +440,201 @@ def _state_cache_params(geometry: UnifiedGeometry) -> SimpleNamespace:
     )
 
 
+def build_test_unified_pools(
+    *,
+    device,
+    kv_cache_dtype,
+    page_size,
+    start_layer,
+    end_layer,
+    full_attention_layer_ids,
+    head_num,
+    head_dim,
+    v_head_dim=None,
+    use_mla_backend=False,
+    kv_lora_rank=None,
+    qk_rope_head_dim=None,
+    swa_attention_layer_ids=(),
+    swa_head_num=None,
+    swa_head_dim=None,
+    swa_v_head_dim=None,
+    sliding_window_size=None,
+    mamba_layer_ids=(),
+    mamba2_cache_params=None,
+    max_mamba_cache_size=0,
+    full_max_total_num_tokens=None,
+    max_total_num_tokens=None,
+    swa_max_total_num_tokens=None,
+    total_bytes=None,
+    unified_total_bytes=None,
+    model_context_len=None,
+    extra_max_context_len=0,
+    max_num_reqs=0,
+    enable_memory_saver=False,
+    post_capture_active=False,
+    need_sort=False,
+    forward_stream=None,
+    lazy_compaction=False,
+    is_draft_worker=False,
+    enable_mamba_extra_buffer=False,
+    enable_mamba_extra_buffer_lazy=False,
+    speculative_num_draft_tokens=None,
+    disable_overlap_schedule=True,
+    decode_pre_alloc_size=0,
+    mamba_full_memory_ratio=None,
+    fused_draft=None,
+):
+    """Build a unified pool stack from flat model arguments: the layer ids given
+    for each kind (full, sliding-window, state) decide the sub-pools."""
+    if use_mla_backend:
+        full_geometry = MLAGeometry(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    else:
+        full_geometry = MHAGeometry(
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim if v_head_dim is not None else head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    window_geometry = None
+    if swa_attention_layer_ids:
+        window_geometry = MHAGeometry(
+            head_num=swa_head_num,
+            head_dim=swa_head_dim,
+            v_head_dim=swa_v_head_dim if swa_v_head_dim is not None else swa_head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    decls = kv_layer_decls(
+        full_layer_ids=full_attention_layer_ids,
+        full_geometry=full_geometry,
+        window_layer_ids=swa_attention_layer_ids,
+        window_geometry=window_geometry,
+        window=sliding_window_size,
+        state_layer_ids=mamba_layer_ids,
+        state_geometry=(
+            StateGeometry.of(mamba2_cache_params) if mamba_layer_ids else None
+        ),
+    )
+    sizing = KVSizingInputs(
+        token_budget_bytes=total_bytes
+        if total_bytes is not None
+        else unified_total_bytes,
+        full_tokens=(
+            full_max_total_num_tokens
+            if full_max_total_num_tokens is not None
+            else max_total_num_tokens
+        ),
+        window_tokens=swa_max_total_num_tokens,
+        state_slots=max_mamba_cache_size,
+        context_len=model_context_len,
+        floor_window=sliding_window_size,
+    )
+    ctx = UnifiedBuildContext(
+        device=device,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        enable_memory_saver=enable_memory_saver,
+        need_sort=need_sort,
+        lazy_compaction=lazy_compaction,
+        forward_stream=forward_stream,
+        post_capture_active=post_capture_active,
+        is_draft_worker=is_draft_worker,
+        head_num=head_num,
+        head_dim=head_dim,
+        max_num_reqs=max_num_reqs,
+        model_context_len=model_context_len or 0,
+        extra_max_context_len=extra_max_context_len,
+        state_cache_params=mamba2_cache_params,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        disable_overlap_schedule=disable_overlap_schedule,
+        decode_pre_alloc_size=decode_pre_alloc_size,
+        mamba_full_memory_ratio=mamba_full_memory_ratio,
+    )
+    return storage_parts(
+        build_unified_pools(
+            decls=decls,
+            page_size=page_size,
+            sizing=sizing,
+            ctx=ctx,
+            fused_draft=fused_draft,
+        )
+    )
+
+
 def build_unified_bundle(geometry: UnifiedGeometry):
-    """Build the unified pool stack a geometry describes, through the factory
-    production uses for that chain."""
+    """Build the unified pool stack a geometry describes, through the
+    declarations, plan, sizing and builder production uses."""
     g = geometry
     layer_ids = g.full_layer_ids + g.swa_layer_ids + g.state_layer_ids
-    common = dict(
+    if g.mla:
+        full_geometry = MLAGeometry(
+            kv_lora_rank=g.kv_lora_rank,
+            qk_rope_head_dim=g.qk_rope_head_dim,
+            kv_cache_dtype=g.kv_cache_dtype,
+        )
+    else:
+        full_geometry = MHAGeometry(
+            head_num=g.head_num,
+            head_dim=g.head_dim,
+            v_head_dim=g.v_head_dim if g.v_head_dim is not None else g.head_dim,
+            kv_cache_dtype=g.kv_cache_dtype,
+        )
+    cache_params = _state_cache_params(g) if g.state_layer_ids else None
+    decls = kv_layer_decls(
+        full_layer_ids=g.full_layer_ids,
+        full_geometry=full_geometry,
+        window_layer_ids=g.swa_layer_ids,
+        window_geometry=MHAGeometry(
+            head_num=g.swa_head_num,
+            head_dim=g.swa_head_dim,
+            v_head_dim=(
+                g.swa_v_head_dim if g.swa_v_head_dim is not None else g.swa_head_dim
+            ),
+            kv_cache_dtype=g.kv_cache_dtype,
+        ),
+        window=g.window,
+        state_layer_ids=g.state_layer_ids,
+        state_geometry=(
+            StateGeometry.of(cache_params) if cache_params is not None else None
+        ),
+    )
+    by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
+    sizing = KVSizingInputs(
+        token_budget_bytes=g.byte_budget,
+        full_tokens=g.full_tokens if by_tokens else None,
+        window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
+        state_slots=g.state_slots if g.state_layer_ids else 0,
+        context_len=g.context_len,
+        floor_window=g.window if g.swa_layer_ids else None,
+    )
+    ctx = UnifiedBuildContext(
         device=g.device,
-        kv_cache_dtype=g.kv_cache_dtype,
-        page_size=g.page_size,
         start_layer=g.start_layer,
         end_layer=g.end_layer if g.end_layer is not None else max(layer_ids) + 1,
-        full_attention_layer_ids=list(g.full_layer_ids),
         enable_memory_saver=False,
         need_sort=False,
         lazy_compaction=g.lazy,
-        fused_draft=g.fused_draft,
         head_num=g.head_num,
         head_dim=g.head_dim,
-        v_head_dim=g.v_head_dim if g.v_head_dim is not None else g.head_dim,
-    )
-    swa_kwargs = dict(
-        swa_head_num=g.swa_head_num,
-        swa_head_dim=g.swa_head_dim,
-        swa_v_head_dim=(
-            g.swa_v_head_dim if g.swa_v_head_dim is not None else g.swa_head_dim
-        ),
-        swa_attention_layer_ids=list(g.swa_layer_ids),
-        sliding_window_size=g.window,
-    )
-    state_kwargs = dict(
-        mamba_layer_ids=list(g.state_layer_ids),
-        mamba2_cache_params=_state_cache_params(g),
-        max_mamba_cache_size=g.state_slots,
+        max_num_reqs=g.max_num_reqs,
         model_context_len=g.context_len,
         extra_max_context_len=1,
-        max_num_reqs=g.max_num_reqs,
-        enable_mamba_extra_buffer=False,
-        enable_mamba_extra_buffer_lazy=False,
+        state_cache_params=cache_params,
         disable_overlap_schedule=True,
-        speculative_num_draft_tokens=None,
-        unified_total_bytes=g.byte_budget,
     )
-    if g.chain == "swa":
-        by_tokens = g.byte_budget is None
-        return init_unified_swa_pools(
-            **common,
-            **swa_kwargs,
-            full_max_total_num_tokens=g.full_tokens if by_tokens else None,
-            swa_max_total_num_tokens=g.swa_tokens if by_tokens else None,
-            total_bytes=g.byte_budget,
-            model_context_len=g.context_len,
+    return storage_parts(
+        build_unified_pools(
+            decls=decls,
+            page_size=g.page_size,
+            sizing=sizing,
+            ctx=ctx,
+            fused_draft=g.fused_draft,
         )
-    if g.chain == "mamba":
-        return init_unified_mamba_pools(
-            **common,
-            **state_kwargs,
-            is_draft_worker=False,
-            use_mla_backend=g.mla,
-            kv_lora_rank=g.kv_lora_rank if g.mla else None,
-            qk_rope_head_dim=g.qk_rope_head_dim if g.mla else None,
-            max_total_num_tokens=g.full_tokens,
-        )
-    assert g.chain == "tri", f"unknown chain {g.chain!r}"
-    return init_unified_mamba_swa_pools(
-        **common,
-        **swa_kwargs,
-        **state_kwargs,
-        full_max_total_num_tokens=g.full_tokens,
-        swa_max_total_num_tokens=g.swa_tokens,
     )
 
 
@@ -408,7 +667,7 @@ def build_mamba_cache(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
             req_to_token_pool=bundle.req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
-            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
         )
     )
     return bundle, allocator, cache
@@ -428,7 +687,7 @@ def _ends_summary(views) -> tuple:
     return (_view_summary(views[0]), _view_summary(views[-1]))
 
 
-def _sub_pool_summary(pool: UnifiedKVPool, spec) -> dict:
+def _sub_pool_summary(arena: KVArena, spec) -> dict:
     out = {
         "kind": type(spec).__name__,
         "layer_num": spec.layer_num,
@@ -437,11 +696,11 @@ def _sub_pool_summary(pool: UnifiedKVPool, spec) -> dict:
         "draft_offset": (
             None if spec.draft_region is None else spec.draft_offset_in_entry()
         ),
-        "max_slots": pool.max_slots(spec.name),
-        "min_slot_index": pool.min_slot_index(spec.name),
+        "max_slots": arena.num_entries(spec.name),
+        "min_slot_index": arena.first_entry(spec.name),
     }
     if isinstance(spec, MambaSubPoolSpec):
-        conv, temporal = pool.mamba_views_for(spec.name)
+        conv, temporal = spec.views(arena)
         out["state"] = (
             tuple(tuple(s) for s in spec.conv_state_shapes),
             str(spec.conv_dtype),
@@ -454,7 +713,7 @@ def _sub_pool_summary(pool: UnifiedKVPool, spec) -> dict:
             "temporal": _view_summary(temporal),
         }
         if spec.draft_region is not None:
-            d_conv, d_temporal = pool.build_draft_state_views(spec.name)
+            d_conv, d_temporal = spec.draft_views(arena)
             out["views"]["draft_conv"] = tuple(_view_summary(v) for v in d_conv)
             out["views"]["draft_temporal"] = _view_summary(d_temporal)
         return out
@@ -470,13 +729,13 @@ def _sub_pool_summary(pool: UnifiedKVPool, spec) -> dict:
         for p in spec.layout().parts
     )
     if isinstance(spec, MHASubPoolSpec):
-        k, v = pool.mha_views_for(spec.name)
+        k, v = spec.views(arena)
         out["views"] = {"k": _ends_summary(k), "v": _ends_summary(v)}
     else:
         assert isinstance(spec, MLASubPoolSpec), type(spec)
-        out["views"] = {"kv": _ends_summary(pool.mla_views_for(spec.name))}
+        out["views"] = {"kv": _ends_summary(spec.views(arena))}
     if spec.draft_region is not None:
-        d_k, d_v = pool.build_dense_draft_views(spec.name)
+        d_k, d_v = spec.draft_views(arena)
         out["views"]["draft_k"] = _ends_summary(d_k)
         out["views"]["draft_v"] = _ends_summary(d_v)
     return out
@@ -500,18 +759,19 @@ def _member_summary(member) -> tuple:
         member.grow_direction,
         member.num_pages,
         member.min_page_index,
-        member.num_virtual_ids,
+        member.ids.num_virtual_ids,
         member.entry_bytes_per_page,
     )
 
 
 def _kv_pools(bundle) -> Dict[str, object]:
-    kv = bundle.token_to_kv_pool
-    pools = {"full": kv.full_kv_pool}
-    if isinstance(kv, UnifiedSWAKVPool):
-        pools["swa"] = kv.swa_kv_pool
-    if isinstance(bundle, UnifiedPoolBundle):
-        pools["mamba"] = bundle.req_to_token_pool.mamba_pool
+    router = bundle.token_to_kv_pool.layer_router
+    pools = {
+        sub_pool.name: router.view(sub_pool.name) for sub_pool in router.sub_pools()
+    }
+    state = bundle.token_to_kv_pool_allocator.state
+    if state is not None:
+        pools[state.sub_pool] = state.pool
     return pools
 
 
@@ -524,24 +784,30 @@ def _pool_summary(pool, raw_base: int) -> dict:
         ),
         "host_capacity": (pool.host_capacity_tokens, pool.host_capacity_bytes),
     }
-    if isinstance(pool, UnifiedMHATokenToKVPool):
+    if isinstance(pool, MHAView):
         out["page_envelope"] = tuple(pool.get_page_envelope_buffer().shape)
     return out
 
 
 def _layer_maps(bundle) -> dict:
-    kv = bundle.token_to_kv_pool
-    if isinstance(kv, UnifiedSWAKVPool):
+    """Each token layer's index in its view; with a window, and whether it
+    is a window layer."""
+    router = bundle.token_to_kv_pool.layer_router
+    owner = router.sub_pools()[0].name
+    routes = {gid: router.route(gid) for gid in router.layer_ids()}
+    if len(router.sub_pools()) > 1:
         kv_map = tuple(
             sorted(
-                (gid, idx, is_swa) for gid, (idx, is_swa) in kv.layers_mapping.items()
+                (gid, route.index, route.sub_pool != owner)
+                for gid, route in routes.items()
             )
         )
     else:
-        kv_map = tuple(sorted(kv.full_attention_layer_id_mapping.items()))
+        kv_map = tuple(sorted((gid, route.index) for gid, route in routes.items()))
     out = {"kv": kv_map}
-    if isinstance(bundle, UnifiedPoolBundle):
-        out["state"] = tuple(sorted(bundle.req_to_token_pool.mamba_map.items()))
+    state = bundle.token_to_kv_pool_allocator.state
+    if state is not None:
+        out["state"] = tuple(sorted(state.layer_map.items()))
     return out
 
 
@@ -552,24 +818,26 @@ def _capacity_summary(bundle) -> dict:
         "size_full": allocator.size_full,
         "draft_virtual_id_space": allocator.draft_virtual_id_space,
     }
-    if isinstance(bundle.token_to_kv_pool, UnifiedSWAKVPool):
+    if allocator.has_window_pool:
         out["size_swa"] = allocator.size_swa
-    if isinstance(bundle, UnifiedPoolBundle):
-        out["state_slots"] = bundle.req_to_token_pool.mamba_allocator.size
+    if allocator.state is not None:
+        out["state_slots"] = allocator.state_slots.size
     return out
 
 
 def unified_layout_summary(bundle) -> dict:
     """Plain data describing a built unified pool stack's byte layout: chain,
     entries, part offsets, views, envelopes, slot bounds and empty capacities."""
-    pool = bundle.unified_memory_pool
-    raw_base = pool._raw.data_ptr()
+    arena = bundle.arena
+    plan = bundle.token_to_kv_pool_allocator.storage.plan
+    specs = [plan.sub_pool(band.name).spec for band in arena.bands]
+    raw_base = arena.raw.data_ptr()
     out = {
-        "chain": tuple((s.name, s.grow_direction) for s in pool.sub_pool_specs),
-        "total_bytes": pool.total_bytes,
-        "reserved_floor": pool._reserved_floor,
-        "active_allocation_bytes": pool.active_allocation_bytes,
-        "sub_pools": {s.name: _sub_pool_summary(pool, s) for s in pool.sub_pool_specs},
+        "chain": tuple((b.name, b.grow_direction) for b in arena.bands),
+        "total_bytes": arena.total_bytes,
+        "reserved_floor": plan.sink_bytes(),
+        "active_allocation_bytes": arena.accessible_bytes,
+        "sub_pools": {s.name: _sub_pool_summary(arena, s) for s in specs},
         "members": {
             name: _member_summary(m)
             for name, m in _chain_members(bundle.token_to_kv_pool_allocator).items()
@@ -580,8 +848,8 @@ def unified_layout_summary(bundle) -> dict:
         "layer_maps": _layer_maps(bundle),
         "capacity": _capacity_summary(bundle),
     }
-    if not isinstance(bundle, UnifiedPoolBundle):
-        # Only the window chain's stored floor has a consumer (post-capture
-        # backing re-checks it).
-        out["bs1_floor_terms"] = tuple(pool._bs1_floor_terms)
+    if bundle.token_to_kv_pool_allocator.state is None:
+        # Only a plan without state resizes after capture, where the backing
+        # re-checks the stored floor.
+        out["bs1_floor_terms"] = tuple(bundle.token_to_kv_pool._bs1_floor_terms)
     return out

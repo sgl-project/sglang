@@ -19,16 +19,16 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiniMax-M2.5 | Ascend A3 Series Products | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 24.44ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-24-44ms) |
-| MiniMax-M2.5 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-20ms) |
+| MiniMax-M2.5 | A3 Series Products | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 24.44ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in128k-out1k-prefix90-24-44ms) |
+| MiniMax-M2.5 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiniMax-M2.5 | Ascend A3 Series Products | 4 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in32k-out1k-50ms) |
-| MiniMax-M2.5 | Ascend A3 Series Products | 4 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms) |
-| MiniMax-M2.5 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) |
+| MiniMax-M2.5 | A3 Series Products | 4 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in32k-out1k-50ms) |
+| MiniMax-M2.5 | A3 Series Products | 4 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-4p-in64k-out1k-prefix90-50ms) |
+| MiniMax-M2.5 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -38,7 +38,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 4
 
@@ -149,7 +149,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 4
 
@@ -258,7 +258,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -368,7 +368,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -473,7 +473,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiniMax-M2.5
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 

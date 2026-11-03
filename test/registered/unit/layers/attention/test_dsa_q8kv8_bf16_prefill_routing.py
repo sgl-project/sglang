@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     _validate_flashmla_sparse_q8_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")

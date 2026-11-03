@@ -6,7 +6,7 @@ pinned here are a wire format: chain order, entry bytes, part offsets, view
 strides, the slot-0 sink, slot bounds and the empty-pool capacities. A changed
 literal is a change of the PD/HiCache byte layout; the PR that changes one must
 say so and why. Nothing is recomputed from the implementation at test time:
-the literals were produced once from the factories and are compared as data.
+the literals were produced once and are compared as data.
 """
 
 import json
@@ -17,13 +17,13 @@ from pathlib import Path
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.kv.layout.base import check_physical_id_bound
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
     DraftStateRegion,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.unified_memory_pool import _assert_physical_id_bound
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -232,9 +232,9 @@ class TestUnifiedLayoutGolden(CustomTestCase):
                 )
 
     def test_physical_ids_stay_within_int32(self):
-        _assert_physical_id_bound(sub_pool_name="full", n_rows=2**31 - 1)
+        check_physical_id_bound(sub_pool="full", n_rows=2**31 - 1)
         with self.assertRaises(AssertionError):
-            _assert_physical_id_bound(sub_pool_name="full", n_rows=2**31)
+            check_physical_id_bound(sub_pool="full", n_rows=2**31)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang's binding to the AMD monokernel plugins behind --enable-amd-monokernel:
-startup validation and graph-size alignment, then weight observation and the
-full-forward dispatch installed on the model."""
+"""SGLang's binding to the monokernel plugins: the AMD ones behind
+--enable-amd-monokernel and the MSA one, which --enable-nvidia-megakernel routes
+here. Startup validation and graph-size alignment, then weight observation and
+the full-forward dispatch installed on the model."""
 
 from __future__ import annotations
 
 import functools
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -27,6 +28,7 @@ from sglang.kernels.plugin_kernels.amd.spec import (
     find_spec,
     spec_registered,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import FLAG as NVIDIA_FLAG
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
@@ -56,6 +58,25 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# The MSA plugin serves NVIDIA Blackwell through the monokernel contract, so
+# --enable-nvidia-megakernel routes the architectures it registers here.
+MSA_BACKEND = "msa"
+
+
+def msa_serves(architectures: Optional[Sequence[str]]) -> bool:
+    """Whether the MSA plugin, not sgl-nvidia-mega, serves these architectures."""
+    return spec_registered(backend=MSA_BACKEND, architectures=architectures)
+
+
+def selected_monokernel(cfg: Any) -> Optional[tuple[str, str]]:
+    """The (backend, flag) a monokernel may serve under this configuration."""
+    if cfg.enable_amd_monokernel:
+        return BACKEND, FLAG
+    if cfg.enable_nvidia_megakernel:
+        return MSA_BACKEND, NVIDIA_FLAG
+    return None
+
 
 # Leave time for peers to abort before the process watchdog fires.
 MAX_DEADLINE_S, MIN_DEADLINE_S = 60.0, 5.0
@@ -128,14 +149,14 @@ def features_in_use(cfg: Any) -> set[Feature]:
 
 
 def monokernel_disable_reasons(
-    *, cfg: Any, model_config: ModelConfig, isa: Optional[str]
+    *, cfg: Any, backend: str, model_config: ModelConfig, isa: Optional[str]
 ) -> tuple[Optional[MonoSpec], list[str]]:
     """Return the matching spec and all configuration rejection reasons."""
     if isa is None:
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
     spec, why = find_spec(
-        backend=BACKEND,
+        backend=backend,
         architectures=hf_config.architectures,
         isa=isa,
         model_type=getattr(hf_config, "model_type", None),
@@ -205,18 +226,23 @@ def covered_capture_sizes(
     return covered + sorted(b for b in set(sizes) if b > covered[-1])
 
 
-def handle_amd_monokernel(server_args: ServerArgs) -> None:
-    """Validate --enable-amd-monokernel and resolve its decode capture sizes."""
+def handle_monokernel(server_args: ServerArgs) -> None:
+    """Validate the selected monokernel flag and resolve its decode capture sizes."""
     cfg = resolving_view(server_args)
-    if not cfg.enable_amd_monokernel:
+    selected = selected_monokernel(cfg)
+    if selected is None:
         return
+    backend, flag = selected
+    model_config = model_config_of(server_args)
+    if backend == MSA_BACKEND and not msa_serves(model_config.hf_config.architectures):
+        return  # sgl-nvidia-mega serves this model
     isa = device_isa()
     spec, reasons = monokernel_disable_reasons(
-        cfg=cfg, model_config=model_config_of(server_args), isa=isa
+        cfg=cfg, backend=backend, model_config=model_config, isa=isa
     )
     if reasons:
         raise ValueError(
-            f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)
+            f"{flag} cannot run this setup:\n  - " + "\n  - ".join(reasons)
         )
     tokens = (
         int(cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
@@ -233,17 +259,17 @@ def handle_amd_monokernel(server_args: ServerArgs) -> None:
         if sizes and new != sorted(set(sizes)):
             declare_resolution(
                 server_args,
-                "handle_amd_monokernel",
+                "handle_monokernel",
                 cuda_graph_config=with_phase(
                     graph, Phase.DECODE, bs=new, max_bs=max(new)
                 ),
             )
     logger.warning(
-        "%s is experimental. Its kernels, coverage and plugin API may change.", FLAG
+        "%s is experimental. Its kernels, coverage and plugin API may change.", flag
     )
     logger.info(
         "%s: %s on %s, widths %s (%d tokens a request)",
-        FLAG,
+        flag,
         spec.name,
         isa,
         list(spec.widths(isa)),
@@ -251,12 +277,22 @@ def handle_amd_monokernel(server_args: ServerArgs) -> None:
     )
 
 
-def _backend() -> Optional[str]:
-    """Return the selected backend, or None without published server configuration."""
+def _selection() -> Optional[tuple[str, str]]:
+    """Return the selected (backend, flag), or None without published server configuration."""
     # the model loader also runs without a server's config (tools, unit tests)
     if not get_context().is_config_namespace_published("exec"):
         return None
-    return BACKEND if get_exec().kernel.enable_amd_monokernel else None
+    return selected_monokernel(get_exec().kernel)
+
+
+def _backend() -> Optional[str]:
+    selection = _selection()
+    return None if selection is None else selection[0]
+
+
+def _flag() -> str:
+    selection = _selection()
+    return FLAG if selection is None else selection[1]
 
 
 def _gather_tp(obj: Any) -> list[Any]:
@@ -357,10 +393,10 @@ def install_monokernel_forward(
         if not is_found
     ]
     if reasons:
-        raise ValueError(f"{FLAG}: " + "; ".join(reasons))
+        raise ValueError(f"{_flag()}: " + "; ".join(reasons))
     if len({identity for *_, identity in lookups}) > 1:
         raise ValueError(
-            f"{FLAG}: the ranks load different specs: "
+            f"{_flag()}: the ranks load different specs: "
             + "; ".join(
                 f"rank {rank}: {name} (API version {api_version})"
                 for rank, (*_, (name, api_version)) in enumerate(lookups)
@@ -387,7 +423,7 @@ def install_monokernel_forward(
         for reason in rank_reasons
     ]
     if reasons:
-        raise ValueError(f"{FLAG}: " + "; ".join(reasons))
+        raise ValueError(f"{_flag()}: " + "; ".join(reasons))
 
     mode, tokens = _server_step()
     if spec.tokens_per_request is not None:
@@ -403,10 +439,10 @@ def install_monokernel_forward(
     served = _served_keys(mode=mode, widths=widths, tokens=tokens)
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
-        raise RuntimeError(f"{FLAG}: the ranks route different graph keys")
+        raise RuntimeError(f"{_flag()}: the ranks route different graph keys")
     if not served:
         raise ValueError(
-            f"{FLAG}: {spec.name} has no width for this "
+            f"{_flag()}: {spec.name} has no width for this "
             f"server's steps ({tokens} tokens a request)"
         )
     build_context = BuildContext(
@@ -420,7 +456,7 @@ def install_monokernel_forward(
     _install_forward(model=model, built=built, served=served, spec=spec)
     # Captured kernels retain weight copies that online updates cannot refresh.
     model._derived_weight_cache_error = (
-        f"Online weight updates are not supported with {FLAG} ({spec.name})"
+        f"Online weight updates are not supported with {_flag()} ({spec.name})"
     )
     logger.info(
         "monokernel %s on %s: widths %s built in %.1f s, %.1f MiB; wait deadline "
@@ -474,7 +510,7 @@ class _CaptureCheck:
         routed = [k for k in self.captured.values() if k in self.served]
         if not routed:
             raise ValueError(
-                f"{FLAG}: none of the "
+                f"{_flag()}: none of the "
                 f"{len(self.captured)} captured decode graphs (batch sizes "
                 f"{sorted(self.captured)}) runs {self.spec.name}'s monokernels"
             )
@@ -547,7 +583,7 @@ def _install_forward(
             attention = get_attn_backend().decode_attention_backend_str or configured
             if attention not in allowed:
                 raise ValueError(
-                    f"{FLAG}: {spec.name} needs a decode "
+                    f"{_flag()}: {spec.name} needs a decode "
                     f"attention backend in {sorted(allowed)}, this runner's is "
                     f"{attention!r}"
                 )

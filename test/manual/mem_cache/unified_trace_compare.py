@@ -8,7 +8,7 @@ script whose result a PR reports, not a unit test:
     # on the candidate checkout
     python test/manual/mem_cache/unified_trace_compare.py compare --trace base.jsonl
     # two implementations in one checkout
-    python test/manual/mem_cache/unified_trace_compare.py pair --a composite --b <name>
+    python test/manual/mem_cache/unified_trace_compare.py pair --a builder --b <name>
 
 Each run is one configuration (chain, page size, lazy compaction) driven by a
 seed or by a scenario file from unified_trace_scenarios/. `compare` and `pair`
@@ -177,7 +177,7 @@ def main() -> int:
         p.add_argument("--scenarios", default=str(_SCENARIOS))
     record = sub.choices["record"]
     record.add_argument("--out", required=True)
-    record.add_argument("--adapter", default="composite")
+    record.add_argument("--adapter", default="builder")
     record.add_argument(
         "--full", action="store_true", help="store observables in full, not digests"
     )
@@ -186,7 +186,7 @@ def main() -> int:
     pair.add_argument("--b", required=True)
     compare = sub.add_parser("compare")
     compare.add_argument("--trace", required=True)
-    compare.add_argument("--adapter", default="composite")
+    compare.add_argument("--adapter", default="builder")
     args = parser.parse_args()
     return {"record": cmd_record, "compare": cmd_compare, "pair": cmd_pair}[args.cmd](
         args
