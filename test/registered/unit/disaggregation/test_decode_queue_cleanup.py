@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -19,6 +20,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -479,6 +481,89 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(kwargs, {"decode_prefix_len": 0})
         self.assertEqual(decode_req.metadata_buffer_index, 0)
         self.assertTrue(queue.has_published_destinations)
+
+    def test_staging_readback_preserves_payload_and_waits_for_both_events(self):
+        payloads = []
+        original_empty, original_copy = torch.empty, torch.Tensor.copy_
+        for master, staging in ((False, True), (True, False), (True, True)):
+            receiver = _PollingReceiver()
+            receiver.require_staging = True
+            entry = self._decode_req(receiver)
+            entry.req.bootstrap_room, entry.req.bootstrap_host = 17, "127.0.0.1"
+            queue = self._deferring_queue([entry])
+            queue._defer_publish = False
+            queue.scheduler.enable_overlap = True
+            forward_done, readback_done = MagicMock(), MagicMock()
+            forward_done.query.return_value = readback_done.query.return_value = False
+            queue.scheduler.device_module = SimpleNamespace(Event=lambda: forward_done)
+            queue.scheduler.forward_stream = object()
+            queue.transfer_queue.enable_staging = staging
+            queue.transfer_queue.staging_handler = MagicMock()
+            queue.token_to_kv_pool_allocator.page_size = 2
+            queue.token_to_kv_pool_allocator.state_ids = lambda _: SimpleNamespace(
+                ids=lambda x: x + 100
+            )
+            queue.req_to_token_pool.req_index_to_mamba_index_mapping = torch.arange(
+                4
+            ).reshape(4, 1)
+            queue.kv_manager.kv_args.state_types = [StateType.MAMBA]
+
+            def pinned_empty(shape, *, dtype, pin_memory):
+                return original_empty(shape, dtype=dtype)
+
+            def copy(host, device, *, non_blocking):
+                self.assertTrue(non_blocking)
+                return original_copy(host, device)
+
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                patch(
+                    "sglang.srt.disaggregation.decode.torch.cuda.is_available",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.decode.torch.cuda.Event",
+                    return_value=readback_done,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.decode.torch.empty",
+                    side_effect=pinned_empty,
+                ),
+                patch.object(torch.Tensor, "copy_", copy),
+            ):
+                queue.pop_preallocated()
+            transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            transfer.queue = decode_queue(ListKind.PD_RECEIVING, [entry])
+            transfer.gloo_group = object()
+            with patch(
+                "sglang.srt.disaggregation.decode.all_reduce_flags",
+                side_effect=_local_reduce,
+            ):
+                transfer.publish_pending_metadata()
+                receiver.send_metadata.assert_not_called()
+                forward_done.query.return_value = True
+                transfer.publish_pending_metadata()
+                self.assertEqual(
+                    receiver.send_metadata.call_count, int(not (master and staging))
+                )
+                readback_done.query.return_value = True
+                transfer.publish_pending_metadata()
+            receiver.send_metadata.assert_called_once()
+            pages, slot, states = receiver.send_metadata.call_args.args
+            payloads.append(
+                (
+                    pages.tolist(),
+                    slot,
+                    [[x.tolist() for x in part] for part in states],
+                    receiver.send_metadata.call_args.kwargs,
+                )
+            )
+            self.assertIsNone(entry.pending_metadata)
+        self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(payloads[1], payloads[2])
+        self.assertEqual(
+            payloads[1], ([4, 5, 6], 0, [[[101]]], {"decode_prefix_len": 0})
+        )
 
     def test_recompute_waits_for_held_metadata_to_be_sent(self):
         receiver = _PollingReceiver()

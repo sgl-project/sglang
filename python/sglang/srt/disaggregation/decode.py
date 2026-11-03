@@ -407,7 +407,7 @@ class DecodeRequest:
     # Queued for transfer but its destination not yet sent to any prefill rank.
     awaiting_publish: bool = False
     # Overlap without the deferred publish: (ready event, send_metadata args,
-    # kwargs) until the forward in flight at allocation time is done.
+    # kwargs) until the forward and any pinned metadata readback are done.
     pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
 
     # HiCache Status
@@ -1873,19 +1873,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         seq_len = fill_len
 
+        state_types = self.kv_manager.kv_args.state_types
+        non_blocking_metadata = (
+            self.transfer_queue.enable_staging
+            and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and not self.scheduler.enable_hisparse
+            and torch.cuda.is_available()
+            and set(state_types) <= {StateType.MAMBA}
+            and not _is_fake_transfer(decode_req.req)
+        )
+
         def _mamba_payload():
             state_ids = self.token_to_kv_pool_allocator.state_ids(
                 self.req_to_token_pool.state_sub_pool
             )
-            return [
-                state_ids.ids(
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.kv.req_pool_idx
-                    ]
-                )
-                .cpu()
-                .numpy()
-            ]
+            indices = state_ids.ids(
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    decode_req.req.kv.req_pool_idx
+                ]
+            )
+            return [indices if non_blocking_metadata else indices.cpu().numpy()]
 
         def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
             if window is _SCHEDULER_WINDOW:
@@ -1963,7 +1970,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
-        state_types = self.kv_manager.kv_args.state_types
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
@@ -2039,6 +2045,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_transfer_page_size,
             state_indices,
             metadata_buffer_preassigned=metadata_buffer_preassigned,
+            non_blocking=non_blocking_metadata,
             **metadata_kwargs,
         )
 
@@ -2049,6 +2056,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         page_size,
         state_indices=None,
         metadata_buffer_preassigned: bool = False,
+        non_blocking: bool = False,
         **metadata_kwargs,
     ) -> None:
         if not metadata_buffer_preassigned:
@@ -2056,7 +2064,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
         assert decode_req.metadata_buffer_index is not None
-        page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
+        readback_ready = None
+        if non_blocking:
+
+            def to_host(indices):
+                host = torch.empty(indices.shape, dtype=indices.dtype, pin_memory=True)
+                host.copy_(indices, non_blocking=True)
+                return host.numpy()
+
+            page_indices = to_host((kv_indices[::page_size] // page_size).int())
+            state_indices = [
+                [to_host(indices) for indices in payload] for payload in state_indices
+            ]
+            # Fence both the D2H and the prior forward before exposing reused pages.
+            if self.scheduler.enable_overlap:
+                forward_done = self.scheduler.device_module.Event()
+                forward_done.record(stream=self.scheduler.forward_stream)
+                torch.cuda.current_stream().wait_event(forward_done)
+            readback_ready = torch.cuda.Event()
+            readback_ready.record()
+        else:
+            page_indices = self._transfer_page_indices(
+                decode_req, kv_indices, page_size
+            )
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -2069,7 +2099,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.bootstrap_room, decode_req
             )
         args = (page_indices, decode_req.metadata_buffer_index, state_indices)
-        if (
+        if readback_ready is not None:
+            decode_req.pending_metadata = (readback_ready, args, metadata_kwargs)
+        elif (
             self.scheduler.enable_overlap
             and not self._defer_publish
             and metadata_kwargs.get("destination") != KVTransferDestination.HOST
