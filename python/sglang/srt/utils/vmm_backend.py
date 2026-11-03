@@ -104,12 +104,19 @@ class VmmBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def can_access_peer(self, peer_device_id: int) -> bool:
+        """Whether this device can map memory owned by ``peer_device_id``."""
+        raise NotImplementedError
+
+    @abstractmethod
     def supports_aliased_mappings(self) -> bool:
         """Whether one physical object may sit in two live VA ranges at once.
 
-        Level Zero cannot (intel/compute-runtime#1024): before compute-runtime 26.35
-        the second zeVirtualMemMap succeeds and access fails with DEVICE_LOST; from
-        26.35 it returns ZE_RESULT_ERROR_INVALID_ARGUMENT. Pages are remapped instead.
+        Level Zero cannot (oneapi-src/level-zero#536, intel/compute-runtime#1024):
+        before compute-runtime 26.35 the second zeVirtualMemMap succeeds and access
+        fails with DEVICE_LOST; from 26.35 it returns ZE_RESULT_ERROR_INVALID_ARGUMENT.
+        Pages are remapped instead. Once Level Zero supports aliased mappings, the XPU
+        backend can return True and the remap path and REMAPPED_NUM_SLOTS can go.
         """
         raise NotImplementedError
 
@@ -201,6 +208,9 @@ class CudaVmmBackend(VmmBackend):
     def owns_exported_fds(self) -> bool:
         return True
 
+    def can_access_peer(self, peer_device_id: int) -> bool:
+        return torch.cuda.can_device_access_peer(self.device_id, int(peer_device_id))
+
     def supports_aliased_mappings(self) -> bool:
         return True
 
@@ -276,6 +286,11 @@ class XpuVmmBackend(VmmBackend):
 
     def owns_exported_fds(self) -> bool:
         return False
+
+    def can_access_peer(self, peer_device_id: int) -> bool:
+        from sglang.srt.utils.xpu_vmm_utils import can_access_peer
+
+        return can_access_peer(self.device_id, int(peer_device_id))
 
     def supports_aliased_mappings(self) -> bool:
         return False

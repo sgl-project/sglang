@@ -32,20 +32,14 @@ from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer, fill_edge_exp
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.utils import get_device, get_device_module, is_cuda, is_xpu
 from sglang.srt.utils.vmm_backend import get_vmm_backend
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.kernels.utils import (
     gloo_group,
     local_device_id,
     multigpu_pytest_main,
 )
 
-register_xpu_ci(est_time=60, suite="nightly-xpu-4-gpu", nightly=True)
-register_cuda_ci(
-    est_time=90,
-    stage="extra-b",
-    runner_config="4-gpu-h100",
-    disabled="not yet run on a CUDA machine",
-)
+register_xpu_ci(est_time=60, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 # the two backends get_vmm_backend() knows; DWDP has no CPU path to fall back to
 pytestmark = pytest.mark.skipif(
@@ -280,8 +274,6 @@ def test_failed_peer_import_closes_every_fd(monkeypatch: pytest.MonkeyPatch) -> 
         )
     if any(fd is None for fd in received_fds):
         pytest.skip("FABRIC handles carry no fds")
-    else:
-        pass
     caller_owned = exported_fds if backend.owns_exported_fds() else []
     still_open = [fd for fd in received_fds + caller_owned if _fd_is_open(fd)]
     dist.barrier(group=group)

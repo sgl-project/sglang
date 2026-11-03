@@ -15,7 +15,7 @@ import requests
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import is_xpu, kill_process_tree
 from sglang.srt.utils.common import get_device_count, get_device_module
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     auto_config_device,
@@ -24,9 +24,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# The XPU MoE path lives in the intel_xpu attention backend, and overlap
-# scheduling plus the radix cache wedged the Level Zero driver at TP>=2.
-_XPU_SERVER_ARGS = [
+# The XPU MoE path lives in the intel_xpu attention backend.
+XPU_SERVER_ARGS = [
     "--device",
     "xpu",
     "--attention-backend",
@@ -34,8 +33,6 @@ _XPU_SERVER_ARGS = [
     "--dtype",
     "bfloat16",
     "--trust-remote-code",
-    "--disable-overlap-schedule",
-    "--disable-radix-cache",
 ]
 # Matches test_disaggregation_dwdp_gpt_oss.py, the CUDA DWDP gate; the attention
 # backend is left to the default, which differs by SM version.
@@ -43,10 +40,10 @@ _CUDA_SERVER_ARGS = [
     "--disable-flashinfer-autotune",
 ]
 
-# The DWDP arm and its TP control assert the same floor, which is the point of the
-# pair; it sits about 1.5 standard errors under the TP score at n=100.
-GPT_OSS_20B_GSM8K_FLOOR = 0.85
-GSM8K_NUM_EXAMPLES = 100
+# Shared by the DWDP arm and its TP control: TP mean 0.960 - 3 SE at n=400 on 2x B60
+# (sgl-eval 0.1.3, greedy; DWDP scored 0.965).
+GPT_OSS_20B_GSM8K_FLOOR = 0.93
+GSM8K_NUM_EXAMPLES = 400
 # The XPU default is single-stream because intel_xpu attention wedged the driver on
 # concurrent prefill; 8 threads run clean at TP=2.
 GSM8K_NUM_THREADS = 8
@@ -64,7 +61,7 @@ def launch_dwdp_server(
     timeout: float,
     tp_size: Optional[int] = None,
 ):
-    backend_args = _XPU_SERVER_ARGS if is_xpu() else _CUDA_SERVER_ARGS
+    backend_args = XPU_SERVER_ARGS if is_xpu() else _CUDA_SERVER_ARGS
     other_args = list(backend_args) + list(extra_args)
     if tp_size is not None:
         other_args += ["--tp-size", str(tp_size)]
@@ -85,15 +82,14 @@ def assert_gsm8k_accuracy(
     accuracy: float,
     num_examples: int,
     num_threads: int,
-    max_tokens: int = 512,
+    max_tokens: int = 4096,
 ) -> dict:
-    """Score a launched server on GSM8K and assert the floor.
+    """Score a launched server on GSM8K with sgl-eval and assert the floor.
 
-    Calls ``run_eval`` directly rather than through ``GSM8KMixin``, which pins
-    ``api="completion"``; the thresholds here were measured over the chat API
-    that ``run_eval`` defaults to, and the two score differently.
+    Greedy sampling, as in test_disaggregation_dwdp_gpt_oss.py, so the DWDP arm
+    and its TP control differ only by the parallelism under test.
     """
-    metrics = run_eval(
+    metrics = run_sgl_eval(
         SimpleNamespace(
             base_url=base_url,
             model=model,
@@ -101,6 +97,9 @@ def assert_gsm8k_accuracy(
             num_examples=num_examples,
             num_threads=num_threads,
             max_tokens=max_tokens,
+            repeat=1,
+            temperature=0.0,
+            top_p=1.0,
         )
     )
     write_github_step_summary(
@@ -256,7 +255,7 @@ PERF_FIXED_SERVER_ARGS = [
     "triton",
     # XPU has no custom all-reduce
     "--disable-custom-all-reduce",
-    # XPU requires overlap scheduling off at TP>=2
+    # kept off in both arms to match the measured perf baseline
     "--disable-overlap-schedule",
     # DWDP forces CUDA graphs off, so the TP arm turns them off too
     "--disable-cuda-graph",

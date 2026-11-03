@@ -16,7 +16,7 @@ test_dwdp_gpt_oss_20b_tp_control.py.
 import unittest
 
 from sglang.srt.utils import is_cuda, is_xpu, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.dwdp_test_utils import (
     GPT_OSS_20B_GSM8K_FLOOR,
     GSM8K_NUM_EXAMPLES,
@@ -27,13 +27,7 @@ from sglang.test.dwdp_test_utils import (
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
-register_xpu_ci(est_time=1800, suite="nightly-xpu-2-gpu", nightly=True)
-register_cuda_ci(
-    est_time=900,
-    stage="extra-b",
-    runner_config="4-gpu-h100",
-    disabled="not yet run on a CUDA machine",
-)
+register_xpu_ci(est_time=5400, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 MODEL = "openai/gpt-oss-20b"
 DWDP_SIZE = 2

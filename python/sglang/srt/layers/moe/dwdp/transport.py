@@ -152,6 +152,7 @@ class DWDPTransport:
                         "DWDP POSIX fd exchange cannot reach ranks on other hosts; "
                         "a multi-host DWDP group needs FABRIC handles"
                     )
+                self._check_peer_access(cpu_group, layout)
                 peer_fds = exchange_posix_fds(
                     cpu_group,
                     layout.dwdp_rank,
@@ -223,6 +224,22 @@ class DWDPTransport:
                     close_errors.append(error)
             if imported and close_errors:
                 raise close_errors[0]
+
+    def _check_peer_access(self, cpu_group, layout: DwdpExpertLayout) -> None:
+        # ranks may map to devices with an offset (--base-gpu-id), so exchange ordinals
+        device_ids = [None] * layout.dwdp_size
+        dist.all_gather_object(device_ids, self._backend.device_id, group=cpu_group)
+        unreachable = [
+            device_ids[peer_rank]
+            for peer_rank in range(layout.dwdp_size)
+            if peer_rank != layout.dwdp_rank
+            and not self._backend.can_access_peer(device_ids[peer_rank])
+        ]
+        if unreachable:
+            raise RuntimeError(
+                f"DWDP needs peer access: device {self._backend.device_id} cannot "
+                f"reach peer devices {unreachable}"
+            )
 
     @property
     def handle_set(self) -> MnnvlHandleSet:

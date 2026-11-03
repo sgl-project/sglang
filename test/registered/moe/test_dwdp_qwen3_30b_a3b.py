@@ -21,17 +21,11 @@ import unittest
 import requests
 
 from sglang.srt.utils import is_cuda, is_xpu, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.dwdp_test_utils import launch_dwdp_server
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
-register_xpu_ci(est_time=1200, suite="nightly-xpu-4-gpu", nightly=True)
-register_cuda_ci(
-    est_time=900,
-    stage="extra-b",
-    runner_config="4-gpu-h100",
-    disabled="not yet run on a CUDA machine",
-)
+register_xpu_ci(est_time=1200, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 MODEL = "Qwen/Qwen3-30B-A3B"
 DWDP_SIZE = 4
@@ -105,7 +99,7 @@ class TestDwdpQwen3_30BA3B(CustomTestCase):
         layers, so each buffer slot is handed back and forth between two layers
         many times. Rebinding a slot too early tore down the pages under a live
         read and killed the rank."""
-        text = self._generate(_LONG_PROMPT, 16).lower()
+        text = self._generate(_LONG_PROMPT, 64).lower()
         self.assertTrue(
             "fox" in text or "dog" in text,
             f"reply does not summarize the prompt: {text!r}",

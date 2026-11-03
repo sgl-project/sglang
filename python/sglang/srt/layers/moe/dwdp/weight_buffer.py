@@ -32,6 +32,8 @@ PREFETCH_DEPTH = 2
 # A backend that remaps pool pages needs one slot more than the prefetch depth, so
 # the slot it takes back belongs to a layer whose compute was launched a layer
 # earlier and the host-side remap overlaps compute instead of stalling the launch.
+# Only Level Zero remaps (oneapi-src/level-zero#536, intel/compute-runtime#1024);
+# drop the third slot and the remap path once it supports aliased mappings.
 ALIASED_NUM_SLOTS = PREFETCH_DEPTH
 REMAPPED_NUM_SLOTS = PREFETCH_DEPTH + 1
 

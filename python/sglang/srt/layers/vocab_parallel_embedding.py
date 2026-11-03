@@ -41,7 +41,6 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_npu,
-    is_xpu,
     set_weight_attrs,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -51,7 +50,6 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +135,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-# XPU: the Inductor-compiled kernel segfaults at launch on Arc Pro B60 (torch 2.13),
-# taking down every TP >= 2 server; eager mode is used there
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_xpu)
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,

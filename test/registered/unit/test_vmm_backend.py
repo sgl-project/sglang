@@ -24,20 +24,14 @@ import torch.distributed as dist
 from sglang.srt.utils import get_device, get_device_module, is_cuda, is_xpu
 from sglang.srt.utils.common import exchange_posix_fds, get_available_gpu_memory
 from sglang.srt.utils.vmm_backend import get_vmm_backend
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.kernels.utils import (
     gloo_group,
     local_device_id,
     multigpu_pytest_main,
 )
 
-register_cuda_ci(
-    est_time=40,
-    stage="base-b",
-    runner_config="2-gpu-large",
-    disabled="not yet run on a CUDA machine",
-)
-register_xpu_ci(est_time=30, suite="nightly-xpu-2-gpu", nightly=True)
+register_xpu_ci(est_time=30, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 # the two backends get_vmm_backend() knows
 pytestmark = pytest.mark.skipif(
@@ -45,6 +39,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 _NUM_OBJECTS = 8
+# room for page rounding and the driver's own bookkeeping, far below one mapping
+_MEMORY_ACCOUNTING_SLACK_BYTES = 64 << 20
 
 
 def test_an_odd_multiple_of_the_granularity_can_be_created_and_mapped() -> None:
@@ -271,6 +267,9 @@ def test_memory_accounting_sees_vmm_allocations() -> None:
         assert freed >= size, (
             f"{size} B of driver memory only moved the free figure by {freed} B"
         )
+        assert freed <= size + _MEMORY_ACCOUNTING_SLACK_BYTES, (
+            f"{size} B of driver memory moved the free figure by {freed} B"
+        )
     finally:
         reservation.close()
 
@@ -307,13 +306,19 @@ def test_cross_rank_peer_weight_alias() -> None:
     else:
         peer_fds = exchange_posix_fds(group, rank, world_size, fds, [1] * world_size)
 
+    # ranks map to devices with an offset under --base-gpu-id, so exchange ordinals
+    device_ids = [None] * world_size
+    dist.all_gather_object(device_ids, device_id, group=group)
+
     imported = []
     peer_reservations = []
     try:
         for peer_rank in range(world_size):
             if peer_rank == rank:
                 continue
-            _assert_peer_is_reachable(device_id, peer_rank)
+            assert backend.can_access_peer(device_ids[peer_rank]), (
+                f"device {device_id} cannot reach peer device {device_ids[peer_rank]}"
+            )
             peer_handle = backend.import_handle(
                 all_fabric[peer_rank][0] if use_fabric else None,
                 None if use_fabric else peer_fds[(peer_rank, 0)],
@@ -348,19 +353,6 @@ def test_cross_rank_peer_weight_alias() -> None:
             for fd in fds:
                 os.close(fd)
         backend.release_handle(handle)
-
-
-def _assert_peer_is_reachable(device_id: int, peer_rank: int) -> None:
-    # Only the Level Zero backend exposes a peer-access query; on CUDA an
-    # unreachable peer surfaces as a failure from the import itself.
-    if not is_xpu():
-        return
-
-    from sglang.srt.utils.xpu_vmm_utils import can_access_peer
-
-    assert can_access_peer(device_id, peer_rank), (
-        f"device {device_id} cannot reach peer device {peer_rank}"
-    )
 
 
 if __name__ == "__main__":

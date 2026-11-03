@@ -13,18 +13,10 @@ from sglang.srt.layers.moe.utils import (
     xpu_moe_ld_padding_elems,
 )
 from sglang.srt.layers.quantization.unquant import _empty_xpu_moe_expert_weight
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
-# The padding gate and the allocator live in unquant.py, which every backend
-# shares; the cases needing a real XPU skip, the rest guard that shared path.
-register_cuda_ci(
-    est_time=20,
-    stage="base-b",
-    runner_config="1-gpu-small",
-    disabled="not yet run on a CUDA machine",
-)
 
 
 class TestXpuMoeLdPadding(CustomTestCase):
