@@ -398,13 +398,14 @@ class ModelSlimConfig(QuantizationConfig):
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             direct_prefix = self._resolve_quant_prefix(prefix)
+            shard_names = packed_modules_mapping_subset.get(
+                proj_name, self.packed_modules_mapping.get(proj_name)
+            )
             if (
                 direct_prefix + ".weight" not in self.quant_description
-                and proj_name in packed_modules_mapping_subset
+                and shard_names is not None
             ):
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
-                )
+                prefix_in_quant_config = prefix.replace(proj_name, shard_names[0])
             prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
             if prefix_in_quant_config + ".weight" not in self.quant_description:
                 # Fused-layout checkpoints (e.g. MiMo-V2.5 fused_qkv) keep the
