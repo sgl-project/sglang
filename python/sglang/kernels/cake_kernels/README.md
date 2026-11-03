@@ -22,7 +22,7 @@ The Cake softmax in `sampling.softmax` also requires FlashInfer's
 `cake_blackwell_softmax` module. With an older FlashInfer, that path uses Torch
 softmax. This adapter does not change SGLang's dependency pins.
 
-DSpark's draft softmax (`SoftmaxTemp` in
-`ops/speculative/dspark/dspark_accept.py`) calls FlashInfer's softmax directly
-and does not use this adapter. FlashInfer routes that call to its Cake softmax
-on SM100 and SM103.
+DSpark's `SoftmaxTemp` (in `ops/speculative/dspark/dspark_accept.py`) calls
+FlashInfer's softmax directly and does not use this adapter. It computes the
+draft softmax, and the target softmax for requests with no top-k or top-p.
+FlashInfer routes that call to its Cake softmax on SM100 and SM103.
