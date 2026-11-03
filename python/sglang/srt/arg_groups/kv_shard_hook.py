@@ -6,14 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
