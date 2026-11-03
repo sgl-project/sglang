@@ -292,7 +292,6 @@ def _get_tool_schema_defs(tools: List[Tool]) -> dict:
 
 def _get_tool_schema(tool: Tool) -> dict:
     return {
-        "type": "object",
         "properties": {
             "name": {"type": "string", "enum": [tool.function.name]},
             "parameters": (

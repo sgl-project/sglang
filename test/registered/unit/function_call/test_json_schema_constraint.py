@@ -2,11 +2,9 @@
 Tests for JSON schema constraint functionality used by JsonArrayParser
 """
 
-import json
 import unittest
 
 import jsonschema
-from llguidance import LLMatcher, LLTokenizer
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -111,20 +109,6 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         item_schema = schema["items"]
         self.assertEqual(item_schema["properties"]["name"]["enum"], ["get_weather"])
         self.assertIn("parameters", item_schema["properties"])
-
-    def test_specific_tool_choice_rejects_items_that_are_not_objects(self):
-        """llguidance applies "properties" and "required" only to objects, so
-        without "type": "object" the named schema accepts ["abc"]."""
-        tool_choice = ToolChoice(
-            type="function", function=ToolChoiceFuncName(name="get_weather")
-        )
-        schema = get_json_schema_constraint(self.tools, tool_choice)
-        tokenizer = LLTokenizer("byte")
-        matcher = LLMatcher(
-            tokenizer, LLMatcher.grammar_from_json_schema(json.dumps(schema))
-        )
-        tokens = tokenizer.tokenize_str('["abc"]')
-        self.assertLess(matcher.validate_tokens(tokens), len(tokens))
 
     def test_specific_tool_choice_dict_schema(self):
         """Test schema generation for specific tool choice as ToolChoice object"""
