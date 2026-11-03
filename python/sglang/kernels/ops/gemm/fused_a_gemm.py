@@ -50,6 +50,8 @@ def fused_a_gemm_weight_eligible(
 ) -> bool:
     return (
         layer.weight.dtype == torch.bfloat16
+        # The kernels compute x @ weight.T only, so a biased layer keeps its own path.
+        and layer.bias is None
         and layer.weight.shape[0] % 16 == 0
         and layer.weight.shape[1] % _K_ALIGNMENT[_resolve_backend(backend)] == 0
         and _IS_CUDA
