@@ -443,22 +443,38 @@ class StandalonePDServerBase(CustomTestCase):
         import pynvml
 
         pynvml.nvmlInit()
+        pending_observations = []
         try:
             while True:
                 live = cls.capture_owned(role)
                 holders = []
+                gpu_pids = []
+                unknown_pids = []
                 for index in range(pynvml.nvmlDeviceGetCount()):
                     device = pynvml.nvmlDeviceGetHandleByIndex(index)
                     compute = pynvml.nvmlDeviceGetComputeRunningProcesses(device)
-                    if any(not psutil.pid_exists(row.pid) for row in compute):
-                        raise RuntimeError(
-                            "Cannot attest NVML PIDs in this process namespace"
-                        )
+                    gpu_pids += [row.pid for row in compute]
+                    unknown_pids += [
+                        row.pid for row in compute if not psutil.pid_exists(row.pid)
+                    ]
                     holders += [
                         row.pid
                         for row in compute
                         if row.pid in owner["members"] or row.pid == process.pid
                     ]
+                gpu_pids = sorted(set(gpu_pids))
+                unknown_pids = sorted(set(unknown_pids))
+                if unknown_pids and (
+                    not pending_observations
+                    or pending_observations[-1]["unknown_gpu_pids"] != unknown_pids
+                ):
+                    pending_observations.append(
+                        {
+                            "time": time.time(),
+                            "gpu_pids": gpu_pids,
+                            "unknown_gpu_pids": unknown_pids,
+                        }
+                    )
                 ports = [cls.ports[role]]
                 if role == "prefill":
                     ports.append(cls.bootstrap_port)
@@ -470,11 +486,20 @@ class StandalonePDServerBase(CustomTestCase):
                 owner["cleanup"] = {
                     "members_remaining": live,
                     "owned_gpu_pids_remaining": holders,
+                    "gpu_pids_remaining": gpu_pids,
+                    "unknown_gpu_pids_remaining": unknown_pids,
+                    "nvml_pending_observations": pending_observations,
                     "port_open": port_open,
                     "leader_exit_code": process.returncode,
                     "parent_cleanup_errors": parent_errors,
                 }
-                if not live and not holders and not port_open:
+                if (
+                    not live
+                    and not holders
+                    and not unknown_pids
+                    and not gpu_pids
+                    and not port_open
+                ):
                     if owner["error"] is not None:
                         raise RuntimeError("Owned-process tracking failed") from owner[
                             "error"
@@ -482,7 +507,8 @@ class StandalonePDServerBase(CustomTestCase):
                     break
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
-                        f"{role} did not release: {live=}, {holders=}, {port_open=}"
+                        f"{role} did not release: {live=}, {holders=}, "
+                        f"{gpu_pids=}, {unknown_pids=}, {port_open=}"
                     )
                 time.sleep(0.25)
         finally:
@@ -494,6 +520,24 @@ class StandalonePDServerBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         errors = []
+        # Ask both peers to exit before waiting on either one's GPU release.
+        # NVML can report host PIDs that are not visible to container psutil.
+        for role, process in list(getattr(cls, "processes", {}).items()):
+            try:
+                if process.poll() is None:
+                    owner = cls.owned[role]
+                    leader = psutil.Process(process.pid)
+                    if (
+                        leader.create_time() != owner["leader_create_time"]
+                        or leader.uids().real != owner["uid"]
+                    ):
+                        raise RuntimeError("Refusing reused launcher PID")
+                    leader.terminate()
+            except psutil.NoSuchProcess:
+                # A launcher may exit naturally between poll and lookup.
+                pass
+            except Exception as exc:
+                errors.append(f"{role} initial TERM: {exc}")
         for role in list(getattr(cls, "processes", {})):
             try:
                 cls.stop_server(role)
