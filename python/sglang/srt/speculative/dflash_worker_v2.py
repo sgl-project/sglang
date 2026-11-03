@@ -34,12 +34,11 @@ from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     compute_position,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
 from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
@@ -3032,4 +3031,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
+            kv_weight_version_record=target_out.kv_weight_version_record,
         )
