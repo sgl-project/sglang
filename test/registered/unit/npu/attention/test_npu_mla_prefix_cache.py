@@ -1,6 +1,6 @@
 """MLA prefix compaction across partially filled request pages.
 
-CPU: python -m pytest test/registered/unit/layers/attention/test_npu_mla_prefix_cache.py
+CPU: python -m pytest test/registered/unit/npu/attention/test_npu_mla_prefix_cache.py
 NPU: run the same command with SGLANG_TEST_NPU=1 in an Ascend environment.
 """
 
