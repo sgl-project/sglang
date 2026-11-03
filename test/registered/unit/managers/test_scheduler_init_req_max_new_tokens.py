@@ -1,6 +1,7 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -8,7 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import max_schedulable_input_len
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
@@ -266,7 +267,10 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         )
         req = self._new_req(max_new_tokens=16, input_len=2048)
 
-        with get_serving().override(allow_auto_truncate=True):
+        with mock.patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(allow_auto_truncate=True),
+        ):
             error_msg = scheduler._validate_input_and_init_max_new_tokens(req)
 
         self.assertIsNone(error_msg)
