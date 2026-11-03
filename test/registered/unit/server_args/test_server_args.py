@@ -2134,12 +2134,10 @@ class TestMoriDispatchTokensPerRank(CustomTestCase):
             disaggregation_mode=disaggregation_mode,
         )
 
-    def test_unset_follows_per_rank_chunked_prefill(self):
+    def test_dispatch_tokens_per_rank(self):
         server_args = self._server_args(8192)
         self.assertEqual(mori_max_dispatch_tokens_per_rank(server_args), 8192)
         handle_a2a_moe(server_args)
-
-    def test_unset_never_below_default(self):
         self.assertEqual(
             mori_max_dispatch_tokens_per_rank(self._server_args(1024)), 4096
         )
@@ -2147,7 +2145,6 @@ class TestMoriDispatchTokensPerRank(CustomTestCase):
             mori_max_dispatch_tokens_per_rank(self._server_args(8192, "decode")), 4096
         )
 
-    def test_explicit_value_wins(self):
         envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.set(2048)
         server_args = self._server_args(8192)
         self.assertEqual(mori_max_dispatch_tokens_per_rank(server_args), 2048)

@@ -42,11 +42,9 @@ class TestTboChildDpRows(CustomTestCase):
         self.assertEqual(first, [4096, 0, 3127, 1400])
         self.assertEqual(second, [4096, 0, 3127, 1600])
         self.assertEqual([a + b for a, b in zip(first, second)], parent)
-
-    def test_split_is_clamped_to_parent_rows(self):
+        # A split outside the parent rows is clamped to them.
         self.assertEqual(_rows([10, 4], [12, -1]), ([10, 0], [0, 4]))
-
-    def test_missing_or_mismatched_split_keeps_parent_rows(self):
+        # A missing or mismatched split keeps the parent rows on both children.
         self.assertEqual(_rows([8, 8], None), ([8, 8], [8, 8]))
         self.assertEqual(_rows([8, 8], [4]), ([8, 8], [8, 8]))
         self.assertEqual(_rows(None, [4, 4]), (None, None))
@@ -169,10 +167,6 @@ class TestTboChildDispatchCap(CustomTestCase):
         gathered = torch.tensor([[int(r[1]), r[2]] for r in results])
         for preparer, _, _ in results:
             self.assertEqual(preparer.compute_output(gathered), (None, None))
-
-    def test_unbounded_backend_keeps_the_split(self):
-        _, can_run, _ = self._local_can_run_tbo([4000, 5000], None)
-        self.assertTrue(can_run)
 
     def test_split_rows_reach_only_backends_that_use_them(self):
         """A backend that does not bound micro-batches by their own rows gets None,

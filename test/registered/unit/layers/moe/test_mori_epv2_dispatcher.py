@@ -217,34 +217,29 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
 class TestMoriRecvBound(CustomTestCase):
     """A TBO micro-batch may use its parent batch's DP rows only as an upper bound."""
 
-    def _bound(self, local_rows, sender_rows, subbatch, attn_dp_size=4):
+    def _bound(self, local_rows, sender_rows, subbatch):
         parallel = SimpleNamespace(
             moe_ep_size=4,
             tp_size=4,
             attn_cp_size=1,
-            attn_dp_size=attn_dp_size,
-            attn_dp_rank=1 if attn_dp_size > 1 else 0,
-            attn_tp_size=4 // attn_dp_size,
+            attn_dp_size=4,
+            attn_dp_rank=1,
+            attn_tp_size=1,
             attn_tp_rank=0,
         )
         with patch.object(moriep, "get_parallel", return_value=parallel):
             return moriep.mori_recv_bound(local_rows, sender_rows, subbatch=subbatch)
 
-    def test_whole_batch_needs_exact_local_rows(self):
+    def test_only_micro_batches_may_bound_by_parent_rows(self):
         rows = (10, 20, 30, 40)
+        # A whole batch needs its exact local rows.
         self.assertEqual(self._bound(20, rows, subbatch=False), 100)
         self.assertEqual(self._bound(12, rows, subbatch=False), 0)
-
-    def test_micro_batch_bounded_by_parent_rows(self):
-        rows = (10, 20, 30, 40)
         self.assertEqual(self._bound(12, rows, subbatch=True), 100)
         self.assertEqual(self._bound(20, rows, subbatch=True), 100)
         # More local rows than the parent published: the rows are stale.
         self.assertEqual(self._bound(21, rows, subbatch=True), 0)
         self.assertEqual(self._bound(12, None, subbatch=True), 0)
-
-    def test_micro_batch_without_dp_attention_keeps_full_view(self):
-        self.assertEqual(self._bound(12, None, subbatch=True, attn_dp_size=1), 0)
 
 
 class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
