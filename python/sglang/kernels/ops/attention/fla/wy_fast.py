@@ -39,6 +39,8 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    v_stride_t=0,
+    STRIDED_V: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -66,14 +68,24 @@ def recompute_w_u_fwd_kernel(
     b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
 
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
+        if STRIDED_V:
+            p_v = tl.make_block_ptr(
+                v + bos.to(tl.int64) * v_stride_t + i_h * V,
+                (T, V),
+                (v_stride_t, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
+            )
+        else:
+            p_v = tl.make_block_ptr(
+                v + (bos * H + i_h) * V,
+                (T, V),
+                (H * V, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
+            )
         p_u = tl.make_block_ptr(
             u + (bos * H + i_h) * V,
             (T, V),
@@ -128,7 +140,15 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
+    # A single-batch v whose heads are contiguous rows of V (e.g. a split of a
+    # packed projection) is read in place; other layouts are copied.
+    strided_v_args = {}
+    if not v.is_contiguous():
+        if B == 1 and v.stride(-1) == 1 and v.stride(-2) == V:
+            strided_v_args = {"v_stride_t": v.stride(1), "STRIDED_V": True}
+        else:
+            v = v.contiguous()
+    u = v.new_empty(B, T, H, V)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
@@ -151,6 +171,7 @@ def recompute_w_u_fwd(
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=3,
+        **strided_v_args,
     )
     return w, u
 

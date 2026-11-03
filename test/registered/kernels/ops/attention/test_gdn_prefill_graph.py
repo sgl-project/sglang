@@ -111,6 +111,7 @@ def _batch(extend_lens, prefix_lens, track=None):
         extend_seq_lens=torch.tensor(extend_lens, device=dev),
         extend_prefix_lens=torch.tensor(prefix_lens, device=dev),
         extend_start_loc=torch.tensor(starts, device=dev),
+        extend_num_tokens=sum(extend_lens),
         extend_seq_lens_cpu=list(extend_lens),
         extend_prefix_lens_cpu=list(prefix_lens),
         tbo_parent_token_range=None,

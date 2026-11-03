@@ -1333,6 +1333,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
+            and not (
+                not is_target_verify
+                and self.kernel_dispatcher.extend_kernel.supports_strided_extend_qkv
+            )
         ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
@@ -1454,6 +1458,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     if h_track_buf is not None
                     else None
                 ),
+                no_padding_rows=forward_batch.extend_num_tokens == actual_seq_len,
             )
 
             if is_npu() and last_recurrent_state is not None:

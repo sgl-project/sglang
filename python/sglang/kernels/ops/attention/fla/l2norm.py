@@ -119,6 +119,74 @@ def l2norm_fwd(
     return y.view(x_shape_og)
 
 
+@triton.jit(do_not_specialize=["N"])
+def l2norm_fwd_strided_kernel(
+    x,
+    y,
+    eps,
+    N,
+    stride_t,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # Row r of the N = T * H rows is head r % H of token r // H. Each program
+    # loads the same [BT, BD] block of rows that l2norm_fwd_kernel loads from
+    # the contiguous copy, so every row is reduced in the same order.
+    o_r = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m = (o_r < N)[:, None] & (o_d < D)[None, :]
+    p_x = x + ((o_r // H) * stride_t + (o_r % H) * D)[:, None] + o_d[None, :]
+    b_x = tl.load(p_x, mask=m, other=0.0).to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1)
+    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    p_y = y + (o_r * D)[:, None] + o_d[None, :]
+    tl.store(p_y, b_y.to(y.dtype.element_ty), mask=m)
+
+
+def l2norm_fwd_strided_supported(x: torch.Tensor) -> bool:
+    """Whether l2norm_fwd_strided(x) matches l2norm_fwd(x.contiguous()) bit for bit.
+
+    x is a [1, T, H, D] view whose H heads are contiguous rows of D and whose
+    tokens are x.stride(1) apart, e.g. a split of a packed projection. The
+    16-element alignment keeps the vectorized load layout of the contiguous copy.
+    """
+    return (
+        x.dim() == 4
+        and x.shape[0] == 1
+        and x.shape[-1] <= 512
+        and x.stride(-1) == 1
+        and x.stride(-2) == x.shape[-1]
+        and x.stride(1) % 16 == 0
+        and x.data_ptr() % 16 == 0
+    )
+
+
+def l2norm_fwd_strided(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """l2norm_fwd(x.contiguous(), eps) without the copy; see l2norm_fwd_strided_supported."""
+    _, T, H, D = x.shape
+    y = x.new_empty(x.shape)
+    N = T * H
+    if N == 0:
+        return y
+    BT = 16
+    l2norm_fwd_strided_kernel[(triton.cdiv(N, BT),)](
+        x,
+        y,
+        eps,
+        N=N,
+        stride_t=x.stride(1),
+        H=H,
+        D=D,
+        BT=BT,
+        BD=triton.next_power_of_2(D),
+        num_warps=8,
+        num_stages=3,
+    )
+    return y
+
+
 @triton.jit(do_not_specialize=["T"])
 def gdn_prefill_qkv_prepare_kernel(
     q,

@@ -3,7 +3,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -42,6 +42,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    supports_strided_extend_qkv: bool = is_cuda()
 
     def packed_decode(
         self,
@@ -183,6 +184,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        padding_args = {"no_padding_rows": kwargs.get("no_padding_rows", False)}
         # Static tables of a CUDA-graph captured prefill (gdn_prefill_graph.py).
         graph_table_args = {}
         if kwargs.get("chunk_indices") is not None:
@@ -196,6 +198,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
                     "GDN multi-item scoring is not supported by the CPU chunk kernel"
                 )
             inplace_update_args = {}
+            padding_args = {}
         elif is_npu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -206,6 +209,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # The external NPU kernel does not expose the optional write-back
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
+            padding_args = {}
 
         return chunk_gated_delta_rule(
             q=q,
@@ -219,6 +223,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **padding_args,
             **graph_table_args,
         )
 

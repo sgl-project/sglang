@@ -135,6 +135,7 @@ def chunk_fwd_o(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
     chunk_indices: Optional[torch.LongTensor] = None,
+    no_padding_rows: bool = False,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -145,7 +146,9 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
+    # The kernel stores every row of every sequence; only rows past
+    # cu_seqlens[-1] (a padded batch) rely on the zero fill.
+    o = torch.empty_like(v) if no_padding_rows else torch.zeros_like(v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
