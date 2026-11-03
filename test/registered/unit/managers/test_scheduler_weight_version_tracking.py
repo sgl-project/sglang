@@ -35,6 +35,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -65,29 +66,17 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.addCleanup(patcher.stop)
         return serving
 
-    def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
-            deferred_responses=DeferredResponses(
-                disaggregation_mode=DisaggregationMode.NULL,
-                output_streamer=None,
-                send_abort=None,
-            ),
-            waiting_queue=list(waiting),
-            chunked_req=chunked,
-            hisparse_coordinator=(
-                SimpleNamespace(ack_staging_queue=list(staging)) if staging else None
-            ),
-        )
-
     def test_every_source_of_live_requests_is_stamped(self):
         """A request missed here keeps attributing its next tokens to the superseded version."""
         self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
-        scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
+        running, queued, chunked, staged = (object() for _ in range(4))
+        scheduler = Scheduler.__new__(Scheduler)
+        empty_request_lists(scheduler)
+        scheduler.running_reqs.join([running])
+        scheduler.waiting_queue = [queued]
+        scheduler.chunked_req = chunked
+        scheduler.hisparse_coordinator = SimpleNamespace(
+            request_lists=lambda: {ListKind.HISPARSE_STAGING: [staged]}
         )
 
         with patch(
@@ -97,7 +86,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
         self.assertEqual(
-            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
+            set(recorder.call_args.args[0]), {running, queued, chunked, staged}
         )
 
 
