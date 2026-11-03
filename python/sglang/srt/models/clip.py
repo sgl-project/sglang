@@ -468,7 +468,6 @@ class CLIPVisionTransformer(nn.Module):
         config: CLIPVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        require_post_norm: bool = True,
     ) -> None:
         super().__init__()
 
@@ -494,13 +493,9 @@ class CLIPVisionTransformer(nn.Module):
                 f"layers, but you requested {len(self.encoder.layers)} layers."
             )
 
-        # HF post-norms only the pooled CLS token; VLM towers read per-token states
-        # and never use it, so they can skip building the layer.
-        self.post_layernorm = (
-            nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-            if require_post_norm
-            else None
-        )
+        # As in HF, applied only to the pooled CLS token (CLIPModel.forward);
+        # forward() returns the un-normed encoder states.
+        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
     @property
     def device(self) -> torch.device:
@@ -514,16 +509,12 @@ class CLIPVisionTransformer(nn.Module):
         hidden_states = self.embeddings(pixel_values.to(self.device))
         hidden_states = self.pre_layrnorm(hidden_states)
 
-        encoder_outputs = self.encoder(
+        # Matches HF's `last_hidden_state`, or with output_hidden_states its
+        # `hidden_states`: entry 0 is the pre_layrnorm'd embedding, entry i layer i.
+        return self.encoder(
             inputs_embeds=hidden_states,
             return_all_hidden_states=output_hidden_states,
         )
-
-        # Matches HF's `hidden_states`: entry 0 is the pre_layrnorm'd embedding and
-        # entry i the output of layer i, none of them post_layernorm'd.
-        if output_hidden_states or self.post_layernorm is None:
-            return encoder_outputs
-        return self.post_layernorm(encoder_outputs)
 
 
 class CLIPVisionOutput(NamedTuple):
@@ -541,15 +532,11 @@ class CLIPVisionModel(nn.Module):
         config: CLIPVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        require_post_norm: bool = True,
     ):
         super().__init__()
         self.config = config
         self.vision_model = CLIPVisionTransformer(
-            config,
-            quant_config,
-            prefix=add_prefix("vision_model", prefix),
-            require_post_norm=require_post_norm,
+            config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
 
     @property
@@ -572,12 +559,6 @@ class CLIPVisionModel(nn.Module):
         return self.vision_model(pixel_values)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        if self.vision_model.post_layernorm is None:
-            weights = (
-                (name, weight)
-                for name, weight in weights
-                if not name.startswith("vision_model.post_layernorm.")
-            )
         load_clip_weights(dict(self.named_parameters()), weights)
 
 
@@ -649,7 +630,7 @@ class CLIPModel(nn.Module):
         if len(pixel_values_list) != 0:
             pixel_values = torch.concat(pixel_values_list)
             vision_outputs = self.vision_model(pixel_values)
-            pooled_output = vision_outputs[:, 0, :]
+            pooled_output = self.vision_model.post_layernorm(vision_outputs[:, 0, :])
             image_embeds = self.visual_projection(pooled_output)
             image_embeds = nn.functional.normalize(image_embeds, p=2, dim=1)
             return EmbeddingPoolerOutput(embeddings=image_embeds)
