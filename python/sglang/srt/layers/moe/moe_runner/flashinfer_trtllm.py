@@ -1521,20 +1521,31 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     defer_finalize = _deferred_finalize_enabled.get() and hidden_pad == 0
     if defer_finalize:
         valid_deferred_input = (
-            use_routed_topk and TopKOutputChecker.format_is_standard(topk_output)
+            use_routed_topk
+            and (
+                TopKOutputChecker.format_is_standard(topk_output)
+                or TopKOutputChecker.format_is_packed(topk_output)
+            )
         ) or (not use_routed_topk and TopKOutputChecker.format_is_bypassed(topk_output))
         if not valid_deferred_input:
             raise RuntimeError(
-                "FP4 deferred finalize requires either materialized routed TopK "
+                "FP4 deferred finalize requires materialized or packed routed TopK "
                 "or the logits-based bypassed TopK input"
             )
 
     symm_output = None
-    if not defer_finalize:
-        num_tokens = hs_fp4.shape[0]
-        hidden_size = (
-            hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
-        )
+    num_tokens = hs_fp4.shape[0]
+    hidden_size = (
+        hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+    )
+    if defer_finalize:
+        if use_routed_topk:
+            # Workaround for flashinfer-ai/flashinfer#6077: the ignored buffer's shape
+            # keeps the autotune lookup on the tuned entry; drop once fixed upstream.
+            symm_output = torch.empty(
+                num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+            )
+    else:
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
         output_dtype = (
@@ -1584,7 +1595,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
-        if not defer_finalize:
+        if symm_output is not None:
             moe_kwargs["output"] = symm_output
         result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
         if defer_finalize:

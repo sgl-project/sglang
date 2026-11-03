@@ -22,7 +22,7 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=43, suite="base-a-test-cpu")
 
 
 class TestUnifiedJointAllocationEviction(CustomTestCase):
@@ -47,7 +47,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             for layer, member in enumerate(
                 (allocator.full_attn_allocator, allocator.swa_attn_allocator)
             ):
-                ids = member.translate_kv_loc(slots)
+                ids = member.ids.translate(slots)
                 marker = slots.to(torch.float16).view(-1, 1, 1) + 1000 * layer
                 kv.get_key_buffer(layer)[ids] = marker
                 kv.get_value_buffer(layer)[ids] = marker + 100
@@ -69,7 +69,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             for layer, member in enumerate(
                 (allocator.full_attn_allocator, allocator.swa_attn_allocator)
             ):
-                ids = member.translate_kv_loc(slots)
+                ids = member.ids.translate(slots)
                 marker = slots.to(torch.float16).view(-1, 1, 1) + 1000 * layer
                 self.assertTrue(torch.all(kv.get_key_buffer(layer)[ids] == marker))
                 self.assertTrue(
@@ -180,10 +180,6 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
     def test_exact_extend_demand_preserves_other_allocator_dispatch(self):
         from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedMambaSWATokenToKVPoolAllocator,
-            UnifiedSWAAllocatorBase,
-        )
 
         allocator, _ = self.build_cache(occupancy=0, page_size=4)
         prefix = torch.tensor([1, 4, 7])
@@ -198,16 +194,6 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             ),
             31,
         )
-        self.assertIs(
-            UnifiedSWAAllocatorBase.get_extend_allocation_demand,
-            BaseTokenToKVPoolAllocator.get_extend_allocation_demand,
-        )
-        self.assertEqual(
-            UnifiedMambaSWATokenToKVPoolAllocator.get_extend_allocation_demand(
-                allocator, prefix, seq, **kwargs
-            ),
-            8,
-        )
         self.assertEqual(
             BaseTokenToKVPoolAllocator.get_extend_allocation_demand(
                 allocator, prefix, seq, **kwargs
@@ -217,9 +203,6 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
     def test_page128_partial_extend_and_conservative_fallback(self):
         from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedMambaSWATokenToKVPoolAllocator,
-        )
 
         allocator, _ = self.build_cache(occupancy=0, page_size=128)
         for prefix, seq, expected in (
@@ -232,22 +215,18 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         ):
             with self.subTest(prefix=prefix, seq=seq):
                 p, q = torch.tensor(prefix), torch.tensor(seq)
-                for query in (
-                    type(allocator).get_extend_allocation_demand,
-                    UnifiedMambaSWATokenToKVPoolAllocator.get_extend_allocation_demand,
-                ):
-                    self.assertEqual(
-                        query(
-                            allocator, p, q, conservative_num_tokens=1024, shard_size=1
-                        ),
-                        expected,
-                    )
-                    self.assertEqual(
-                        query(
-                            allocator, p, q, conservative_num_tokens=1024, shard_size=2
-                        ),
-                        1024,
-                    )
+                self.assertEqual(
+                    allocator.get_extend_allocation_demand(
+                        p, q, conservative_num_tokens=1024, shard_size=1
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    allocator.get_extend_allocation_demand(
+                        p, q, conservative_num_tokens=1024, shard_size=2
+                    ),
+                    1024,
+                )
                 self.assertEqual(
                     BaseTokenToKVPoolAllocator.get_extend_allocation_demand(
                         allocator, p, q, conservative_num_tokens=1024, shard_size=1
@@ -279,11 +258,11 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
     def test_shared_virtual_id_limit_is_independent_of_swa_bytes(self):
         allocator, cache = self.build_cache(occupancy=0, ratio=(4, 1))
         fa, sa = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        demand = fa.num_virtual_ids - fa.min_page_index + 1
+        demand = fa.ids.num_virtual_ids - fa.min_page_index + 1
         # Asymmetric SWA restore demand fits bytes/physical SWA slots, but
         # cannot address more virtual pages than its FULL ID owner provides.
         self.assertLess(
-            demand * sa.entry_bytes_per_page, allocator._empty_shared_gap_bytes
+            demand * sa.entry_bytes_per_page, allocator._policy._empty_shared_gap_bytes
         )
         self.assertLess(demand, sa.num_pages - sa.min_page_index)
         self.assertIsNone(allocator.reclaim_plan(0, demand, empty_pool=True))
@@ -343,7 +322,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 extra_tokens = sum(b - a for a, b in zip(prefixes, lengths))
                 before_pages = allocator.full_attn_allocator.allocated_count() // 4
                 with patch(
-                    "sglang.srt.mem_cache.allocator.unified_sub_pool.alloc_extend_kernel",
+                    "sglang.srt.mem_cache.kv.alloc.chain.alloc_extend_kernel",
                     CPUReferenceKernel(),
                 ):
                     out = alloc_paged_token_slots_extend(
@@ -391,8 +370,8 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             for member in allocator._flush_targets():
                 members.append(
                     (
-                        member.virtual_to_physical.tolist(),
-                        member.physical_to_virtual.tolist(),
+                        member.ids.virtual_to_physical.tolist(),
+                        member.ids.physical_to_virtual.tolist(),
                         member._free_phys_pages.tolist(),
                         member._byte_low_frontier(),
                         member._byte_high_frontier(),
@@ -404,12 +383,12 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         before = snapshot()
         for gate in (False, True):
             for member in allocator._flush_targets():
-                member.disagg_move_gate = lambda: gate
+                member.pin_sources = (lambda: not gate,)
             for _ in range(20):
                 allocator.reclaim_plan(4, 4)
             self.assertEqual(snapshot(), before)
         for member in allocator._flush_targets():
-            member.disagg_move_gate = None
+            member.pin_sources = ()
         self.assertTrue(evict_from_tree_cache(cache, 4))
         self.assertIsNotNone(allocator.alloc(4))
         self.assertEqual(cache.full_evictable_size(), 94)
@@ -452,7 +431,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertEqual(allocator.available_size(), 3)
         kv = allocator.get_kvcache()
         for layer, member in enumerate(allocator._flush_targets()):
-            ids = member.translate_kv_loc(slots[12:13])
+            ids = member.ids.translate(slots[12:13])
             kv.get_key_buffer(layer)[ids] = 17 + layer
             kv.get_value_buffer(layer)[ids] = 117 + layer
         original = cache._evict_device_next_node
@@ -489,7 +468,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         )
         torch.testing.assert_close(actual, slots[12:13])
         for layer, member in enumerate(allocator._flush_targets()):
-            ids = member.translate_kv_loc(actual)
+            ids = member.ids.translate(actual)
             self.assertTrue(torch.all(kv.get_key_buffer(layer)[ids] == 17 + layer))
             self.assertTrue(torch.all(kv.get_value_buffer(layer)[ids] == 117 + layer))
         self.assertFalse(allocator.verify_byte_accounting())

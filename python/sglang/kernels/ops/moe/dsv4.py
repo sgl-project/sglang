@@ -132,6 +132,7 @@ def mega_moe_pre_dispatch(
     shared_x_sf: Optional[torch.Tensor] = None,
     shared_block_m: int = 0,
     copy_topk: bool = True,
+    topk_weight_scale: float = 1.0,
 ) -> None:
     if x.shape[0] == 0 and x.stride(0) != x.shape[1]:
         x = x.new_empty(x.shape)
@@ -149,6 +150,7 @@ def mega_moe_pre_dispatch(
         buf_topk_weights,
         shared_x_sf,
         shared_block_m,
+        topk_weight_scale,
     )
 
 

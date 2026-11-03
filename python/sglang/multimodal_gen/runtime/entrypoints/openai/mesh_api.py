@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -241,12 +241,12 @@ async def create_mesh(
 @router.get("", response_model=MeshListResponse)
 async def list_meshes(
     after: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=100),
-    order: Optional[str] = Query("desc"),
+    limit: int = Query(20, ge=1, le=100),
+    order: Literal["asc", "desc"] = Query("desc"),
 ):
-    jobs = await MESH_STORE.list_page(after=after, limit=limit, order=order)
-    items = [MeshResponse(**job) for job in jobs]
-    return MeshListResponse(data=items)
+    return MeshListResponse(
+        **await MESH_STORE.list_page(after=after, limit=limit, order=order)
+    )
 
 
 @router.get("/{mesh_id}", response_model=MeshResponse)

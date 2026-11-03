@@ -1,6 +1,6 @@
 ---
 name: write-sglang-test
-description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI registration, server fixtures, model selection, mock testing, and test placement. Always read test/README.md for the full CI layout, how to run tests, and extra tips. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
+description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI registration, which tier (base, extra, nightly, weekly) and runner a test belongs to, server fixtures, model selection, mock testing, and test placement. Always read test/README.md for the full CI layout, how to run tests, and extra tips. Use when creating new tests, adding CI test cases, writing unit tests, moving a test between tiers, or when the user asks to add tests for SGLang features.
 ---
 
 # Writing SGLang CI / UT Tests
@@ -49,7 +49,7 @@ JIT kernel notes:
 | **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `base-b-test-1-gpu-small` |
 | **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `base-b-test-1-gpu-small` |
 | **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `base-b-test-1-gpu-large` |
-| **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See **Choosing a Suite** below |
+| **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See **Choosing a Tier** and **Choosing a Runner** below |
 
 **Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
 
@@ -98,9 +98,25 @@ per-purpose split; kernel, eval, perf, and precision all share their machine's s
 
 > **Note**: Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
-### Choosing a Suite
+### Choosing a Tier
 
-Use the lightest suite that meets your test's needs:
+The stage sets how often a test runs; when each tier runs is in [ci-workflow-guide, Tiers](../ci-workflow-guide/SKILL.md#tiers). Tests outside base do not run on a normal PR, but `/rerun-test` runs a test of any tier on a PR (see the [rerun-test](../rerun-test/SKILL.md) skill). As a rough guide:
+
+- **base**: core paths that most users hit with default settings, cheap unit tests, and a representative e2e for each major feature. Every PR pays for it, so keep it small.
+- **extra**: features with real users that are off the default path, the current flagship models, and important accuracy gates.
+- **nightly**: niche configurations, and accuracy or performance gates for less-used models.
+- **weekly**: older or rarely used models, kept covered at low cost.
+
+When unsure, follow where similar tests are registered and raise the choice in the PR.
+
+Across tiers:
+
+- **Change the stage, not the runner.** When the target tier lacks the test's runner, add that runner to the tier ([ci-workflow-guide](../ci-workflow-guide/SKILL.md#how-to-add-a-runner-to-a-tier)).
+- **CPU tests stay in `base-a-test-cpu`.** They are cheap and surface problems on every PR; a CPU test that is redundant or never runs is deleted, not moved to a later tier.
+
+### Choosing a Runner
+
+Use the lightest runner that meets your test's needs:
 
 - **No GPU required** → `base-a-test-cpu`
 - **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
@@ -129,7 +145,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-# Unit tests are CPU-only. GPU operator tests belong under `kernel/`.
+# Unit tests are CPU-only. GPU operator tests belong under `kernels/ops/`.
 
 class TestTargetClass(CustomTestCase):
     def test_basic_behavior(self):
@@ -361,7 +377,7 @@ Every call generates a suite named `{stage}-test-{runner_config}`, e.g. `base-b-
 test/
 ├── registered/          # CI tests (auto-discovered by run_suite.py)
 │   ├── unit/<subsystem>/      # CPU-only; no server or model weights
-│   ├── kernel/<group>/        # accelerator operator correctness/benchmarks
+│   ├── kernels/{ops,benchmark}/<group>/  # accelerator operator correctness/benchmarks
 │   ├── e2e/<subsystem>/       # engine/server integration
 │   ├── accuracy/<family>/     # scheduled eval floors
 │   ├── perf/<family>/         # scheduled latency/throughput contracts

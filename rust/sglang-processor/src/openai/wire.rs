@@ -3,6 +3,9 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
+use sglang_api_types::api::v1::{
+    FinishReason, GenerateMetaInfo, GenerateResponse, GenerateStreamError, finish_reason,
+};
 
 use crate::py::python_json;
 
@@ -32,14 +35,26 @@ pub(super) fn stream_error_event(message: &str, err_type: &str, code: u16) -> St
     format!("data: {}\n\n", python_json(&error, true))
 }
 
-/// The OpenAI reply for a `/generate` error response. `None` passes the
-/// engine's reply through: SGLang answers its other errors, such as an
-/// `HTTPException`, in the OpenAI error shape on every route.
-pub(super) fn engine_error_reply(body: &[u8]) -> Option<Reply> {
-    let body: Value = serde_json::from_slice(body).ok()?;
-    // A ValueError: `/generate` answers `{"error": {"message"}}`, OpenAI a 400.
-    let message = body.pointer("/error/message")?.as_str()?;
-    Some(error_reply(message, "BadRequestError", 400))
+/// A native `/generate` error's message, OpenAI type and status. Python's
+/// `/generate` sends no code (a ValueError, so a 400); an engine that sends one
+/// keeps its status, typed as `create_error_response` types it.
+fn engine_error_parts(error: GenerateStreamError) -> (String, String, u16) {
+    let error = error.error.unwrap_or_default();
+    let code = u16::try_from(error.code)
+        .ok()
+        .filter(|code| (400..600).contains(code))
+        .unwrap_or(400);
+    let err_type = match code {
+        400 => "BadRequestError".to_owned(),
+        _ => code.to_string(),
+    };
+    (error.message, err_type, code)
+}
+
+/// The OpenAI reply for a native `/generate` error.
+pub(super) fn engine_error_reply(error: GenerateStreamError) -> Reply {
+    let (message, err_type, code) = engine_error_parts(error);
+    error_reply(&message, &err_type, code)
 }
 
 /// Python's answer when the engine output lacks what the OpenAI layer reads.
@@ -48,22 +63,49 @@ pub(super) fn malformed_output_reply(missing: &str) -> Reply {
     error_reply(&message, "InternalServerError", 500)
 }
 
-/// `HTTPStatus(code).name` for the codes SGLang aborts with.
+/// `HTTPStatus(code).name` for an error status, as Python 3.12 names it.
 pub(super) fn http_status_name(code: u64) -> Option<&'static str> {
     Some(match code {
         400 => "BAD_REQUEST",
         401 => "UNAUTHORIZED",
+        402 => "PAYMENT_REQUIRED",
         403 => "FORBIDDEN",
         404 => "NOT_FOUND",
+        405 => "METHOD_NOT_ALLOWED",
+        406 => "NOT_ACCEPTABLE",
+        407 => "PROXY_AUTHENTICATION_REQUIRED",
         408 => "REQUEST_TIMEOUT",
+        409 => "CONFLICT",
+        410 => "GONE",
+        411 => "LENGTH_REQUIRED",
+        412 => "PRECONDITION_FAILED",
         413 => "REQUEST_ENTITY_TOO_LARGE",
+        414 => "REQUEST_URI_TOO_LONG",
+        415 => "UNSUPPORTED_MEDIA_TYPE",
+        416 => "REQUESTED_RANGE_NOT_SATISFIABLE",
+        417 => "EXPECTATION_FAILED",
+        418 => "IM_A_TEAPOT",
+        421 => "MISDIRECTED_REQUEST",
         422 => "UNPROCESSABLE_ENTITY",
+        423 => "LOCKED",
+        424 => "FAILED_DEPENDENCY",
+        425 => "TOO_EARLY",
+        426 => "UPGRADE_REQUIRED",
+        428 => "PRECONDITION_REQUIRED",
         429 => "TOO_MANY_REQUESTS",
+        431 => "REQUEST_HEADER_FIELDS_TOO_LARGE",
+        451 => "UNAVAILABLE_FOR_LEGAL_REASONS",
         500 => "INTERNAL_SERVER_ERROR",
         501 => "NOT_IMPLEMENTED",
         502 => "BAD_GATEWAY",
         503 => "SERVICE_UNAVAILABLE",
         504 => "GATEWAY_TIMEOUT",
+        505 => "HTTP_VERSION_NOT_SUPPORTED",
+        506 => "VARIANT_ALSO_NEGOTIATES",
+        507 => "INSUFFICIENT_STORAGE",
+        508 => "LOOP_DETECTED",
+        510 => "NOT_EXTENDED",
+        511 => "NETWORK_AUTHENTICATION_REQUIRED",
         _ => return None,
     })
 }
@@ -76,6 +118,8 @@ pub(super) fn usage(prompt: u64, completion: u64, reasoning: u64, cached: Option
         "completion_tokens": completion,
         "prompt_tokens_details": cached.map(|n| json!({"cached_tokens": n})),
         "reasoning_tokens": reasoning,
+        // OpenAI's place for the reasoning count, set only when there is some.
+        "completion_tokens_details": (reasoning > 0).then(|| json!({"reasoning_tokens": reasoning})),
     })
 }
 
@@ -88,46 +132,39 @@ pub(super) fn now() -> u64 {
 /// The non-streaming response over `ret`, the `/generate` items for `choices`.
 /// Prompt and cached tokens count once per prompt, i.e. every `n`-th item.
 pub(super) fn unary_reply(
-    ret: &[Value],
+    ret: &[GenerateResponse],
     n: usize,
     cache_report: bool,
     object: &str,
     model: &str,
     choices: Vec<Value>,
 ) -> Option<Reply> {
-    let first = &ret.first()?["meta_info"];
-    let stride = |key: &str| -> u64 {
+    let first = ret.first()?.meta_info.as_ref();
+    let sum = |stride: usize, field: fn(&GenerateMetaInfo) -> u64| -> u64 {
         ret.iter()
-            .step_by(n)
-            .map(|r| meta_u64(&r["meta_info"], key))
+            .step_by(stride)
+            .filter_map(|r| r.meta_info.as_ref())
+            .map(field)
             .sum()
     };
-    let all = |key: &str| -> u64 { ret.iter().map(|r| meta_u64(&r["meta_info"], key)).sum() };
-    let cached = cache_report.then(|| stride("cached_tokens"));
-    let mut metadata = json!({"weight_version": first["weight_version"]});
-    if let Some(versions) = first.get("weight_versions") {
-        metadata["weight_versions"] = versions.clone();
+    let cached = cache_report.then(|| sum(n, |m| u64::from(m.cached_tokens)));
+    let mut metadata = json!({"weight_version": first.and_then(|m| m.weight_version.as_deref())});
+    if let Some(meta) = first.filter(|m| !m.weight_versions.is_empty()) {
+        metadata["weight_versions"] = json!(meta.weight_versions);
     }
     let response = json!({
-        "id": first["id"],
+        "id": first.map(|m| &m.id),
         "object": object,
         "created": now(),
         "model": model,
         "choices": choices,
-        "usage": usage(stride("prompt_tokens"), all("completion_tokens"), all("reasoning_tokens"), cached),
+        "usage": usage(sum(n, |m| u64::from(m.prompt_tokens)), sum(1, |m| m.completion_tokens), sum(1, |m| m.reasoning_tokens), cached),
         "metadata": metadata,
     });
     Some(Reply {
         status: 200,
         body: response.to_string(),
     })
-}
-
-/// What a stream does with one `/generate` SSE payload.
-pub(super) enum Payload {
-    Done,
-    Frame(Value),
-    Events(Vec<String>),
 }
 
 /// Stream state both endpoints keep: whether it started, stopped or failed,
@@ -138,7 +175,7 @@ pub(super) struct StreamState {
     pub stopped: bool,
     pub failed: bool,
     pub done: bool,
-    pub last_id: Value,
+    pub last_id: String,
     /// Per choice: characters of cumulative text and logprobs already sent.
     pub text_offsets: HashMap<u64, usize>,
     pub logprob_counts: HashMap<u64, usize>,
@@ -149,31 +186,30 @@ pub(super) struct StreamState {
 }
 
 impl StreamState {
-    /// The checks Python makes before reading a frame. `Err` replaces the
-    /// whole stream, before anything was sent.
-    pub(super) fn payload(&mut self, data: &[u8]) -> Result<Payload, Reply> {
-        if self.done {
-            return Ok(Payload::Events(Vec::new()));
-        }
-        if data == b"[DONE]" {
-            return Ok(Payload::Done);
-        }
-        let Ok(content) = serde_json::from_slice::<Value>(data) else {
-            return Ok(Payload::Events(Vec::new()));
-        };
-        if let Some(message) = content.pointer("/error/message").and_then(Value::as_str) {
-            if !self.started {
-                return Err(error_reply(message, "BadRequestError", 400));
+    /// An engine error replaces the reply until the first chunk has been sent.
+    pub(super) fn error(&mut self, error: GenerateStreamError) -> Result<Vec<String>, Reply> {
+        let (message, err_type, code) = engine_error_parts(error);
+        if !self.started {
+            // Python's `/generate` streams a scheduler abort as a frame and
+            // sends only 400 error frames, so a 500 is a host's own failure:
+            // `handle_request`'s generic `InternalServerError`.
+            if code == 500 {
+                let message = format!("Internal server error: {message}");
+                return Err(error_reply(&message, "InternalServerError", code));
             }
-            self.failed = true;
-            return Ok(Payload::Events(vec![stream_error_event(
-                message,
-                "BadRequestError",
-                400,
-            )]));
+            return Err(error_reply(&message, &err_type, code));
         }
-        self.started = true;
-        Ok(Payload::Frame(content))
+        self.failed = true;
+        // Mid-stream, Python's abort event is typed by the status's name.
+        let event_type = match code {
+            400 => None,
+            _ => http_status_name(code.into()),
+        };
+        Ok(vec![stream_error_event(
+            &message,
+            event_type.unwrap_or(&err_type),
+            code,
+        )])
     }
 
     /// An abort or error just ended the stream; Python stops there, without
@@ -183,14 +219,12 @@ impl StreamState {
     }
 
     /// Record the frame's id and choice `index`'s token counts.
-    pub(super) fn record(&mut self, index: u64, meta: &Value) {
-        self.last_id = meta["id"].clone();
-        self.prompt.insert(index, meta_u64(meta, "prompt_tokens"));
-        self.completion
-            .insert(index, meta_u64(meta, "completion_tokens"));
-        self.reasoning
-            .insert(index, meta_u64(meta, "reasoning_tokens"));
-        self.cached.insert(index, meta_u64(meta, "cached_tokens"));
+    pub(super) fn record(&mut self, index: u64, meta: &GenerateMetaInfo) {
+        self.last_id.clone_from(&meta.id);
+        self.prompt.insert(index, u64::from(meta.prompt_tokens));
+        self.completion.insert(index, meta.completion_tokens);
+        self.reasoning.insert(index, meta.reasoning_tokens);
+        self.cached.insert(index, u64::from(meta.cached_tokens));
     }
 
     /// Choice `index`'s usage, for `continuous_usage_stats`.
@@ -236,8 +270,57 @@ pub(super) fn without_nulls(value: Value) -> Value {
     }
 }
 
-pub(super) fn meta_u64(meta: &Value, key: &str) -> u64 {
-    meta.get(key).and_then(Value::as_u64).unwrap_or(0)
+pub(super) fn finish_fields(reason: Option<&FinishReason>) -> (Option<String>, Value) {
+    let Some(reason) = reason else {
+        return (None, Value::Null);
+    };
+    let matched = match reason.kind.as_ref() {
+        Some(finish_reason::Kind::Stop(stop)) => json!(stop.matched),
+        Some(finish_reason::Kind::Unknown(raw)) => {
+            // The shared API retains unknown finish reasons as raw JSON.
+            let value: Value = serde_json::from_str(raw).unwrap_or_default();
+            return (
+                value.get("type").and_then(Value::as_str).map(str::to_owned),
+                value.get("matched").cloned().unwrap_or(Value::Null),
+            );
+        }
+        _ => Value::Null,
+    };
+    (reason.kind_name().map(|kind| kind.into_owned()), matched)
+}
+
+pub(super) fn abort_event(reason: Option<&FinishReason>) -> Option<String> {
+    let finish_reason::Kind::Abort(abort) = reason?.kind.as_ref()? else {
+        return None;
+    };
+    let code = u64::from(abort.status_code?);
+    Some(stream_error_event(
+        abort.message.as_deref().unwrap_or("Generation aborted."),
+        http_status_name(code)?,
+        code as u16,
+    ))
+}
+
+pub(super) fn logprob_slice<T>(items: &[T], prev: usize, total: usize, incremental: bool) -> &[T] {
+    if incremental {
+        items
+    } else {
+        let start = prev.min(items.len());
+        &items[start..start + total.saturating_sub(prev).min(items.len() - start)]
+    }
+}
+
+/// `output_token_logprobs_length`, or, for frames without it, the count the
+/// frame's list implies.
+pub(super) fn logprobs_length(meta: &GenerateMetaInfo, prev: usize, incremental: bool) -> usize {
+    if let Some(length) = meta.output_token_logprobs_length {
+        return length as usize;
+    }
+    let listed = meta
+        .output_token_logprobs
+        .as_ref()
+        .map_or(0, |logprobs| logprobs.entries.len());
+    if incremental { prev + listed } else { listed }
 }
 
 #[cfg(test)]

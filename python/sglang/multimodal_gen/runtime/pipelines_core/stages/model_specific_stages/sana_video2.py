@@ -267,11 +267,16 @@ class SanaVideo2DenoisingStage(PipelineStage):
             else server_args.pipeline_config.flow_shift
         )
         with self.progress_bar(total=steps, batch=batch) as progress:
+
+            def on_step(*_):
+                self.check_cancelled(batch)
+                progress.update()
+
             batch.latents = sampler(
                 predict,
                 batch.latents,
                 steps,
                 flow_shift,
-                callback=lambda *_: progress.update(),
+                callback=on_step,
             )
         return batch
