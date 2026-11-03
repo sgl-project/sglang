@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     KeyedReqList,
     ListKind,
 )
@@ -70,7 +71,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
-        self.disagg_prefill_transfer_queue = KeyedReqList(ListKind.PD_SENDING)
+        self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()

@@ -23,7 +23,7 @@ from sglang.srt.managers.mm_schedule import (
     _move_items_to_device,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
     ReqList,
     move,
@@ -196,13 +196,13 @@ class DocPrefetch:
         # Vision runs on every TP rank in lockstep; it is not encoded out of step.
         self._encode_ahead = early is not None and tp_size == 1
         # Follow-ups waiting for their predecessor.
-        self._parked = KeyedReqList(
+        self._parked = IndexedReqList(
             ListKind.UOCR_PARKED, abort=lambda r: self._abort(self._parked, r)
         )
         # Completion tokens of finished predecessors whose follow-up has not arrived.
         self._finished: Dict[str, int] = {}
         # Follow-ups whose predecessor finished, for the scheduler to queue.
-        self._released = KeyedReqList(
+        self._released = IndexedReqList(
             ListKind.UOCR_RELEASED, abort=lambda r: self._abort(self._released, r)
         )
 

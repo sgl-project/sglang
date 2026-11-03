@@ -76,7 +76,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s._abort_on_waiting_timeout = Mock()
         s._abort_on_running_timeout = Mock()
         s.dllm_config = None
-        s.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.enable_hisparse = False
         s.require_mlp_sync = False
         s._should_defer_prefill = self.calls.defer

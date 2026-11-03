@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
     ReqList,
 )
@@ -37,7 +37,7 @@ class DeferredResponses:
         self.output_streamer = output_streamer
         self.send_abort = send_abort
         # (req, completion) per held response.
-        self.held = KeyedReqList(
+        self.held = IndexedReqList(
             ListKind.DEFERRED, abort=self._abort, req_of=lambda x: x[0]
         )
 

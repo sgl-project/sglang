@@ -1436,7 +1436,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_reqs = KeyedReqList(ListKind.CHUNKED, abort=self._abort_chunked)
+        self.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=self._abort_chunked)
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -1576,7 +1576,7 @@ class Scheduler(
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_transfer_queue = KeyedReqList(
+        self.disagg_prefill_transfer_queue = IndexedReqList(
             ListKind.PD_SENDING, abort=self._abort_prefill_transfer
         )
         self.disagg_decode_prealloc_queue = None

@@ -102,7 +102,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
-        scheduler.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_batch = MagicMock()
@@ -133,7 +133,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
         scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue = KeyedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.dllm_config = None
@@ -902,16 +902,16 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler
-        prealloc_queue.queue = KeyedReqList(ListKind.PD_PREALLOC)
-        prealloc_queue.retracted_queue = KeyedReqList(ListKind.PD_RETRACTED)
-        prealloc_queue.held_rebootstrap_reqs = KeyedReqList(
+        prealloc_queue.queue = IndexedReqList(ListKind.PD_PREALLOC)
+        prealloc_queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
+        prealloc_queue.held_rebootstrap_reqs = IndexedReqList(
             ListKind.PD_HELD, abort=prealloc_queue._abort_held
         )
         prealloc_queue.add = MagicMock()
         scheduler.disagg_decode_prealloc_queue = prealloc_queue
         transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        transfer_queue.queue = KeyedReqList(ListKind.PD_RECEIVING)
-        transfer_queue._deferred_releases = KeyedReqList(ListKind.PD_RELEASING)
+        transfer_queue.queue = IndexedReqList(ListKind.PD_RECEIVING)
+        transfer_queue._deferred_releases = IndexedReqList(ListKind.PD_RELEASING)
         scheduler.disagg_decode_transfer_queue = transfer_queue
         scheduler.deferred_responses = MagicMock()
         scheduler.mm_receiver = None

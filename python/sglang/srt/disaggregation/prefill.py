@@ -73,7 +73,7 @@ from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indi
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
     ReqList,
     move,
@@ -208,7 +208,7 @@ class PrefillBootstrapQueue:
         self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
-        self.queue = KeyedReqList(ListKind.PD_BOOTSTRAP, abort=self._abort)
+        self.queue = IndexedReqList(ListKind.PD_BOOTSTRAP, abort=self._abort)
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         # Each rank owns a subset of logical KV pages, so capacity widens by N.

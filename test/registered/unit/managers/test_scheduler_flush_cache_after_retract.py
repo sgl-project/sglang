@@ -13,6 +13,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     KeyedReqList,
     ListKind,
 )
@@ -49,7 +50,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.enable_overlap = False
         scheduler.last_batch = None
         scheduler.cur_batch = None
-        scheduler.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
@@ -67,7 +68,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.running_reqs = []
         scheduler.dllm_config = None
         scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue = KeyedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.hisparse_coordinator = None

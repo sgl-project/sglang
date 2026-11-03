@@ -34,7 +34,6 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
-    KeyedReqList,
     ListKind,
 )
 from sglang.srt.runtime_context import publish, reset_context
@@ -84,7 +83,7 @@ def _make_scheduler():
 def _prefill_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
-        queue=KeyedReqList(ListKind.PD_BOOTSTRAP),
+        queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(return_value=True),
     )
     return q
@@ -94,7 +93,7 @@ def _decode_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
         token_to_kv_pool_allocator=MagicMock(),
-        retracted_queue=KeyedReqList(ListKind.PD_RETRACTED),
+        retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
         pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
         _create_receiver_and_enqueue=MagicMock(

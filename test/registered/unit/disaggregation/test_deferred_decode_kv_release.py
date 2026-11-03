@@ -35,7 +35,7 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -487,10 +487,10 @@ class _FakeIdxAllocator:
 
 def _make_queue(timeout=30.0, enable_metrics=False):
     q = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    q._deferred_releases = KeyedReqList(
+    q._deferred_releases = IndexedReqList(
         ListKind.PD_RELEASING, req_of=lambda x: x[0].req
     )
-    q.queue = KeyedReqList(ListKind.PD_RECEIVING, req_of=lambda x: x.req)
+    q.queue = IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda x: x.req)
     q.gloo_group = dist.group.WORLD
     q.tp_rank = 0
     q.enable_deferred_kv_release = True

@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     KeyedReqList,
     ListKind,
 )
@@ -96,7 +97,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
-    s.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
+    s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
     s.running_reqs = KeyedReqList(ListKind.DECODING)

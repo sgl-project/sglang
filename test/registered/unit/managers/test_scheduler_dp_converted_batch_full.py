@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
 )
 
@@ -58,7 +58,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s._process_hicache_events = Mock()
         s.enable_fpm = False
         s.dllm_config = None
-        s.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.enable_hisparse = False
         s.invariant_checker = Mock()
         s.require_mlp_sync = False

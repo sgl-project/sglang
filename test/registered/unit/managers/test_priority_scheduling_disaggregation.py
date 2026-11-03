@@ -27,7 +27,6 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
-    KeyedReqList,
     ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -251,7 +250,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             kv=SimpleNamespace(cache_protected_len=2),
             time_stats=MagicMock(),
         )
-        queue.queue = KeyedReqList(ListKind.PD_BOOTSTRAP)
+        queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
         queue.queue.join([req])
 
         with (
@@ -985,7 +984,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.schedule_stream = MagicMock()
         scheduler.forward_stream = MagicMock()
         scheduler.ngram_embedding_manager = MagicMock()
-        scheduler.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         return scheduler
 
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):

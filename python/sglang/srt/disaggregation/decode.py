@@ -10,7 +10,7 @@ Life cycle of a request in the decode server
     a. Poll the receiver to check the transfer state
     b. If the transfer has finished, move the request to waiting queue
 
-3. IndexedReqList:
+3. WaitingQueue:
     a. Use the requests in the queue to construct a PrebuiltExtendBatch
     b. Skip the prefill forward but only populate metadata
 
@@ -96,7 +96,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_tokens,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
     ReqList,
 )
@@ -493,12 +493,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
-        self.queue = KeyedReqList(
+        self.queue = IndexedReqList(
             ListKind.PD_PREALLOC,
             abort=self._abort_prealloc,
             req_of=lambda x: x.req,
         )
-        self.retracted_queue = KeyedReqList(
+        self.retracted_queue = IndexedReqList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
         )
         self.pending_reqs: List[DecodeRequest] = []
@@ -513,7 +513,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
-        self.held_rebootstrap_reqs = KeyedReqList(
+        self.held_rebootstrap_reqs = IndexedReqList(
             ListKind.PD_HELD, abort=self._abort_held
         )
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1495,8 +1495,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 1 if self.scheduler.schedule_low_priority_values_first else -1
             )
             queue.sort(key=lambda r: r.req.priority * priority_sign)
-            self.queue.clear()
-            self.queue.join(queue)
+            self.queue.replace(queue)
 
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(queue):
@@ -2854,7 +2853,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
-        self.queue = KeyedReqList(
+        self.queue = IndexedReqList(
             ListKind.PD_RECEIVING,
             abort=self._abort_receiving,
             req_of=lambda x: x.req,
@@ -2882,7 +2881,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
-        self._deferred_releases = KeyedReqList(
+        self._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
 

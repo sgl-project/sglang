@@ -27,10 +27,10 @@ class FakeReq(SimpleNamespace):
     __hash__ = object.__hash__
 
 
-def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> KeyedReqList:
+def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> IndexedReqList:
     """A PD decode queue of `kind` holding `decode_reqs`, each a wrapper with
     `.req`."""
-    queue = KeyedReqList(kind, req_of=lambda x: x.req)
+    queue = IndexedReqList(kind, req_of=lambda x: x.req)
     queue.join(decode_reqs)
     return queue
 
@@ -42,15 +42,15 @@ def empty_request_lists(scheduler: Scheduler) -> None:
         ListKind.WAITING, abort=scheduler._abort_waiting
     )
     scheduler.grammar_manager = SimpleNamespace(
-        grammar_queue=KeyedReqList(ListKind.GRAMMAR)
+        grammar_queue=IndexedReqList(ListKind.GRAMMAR)
     )
-    scheduler.chunked_reqs = KeyedReqList(
+    scheduler.chunked_reqs = IndexedReqList(
         ListKind.CHUNKED, abort=scheduler._abort_chunked
     )
     scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
     scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
     scheduler.disagg_prefill_bootstrap_queue = None
-    scheduler.disagg_prefill_transfer_queue = KeyedReqList(ListKind.PD_SENDING)
+    scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
     scheduler.dllm_config = None
     scheduler.disagg_decode_prealloc_queue = None
     scheduler.disagg_decode_transfer_queue = None

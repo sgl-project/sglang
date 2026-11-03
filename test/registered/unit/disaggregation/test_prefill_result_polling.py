@@ -123,7 +123,7 @@ def _input(batch):
 
 
 def _sending(reqs=()):
-    sending = KeyedReqList(ListKind.PD_SENDING)
+    sending = IndexedReqList(ListKind.PD_SENDING)
     sending.join(reqs)
     return sending
 

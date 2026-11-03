@@ -357,7 +357,7 @@ class TestAllocationIntegration(CustomTestCase):
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
             waiting_queue=IndexedReqList(ListKind.WAITING),
             disagg_prefill_bootstrap_queue=SimpleNamespace(
-                queue=KeyedReqList(ListKind.PD_BOOTSTRAP)
+                queue=IndexedReqList(ListKind.PD_BOOTSTRAP)
             ),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
@@ -554,7 +554,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = SchedulerDisaggregationPrefillMixin()
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
-        scheduler.disagg_prefill_transfer_queue = KeyedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.disagg_prefill_transfer_queue.join(reqs)
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
         scheduler.output_streamer = Mock()

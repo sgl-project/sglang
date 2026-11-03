@@ -48,7 +48,7 @@ from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_ds
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
     ReqList,
 )
@@ -678,7 +678,7 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        self.ack_staging_queue = KeyedReqList(
+        self.ack_staging_queue = IndexedReqList(
             ListKind.HISPARSE_STAGING, req_of=lambda x: x.req
         )
         self.decode_producer_stream = None

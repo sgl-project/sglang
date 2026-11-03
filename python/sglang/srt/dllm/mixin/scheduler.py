@@ -10,7 +10,7 @@ from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
+    IndexedReqList,
     ListKind,
 )
 from sglang.srt.managers.utils import make_abort_req
@@ -453,7 +453,7 @@ class DllmManager:
         self.max_running_reqs = (
             dllm_config.max_running_requests if dllm_config is not None else 1
         )
-        self.waiting_queue = KeyedReqList(ListKind.DLLM, abort=self._abort)
+        self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         # A subset of the waiting queue.
         self.staging_queue: List[Req] = []
         self._release_aborted = release_aborted
@@ -500,7 +500,7 @@ class DllmManager:
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""
-        self.waiting_queue.leave_finished()
+        self.waiting_queue.take(lambda req: req.finished())
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
     def _abort(self, recv_req: AbortReq) -> None:

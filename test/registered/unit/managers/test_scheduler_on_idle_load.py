@@ -24,6 +24,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     KeyedReqList,
     ListKind,
 )
@@ -113,7 +114,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.metrics_reporter = MagicMock()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
@@ -127,7 +128,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.running_reqs = []
         scheduler.dllm_config = None
         scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue = KeyedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.hisparse_coordinator = None
