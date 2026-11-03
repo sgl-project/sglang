@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -475,6 +476,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             processed_tokens_counter=0,
             _release_aborted_request=lambda req: None,
             clear_pending_chunk_send=lambda req: None,
+            prefill_launched_reqs=RequestList(),
         )
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
