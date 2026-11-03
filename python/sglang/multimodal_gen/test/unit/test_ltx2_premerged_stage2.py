@@ -11,8 +11,8 @@ def _controller(
 ) -> LTX2TwoStageResidencyController:
     controller = object.__new__(LTX2TwoStageResidencyController)
     controller.mode = mode
+    controller.server_args = SimpleNamespace(disable_lora_merge=False)
     controller.pipeline = SimpleNamespace(
-        allow_merge=True,
         _distilled_lora_path=distilled_lora,
         _stage1_lora_path=stage1_lora,
     )
@@ -27,7 +27,7 @@ class TestLTX2PremergedStage2(unittest.TestCase):
 
     def test_resident_mode_skips_premerge_when_disabled(self):
         controller = _controller("resident", distilled_lora="lora")
-        controller.pipeline.allow_merge = False
+        controller.server_args.disable_lora_merge = True
         self.assertFalse(controller.should_use_premerged)
 
     def test_original_mode_keeps_one_dit(self):

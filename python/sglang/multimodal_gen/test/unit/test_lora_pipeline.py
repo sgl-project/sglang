@@ -47,6 +47,7 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.server_args = SimpleNamespace(
         lora_alpha=None,
         lora_merge_mode="dynamic",
+        disable_lora_merge=False,
         model_path="/model",
     )
     pipeline.lora_initialized = True
@@ -498,7 +499,7 @@ def test_disabled_merge_skips_snapshot_and_preserves_dynamic_adapter():
     pipeline = _make_pipeline(_make_layer())
     pipeline.modules["transformer"].add_module("linear", base)
     pipeline.lora_initialized = False
-    pipeline.allow_merge = False
+    pipeline.server_args.disable_lora_merge = True
     pipeline.exclude_lora_layers = []
     pipeline.lora_rank = pipeline.lora_alpha = None
 

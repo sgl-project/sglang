@@ -299,6 +299,7 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline.server_args = SimpleNamespace(
         lora_path=None,
         lora_weight_name=None,
+        disable_lora_merge=False,
         pipeline_config=SimpleNamespace(
             dit_config=SimpleNamespace(
                 arch_config=SimpleNamespace(

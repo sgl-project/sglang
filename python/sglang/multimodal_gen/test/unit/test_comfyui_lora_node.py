@@ -127,7 +127,10 @@ def _one_layer_pipeline():
     p.modules = {"transformer": torch.nn.Module()}
     p.modules["transformer"].add_module("linear", layer)
     p.server_args = SimpleNamespace(
-        lora_alpha=None, lora_merge_mode="merge", model_path="/model"
+        lora_alpha=None,
+        lora_merge_mode="merge",
+        disable_lora_merge=False,
+        model_path="/model",
     )
     p.lora_initialized = True
     p.lora_layers = {"linear": layer}

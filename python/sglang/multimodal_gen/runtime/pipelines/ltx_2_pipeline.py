@@ -617,7 +617,7 @@ class LTX2TwoStageResidencyController:
         """
         return (
             self.mode == "resident"
-            and self.pipeline.allow_merge
+            and not self.server_args.disable_lora_merge
             and self.pipeline._distilled_lora_path is not None
             and self.pipeline._stage1_lora_path is None
         )
@@ -675,8 +675,9 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 self._ltx2_residency.strategy
             )
 
-    def _should_merge_stage2_distilled_lora(self, server_args: ServerArgs) -> bool:
-        return self.allow_merge and is_ltx23_native_variant(
+    @staticmethod
+    def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
+        return not server_args.disable_lora_merge and is_ltx23_native_variant(
             server_args.pipeline_config.vae_config.arch_config
         )
 
