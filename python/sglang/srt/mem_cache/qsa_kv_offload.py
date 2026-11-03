@@ -298,7 +298,12 @@ class QSAKVHostOffload:
         rows ``rows`` and host rows ``loc``."""
         loc = loc.long()
         _copy_rows(
-            self.dev_k[layer_idx], self.dev_v[layer_idx], rows.long(), pool_k, pool_v, loc
+            self.dev_k[layer_idx],
+            self.dev_v[layer_idx],
+            rows.long(),
+            pool_k,
+            pool_v,
+            loc,
         )
         _copy_rows(
             self.host_k[layer_idx], self.host_v[layer_idx], loc, pool_k, pool_v, loc
