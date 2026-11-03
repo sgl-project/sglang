@@ -1,4 +1,6 @@
+import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import requests
@@ -15,6 +17,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
+
+# The rerun workflow executes this file directly from ``test/``.  Python then
+# puts only ``test/registered/ep`` on sys.path, so add the test root before
+# importing the manual modules that provide the CI entry-point wrappers.
+TEST_ROOT = Path(__file__).resolve().parents[2]
+if str(TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(TEST_ROOT))
 
 from manual.ep.test_elastic_scale import (
     TestElasticScaleUp4To5To6CudaGraph as _TestElasticScaleUp4To5To6CudaGraph,
