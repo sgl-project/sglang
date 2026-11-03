@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
     LoadSnapshot,
