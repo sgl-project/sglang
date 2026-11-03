@@ -12,12 +12,12 @@ from PIL import Image
 from sglang.srt.managers.multimodal_preprocessing_admission import (
     MultimodalPreprocessingAdmission,
 )
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import MultimodalPreprocessCache, snapshot_media
 from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

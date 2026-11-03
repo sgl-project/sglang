@@ -24,12 +24,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.multimodal_preprocessing_admission import (
     track_mm_preprocessing_future,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -527,7 +524,7 @@ class MiMoProcessor:
     def preprocess_for_encoder(self, mm_data, modality):
         # EPD encoder-side features. video_audio_* fields appear when any
         # video has audio; the D side uses them to rebuild input_ids.
-        from sglang.srt.managers.schedule_batch import Modality
+        from sglang.srt.multimodal.modality import Modality
 
         if not isinstance(mm_data, (list, tuple)):
             mm_data = [mm_data]

@@ -13,7 +13,7 @@ from sglang.srt.managers.multimodal_preprocessing_admission import (
     MultimodalPreprocessingAdmission,
     MultimodalPreprocessingBusy,
 )
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors import glm4v as glm4v_module
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.glm4v import (

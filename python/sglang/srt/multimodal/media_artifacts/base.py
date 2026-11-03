@@ -35,7 +35,6 @@ from PIL import Image
 from sglang.srt.managers.multimodal_preprocessing_admission import (
     track_mm_preprocessing_future,
 )
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
     CacheMiss,
@@ -45,6 +44,7 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import load_image
 
 
