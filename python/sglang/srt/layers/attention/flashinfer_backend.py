@@ -5,6 +5,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    pop_buffer,
 )
 
 """
@@ -14,8 +15,10 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import gc
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -330,6 +333,29 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+# Backends that share the process-wide "flashinfer_workspace" buffer.
+_global_workspace_users: weakref.WeakSet = weakref.WeakSet()
+
+
+def release_unused_global_workspace() -> int:
+    """Drop the shared FlashInfer workspace once no backend uses it.
+
+    A model-level wrapper can replace the full-attention backend it was handed
+    (hybrid QSA models do), which leaves the workspace allocated for nobody.
+    Returns the number of bytes released.
+    """
+    # A discarded backend can sit in a reference cycle.
+    gc.collect()
+    if _global_workspace_users:
+        return 0
+    workspace = pop_buffer("flashinfer_workspace")
+    if workspace is None:
+        return 0
+    nbytes = workspace.numel() * workspace.element_size()
+    logger.info("Released the unused FlashInfer workspace (%.3f GiB).", nbytes / 2**30)
+    return nbytes
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -487,6 +513,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
+            _global_workspace_users.add(self)
         max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:
             self.kv_indptr = [

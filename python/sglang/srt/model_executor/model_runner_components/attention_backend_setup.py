@@ -121,6 +121,13 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=False
         )
+    if "flashinfer" in (resolved.prefill, resolved.decode):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            release_unused_global_workspace,
+        )
+
+        # A model-level wrapper may have replaced the FlashInfer backend.
+        release_unused_global_workspace()
 
     if (
         model_runner.device == "npu"
