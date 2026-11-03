@@ -2747,14 +2747,8 @@ class Scheduler(
             ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: (
-                self.disagg_prefill_bootstrap_queue
-            ),
-            get_disagg_prefill_transfer_queue=lambda: (
-                self.disagg_prefill_transfer_queue
-            ),
+            get_request_lists=self.request_lists,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
-            get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: (
                 self.metrics_reporter.spec_total_num_accept_tokens
             ),
@@ -5987,14 +5981,7 @@ class Scheduler(
         old_version = get_serving().weight_version
         get_context().override("scheduler.weight_version", weight_version=new_version)
 
-        live_reqs = {
-            *self.collect_inflight_reqs(),
-            *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
-            *self.deferred_responses.held,
-        }
-        if self.hisparse_coordinator is not None:
-            live_reqs.update(self.hisparse_coordinator.ack_staging_queue)
+        live_reqs = [req for reqs in self.request_lists().values() for req in reqs]
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
