@@ -420,10 +420,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 return
             self._runtime = error.kvcr_runtime
         while not self._closed:
-            active = self._fatal is None and (self._batches or self._offloads)
+            # Spin only while transfers are in flight; a batch that only awaits its
+            # forward (gather/drain) would otherwise contend for the GIL with it.
+            active = self._fatal is None and (
+                self._offloads
+                or any(not b.exhausted or b.active for b in self._batches)
+            )
             try:
                 function, args, future = self._commands.get(
-                    timeout=0 if active else 0.001
+                    timeout=0 if active else (0.0005 if self._batches else 0.001)
                 )
             except Empty:
                 if active:
