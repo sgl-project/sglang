@@ -173,6 +173,11 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "(--dcp-size) are mutually exclusive users of the widened "
             "allocator index space."
         )
+    if cfg.enable_prefill_cp and cfg.attn_cp_size > 1 and cfg.cp_kv_layout is not None:
+        raise ValueError(
+            "--enable-kv-cache-sharding and --cp-kv-layout cannot be combined: "
+            "each sets the KV cache layout across the prefill CP ranks."
+        )
     if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
         raise ValueError(
             "--enable-kv-cache-sharding supports HiCache host offload but not "
