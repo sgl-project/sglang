@@ -92,8 +92,9 @@ impl<'de> Deserialize<'de> for ChatBody {
 
 /// `raw` as Dynamo's typed request can read it. Dynamo aliases a message's
 /// `reasoning` to `reasoning_content`, so it rejects both keys together and a
-/// `reasoning` that is not text, which Python accepts. A string `reasoning` fills
-/// a missing or null `reasoning_content`, and any other `reasoning` is dropped.
+/// `reasoning` such as an object or a number, which Python accepts. A string
+/// `reasoning` fills a missing or null `reasoning_content`, and any other
+/// `reasoning` is dropped.
 fn fold_reasoning(raw: &Value) -> Cow<'_, Value> {
     let carries_reasoning = raw["messages"].as_array().is_some_and(|messages| {
         messages
