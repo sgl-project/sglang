@@ -414,7 +414,8 @@ class AscendAttnBackend(AttentionBackend):
                 graph_batch_capacity=graph_batch_capacity,
                 paged_kv_cache=self.token_to_kv_pool,
             )
-            self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
+            if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
+                self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",

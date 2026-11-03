@@ -205,3 +205,17 @@ def get_sparse_kv_budget(
             max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),
         ),
     )
+
+
+def get_sparse_kv_max_query_width() -> int:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+        MAX_QUERY_WIDTH,
+    )
+
+    spec = get_spec()
+    width = int(spec.speculative_num_draft_tokens or 1)
+    if not 1 <= width <= MAX_QUERY_WIDTH:
+        raise ValueError(
+            f"Native LIM supports chain query widths 1..{MAX_QUERY_WIDTH}."
+        )
+    return width
