@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream_o1_image.generation import (
     DEFAULT_TIMESTEPS,
+    FlowMatchScheduler,
     build_scheduler,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -89,20 +90,15 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, torch.nn.Module]:
-        if loaded_modules is not None:
-            return loaded_modules
-
-        # resolves HF repo ids to a local snapshot; local paths pass through
         model_path = maybe_download_model(
             self.model_path, revision=server_args.revision
         )
-        logger.info("Loading HiDream model from %s", model_path)
+        with open(os.path.join(model_dir, "config.json")) as config_file:
+            hf_config = json.load(config_file)
 
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-
-        config_path = os.path.join(model_path, "config.json")
-        with open(config_path, "r") as f:
-            hf_config = json.load(f)
+        if loaded_modules is not None and _HIDREAM_O1_MODULES <= set(loaded_modules):
+            self._validate_tms_token(loaded_modules["tokenizer"], dit_config)
+            return loaded_modules
 
         dit_config = server_args.pipeline_config.dit_config
         variant = _resolve_variant(model_path)
@@ -113,27 +109,30 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         model = self._load_transformer(
             server_args, model_path, dit_config, hf_config, w_dtype
         )
+
         if variant != "full":
             # Dev variants keep fp32 weights + bf16 autocast per variant policy;
             # the dtype reaches the loader as param_dtype, so this is just the
             # eval switch (the loader may leave the model on CPU for residency).
             model = model.eval()
 
+        processor = AutoProcessor.from_pretrained(model_path)
+
         tokenizer = (
-            processor.tokenizer
-            if hasattr(processor, "tokenizer")
-            else processor
+            processor
+            if isinstance(processor, PreTrainedTokenizerBase)
+            else processor.tokenizer
         )
         self._validate_tms_token(tokenizer, dit_config)
 
         # The variant-default scheduler is built once at pipeline creation,
         # like the official pipeline builds its scheduler before denoising:
         # full -> FlowUniPCMultistepScheduler via the diffusion defaults
-        # (recipe shift 3.0), Dev -> flash. Stages clone it per trajectory;
-        # the task-specific Dev editing override (flow_match) is built
-        # in-stage since it depends on the request, not on the deployment.
-        variant_defaults = _VARIANT_DEFAULTS[variant]
-        # __post_init__ resolves the sentinel to 50 (full) / 28 (Dev).
+        # (recipe shift 3.0), Dev -> flash. The Dev editing override is also a
+        # deployment constant (the variant recipe decides it, not the
+        # request), so its flow_match template is built here too; the stage
+        # only selects a template and re-arms its per-request step counter.
+        variant_defaults = _VARIANT_DEFAULTS[variant] # TODO: check need to change
         scheduler = build_scheduler(
             num_inference_steps=server_args.pipeline_config.num_inference_steps,
             timesteps_list=None if variant == "full" else DEFAULT_TIMESTEPS,
@@ -141,12 +140,17 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
             device=get_local_torch_device(),
             scheduler_name=variant_defaults["scheduler_name"],
         )
+        editing_scheduler = FlowMatchScheduler(shift=variant_defaults["shift"])
+        editing_scheduler.set_timesteps_list(
+            DEFAULT_TIMESTEPS, get_local_torch_device()
+        )
 
         return {
             "model": model,
             "processor": processor,
             "tokenizer": tokenizer,
             "scheduler": scheduler,
+            "editing_scheduler": editing_scheduler,
         }
 
     @staticmethod
@@ -157,18 +161,6 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         hf_config: dict,
         param_dtype: torch.dtype,
     ) -> HiDreamO1ImageTransformer:
-        """Every variant loads through the framework's loader machinery: one
-        mapped, shard-aware weight load where the arch config's
-        param_names_mapping performs the HF-layout -> SRT fused-layer renames
-        and splits (q/k/v -> qkv_proj, gate/up -> gate_up_proj, and the vision
-        tower's ``.attn.qkv.`` -> ``.attn.qkv_proj.``).
-
-        FSDP inference, HSDP sharding and CPU-residency memory planning follow
-        the server args for every variant; the framework already disables
-        --use-fsdp-inference when cache-dit is on. Under FSDP inference the
-        TI2I two-pass loop takes the model's dense 4D-mask branch (see the
-        ``_fsdp_wrapped`` flag below).
-        """
         safetensors_list = _list_safetensors_files(
             model_path,
             index_file="model.safetensors.index.json",
@@ -233,6 +225,7 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
                 tokenizer=self.get_module("tokenizer"),
                 processor=processor,
                 scheduler=self.get_module("scheduler"),
+                editing_scheduler=self.get_module("editing_scheduler"),
                 vision_start_token_id=arch_config.vision_start_token_id,
                 tms_token_id=arch_config.tms_token_id,
             ),
@@ -246,10 +239,7 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
             ),
             "hidream_o1_image_denoising_stage",
         )
-        self.add_stage(
-            HiDreamO1ImageDecodingStage(),
-            "hidream_o1_image_decoding_stage",
-        )
+        self.add_stage(HiDreamO1ImageDecodingStage(), "hidream_o1_image_decoding_stage")
 
 
 EntryClass = HiDreamO1ImagePipeline

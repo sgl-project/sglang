@@ -5,15 +5,6 @@ The checkpoint is a Qwen3-VL text backbone plus a flow-matching pixel head
 (``x_embedder`` / ``t_embedder1`` / ``final_layer2``). There is no VAE and no
 separate text encoder: the prompt is embedded by the backbone itself and the
 image is a sequence of 32x32 raw pixel patches appended to the prompt tokens.
-
-One class serves all three checkpoints. The full variant runs the dense-mask
-SDPA contract expected by the framework stage chain; the Dev variants
-additionally run the two-pass SDPA loop (causal AR rows + full image span) with
-TI2I reference conditioning, for which the vision tower is built and the
-forward is split into ``forward_pre`` / blocks / ``forward_post`` so cache-dit
-can wrap the decoder. ``model.visual.*`` and ``lm_head.weight`` ship in the
-checkpoint but are unused for text-to-image, so the full-variant loader
-filters them out.
 """
 
 import math
@@ -21,8 +12,6 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
     HiDreamO1ImageArchConfig,
     HiDreamO1ImageDitConfig,
@@ -49,10 +38,9 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+from torch import nn
 
-# Checkpoint prefixes that carry no parameter of this model. The vision
-# tower joins the load (TI2I serving builds it for every variant); its fused
-# qkv reaches qkv_proj through param_names_mapping.
+# Checkpoint prefixes that carry no parameter of this model.
 UNUSED_CHECKPOINT_PREFIXES = ("lm_head.",)
 
 
@@ -71,21 +59,6 @@ def timestep_embedding(
     )
     args = timestep[:, None].float() * freqs[None]
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
-
-def apply_interleaved_mrope(
-    freqs: torch.Tensor, mrope_section: tuple[int, ...]
-) -> torch.Tensor:
-    """Reorganize chunked [TTT...HHH...WWW] freqs into interleaved [THTHWHTHW...TT].
-
-    Shared by both HiDream-O1-Image model implementations; the head_dim//2
-    channels of each axis are woven into every third rotary channel.
-    """
-    freqs_t = freqs[0]  # overwrite the first (t) axis
-    for axis, offset in enumerate((1, 2), start=1):
-        length = mrope_section[axis] * 3
-        freqs_t[..., offset:length:3] = freqs[axis, ..., offset:length:3]
-    return freqs_t
 
 
 class HiDreamO1RotaryEmbedding(nn.Module):
@@ -121,7 +94,10 @@ class HiDreamO1RotaryEmbedding(nn.Module):
             )
             positions = position_ids[:, :, None, :].float()
             freqs = (inv_freq_expanded @ positions).transpose(2, 3)
-            freqs_t = apply_interleaved_mrope(freqs, self.mrope_section)
+            freqs_t = freqs[0]
+            for axis, offset in enumerate((1, 2), start=1):
+                length = self.mrope_section[axis] * 3
+                freqs_t[..., offset:length:3] = freqs[axis, ..., offset:length:3]
             emb = torch.cat((freqs_t, freqs_t), dim=-1)
             return emb.cos().to(dtype), emb.sin().to(dtype)
 
@@ -530,42 +506,26 @@ def _flash_decoder_layer(
         v_ar = v[:, :, idx_ar].contiguous()
         if pad_mask is None:
             out_ar = F.scaled_dot_product_attention(
-                q_ar,
-                k_ar,
-                v_ar,
-                is_causal=True,
-                scale=softmax_scale,
+                q_ar, k_ar, v_ar, is_causal=True, scale=softmax_scale,
             )
         else:
-            # causal over original slots, padded keys removed
             slot_q = idx_ar.view(1, -1)
             slot_k = idx_ar.view(1, -1)
             keep = (slot_q >= slot_k).unsqueeze(0) & ~pad_mask[:, idx_ar].unsqueeze(1)
             out_ar = F.scaled_dot_product_attention(
-                q_ar,
-                k_ar,
-                v_ar,
-                attn_mask=keep.unsqueeze(1),
-                scale=softmax_scale,
+                q_ar, k_ar, v_ar, attn_mask=keep.unsqueeze(1), scale=softmax_scale,
             )
     else:
         out_ar = None
 
     if pad_mask is None:
         out_full = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=softmax_scale,
+            q, k, v, scale=softmax_scale,
         )
     else:
         key_keep = (~pad_mask)[:, None, None, :]
         out_full = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=key_keep,
-            scale=softmax_scale,
+            q, k, v, attn_mask=key_keep, scale=softmax_scale,
         )
 
     if out_ar is not None:
@@ -581,9 +541,7 @@ def _flash_decoder_layer(
 
     if deepstack_embed is not None and visual_pos_masks is not None:
         hidden_states = deepstack_process(
-            hidden_states,
-            visual_pos_masks,
-            deepstack_embed,
+            hidden_states, visual_pos_masks, deepstack_embed,
         )
 
     return hidden_states
@@ -682,8 +640,7 @@ class HiDreamO1ImageTransformer(BaseDiT):
         self.image_token_id = arch.image_token_id
         self.video_token_id = arch.video_token_id
         self.vision_start_token_id = arch.vision_start_token_id
-        # The vision tower is built whenever the caller asks for it; the
-        # model.visual.* weights are part of the load for every loader.
+
         self.model = HiDreamO1ImageModel(
             config=arch,
             supported_attention_backends=self._supported_attention_backends,
@@ -780,8 +737,6 @@ class HiDreamO1ImageTransformer(BaseDiT):
         position_ids: torch.Tensor,
         token_types: torch.Tensor,
     ) -> dict[str, Any]:
-        """Per-request decoder conditioning (RoPE, AR slots), fixed across steps.
-        Visual inject slots are filled later by forward_pre."""
         position_ids = _normalize_position_ids(position_ids)
         # fp32 cos/sin: the flash path's rope precision (the dense path casts
         # to the embed dtype instead).
@@ -1081,83 +1036,8 @@ class HiDreamO1ImageTransformer(BaseDiT):
         # the reference implementation's precision.
         return x_pred[:, -hidden_states.shape[1] :].float()
 
-
     def get_input_embeddings(self) -> nn.Module:
         return self.model.language_model.embed_tokens
-
-
-class _O1CacheBlock(nn.Module):
-    """One decoder layer as cache-dit expects (hidden -> hidden).
-    The layer lives outside the nn.Module tree to avoid re-registering its params."""
-
-    def __init__(self, layer: nn.Module, layer_idx: int, deepstack_process):
-        super().__init__()
-        object.__setattr__(self, "_layer", layer)
-        self.layer_idx = layer_idx
-        self._deepstack_process = deepstack_process
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        idx_ar: torch.Tensor,
-        pad_mask: Optional[torch.Tensor],
-        visual_pos_masks: Optional[torch.Tensor],
-        deepstack_embeds: Optional[list[torch.Tensor]],
-    ) -> torch.Tensor:
-        deepstack_embed = None
-        if deepstack_embeds is not None and self.layer_idx < len(deepstack_embeds):
-            deepstack_embed = deepstack_embeds[self.layer_idx]
-        return _flash_decoder_layer(
-            self._layer,
-            hidden_states,
-            cos,
-            sin,
-            idx_ar,
-            pad_mask,
-            visual_pos_masks,
-            deepstack_embed,
-            self._deepstack_process,
-        )
-
-
-class O1CacheBlockAdapter(nn.Module):
-    """Expose the decoder loop as cache-dit ``blocks`` (ForwardPattern.Pattern_3).
-    The modified Qwen3VL decoder is not a diffusers DiT, so cache-dit cannot locate
-    its blocks; this wrapper threads per-request conditioning through unchanged."""
-
-    def __init__(self, model: HiDreamO1ImageTransformer):
-        super().__init__()
-        text_model = model.language_model
-        self.blocks = nn.ModuleList(
-            [
-                _O1CacheBlock(layer, layer_idx, text_model._deepstack_process)
-                for layer_idx, layer in enumerate(text_model.layers)
-            ]
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        idx_ar: torch.Tensor,
-        pad_mask: Optional[torch.Tensor],
-        visual_pos_masks: Optional[torch.Tensor],
-        deepstack_embeds: Optional[list[torch.Tensor]],
-    ) -> torch.Tensor:
-        for block in self.blocks:
-            hidden_states = block(
-                hidden_states,
-                cos,
-                sin,
-                idx_ar,
-                pad_mask,
-                visual_pos_masks,
-                deepstack_embeds,
-            )
-        return hidden_states.contiguous()
 
 
 EntryClass = HiDreamO1ImageTransformer

@@ -32,11 +32,6 @@ class HiDreamO1ImageArchConfig(DiTArchConfig):
     in_channels: int = HIDREAM_O1_IN_CHANNELS
     tms_token_id: int = HIDREAM_O1_TMS_TOKEN_ID
 
-    # Diffusion-head geometry shared by both variants (model code constants;
-    # not recoverable from config.json).
-    bottleneck_dim: int = 1024  # hidden_size // 4
-    frequency_embedding_size: int = 256
-
     # Special token ids the Dev variant's TI2I conditioning reads from the
     # checkpoint's stock Qwen3-VL config.
     image_token_id: int = 151655
@@ -96,9 +91,6 @@ class HiDreamO1ImageArchConfig(DiTArchConfig):
                 )
         # A "latent" here is one raw pixel patch, not a VAE channel vector.
         self.num_channels_latents = self.in_channels * self.patch_size**2
-        # PCA bottleneck of the patch embedder; hidden_size // 4 by construction.
-        if self.bottleneck_dim == 0:
-            self.bottleneck_dim = self.hidden_size // 4
 
 
 @dataclass

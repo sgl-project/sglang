@@ -11,16 +11,14 @@ from .generation import (
     HIDREAM_O1_NOISE_SCALE,
     HIDREAM_O1_T_EPS,
     HIDREAM_O1_TMS_TOKEN,
-    build_hidream_o1_attention_mask,
-    build_hidream_o1_position_ids,
-    patchify_pixels,
-    unpatchify_pixels,
-)
-from .pipeline_stages import (
     HiDreamO1ImageBeforeDenoisingStage,
     HiDreamO1ImageDecodingStage,
     HiDreamO1ImageDenoisingStage,
     _resolve_single_prompt,
+    build_hidream_o1_attention_mask,
+    build_hidream_o1_position_ids,
+    patchify_pixels,
+    unpatchify_pixels,
 )
 
 __all__ = [

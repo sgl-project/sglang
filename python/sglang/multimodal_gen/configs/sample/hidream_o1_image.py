@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from typing import ClassVar, List, Optional
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def _resolve_variant(model_path: str | None) -> str:
@@ -25,48 +28,57 @@ def _resolve_variant(model_path: str | None) -> str:
     return "full"
 
 
-def _is_dev_2604(model_path: str | None) -> bool:
-    return _resolve_variant(model_path) == "dev-2604"
-
-
 _VARIANT_DEFAULTS = {
     "dev-2604": {
         "guidance_scale": 0.0,
         "shift": 1.0,
         "scheduler_name": "flash",
-        "torch_dtype": "float32",
         "noise_scale_start": 7.5,
         "noise_scale_end": 7.5,
         "noise_clip_std": 2.5,
+        "num_inference_steps": 28,
     },
     "dev": {
         "guidance_scale": 0.0,
         "shift": 1.0,
         "scheduler_name": "flash",
-        "torch_dtype": "float32",
         "noise_scale_start": 8.0,
         "noise_scale_end": 8.0,
         "noise_clip_std": 8.0,
+        "num_inference_steps": 28,
     },
-    # The full model's FlowUniPC path never injects per-step noise, but its
-    # initial latent IS drawn at noise_scale_start: the reference implementation
-    # uses NOISE_SCALE=8.0 internally (the 7.5 CLI defaults never reach it).
     "full": {
         "guidance_scale": 5.0,
         "shift": 3.0,
         "scheduler_name": "default",
-        "torch_dtype": "bfloat16",
         "noise_scale_start": 8.0,
         "noise_scale_end": 8.0,
         "noise_clip_std": 2.5,
+        "num_inference_steps": 50,
     },
 }
 
 
+# (width, height) pairs the model was trained on. The pixel patches carry no
+# scale invariance, so anything else degrades quality even when it is a legal
+# multiple of the 32-pixel patch size.
+HIDREAM_O1_SUPPORTED_RESOLUTIONS = [
+    (2048, 2048),
+    (2304, 1728),
+    (1728, 2304),
+    (2560, 1440),
+    (1440, 2560),
+    (2496, 1664),
+    (1664, 2496),
+    (3104, 1312),
+    (1312, 3104),
+    (2304, 1792),
+    (1792, 2304),
+]
+
+
 @dataclass
 class HiDreamO1ImageSamplingParams(SamplingParams):
-    """Sampling parameters for the HiDream-O1-Image family."""
-
     # The reference implementation conditions the unconditional branch on a
     # single space rather than the empty string.
     negative_prompt: str = " "
@@ -76,14 +88,11 @@ class HiDreamO1ImageSamplingParams(SamplingParams):
     width: int = 2048
     seed: int = 42
 
-    # Sentinel resolved in _adjust from the pipeline config (50 FULL / fixed
+    # Sentinel resolved in _adjust from the variant table (50 FULL / fixed
     # 28 DEV); an explicit request value always wins.
     num_inference_steps: Optional[int] = None
-    guidance_scale: float = 5.0
+    guidance_scale: float = None
     shift: Optional[float] = None
-
-    # "flash" (Dev T2I), "flow_match" (Dev editing), "default" (FULL UniPC)
-    scheduler_name: Optional[str] = None
 
     # linearly interpolated across steps (flash scheduler only)
     noise_scale_start: Optional[float] = None
@@ -92,33 +101,16 @@ class HiDreamO1ImageSamplingParams(SamplingParams):
 
     # Reference images for TI2I editing (Dev checkpoints)
     ref_images: Optional[List[str]] = None
-    layout_bboxes: Optional[str] = None
 
-    # (width, height) pairs the model was trained on. The pixel patches carry
-    # no scale invariance, so anything else degrades quality even when it is a
-    # legal multiple of the 32-pixel patch size. Off-list requests only warn
-    # here: the full stage rejects non-multiples of 32 and the Dev stage snaps
-    # to the closest trained resolution by aspect ratio.
     supported_resolutions: list[tuple[int, int]] | None = field(
-        default_factory=lambda: [
-            (2048, 2048),
-            (2304, 1728),
-            (1728, 2304),
-            (2560, 1440),
-            (1440, 2560),
-            (2496, 1664),
-            (1664, 2496),
-            (3104, 1312),
-            (1312, 3104),
-            (2304, 1792),
-            (1792, 2304),
-        ]
+        default_factory=lambda: list(HIDREAM_O1_SUPPORTED_RESOLUTIONS)
     )
 
     _default_height: ClassVar[int] = 2048
     _default_width: ClassVar[int] = 2048
 
     _RECIPE_FIELDS = (
+        "num_inference_steps",
         "guidance_scale",
         "shift",
         "scheduler_name",
@@ -134,13 +126,19 @@ class HiDreamO1ImageSamplingParams(SamplingParams):
         else:
             unset = {name: name not in explicit for name in self._RECIPE_FIELDS}
         super()._adjust(server_args)
-        # serve --num-inference-steps default; explicit request wins.
-        if self.num_inference_steps is None:
-            self.num_inference_steps = int(
-                server_args.pipeline_config.num_inference_steps
-            )
-
-        defaults = _VARIANT_DEFAULTS[_resolve_variant(server_args.model_path)]
+        variant = _resolve_variant(server_args.model_path)
+        defaults = _VARIANT_DEFAULTS[variant]
         for name, was_unset in unset.items():
             if was_unset:
                 setattr(self, name, defaults[name])
+        if (
+            variant != "full"
+            and self.num_inference_steps != defaults["num_inference_steps"]
+        ):
+            logger.warning(
+                "HiDream DEV generation always uses num_inference_steps=%d "
+                "(the official fixed DEFAULT_TIMESTEPS schedule); ignoring "
+                "the requested %d.",
+                defaults[variant]["num_inference_steps"],
+                self.num_inference_steps,
+            )
