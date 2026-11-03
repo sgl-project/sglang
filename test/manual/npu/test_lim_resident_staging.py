@@ -201,6 +201,18 @@ def test_staging_dynamic_rows_and_reuse(graph):
             run()
         check(1, capacity - 3, slice(2, 4))
         assert old_begin.cpu().tolist() == [-1, 0, -1]
+        # C + 1 is also long and must invalidate without touching payload.
+        lengths.copy_(
+            torch.tensor([capacity + 1, capacity], dtype=torch.int32, device=device)
+        )
+        before = cache[2].cpu().clone()
+        if graph:
+            captured.replay()
+        else:
+            run()
+        torch.npu.synchronize()
+        torch.testing.assert_close(cache[2].cpu(), before, rtol=0, atol=0)
+        assert old_begin[2].item() == old_end[2].item() == -1
         # Invalid source IDs leave their destinations untouched.
         lengths.copy_(torch.tensor([5, capacity], dtype=torch.int32, device=device))
         first.copy_(torch.tensor([3, capacity - 2], dtype=torch.int32, device=device))
@@ -227,6 +239,243 @@ def test_staging_dynamic_rows_and_reuse(graph):
             cache[2, 3:5].cpu(), current[:2].cpu(), rtol=0, atol=0
         )
         torch.testing.assert_close(cache[1].cpu(), long_before, rtol=0, atol=0)
+    finally:
+        torch.npu.synchronize()
+        free_shm(device_id)
+
+
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 8, 14])
+@pytest.mark.parametrize("graph", [False, True])
+def test_staging_width_padding_and_source_bounds(width, graph):
+    """Guard padded rows and invalid source indices across graph replays."""
+    if not torch.npu.is_available():
+        pytest.skip("NPU is required")
+    device_id = torch.npu.current_device()
+    device = torch.device("npu", device_id)
+    capacity, context, features = 32, 64, 576
+    host, _, pointer = create_shm_tensor(
+        shape=(1, 2 * context, 1, features),
+        dtype=torch.bfloat16,
+        device_id=device_id,
+        name="resident_staging_width_test",
+    )
+    feature = torch.arange(features, dtype=torch.int32)
+    host_values = (
+        (torch.arange(2 * context, dtype=torch.int32)[:, None] * 17 + feature * 13)
+        % 251
+    ).to(torch.bfloat16)[:, None, :]
+    host[0].copy_(host_values)
+    current = (
+        ((torch.arange(width, dtype=torch.int32)[:, None] * 29 + feature * 7) % 251)
+        .to(torch.bfloat16)[:, None, :]
+        .to(device)
+    )
+    cache = torch.full(
+        (2, capacity, 1, features), -7, dtype=torch.bfloat16, device=device
+    )
+    mapping = torch.arange(2 * context, dtype=torch.int32, device=device).view(
+        2, context
+    )
+    # Use a strided view, as decode and speculative paths do.
+    position_matrix = (
+        torch.arange(width, dtype=torch.int32, device=device).view(1, width) + 2
+    )
+    first = position_matrix[:, 0]
+    requests = torch.tensor([1], dtype=torch.int32, device=device)
+    lengths = torch.tensor([2 + width], dtype=torch.int32, device=device)
+    token_requests = torch.ones(width, dtype=torch.int32, device=device)
+    positions = position_matrix.reshape(-1)
+    valid = torch.ones(width, dtype=torch.bool, device=device)
+    sources = torch.arange(width, dtype=torch.int64, device=device)
+    old_begin = torch.full((2,), -1, dtype=torch.int32, device=device)
+    old_end = old_begin.clone()
+    extents = tuple(old_begin.clone() for _ in range(3))
+    history = (
+        torch.empty(capacity, dtype=torch.int64, device=device),
+        torch.empty(capacity, dtype=torch.int64, device=device),
+        torch.empty(capacity, dtype=torch.bool, device=device),
+    )
+    workspace = (
+        torch.empty(width, dtype=torch.int64, device=device),
+        torch.empty(width, dtype=torch.bool, device=device),
+    )
+
+    def run():
+        stage_resident_kv(
+            current=current,
+            source_indices=sources,
+            host=host,
+            host_address=pointer,
+            cache=cache,
+            req_to_token=mapping,
+            requests=requests,
+            lengths=lengths,
+            first_positions=first,
+            token_requests=token_requests,
+            token_positions=positions,
+            token_valid=valid,
+            old_begin=old_begin,
+            old_end=old_end,
+            next_extents=extents,
+            history_workspace=history,
+            current_workspace=workspace,
+            capacity=capacity,
+            context_len=context,
+        )
+
+    def replay():
+        if graph:
+            captured.replay()
+        else:
+            run()
+        torch.npu.synchronize()
+
+    try:
+        if graph:
+            run()
+            torch.npu.synchronize()
+            captured = torch.npu.NPUGraph()
+            with torch.npu.graph(captured):
+                run()
+        cache.fill_(-7)
+        old_begin.fill_(-1)
+        old_end.fill_(-1)
+        replay()
+        torch.testing.assert_close(
+            cache[1, :2].cpu(), host_values[context : context + 2], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            cache[1, 2 : 2 + width].cpu(), current.cpu(), rtol=0, atol=0
+        )
+        # Reuse the captured graph with negative, out-of-range and last-valid
+        # source rows, and padded/invalid request IDs.
+        cache.fill_(-7)
+        sources.fill_(width - 1)
+        sources[0] = -1
+        if width > 1:
+            sources[1] = width
+        if width > 3:
+            valid[3] = False
+        if width > 4:
+            token_requests[4] = 2
+        replay()
+        assert torch.all(cache[1, 2] == -7).item()
+        if width > 1:
+            assert torch.all(cache[1, 3] == -7).item()
+        if width > 2:
+            torch.testing.assert_close(
+                cache[1, 4].cpu(), current[-1].cpu(), rtol=0, atol=0
+            )
+        if width > 3:
+            assert torch.all(cache[1, 5] == -7).item()
+        if width > 4:
+            assert torch.all(cache[1, 6] == -7).item()
+        if width == 1:
+            # These rows were previously valid; stale extents must not make an
+            # invalid length or first position publish current KV on replay.
+            sources.zero_()
+            for invalid_length in (0, context + 1, 1):
+                cache.fill_(-7)
+                old_begin.fill_(-1)
+                old_end.fill_(-1)
+                extents[0][1] = 0
+                extents[1][1] = 3
+                extents[2][1] = 2
+                lengths.fill_(invalid_length)
+                replay()
+                assert torch.all(cache == -7).item()
+                assert old_begin[1].item() == old_end[1].item() == -1
+                assert [extent[1].item() for extent in extents] == [-1, -1, -1]
+            # A real cache row outside the mapping table must not use stale next
+            # metadata, even if a token is marked valid.
+            mapping = mapping[:1]
+            lengths.fill_(3)
+            extents[0][1] = 0
+            extents[1][1] = 3
+            extents[2][1] = 2
+            cache.fill_(-7)
+            if graph:
+                run()
+                torch.npu.synchronize()
+                captured = torch.npu.NPUGraph()
+                with torch.npu.graph(captured):
+                    run()
+            replay()
+            assert torch.all(cache == -7).item()
+            assert old_begin[1].item() == old_end[1].item() == -1
+    finally:
+        torch.npu.synchronize()
+        free_shm(device_id)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_long_rows_leave_cache_unchanged(graph):
+    """A 64K long row must invalidate residency without writing cache data."""
+    if not torch.npu.is_available():
+        pytest.skip("NPU is required")
+    device_id = torch.npu.current_device()
+    device = torch.device("npu", device_id)
+    capacity, context, features = 12288, 65536, 576
+    host, _, pointer = create_shm_tensor(
+        shape=(1, 4, 1, features),
+        dtype=torch.bfloat16,
+        device_id=device_id,
+        name="resident_staging_long_test",
+    )
+    cache = torch.full(
+        (2, capacity, 1, features), -7, dtype=torch.bfloat16, device=device
+    )
+    mapping = torch.zeros((2, context), dtype=torch.int32, device=device)
+    requests = torch.tensor([1], dtype=torch.int32, device=device)
+    lengths = torch.tensor([context], dtype=torch.int32, device=device)
+    first = torch.tensor([context - 1], dtype=torch.int32, device=device)
+    valid = torch.ones(1, dtype=torch.bool, device=device)
+    source = torch.zeros(1, dtype=torch.int64, device=device)
+    current = torch.ones((1, 1, features), dtype=torch.bfloat16, device=device)
+    old_begin = torch.zeros(2, dtype=torch.int32, device=device)
+    old_end = old_begin.clone()
+    extents = tuple(old_begin.clone() for _ in range(3))
+    history = (source, source, valid)
+    workspace = (source, valid)
+
+    def run():
+        stage_resident_kv(
+            current=current,
+            source_indices=source,
+            host=host,
+            host_address=pointer,
+            cache=cache,
+            req_to_token=mapping,
+            requests=requests,
+            lengths=lengths,
+            first_positions=first,
+            token_requests=requests,
+            token_positions=first,
+            token_valid=valid,
+            old_begin=old_begin,
+            old_end=old_end,
+            next_extents=extents,
+            history_workspace=history,
+            current_workspace=workspace,
+            capacity=capacity,
+            context_len=context,
+        )
+
+    try:
+        if graph:
+            run()
+            torch.npu.synchronize()
+            captured = torch.npu.NPUGraph()
+            with torch.npu.graph(captured):
+                run()
+            old_begin[1] = 0
+            old_end[1] = 10
+            captured.replay()
+        else:
+            run()
+        torch.npu.synchronize()
+        assert torch.all(cache == -7).item()
+        assert old_begin[1].item() == old_end[1].item() == -1
     finally:
         torch.npu.synchronize()
         free_shm(device_id)
