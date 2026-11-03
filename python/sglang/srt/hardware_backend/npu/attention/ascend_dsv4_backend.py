@@ -1628,7 +1628,6 @@ class DeepseekV4AscendAttnBackend(
                         final_seq_lens_cpu - int(tokens_per_bs),
                         min=0,
                     )
-
                 else:
                     explicit_live_cpu = torch.as_tensor(
                         explicit_live_cpu,
@@ -1804,7 +1803,6 @@ class DeepseekV4AscendAttnBackend(
                 ctx.live_seq_lens,
                 n_draft=ctx.tokens_per_bs,
             )
-
             self._fill_verify_positions_cmp_padding_one_device(
                 ctx.forward_batch.positions,
                 fm.positions_cmp_padding_c128,
@@ -2440,7 +2438,6 @@ class DeepseekV4AscendAttnBackend(
         bs = forward_batch.batch_size
         ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         n_draft = int(forward_batch.spec_info.draft_token_num)
-
         # The parent backend normalizes this to final KV lengths for every
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
         # already pass expanded lengths and are not incremented again.

@@ -262,7 +262,6 @@ def maybe_build_dsv4_verify_bundle(
     current draft interval from the per-request DSV4 tables instead of reusing
     the larger allocation bundle produced during decode preparation.
     """
-
     pool = batch.req_to_token_pool
     if not hasattr(pool, "req_to_c128_sidecar"):
         return None
