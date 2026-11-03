@@ -52,6 +52,7 @@ def main():
         remote_engram.prepare_forward(True)
         remote_engram.prefetch_full_hash(full, 64, 4)
         ordered = torch.cat([full[rank::4] for rank in range(4)], dim=0)
+        references = []
         for layer_index, layer in enumerate(layers):
             count = int(config["engram_num_embeddings"][layer_index])
             ids = ordered[:, layer_index, :].contiguous().view(-1)
@@ -80,6 +81,7 @@ def main():
                 * torch.exp2(scales.int().float() - 127).repeat_interleave(32, 1)
                 + 0.0
             ).to(torch.bfloat16)
+            references.append(expected)
             ids_cpu = ids.cpu()
             actual = output.cpu()
             for i, value in enumerate(values):
@@ -92,6 +94,24 @@ def main():
                 )
                 assert torch.equal(selected, reference), (layer, value)
             print(f"PASS layer={layer} selections={ids.numel()}", flush=True)
+        # Non-CP health requests use a single lane of the same prepared plan.
+        remote_engram.prepare_forward(False)
+        for layer_index, layer in enumerate(layers):
+            count = int(config["engram_num_embeddings"][layer_index])
+            actual = tables[layer_index].lookup(
+                base,
+                0,
+                count,
+                lambda query: torch.empty(
+                    (query.numel(), 256), dtype=torch.bfloat16, device="cuda"
+                ),
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(
+                actual.cpu().view(torch.int16),
+                references[layer_index].view(torch.int16),
+            ), layer
+            print(f"PASS noncp layer={layer} selections={base.numel()}", flush=True)
         if reader.context.graph_replays < 2:
             raise RuntimeError("expected a graph replay for each layer")
         print(f"PASS graph_replays={reader.context.graph_replays}", flush=True)

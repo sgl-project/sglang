@@ -49,8 +49,8 @@ TP-owned rows through the research adapter. The option is off by default.
 The SGLang package contains the reader, owner service, and READ-plan code. It
 requires the separately built experimental NIXL/GPUNETIO GPU-GET library from
 the prior research runtime. It currently only supports 256-wide Engram layers 1 and 14.
-`ENGRAM_SHARED_PREFETCH=1` enables the reader's experimental CP hash
-prefetch; `ENGRAM_SHARED_READ_PLAN=1` uses its prepared multi-QP READ plan.
+The experimental path requires row264 storage, `ENGRAM_SHARED_PREFETCH=1`
+and `ENGRAM_SHARED_READ_PLAN=1` for its prepared multi-QP READ plan.
 These options require the matching native library and have not been qualified
 for all graph, cancellation, or model configurations. The native NIXL GET
 implementation remains a separate dependency.

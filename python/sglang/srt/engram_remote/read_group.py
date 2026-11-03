@@ -173,20 +173,6 @@ class ReadGroup:
         self.lib.engram_read_group_pipeline.argtypes = [C.c_void_p, C.c_uint32]
         self.contexts[0].check(self.lib.engram_read_group_pipeline(self.handle, depth))
 
-    def set_terminal(self, enabled):
-        if not hasattr(self.lib, "engram_read_group_terminal"):
-            if not enabled:
-                return
-            raise RuntimeError("runtime lacks terminal verification capability")
-        self.lib.engram_read_group_terminal.argtypes = [C.c_void_p, C.c_int]
-        self.contexts[0].check(
-            self.lib.engram_read_group_terminal(self.handle, int(enabled))
-        )
-
-    def record_consumed(self):
-        for c in self.contexts[: self.active]:
-            c.record_consumed()
-
     def close(self):
         if self.handle:
             self.contexts[0].check(self.lib.engram_read_group_destroy(self.handle))

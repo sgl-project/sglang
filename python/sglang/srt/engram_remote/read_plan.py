@@ -1,11 +1,26 @@
 """Opt-in model adapter: bounded scratch, live MR generation, GPU read plans."""
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.engram_remote import dedup_rows
 from sglang.srt.engram_remote.engram_transport import Context
 from sglang.srt.engram_remote.read_group import ReadGroup
-from sglang.srt.engram_remote.read_lanes import _merge_stats
+
+
+@triton.jit
+def _merge_stats(src, dst, LANES: tl.constexpr):
+    column = tl.arange(0, 8)
+    value = tl.full((8,), 0, tl.uint64)
+    for lane in range(LANES):
+        item = tl.load(src + lane * 8 + column)
+        value = tl.where(
+            (column == 0) | (column == 3) | (column == 7),
+            tl.maximum(value, item),
+            value + item,
+        )
+    tl.store(dst + column, value)
 
 
 class ReadPlan:
@@ -16,14 +31,11 @@ class ReadPlan:
             raise ValueError("planned READ supports4/8/16QP")
         self.gpu, self.lanes, self.maximum = gpu, lanes, max_queries
         self.graph_sizes = set(graph_sizes)
-        self.graph_captures = 0
         self.graph_replays = 0
-        self.direct_calls = 0
         self.contexts = []
         self.groups = {}
         self.plans = {}
         self.last_map = {}
-        self.used = set()
         self.stream = None
         self.last_active = 0
         self.supports_row264 = True
@@ -118,7 +130,6 @@ class ReadPlan:
         dedup = count >= 4096
         w = self.workspace[li]
         self.last_map[li] = w["reps"][:count] if dedup else None
-        self.used.add((li, q))
         key = (
             li,
             count,
@@ -166,11 +177,9 @@ class ReadPlan:
                     )
                     _merge_stats[(1,)](self.stats, stats, q, num_warps=1)
                 self.plans[key] = (graph, stats)
-                self.graph_captures += 1
             self.plans[key][0].replay()
             self.graph_replays += 1
         else:
-            self.direct_calls += 1
             self._enqueue(
                 li,
                 q,

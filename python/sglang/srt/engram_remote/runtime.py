@@ -10,10 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import torch
-import triton
-import triton.language as tl
 
-from sglang.srt.engram_remote.engram_transport import Context
 from sglang.srt.engram_remote.owner_control import OwnerClient
 
 
@@ -36,19 +33,6 @@ def _reader_device_scope(mapping, gpu):
             os.environ.pop(key, None)
         else:
             os.environ[key] = previous
-
-
-@triton.jit
-def _read_wait_stamp(pointer):
-    tick = tl.inline_asm_elementwise(
-        "mov.u64 $0, %globaltimer;",
-        constraints="=l",
-        args=[],
-        dtype=tl.uint64,
-        is_pure=False,
-        pack=1,
-    )
-    tl.store(pointer, tick)
 
 
 _quarantined = []
@@ -101,9 +85,9 @@ class ReaderRuntime:
     def _prepare(self):
         md = self.lease.metadata
         self.metadata = md
-        self.storage_layout = md.get("storage_layout", "split")
-        if self.storage_layout not in ("split", "row264"):
-            raise ValueError("unknown shared Engram storage layout")
+        self.storage_layout = md.get("storage_layout")
+        if self.storage_layout != "row264":
+            raise ValueError("remote Engram requires row264 storage")
         # Validate actual serving checkpoint, not merely a same-shape table.
         model = Path(os.environ["ENGRAM_SHARED_MODEL"])
         for name, field in (
@@ -114,28 +98,28 @@ class ReaderRuntime:
                 raise ValueError(
                     "shared owner/serving checkpoint identity mismatch: " + name
                 )
-        if self.storage_layout == "row264":
-            cfg = json.loads((model / "config.json").read_text())
-            cfg = cfg.get("text_config", cfg)
-            rows = cfg["engram_num_embeddings"]
-            specs = md.get("table_specs", ())
-            if len(specs) != 2 or tuple(md["lengths"]) != tuple(
-                int(n) * 264 for n in rows
-            ):
-                raise ValueError("row264 MR count/length mismatch")
-            expected = {
-                "weight": {"offset": 0, "bytes_per_row": 256, "dtype": "F8_E4M3"},
-                "scale": {"offset": 256, "bytes_per_row": 8, "dtype": "F8_E8M0"},
-            }
-            if any(
-                s.get("layer") != layer or s.get("component_layout") != expected
-                for s, layer in zip(specs, (1, 14))
-            ):
-                raise ValueError("row264 component layout mismatch")
+        cfg = json.loads((model / "config.json").read_text())
+        cfg = cfg.get("text_config", cfg)
+        rows = cfg["engram_num_embeddings"]
+        specs = md.get("table_specs", ())
+        if len(specs) != 2 or tuple(md["lengths"]) != tuple(int(n) * 264 for n in rows):
+            raise ValueError("row264 MR count/length mismatch")
+        expected = {
+            "weight": {"offset": 0, "bytes_per_row": 256, "dtype": "F8_E4M3"},
+            "scale": {"offset": 256, "bytes_per_row": 8, "dtype": "F8_E8M0"},
+        }
+        if any(
+            s.get("layer") != layer or s.get("component_layout") != expected
+            for s, layer in zip(specs, (1, 14))
+        ):
+            raise ValueError("row264 component layout mismatch")
         self.max_queries = int(os.environ.get("ENGRAM_SHARED_MAX_QUERIES", "196608"))
         self.prefetch_enabled = os.environ.get("ENGRAM_SHARED_PREFETCH") == "1"
-        if self.prefetch_enabled and self.storage_layout != "row264":
-            raise ValueError("early prefetch requires row264")
+        if (
+            not self.prefetch_enabled
+            or os.environ.get("ENGRAM_SHARED_READ_PLAN") != "1"
+        ):
+            raise ValueError("remote Engram requires prefetch and a prepared READ plan")
         self.p_off = 64
         self.s_off = self.p_off + self.max_queries * 256 + 64
         self.dump = (self.s_off + self.max_queries * 8 + 127) // 64 * 64
@@ -149,69 +133,40 @@ class ReaderRuntime:
         self.layer_stats = torch.zeros(
             (2 if self.prefetch_enabled else 1, 8), dtype=torch.uint64, device="cuda"
         )
-        self.stats = self.layer_stats[0]
-        self.timing_dir = os.environ.get("ENGRAM_RESEARCH_WAIT_TIMING_DIR")
-        self.timing_seq = 0
-        self.read_wait_times = (
-            torch.zeros((2, 2), device="cuda", dtype=torch.uint64)
-            if self.timing_dir
-            else None
-        )
-        self.sequence = torch.arange(self.max_queries, dtype=torch.int64, device="cuda")
         self.ranges = {}
         self.prefetch_ids = None
         self.prefetch_issued = set()
         self.defer_layer14 = os.environ.get("ENGRAM_SHARED_DEFER_LAYER14") == "1"
-        self.defer_control_path = os.environ.get("ENGRAM_RESEARCH_DEFER_CONTROL")
         self.forward_cp_expected = False
-        if self.prefetch_enabled:
-            self.comm_stream = torch.cuda.Stream(device=gpu)
-            self.ready_events = {layer: torch.cuda.Event() for layer in (1, 14)}
-            self.consumed_events = {layer: torch.cuda.Event() for layer in (1, 14)}
+        self.comm_stream = torch.cuda.Stream(device=gpu)
+        self.ready_events = {layer: torch.cuda.Event() for layer in (1, 14)}
+        self.consumed_events = {layer: torch.cuda.Event() for layer in (1, 14)}
         # A separate base per model instance prevents same-node endpoint reuse.
         port = int(os.environ["ENGRAM_SHARED_READER_PORT_BASE"]) + gpu * max(
             4, int(os.environ.get("ENGRAM_SHARED_READ_LANES", "1"))
         )
         lanes = int(os.environ.get("ENGRAM_SHARED_READ_LANES", "1"))
-        planned = os.environ.get("ENGRAM_SHARED_READ_PLAN") == "1"
+        from sglang.srt.engram_remote.read_plan import ReadPlan
+
+        graph_sizes = tuple(
+            int(n)
+            for n in os.environ.get("ENGRAM_SHARED_READ_GRAPH_SIZES", "49152").split(
+                ","
+            )
+        )
+        if not graph_sizes or any(n <= 0 or n > self.max_queries for n in graph_sizes):
+            raise ValueError("invalid planned READ graph capacity")
         with _reader_device_scope(
             os.environ.get("ENGRAM_SHARED_READER_DEVICES"), gpu
         ) as self.reader_device:
-            if planned:
-                if not self.prefetch_enabled:
-                    raise ValueError("planned reader is P-only")
-                from sglang.srt.engram_remote.read_plan import ReadPlan
-
-                graph_sizes = tuple(
-                    int(n)
-                    for n in os.environ.get(
-                        "ENGRAM_SHARED_READ_GRAPH_SIZES", "49152"
-                    ).split(",")
-                )
-                if not graph_sizes or any(
-                    n <= 0 or n > self.max_queries for n in graph_sizes
-                ):
-                    raise ValueError("invalid planned READ graph capacity")
-                self.context = ReadPlan(
-                    os.environ["ENGRAM_SHARED_LIBRARY"],
-                    gpu,
-                    port,
-                    lanes,
-                    self.max_queries,
-                    graph_sizes,
-                )
-            elif lanes != 1:
-                if not self.prefetch_enabled:
-                    raise ValueError("multiple READ lanes require P prefetch")
-                from sglang.srt.engram_remote.read_lanes import ReadLanes
-
-                self.context = ReadLanes(
-                    os.environ["ENGRAM_SHARED_LIBRARY"], gpu, port, lanes
-                )
-            else:
-                self.context = Context(os.environ["ENGRAM_SHARED_LIBRARY"], gpu, port)
-        if self.storage_layout == "row264" and not self.context.supports_row264:
-            raise RuntimeError("selected runtime lacks row264 capability")
+            self.context = ReadPlan(
+                os.environ["ENGRAM_SHARED_LIBRARY"],
+                gpu,
+                port,
+                lanes,
+                self.max_queries,
+                graph_sizes,
+            )
         self.context.register([self.arena], host=False)
         self.context.connect_raw(
             base64.b64decode(md["native_md"], validate=True),
@@ -230,91 +185,58 @@ class ReaderRuntime:
         if n > self.max_queries:
             raise ValueError(f"shared Engram scratch capacity {n}>{self.max_queries}")
         li = (1, 14).index(layer)
-        if self.prefetch_enabled:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "prefetch consumer must remain the native eager Engram break"
-                )
-            if self.prefetch_ids is None:
-                if self.forward_cp_expected:
-                    raise RuntimeError(
-                        "CP forward did not execute early hash prefetch hook"
-                    )
-                # Tiny/non-CP forwards (including health requests) never run
-                # the full-CP hash hook. Keep the same producer stream even
-                # when a synchronous read is required.
-                self.comm_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.comm_stream):
-                    ids.record_stream(self.comm_stream)
-                    self.context.fetch(
-                        ids,
-                        n,
-                        li * self.span + self.p_off,
-                        0,
-                        li * self.span + self.dump,
-                        512,
-                        self.layer_stats[li],
-                        weight_index=li,
-                        scale_index=li,
-                        row_lo=lo,
-                        row_hi=hi,
-                        row264=True,
-                    )
-                    self.ready_events[layer].record()
-            elif self.prefetch_ids[layer].numel() != n or self.ranges[layer] != (
-                lo,
-                hi,
-            ):
-                raise RuntimeError("prefetch consumer shape/range was not prepared")
-            if self.prefetch_ids is not None and layer not in self.prefetch_issued:
-                self.issue_prefetch_layer(
-                    layer
-                )  # Safe synchronous fallback for non-scatter paths.
-            if self.read_wait_times is not None:
-                _read_wait_stamp[(1,)](self.read_wait_times[li, 0], num_warps=1)
-            torch.cuda.current_stream().wait_event(self.ready_events[layer])
-            if self.read_wait_times is not None:
-                _read_wait_stamp[(1,)](self.read_wait_times[li, 1], num_warps=1)
-            if self.prefetch_ids is not None:
-                torch._assert_async(
-                    (ids == self.prefetch_ids[layer]).all(),
-                    "prefetched Engram IDs differ",
-                )
-            torch._assert_async(
-                self.layer_stats[li].view(torch.int64)[0] == 0,
-                "prefetched Engram GET failed",
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "prefetch consumer must remain the native eager Engram break"
             )
-            offset = li * self.span + self.p_off
-            raw = self.arena[offset : offset + n * 264].view(n, 264)
-            return ids, raw[:, :256].view(torch.float8_e4m3fn), raw[:, 256:]
-        packed = self.storage_layout == "row264"
-        self.context.fetch(
-            ids,
-            n,
-            self.p_off,
-            0 if packed else self.s_off,
-            self.dump,
-            512,
-            self.stats,
-            weight_index=li if packed else 2 * li,
-            scale_index=li if packed else 2 * li + 1,
-            row_lo=lo,
-            row_hi=hi,
-            row264=packed,
-        )
+        if self.prefetch_ids is None:
+            if self.forward_cp_expected:
+                raise RuntimeError(
+                    "CP forward did not execute early hash prefetch hook"
+                )
+            # Tiny/non-CP forwards (including health requests) never run
+            # the full-CP hash hook. Keep the same producer stream even
+            # when a synchronous read is required.
+            self.comm_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.comm_stream):
+                ids.record_stream(self.comm_stream)
+                self.context.fetch(
+                    ids,
+                    n,
+                    li * self.span + self.p_off,
+                    0,
+                    li * self.span + self.dump,
+                    512,
+                    self.layer_stats[li],
+                    weight_index=li,
+                    scale_index=li,
+                    row_lo=lo,
+                    row_hi=hi,
+                    row264=True,
+                )
+                self.ready_events[layer].record()
+        elif self.prefetch_ids[layer].numel() != n or self.ranges[layer] != (
+            lo,
+            hi,
+        ):
+            raise RuntimeError("prefetch consumer shape/range was not prepared")
+        if self.prefetch_ids is not None and layer not in self.prefetch_issued:
+            self.issue_prefetch_layer(
+                layer
+            )  # Safe synchronous fallback for non-scatter paths.
+        torch.cuda.current_stream().wait_event(self.ready_events[layer])
+        if self.prefetch_ids is not None:
+            torch._assert_async(
+                (ids == self.prefetch_ids[layer]).all(),
+                "prefetched Engram IDs differ",
+            )
         torch._assert_async(
-            self.stats.view(torch.int64)[0] == 0, "shared Engram GET failed"
+            self.layer_stats[li].view(torch.int64)[0] == 0,
+            "prefetched Engram GET failed",
         )
-        if packed:
-            raw = self.arena[self.p_off : self.p_off + n * 264].view(n, 264)
-            return ids, raw[:, :256].view(torch.float8_e4m3fn), raw[:, 256:]
-        return (
-            ids,
-            self.arena[self.p_off : self.p_off + n * 256]
-            .view(n, 256)
-            .view(torch.float8_e4m3fn),
-            self.arena[self.s_off : self.s_off + n * 8].view(n, 8),
-        )
+        offset = li * self.span + self.p_off
+        raw = self.arena[offset : offset + n * 264].view(n, 264)
+        return ids, raw[:, :256].view(torch.float8_e4m3fn), raw[:, 256:]
 
     def begin_prefetch(self, full_hash_ids, local_rows, cp_size):
         if not self.prefetch_enabled or self.closed:
@@ -386,52 +308,14 @@ class ReaderRuntime:
             self._enqueue_prefetch_layer(layer)
 
     def start_forward(self, cp_extend):
-        if cp_extend and self.defer_control_path:
-            # Opt-in experiment control, changed atomically only while idle.
-            # No file access in the default model path.
-            value = Path(self.defer_control_path).read_text().strip()
-            if value not in ("0", "1"):
-                raise ValueError("invalid deferred READ experiment policy")
-            self.defer_layer14 = value == "1"
-        if cp_extend:
-            self.timing_seq = getattr(self, "timing_seq", 0) + 1
         self.prefetch_ids = None
         self.prefetch_issued = set()
         self.forward_cp_expected = bool(cp_extend)
 
-    def report_wait_timing(self):
-        if (
-            not self.timing_dir
-            or self.prefetch_ids is None
-            or self.prefetch_ids[1].numel() != 393216
-        ):
-            return
-        # Readback is after the second consumer was queued. It cannot alter this
-        # forward's first-Engram wait; do not use these runs for serving timing.
-        timing = self.read_wait_times.cpu().tolist()
-        stats = self.layer_stats.cpu().tolist()
-        record = dict(
-            gpu=torch.cuda.current_device(),
-            sequence=self.timing_seq,
-            policy=int(self.defer_layer14),
-            queries=393216,
-            wait_ns=[b - a for a, b in timing],
-            layer_stats=stats,
-        )
-        path = Path(self.timing_dir) / (
-            "frame" + str(self.timing_seq) + "-gpu" + str(record["gpu"]) + ".json"
-        )
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(record))
-        temp.replace(path)
-
     def record_consumed(self, layer):
-        if self.prefetch_enabled:
-            self.consumed_events[layer].record(torch.cuda.current_stream())
-            with torch.cuda.stream(self.comm_stream):
-                self.comm_stream.wait_event(self.consumed_events[layer])
-                self.context.record_consumed()
-        else:
+        self.consumed_events[layer].record(torch.cuda.current_stream())
+        with torch.cuda.stream(self.comm_stream):
+            self.comm_stream.wait_event(self.consumed_events[layer])
             self.context.record_consumed()
 
     def close(self):

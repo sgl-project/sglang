@@ -3,7 +3,6 @@ import os
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -70,35 +69,6 @@ class RemoteEngramValidationTest(CustomTestCase):
             ):
                 table.lookup(indices, 0, 4, lambda ids: torch.empty((ids.numel(), 256)))
         table.runtime.fetch.assert_not_called()
-
-    def test_capture_does_not_apply_stale_prefetch_representatives(self):
-        table = self.module.RemoteEngramTable(4, 256, 1)
-        runtime = mock.Mock(prefetch_enabled=False, storage_layout="row264")
-        runtime.fetch.return_value = (torch.tensor([0]), torch.empty(1, 256), None)
-        runtime.context.representatives.return_value = torch.tensor([123])
-        table.runtime = runtime
-        seen = []
-
-        def gather(_weight, _ids, out, _lo, _hi, *, query_order, representatives):
-            seen.append((query_order, representatives))
-            out.fill_(7)
-
-        with (
-            mock.patch("torch.cuda.is_current_stream_capturing", return_value=True),
-            mock.patch.dict(
-                "sys.modules",
-                {
-                    "sglang.srt.engram_remote.row264_kernels": SimpleNamespace(
-                        gather_row264=gather
-                    )
-                },
-            ),
-        ):
-            result = table.lookup(
-                torch.tensor([0]), 0, 4, lambda _: torch.zeros(1, 256)
-            )
-        self.assertTrue(torch.all(result == 7))
-        self.assertEqual(seen, [(True, None)])
 
     def test_plan_is_primed_only_after_both_layers_and_deferred_read_after_reduce(self):
         runtime = mock.Mock()
