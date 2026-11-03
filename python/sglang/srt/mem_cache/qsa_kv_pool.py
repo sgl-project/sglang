@@ -144,7 +144,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
             if (
                 quant_method is not None
                 or post_capture_active
-                or full_kv_pool_class is not None
+                or full_kv_pool_class not in (None, MHATokenToKVPool)
             ):
                 raise ValueError("QSA K/V offload needs a plain unquantized K/V pool")
             # The GPU keeps only the hot-cache and scratch rows of the K/V.
