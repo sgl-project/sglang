@@ -11,16 +11,14 @@ A module may still export a name it imports when it says so:
   * the name is in its literal `__all__`;
   * it imports the name as `f as f`;
   * it is a package `__init__.py`;
-  * it binds the name inside a runtime `if` / `try`, or more than once, which
-    makes it the place that picks an implementation (per platform, or a
-    fallback).
+  * it binds the name inside an `if` / `try`, which makes it the place that
+    picks an implementation (per platform, or a fallback).
 
 With file arguments, only those files are checked as importers; with none,
 every Python file under python/ and test/ is.
 """
 
 import ast
-import os
 import sys
 import warnings
 from functools import lru_cache
@@ -56,30 +54,17 @@ def _resolve(current: str, is_package: bool, node: ast.ImportFrom) -> str:
     return ".".join(base + ([node.module] if node.module else []))
 
 
-def _is_type_checking(test: ast.expr) -> bool:
-    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
-        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
-    )
-
-
-def _top_level(stmts, type_checking=False, conditional=False):
-    """Yield (stmt, under TYPE_CHECKING, under a runtime if/try)."""
+def _top_level(stmts, conditional=False):
+    """Yield (stmt, under an if/try) for each module-level statement."""
     for stmt in stmts:
         if isinstance(stmt, ast.If):
-            if _is_type_checking(stmt.test):
-                yield from _top_level(stmt.body, True, conditional)
-            else:
-                yield from _top_level(stmt.body, type_checking, True)
-            yield from _top_level(stmt.orelse, type_checking, True)
+            yield from _top_level(stmt.body + stmt.orelse, True)
         elif isinstance(stmt, ast.Try):
-            for block in (stmt.body, stmt.orelse, stmt.finalbody):
-                yield from _top_level(block, type_checking, True)
-            for handler in stmt.handlers:
-                yield from _top_level(handler.body, type_checking, True)
-        elif isinstance(stmt, ast.With):
-            yield from _top_level(stmt.body, type_checking, conditional)
+            blocks = [stmt.body, stmt.orelse, stmt.finalbody]
+            for block in blocks + [h.body for h in stmt.handlers]:
+                yield from _top_level(block, True)
         else:
-            yield stmt, type_checking, conditional
+            yield stmt, conditional
 
 
 @lru_cache(maxsize=None)
@@ -94,8 +79,7 @@ def _module_info(module: str):
         return None
     is_package = path.name == "__init__.py"
     defined, exported, imported, selectors = set(), set(), {}, set()
-    bindings = {}
-    for stmt, type_checking, conditional in _top_level(tree.body):
+    for stmt, conditional in _top_level(tree.body):
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             defined.add(stmt.name)
         elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
@@ -109,7 +93,7 @@ def _module_info(module: str):
                         exported |= set(ast.literal_eval(stmt.value))
                     except (ValueError, TypeError, SyntaxError):
                         pass
-        elif isinstance(stmt, (ast.Import, ast.ImportFrom)) and not type_checking:
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             source = (
                 _resolve(module, is_package, stmt)
                 if isinstance(stmt, ast.ImportFrom)
@@ -119,7 +103,6 @@ def _module_info(module: str):
                 if alias.name == "*":
                     continue
                 local = alias.asname or alias.name.split(".")[0]
-                bindings[local] = bindings.get(local, 0) + 1
                 if conditional:
                     selectors.add(local)
                 if alias.asname == alias.name:
@@ -127,7 +110,6 @@ def _module_info(module: str):
                 imported[local] = (
                     (source, alias.name) if source is not None else (alias.name, None)
                 )
-    selectors |= {name for name, count in bindings.items() if count > 1}
     return is_package, defined, exported, imported, selectors
 
 
@@ -143,20 +125,6 @@ def _declares(module: str, name: str) -> bool:
         or name in selectors
         or name not in imported
     )
-
-
-def _source_of(module: str, name: str) -> str:
-    """The nearest module after `module` that declares `name`."""
-    for _ in range(10):
-        source, original = _module_info(module)[3][name]
-        if original is None:
-            return source
-        if _module_path(f"{source}.{original}") is not None:
-            return f"{source}.{original}"
-        if not source.startswith("sglang") or _declares(source, original):
-            return source
-        module, name = source, original
-    return module
 
 
 def _import_froms(stmts):
@@ -197,7 +165,7 @@ def check_file(path: Path):
                 continue
             if _declares(module, name):
                 continue
-            source = _source_of(module, name)
+            source = _module_info(module)[3][name][0]
             if source == current:
                 continue
             errors.append(
@@ -214,7 +182,7 @@ def main(argv) -> int:
         files = [Path(f) for f in argv if f.endswith(".py")]
     else:
         files = [p for root in SCAN_ROOTS for p in sorted(Path(root).rglob("*.py"))]
-    errors = [e for f in files if os.path.isfile(f) for e in check_file(f)]
+    errors = [e for f in files for e in check_file(f)]
     if errors:
         print("ERROR: names imported through a module that only re-imports them:")
         for error in errors:
