@@ -107,8 +107,9 @@ class VmmBackend(ABC):
     def supports_aliased_mappings(self) -> bool:
         """Whether one physical object may sit in two live VA ranges at once.
 
-        Level Zero returns success from the second zeVirtualMemMap but any access
-        then fails with DEVICE_LOST, so pages are remapped, not aliased.
+        Level Zero cannot (intel/compute-runtime#1024): before compute-runtime 26.35
+        the second zeVirtualMemMap succeeds and access fails with DEVICE_LOST; from
+        26.35 it returns ZE_RESULT_ERROR_INVALID_ARGUMENT. Pages are remapped instead.
         """
         raise NotImplementedError
 
