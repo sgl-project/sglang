@@ -75,5 +75,32 @@ Set a cooldown deliberately: `0` lets the holder run PR-head code on the
 self-hosted GPU runners, and raising it above `0` takes that away again along
 with their rate-limit waiver.
 
+## DCO check
+
+`workflows/dco-check.yml` checks every non-merge commit introduced by a pull
+request for a `Signed-off-by` trailer. Sign off contributions you can certify
+under the [Developer Certificate of Origin](https://developercertificate.org/)
+with `git commit -s`:
+
+```text
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+To add a missing sign-off to your latest commit:
+
+```bash
+git commit --amend --no-edit --signoff
+git push --force-with-lease
+```
+
+For multiple commits you can certify, use `git rebase --signoff HEAD~N`, replacing
+`N` with the number of commits to update, then `git push --force-with-lease`.
+The workflow checks the trailer format, not the signer's identity. Merge commits
+are exempt; bot-authored non-merge commits follow the same rule as other commits.
+
+To require this check before merging, repository maintainers must add
+`Developer Certificate of Origin` to the required status checks in the branch
+protection rule or ruleset after the workflow has run.
+
 ## Others
 - `MAINTAINER.md` defines the code maintenance model.

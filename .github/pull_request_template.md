@@ -26,6 +26,7 @@ Examples: [Fix] attention: Fix KV cache indexing; [Perf] [AMD] flash-attn: Optim
 
 ## Checklist
 
+- [ ] Sign off every non-merge commit with `git commit -s` to certify the [Developer Certificate of Origin](https://developercertificate.org/).
 - [ ] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).
 - [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).
 - [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).

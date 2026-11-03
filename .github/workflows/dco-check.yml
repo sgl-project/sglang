@@ -1,0 +1,59 @@
+name: DCO Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    name: Developer Certificate of Origin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check DCO sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Resolve the range before looping so missing commits fail the check.
+          commits=$(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA")
+          failed=0
+          while IFS= read -r sha; do
+            [[ -z "$sha" ]] && continue
+
+            message=$(git log -1 --format='%B' "$sha")
+            trailers=$(printf '%s\n' "$message" | git interpret-trailers --parse)
+            if ! grep -Eq '^Signed-off-by: [^<>[:space:]][^<>]* <[^<>[:space:]@]+@[^<>[:space:]@]+>$' <<< "$trailers"; then
+              echo "::error::Commit $sha is missing a valid Signed-off-by trailer."
+              echo "  Subject: $(git log -1 --format='%s' "$sha")"
+              echo "  Author:  $(git log -1 --format='%an <%ae>' "$sha")"
+              failed=1
+            fi
+          done <<< "$commits"
+
+          if [[ "$failed" -eq 1 ]]; then
+            echo "Every non-merge commit must end with a sign-off trailer:"
+            echo "  Signed-off-by: Your Name <your.email@example.com>"
+            echo "Use git commit -s for new commits."
+            echo "For your latest commit: git commit --amend --no-edit --signoff"
+            echo "For your last N commits: git rebase --signoff HEAD~N"
+            echo "Then update the PR with: git push --force-with-lease"
+            echo "Only sign off contributions you can certify under https://developercertificate.org/"
+            exit 1
+          fi
+
+          echo "All non-merge commits have valid DCO sign-off trailers."
