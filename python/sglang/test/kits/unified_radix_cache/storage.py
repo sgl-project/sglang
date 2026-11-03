@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -551,7 +552,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=sib.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=sib.device_prefix_len),
+            kv=ReqKvInfo(cache_protected_len=sib.device_prefix_len),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertEqual(req.host_hit_length, len(seq) - len(head))
