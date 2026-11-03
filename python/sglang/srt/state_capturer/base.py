@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.state_capturer import hicache_carry
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,10 @@ class TopkCaptureOutput:
     out_cache_loc: torch.Tensor
     topk: torch.Tensor
     host_cache: BaseHostCache
+    # Lets HiCache carry defer backups of rows this output has not written yet.
+    carry_output_id: int = dataclasses.field(
+        default_factory=hicache_carry.register_output
+    )
 
     def map_device_tensors(self, fn):
         # Device-tensor fields only; caller injects the copy+safety primitive
@@ -116,6 +121,7 @@ class TopkCaptureOutput:
 
     def finalize(self):
         self.host_cache.buffer[self.out_cache_loc] = self.topk
+        hicache_carry.on_output_finalized(self.carry_output_id)
 
 
 class BaseTopkCapturer:
