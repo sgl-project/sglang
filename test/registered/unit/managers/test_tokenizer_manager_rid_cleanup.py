@@ -50,6 +50,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     SchedulerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -157,6 +158,7 @@ def _make_req_state(rid: str = "test_rid") -> ReqState:
     obj.rid = rid
     obj.stream = False
     obj.return_logprob = False
+    obj.return_routed_experts = False
     obj.lora_path = None
     obj.log_metrics = False
     return ReqState(
@@ -492,6 +494,72 @@ class TestAbortOutputPayload(CustomTestCase):
                 out = state.out_list[0]
                 self.assertEqual(out["output_ids"], expected)
                 self.assertEqual(out["meta_info"]["completion_tokens"], 3)
+
+    def test_abort_with_routed_experts_returns_no_output(self):
+        """An abort echo has no routed-experts rows, so a request that asked
+        for them gets no output tokens and no output logprobs either."""
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_routed_experts_rid"
+        state = _make_req_state(rid)
+        state.obj.return_routed_experts = True
+        state.obj.return_logprob = True
+        state.obj.top_logprobs_num = 0
+        state.obj.token_ids_logprob = None
+        state.obj.return_text_in_logprobs = False
+        state.output_ids = [5, 6, 7]
+        state.output_token_logprobs_val = [-0.1, -0.2, -0.3]
+        state.output_token_logprobs_idx = [5, 6, 7]
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        out = state.out_list[0]
+        self.assertEqual(out["output_ids"], [])
+        self.assertEqual(out["text"], "")
+        meta = out["meta_info"]
+        self.assertEqual(meta["completion_tokens"], 0)
+        self.assertEqual(meta["routed_experts"], "")
+        self.assertEqual(meta["output_token_logprobs"], [])
+        self.assertEqual(meta["output_token_logprobs_length"], 0)
+
+    def test_blanked_abort_echo_reports_weight_versions_of_no_tokens(self):
+        """The weight versions of a blanked echo describe the 0 returned tokens."""
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_routed_experts_versions_rid"
+        state = _make_req_state(rid)
+        state.obj.return_routed_experts = True
+        state.output_ids = [5, 6, 7]
+        tm.rid_to_state[rid] = state
+        abort = _make_abort_req(rid)
+        abort.weight_versions = [
+            WeightVersionSpan(version="v1", start=0, end=2),
+            WeightVersionSpan(version="v2", start=2, end=3),
+        ]
+
+        tm._handle_abort_req(abort)
+
+        meta = state.out_list[0]["meta_info"]
+        self.assertEqual(meta["completion_tokens"], 0)
+        self.assertEqual(
+            meta["weight_versions"], [{"version": "v1", "start": 0, "end": 0}]
+        )
+        self.assertEqual(meta["weight_version"], "v1")
+
+    def test_streaming_abort_with_routed_experts_keeps_tokens(self):
+        """A streaming client has already received the tokens; the final abort
+        chunk is not blanked."""
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_routed_experts_stream_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.obj.return_routed_experts = True
+        state.output_ids = [5, 6, 7]
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertEqual(state.out_list[0]["meta_info"]["completion_tokens"], 3)
+        self.assertNotIn("routed_experts", state.out_list[0]["meta_info"])
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
