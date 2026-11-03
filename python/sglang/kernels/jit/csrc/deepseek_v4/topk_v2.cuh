@@ -804,9 +804,6 @@ struct SplitWorkspace {
 /// kMaxNumTie far more often, and each overflowing row costs the epilogue a
 /// refine_ties rescan of the whole row in one block.
 struct TopKSplit : impl::TopKRadixBase<12> {
-  /// A threshold bin holding only zeros needs no refine when any tie subset is
-  /// valid; the deterministic mode still orders those ties by index.
-  static constexpr bool kZeroShortcut = impl::kExact && !impl::kDeterministic;
   using Base = impl::TopKRadixBase<12>;
   static_assert(kHistSize % kBlockSize == 0, "the histogram is transferred kHistItems bins per thread");
   /// Bins per thread, in the contiguous tx * kHistItems layout the base uses.
@@ -891,7 +888,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto topk = problem.topk;
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
-    const bool zero_bin = kZeroShortcut && is_zero_bin(v_lo);
+    const bool zero_bin = impl::kExact && zero_bin_shortcut(v_lo);
     if (zero_bin && tx == 0) smem->tie_nonzero = 0;
     __syncthreads();
 
@@ -947,7 +944,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
         // served out of this CU's own stale cache.
         smem->total_gt = atomicAdd(&ctr->count_gt, 0u);
         smem->total_eq = atomicAdd(&ctr->count_eq, 0u);
-        if (kZeroShortcut && is_zero_bin(smem->v_lo)) smem->tie_nonzero = atomicAdd(&ctr->tie_nonzero, 0u);
+        if (impl::kExact && zero_bin_shortcut(smem->v_lo)) smem->tie_nonzero = atomicAdd(&ctr->tie_nonzero, 0u);
       }
     }
     __syncthreads();
@@ -960,7 +957,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
     uint32_t above_count, tie_count;
-    const bool zero_ties = kZeroShortcut && is_zero_bin(smem->v_lo) && smem->tie_nonzero == 0;
+    const bool zero_ties = impl::kExact && zero_bin_shortcut(smem->v_lo) && smem->tie_nonzero == 0;
     if (impl::kExact && smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
       // The global list holds an arrival-order subset. refine_ties emits after
       // the slots every rank already took, so seed its counter with their total.

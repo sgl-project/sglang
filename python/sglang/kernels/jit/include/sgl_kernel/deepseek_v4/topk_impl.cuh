@@ -629,9 +629,12 @@ struct TopKRadixBase : TopKConfig {
   };
 
  protected:
-  SGL_DEVICE static bool is_zero_bin([[maybe_unused]] float lower) {
+  /// True when a threshold bin starting at `lower` may skip refine_ties once its
+  /// members are proven all +0, since any subset of them is then exact (ROCm only).
+  /// The deterministic mode still orders those ties by index, so it never may.
+  SGL_DEVICE static bool zero_bin_shortcut([[maybe_unused]] float lower) {
 #ifdef USE_ROCM
-    return __float_as_uint(lower) == 0u;
+    return !kDeterministic && __float_as_uint(lower) == 0u;
 #else
     return false;
 #endif
@@ -1007,7 +1010,7 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto topk = problem.topk;
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
-    const bool zero_bin = kExact && is_zero_bin(v_lo);
+    const bool zero_bin = kExact && zero_bin_shortcut(v_lo);
     if (zero_bin) {
       // find_threshold has finished using the overlaid warp sums.
       if (tx == 0) smem->tie_nonzero = 0;
@@ -1138,7 +1141,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
     const auto topk = problem.topk;
-    const bool zero_bin = kExact && is_zero_bin(v_lo);
+    const bool zero_bin = kExact && zero_bin_shortcut(v_lo);
     if (kExact && !zero_bin && smem->thr_count > kMaxNumTie) [[unlikely]] {
       // The threshold bin overflows the staging buffer (known from the histogram):
       // the collect pass builds refine_ties' first histogram instead of staging.
