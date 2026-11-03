@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_resources,
     get_schedule,
+    is_scheduler_io_rank,
 )
 from sglang.srt.state_capturer.base import BaseDeviceCache, BaseTopkCapturer
 from sglang.srt.utils import ceil_align
@@ -37,16 +38,6 @@ def _routed_layer_ids(model: torch.nn.Module) -> list[int]:
         module.layer_id
         for module in model.modules()
         if isinstance(module, TopK) and module.topk_config.allow_routed_experts_capture
-    )
-
-
-def _is_output_rank() -> bool:
-    # Must match the scheduler's is_rank_zero: only that rank sends outputs.
-    parallel = get_parallel()
-    return (
-        parallel.pp_rank == 0
-        and parallel.attn_tp_rank == 0
-        and parallel.attn_cp_rank == 0
     )
 
 
@@ -117,8 +108,6 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             # Shares are padded to equal size, so whole shares must fit.
             max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
 
-        # Only the output rank sends outputs, so only it keeps the readback caches.
-        output_rank = _is_output_rank()
         super().__init__(
             num_tokens=num_tokens,
             max_batch_size=max_batch_size,
@@ -127,8 +116,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
-            allocate_host_cache=output_rank,
-            allocate_device_cache=output_rank,
+            # Other ranks compute the same ids (or join the gather below) and
+            # send nothing, so they keep no rows.
+            allocate_caches=is_scheduler_io_rank(),
         )
 
         # Scattered backends split tokens across attention-TP ranks; only the

@@ -10,6 +10,7 @@ import torch
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
 from sglang.srt.state_capturer.base import BaseDeviceCache
@@ -164,18 +165,17 @@ class TestOutputRankHostCache(CustomTestCase):
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
     def _capturer(self, attn_tp_rank, backend="none"):
-        parallel = SimpleNamespace(
-            num_dp_ranks=1,
-            pp_rank=0,
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=2,
-            attn_cp_rank=0,
-        )
         hf_text_config = SimpleNamespace(
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
         with (
-            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            get_parallel().override(
+                num_dp_ranks=1,
+                pp_rank=0,
+                attn_tp_rank=attn_tp_rank,
+                attn_tp_size=2,
+                attn_cp_rank=0,
+            ),
             mock.patch.object(
                 re_mod,
                 "get_schedule",
@@ -280,9 +280,10 @@ class TestLastLayerGather(CustomTestCase):
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5, 9])
 
     def _parallel(self, attn_tp_rank, pp_rank=0):
-        return SimpleNamespace(
+        return dict(
             num_dp_ranks=1,
             pp_rank=pp_rank,
+            pp_size=2,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=2,
             attn_cp_rank=0,
@@ -298,7 +299,7 @@ class TestLastLayerGather(CustomTestCase):
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
         with (
-            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            get_parallel().override(**parallel),
             mock.patch.object(
                 re_mod,
                 "get_schedule",
@@ -326,7 +327,7 @@ class TestLastLayerGather(CustomTestCase):
 
     def _capture_layers(self, cap, parallel, local_topk, all_gather, layers=None):
         with (
-            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            get_parallel().override(**parallel),
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
             ),
@@ -369,7 +370,7 @@ class TestLastLayerGather(CustomTestCase):
         self.assertEqual(calls, [1, 0])
 
         with (
-            mock.patch.object(re_mod, "get_parallel", return_value=output_parallel),
+            get_parallel().override(**output_parallel),
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
             ),
@@ -420,7 +421,7 @@ class TestLastLayerGather(CustomTestCase):
         local_topk = self._local_topk()
         with self.assertRaisesRegex(RuntimeError, "captured 2 routed-expert rows"):
             with (
-                mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+                get_parallel().override(**parallel),
                 mock.patch.object(
                     re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
                 ),
