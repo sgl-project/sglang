@@ -268,6 +268,14 @@ def _index_k_dcp() -> Tuple[int, int]:
     return parallel.attn_dcp_size, parallel.attn_dcp_rank
 
 
+def _index_k_slot_mappings(pool, layer_id: int, loc: torch.Tensor):
+    """(index-K buffer, token slots with -1 to skip) for slot-skipping kernels."""
+    shard_pool = get_kv_shard_pool(pool)
+    if shard_pool is None:
+        return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc),)
+    return shard_pool.index_key_cache.slot_mappings(layer_id, loc)
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -735,39 +743,38 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
-        kv_cache = (
-            pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            .view(-1, pool.index_page_size, self.head_dim + 4)
-            .view(fp8_dtype)
-        )
 
         q_fp8 = torch.empty_like(query, dtype=fp8_dtype)
         weights = torch.empty_like(weights_raw, dtype=torch.float32)
         cos_cache, sin_cache = self._aiter_fused_fp8_rope_caches(
             query.device, query.dtype
         )
-        aiter_fused_fp8_qk_write(
-            query,
-            q_fp8,
-            weights_raw,
-            weights,
-            key,
-            kv_cache,
-            out_cache_loc,
-            self.k_norm.weight,
-            self.k_norm.bias,
-            positions,
-            cos_cache,
-            sin_cache,
-            self.k_norm.variance_epsilon,
-            self.block_size,
-            self.scale_fmt,
-            self.softmax_scale * self.n_heads**-0.5,
-            preshuffle=_use_aiter_preshuffle,
-            is_neox=self.is_neox_style,
-            # Padded graph rows still need Q/gate; only K write is skipped.
-            compute_all_q_rope=True,
-        )
+        for i, (buf, slots) in enumerate(
+            _index_k_slot_mappings(pool, layer_id, out_cache_loc)
+        ):
+            aiter_fused_fp8_qk_write(
+                query,
+                q_fp8,
+                weights_raw,
+                weights,
+                key,
+                buf.view(-1, pool.index_page_size, self.head_dim + 4).view(fp8_dtype),
+                slots,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                positions,
+                cos_cache,
+                sin_cache,
+                self.k_norm.variance_epsilon,
+                self.block_size,
+                self.scale_fmt,
+                self.softmax_scale * self.n_heads**-0.5,
+                preshuffle=_use_aiter_preshuffle,
+                is_neox=self.is_neox_style,
+                # Padded graph rows still need Q/gate; only K write is skipped.
+                # Later targets recompute identical Q only for rows they write.
+                compute_all_q_rope=i == 0,
+            )
         return q_fp8, weights.unsqueeze(-1)
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
@@ -2085,19 +2092,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # because page_size is 1 there.
         if _use_aiter:
             page_size = pool.index_page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
-            indexer_k_quant_and_cache(
-                key,
-                kv_cache,
-                out_loc,
-                self.block_size,
-                self.scale_fmt,
-                preshuffle=_use_aiter_preshuffle,
-            )
+            for buf, slots in _index_k_slot_mappings(pool, layer_id, out_loc):
+                indexer_k_quant_and_cache(
+                    key,
+                    buf.view(-1, page_size, 132).view(fp8_dtype),
+                    slots,
+                    self.block_size,
+                    self.scale_fmt,
+                    preshuffle=_use_aiter_preshuffle,
+                )
             return
 
         # Fallback: original path

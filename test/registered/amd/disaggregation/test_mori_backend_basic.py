@@ -230,5 +230,47 @@ class TestMoriDsaStateElision(unittest.TestCase):
         self.assertEqual(calls, [call("s5", "d5", "plan")])
 
 
+class TestMoriShardedDsaState(unittest.TestCase):
+    def _send_state(self, shard_rank, shard_size, src_pages, dst_pages):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.kv_shard_rank, manager.kv_shard_size = shard_rank, shard_size
+        manager.state_mem_descs = [["src"]]
+        manager.kv_args = SimpleNamespace(
+            state_types=["dsa"],
+            state_item_lens=[[8448]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[]],
+        )
+        manager._send_swa_dsa_state = Mock(return_value=[])
+        peer = SimpleNamespace(
+            dst_state_mem_descs=[["dst"]],
+            dst_state_item_lens=[[8448]],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[]],
+        )
+        manager.send_state(
+            peer,
+            [np.array(src_pages, dtype=np.int32)],
+            [np.array(dst_pages, dtype=np.int32)],
+        )
+        return manager._send_swa_dsa_state.call_args_list
+
+    def test_each_owner_sends_its_local_pages_to_the_paired_destinations(self):
+        logical = [15, 3, 24, 9, 18, 6]
+        dst = [29, 5, 16, 8, 1, 27]
+        for rank, local_pages, dst_pages in (
+            (0, [12, 9, 3], [16, 1, 27]),
+            (1, [7, 1, 4], [29, 5, 8]),
+        ):
+            with self.subTest(rank=rank):
+                (sent,) = self._send_state(rank, 2, logical, dst)
+                _, src, dst_sent, *_ = sent.args
+                np.testing.assert_array_equal(src, local_pages)
+                np.testing.assert_array_equal(dst_sent, dst_pages)
+
+    def test_rank_without_owned_pages_sends_nothing(self):
+        self.assertEqual(self._send_state(1, 2, [0, 2], [5, 6]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

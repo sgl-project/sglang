@@ -524,8 +524,8 @@ class CommonKVManager(BaseKVManager):
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
         exception because each CP rank owns different state layers. Page-sharded
-        DSA indexer state likewise needs every owner; Mooncake filters its page
-        lists before transfer instead of suppressing whole ranks.
+        DSA indexer state likewise needs every owner; the transfer backends
+        filter its page lists before transfer instead of suppressing whole ranks.
         """
         return (
             self.attn_cp_size > 1
@@ -534,6 +534,21 @@ class CommonKVManager(BaseKVManager):
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
         )
+
+    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
+        """Pair target/draft indexer pages before narrowing to this owner."""
+        if len(src_indices) != len(dst_indices):
+            raise RuntimeError(
+                "Sharded DSA state page count mismatch: "
+                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+            )
+        local_indices, positions = filter_kv_indices_for_shard_rank(
+            kv_indices=np.asarray(src_indices, dtype=np.int32),
+            index_slice=slice(0, len(src_indices)),
+            shard_rank=self.kv_shard_rank,
+            shard_size=self.kv_shard_size,
+        )
+        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
@@ -2290,6 +2305,20 @@ class CommonKVSender(BaseKVSender):
         state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
+        if state_indices and self.kv_mgr.kv_shard_size > 1:
+            # The queued state remains logical and is filtered by the worker.
+            # Account only for this sender's indexer pages.
+            state_indices = list(state_indices)
+            for i, (st, indices) in enumerate(
+                zip(self.kv_mgr.kv_args.state_types, state_indices)
+            ):
+                if st == StateType.DSA and indices is not None:
+                    state_indices[i], _ = filter_kv_indices_for_shard_rank(
+                        kv_indices=np.asarray(indices, dtype=np.int32),
+                        index_slice=slice(0, len(indices)),
+                        shard_rank=self.kv_mgr.kv_shard_rank,
+                        shard_size=self.kv_mgr.kv_shard_size,
+                    )
         if state_indices:
             for component_indices in state_indices:
                 if component_indices is not None:

@@ -4735,6 +4735,68 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
             handle_kv_cache_sharding(args, 80 * 1024)
 
+    def _hip_dsa_args(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.attention_backend = "dsa"
+        args.dsa_prefill_backend = "triton"
+        args.dsa_decode_backend = "triton"
+        args.kv_cache_dtype = "fp8_e4m3"
+        args.disaggregation_transfer_backend = "mori"
+        args._model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"]
+        )
+        return args
+
+    @staticmethod
+    def _hip_dsa_view(**overrides):
+        view = SimpleNamespace(
+            device="cuda",
+            enable_prefill_cp=False,
+            cp_strategy="interleave",
+            attn_cp_size=1,
+            pp_size=1,
+            dsa_prefill_backend="triton",
+            dsa_decode_backend="triton",
+            kv_cache_dtype="fp8_e4m3",
+            page_size=64,
+            disaggregation_transfer_backend="mori",
+            enable_dsa_cache_layer_split=False,
+        )
+        for key, value in overrides.items():
+            setattr(view, key, value)
+        return view
+
+    @override_platform(is_hip=True)
+    def test_hip_dsa_shards_across_attention_tp(self):
+        for dsa_backend in ("tilelang", "triton"):
+            with self.subTest(dsa=dsa_backend):
+                args = self._hip_dsa_args()
+                args.dsa_prefill_backend = args.dsa_decode_backend = dsa_backend
+                with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+                    handle_kv_cache_sharding(args, 80 * 1024)
+
+    @override_platform(is_hip=True)
+    def test_hip_dsa_rejects_unsupported_shapes(self):
+        cases = (
+            ({"attn_cp_size": 2}, "requires attn_cp_size 1"),
+            ({"dsa_prefill_backend": "trtllm"}, "tilelang/triton prefill/decode"),
+            ({"page_size": 1}, "preshuffle paged-MQA"),
+            ({"disaggregation_transfer_backend": "mooncake"}, "requires mori"),
+        )
+        for overrides, error in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_kv_shard_attention_backend(
+                        self._hip_dsa_args(), self._hip_dsa_view(**overrides)
+                    )
+
+    @override_platform(is_hip=False)
+    def test_cuda_dsa_still_requires_interleave_prefill_cp(self):
+        with self.assertRaisesRegex(ValueError, "CUDA interleave prefill CP"):
+            validate_kv_shard_attention_backend(
+                self._hip_dsa_args(), self._hip_dsa_view()
+            )
+
     def test_hisparse_allocator_is_rejected(self):
         args = self._args(enable_hisparse=True)
 

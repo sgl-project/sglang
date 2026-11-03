@@ -980,6 +980,35 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
             )
         return targets
 
+    def slot_mappings(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """(buffer, per-token slot or -1) for kernels that skip negative slots.
+
+        The same targets as ``write_targets`` without a host sync: the local
+        mapping keeps every token's row and marks non-owned tokens with -1.
+        """
+        if loc.numel() == 0:
+            return []
+        pool = self.pool
+        local = self.buffer[layer_id - pool.start_layer]
+        assert local.shape[0], "cannot write indexer keys for a skip-topk layer"
+        targets = []
+        if pool._shard_extend_active:
+            targets.append(
+                (
+                    pool._slots[layer_id % 2].tensors["index_k"],
+                    pool.translate_loc_to_scratch(loc),
+                )
+            )
+        local_rows = torch.where(
+            pool.placement.local_mask(loc, pool.shard_rank),
+            pool.placement.local_index(loc.long()),
+            -1,
+        )
+        targets.append((local, local_rows))
+        return targets
+
     def store_quantized(
         self,
         layer_id: int,

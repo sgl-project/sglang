@@ -107,6 +107,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+    _PageInterleaveIndexKeyCache,
     _symmetric_scratch_layout,
     _symmetric_scratch_supported,
 )
@@ -1803,6 +1804,43 @@ class TestWritePlan(CustomTestCase):
         owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
         self.assertEqual(owned_idx.numel(), 0)
         self.assertEqual(local_rows.numel(), 0)
+
+
+class TestIndexKeySlotMappings(CustomTestCase):
+    def test_masked_slots_match_the_filtered_write_targets(self):
+        spec = _make_spec(shard_rank=2)
+        scratch = torch.zeros(4, 1, dtype=torch.uint8)
+        local = torch.zeros(4, 1, dtype=torch.uint8)
+        pool = SimpleNamespace(
+            placement=PageInterleavePlacement(spec),
+            shard_rank=2,
+            start_layer=0,
+            _slots=[SimpleNamespace(tensors={"index_k": scratch})] * 2,
+            translate_loc_to_scratch=lambda loc: loc.long() + 1000,
+        )
+        cache = object.__new__(_PageInterleaveIndexKeyCache)
+        cache.pool, cache.buffer = pool, [local]
+        # Partial pages of two groups, with owned and non-owned tokens.
+        loc = torch.cat(
+            [torch.arange(GS + 20, GS + 40), torch.arange(3 * GS + 33, 3 * GS + 50)]
+        )
+        for active in (True, False):
+            with self.subTest(extend_active=active):
+                pool._shard_extend_active = active
+                masked = cache.slot_mappings(0, loc)
+                filtered = cache.write_targets(0, loc)
+                self.assertEqual(len(masked), len(filtered))
+                for (buf, slots), (ref_buf, ref_slots, rows) in zip(masked, filtered):
+                    self.assertIs(buf, ref_buf)
+                    self.assertEqual(slots.shape, loc.shape)
+                    if rows is None:
+                        self.assertTrue(torch.equal(slots, ref_slots))
+                        continue
+                    expected = torch.full_like(slots, -1)
+                    expected[rows] = ref_slots
+                    self.assertTrue(torch.equal(slots, expected))
+                    self.assertTrue(bool((slots >= 0).any()))
+                    self.assertTrue(bool((slots < 0).any()))
 
 
 class TestShardedPoolFootprint(CustomTestCase):

@@ -21,6 +21,7 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
@@ -87,6 +88,32 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+
+    def test_page_sharded_pool_bypasses_the_fused_dsa_writer(self):
+        # The fused writer targets unsharded locs; sharded writes need the owner plan.
+        mixin = forward_mla_rocm.DeepseekMLARocmForwardMixin
+        attn = SimpleNamespace(dcp_size=1, current_attention_backend="dsa")
+        kernel = SimpleNamespace(
+            dsa_decode_backend="triton", dsa_prefill_backend="triton"
+        )
+        for pool, expected in (
+            (object(), True),
+            (mock.Mock(spec=PageInterleaveKVPoolMixin), False),
+        ):
+            with (
+                self.subTest(sharded=not expected),
+                mock.patch.object(
+                    forward_mla_rocm, "get_token_to_kv_pool", return_value=pool
+                ),
+                mock.patch.object(
+                    forward_mla_rocm,
+                    "get_exec",
+                    return_value=SimpleNamespace(kernel=kernel),
+                ),
+            ):
+                self.assertEqual(
+                    mixin._skip_rope_for_dsa_tilelang_fused(attn), expected
+                )
 
 
 class TestAbsorbBmmConfig(CustomTestCase):
