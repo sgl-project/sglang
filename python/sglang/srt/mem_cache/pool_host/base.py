@@ -169,11 +169,9 @@ def _hugetlb_page_size_and_mode(
 
 def _host_memory_allocation_bytes(
     mapping_lengths: Iterable[int],
-    allocator: Optional[Union[HostTensorAllocator, type[HostTensorAllocator]]],
-    device: Optional[Union[str, torch.device]],
     *,
     hugetlb_bookable_bytes: int,
-    page_size_and_mode: Optional[tuple[int, str]] = None,
+    page_size_and_mode: tuple[int, str],
 ) -> tuple[int, int]:
     """The (plain, hugetlb) bytes the given mapping lengths will occupy.
 
@@ -184,9 +182,7 @@ def _host_memory_allocation_bytes(
     """
     lengths = list(mapping_lengths)
     plain = sum(lengths)
-    page_size, mode = page_size_and_mode or _hugetlb_page_size_and_mode(
-        allocator, device
-    )
+    page_size, mode = page_size_and_mode
     if page_size == 0 or mode == HUGEPAGE_MODE_OFF:
         return plain, 0
     rounded = [-(-length // page_size) * page_size for length in lengths]
@@ -294,8 +290,6 @@ def host_memory_preflight(
         page_size_and_mode = _hugetlb_page_size_and_mode(allocator, device)
         plain_part, pool_part = _host_memory_allocation_bytes(
             mapping_lengths,
-            allocator,
-            device,
             hugetlb_bookable_bytes=pool_rem,
             page_size_and_mode=page_size_and_mode,
         )
@@ -338,8 +332,6 @@ def host_memory_preflight(
     )
     plain_part, pool_part = _host_memory_allocation_bytes(
         mapping_lengths,
-        allocator,
-        device,
         hugetlb_bookable_bytes=pool,
         page_size_and_mode=page_size_and_mode,
     )
