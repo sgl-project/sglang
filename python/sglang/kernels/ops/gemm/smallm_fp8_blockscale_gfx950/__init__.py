@@ -7,7 +7,7 @@ import tempfile
 
 import torch
 
-from sglang.kernels.ops.moe.smallm_moe_gfx950 import _check, _hip_lib, _hipcc, _Kernel
+from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
 
 _SRC = os.path.join(os.path.dirname(__file__), "smallm_fp8_blockscale_gemm.hip")
 # (N, K) -> (max M, N tiles/block, K steps/wave, waves), first match wins.
@@ -49,24 +49,26 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
         return None
     if _mod is None:
         co = os.path.join(tempfile.mkdtemp(), "k.co")
-        cmd = [_hipcc(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
+        cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
             _mod = ctypes.c_void_p()
-            _check(_hip_lib().hipModuleLoad(ctypes.byref(_mod), co.encode()), "load")
+            check_hip(hip_lib().hipModuleLoad(ctypes.byref(_mod), co.encode()), "load")
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
             _mod = False
             print(f"[smallm_fp8_bs] disabled: {e}", flush=True)
             return None
     key = ((M + 15) // 16, *cfg)
-    hip, fn = _hip_lib(), _fns.get(key)
+    hip, fn = hip_lib(), _fns.get(key)
     if fn is None:
-        fn = _fns[key] = _Kernel(_mod, "smallm_fp8_bs_m{}_n{}_s{}_w{}".format(*key)).fn
+        fn = _fns[key] = HipKernel(
+            _mod, "smallm_fp8_bs_m{}_n{}_s{}_w{}".format(*key)
+        ).fn
     out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
     args = Args(*(t.data_ptr() for t in (x, WQ, w_scale, out)), M, N, x.stride(0))
     params = (ctypes.c_void_p * 1)(ctypes.addressof(args))
     stream = torch.cuda.current_stream().cuda_stream
     grid, block = N // (16 * key[1]), 64 * key[3]
     rc = hip.hipModuleLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, stream, params, None)
-    _check(rc, "launch")
+    check_hip(rc, "launch")
     return out

@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=320, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=157, stage="base-b", runner_config="1-gpu-small")
 
 _MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 _KEY_A = "0123456789abcdef"

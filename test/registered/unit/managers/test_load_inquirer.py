@@ -3,7 +3,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     SchedulePolicy,
@@ -64,7 +64,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             get_recent_cache_hit_rate=lambda: 0.75,
             get_stats=None,
             get_disagg_prefill_bootstrap_queue=None,
-            get_disagg_prefill_inflight_queue=None,
+            get_disagg_prefill_transfer_queue=None,
             get_disagg_decode_prealloc_queue=None,
             get_disagg_decode_transfer_queue=None,
             get_spec_total_num_accept_tokens=None,

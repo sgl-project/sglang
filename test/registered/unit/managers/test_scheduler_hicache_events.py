@@ -15,8 +15,12 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheEvents(unittest.TestCase):
@@ -32,6 +36,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s._process_storage_prefetch_retries = self.calls.retry
         s.process_pending_chunked_abort = Mock()
         s.process_prefill_chunk = Mock()
+        s.running_reqs = _RequestList(ListKind.DECODING)
+        s.invariant_checker = Mock()
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         self.running_batch = SimpleNamespace(
@@ -85,7 +91,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.assertIsNone(plan.batch_to_run)
         s.get_new_batch_prefill.assert_not_called()
         self.assertEqual(
-            self.calls.mock_calls, [call.drain(), call.retry(), call.defer()]
+            self.calls.mock_calls,
+            [
+                call.drain(),
+                call.retry(),
+                call.defer(self.running_batch),
+            ],
         )
 
     def test_pp_prefill_drains_before_admission(self):

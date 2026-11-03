@@ -25,16 +25,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.mm_utils import hash_feature
-from sglang.srt.managers.schedule_batch import (
-    MM_PAD_SHIFT_VALUE,
-    Modality,
-    MultimodalDataItem,
-)
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestMmHashesContract(CustomTestCase):
