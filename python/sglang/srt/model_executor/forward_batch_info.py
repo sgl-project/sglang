@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from functools import lru_cache, total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -828,7 +828,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # wrapper plans and view-context plans must keep this False — a
     # forward-path re-plan would clobber their metadata.
     forward_metadata_replan_equivalent: bool = False
-
+    
+    # For superlong-context general chunked prefill (assumes batch size of 1)
+    is_first_chunk:bool = None
+    is_last_chunk:bool = None
+    kv_cache_pruning_config: dict = None 
+    kv_cache_pruned_num_list: dict = field(default_factory=dict)
+    # Guiding-tail tokens at the end of this extend batch: computed but not
+    # cached (chunked-prefill KV-cache pruning); 0 otherwise.
+    uncached_suffix_len: int = 0
+    
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.
 
@@ -1115,6 +1124,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            is_first_chunk=batch.is_first_chunk,
+            is_last_chunk=batch.is_last_chunk,
+            kv_cache_pruning_config=batch.kv_cache_pruning_config,
+            uncached_suffix_len=batch.extend_tail,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
@@ -1124,6 +1137,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
         ret._maybe_init_non_generation_fields(batch)
+
+        #copy kv_cache_pruned_num_list from request to forward_batch
+        #only batch with single request is allowed
+        kv_cache_pruned_num_list_req = [req.kv_cache_pruned_num_list for req in batch.reqs if hasattr(req, 'kv_cache_pruned_num_list')]
+        if len(kv_cache_pruned_num_list_req) > 0:
+            #   only batch with single request is allowed
+            assert len(kv_cache_pruned_num_list_req)==1
+            ret.kv_cache_pruned_num_list = kv_cache_pruned_num_list_req[0]
 
         device = model_runner.device
 

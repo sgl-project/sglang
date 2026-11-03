@@ -373,6 +373,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
+
+            if forward_batch.kv_cache_pruning_config and getattr(forward_batch,'kv_cache_pruned_num_list', None):
+                #we can correct seq_lens_cpu only by same value for all layers. check that all values are the same
+                assert all([len(num_list)==1 for num_list in forward_batch.kv_cache_pruned_num_list.values()])
+                kv_cache_pruned_num = [num_list[0] for num_list in forward_batch.kv_cache_pruned_num_list.values()]
+                assert len(set(kv_cache_pruned_num))==1
+                kv_cache_pruned_num = kv_cache_pruned_num[0]
+            else:
+                kv_cache_pruned_num = 0
+
             if forward_batch.forward_mode.is_target_verify():
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
@@ -397,22 +407,23 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     if forward_batch.seq_lens_cpu is not None:
                         seq_lens_cpu = (
                             forward_batch.seq_lens_cpu[: self.raw_bs]
-                            + self.captured_req_width
+                            + self.captured_req_width - kv_cache_pruned_num
                         )
                     else:
                         seq_lens_cpu = (
-                            forward_batch.seq_lens.cpu() + self.captured_req_width
+                            forward_batch.seq_lens.cpu() 
+                            + self.captured_req_width - kv_cache_pruned_num 
                         )
                     seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
                 # Reuse the live CPU mirror when available to avoid
                 # a blocking D2H copy.
                 if forward_batch.seq_lens_cpu is not None:
-                    seq_lens = forward_batch.seq_lens_cpu[: self.raw_bs].tolist() + [
+                    seq_lens = (forward_batch.seq_lens_cpu[: self.raw_bs] - kv_cache_pruned_num).tolist() + [
                         0
                     ] * (self.bs - self.raw_bs)
                 else:
-                    seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                    seq_lens = (forward_batch.seq_lens.cpu() - kv_cache_pruned_num).tolist() + [0] * (
                         self.bs - self.raw_bs
                     )
             output = self.backend.replay_with_input_update(

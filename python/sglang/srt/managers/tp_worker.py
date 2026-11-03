@@ -698,6 +698,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                kv_cache_pruned_num_list=forward_batch.kv_cache_pruned_num_list,
                 kv_loc_plan=(
                     None
                     if not return_kv_loc_plan
@@ -773,6 +774,7 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                kv_cache_pruned_num_list=forward_batch.kv_cache_pruned_num_list
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):

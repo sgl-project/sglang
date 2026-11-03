@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
+import os
 import torch
 import torch_npu
 from sgl_kernel_npu.attention.sinks_attention import (
@@ -49,6 +50,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     next_power_of_2,
 )
+from  sglang.srt.hardware_backend.npu.attention.kv_cache_compression import real_prune_prefill_pack_, real_prune_prefill_pack_empty_state
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -283,6 +285,8 @@ def _cp_allgather_and_save_kv_npu(
     swa_loc is the pre-translated full->SWA write target for hybrid SWA pools
     (None for non-SWA pools); set_kv_buffer never translates internally.
     """
+
+    assert forward_batch.kv_cache_pruning_config is None, "seq parralel is not supported with kv_cache_pruning"
     cache_loc = (
         forward_batch.out_cache_loc
         if not layer.is_cross_attention
@@ -449,6 +453,12 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = get_parallel().attn_cp_size
 
+        #create tensors for NPUGraph
+        tp_kv_head_num = model_runner.model_config.num_key_value_heads // get_parallel().attn_tp_size
+        self.kv_cache_pruned_num_tensors = {
+            layer_id: torch.zeros([tp_kv_head_num], dtype=torch.int32, device=self.device) for layer_id in range(model_runner.model_config.num_attention_layers)
+        }
+
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
             self.is_hybrid_swa
@@ -501,6 +511,9 @@ class AscendAttnBackend(AttentionBackend):
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
         pass
+
+    def get_prune_state(self, layer_id):
+        return self.prune_state[layer_id]
 
     def init_forward_metadata_out_graph(
         self,
@@ -1696,6 +1709,7 @@ class AscendAttnBackend(AttentionBackend):
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 if is_cp_mode:
+                    assert not forward_batch.kv_cache_pruning_config, "cp_mode does not support kv_cache_pruning"
                     # All-gather K/V from all CP ranks and write full sequence to KV pool
                     _cp_allgather_and_save_kv_npu(
                         forward_batch,
@@ -1718,14 +1732,45 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else None
                     )
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
-                    )
+                
+                    #correct cache_loc to 
+                    kv_cache_pruned_num_list = []
+                    head_range_list = []
+                    if not forward_batch.is_first_chunk and forward_batch.kv_cache_pruning_config:
+                        
+                        assert forward_batch.is_first_chunk is not None
+                        assert forward_batch.is_last_chunk is not None
+                        assert forward_batch.batch_size == 1
+
+                        #correct cache_loc if we have pruned cache
+                        state_list = self.prune_state[layer.layer_id]
+                        kv_cache_pruned_num_list = [s['kv_cache_pruned_num'] for s in state_list]
+                        if len(kv_cache_pruned_num_list)==1:
+                            if kv_cache_pruned_num_list[0]>0 and cache_loc is not None:
+                                cache_loc = cache_loc - kv_cache_pruned_num_list[0]
+                            if kv_cache_pruned_num_list[0]>0 and swa_loc is not None:
+                                swa_loc = swa_loc - kv_cache_pruned_num_list[0]
+                            self.token_to_kv_pool.set_kv_buffer(layer, KVWriteLoc(cache_loc, swa_loc), k, v)
+                        else:
+                            #iterate by head groups
+                            h1=0
+                            for state in state_list:
+                                h0,h1 = h1,h1+state["kv_cache_head_num"]
+                                head_range = (h0,h1)
+                                head_range_list.append(head_range)
+                                cache_loc_head_range = cache_loc-state['kv_cache_pruned_num']
+                                swa_loc_head_range = swa_loc-state['kv_cache_pruned_num'] if swa_loc is not None else None
+                                self.token_to_kv_pool.set_kv_buffer(layer, KVWriteLoc(cache_loc_head_range, swa_loc_head_range), k, v, head_range = head_range)
+                    else:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                        )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
+                assert forward_batch.kv_cache_pruning_config is None, "no kv cache prune in sink mode"
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
@@ -1861,6 +1906,7 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_out
 
             if is_cp_mode:
+                assert forward_batch.kv_cache_pruning_config is None, "no kv cache prune in cp_mode"
                 if self.use_fia:
                     attn_output = self.do_cp_attn_fia(
                         q, k_cache, v_cache, layer, forward_batch
@@ -1885,6 +1931,13 @@ class AscendAttnBackend(AttentionBackend):
                             data[: forward_batch.global_num_token_non_padded_cpu]
                             for data in [q, k, v]
                         ]
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int
+                    if forward_batch.kv_cache_pruning_config is not None and len(kv_cache_pruned_num_list)>0:
+                        #need to reduce seqsize
+                        if len(kv_cache_pruned_num_list)>1:
+                            raise RuntimeError(f"kv_cache_pruning supports only single head group. {len(kv_cache_pruned_num_list)=} {kv_cache_pruned_num_list=}")
+                        else:
+                            actual_seq_lengths_kv = actual_seq_lengths_kv - kv_cache_pruned_num_list[0]
                     attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                         query=q,
                         key=k_cache.view(
@@ -1898,7 +1951,7 @@ class AscendAttnBackend(AttentionBackend):
                         atten_mask=self.fia_mask,
                         input_layout="TND",
                         actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
                         num_key_value_heads=layer.tp_k_head_num,
                         num_heads=layer.tp_q_head_num,
                         scale=layer.scaling,
@@ -1922,6 +1975,48 @@ class AscendAttnBackend(AttentionBackend):
                             ],
                             dim=0,
                         )
+
+
+                    #apdate statistics and pack kv cache
+                    if forward_batch.kv_cache_pruning_config is not None:
+                        assert forward_batch.is_first_chunk is not None
+                        assert forward_batch.is_last_chunk is not None
+
+                        if not hasattr(self, 'prune_state'):
+                            self.prune_state = {}
+                        if forward_batch.is_first_chunk:
+                            #create empty state for start
+                            self.prune_state[layer.layer_id] = real_prune_prefill_pack_empty_state(
+                                forward_batch.kv_cache_pruning_config,
+                                layer.layer_id,
+                                forward_batch.batch_size,
+                                device=q.device
+                            )
+                        
+                        real_prune_prefill_pack_(
+                            forward_batch.kv_cache_pruning_config,
+                            layer.tp_q_head_num, 
+                            layer.tp_k_head_num, 
+                            q,
+                            k_cache, 
+                            v_cache,
+                            "L,B,HN,D", # L - sequence length, B - batch size, HN - head num, D - single head dimention size
+                            self.prune_state[layer.layer_id],  #current state
+                            forward_batch.is_first_chunk,
+                            forward_batch.is_last_chunk,
+                            layer.layer_id, 
+                            self.page_size  #first page (of page_size) is reserved
+                        )
+
+                        states = self.prune_state[layer.layer_id]
+                        
+                        kv_cache_pruned_num_list = [s['kv_cache_pruned_num'] for s in states]
+                        forward_batch.kv_cache_pruned_num_list[layer.layer_id] = kv_cache_pruned_num_list
+
+                        for i,s in enumerate(states):
+                            self.kv_cache_pruned_num_tensors[layer.layer_id][i] = s['kv_cache_pruned_num']
+                        
+
                 else:
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
@@ -2829,10 +2924,18 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
+
+                out_cache_loc = forward_batch.out_cache_loc
+                if forward_batch.kv_cache_pruning_config:
+                    #head_split_list, head_size_list = forward_batch.kv_cache_pruning_config['head_layer_groups'][layer.layer_id]
+                    #assert len(head_split_list)==1, "NUPGraph implemented only for single group KV cache pruning"
+                    out_cache_loc = out_cache_loc - self.kv_cache_pruned_num_tensors[layer.layer_id][0]
+
+                # when the kv-cache pruning is enabled it stores the k and v differently (see real_prune_update call below)
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(
-                        forward_batch.out_cache_loc,
+                        out_cache_loc,
                         self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
@@ -3142,6 +3245,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
+            # also, when the kv-cache pruning is enabled it stores the k and v differently (see real_prune_update)
             if save_kv_cache and k is not None and v is not None:
                 # support cross attention
                 cache_loc = (
@@ -3149,6 +3253,9 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                if forward_batch.kv_cache_pruning_config:
+                    cache_loc = cache_loc - self.kv_cache_pruned_num_tensors[layer.layer_id][0]
+
                 # swa_out_cache_loc is the full->SWA write target, derived from
                 # out_cache_loc; it must not be applied to cross-attention writes
                 # (which target encoder_out_cache_loc) and is None for non-SWA pools.
@@ -3239,6 +3346,19 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
+
+                if forward_batch.kv_cache_pruning_config:
+                    assert self.forward_metadata.block_tables.shape[0]==1
+                    #prune only on prefill. lets correct actual_seq_len_kv by pruned positions
+                    states_list = self.get_prune_state(layer.layer_id)
+
+                    if len(states_list)==1:
+                        kv_cache_pruned_num = states_list[0]['kv_cache_pruned_num']
+                        assert len(actual_seq_len_kv)==1
+                        actual_seq_len_kv[0] -= kv_cache_pruned_num
+                    
+                                            
+                
                 num_token_padding = q.shape[0]
                 actual_bs = self.forward_metadata.block_tables.shape[0]
                 q = q[:actual_bs]

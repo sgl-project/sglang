@@ -153,6 +153,7 @@ class GenerationBatchResult:
     fpm_timing: Optional[FpmTiming] = None
     fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
 
+    kv_cache_pruned_num_list: Optional[dict] = None
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
     @property

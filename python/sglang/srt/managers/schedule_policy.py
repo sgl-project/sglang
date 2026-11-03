@@ -1179,9 +1179,17 @@ class PrefillAdder:
         if _rem_tokens is None:
             return req
         truncated = cand_extend_input_len > _rem_tokens
+
         new_len = self.floor_chunked_tokens(
             min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
         )
+
+        if truncated and req.kv_cache_pruning_config:
+            prefill_chunk_tail = req.kv_cache_pruning_config["prefill_chunk_tail"] + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+            new_len += prefill_chunk_tail
+        else:
+            prefill_chunk_tail = 0
+
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1203,6 +1211,7 @@ class PrefillAdder:
         if not reserved:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.extend_end = req.prefix_len + new_len
+        req.extend_tail = prefill_chunk_tail
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -1361,12 +1370,20 @@ class PrefillAdder:
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
 
+            if req.kv_cache_pruning_config:
+                #calculate guiding tail size
+                prefill_chunk_tail = req.kv_cache_pruning_config["prefill_chunk_tail"] + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+                trunc_len += prefill_chunk_tail
+            else:
+                prefill_chunk_tail = 0
+
             # Reserve after the tile gate so rejected requests consume no scratch.
             if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
                 return AddReqResult.OTHER
 
             assert req.prefix_len == 0
             req.extend_end = req.prefix_len + trunc_len
+            req.extend_tail = prefill_chunk_tail
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(
@@ -1686,19 +1703,26 @@ class PrefillAdder:
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
     ) -> None:
         assert req.prefix_len == admission.prefix_len
-        req.extend_end = admission.prefix_len + admission.extend_len
+        if admission.is_chunked and req.kv_cache_pruning_config:
+            #add guiding tail
+            prefill_chunk_tail = req.kv_cache_pruning_config["prefill_chunk_tail"] + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+        else:
+            prefill_chunk_tail = 0
+        req.extend_end = admission.prefix_len + admission.extend_len + prefill_chunk_tail
+        req.extend_tail = prefill_chunk_tail
+
         req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req
         self._update_prefill_budget(
             admission.prefix_len,
-            admission.extend_len,
+            admission.extend_len + prefill_chunk_tail,
             admission.max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=mamba_gap_reserve,
             request_slot_reserve=self._request_slot_reserve_for_req(
-                req, extend_input_len=admission.extend_len
+                req, extend_input_len=admission.extend_len + prefill_chunk_tail
             ),
             replay_len=admission.replay_len,
         )

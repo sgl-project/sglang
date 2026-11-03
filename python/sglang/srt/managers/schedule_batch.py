@@ -1104,6 +1104,9 @@ class Req(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q")
         # This round extends fill ids [prefix_len, extend_end).
         self.extend_end: Optional[int] = None
+        #guide tail size. the tail is a query that is used to detect most important KV positions due to chunked prefill
+        self.extend_tail:  Optional[int] = 0
+        self.kv_cache_pruning_config: Optional[dict] = None
         self.dllm_initialized: bool = False
 
         self.session = session
@@ -1658,6 +1661,18 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_fill_ids(self) -> array:
+        if self.extend_tail:
+            #forms prompt with guiding tail
+            assert len(self.full_untruncated_fill_ids) > 0
+            fill_ids_tail = self.full_untruncated_fill_ids
+            while len(fill_ids_tail) < self.extend_tail:
+                fill_ids_tail = fill_ids_tail + self.full_untruncated_fill_ids
+            fill_ids_tail = fill_ids_tail[-self.extend_tail:]
+            return self.full_untruncated_fill_ids[: (self.extend_end-self.extend_tail)] + fill_ids_tail
+        else:
+            return self.full_untruncated_fill_ids[: self.extend_end]
+
     def next_output_finishes_by_length(self) -> bool:
         # Whether committing one more output token reaches max_new_tokens
         return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
@@ -1665,9 +1680,6 @@ class Req(ReqDllmMixin):
     @property
     def extend_len(self) -> int:
         return self.extend_end - self.prefix_len
-
-    def get_fill_ids(self) -> array:
-        return self.full_untruncated_fill_ids[: self.extend_end]
 
     def refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
@@ -2062,6 +2074,7 @@ class Req(ReqDllmMixin):
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None
+        self.extend_tail = 0
         self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
@@ -2480,6 +2493,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
+
+    # For superlong-context general chunked prefill (assumes batch size of 1)
+    is_first_chunk = False
+    is_last_chunk = False
+    kv_cache_pruning_config: dict = None
+    # Guiding-tail tokens carried by the (single) chunked-prefill request:
+    # computed in this batch but never written to the caches, so linear
+    # attention state must be persisted only for the main part.
+    extend_tail: int = 0
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None

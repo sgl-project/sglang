@@ -105,6 +105,8 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
+    get_tp_group,
+    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -375,6 +377,7 @@ from sglang.srt.utils.weight_versions import (
     record_weight_version_events,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.hardware_backend.npu.attention.kv_cache_compression import read_kv_cache_pruning_config
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -779,6 +782,17 @@ class Scheduler(
             device_module=tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
+
+    def init_req_kv_cache_pruning_config(self, req):
+        model_runner = self.tp_worker.model_runner
+        req.kv_cache_pruning_config = read_kv_cache_pruning_config(
+            model_runner.server_args.kv_cache_pruning_config,
+            layer_num = model_runner.model_config.num_hidden_layers,
+            page_size = model_runner.page_size,
+            num_kv_heads = model_runner.model_config.get_num_kv_heads(get_tensor_model_parallel_world_size()),
+            attn_tp_rank = get_parallel().attn_tp_rank,
+            attn_tp_size = get_parallel().attn_tp_size,
+        )
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -3242,6 +3256,9 @@ class Scheduler(
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
+
+        self.init_req_kv_cache_pruning_config(req)
+
         # Validate prompt length
         error_msg = validate_input_length(
             req,
@@ -4100,6 +4117,20 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        if self.chunked_req is not None and self.chunked_req.kv_cache_pruning_config:
+            # Chunked prefill
+            prefill_chunk_tail = self.chunked_req.kv_cache_pruning_config["prefill_chunk_tail"] + self.chunked_req.kv_cache_pruning_config["prefill_chunk_tail2"]
+            if prefill_chunk_tail>0:
+
+                prefix_indices = self.req_to_token_pool.req_to_token[
+                    self.chunked_req.kv.req_pool_idx, : self.chunked_req.prefix_len
+                ]                
+
+                _prefix_indices_to_free = prefix_indices[-prefill_chunk_tail:]
+                self.tree_cache.token_to_kv_pool_allocator.free(_prefix_indices_to_free)
+                self.chunked_req.prefix_len -= prefill_chunk_tail
+                del _prefix_indices_to_free
+
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
@@ -4348,6 +4379,24 @@ class Scheduler(
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
+        if self.chunked_req:
+            kv_cache_pruning_config=self.chunked_req.kv_cache_pruning_config
+        else:
+            #last chunk
+            kv_cache_pruning_config=can_run_list[0].kv_cache_pruning_config
+
+        if kv_cache_pruning_config:
+            assert len(can_run_list)==1, "kv-cache pruning is implemented for batch 1 only!"
+            total_prefill_len = len(can_run_list[0].origin_input_ids)
+            new_batch.is_first_chunk = (adder.new_chunked_req is not None) or (self.server_args.chunked_prefill_size == -1) or (chunked_prefill_size >= total_prefill_len)
+            new_batch.is_last_chunk = self.chunked_req is None
+            new_batch.kv_cache_pruning_config = kv_cache_pruning_config
+            new_batch.extend_tail = (
+                self.chunked_req.extend_tail
+                if self.chunked_req
+                else can_run_list[0].extend_tail
+            )
+                
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -4893,6 +4942,9 @@ class Scheduler(
             else:
                 batch_result.extend_logprob_start_len_per_req = None
 
+            if batch_result.kv_cache_pruned_num_list:
+                for req in batch.reqs:
+                    req.kv_cache_pruned_num_list = batch_result.kv_cache_pruned_num_list
             ret = batch_result
         else:  # embedding or reward model
             if self.enable_overlap:

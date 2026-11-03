@@ -22,7 +22,6 @@ from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
@@ -37,9 +36,22 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
-            seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
-                self.bs - self.raw_bs
-            )
+            if forward_batch.kv_cache_pruning_config and getattr(forward_batch,'kv_cache_pruned_num_list', None):
+
+                #we can correct only by same value for all node. check that all values are the same
+                assert all([len(num_list)==1 for num_list in forward_batch.kv_cache_pruned_num_list.values()])
+                kv_cache_pruned_num = [num_list[0] for num_list in forward_batch.kv_cache_pruned_num_list.values()]
+                assert len(set(kv_cache_pruned_num))==1
+                kv_cache_pruned_num = kv_cache_pruned_num[0]
+
+                seq_lens_cpu = forward_batch.seq_lens_cpu - kv_cache_pruned_num
+                seq_lens = seq_lens_cpu.tolist() + [0] * (
+                    self.bs - self.raw_bs
+                )
+            else:
+                seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
+                    self.bs - self.raw_bs
+                )
             return self.backend.replay_with_input_update(
                 shape_key,
                 seq_lens=seq_lens,

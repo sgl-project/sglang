@@ -130,6 +130,7 @@ from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
 )
+from sglang.srt.hardware_backend.npu.attention.kv_cache_compression import read_kv_cache_pruning_config
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -1234,6 +1235,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+
+        model_runner = self.model_runner
+        forward_batch.kv_cache_pruning_config = read_kv_cache_pruning_config(
+            model_runner.server_args.kv_cache_pruning_config,
+            layer_num = model_runner.model_config.num_hidden_layers,
+            page_size = model_runner.page_size,
+            num_kv_heads = model_runner.model_config.get_num_kv_heads(self.attn_tp_size),
+            attn_tp_rank = self.attn_tp_rank,
+            attn_tp_size = self.attn_tp_size,
+        )
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.

@@ -219,6 +219,13 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    kv_cache_pruning_config: A[
+        Optional[str],
+        (
+            "json file with configuration to prune KV cache."
+            "If it is a digit then it is treated as maximal allowed KV cache size."
+        ),
+    ] = None
     qsa_indexer_dtype: A[
         str,
         Arg(

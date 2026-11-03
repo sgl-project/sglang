@@ -242,6 +242,7 @@ class BaseRunner(ABC):
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
     def model_context(self):
