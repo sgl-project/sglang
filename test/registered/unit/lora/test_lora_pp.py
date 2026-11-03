@@ -137,6 +137,7 @@ class TestAllPPLoras(CustomTestCase):
             is_hybrid_swa=False,
             chunked_req=None,
             min_free_slots_delayer=None,
+            hw_governor=None,
             is_mixed_chunk=False,
             dllm_config=None,
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),

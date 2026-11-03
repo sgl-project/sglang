@@ -8,6 +8,10 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.hw_governor.governor import HardwareGovernor
+from sglang.srt.managers.hw_governor.knobs import KnobOverrides
+from sglang.srt.managers.hw_governor.policy import GovernorDecision
+from sglang.srt.managers.io_struct import HwGovernorAdviceReq
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -21,6 +25,7 @@ def _make_scheduler(
     scheduler._prefill_decode_interval_remaining = 0
     scheduler.prefill_decode_interval_min_bs = min_bs
     scheduler.require_mlp_sync = require_mlp_sync
+    scheduler.hw_governor = None
     return scheduler
 
 
@@ -102,6 +107,26 @@ class TestPrefillDecodeIntervalNothingDecodes(unittest.TestCase):
         running = _make_running_batch(3, prefill_only=True)
         self.assertTrue(scheduler._should_defer_prefill(running))
         self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(0)))
+
+
+class TestPrefillDecodeIntervalHwGovernor(unittest.TestCase):
+    def test_governor_advice_spaces_prefills_when_interval_is_off(self):
+        scheduler = _make_scheduler(interval=0, min_bs=0)
+        scheduler.hw_governor = HardwareGovernor(
+            page_size=1, source=None, policy=None, interval_s=3600.0
+        )
+        scheduler.hw_governor.apply_advice(
+            HwGovernorAdviceReq(
+                decision=GovernorDecision(
+                    level=1, overrides=KnobOverrides(prefill_decode_interval=2)
+                )
+            )
+        )
+        _arm(scheduler)
+
+        self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(4)))
+        self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(4)))
+        self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(4)))
 
 
 if __name__ == "__main__":

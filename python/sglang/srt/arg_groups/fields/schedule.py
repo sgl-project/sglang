@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import (
+    Any,
+    Dict,
     List,
     Optional,
 )
@@ -281,5 +284,59 @@ class Schedule(msgspec.Struct):
             "(1 disables). When unset, DFlash workloads auto-enable the "
             "formula; other workloads stay disabled. Not supported with "
             "pipeline parallelism."
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Hardware governor (telemetry-driven knob overrides)
+    # -------------------------------------------------------------------------
+    enable_hw_governor: A[
+        bool,
+        (
+            "Scale existing scheduling knobs (chunked prefill size, max prefill "
+            "tokens, max running requests, prefill-decode interval) from GPU "
+            "power, temperature and clock telemetry. The leader rank samples "
+            "telemetry in a background thread and broadcasts each decision, so "
+            "every rank applies it at the same step. Overrides only shrink "
+            "sizes and lengthen the interval. Not supported with pipeline "
+            "parallelism or DP attention."
+        ),
+    ] = False
+    hw_telemetry_source: A[
+        str,
+        (
+            "Telemetry source for --enable-hw-governor: 'nvml' (in-process "
+            "NVML) or a 'package.module:ClassName' subclass of "
+            "sglang.srt.managers.hw_governor.TelemetrySource."
+        ),
+    ] = "nvml"
+    hw_telemetry_interval_ms: A[
+        float,
+        "Telemetry sampling period of --enable-hw-governor, in milliseconds.",
+    ] = 500.0
+    hw_governor_policy: A[
+        str,
+        (
+            "Policy for --enable-hw-governor: 'stepwise' (trip rules select a "
+            "ladder of knob overrides) or a 'package.module:ClassName' subclass "
+            "of sglang.srt.managers.hw_governor.GovernorPolicy."
+        ),
+    ] = "stepwise"
+    hw_governor_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "JSON config passed to --hw-governor-policy. For 'stepwise': "
+                '{"rules": [{"metric": "temp_margin_c", "trip": 5, "clear": 10}], '
+                '"levels": [{"chunked_prefill_size": 0.5, "max_prefill_tokens": '
+                '0.5}], "escalate_after_s": 3, "recover_after_s": 15}. Rule '
+                "metrics: gpu_temp_c, temp_margin_c, power_w, power_ratio, "
+                "sm_clock_ratio, or clock_event_reasons with any_of. Level keys "
+                "chunked_prefill_size, max_prefill_tokens and "
+                "max_running_requests are fractions of the configured value; "
+                "prefill_decode_interval is a minimum in decode rounds. Unset "
+                "keys take the built-in defaults."
+            ),
+            type_parser=json.loads,
         ),
     ] = None

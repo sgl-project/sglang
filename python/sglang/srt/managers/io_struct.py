@@ -56,6 +56,7 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.hw_governor.policy import GovernorDecision
 from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
 from sglang.srt.managers.req_types import (
@@ -2427,6 +2428,12 @@ class SetInternalStateReq(BaseReq, kw_only=True):
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
+
+
+class HwGovernorAdviceReq(BaseReq, kw_only=True):
+    # Sent by the leader rank through the request broadcast, so every rank
+    # applies the same decision at the same iteration.
+    decision: GovernorDecision
 
 
 class GetHiCacheL3LayoutReq(BaseReq, kw_only=True):
