@@ -50,16 +50,16 @@ def _filter_unwatermarked_target_probs(
     sampling_info: SamplingBatchInfo,
     rows_per_request: int,
 ) -> torch.Tensor:
-    """Retain EAGLE's sequential top-k/top-p target law, without min-p."""
+    """Retain EAGLE's joint top-k/top-p target law, without min-p."""
     top_ks = sampling_info.top_ks.repeat_interleave(rows_per_request)
     top_ps = sampling_info.top_ps.repeat_interleave(rows_per_request)
     if probs.is_cuda:
         from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
-        if sampling_info.need_top_k_sampling:
-            probs = top_k_renorm_prob(probs, top_ks)
         if sampling_info.need_top_p_sampling:
             probs = top_p_renorm_prob(probs, top_ps)
+        if sampling_info.need_top_k_sampling:
+            probs = top_k_renorm_prob(probs, top_ks)
         return probs
 
     from sglang.srt.layers.sampler import (
@@ -67,14 +67,14 @@ def _filter_unwatermarked_target_probs(
         top_p_normalize_probs_torch,
     )
 
+    if sampling_info.need_top_p_sampling:
+        probs = top_p_normalize_probs_torch(probs, top_ps)
     if sampling_info.need_top_k_sampling:
         values, indices = top_k_top_p_min_p_filter_probs_torch(
             probs, top_ks, torch.ones_like(top_ps), torch.zeros_like(top_ps), False
         )
         probs = torch.zeros_like(probs).scatter_(1, indices, values)
         probs = probs / probs.sum(dim=-1, keepdim=True)
-    if sampling_info.need_top_p_sampling:
-        probs = top_p_normalize_probs_torch(probs, top_ps)
     return probs
 
 

@@ -2025,7 +2025,7 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+    """Sent by each tokenizer worker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 

@@ -109,10 +109,10 @@ class TestSynthIDKernels(CustomTestCase):
                 raw = torch.tensor([[0.5, 0.3, 0.2]] * 2, device="cuda").log()
                 expected = (raw / info.temperatures).softmax(-1)
                 target_expected = expected.clone()
-                if info.need_top_k_sampling:
-                    target_expected = top_k_renorm_prob(target_expected, info.top_ks)
                 if info.need_top_p_sampling:
                     target_expected = top_p_renorm_prob(target_expected, info.top_ps)
+                if info.need_top_k_sampling:
+                    target_expected = top_k_renorm_prob(target_expected, info.top_ks)
                 target = raw.repeat_interleave(2, dim=0)
                 apply_synthid_to_target(
                     processor=processor,

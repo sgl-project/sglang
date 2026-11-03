@@ -448,7 +448,7 @@ class TestSynthID(CustomTestCase):
                         torch.testing.assert_close(scores[1], scores[0], rtol=0, atol=0)
 
     def test_mixed_speculative_off_rows_preserve_target_and_draft_filter_laws(self):
-        """OFF target filters stay sequential; OFF rejection drafts stay unfiltered."""
+        """OFF targets keep the joint filter law; OFF rejection drafts stay unfiltered."""
         for draft in (False, True):
             for kind in ("joint", "min_p", "greedy"):
                 with self.subTest(draft=draft, kind=kind):
@@ -489,7 +489,11 @@ class TestSynthID(CustomTestCase):
                     expected = (
                         torch.tensor(probabilities)
                         if draft or kind == "min_p"
-                        else torch.tensor([1.0, 0.0, 0.0])
+                        else (
+                            torch.tensor([0.625, 0.375, 0.0])
+                            if kind == "joint"
+                            else torch.tensor([1.0, 0.0, 0.0])
+                        )
                     )
                     torch.testing.assert_close(
                         logits.softmax(-1)[repeats:], expected.expand(repeats, -1)
