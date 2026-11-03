@@ -42,6 +42,7 @@ def _table_qk_norm_rope_kernel(
     sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar)
 
     is_q = (heads < NHQ)[:, None]
+    # Equal to heads * D, but that form changes Triton's codegen and breaks bit-exactness.
     col0 = tl.where(heads < NHQ, heads * D, q_size + (heads - NHQ) * D).to(tl.int64)
     row = (qkv_ptr + t * row_stride + col0)[:, None]
     mask = (heads < NH)[:, None]

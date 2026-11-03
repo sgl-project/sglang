@@ -75,13 +75,13 @@ def test_cuda_sequence_is_bit_exact(d, batch, hq, hk, padded, pos_dtype):
         assert_same_bits(storage[:, -8:], before[:, -8:])
 
 
+@pytest.mark.parametrize("d,section", [(64, [16, 8, 8]), (128, [24, 20, 20])])
 @pytest.mark.parametrize("layout", ["sections", "interleaved", "interleaved_glm"])
 @pytest.mark.parametrize(
     "batch,hq,hk", [(1, 32, 8), (32, 8, 1), (129, 12, 2), (257, 64, 8)]
 )
-def test_bf16_mrope_matches_triton_mrope(batch, hq, hk, layout):
+def test_bf16_mrope_matches_triton_mrope(d, section, batch, hq, hk, layout):
     """A BF16 table with per-axis positions must reproduce the split MRoPE path."""
-    d, section = 128, [24, 20, 20]
     _, x, pos, qw, kw, cache = inputs(d, batch, hq, hk, 29)
     cache = cache.bfloat16()
     # Distinct axes, as in prefill or precomputed spatial decode positions.

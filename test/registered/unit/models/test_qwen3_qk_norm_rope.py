@@ -70,7 +70,8 @@ def decode_positions(layer, positions):
         # Distinct axes also cover models with precomputed spatial decode positions;
         # the decode graph runner passes a [:, :bs] slice of a [3, max_bs] buffer.
         padded = torch.nn.functional.pad(positions, (0, 8))
-        return torch.stack([padded, padded + 5, padded * 3])[:, : len(positions)]
+        axes = torch.stack([padded, padded + 5, padded * 3])
+        return (axes % len(layer.rotary_emb.cos_sin_cache))[:, : len(positions)]
     return positions
 
 
@@ -132,6 +133,11 @@ def test_model_dispatch(rope_scaling, mode, dtype, should_fuse):
         ),
         ({}, {"d": 512}, False),
         ({}, {"rope_scaling": {"rope_type": "linear", "factor": 2.0}}, False),
+        (
+            {},
+            {"d": 256, "rope_scaling": {**MROPE, "mrope_section": [48, 40, 40]}},
+            False,
+        ),
         ({}, {}, True),
     ],
 )
@@ -153,7 +159,7 @@ def test_mrope_one_d_positions_stay_separate():
 
 
 @pytest.mark.parametrize("rope_scaling", [None, MROPE])
-@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("batch_size", [1, 4, 128])
 def test_changing_input_graph_replay(rope_scaling, batch_size):
     layer = make_layer(rope_scaling=rope_scaling)
     x = torch.randn(batch_size, layer.hidden_size, device="cuda", dtype=torch.bfloat16)

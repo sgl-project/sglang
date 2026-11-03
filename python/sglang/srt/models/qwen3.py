@@ -265,8 +265,10 @@ class Qwen3Attention(nn.Module):
             and (
                 type(self.rotary_emb) is RotaryEmbedding
                 or (
+                    # At head_dim 256, triton_mrope_fused's BF16 rounding differs.
                     type(self.rotary_emb) is MRotaryEmbedding
                     and self.rotary_emb.mrope_section is not None
+                    and self.head_dim in (64, 128)
                 )
             )
             and self.head_dim in (64, 128, 256)
