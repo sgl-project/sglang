@@ -75,8 +75,7 @@ class ReqList(ABC):
 
 class KeyedReqList(ReqList):
     """Requests in join order, held in a dict by identity: for a list asked `in`
-    often (the running and prefill-launched requests). Changed in place, so a
-    loop that changes the list iterates a copy."""
+    often. Changed in place, so a loop that changes the list iterates a copy."""
 
     def __init__(self, kind: ListKind) -> None:
         self.kind = kind
@@ -110,9 +109,8 @@ class KeyedReqList(ReqList):
 
 class IndexedReqList(ReqList):
     """The default list: items in an order the owner sets, held in a list, for a
-    queue scanned in order and dropped from in batches. Read by index and slice,
-    joined at the back or front, and reordered through `replace`. An owner that
-    wraps each request stores the wrappers and passes `req_of` to unwrap them."""
+    queue scanned in order and dropped from in batches. An owner that wraps each
+    request stores the wrappers and passes `req_of` to unwrap them."""
 
     def __init__(
         self,
@@ -135,7 +133,6 @@ class IndexedReqList(ReqList):
         self._items[:0] = items
 
     def replace(self, items: Iterable) -> None:
-        """Make the queue the given items, in order."""
         self._items = list(items)
 
     def leave(self, reqs: Iterable[Req]) -> None:
@@ -154,7 +151,6 @@ class IndexedReqList(ReqList):
             self._abort(recv_req)
 
     def items(self) -> Iterator:
-        """The stored items, in list order."""
         return iter(self._items)
 
     def __iter__(self) -> Iterator[Req]:

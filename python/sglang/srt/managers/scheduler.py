@@ -6034,7 +6034,6 @@ class Scheduler(
         return inflight_batches
 
     def _abort_waiting(self, recv_req: AbortReq) -> None:
-        """Abort the waiting requests `recv_req` names."""
         for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
             # A waiting request has started nothing, so it is aborted here; the
             # tokenizer still needs the abort output to clean up its state.
