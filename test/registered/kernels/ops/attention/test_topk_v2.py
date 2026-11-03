@@ -520,7 +520,9 @@ def _start_exact_mode_checks():
     [
         pytest.param(
             MODE_EXACT,
-            marks=pytest.mark.skipif(is_hip(), reason="ROCm runs EXACT in-process by default"),
+            marks=pytest.mark.skipif(
+                is_hip(), reason="ROCm runs EXACT in-process by default"
+            ),
         ),
         MODE_DETERMINISTIC,
     ],
