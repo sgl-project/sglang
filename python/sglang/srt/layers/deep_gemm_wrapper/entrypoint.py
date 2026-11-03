@@ -590,8 +590,6 @@ def grouped_gemm_nt_bf16i4bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
-    overlap_args: Optional[Any] = None,
-    max_block_n: int = 256,
 ):
     # lhs: shape [e, m, k], dtype bf16
     # VALU/INT4: int32 weights [e, k//16, n*2], scales [e, k//32, n].
@@ -614,21 +612,13 @@ def grouped_gemm_nt_bf16i4bf16_masked(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        return deep_gemm.m_grouped_gemm_w4a16_masked(
+        # W4A16 masked has no SBO entry point, so there is nothing to forward.
+        deep_gemm.m_grouped_gemm_w4a16_masked(
             lhs,
             rhs,
             out,
             masked_m,
             expected_m,
-            **(
-                dict(
-                    enable_sbo_overlap=True,
-                    max_block_n=max_block_n,
-                    signal=overlap_args.signal,
-                )
-                if overlap_args is not None
-                else {}
-            ),
         )
 
 
