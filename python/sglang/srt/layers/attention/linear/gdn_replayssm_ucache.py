@@ -225,7 +225,7 @@ class GdnUcacheVerifier:
     def __init__(self, *, device: torch.device, first_layer_id: int):
         self._flush_kernel = _load_flush_kernel(device)
         self._first_layer_id = first_layer_id
-        # layer_id -> (A_log, dt_bias) as fp32, built eagerly before any capture.
+        # layer_id -> fp32 (A_log, dt_bias) buffers, allocated before any capture.
         self._gate_params: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._rows: Optional[GdnUcacheRows] = None
 
@@ -342,9 +342,17 @@ class GdnUcacheVerifier:
                     "GDN u-cache verify: layer gate parameters must be prepared by "
                     "an eager forward before CUDA graph capture."
                 )
-            params = (
-                A_log.detach().float().contiguous(),
-                dt_bias.detach().float().contiguous(),
-            )
+            params = (_fp32_view_or_buffer(A_log), _fp32_view_or_buffer(dt_bias))
             self._gate_params[layer_id] = params
+        # Refreshed on device every call (and captured), so in-place weight
+        # updates reach graph replays; an fp32 contiguous parameter is aliased.
+        for buf, src in zip(params, (A_log, dt_bias)):
+            if buf.data_ptr() != src.data_ptr():
+                buf.copy_(src)
         return params
+
+
+def _fp32_view_or_buffer(param: torch.Tensor) -> torch.Tensor:
+    if param.dtype == torch.float32 and param.is_contiguous():
+        return param.detach()
+    return torch.empty(param.shape, dtype=torch.float32, device=param.device)

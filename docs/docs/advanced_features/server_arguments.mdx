@@ -2065,6 +2065,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-gdn-replayssm-ucache`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the deferred-fold GDN ReplaySSM target verify on FlashInfer's u-cache kernels (SM100 / SM107). Each verify reads the fp16 checkpoint plus a per-slot window of up to 16 committed records and folds a full window into the checkpoint in the same launch. Requires a GDN hybrid model, a linear draft chain with at most 8 draft tokens, <code>--mamba-ssm-dtype float16</code> and <code>--disable-radix-cache</code>; refuses <code>--enable-mixed-chunk</code>, <code>--enable-streaming-session</code>, <code>--enable-unified-memory</code> and PD disaggregation. Needs FlashInfer &gt;= 0.7.3.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mamba-cache-philox-rounds`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of Philox rounds to use for stochastic rounding of FP16 Mamba SSM cache writes. Triton uses the Triton default when set to 0; FlashInfer uses 10 rounds when set to 0.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>

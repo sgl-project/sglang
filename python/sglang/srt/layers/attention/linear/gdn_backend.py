@@ -631,6 +631,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._fi_graph_engage_logged = False
         self._fi_graph_eager_batches = 0
         self._gdn_ucache = self.state_pool.gdn_ucache
+        if (
+            get_exec().mamba.enable_gdn_replayssm_ucache
+            and self._gdn_ucache is None
+            and not self.is_draft_worker
+        ):
+            raise RuntimeError(
+                "--enable-gdn-replayssm-ucache: the GDN state pool carries no "
+                "u-cache rings, so verify would fall back to the snapshot path."
+            )
         self._gdn_ucache_verifier = (
             GdnUcacheVerifier(
                 device=torch.device(model_runner.device),
@@ -1847,6 +1856,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         ssm_states=ssm_states,
                         cache_indices=cache_indices,
                         num_draft_tokens=forward_batch.spec_info.draft_token_num,
+                        retrieve_parent_token=retrieve_parent_token,
                     )
                 elif use_replayssm_fold:
                     core_attn_out = self._replayssm_fold_target_verify(
@@ -2168,6 +2178,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         ssm_states=ssm_states,
                         cache_indices=cache_indices,
                         num_draft_tokens=forward_batch.spec_info.draft_token_num,
+                        retrieve_parent_token=retrieve_parent_token,
                     )
                 elif use_replayssm_fold:
                     core_attn_out = self._replayssm_fold_target_verify(
@@ -2520,7 +2531,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         num_draft_tokens: int,
+        retrieve_parent_token: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        assert retrieve_parent_token is None, (
+            "GDN u-cache verify supports linear draft chains only (topk == 1)."
+        )
         gdn_ucache = self._gdn_ucache
         layer_index = self.state_layer(layer.layer_id).view_layer_id
         return self._gdn_ucache_verifier.target_verify(

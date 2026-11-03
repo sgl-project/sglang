@@ -541,7 +541,7 @@ def _check_gdn_replayssm_ucache(server_args: Any) -> None:
     _check_gdn_replayssm_ucache_model(server_args, flag=flag)
     _check_gdn_replayssm_ucache_spec(cfg, flag=flag)
     _check_gdn_replayssm_ucache_cache(cfg, flag=flag)
-    _check_gdn_replayssm_ucache_megakernel(flag=flag)
+    _check_gdn_replayssm_ucache_megakernel(cfg, flag=flag)
     if cfg.mamba_ssm_dtype is None:
         logger.info(f"{flag}: setting --mamba-ssm-dtype float16 (UMMA fp16 state).")
         declare_resolution(
@@ -579,17 +579,6 @@ def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
 
     if cfg.speculative_algorithm is None:
         raise ValueError(f"{flag} requires speculative decoding (it is a verify path).")
-    if cfg.speculative_eagle_topk not in (None, 1):
-        raise ValueError(
-            f"{flag} requires a linear draft chain (--speculative-eagle-topk in "
-            f"{{None, 1}}); got {cfg.speculative_eagle_topk!r}."
-        )
-    num_draft_tokens = cfg.speculative_num_draft_tokens
-    if num_draft_tokens is not None and not 1 <= num_draft_tokens <= 8:
-        raise ValueError(
-            f"{flag} supports 1 to 8 draft tokens per verify; got "
-            f"--speculative-num-draft-tokens={num_draft_tokens}."
-        )
     if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
         raise ValueError(f"{flag} requires SGLANG_RAGGED_VERIFY_MODE=static.")
     if pp_spec_stable_rows_enabled():
@@ -619,14 +608,66 @@ def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
             f"{flag} does not support PD disaggregation; got "
             f"--disaggregation-mode={cfg.disaggregation_mode!r}."
         )
+    # TODO(ameynaik-hub): support sessions by folding the window into the
+    # checkpoint before an extend on a held slot; resetting hist_len alone is wrong.
+    if cfg.enable_streaming_session:
+        raise ValueError(
+            f"{flag} does not support --enable-streaming-session: a session turn "
+            "reuses its mamba slot, and the next prefill would read the checkpoint "
+            "without its unfolded window."
+        )
+    # Page-major layout requires unified memory, so this covers both flags.
+    if cfg.enable_unified_memory or cfg.enable_page_major_kv_layout:
+        raise ValueError(
+            f"{flag} does not support --enable-unified-memory or "
+            "--enable-page-major-kv-layout: the arena state pool (StateView) "
+            "allocates no u-cache rings."
+        )
 
 
-def _check_gdn_replayssm_ucache_megakernel(*, flag: str) -> None:
+def _check_gdn_replayssm_ucache_megakernel(cfg: Any, *, flag: str) -> None:
+    if cfg.enable_nvidia_megakernel:
+        raise ValueError(
+            f"{flag} cannot run with --enable-nvidia-megakernel: its verify step "
+            "reads the GDN pool without the u-cache rings."
+        )
+    # The deferred side-stream cursor commit is not ordered before the
+    # schedule-stream hist_len reset of a reacquired slot.
+    if envs.SGLANG_PLB_COMMIT_LATE_JOIN.get():
+        raise ValueError(f"{flag} cannot run with SGLANG_PLB_COMMIT_LATE_JOIN.")
     if envs.SGLANG_Q38C_MK_GDN.get():
         raise ValueError(f"{flag} cannot run with SGLANG_Q38C_MK_GDN.")
     for name in _Q38_GDN_VERIFY_KNOBS:
         if os.environ.get(name, "0") == "1":
             raise ValueError(f"{flag} cannot run with {name}=1.")
+
+
+def handle_gdn_replayssm_ucache_spec_shape(server_args: Any) -> None:
+    """Validate the resolved draft shape for --enable-gdn-replayssm-ucache.
+
+    Runs after the speculative hook: NGRAM forces topk > 1, and EAGLE-family
+    resolution may rewrite the draft-token count.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_gdn_replayssm_ucache:
+        return
+    flag = "--enable-gdn-replayssm-ucache"
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        raise ValueError(
+            f"{flag} requires a linear EAGLE / EAGLE3 / NEXTN draft chain; got "
+            f"--speculative-algorithm {cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            f"{flag} requires a linear draft chain (--speculative-eagle-topk 1); "
+            f"got {cfg.speculative_eagle_topk!r}."
+        )
+    num_draft_tokens = cfg.speculative_num_draft_tokens
+    if num_draft_tokens is None or not 1 <= num_draft_tokens <= 8:
+        raise ValueError(
+            f"{flag} supports 1 to 8 draft tokens per verify; got "
+            f"--speculative-num-draft-tokens={num_draft_tokens}."
+        )
 
 
 def handle_multi_item_scoring(server_args: Any):

@@ -39,8 +39,15 @@ NUM_SLOTS = 8
 # Real rows on slots 3, 5, 1, 6; slot 0 (the reserved padding slot) and -1 are padding.
 CACHE_INDICES = [3, 0, 5, -1, 1, 6]
 NUM_STEPS = 32
-# FlashInfer's multi-step bound against a ring-free fp32 recurrence (2 * 8e-3).
+# FlashInfer's bounds against a ring-free fp32 recurrence: one verify from the
+# initial fp16 state, and over the whole horizon (2 * 8e-3).
+FIRST_STEP_TOL = 8e-3
 DRIFT_TOL = 1.6e-2
+# Relative to the largest reference output (about 0.15 here), so a few-percent
+# gain or gate error fails; measured 0.27% on B200, bound about 4x that.
+REL_TOL = 1e-2
+# An in-place weight update at this step must reach the verify's gate parameters.
+DT_BIAS_UPDATE_STEP = NUM_STEPS // 2
 
 
 def _fp32_window(state, q, k, v, a, b, A_log, dt_bias):
@@ -93,9 +100,11 @@ class TestGdnReplaySsmUcache(CustomTestCase):
         batch = len(CACHE_INDICES)
         verifier = GdnUcacheVerifier(device=device, first_layer_id=0)
 
-        worst = 0.0
+        worst = worst_first = ref_max = 0.0
         folds = {r: 0 for r in rows}
-        for _ in range(NUM_STEPS):
+        for step in range(NUM_STEPS):
+            if step == DT_BIAS_UPDATE_STEP:
+                dt_bias.copy_(randn(HV, scale=0.5))
             q, k = randn(batch * T, H, K), randn(batch * T, H, K)
             v = randn(batch * T, HV, V, scale=0.5)
             a, b = randn(batch * T, HV, scale=0.5), randn(batch * T, HV)
@@ -140,12 +149,23 @@ class TestGdnReplaySsmUcache(CustomTestCase):
                     A_log,
                     dt_bias,
                 )
-                worst = max(worst, (output[r].float() - y_ref).abs().max().item())
+                err = (output[r].float() - y_ref).abs().max().item()
+                worst = max(worst, err)
+                if step == 0:
+                    worst_first = max(worst_first, err)
+                ref_max = max(ref_max, y_ref.abs().max().item())
                 truth[slot] = states[int(num_accept[r]) - 1]
                 folds[r] += int(hist_before[slot] >= buffers.flush_min)
 
         torch.cuda.synchronize()
-        self.assertLess(worst, DRIFT_TOL, f"|y - fp32 truth| = {worst:.2e}")
+        report = (
+            f"|y - fp32 truth|: first step {worst_first:.2e}, horizon {worst:.2e}, "
+            f"relative {worst / ref_max:.2%} of max |y| {ref_max:.3f}"
+        )
+        print(report)
+        self.assertLess(worst_first, FIRST_STEP_TOL, report)
+        self.assertLess(worst, DRIFT_TOL, report)
+        self.assertLess(worst / ref_max, REL_TOL, report)
         self.assertTrue(all(count > 0 for count in folds.values()), folds)
         # Padding slot 0 is never verified or committed.
         self.assertEqual(int(buffers.hist_len[0]), 0)
