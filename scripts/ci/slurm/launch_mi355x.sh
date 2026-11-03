@@ -6,7 +6,7 @@
 # salloc's (prefill_workers + decode_workers) nodes -- one server per node --
 # and runs the Docker harness: prefill server(s) on the first nodes, decode
 # server(s) on the rest, a standalone load balancer on the prefill node, then an
-# sglang.bench_serving concurrency sweep over MORI. Default recipe is 1P1D (2
+# sglang.benchmark.serving concurrency sweep over MORI. Default recipe is 1P1D (2
 # nodes); see the drive.sh note on reserving 2P2D / 1P3D / 3P1D.
 #
 # Required environment variables (set by the GitHub Actions workflow):
@@ -1208,7 +1208,7 @@ $PREFILL_WAIT_ROUTER
       echo "=== concurrency=\$C ==="
       OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
       rm -f \$OUT
-      python3 -m sglang.bench_serving --backend sglang \
+      python3 -m sglang.benchmark.serving --backend sglang \
         --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \
         --dataset-name random --random-input-len $ISL --random-output-len $OSL \
         --random-range-ratio $RRR --max-concurrency \$C \
@@ -1905,11 +1905,32 @@ EOF
     }
     SPUR_RESUBMITS_LEFT=${SPUR_RESUBMITS_LEFT:-20}
 
+    # Containers are started -d (detached) on spur, so killing this script does
+    # not kill them -- only the explicit teardown below does, and only if the
+    # script is still alive to reach it. A killed/disconnected runner otherwise
+    # leaves the job (and its containers) running until TIME_LIMIT. This trap
+    # covers that case the same way the normal path already covers a clean
+    # finish; it does not cover a hard SIGKILL or a severed connection.
+    spur_cleanup_on_exit() {
+        [[ "${SPUR_LEG_JOB_ID:-}" =~ ^[0-9]+$ ]] || return 0
+        local _nodes
+        _nodes=$(scontrol show job "$SPUR_LEG_JOB_ID" 2>/dev/null \
+            | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+        for _n in $_nodes; do
+            echo "[launch] reaping containers on $_n for spur job $SPUR_LEG_JOB_ID" >&2
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$_n" \
+                'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
+                >/dev/null 2>&1 || true
+        done
+        scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
+    }
+
     spur_submit_leg
     if [[ ! "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]]; then
         echo "ERROR: could not parse a job id out of: $SBATCH_MSG" >&2
         SALLOC_RC=1
     else
+        trap spur_cleanup_on_exit EXIT INT TERM
         echo "[launch] spur job $SPUR_LEG_JOB_ID submitted; streaming $SBATCH_OUT"
         tail -F "$SBATCH_OUT" 2>/dev/null &
         SPUR_TAIL_PID=$!
@@ -1999,10 +2020,9 @@ EOF
         # 1774/1775 held all four nodes long after their legs had been recorded
         # rc=1. Unconditional, because reaching here means this leg is done with
         # its nodes either way.
-        if spur_job_alive "$SPUR_LEG_JOB_ID"; then
-            echo "[launch] releasing spur job $SPUR_LEG_JOB_ID"
-            scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
-        fi
+        echo "[launch] releasing spur job $SPUR_LEG_JOB_ID"
+        trap - EXIT INT TERM
+        spur_cleanup_on_exit
     fi
 else
     salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \

@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec, StateView
 from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
