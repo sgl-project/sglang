@@ -1,0 +1,69 @@
+name: Buf Protobuf
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "proto/**"
+      - ".github/workflows/buf.yml"
+  release:
+    types:
+      - published
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "proto/**"
+      - ".github/workflows/buf.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: buf-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  buf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+
+      - name: Build and lint protobuf schemas
+        run: |
+          buf build proto
+          buf lint proto
+
+      - name: Check for breaking protobuf changes
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'buf skip breaking')
+        run: |
+          buf breaking proto --against "https://github.com/${{ github.repository }}.git#branch=${{ github.base_ref }},subdir=proto"
+
+      - name: Push module to Buf Schema Registry
+        if: (github.event_name == 'push' || github.event_name == 'release') && github.repository == 'sgl-project/sglang'
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+        run: |
+          if [ -z "${BUF_TOKEN}" ]; then
+            echo "::notice::Skipping BSR push because secrets.BUF_TOKEN is not configured."
+            exit 0
+          fi
+          labels=(--label "${GITHUB_SHA}")
+          if [ -n "${GITHUB_REF_NAME}" ]; then
+            labels+=(--label "${GITHUB_REF_NAME}")
+          fi
+          buf push proto \
+            --create \
+            --create-visibility public \
+            --create-default-label main \
+            --source-control-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" \
+            "${labels[@]}"
