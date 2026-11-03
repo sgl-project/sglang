@@ -38,7 +38,7 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -279,7 +279,7 @@ class TestAllocationIntegration(CustomTestCase):
 
     def test_scheduler_does_not_reserve_request_rows_for_unready_prefill(self):
         sender, receiver = self.sender(), self.receiver()
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="req",
             bootstrap_room=1,
             finished_reason=None,
@@ -288,7 +288,8 @@ class TestAllocationIntegration(CustomTestCase):
         )
         entry = DecodeRequest(req=req, kv_receiver=receiver)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.queue, queue.pending_reqs = [entry], []
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, [entry])
+        queue.pending_reqs = []
         queue.pp_size, queue.tp_rank = 1, 0
         queue.gloo_group = object()
         queue._resolve_pending_reqs = Mock()
@@ -324,7 +325,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertTrue(entry.waiting_for_input)
         queue.req_to_metadata_buffer_idx_allocator.available_size.assert_called_once()
         queue.req_to_token_pool.available_size.assert_called_once()
-        self.assertEqual(queue.queue, [entry])
+        self.assertEqual(list(queue.queue.items()), [entry])
 
     def test_exhausted_optimistic_attempt_follows_allocation_policy(self):
         override = get_context().override_server_args(
