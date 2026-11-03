@@ -1729,15 +1729,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     cls=pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
+            main_kv_layout_specs = getattr(self, "main_kv_layout_specs", {})
             for ratio, sources in low_ratio_sources.items():
-                if ratio in self.main_kv_layout_specs:
+                if ratio in main_kv_layout_specs:
                     self.kv_pools[ratio] = DeepSeekV41PackedMainKVPool(
                         size=self.full_size // ratio,
                         page_size=page_size // ratio,
                         layer_num=len(sources),
                         device=device,
                         enable_memory_saver=enable_memory_saver,
-                        spec=self.main_kv_layout_specs[ratio],
+                        spec=main_kv_layout_specs[ratio],
                         global_page_size=page_size,
                     )
                 else:
