@@ -8,6 +8,11 @@ export const agentx = {
   "repo": "https://github.com/SemiAnalysisAI/InferenceX",
   "main": "c5e8b9b3e9b90511fa5c7774d83e4663ca4db553",
   "prs": {
+   "4750": {
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/41528865560",
+    "sha": "6528aa7c4341e9027ed152fa280fa22f32363b1f",
+    "status": "verified-pr"
+   },
    "4726": {
     "run": null,
     "sha": "0979dfd84e3fe408e9c36752b69da7f5915ce5ab",
@@ -247,7 +252,7 @@ export const agentx = {
     },
     {
      "concs": [4],
-     "item": 1,
+     "item": 2,
      "override": "override_tp4_c4",
      "goldenAL": "4.04",
      "kv": "none",
@@ -275,7 +280,7 @@ export const agentx = {
     },
     {
      "concs": [8],
-     "item": 2,
+     "item": 3,
      "override": "override_tp4_c8",
      "goldenAL": "4.04",
      "kv": "none",
@@ -303,7 +308,7 @@ export const agentx = {
     },
     {
      "concs": [16],
-     "item": 3,
+     "item": 4,
      "override": "override_tp4_c16",
      "goldenAL": "4.04",
      "kv": "none",
@@ -331,7 +336,7 @@ export const agentx = {
     },
     {
      "concs": [24],
-     "item": 4,
+     "item": 5,
      "override": "override_tp4_hicache_spf_c24",
      "goldenAL": "4.04",
      "kv": "hicache",
@@ -1699,7 +1704,7 @@ export const agentx = {
    }
   },
   {
-   "id": "minimaxm31flash-fp4-gb300-dynamo-sglang-agentic-dspark-agg#5",
+   "id": "minimaxm31flash-fp4-gb300-dynamo-sglang-agentic-dspark-agg#6",
    "hw": "gb300",
    "ckpt": "MiniMaxAI/MiniMax-M3.1-Flash",
    "label": "Agg TP2",
@@ -1736,7 +1741,7 @@ export const agentx = {
    "points": [
     {
      "concs": [40],
-     "item": 5,
+     "item": 6,
      "override": "override_tp2_hicache_spf_c40",
      "goldenAL": "4.04",
      "kv": "hicache"
@@ -1832,7 +1837,7 @@ export const agentx = {
    }
   },
   {
-   "id": "minimaxm31flash-fp4-gb300-dynamo-sglang-agentic-dspark-agg#6",
+   "id": "minimaxm31flash-fp4-gb300-dynamo-sglang-agentic-dspark-agg#7",
    "hw": "gb300",
    "ckpt": "MiniMaxAI/MiniMax-M3.1-Flash",
    "label": "Agg TP2",
@@ -1869,14 +1874,14 @@ export const agentx = {
    "points": [
     {
      "concs": [40],
-     "item": 6,
+     "item": 7,
      "override": "override_tp2_hicache_c40",
      "goldenAL": "4.04",
      "kv": "hicache"
     },
     {
      "concs": [44],
-     "item": 7,
+     "item": 8,
      "override": "override_tp2_hicache_c44",
      "goldenAL": "4.04",
      "kv": "hicache",
@@ -2422,16 +2427,16 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "b1af0163907bb3bd238986c4377be6ad81aec9ff",
+    "sha": "6528aa7c4341e9027ed152fa280fa22f32363b1f",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/minimaxm31flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
-    "run": "41271829525/attempts/1",
-    "pr": "4698",
+    "run": "41528865560",
+    "pr": "4750",
     "status": "verified",
-    "date": "2026-11-02"
+    "date": "2026-11-03"
    },
    "points": [
     {
-     "concs": [300, 360, 400],
+     "concs": [220, 240, 260, 300, 360, 400],
      "item": 3,
      "override": "override_6p_dep2_dep16",
      "goldenAL": "4.04",
@@ -7094,6 +7099,114 @@ export const agentx = {
          "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
         }
        }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "minimaxm31flash-fp4-gb300-dynamo-sglang-agentic-dspark-agg#1",
+   "hw": "gb300",
+   "ckpt": "MiniMaxAI/MiniMax-M3.1-Flash",
+   "label": "Agg TP4",
+   "detail": "DSpark 7 · MSA MonoKernel",
+   "gpus": 4,
+   "configKey": "minimaxm31flash-fp4-gb300-dynamo-sglang-agentic-dspark-agg",
+   "image": "lmsysorg/sglang:nightly-cu134-20261030-e371881@sha256:a82fff791d7dc1e5cfdfde9022487c60c079286fd54684950d55b787eb2e673a",
+   "imageStatus": "ok",
+   "imageCommit": "e371881",
+   "submitted": "dynamo",
+   "setup": [],
+   "disclosures": ["synthetic-acceptance"],
+   "kv": {
+    "available": ["none", "hicache", "mooncake"],
+    "unavailable": {},
+    "hicache": {
+     "args": [
+      ["--enable-hierarchical-cache"],
+      ["--hicache-size", "180"],
+      ["--hicache-write-policy", "write_back"]
+     ],
+     "donor": "minimaxm31flash-fp4-gb300-sglang-agentic-dspark",
+     "donorHardware": "gb300"
+    }
+   },
+   "prov": {
+    "sha": "6528aa7c4341e9027ed152fa280fa22f32363b1f",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/minimaxm31flash/sglang/gb300-fp4/agentx/agg-variants.yaml",
+    "run": "41528865560",
+    "pr": "4750",
+    "status": "verified",
+    "date": "2026-11-03"
+   },
+   "points": [
+    {
+     "concs": [1],
+     "item": 1,
+     "override": "override_tp4_monokernel_c1",
+     "goldenAL": "4.04",
+     "kv": "none"
+    }
+   ],
+   "routers": {
+    "dynamo": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "ref": [0, "dynamo", 0]
+      },
+      {
+       "ref": [0, "dynamo", 1]
+      },
+      {
+       "ref": [0, "dynamo", 2],
+       "diff": {
+        "args": {
+         "--cuda-graph-max-bs-decode": ["8"],
+         "--max-running-requests": ["8"],
+         "--disable-attn-tp-gather": [],
+         "--enable-nvidia-megakernel": [],
+         "--page-size": ["128"],
+         "--speculative-draft-kv-cache-dtype": ["auto"],
+         "--speculative-eagle-topk": ["1"],
+         "--speculative-num-draft-tokens": ["8"],
+         "--speculative-num-steps": ["1"]
+        },
+        "env": {
+         "ALLOW_JIT": "1",
+         "SGLANG_FORCE_COARSE_WAR_BARRIER": "1"
+        }
+       }
+      }
+     ]
+    },
+    "sglang": {
+     "install": [],
+     "files": [],
+     "blocks": [
+      {
+       "from": 2,
+       "cmd": "python3 -m sglang.launch_server",
+       "diff": {
+        "args": {
+         "--request-plane": null,
+         "--kv-events-config": null,
+         "--router-mode": null,
+         "--router-session-affinity-ttl-secs": null
+        },
+        "env": {
+         "DYN_BACKEND_ADMISSION_ENGINE_REQUEST_LIMIT": null,
+         "DYN_BACKEND_ADMISSION_ENGINE_REQUEST_WAITING_LIMIT": null,
+         "DYN_BACKEND_ADMISSION_REQUEST_QUEUE_LIMIT": null,
+         "DYN_EVENT_PLANE": null,
+         "DYN_REQUEST_PLANE": null,
+         "ETCD_ENDPOINTS": null
+        }
+       }
+      },
+      {
+       "ref": [0, "sglang", 1]
       }
      ]
     }
