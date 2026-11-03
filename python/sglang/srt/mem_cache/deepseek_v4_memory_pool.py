@@ -1587,6 +1587,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     global_page_size=page_size,
                     cls=pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
+                    compressed=True,
                 )
             for ratio, sources in low_ratio_sources.items():
                 self.kv_pools[ratio] = self._make_kv_pool(
@@ -1599,6 +1600,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     global_page_size=page_size,
                     cls=kv_pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
+                    compressed=True,
                 )
 
         index_k_page8 = _is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
@@ -1661,10 +1663,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         global_page_size: int,
         cls: type = DeepSeekV4SingleKVPool,
         kv_layout: KVLayout = KVLayout.V4,
+        compressed: bool = False,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
         is the model-wide logical page size. CUDA pools use it to reserve enough
         physical rows for the allocator's dummy logical page.
+        ``compressed`` marks a per-ratio compressed pool; only the NPU override
+        reads it (it selects the V4.1 fp4 row format over the window pool's fp8
+        one), CUDA pools are unaffected.
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
         return cls(

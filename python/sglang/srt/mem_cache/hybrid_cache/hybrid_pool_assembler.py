@@ -830,7 +830,14 @@ def _dsv4_low_ratio_regions(
             source - kvcache.start_layer: index for index, source in enumerate(sources)
         }
         regions.append((names[0], kv_pool, kv_pool.kv_buffer, layer_mapping))
-        if index_pool.index_k_with_scale_buffer is not None:
+        if getattr(index_pool, "has_npu_storage", False):
+            # NPU low-ratio pools keep packed-fp4 K and scale in separate
+            # PA_ND buffers and never allocate the fused packed buffer.
+            index_regions = [
+                (names[1], index_pool.index_k_buffer),
+                (names[2], index_pool.index_scale_buffer),
+            ]
+        elif index_pool.index_k_with_scale_buffer is not None:
             index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
         else:
             index_regions = [
