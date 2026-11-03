@@ -11,8 +11,40 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import is_gfx95_supported
 
 PAD_SLOT_ID = -1
+_DEFAULT_PREFILL_CONFIG = {
+    "BLOCK_M": 8,
+    "BLOCK_N": 256,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+_GFX950_GLM53_PREFILL_CONFIG = {
+    "BLOCK_M": 32,
+    "BLOCK_N": 512,
+    "num_warps": 4,
+    "num_stages": 3,
+}
+# Token count from which the GLM tile beats the default, per measured channel width.
+_GFX950_GLM53_PREFILL_MIN_TOKENS = {3072: 24576, 6144: 12288}
+
+
+def _causal_conv1d_prefill_config(
+    *,
+    dim: int,
+    width: int,
+    total_tokens: int,
+    dtype: torch.dtype,
+) -> dict:
+    if (
+        is_gfx95_supported()
+        and dtype == torch.bfloat16
+        and width == 4
+        and total_tokens >= _GFX950_GLM53_PREFILL_MIN_TOKENS.get(dim, total_tokens + 1)
+    ):
+        return _GFX950_GLM53_PREFILL_CONFIG
+    return _DEFAULT_PREFILL_CONFIG
 
 
 # Tokens per program of _causal_conv1d_fwd_kernel; a block_table enumerates
@@ -557,6 +589,17 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
+    if block_table is not None:
+        # block_table rows are in CAUSAL_CONV1D_FWD_BLOCK_M-token chunks.
+        config = _DEFAULT_PREFILL_CONFIG
+    else:
+        config = _causal_conv1d_prefill_config(
+            dim=dim,
+            width=width,
+            total_tokens=cu_seqlen,
+            dtype=x.dtype,
+        )
+
     def grid(META):
         if block_table is not None:
             # (num_blocks, 1, feature blocks): no host-side sequence lengths.
@@ -606,12 +649,9 @@ def causal_conv1d_fn(
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
-        # launch_cooperative_grid=True
-        BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
-        BLOCK_N=256,
         USE_BLOCK_TABLE=block_table is not None,
         OUTPUT_SPLIT_SIZE=output_split_size,
-        num_stages=2,
+        **config,
     )
     return out
 
