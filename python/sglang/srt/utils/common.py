@@ -429,6 +429,7 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     empty_cache()
     return True
 
+
 def get_numa_node_available_bytes(node: int) -> int:
     """
     Estimate the available memory on a NUMA node in bytes.
@@ -439,8 +440,13 @@ def get_numa_node_available_bytes(node: int) -> int:
     """
     with open(f"/sys/devices/system/node/node{node}/meminfo") as f:
         fields = {p[2].rstrip(":"): int(p[3]) for p in map(str.split, f) if len(p) >= 4}
-    return (fields["MemFree"] + fields["Active(file)"] + fields["Inactive(file)"]
-            + fields["SReclaimable"]) * 1024
+    return (
+        fields["MemFree"]
+        + fields["Active(file)"]
+        + fields["Inactive(file)"]
+        + fields["SReclaimable"]
+    ) * 1024
+
 
 def parse_node_list(spec: str) -> list[int]:
     """Parse a node list such as "2", "2,3" or "0-1". Returns the list of nodes as integers."""
@@ -449,6 +455,7 @@ def parse_node_list(spec: str) -> list[int]:
         start, _, end = part.strip().partition("-")
         nodes.extend(range(int(start), int(end or start) + 1))
     return nodes
+
 
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
@@ -530,7 +537,7 @@ def get_available_gpu_memory(
             free_gpu_memory = min(get_numa_node_available_bytes(n) for n in nodes)
         else:
             # No NUMA information, e.g. on non-Linux systems
-            total_free_memory = psutil.virtual_memory().available
+            total_free_memory = get_free_cpu_memory()
             n_numa_node: int = len(get_cpu_ids_by_node())
             free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
