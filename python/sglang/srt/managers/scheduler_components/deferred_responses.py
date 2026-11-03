@@ -59,7 +59,7 @@ class DeferredResponses:
         if not self.held:
             return
         ready = []
-        for req, completion in self.held.items():
+        for req, completion in list(self.held.items()):
             if not completion.done():
                 continue
             self.held.leave([req])
@@ -89,7 +89,7 @@ class DeferredResponses:
         self.send_abort(req, finished_reason)
 
     def _abort(self, recv_req: AbortReq) -> None:
-        for req, completion in self.held.items():
+        for req, completion in list(self.held.items()):
             if recv_req.matches(req.rid):
                 self.held.leave([req])
                 try:

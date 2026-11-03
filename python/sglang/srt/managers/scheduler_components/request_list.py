@@ -11,7 +11,6 @@ from typing import (
     Iterator,
     List,
     Optional,
-    Set,
 )
 
 if TYPE_CHECKING:
@@ -75,9 +74,9 @@ class RequestList(ABC):
 
 
 class _RequestList(RequestList):
-    """Requests in join order, held by identity. Each change rebinds a new dict,
-    so leaving while iterating is safe. An owner that wraps each request joins
-    the wrappers and passes `req_of` to unwrap them."""
+    """Requests in join order, held by identity and changed in place: a loop that
+    changes the list iterates a copy. An owner that wraps each request joins the
+    wrappers and passes `req_of` to unwrap them."""
 
     def __init__(
         self,
@@ -93,23 +92,19 @@ class _RequestList(RequestList):
 
     def join(self, items: Iterable) -> None:
         """Add the given items; ones whose request is already in keep their place."""
-        joining = {}
         for item in items:
-            req = self._req_of(item)
-            if req not in self._items:
-                joining.setdefault(req, item)
-        if joining:
-            self._items = {**self._items, **joining}
+            self._items.setdefault(self._req_of(item), item)
 
     def leave(self, reqs: Iterable[Req]) -> None:
         """Drop the given requests; ones not in are ignored."""
-        self._drop({req for req in reqs if req in self._items})
+        for req in reqs:
+            self._items.pop(req, None)
 
     def leave_finished(self) -> None:
-        self._drop({req for req in self._items if req.finished()})
+        self.leave([req for req in self._items if req.finished()])
 
     def clear(self) -> None:
-        self._items = {}
+        self._items.clear()
 
     def abort(self, recv_req: AbortReq) -> None:
         if self._abort is not None:
@@ -127,12 +122,6 @@ class _RequestList(RequestList):
 
     def __contains__(self, req: Req) -> bool:
         return req in self._items
-
-    def _drop(self, leaving: Set[Req]) -> None:
-        if leaving:
-            self._items = {
-                req: item for req, item in self._items.items() if req not in leaving
-            }
 
 
 class WaitingQueue(RequestList):

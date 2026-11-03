@@ -140,7 +140,7 @@ def _launch(s, batch):
 
 
 class TestRequestList(CustomTestCase):
-    def test_join_keeps_order_and_leaving_mid_iteration_is_safe(self):
+    def test_join_keeps_order_and_leaving_while_iterating_a_copy_is_safe(self):
         a, b, c, outsider = (_req(rid) for rid in "abcx")
         running = _RequestList(ListKind.DECODING)
         running.join([a, b])
@@ -148,7 +148,7 @@ class TestRequestList(CustomTestCase):
         _finish(b)
 
         seen = []
-        for req in running:
+        for req in list(running):
             seen.append(req)
             running.leave_finished()
             running.leave([a, outsider])
