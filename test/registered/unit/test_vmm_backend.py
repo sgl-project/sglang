@@ -22,7 +22,7 @@ from sglang.srt.utils import get_device, get_device_module
 from sglang.srt.utils.common import get_available_gpu_memory
 from sglang.srt.utils.vmm_backend import get_vmm_backend
 from sglang.srt.utils.vmm_common import exchange_posix_fds
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.kernels.utils import (
     gloo_group,
     local_device_id,
@@ -30,6 +30,7 @@ from sglang.test.kernels.utils import (
 )
 
 register_cuda_ci(est_time=40, stage="extra-a", runner_config="2-gpu-large")
+register_xpu_ci(est_time=30, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(
     current_platform.get_vmm_backend_class() is None,

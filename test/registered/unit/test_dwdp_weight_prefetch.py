@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device, get_device_module
 from sglang.srt.utils.vmm_backend import get_vmm_backend
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.kernels.utils import (
     gloo_group,
     local_device_id,
@@ -42,6 +42,7 @@ from sglang.test.kernels.utils import (
 )
 
 register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+register_xpu_ci(est_time=60, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 # DWDP has no CPU path to fall back to
 pytestmark = pytest.mark.skipif(
