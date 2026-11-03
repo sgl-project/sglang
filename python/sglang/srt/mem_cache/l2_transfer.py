@@ -28,6 +28,16 @@ def _timing_events_supported() -> bool:
         return False
 
 
+@cache
+def _warn_direct_without_metadata_kernels() -> None:
+    logger.warning(
+        "HiCache io backend 'direct' moves KV with copy-engine DMA, which can queue "
+        "ahead of the forward's small metadata host-to-device copies and stall the "
+        "forward; set SGLANG_ENABLE_MLP_SYNC_METADATA_FILL=1 to write that metadata "
+        "with kernels instead."
+    )
+
+
 def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
@@ -57,6 +67,12 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
+        if (
+            io_backend == "direct"
+            and device_module is torch.cuda
+            and not envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.get()
+        ):
+            _warn_direct_without_metadata_kernels()
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
         # Index preparation runs here, never queued behind earlier copies: the
@@ -132,6 +148,12 @@ class L2TransferEngine:
         own_stream = stream in (self.host_to_device_stream, self.device_to_host_stream)
         # A caller's stream prepares indices in order with its own copies.
         index_stream = self.index_stream if own_stream else stream
+        # The host layout keeps one finish event per key, and a newer event
+        # covers an older one only on the same stream: a caller's stream keeps
+        # its own entry beside the engine stream's.
+        layout_key = (
+            (id(self), transfer_key) if own_stream else (id(self), transfer_key, stream)
+        )
         try:
             with device_module.stream(index_stream):
                 # Index preparation can read producer-owned device indices. On its
@@ -155,8 +177,7 @@ class L2TransferEngine:
         finally:
             for domain in reversed(domains):
                 domain.release_layout(
-                    ack_finish if finish_recorded else None,
-                    (id(self), transfer_key),
+                    ack_finish if finish_recorded else None, layout_key
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
