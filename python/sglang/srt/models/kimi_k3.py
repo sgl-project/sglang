@@ -103,8 +103,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (

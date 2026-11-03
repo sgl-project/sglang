@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 
 if TYPE_CHECKING:
