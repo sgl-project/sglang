@@ -1,3 +1,4 @@
+import dataclasses
 from typing import List, Optional
 
 import torch
@@ -267,3 +268,36 @@ class IntelXpuLoRABackend(TritonLoRABackend):
     ) -> Optional[LoRABatchInfo]:
         # XPU kernels tile M per segment; fixed-size chunks only add partial tiles.
         return None
+
+    def prepare_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+        use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
+    ):
+        super().prepare_lora_batch(
+            forward_batch,
+            weight_indices,
+            lora_ranks,
+            scalings,
+            use_cuda_graph,
+            use_prefill_cuda_graph,
+        )
+        if use_cuda_graph:
+            # XPU kernels size grids from seg_indptr / permutation, not bs, so the
+            # max_bs-sized static buffers are sliced to the captured batch (views).
+            bs = self.batch_info.bs
+            self.batch_info = dataclasses.replace(
+                self.batch_info,
+                seg_lens=self.batch_info.seg_lens[:bs],
+                seg_indptr=self.batch_info.seg_indptr[: bs + 1],
+                weight_indices=self.batch_info.weight_indices[:bs],
+            )
+            if self.sgemm_batch_info is not None:
+                self.sgemm_batch_info = dataclasses.replace(
+                    self.sgemm_batch_info,
+                    permutation=self.sgemm_batch_info.permutation[:bs],
+                )
