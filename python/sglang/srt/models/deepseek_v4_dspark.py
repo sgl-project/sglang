@@ -920,10 +920,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        return self._expand_hc(self.embed_tokens(input_ids))
-
-    def _expand_hc(self, embeds: torch.Tensor) -> torch.Tensor:
-        return embeds.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        x = self.embed_tokens(input_ids)
+        x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        return x
 
     def forward(
         self,
@@ -947,10 +946,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             residual_batch.clear(forward_batch)
 
     def _forward_impl(self, input_ids, positions, forward_batch, input_embeds):
-        if input_embeds is None:
+        if input_embeds is None or input_embeds.dim() == 2:
             input_embeds = self.forward_embed(input_ids)
-        elif input_embeds.dim() == 2:
-            input_embeds = self._expand_hc(input_embeds)
         x = input_embeds
         pre = None
         if _is_cuda:
