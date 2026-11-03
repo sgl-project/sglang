@@ -9,10 +9,10 @@ device slots to its host slots, and every load-back copies them into the new
 device slots.
 
 The slot indices reach the CPU with a non-blocking copy on the transfer
-engine's index stream, so they never wait behind earlier KV copies. Each transfer's TopkRowCopy rides on its
-HiCacheAck. A write's rows are copied when its ack is processed, before the
-device slots can be freed. A load's rows are copied when its ack is processed,
-or earlier when get_topk reads rows.
+engine's index stream, so they never wait behind earlier KV copies. Each
+transfer's TopkRowCopy rides on its HiCacheAck. A write's rows are copied when
+its ack is processed, before the device slots can be freed. A load's rows are
+copied when its ack is processed, or earlier when get_topk reads rows.
 """
 
 import collections
