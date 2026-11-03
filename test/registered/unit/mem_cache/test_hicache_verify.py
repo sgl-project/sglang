@@ -12,6 +12,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import hicache_verify as verify_module
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_verify import HiCacheVerifier
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
@@ -165,6 +166,38 @@ class TestHiCacheVerify(CustomTestCase):
         counts = verifier.counts
         self.assertEqual(
             (counts["checked"], counts["mismatch"], counts["unverified"]), (2, 1, 1)
+        )
+
+    def test_every_chunk_of_a_row_is_hashed(self):
+        verify_module._coeffs.cache_clear()
+        self.addCleanup(verify_module._coeffs.cache_clear)
+        verifier = HiCacheVerifier(resolve_rows=_device_indices)
+        host_pool = object()
+        pool = SimpleNamespace(
+            k_buffer=[torch.randn(4, 4, 8, dtype=torch.bfloat16)],
+            v_buffer=[torch.randn(4, 4, 8, dtype=torch.bfloat16)],
+            device="cpu",
+        )
+        with mock.patch.object(verify_module, "_CHUNK_WORDS", 2):
+            verifier.record_backup([_transfer(host_pool, pool, [0, 1], [0, 1])])
+            for buf in (*pool.k_buffer, *pool.v_buffer):
+                buf[[2, 3]] = buf[[0, 1]]
+            pool.k_buffer[0][3].view(torch.uint8).view(-1)[60] ^= 1
+            verifier.check_load([_transfer(host_pool, pool, [0, 1], [2, 3])])
+        counts = verifier.counts
+        self.assertEqual((counts["checked"], counts["mismatch"]), (2, 1))
+
+    def test_storage_backend_turns_the_check_off(self):
+        engine, host_pool, device_pool = self._engine(), _CopyHostPool(), _mha_pool()
+        with self.assertLogs("sglang.srt.mem_cache.l2_transfer", "WARNING"):
+            engine.disable_verifier(reason="a storage backend is attached")
+        self.assertIsNone(engine._verifier)
+        engine.submit_device_to_host(
+            [_transfer(host_pool, device_pool, [10, 11], [0, 1])]
+        )
+        engine.submit_host_to_device(
+            [_transfer(host_pool, device_pool, [10, 11], [5, 6])],
+            transfer_layer_id_max=1,
         )
 
     def test_unsupported_pool_rows_are_unverified(self):

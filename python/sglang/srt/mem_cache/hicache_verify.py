@@ -10,16 +10,18 @@ Rows are read from MHA (K/V), MLA (KV) and Mamba (conv/temporal) device pools.
 Rows of other pools, and host slots with no recorded backup (for example
 packed draft-model layers, which have no backup transfer of their own), are
 counted as unverified. Every check synchronizes the transfer stream, so this
-is for debugging only.
+is for debugging only. Host slots filled from a storage backend never pass a
+device-to-host backup, so the check is turned off when one is attached.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+import random
 import time
 from collections import Counter
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import torch
 
@@ -28,51 +30,72 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 logger = logging.getLogger(__name__)
 
 _STATS_INTERVAL_S = 60.0
+# int64 words of each row hashed per step; bounds the temporaries to
+# num_rows * 2 * _CHUNK_WORDS * 8 bytes, whatever the row size.
+_CHUNK_WORDS = 1 << 16
 
 
-def _row_parts(pool, rows: torch.Tensor) -> Optional[list[torch.Tensor]]:
-    """The device rows' state as [n, ...] tensors, or None for an unsupported pool."""
+def _row_parts(pool, rows: torch.Tensor) -> Optional[Iterator[torch.Tensor]]:
+    """The device rows' state as [n, ...] tensors, one layer at a time, or
+    None for an unsupported pool."""
     if isinstance(pool, MambaPool):
         cache = pool.mamba_cache
-        return [
-            state[:, rows].transpose(0, 1) for state in (*cache.conv, cache.temporal)
-        ]
+        return (
+            state[layer, rows]
+            for state in (*cache.conv, cache.temporal)
+            for layer in range(state.shape[0])
+        )
+    # MHATokenToKVPool and its subclasses: one K and one V buffer per layer
     k_buffer = getattr(pool, "k_buffer", None)
     if k_buffer is not None:
         v_buffer = getattr(pool, "v_buffer", None)
         buffers = [*k_buffer, *(v_buffer if v_buffer is not None else ())]
-        return [buf[rows] for buf in buffers]
+        return (buf[rows] for buf in buffers)
+    # MLATokenToKVPool and its subclasses: one KV buffer per layer
     kv_buffer = getattr(pool, "kv_buffer", None)
     if kv_buffer is not None:
-        return [buf[rows] for buf in kv_buffer]
+        return (buf[rows] for buf in kv_buffer)
+    # HybridLinearKVPool and SWAKVPool: rows of the wrapped full-attention pool
     full_kv_pool = getattr(pool, "full_kv_pool", None)
     if full_kv_pool is not None:
         return _row_parts(full_kv_pool, rows)
     return None
 
 
-@functools.lru_cache(maxsize=256)
-def _coeffs(part: int, width: int, device: torch.device) -> torch.Tensor:
-    """Two fixed odd int64 multipliers per word, the same for backup and load."""
-    gen = torch.Generator(device="cpu").manual_seed(part * 1_000_003 + width)
+@functools.lru_cache(maxsize=8)
+def _coeffs(device: torch.device) -> torch.Tensor:
+    """[2, _CHUNK_WORDS] fixed odd int64 multipliers, one row per hash lane."""
+    gen = torch.Generator(device="cpu").manual_seed(0)
     coeffs = torch.randint(
-        -(1 << 62), 1 << 62, (2, width), generator=gen, dtype=torch.int64
+        -(1 << 62), 1 << 62, (2, _CHUNK_WORDS), generator=gen, dtype=torch.int64
     )
     return (coeffs | 1).to(device)
 
 
-def _row_hashes(parts: list[torch.Tensor]) -> torch.Tensor:
+@functools.lru_cache(maxsize=4096)
+def _chunk_multipliers(part: int, chunk: int) -> tuple[int, int]:
+    """Two odd multipliers that tie a chunk's sums to its part and position."""
+    rng = random.Random(part * 1_000_003 + chunk)
+    return rng.getrandbits(62) | 1, rng.getrandbits(62) | 1
+
+
+def _row_hashes(
+    parts: Iterator[torch.Tensor], num_rows: int, device: torch.device
+) -> torch.Tensor:
     """[n, 2] int64: two polynomial hashes (wrapping) over each row's bytes."""
-    n = parts[0].shape[0]
-    hashes = torch.zeros(n, 2, dtype=torch.int64, device=parts[0].device)
+    hashes = torch.zeros(num_rows, 2, dtype=torch.int64, device=device)
+    coeffs = _coeffs(device)
     for index, part in enumerate(parts):
-        row_bytes = part.contiguous().view(torch.uint8).reshape(n, -1)
+        row_bytes = part.contiguous().view(torch.uint8).reshape(num_rows, -1)
         pad = (-row_bytes.shape[1]) % 8
         if pad:
             row_bytes = torch.nn.functional.pad(row_bytes, (0, pad))
         words = row_bytes.view(torch.int64)
-        coeffs = _coeffs(index, words.shape[1], words.device)
-        hashes += (words.unsqueeze(1) * coeffs).sum(dim=2)
+        for chunk, start in enumerate(range(0, words.shape[1], _CHUNK_WORDS)):
+            block = words[:, start : start + _CHUNK_WORDS]
+            sums = (block.unsqueeze(1) * coeffs[:, : block.shape[1]]).sum(dim=2)
+            for lane, multiplier in enumerate(_chunk_multipliers(index, chunk)):
+                hashes[:, lane] += sums[:, lane] * multiplier
     return hashes.cpu()
 
 
@@ -132,7 +155,7 @@ class HiCacheVerifier:
                 logger.warning("HiCache verify: rows of %s are not checked", name)
             return None
         slots = transfer.host_indices.to(device="cpu", dtype=torch.int64)
-        return slots, _row_hashes(parts)
+        return slots, _row_hashes(parts, num_rows=rows.shape[0], device=rows.device)
 
     def _table(self, transfer) -> _HashTable:
         key = (id(transfer.host_pool), id(transfer.device_pool))

@@ -87,6 +87,11 @@ class L2TransferEngine:
 
             self._verifier = HiCacheVerifier(resolve_rows=self._resolve_device_indices)
 
+    def disable_verifier(self, reason: str) -> None:
+        if self._verifier is not None:
+            self._verifier = None
+            logger.warning("HiCache verify disabled: %s", reason)
+
     @contextmanager
     def on_current_stream(self):
         """Run host-to-device submissions made inside the block on the caller's
@@ -186,6 +191,8 @@ class L2TransferEngine:
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+        # The verifier hashes the requested transfers (host slots as the caller
+        # gave them); `transfers` is rebound to the prepared ones below.
         requested = transfers
         with self._submission(
             transfers, self.device_to_host_stream, "device_to_host"
@@ -215,6 +222,8 @@ class L2TransferEngine:
             if self._h2d_on_current_stream
             else self.host_to_device_stream
         )
+        # The verifier hashes the requested transfers (host slots as the caller
+        # gave them); `transfers` is rebound to the prepared ones below.
         requested = transfers
         with self._submission(transfers, stream, "host_to_device", start_event) as (
             transfers,
