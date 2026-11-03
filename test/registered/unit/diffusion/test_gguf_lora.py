@@ -9,6 +9,9 @@ import gguf
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MiniMaxH3DiTArchConfig,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -25,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
 )
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -345,6 +349,34 @@ class TestGGUFLoRA(CustomTestCase):
             args.lora_merge_mode, args.tp_size = "dynamic", 2
             with self.assertRaisesRegex(ValueError, "TP=1"):
                 _validate_gguf_runtime_support(args)
+
+    def test_pruned_adaln_without_projection_rejects_full_width_adapter(self):
+        """GGUF curve metadata used to let incompatible AdaLN deltas be installed."""
+        model = SimpleNamespace(
+            arch=MiniMaxH3DiTArchConfig(time_embed_dim=2, adaln_curve_grid=9),
+            _adaln_precomputed=False,
+        )
+        prefix = "blocks.0.adaln_proj.linear."
+        adapter = {
+            prefix + "lora_A": torch.ones(1, 3),
+            prefix + "lora_B": torch.ones(4, 1),
+        }
+        with self.assertRaisesRegex(ValueError, "adaln_basis.*adaln_mean"):
+            MiniMaxH3DiTModel.prepare_lora_adapter(model, adapter)
+
+        full_model = SimpleNamespace(
+            arch=MiniMaxH3DiTArchConfig(time_embed_dim=3),
+            _adaln_precomputed=False,
+        )
+        self.assertIs(
+            MiniMaxH3DiTModel.prepare_lora_adapter(full_model, adapter), adapter
+        )
+        adapter[prefix + "lora_A"] = torch.ones(1, 2)
+        self.assertIs(MiniMaxH3DiTModel.prepare_lora_adapter(model, adapter), adapter)
+        attention = {"blocks.0.attn.qkv_proj.lora_A": torch.ones(1, 3)}
+        self.assertIs(
+            MiniMaxH3DiTModel.prepare_lora_adapter(model, attention), attention
+        )
 
 
 if __name__ == "__main__":

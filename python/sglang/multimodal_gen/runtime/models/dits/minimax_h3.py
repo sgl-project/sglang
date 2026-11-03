@@ -2143,8 +2143,6 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         if self._adaln_precomputed:
             _reject_adaln_lora(list(adapter))
         full_width = self.arch.adaln_affine_input_dim
-        if full_width is None:
-            return adapter
 
         suffix = ".adaln_proj.linear.lora_A"
         a_keys = sorted(key for key in adapter if key.endswith(suffix))
@@ -2152,6 +2150,15 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             return adapter
         widths = {int(adapter[key].shape[-1]) for key in a_keys}
         if widths == {self.arch.time_embed_dim}:
+            return adapter
+        if full_width is None:
+            if self.arch.adaln_curve_grid is not None:
+                raise ValueError(
+                    "MiniMax H3 pruned AdaLN LoRA inputs must be "
+                    f"{self.arch.time_embed_dim} wide without adaln_basis and "
+                    f"adaln_mean; got {sorted(widths)}. Use a compatible adapter "
+                    "or a full-width checkpoint."
+                )
             return adapter
         if widths != {full_width}:
             raise ValueError(
