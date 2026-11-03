@@ -114,3 +114,40 @@ was clean; executed model/harness/test hashes match the committed local files.
 Pod compute and container storage verified Not running, $0.00/hr, by
 2026-11-03 00:07:32 UTC. Conservative current-run cost estimate $1.18; cumulative
 including previous runs $4.17, below $10. Elapsed-time estimate, not final bill.
+
+Post-upstream-merge regression, 2026-11-03 UTC
+-------------------------------------------
+Tested clean head: 2ecbb7b8c4aa4890a6001895dc91abb0a33cb34a.
+H100 and A100 allocation attempts found no available instance. The actual run
+used one H200 SXM, the same pinned image and model revisions above, torch
+2.14.1+cu130, BF16, TP1, Triton, and the same lifecycle harness/settings.
+Rust build, independent cache loading, probe imports and model preflight passed.
+
+GPU units: 41 passed, 191 subtests, no skips, 21 warnings (44.51s). Suites:
+test_eagle3_reduced_vocab_head.py, test_per_request_spec_opt_out.py,
+test_spec_opt_out_e2e_diagnostics.py, test_eagle_post_verify_graphs.py,
+and test_generate_api_contract.py.
+
+Both eager and graph lifecycle runs printed EAGLE3_LIFECYCLE_PASS:
+- Each: 38 mixed verify rounds, 659 draft-state probes, 606 KV page checks.
+- Graph: 560 target-verify forward graph rounds; eager: zero graph rounds.
+- Isolated/mixed output comparison passed. Normal streaming, natural EOS,
+  explicit abort and disconnect each released request rows and physical KV
+  slots that subsequent requests successfully reused.
+- Graph warmup still emitted one empty CUDA graph warning; eager emitted none.
+  The scope and no-op Mamba commit-capture interpretation above remain unchanged.
+- Server SIGTERM/SIGQUIT diagnostics at the end occurred during harness cleanup
+  after successful checks; the graph driver exited zero.
+
+No production code change was needed. These checks do not expand the coverage
+to TP/PP/DP, HiSparse, topk>1, performance, or independent KV recomputation.
+
+Downloaded and hash-verified full evidence archive SHA-256:
+36bece18cde9dc8a53a511932208c25f5ef8daec7ba65c750cfb2a353140cff1
+Contains both lifecycle directories, raw responses/traces, unit/preflight/server
+logs, clean-tree status, tested head/source hashes and GPU/environment details.
+RunPod ktq4xyczu5u32u compute and container storage were verified Not running,
+$0.00/hr, before 2026-11-03 21:43:12 UTC. Conservative elapsed-time cost estimate
+for this attempt: $1.86; cumulative estimate $6.03 of the existing $10 cap.
+This is an upper estimate including provisioning, not an itemized billing claim.
+PR remains Ready for review; old instructions above to keep draft are historical.
