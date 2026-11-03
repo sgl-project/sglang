@@ -790,5 +790,5 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
-                kv_cache_pruned_num_list=forward_batch.kv_cache_pruned_num_list
+                kv_cache_pruned_num_list=forward_batch.kv_cache_pruned_num_list,
             )

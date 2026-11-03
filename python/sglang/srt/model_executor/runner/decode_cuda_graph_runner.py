@@ -39,6 +39,9 @@ from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_co
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.kv_cache_compression import (
+    read_kv_cache_pruning_config,
+)
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_verify_variants
 from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
@@ -124,7 +127,6 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
-from sglang.srt.hardware_backend.npu.attention.kv_cache_compression import read_kv_cache_pruning_config
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -1190,11 +1192,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         model_runner = self.model_runner
         forward_batch.kv_cache_pruning_config = read_kv_cache_pruning_config(
             model_runner.server_args.kv_cache_pruning_config,
-            layer_num = model_runner.model_config.num_hidden_layers,
-            page_size = model_runner.page_size,
-            num_kv_heads = model_runner.model_config.get_num_kv_heads(self.attn_tp_size),
-            attn_tp_rank = self.attn_tp_rank,
-            attn_tp_size = self.attn_tp_size,
+            layer_num=model_runner.model_config.num_hidden_layers,
+            page_size=model_runner.page_size,
+            num_kv_heads=model_runner.model_config.get_num_kv_heads(self.attn_tp_size),
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
         )
 
         # Trip the coordinator so the hisparse code path is captured into the

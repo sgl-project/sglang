@@ -1171,7 +1171,10 @@ class PrefillAdder:
         )
 
         if truncated and req.kv_cache_pruning_config:
-            prefill_chunk_tail = req.kv_cache_pruning_config["prefill_chunk_tail"] + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+            prefill_chunk_tail = (
+                req.kv_cache_pruning_config["prefill_chunk_tail"]
+                + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+            )
             new_len += prefill_chunk_tail
         else:
             prefill_chunk_tail = 0
@@ -1362,8 +1365,11 @@ class PrefillAdder:
                 return tile_stop
 
             if req.kv_cache_pruning_config:
-                #calculate guiding tail size
-                prefill_chunk_tail = req.kv_cache_pruning_config["prefill_chunk_tail"] + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+                # calculate guiding tail size
+                prefill_chunk_tail = (
+                    req.kv_cache_pruning_config["prefill_chunk_tail"]
+                    + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+                )
                 trunc_len += prefill_chunk_tail
             else:
                 prefill_chunk_tail = 0
@@ -1708,11 +1714,16 @@ class PrefillAdder:
     ) -> None:
         assert req.prefix_len == admission.prefix_len
         if admission.is_chunked and req.kv_cache_pruning_config:
-            #add guiding tail
-            prefill_chunk_tail = req.kv_cache_pruning_config["prefill_chunk_tail"] + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+            # add guiding tail
+            prefill_chunk_tail = (
+                req.kv_cache_pruning_config["prefill_chunk_tail"]
+                + req.kv_cache_pruning_config["prefill_chunk_tail2"]
+            )
         else:
             prefill_chunk_tail = 0
-        req.extend_end = admission.prefix_len + admission.extend_len + prefill_chunk_tail
+        req.extend_end = (
+            admission.prefix_len + admission.extend_len + prefill_chunk_tail
+        )
         req.extend_tail = prefill_chunk_tail
 
         req.lock = self.tree_cache.lock(req.last_node)

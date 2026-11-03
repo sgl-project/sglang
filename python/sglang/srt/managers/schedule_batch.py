@@ -506,8 +506,8 @@ class Req(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q")
         # This round extends fill ids [prefix_len, extend_end).
         self.extend_end: Optional[int] = None
-        #guide tail size. the tail is a query that is used to detect most important KV positions due to chunked prefill
-        self.extend_tail:  Optional[int] = 0
+        # guide tail size. the tail is a query that is used to detect most important KV positions due to chunked prefill
+        self.extend_tail: Optional[int] = 0
         self.kv_cache_pruning_config: Optional[dict] = None
         self.dllm_initialized: bool = False
 
@@ -1077,15 +1077,19 @@ class Req(ReqDllmMixin):
 
     def get_fill_ids(self) -> array:
         if self.extend_tail:
-            #forms prompt with guiding tail
+            # forms prompt with guiding tail
             assert len(self.full_untruncated_fill_ids) > 0
             fill_ids_tail = self.full_untruncated_fill_ids
             while len(fill_ids_tail) < self.extend_tail:
                 fill_ids_tail = fill_ids_tail + self.full_untruncated_fill_ids
-            fill_ids_tail = fill_ids_tail[-self.extend_tail:]
-            return self.full_untruncated_fill_ids[: (self.extend_end-self.extend_tail)] + fill_ids_tail
+            fill_ids_tail = fill_ids_tail[-self.extend_tail :]
+            return (
+                self.full_untruncated_fill_ids[: (self.extend_end - self.extend_tail)]
+                + fill_ids_tail
+            )
         else:
             return self.full_untruncated_fill_ids[: self.extend_end]
+
     def take_request_stats_due(self) -> bool:
         """Whether this output row carries the request's stats, recording the
         send: due on the first output, the first after each retraction, and the

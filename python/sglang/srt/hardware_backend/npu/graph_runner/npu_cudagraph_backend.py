@@ -49,16 +49,24 @@ logger = logging.getLogger(__name__)
 
 
 def get_kv_cache_pruned_num(forward_batch):
-    if forward_batch.kv_cache_pruning_config and getattr(forward_batch,'kv_cache_pruned_num_list', None):
-        #we can correct seq_lens_cpu only by same value for all layers. check that all values are the same
-        assert all([len(num_list)==1 for num_list in forward_batch.kv_cache_pruned_num_list.values()])
-        kv_cache_pruned_num = [num_list[0] for num_list in forward_batch.kv_cache_pruned_num_list.values()]
-        assert len(set(kv_cache_pruned_num))==1
+    if forward_batch.kv_cache_pruning_config and getattr(
+        forward_batch, "kv_cache_pruned_num_list", None
+    ):
+        # we can correct seq_lens_cpu only by same value for all layers. check that all values are the same
+        assert all(
+            [
+                len(num_list) == 1
+                for num_list in forward_batch.kv_cache_pruned_num_list.values()
+            ]
+        )
+        kv_cache_pruned_num = [
+            num_list[0] for num_list in forward_batch.kv_cache_pruned_num_list.values()
+        ]
+        assert len(set(kv_cache_pruned_num)) == 1
         kv_cache_pruned_num = kv_cache_pruned_num[0]
     else:
         kv_cache_pruned_num = 0
-    return kv_cache_pruned_num 
-                
+    return kv_cache_pruned_num
 
 
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
@@ -163,7 +171,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         mla_backend = get_mla_dcp_backend(getattr(runner, "attn_backend", None))
         if getattr(mla_backend, "dense_mla_dcp_target", False):
             seq_lens = list(
-                mla_backend.forward_metadata.seq_lens_cpu_list[: runner.raw_bs] - kv_cache_pruned_num
+                mla_backend.forward_metadata.seq_lens_cpu_list[: runner.raw_bs]
+                - kv_cache_pruned_num
             )
             return seq_lens + [0] * (runner.bs - len(seq_lens))
         if forward_batch.forward_mode.is_target_verify():
@@ -209,9 +218,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     runner.bs - runner.raw_bs
                 )
-        
-        if kv_cache_pruned_num>0:
-            seq_lens = [l-kv_cache_pruned_num if l>0 else 0 for l in seq_lens ]
+
+        if kv_cache_pruned_num > 0:
+            seq_lens = [l - kv_cache_pruned_num if l > 0 else 0 for l in seq_lens]
 
         return seq_lens
 
@@ -531,8 +540,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def _eagle_draft_extend_update_lengths(self, runner, forward_batch):
         kv_cache_pruned_num = get_kv_cache_pruned_num(forward_batch)
-                        
-        seq_lens = (forward_batch.seq_lens_cpu-kv_cache_pruned_num).tolist() + [0] * (
+
+        seq_lens = (forward_batch.seq_lens_cpu - kv_cache_pruned_num).tolist() + [0] * (
             runner.bs - runner.raw_bs
         )
         return [{self.get_update_attr_name(): seq_lens}]
@@ -547,7 +556,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_name = self.get_update_attr_name()
         cpu_update_input = []
         for step in range(runner.speculative_num_steps - 1):
-            seq_lens_cpu = forward_batch.seq_lens_cpu[: runner.raw_bs] + step + 1 - kv_cache_pruned_num
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu[: runner.raw_bs]
+                + step
+                + 1
+                - kv_cache_pruned_num
+            )
             seq_lens = seq_lens_cpu.tolist() + [0] * (runner.bs - runner.raw_bs)
             cpu_update_input.append({attr_name: seq_lens})
         return cpu_update_input
