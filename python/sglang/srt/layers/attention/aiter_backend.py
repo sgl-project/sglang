@@ -587,6 +587,10 @@ class AiterAttnBackend(AttentionBackend):
         # same value, one that covers any extend: at most one chunk.
         self.deterministic_prefill_max_q = None
         if get_exec().deterministic.enable_deterministic_inference:
+            self._reject_deterministic_fp8_kv_prefill(
+                getattr(model_runner, "prefill_attention_backend_str", None),
+                self.kv_cache_dtype,
+            )
             chunk = get_schedule().chunked_prefill_size
             self.deterministic_prefill_max_q = (
                 chunk if chunk is not None and chunk > 0 else self.max_context_len
@@ -3679,6 +3683,28 @@ class AiterAttnBackend(AttentionBackend):
         # the merge_state_triton needs lse layout [tokens, heads].
         # See https://github.com/sgl-project/sglang/blob/98fce73d5bd0a25afe7d68443d314190b1c47e64/python/sglang/kernels/ops/attention/merge_state.py#L13-L15
         return output, lse.transpose(0, 1).contiguous()
+
+    @staticmethod
+    def _reject_deterministic_fp8_kv_prefill(prefill_backend, kv_cache_dtype):
+        """Reject aiter prefill on an fp8 KV cache in deterministic mode.
+
+        The argument check accepts aiter prefill with ``--kv-cache-dtype auto``,
+        but ``auto`` becomes an fp8 KV cache at load time when the checkpoint
+        quantizes its KV cache to FP8, and the fp8 KV prefill kernel is not
+        batch-invariant. Check the resolved dtype here.
+        """
+        if prefill_backend == "aiter" and kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2,
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter prefill attention only with "
+                f"a bf16 KV cache, but the KV cache is {kv_cache_dtype} (with "
+                "--kv-cache-dtype auto, the checkpoint's FP8 KV cache quantization "
+                "selects fp8). Use --kv-cache-dtype bfloat16 or another "
+                "--prefill-attention-backend."
+            )
 
     @staticmethod
     def _reject_target_verify_cross_layer_kv(k, v):
