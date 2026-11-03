@@ -91,9 +91,14 @@ class TestRenderAndEncode(unittest.TestCase):
 
 
 class TestEnginePrompt(unittest.TestCase):
-    def _server(self, lossy):
+    def _server(self, lossy, auto_adds_specials=False):
         return SimpleNamespace(
-            _prompt_text_round_trip_is_lossy=lossy, chat_encoding_spec=None
+            _prompt_text_round_trip_is_lossy=lossy,
+            _tokenizer_auto_adds_specials=auto_adds_specials,
+            tokenizer_manager=SimpleNamespace(
+                tokenizer=SimpleNamespace(bos_token_id=1)
+            ),
+            chat_encoding_spec=None,
         )
 
     def test_lossy_text_only_sends_ids(self):
@@ -118,6 +123,22 @@ class TestEnginePrompt(unittest.TestCase):
         )
         self.assertEqual(key, "text")
         self.assertEqual(value, "rendered")
+
+    def test_auto_added_bos_is_not_added_to_a_templated_bos(self):
+        # Encoding the text would add a second BOS, so the ids go to the engine.
+        server = self._server(False, auto_adds_specials=True)
+        key, value = engine_prompt(server, _messages([1, 3, 4]), is_multimodal=True)
+        self.assertEqual((key, value), ("input_ids", [1, 3, 4]))
+
+        # With media, the MM processor tokenizes the text and adds no second BOS.
+        key, _ = engine_prompt(
+            server, _messages([1, 3, 4], image_data=["img"]), is_multimodal=True
+        )
+        self.assertEqual(key, "text")
+
+        # A template that writes no BOS relies on the one that the tokenizer adds.
+        key, value = engine_prompt(server, _messages([3, 4]), is_multimodal=True)
+        self.assertEqual((key, value), ("text", "rendered"))
 
     def test_lossy_without_ids_falls_back_to_text(self):
         key, _ = engine_prompt(self._server(True), _messages([]), is_multimodal=True)
