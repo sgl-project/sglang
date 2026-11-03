@@ -17,6 +17,10 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -48,6 +52,7 @@ from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftPlan,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
@@ -243,7 +248,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         )
 
     def _admit_req(self, env, num_tokens: int):
-        req = SimpleNamespace(rid="request", kv=ReqKvInfo(), seqlen=num_tokens + 1)
+        req = FakeReq(rid="request", kv=ReqKvInfo(), seqlen=num_tokens + 1)
         self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
         source_indices = env.allocator.alloc(num_tokens)
         self.assertIsNotNone(source_indices)
@@ -371,7 +376,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             transfer_queue=SimpleNamespace(queue=[], enable_staging=False),
             queue=[],
             pending_reqs=[],
-            retracted_queue=[],
+            retracted_queue=_RequestList(ListKind.PD_RETRACTED),
             _prefill_dp_rank_queries={},
             _num_published_destinations=0,
             num_reserved_decode_tokens=0,
@@ -389,6 +394,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 enable_decode_hicache=False,
                 enable_lora=False,
                 enable_priority_scheduling=False,
+                enable_overlap=False,
                 metrics_reporter=SimpleNamespace(
                     current_scheduler_metrics_enabled=False
                 ),
@@ -768,7 +774,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     (resumed.kv.req_pool_idx, slice(0, self.num_tokens)), reused
                 )
 
-            queue.retracted_queue = [req]
+            queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+            queue.retracted_queue.join([req])
             with (
                 patch.object(queue, "_uses_swa_reservation", return_value=False),
                 patch.object(queue, "_allocatable_token_budgets", return_value=1 << 20),
