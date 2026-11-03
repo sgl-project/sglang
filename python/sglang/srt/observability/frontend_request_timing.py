@@ -7,9 +7,11 @@ added to infer the overall elapsed time.
 
 import contextvars
 import time
+from _thread import LockType
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from threading import Lock
+
+import msgspec
 
 current_frontend_timing = contextvars.ContextVar(
     "frontend_request_timing", default=None
@@ -37,12 +39,11 @@ def measure_frontend_stage(timing, stage):
         timing.add_span(stage, start, time.perf_counter())
 
 
-@dataclass
-class FrontendRequestTiming:
+class FrontendRequestTiming(msgspec.Struct):
     started_at: float
-    _spans: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
-    _lock: Lock = field(default_factory=Lock, repr=False)
-    _finished_at: float | None = field(default=None, init=False, repr=False)
+    _spans: dict[str, list[tuple[float, float]]] = msgspec.field(default_factory=dict)
+    _lock: LockType = msgspec.field(default_factory=Lock)
+    _finished_at: float | None = None
 
     def finish(self, finished_at):
         """Claim the logical request's first submission exactly once."""
@@ -58,8 +59,8 @@ class FrontendRequestTiming:
         """Copy work shared before a batch was split into logical requests."""
         with self._lock:
             return FrontendRequestTiming(
-                self.started_at,
-                {stage: list(items) for stage, items in self._spans.items()},
+                started_at=self.started_at,
+                _spans={stage: list(items) for stage, items in self._spans.items()},
             )
 
     def add_span(self, stage: str, started_at: float, finished_at: float) -> None:

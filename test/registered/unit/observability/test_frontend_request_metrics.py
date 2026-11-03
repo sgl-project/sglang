@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, multiprocess
+
 from sglang.test.test_utils import (
     CustomTestCase,
     maybe_stub_sgl_kernel,
@@ -160,6 +161,7 @@ class TestFrontendRequestMetrics(CustomTestCase):
         )
 
     def test_unused_stages_do_not_dilute_participating_request_histograms(self):
+        """Requests that skip a stage must not dilute its latency histogram."""
         manager = self.manager()
         manager.enable_metrics = True
         manager.rid_to_state = {}
@@ -229,7 +231,8 @@ class TestFrontendRequestMetrics(CustomTestCase):
                     cancel_for_dispatch=Mock(),
                 )
                 manager.positional_embeds_transport = SimpleNamespace(
-                    prepare_for_dispatch=Mock(return_value=[]), cancel_for_dispatch=Mock()
+                    prepare_for_dispatch=Mock(return_value=[]),
+                    cancel_for_dispatch=Mock(),
                 )
                 manager._dispatch_to_scheduler = Mock(side_effect=error_type())
                 request = SimpleNamespace(
@@ -248,7 +251,8 @@ class TestFrontendRequestMetrics(CustomTestCase):
                 for stage in ("total", "text", "multimodal"):
                     self.assertIsNone(
                         self.registry.get_sample_value(
-                            _METRIC + "_count", {**self.collector.labels, "stage": stage}
+                            _METRIC + "_count",
+                            {**self.collector.labels, "stage": stage},
                         )
                     )
 
@@ -295,7 +299,10 @@ class TestFrontendRequestMetrics(CustomTestCase):
     def test_async_batch_attributes_execution_to_each_request_without_queue_wait(self):
         entered, release = threading.Event(), threading.Event()
         batcher = AsyncDynamicbatchTokenizer(self.tokenizer)
-        timings = [FrontendRequestTiming(0.0), FrontendRequestTiming(0.0)]
+        timings = [
+            FrontendRequestTiming(started_at=0.0),
+            FrontendRequestTiming(started_at=0.0),
+        ]
 
         def block_executor():
             entered.set()
@@ -370,7 +377,11 @@ with published_topology():
             self.assertIsNone(
                 registry.get_sample_value(
                     _METRIC + "_count",
-                    {"model_name": "test", "engine_type": "unified", "stage": "multimodal"},
+                    {
+                        "model_name": "test",
+                        "engine_type": "unified",
+                        "stage": "multimodal",
+                    },
                 )
             )
 
