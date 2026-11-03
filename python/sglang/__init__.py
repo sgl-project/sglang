@@ -3,24 +3,32 @@
 import platform as _platform
 import sys as _sys
 
-# sglang.srt.environ must run before the rest of this file's imports
-# (hf_transformers_patches, lang.api, ...), which pull in torch and
-# FlashInfer: those claim these cache dirs early, and the first value set is
-# the one that sticks. Safe here -- environ has no heavy dependency (no torch).
+from sglang.srt.debug_utils.rocprofiler_register import torch_built_with_hip as _is_hip
+
+# sglang.srt.environ must run before anything imports torch or FlashInfer:
+# those claim these cache dirs early, and the first value set is the one that
+# sticks. Safe here -- environ has no heavy dependency (no torch).
 from sglang.srt.environ import (
     redirect_third_party_caches as _redirect_third_party_caches,
 )
 
 _redirect_third_party_caches()
 
+from sglang._logging_once import install_logging_once as _install_logging_once
+
+_install_logging_once()
+
+if _is_hip():
+    from sglang.srt.debug_utils.rocprofiler_register import (
+        clear_inherited_rocprofiler_registration as _clear_inherited_rocprofiler_registration,
+    )
+
+    _clear_inherited_rocprofiler_registration()
+
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
 
     _install_platform_stubs()
-
-from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
-
-_apply_hf_patches()
 
 from sglang.lang.api import (
     Runtime,

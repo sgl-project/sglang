@@ -98,6 +98,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     tree_cache.protected_size_ = 0
     tree_cache.req_to_token_pool = req_to_token_pool
     tree_cache.token_to_kv_pool_allocator = allocator
+    tree_cache.logical_page_size = allocator.page_size
     tree_cache.free_kv_row = lambda owner, ranges: BasePrefixCache.free_kv_row(
         tree_cache, owner, ranges
     )
@@ -107,6 +108,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
     manager.kv_cache = MagicMock()
+    manager._unified_window = False
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()

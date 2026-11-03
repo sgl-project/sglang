@@ -6,14 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
@@ -172,6 +172,11 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "--enable-kv-cache-sharding and decode context parallelism "
             "(--dcp-size) are mutually exclusive users of the widened "
             "allocator index space."
+        )
+    if cfg.enable_prefill_cp and cfg.attn_cp_size > 1 and cfg.cp_kv_layout is not None:
+        raise ValueError(
+            "--enable-kv-cache-sharding and --cp-kv-layout cannot be combined: "
+            "each sets the KV cache layout across the prefill CP ranks."
         )
     if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
         raise ValueError(
