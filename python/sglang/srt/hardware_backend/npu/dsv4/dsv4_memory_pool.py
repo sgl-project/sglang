@@ -23,6 +23,7 @@ import torch_npu
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
@@ -567,16 +568,24 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """Ratio-2 pending-pair state exposed as a physical
         ``[block_num, ring_size, 2*D]`` bank.
 
-        The community factory leaves the flat ``page_size=1`` default, on which
-        :attr:`CompressStatePool.state_cache_3d` raises — and that view is the
-        ``state_cache`` the fused ``ds41.compressor`` gets on arch35 (one request
-        bank per ``state_block_table`` row). Only the second-axis page size is
-        turned on here; sizing, ring ownership and the PD transfer indices stay
-        in :class:`CompressStatePool`.
+        The community factory allocates the same ring buffer but leaves the flat
+        ``page_size=1`` default, on which :attr:`CompressStatePool.state_cache_3d`
+        raises — and that view is exactly the ``state_cache`` the fused
+        ``ds41.compressor`` gets on A5 (cache_mode=2 CYCLE addresses one request
+        bank per ``state_block_table`` row). A3 also needs physical capacity for
+        TP-padded batches. Ring ownership and PD transfer indices are unchanged.
         """
         ring_size = self.get_ring_size(2)
+        num_req_slots = self.num_req_slots
+        if not is_npu_arch35():
+            # CompressorV2 checks block_num >= batch_size even for seqused=0
+            # padding rows. Slot 0 is reserved; align the real request capacity
+            # without increasing the request allocator or changing bank IDs.
+            num_req_slots = max(
+                num_req_slots, get_eager_max_batch_size(num_req_slots - 1)
+            )
         return CompressStatePool(
-            size=self.num_req_slots * ring_size,
+            size=num_req_slots * ring_size,
             ring_size=ring_size,
             overlap=False,
             head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
