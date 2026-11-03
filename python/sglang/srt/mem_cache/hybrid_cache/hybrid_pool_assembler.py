@@ -5,8 +5,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-import torch
-
 from sglang.srt.mem_cache.device_pool_info import IndexKeyLayout
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -52,6 +50,8 @@ from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
     from sglang.srt.mem_cache.device_pool_info import (
@@ -150,6 +150,8 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    import torch
+
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
     if use_mla:
