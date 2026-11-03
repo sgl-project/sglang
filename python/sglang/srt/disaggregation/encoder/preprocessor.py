@@ -334,8 +334,7 @@ class EncoderPreprocessor:
                     if self.use_image_processor_gpu
                     else False
                 )
-                # The separate encoder has no verified NPU tensor input path.
-                img, _ = load_image(data, gpu_image_decode, npu_image_decode=False)
+                img, _ = load_image(data, gpu_image_decode)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)

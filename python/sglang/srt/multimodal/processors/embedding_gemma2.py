@@ -121,9 +121,6 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
         frame_count_limit: int | None = None,
         audio_sample_rate: int | None = None,
         discard_alpha_channel: bool = True,
-        *,
-        gpu_image_decode=None,
-        npu_image_decode=False,
     ) -> Any:
         if modality == Modality.AUDIO:
             return _load_audio_from_memory(data, sr=audio_sample_rate, mono=True)
@@ -133,8 +130,6 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
             frame_count_limit=frame_count_limit,
             audio_sample_rate=audio_sample_rate,
             discard_alpha_channel=discard_alpha_channel,
-            gpu_image_decode=gpu_image_decode,
-            npu_image_decode=npu_image_decode,
         )
 
     async def load_mm_data(  # type: ignore[override]

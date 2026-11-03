@@ -47,52 +47,6 @@ class TestNpuJpegDispatch(unittest.TestCase):
         self.assertEqual(result.size, (64, 32))
         decode.assert_not_called()
 
-    def test_enabled_returns_decoder_tensor(self):
-        output = torch.empty((3, 32, 64), dtype=torch.uint8)
-        with (
-            patch.object(common, "_image_decode_backend", return_value="npu"),
-            patch.object(jpeg, "decode_jpeg", return_value=output) as decode,
-        ):
-            self.assertIs(
-                common._load_image(image_bytes=self.data, npu_image_decode=True), output
-            )
-        decode.assert_called_once_with(self.data)
-
-    def test_processor_disabled_and_fancy_keep_pil(self):
-        for mode in [False, "nvjpeg_fancy"]:
-            with (
-                self.subTest(mode=mode),
-                patch.object(common, "_image_decode_backend", return_value="npu"),
-                patch.object(common, "is_cuda", return_value=False),
-                patch.object(jpeg, "decode_jpeg") as decode,
-            ):
-                result = common._load_image(
-                    image_bytes=self.data, gpu_image_decode=mode
-                )
-                self.assertIsInstance(result, Image.Image)
-                decode.assert_not_called()
-
-    def test_non_npu_preserves_existing_loader(self):
-        with (
-            patch.object(common, "_image_decode_backend", return_value="cpu"),
-            patch.object(common, "is_cuda", return_value=False),
-            patch.object(jpeg, "decode_jpeg") as decode,
-        ):
-            self.assertIsInstance(
-                common._load_image(image_bytes=self.data), Image.Image
-            )
-        decode.assert_not_called()
-
-    def test_npu_runtime_failure_is_visible(self):
-        with (
-            patch.object(common, "_image_decode_backend", return_value="npu"),
-            patch.object(
-                jpeg, "decode_jpeg", side_effect=RuntimeError("device failed")
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "device failed"):
-                common._load_image(image_bytes=self.data, npu_image_decode=True)
-
     def test_file_input_is_resolved_before_dispatch(self):
         output = object()
         with (

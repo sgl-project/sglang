@@ -542,9 +542,7 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
                         return_value=(image, None),
                     ) as load:
                         generic._load_images([b"jpeg"])
-                        load.assert_called_once_with(
-                            b"jpeg", True, npu_image_decode=False
-                        )
+                        load.assert_called_once_with(b"jpeg")
                     encoder = object.__new__(EncoderPreprocessor)
                     encoder.device = backend
                     encoder.use_image_processor_gpu = True
@@ -556,9 +554,7 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
                         return_value=(image, None),
                     ) as load:
                         encoder._load_single_item(b"jpeg", Modality.IMAGE)
-                        load.assert_called_once_with(
-                            b"jpeg", gpu_mode, npu_image_decode=False
-                        )
+                        load.assert_called_once_with(b"jpeg", gpu_mode)
 
     def test_fingerprint_records_both_policies_without_changing_class(self):
         class Processor(BaseMultimodalProcessor):
@@ -847,7 +843,7 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
                     self.assertIs(processor._get_npu_image_decode_mode(), False)
                 self.assertIs(wrapper.gpu_image_decode, True)
 
-    def test_kimi_and_embedding_overrides_forward_both_policies(self):
+    def test_kimi_and_embedding_keep_class_gpu_policy(self):
         from sglang.srt.multimodal.processors.embedding_gemma2 import (
             EmbeddingGemma2SGLangProcessor,
         )
@@ -866,11 +862,11 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
                 result = processor_type._load_single_item(
                     b"jpeg",
                     Modality.IMAGE,
-                    gpu_image_decode=False,
-                    npu_image_decode=True,
                 )
             self.assertIs(result, image)
-            load.assert_called_once_with(b"jpeg", False, npu_image_decode=True)
+            load.assert_called_once_with(
+                b"jpeg", processor_type.gpu_image_decode, npu_image_decode=False
+            )
 
     def test_auto_pil_backend_stages_only_npu_tensors(self):
         class InputTensor:

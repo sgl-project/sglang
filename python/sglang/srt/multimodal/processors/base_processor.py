@@ -1045,7 +1045,6 @@ class BaseMultimodalProcessor(ABC):
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
         *,
-        gpu_image_decode=None,
         npu_image_decode=False,
     ):
         """
@@ -1059,12 +1058,9 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                gpu_mode = (
-                    cls.gpu_image_decode
-                    if gpu_image_decode is None
-                    else gpu_image_decode
+                img, _ = load_image(
+                    data, cls.gpu_image_decode, npu_image_decode=npu_image_decode
                 )
-                img, _ = load_image(data, gpu_mode, npu_image_decode=npu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded to a device tensor.
                 # PIL decodes lazily; do it here in the io worker so the decode
