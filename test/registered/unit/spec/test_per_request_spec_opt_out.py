@@ -11,7 +11,7 @@ import torch
 from sglang.srt.layers import sampler as sampler_impl
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative import eagle_utils, eagle_worker_v2
 from sglang.srt.speculative.eagle_utils import (
     _sample_spec_opt_out_roots,
