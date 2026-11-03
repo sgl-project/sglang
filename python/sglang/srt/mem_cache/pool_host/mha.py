@@ -1006,10 +1006,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         allocation_bytes = host_memory_allocation_bytes(
-            self.get_mapping_lengths(), self.allocator, self.device_pool.device
+            self.get_mapping_lengths(), self.allocator, self._transfer_device
         )
         available_bytes = host_memory_budget_bytes(
-            allocation_bytes, self.allocator, self.device_pool.device
+            allocation_bytes, self.allocator, self._transfer_device
         )
         if allocation_bytes > available_bytes:
             raise ValueError(
