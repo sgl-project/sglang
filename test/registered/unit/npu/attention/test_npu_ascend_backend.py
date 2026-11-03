@@ -611,7 +611,13 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             local.append(values[(positions // page_size) % size == rank])
         expected_local = torch.cat(local)
         expected_full = torch.cat(full)
-        self.assertEqual(metadata.prefix_token_indices.numel(), expected_local.shape[0])
+        if size == 1:
+            self.assertEqual(
+                metadata.prefix_token_indices.numel(), expected_local.shape[0]
+            )
+        else:
+            # DCP keeps its existing per-request page trimming before all-gather.
+            self.assertIsNone(metadata.prefix_token_indices)
 
         blocks = metadata.flatten_prefix_block_tables.tolist()
         pages = torch.full((max(blocks, default=0) + 1, page_size, 1, 48), -999.0)
