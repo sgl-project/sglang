@@ -10,7 +10,7 @@ import msgspec
 import torch
 
 from sglang.srt.arg_groups.kv_cache_hook import draft_rows_refusal
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
