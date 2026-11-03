@@ -91,7 +91,7 @@ import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
 from PIL import Image, ImageOps, UnidentifiedImageError
-from starlette.responses import PlainTextResponse, Response
+from starlette.responses import PlainTextResponse
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -2857,8 +2857,7 @@ def set_prometheus_multiproc_dir():
 
 
 def _make_guarded_metrics_app(
-    generate_metrics: Callable[[], bytes],
-    content_type: str,
+    metrics_app: Callable,
     scrape_timeout_s: float = 5.0,
 ):
     scrape_task: Optional[asyncio.Task] = None
@@ -2880,6 +2879,10 @@ def _make_guarded_metrics_app(
             await response(scope, receive, send)
             return
 
+        request = await receive()
+        if request.get("type") != "http.request":
+            return
+
         if scrape_task is not None and not scrape_task.done():
             response = PlainTextResponse(
                 "metrics scrape already in progress\n", status_code=503
@@ -2887,10 +2890,23 @@ def _make_guarded_metrics_app(
             await response(scope, receive, send)
             return
 
-        scrape_task = asyncio.create_task(asyncio.to_thread(generate_metrics))
+        messages = []
+
+        async def buffered_receive():
+            return request
+
+        async def collect_message(message):
+            messages.append(message)
+
+        def run_metrics_app():
+            # Buffer the request and response so the native app's synchronous
+            # registry work never runs on the serving event loop.
+            asyncio.run(metrics_app(scope, buffered_receive, collect_message))
+
+        scrape_task = asyncio.create_task(asyncio.to_thread(run_metrics_app))
         scrape_task.add_done_callback(clear_scrape_task)
         try:
-            output = await asyncio.wait_for(
+            await asyncio.wait_for(
                 asyncio.shield(scrape_task), timeout=scrape_timeout_s
             )
         except asyncio.TimeoutError:
@@ -2905,26 +2921,19 @@ def _make_guarded_metrics_app(
             await response(scope, receive, send)
             return
 
-        response = Response(output, headers={"Content-Type": content_type})
-        await response(scope, receive, send)
+        for message in messages:
+            await send(message)
 
     return guarded_metrics_app
 
 
 def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-    from prometheus_client import (
-        CONTENT_TYPE_LATEST,
-        CollectorRegistry,
-        generate_latest,
-        multiprocess,
-    )
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
-    metrics_app = _make_guarded_metrics_app(
-        partial(generate_latest, registry), CONTENT_TYPE_LATEST
-    )
+    metrics_app = _make_guarded_metrics_app(make_asgi_app(registry=registry))
     metrics_route = Mount("/metrics", metrics_app)
 
     # Workaround for 307 Redirect for /metrics
