@@ -1030,6 +1030,7 @@ class TestNixlStaging(CustomTestCase):
         )
 
         self.assertIsNone(transfer_infos[3]["agent"].staging)
+
     def test_send_aux_uses_destination_row_stride(self):
         context = get_context().override_server_args(
             disaggregation_enable_kv_checksum=False
