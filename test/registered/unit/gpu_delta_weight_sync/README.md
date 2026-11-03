@@ -5,6 +5,9 @@ execution-layout buffers. Small complete-value targets use overwrite semantics.
 It does not requantize weights, change checkpoint loading, replace the ordinary
 allocator, or alter the independent disk update API.
 
+See [GPU-accelerated Weight Teleportation](https://humansand.ai/blog/gpu-accelerated-weight-teleportation)
+for the end-to-end design and performance motivation.
+
 Implementation ownership is explicit: `layout.py` admits immutable canonical
 bindings and consumer identities; `receiver.py` prepares publications and runs
 the fixed DE/apply pipeline. `host.py` owns payload workers, the shared encoded
@@ -329,7 +332,7 @@ CPU cases register in `base-a-test-cpu`; layout CUDA cases register in
 nvCOMP. They compare against ordinary loader/preprocessing helpers and check
 padding, independent/aliased images, exact bytes, failure gates and graph addresses.
 
-Manual DE tests require Blackwell, CUDA 13, `nvidia-libnvcomp-cu13==5.3.0.16`,
+Manual DE tests require Blackwell, CUDA 13, `nvidia-libnvcomp-cu13==6.0.0.12`,
 `zstandard`, `python-snappy` and `lz4`; missing prerequisites fail. They exercise
 Snappy/LZ4 sorting off/on, fixed-slot reuse, known byte output and ownership without
 sending malformed compressed streams into nvCOMP. The host CUDA test additionally

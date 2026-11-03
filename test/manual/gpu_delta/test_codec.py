@@ -1,6 +1,6 @@
 """GPU conformance for the prebuilt nvCOMP ABI; no extension compilation.
 
-Manual-only: requires Blackwell, the paired Miles image, nvCOMP 5.3,
+Manual-only: requires Blackwell, the paired Miles image, nvCOMP 6,
 zstandard, python-snappy, and lz4. Missing hardware or dependencies fail this suite.
 The hardware decoder preserves known bytes. Tests intentionally never feed malformed
 compressed streams to the GPU decoder.
