@@ -94,6 +94,7 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     prepare_for_draft,
@@ -1324,6 +1325,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
 
     @property
     def draft_parallel_layout(self):
@@ -1417,7 +1419,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         super().init_attention_backends()
         # Resolve once before any eager or captured post-verify path runs.
-        bind_eagle_runtime_hooks(
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
             self.target_worker, supports_sharded_verify=self.topk == 1
         )
         # not in __init__, which the standalone and frozen-KV workers do not run
@@ -1444,6 +1446,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._post_verify_graphs = EaglePostVerifyGraphs(
             target_worker=self.target_worker,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
 
     def init_cuda_graphs(self):
@@ -2048,6 +2051,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(
             batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             pp_proxy_tensors=pp_proxy_tensors,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,
