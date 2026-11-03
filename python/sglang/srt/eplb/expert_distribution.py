@@ -261,8 +261,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         *,
         enabled: bool = True,
     ):
-        # Target and draft share counters. Skip disabled passes before reset;
-        # suppressing hooks alone would still append empty rows to the window.
+        # Target and draft share counters. Exclude disabled passes before reset
+        # and append; disabling hooks alone does not skip the recorder lifecycle.
         if self._disable_all or not enabled:
             with self.disable_this_region():
                 yield {}
@@ -781,7 +781,7 @@ class _Accumulator(ABC):
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
-        # Default WORLD; the NPU recorder may supply a compatible existing TP group.
+        # None selects WORLD; NPU recorders can supply a WORLD-equivalent TP group.
         self._communication_group = None
 
     def get_single_pass_gatherer_keys(self):

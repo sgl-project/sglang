@@ -34,13 +34,12 @@ if TYPE_CHECKING:
 
 
 def get_eplb_group():
-    """Reuse a WORLD-equivalent TP group for NPU statistics and migration."""
+    """Return a compatible TP device group, or None to select default WORLD."""
     if not dist.is_initialized():
         return None
     tp_group = get_parallel().tp_group
-    # Layouts, collective roots, and P2P peers use WORLD ranks, so TP membership
-    # must match in order and backend. Elastic groups and TP subgroups retain
-    # default WORLD rather than changing that rank contract.
+    # Placement maps, collective roots, and P2P peers use WORLD ranks. Reuse TP
+    # only with the same ordered members and backend; elastic EP keeps WORLD.
     if (
         get_exec().moe.elastic_ep_backend
         or tp_group is None
@@ -52,7 +51,7 @@ def get_eplb_group():
 
 
 def _warmup_eplb_communication(group):
-    """Join all ranks before migration can skip ranks without local transfers."""
+    """Warm the selected TP group's collective and peer channels once."""
     resources = get_resources()
     if group is None or group is resources.npu_eplb_warmed_group:
         return
@@ -77,7 +76,7 @@ def _warmup_eplb_communication(group):
 
 
 class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
-    """Use compatible TP communication for NPU expert statistics and migration."""
+    """Configure statistics communication and warm a reused TP group for migration."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
