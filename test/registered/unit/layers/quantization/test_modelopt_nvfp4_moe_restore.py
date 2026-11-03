@@ -212,8 +212,9 @@ class TestNvFp4MoeRestore(CustomTestCase):
             layer = _layer(raw)
             try:
                 self._process(layer)
-            except RuntimeError:
-                # The TRT-LLM aligner cannot store a padded interleave today.
+            except AssertionError:
+                # FlashInfer's TRT-LLM row shuffle needs 128-row multiples, so
+                # this layout fails at load today; restore must stay off if not.
                 pass
             self.assertTrue(layer.trtllm_fp4_layout_padded)
             self.assertIsNone(layer._fp4_moe_repack)
