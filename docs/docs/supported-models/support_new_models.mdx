@@ -5,12 +5,16 @@ description: "This document explains how to add support for new language models 
 This document explains how to add support for new language models and multimodal large language models (MLLMs) in
 SGLang. It also covers how to test new models and register external implementations.
 
+This guide is hardware-agnostic. If you are adding a model on Ascend NPUs, follow it first, then see
+[Support New Models on Ascend NPU](/docs/hardware-platforms/ascend-npus/development/support_new_models) for the
+NPU-specific additions.
+
 ## How to Support a New Language Model
 
 To support a new model in SGLang, you only need to add a single file under
 the [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models). You can learn
 from existing model implementations and create a new file for your model. For most models, you should be able to find a
-similar model to start with (e.g., starting from Llama). Also refer how
+similar model to start with (e.g., starting from Llama). Also refer to how
 to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
 
 ## How to Support a New Multimodal Large Language Model
@@ -29,7 +33,7 @@ standard LLM support:
 3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
    model’s dedicated processor.
-   See [multimodal_processor.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/multimodal/processors)
+   See [Multimodal Processors](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/multimodal/processors)
    for more details.
 
 4. **Handle Multimodal Tokens**:
@@ -80,7 +84,7 @@ ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerati
 
 ### Benchmark
 
-- **(Required) MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow https://docs.sglang.io/developer_guide/benchmark_and_profiling.html to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
+- **(Required) MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow the [benchmark and profiling guide](/docs/developer_guide/benchmark_and_profiling) to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
 - **(Optional) Other evals**: If you ran other evals, please note the results in PR description.
 
 ## Port a Model from vLLM to SGLang
@@ -97,10 +101,12 @@ To port a model from vLLM to SGLang:
 - The major differences include:
   - **Replace vLLM’s `Attention` with `RadixAttention`** (ensure you pass `layer_id` to `RadixAttention`).
   - **Replace vLLM’s `LogitsProcessor` with SGLang’s `LogitsProcessor`.**
-  - **Replace the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.**
+  - **(For multimodal models) Replace the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.**
   - **Replace other vLLM layers** (such as `RMSNorm`, `SiluAndMul`) with SGLang layers.
-  - **Remove `Sample`.**
-  - **Change the `forward()` functions** and add a `forward_batch()` method.
+  - **Change the `forward()` functions** to accept a `forward_batch: ForwardBatch` argument carrying the full batch
+    state (positions, `input_ids`, KV cache indices, sampling info, etc.). SGLang’s top-level model `forward()` is the
+    entry point and returns the final `LogitsProcessorOutput` directly — it does both the backbone forward and the
+    logits computation, unlike vLLM which splits these into `forward()` + `compute_logits()`.
   - **Add `EntryClass`** at the end.
   - **Ensure that the new implementation uses only SGLang components** and does not rely on any vLLM components.
 
@@ -138,7 +144,7 @@ launch_server(server_args)
 
 ## Example: Implementing and Serving a Llama Wrapper Model
 
-Below is an introductory, step-by-step walkthrough on how to implement a new model end-to-end in SGLang and then run it via the [Offline Engine](../basic_usage/offline_engine_api).
+Below is an introductory, step-by-step walkthrough on how to implement a new model end-to-end in SGLang and then run it via the [Offline Engine](/docs/basic_usage/offline_engine_api).
 
 ### Implementing Our Model
 
@@ -256,10 +262,9 @@ llama_dir = snapshot_download(
 Now that we have our model on disk, we want to point it to `LlamaWrapper` by changing the `architectures` field in `./llama_ckpt/config.json` to be `LlamaWrapper`.
 That way, when we pass in the path of our model checkpoint to SGLang, it will know that we want to use "LlamaWrapper" instead of "LlamaForCausalLM" as our model.
 
-```python Example
+```json Example
 {
   "architectures": [
-   #  "LlamaForCausalLM"
     "LlamaWrapper"
   ],
   ...
@@ -514,7 +519,7 @@ python -m sglang.launch_server \
 
 ## Documentation
 
-Add to table of supported models in [generative_models.md](./generative_models) or [multimodal_language_models.md](./multimodal_language_models)
+Add to table of supported models in [generative_models.mdx](/docs/supported-models/generative_models) or [multimodal_language_models.mdx](/docs/supported-models/multimodal_language_models)
 
 ---
 
