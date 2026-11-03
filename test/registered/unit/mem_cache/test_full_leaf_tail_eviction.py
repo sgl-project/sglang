@@ -1,5 +1,5 @@
+import unittest
 from array import array
-from unittest import TestCase
 from unittest.mock import patch
 
 import torch
@@ -14,7 +14,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import build_fixture, match_p
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestFullLeafTailEviction(TestCase):
+class TestFullLeafTailEviction(unittest.TestCase):
     def make_cache(self, chunk=8, *, session_cache=False):
         with (
             envs.SGLANG_PYTHON_RADIX_EVICT_TAIL_CHUNK_SIZE.override(chunk),
@@ -92,3 +92,7 @@ class TestFullLeafTailEviction(TestCase):
     def test_invalid_chunk_size(self):
         with self.assertRaisesRegex(ValueError, "page multiple"):
             self.make_cache(6)
+
+
+if __name__ == "__main__":
+    unittest.main()
