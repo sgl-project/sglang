@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import DocPrefetch
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
@@ -34,6 +35,7 @@ _OWNERS = (
     DllmManager,
     HiSparseCoordinator,
     UocrSchedulerRuntime,
+    DocPrefetch,
     DeferredResponses,
 )
 
@@ -41,14 +43,10 @@ _OWNERS = (
 # shrinks: a list that migrates leaves it.
 _NOT_YET_LISTS = {
     "Scheduler.waiting_queue",
-    "DecodePreallocQueue.queue",
     # Shares its entries with `queue`.
     "DecodePreallocQueue.pending_reqs",
-    "DecodeTransferQueue.queue",
-    "DecodeTransferQueue._deferred_releases",
     # A subset of `waiting_queue`.
     "DllmManager.staging_queue",
-    "DeferredResponses.held",
 }
 
 _HOLDS_REQUESTS = re.compile(r"\b(Req|DecodeRequest)\b")
