@@ -15,6 +15,8 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     hip_attention_needs_head_pad,
     resolve_hip_flashmla_backend,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8Block128Input
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -28,13 +30,17 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
     wo_a_fp8_block,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
 wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
+
+if _is_gfx1250_supported:
+    from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
 
 # ---- MqaAttentionBase / MQALayer ----
@@ -55,6 +61,7 @@ def init_mqa_layer(attn, quant_config) -> None:
         wo_a_fp8_block(attn.wo_a.weight, attn.wo_a.weight_scale_inv)
         == WO_A_MXFP8_GROUP_SIZE
     )
+    attn._q_norm_mx128 = None
 
 
 def wo_a_emits_fp8_grid(attn) -> bool:
@@ -87,13 +94,55 @@ def use_fused_qk_norm_rope(attn) -> bool:
     return bool(envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get() and attn.q_head_norm)
 
 
-def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
-    """attn.q_norm(q_lora) as (the bf16 norm the indexer reads, the operand wq_b
-    consumes); on the gfx950 32-block route the second is already on the fp8 grid."""
+def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[object, object]:
+    """attn.q_norm(q_lora) as (the norm the indexer reads, the operand wq_b consumes);
+    on the gfx950 32-block route the second is already on the fp8 grid, on the gfx1250
+    mx128 route both are one Mxfp8Block128Input."""
     if attn.fused_rmsnorm_fake_quant:
         return gfx95_dense.q_norm_fake_quant(attn, q_lora)
+    if _q_norm_emits_mx128(attn, q_lora):
+        q = _rmsnorm_mx128_quant(q_lora, attn.q_norm)
+        return q, q
     q_lora = attn.q_norm(q_lora)
     return q_lora, q_lora
+
+
+def _takes_mx128_input(linear) -> bool:
+    quant_method = linear.quant_method
+    return (
+        isinstance(quant_method, Fp8LinearMethod)
+        and quant_method.block_quant
+        and linear.weight_scale_inv.dtype == torch.float8_e8m0fnu
+    )
+
+
+def _q_norm_emits_mx128(attn, q_lora: torch.Tensor) -> bool:
+    """Whether both wq_b GEMMs (attention, indexer) take the gfx1250 mx128 route and
+    nothing else reads the bf16 norm (the low-ratio sources do); resolved on first use."""
+    if attn._q_norm_mx128 is None:
+        consumers = [attn.wq_b] + (
+            [attn.indexer.wq_b] if attn.indexer is not None else []
+        )
+        attn._q_norm_mx128 = (
+            _is_gfx1250_supported
+            and attn.compress_ratio not in (1, 2)
+            and all(_takes_mx128_input(linear) for linear in consumers)
+        )
+    return (
+        attn._q_norm_mx128
+        and q_lora.dim() == 2
+        and q_lora.dtype == attn.q_norm.weight.dtype
+    )
+
+
+def _rmsnorm_mx128_quant(x: torch.Tensor, norm) -> Mxfp8Block128Input:
+    m, k = x.shape
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty(
+        (k // 128, m), dtype=torch.float8_e8m0fnu, device=x.device
+    ).view(m, k // 128)
+    _aiter_rmsnorm_quant(q, x, scales, norm.weight, norm.variance_epsilon, 128, True)
+    return Mxfp8Block128Input(q, scales)
 
 
 def fuses_q_rope_into_k_store(

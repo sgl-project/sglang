@@ -1,8 +1,9 @@
 """Unit tests for DeepSeek-V4 layer-level RoPE selection."""
 
+import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -14,6 +15,45 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestQLoraProjectionDispatch(unittest.TestCase):
+    def test_kernel_availability_selects_fused_or_fallback(self):
+        q_lora = object()
+        q_norm = SimpleNamespace(weight=object(), variance_epsilon=1e-6)
+        wq_b = Mock(return_value=("q", None))
+
+        with patch.object(deepseek_v4, "_fused_rms_fp8_group_quant", None):
+            self.assertIsNone(
+                deepseek_v4._fused_q_lora_projection(q_lora, q_norm, wq_b)
+            )
+        wq_b.assert_not_called()
+
+        def fused(hidden_states, weight, eps, **kwargs):
+            self.assertIs(hidden_states, q_lora)
+            self.assertIs(weight, q_norm.weight)
+            self.assertEqual(eps, q_norm.variance_epsilon)
+            return "quant", "normalized", None, None
+
+        with (
+            patch.object(deepseek_v4, "_fused_rms_fp8_group_quant", fused),
+            patch.object(deepseek_v4, "_use_aiter_bpreshuffle_gfx95", False),
+        ):
+            self.assertEqual(
+                deepseek_v4._fused_q_lora_projection(q_lora, q_norm, wq_b),
+                ("q", "normalized", "quant"),
+            )
+        wq_b.assert_called_once_with("quant")
+
+    def test_forward_paths_share_capability_dispatch(self):
+        for method in (
+            deepseek_v4.MQALayer._forward_prepare_multi_stream_hip,
+            deepseek_v4.MQALayer._forward_prepare,
+        ):
+            source = inspect.getsource(method)
+            self.assertEqual(source.count("_fused_q_lora_projection("), 1)
+            self.assertNotIn("_is_gfx95_supported", source)
+            self.assertNotIn("_is_gfx1250_supported", source)
 
 
 class _ModuleStub(nn.Module):

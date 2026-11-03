@@ -406,13 +406,19 @@ _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 
 
-if _use_aiter:
-    if _is_gfx95_supported or _is_gfx1250_supported:
-        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+_fused_rms_fp8_group_quant = None
+if _use_aiter and _is_gfx95_supported:
+    from aiter.ops.triton.fused_fp8_quant import (
+        fused_rms_fp8_group_quant as _fused_rms_fp8_group_quant,
+    )
 
 
 def _wo_a_aiter_gemm_eligible(
-    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
+    flag: bool,
+    use_aiter: bool,
+    is_hip: bool,
+    is_gfx95: bool,
+    is_gfx1250: bool = False,
 ) -> bool:
     """Static eligibility for the aiter ``wo_a`` reroute.
 
@@ -421,7 +427,7 @@ def _wo_a_aiter_gemm_eligible(
     ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
     decode critical path.
     """
-    return bool(flag and use_aiter and is_hip and is_gfx95)
+    return bool(flag and use_aiter and is_hip and (is_gfx95 or is_gfx1250))
 
 
 # Read the opt-in flag and import the aiter kernel ONCE at module import: the
@@ -434,6 +440,7 @@ _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
     _use_aiter,
     _is_hip,
     _is_gfx95_supported,
+    _is_gfx1250_supported,
 )
 _wo_a_batched_gemm_bf16 = None
 if _wo_a_aiter_batched_gemm_enabled:
@@ -616,7 +623,7 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
         )
 
         return rmsnorm_fp8_e8m0_quant(hidden_states, weight, eps)
-    x_quant, x_bf16, _, _ = fused_rms_fp8_group_quant(
+    x_quant, x_bf16, _, _ = _fused_rms_fp8_group_quant(
         hidden_states,
         weight,
         eps,
@@ -635,6 +642,16 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
             view_aiter_fused_rms_transposed_fp8_scale(x_quant[1]),
         )
     return x_quant, x_bf16
+
+
+def _fused_q_lora_projection(q_lora, q_norm, wq_b, e8m0: bool = False):
+    if _fused_rms_fp8_group_quant is None:
+        return None
+    q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
+        q_lora, q_norm.weight, q_norm.variance_epsilon, e8m0=e8m0
+    )
+    q, _ = wq_b(q_for_wqb)
+    return q, q_lora, q_for_wqb
 
 
 def make_hc_mixing_params(
@@ -1146,7 +1163,7 @@ class MqaAttentionBase(nn.Module):
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
             # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
-            # mxscale BMM on gfx950), both of which want the plain row-major
+            # mxscale BMM on ROCm), both of which start from the plain row-major
             # [G, R, D] weight. Opt out of any backend-private weight layout the
             # linear method would otherwise install for its own GEMM -- on ROCm
             # that is aiter's B-preshuffle, which silently permutes the weight
@@ -2163,14 +2180,14 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
-                q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
-                    q_lora,
-                    self.q_norm.weight,
-                    self.q_norm.variance_epsilon,
-                    e8m0=self._q_lora_quant_e8m0(with_indexer=False),
-                )
-                q, _ = self.wq_b(q_for_wqb)
+            fused_projection = _fused_q_lora_projection(
+                q_lora,
+                self.q_norm,
+                self.wq_b,
+                e8m0=self._q_lora_quant_e8m0(with_indexer=False),
+            )
+            if fused_projection is not None:
+                q, q_lora, _ = fused_projection
             else:
                 q_lora = self.q_norm(q_lora)
                 q, _ = self.wq_b(q_lora)
@@ -2305,15 +2322,14 @@ class MQALayer(MqaAttentionBase):
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
         if do_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
-                q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
-                    q_lora,
-                    self.q_norm.weight,
-                    self.q_norm.variance_epsilon,
-                    e8m0=self._q_lora_quant_e8m0(with_indexer=True),
-                )
-                q, _ = self.wq_b(q_for_wqb)
-                q_lora_quant = q_for_wqb
+            fused_projection = _fused_q_lora_projection(
+                q_lora,
+                self.q_norm,
+                self.wq_b,
+                e8m0=self._q_lora_quant_e8m0(with_indexer=True),
+            )
+            if fused_projection is not None:
+                q, q_lora, q_lora_quant = fused_projection
             else:
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
                 q, _ = self.wq_b(q_for_wqb)
@@ -2990,7 +3006,7 @@ class MQALayer(MqaAttentionBase):
                     perm_y=(1, 0, 2),
                 )
             elif self.wo_a_fp8 and _wo_a_fp8_mxscale is not None:
-                # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
+                # ROCm gfx950/gfx1250: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
                 # activation is quantized per token-group inside the helper.
                 T, G, D = o.shape
@@ -5024,10 +5040,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             if _wo_a_weight_scale_to_e8m0 is not None:
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
-                # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured keep_plain_weight_layout: a
-                # preshuffled weight has the same shape, dtype and strides and
-                # would only show up as garbage output.
+                # already powers of two. It starts from the row-major weight
+                # (and applies the layout its kernel reads itself), so check the
+                # linear method honoured keep_plain_weight_layout: a preshuffled
+                # weight has the same shape, dtype and strides and would only
+                # show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
                     "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
                     "aiter mxscale absorb GEMM needs the row-major weight"

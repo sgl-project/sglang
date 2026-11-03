@@ -12,6 +12,9 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.utils import is_gfx1250_supported
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
@@ -19,10 +22,15 @@ def resolve_fused_clamp_route(mlp, half_width: int) -> None:
     quant_method = mlp.down_proj.quant_method
     # the aiter kernel tiles and quantizes the half width per 128, the 128x128 block GEMM's layout
     mlp.use_fused_clamp_act_mul = half_width % 128 == 0
+    # an e8m0 weight scale (gfx1250 MXFP8) means down_proj quantizes its own input, so emit bf16
     mlp._fused_clamp_use_fp8 = (
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_quant
         and quant_method.weight_block_size == [128, 128]
+        and not (
+            _is_gfx1250_supported
+            and mlp.down_proj.weight_scale_inv.dtype == torch.float8_e8m0fnu
+        )
     )
     # gfx950 32-block native or aiter route: the activation lands on the fp8 grid, so down_proj
     # skips its fake-quant
