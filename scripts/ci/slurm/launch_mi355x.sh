@@ -265,6 +265,9 @@ if [[ "$CLUSTER" == "spur" ]]; then
 else
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 fi
+# Lets runner_disk_preflight.py reclaim this dir if the leg dies before the
+# workflow's cleanup step runs.
+printf '%s\n' "${RUNNER_NAME:-}" > "$WORKDIR/.runner_name"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Stage the workflow checkout on shared NFS so Slurm compute-node containers can
