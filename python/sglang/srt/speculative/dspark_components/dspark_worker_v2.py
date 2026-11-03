@@ -902,18 +902,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
-        # An idle rank only needs fabricated compact rows to replay the same
-        # token-keyed graph as busy ranks.  In eager mode it must keep zero
-        # local tokens and merely participate in the DP/EP collectives.  If we
-        # build a uniform layout without a ragged graph runner, the verify path
-        # creates ``verify_num_draft_tokens`` dummy inputs while DP padding
-        # still assigns this rank zero tokens, which results in negative
-        # padding (for example, ``0 - 6``).
-        if (
-            batch.global_num_tokens is None
-            or not self._verify_planner.is_compact_mode
-            or ragged_capture_num_tokens(model_runner=self.model_runner) is None
-        ):
+        if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:

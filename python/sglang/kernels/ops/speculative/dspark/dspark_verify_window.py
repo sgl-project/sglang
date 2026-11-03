@@ -824,37 +824,6 @@ def _build_out_tokens_kernel(
     tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
 
 
-@triton.jit
-def _build_out_tokens_npu_kernel(
-    draft_tokens_ptr,
-    correct_len_ptr,
-    bonus_ptr,
-    out_ptr,
-    gamma,
-    T,
-    n_out,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_out
-    b = offs // T
-    k = offs % T
-
-    # Keep the whole selection path in int64 on Ascend. Mixing the int32
-    # predicate/index path with int64 token values can be lowered to an i8/i1
-    # predicate mismatch by Triton-Ascend and produce incorrect output tokens.
-    cl = tl.load(correct_len_ptr + b, mask=mask, other=0).to(tl.int64)
-    bonus = tl.load(bonus_ptr + b, mask=mask, other=0).to(tl.int64)
-    draft_mask = mask & (k < gamma)
-    draft = tl.load(draft_tokens_ptr + b * gamma + k, mask=draft_mask, other=0).to(
-        tl.int64
-    )
-    k64 = k.to(tl.int64)
-    val = tl.where(k64 == cl, bonus, tl.where(k64 < gamma, draft, 0))
-    tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
-
-
 def build_out_tokens_triton(
     *,
     draft_tokens: torch.Tensor,
@@ -873,8 +842,7 @@ def build_out_tokens_triton(
     n_out = bs * T
     BLOCK = 256
     grid = (triton.cdiv(n_out, BLOCK),)
-    kernel = _build_out_tokens_npu_kernel if _is_npu else _build_out_tokens_kernel
-    kernel[grid](
+    _build_out_tokens_kernel[grid](
         draft_tokens, correct_len_i, bonus_i, out, gamma, T, n_out, BLOCK=BLOCK
     )
     return out
