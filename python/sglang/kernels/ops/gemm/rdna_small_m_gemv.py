@@ -1,8 +1,8 @@
 """Split-K bf16 GEMV for single-row decode on RDNA APUs.
 
-Enabled on gfx1151 (Strix Halo); the tuning constants below were measured there and
-have not been re-measured on the wider RDNA parts, which have enough compute units
-that the rocBLAS tile already covers the machine.
+Enabled on gfx1151 (Strix Halo) running the ROCm generation these constants were tuned
+on; the tuning was measured there and has not been re-measured on the wider RDNA parts,
+which have enough compute units that the rocBLAS tile already covers the machine.
 
 Motivation
 ----------
@@ -35,7 +35,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx1151_supported
+from sglang.srt.utils import get_hip_version, is_gfx1151_supported
 
 _BLOCK_N = 32
 _BLOCK_K = 512
@@ -51,6 +51,18 @@ _SUPPORTED_ROWS = 1
 # 121 GB/s with split-K; a 34816x5120 gate_up (1088 tiles) is 145.7 vs 133.0 GB/s,
 # i.e. the crossover sits right at this bound.
 _MAX_N_TILES = 1024
+# The baseline these constants beat is the stock `F.linear` of ROCm 7.2.x (74-135 GB/s
+# on the gated shapes). On ROCm 7.13 the same call reaches 205-242 GB/s and split-K
+# loses 4-21% on every gated shape, so the wide routing stays off from 7.3 onwards
+# instead of extrapolating from the older numbers. The aliased K=1024 rows still gain
+# 7.5% end to end on 7.13, but a narrower rule for them needs its own measurements.
+_BASELINE_CROSSOVER_HIP_VERSION = (7, 3)
+
+
+@lru_cache(maxsize=1)
+def _baseline_is_slow() -> bool:
+    """Whether the stock BLAS baseline is still the one these constants were tuned for."""
+    return get_hip_version() < _BASELINE_CROSSOVER_HIP_VERSION
 
 
 @triton.jit
@@ -99,6 +111,8 @@ def _is_disabled() -> bool:
 def use_rdna_splitk_gemv(m: int, n: int, k: int, weight_dtype: torch.dtype) -> bool:
     """Whether a single-row bf16 GEMV should be routed to the split-K kernel."""
     if _is_disabled():
+        return False
+    if not _baseline_is_slow():
         return False
     if m != _SUPPORTED_ROWS or weight_dtype != torch.bfloat16:
         return False
