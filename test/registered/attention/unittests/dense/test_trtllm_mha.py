@@ -4,7 +4,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
     is_sm90_supported,

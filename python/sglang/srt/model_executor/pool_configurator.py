@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -380,14 +380,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            cell_size = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config,
-                    kv_cache_dtype=kv_cache_dtype,
+            if kvc.modelslim_cache_layout is not None:
+                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
+            else:
+                per_layer_bytes = (
+                    calculate_mla_kv_cache_dim(
+                        model_config=model_config,
+                        kv_cache_dtype=kv_cache_dtype,
+                    )
+                    * kv_size
                 )
-                * effective_num_layers
-                * kv_size
-            )
+            cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

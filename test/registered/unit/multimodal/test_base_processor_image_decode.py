@@ -27,7 +27,7 @@ import requests
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import common
 from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool

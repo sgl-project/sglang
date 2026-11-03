@@ -46,9 +46,9 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -89,11 +89,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -101,6 +97,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
