@@ -51,7 +51,10 @@ each waits for an event recorded after what precedes it (the first chunk:
 the run's setup ops and the whole previous run): a gate is read only once the
 work before it has retired, so at most one chunk drains after a pause. The
 chain creates its streams itself (``cuStreamCreate``): a pooled
-``torch.cuda.Stream`` may be the very stream the forward runs on.
+``torch.cuda.Stream`` may be the very stream the forward runs on. It never
+destroys them: torch may still record events on a stream a chunk used (a
+pinned ``tensor.copy_`` records its stream on the host block, and freeing the
+block later records an event there), so a chain lives as long as the process.
 
 In flight: a bracket pauses only gates whose chains have unretired chunks
 (``cuEventQuery`` on each chain's gated tail; a host flag keeps the drained
@@ -142,7 +145,6 @@ class CudaDriver:
             "cuMemHostGetDevicePointer_v2", [ctypes.POINTER(u64), void_p, uint]
         )
         self.stream_create = bind("cuStreamCreate", [ctypes.POINTER(void_p), uint])
-        self.stream_destroy = bind("cuStreamDestroy_v2", [void_p])
         self.stream_is_capturing = bind(
             "cuStreamIsCapturing", [void_p, ctypes.POINTER(ctypes.c_int)]
         )
@@ -150,7 +152,6 @@ class CudaDriver:
             "cuThreadExchangeStreamCaptureMode", [ctypes.POINTER(ctypes.c_int)]
         )
         self.event_create = bind("cuEventCreate", [ctypes.POINTER(void_p), uint])
-        self.event_destroy = bind("cuEventDestroy_v2", [void_p])
         self.event_record = bind("cuEventRecord", [void_p, void_p])
         self.event_query = bind("cuEventQuery", [void_p])
         self.stream_wait_event = bind("cuStreamWaitEvent", [void_p, void_p, uint])
@@ -337,12 +338,6 @@ class TransferGate:
             self._chains = [ref for ref in self._chains if ref() is not None]
             self._chains.append(weakref.ref(chain))
 
-    def _remove_chain(self, chain: TransferChain) -> None:
-        with self._lock:
-            self._chains = [
-                ref for ref in self._chains if ref() is not None and ref() is not chain
-            ]
-
     def _note_run(self) -> None:
         with self._lock:
             self._runs += 1
@@ -354,9 +349,8 @@ class TransferGate:
             return False
         with self._lock:
             runs = self._runs
-            # Queried under the lock, with the chains held: close() destroys
-            # a chain's events only after leaving the list, and a collected
-            # chain only once nothing references it.
+            # A chain never destroys its events, so a live chain's are
+            # always safe to query.
             chains = [chain for chain in (ref() for ref in self._chains) if chain]
             if not self._drv.events_done([chain._gated_tail for chain in chains]):
                 return True
@@ -468,8 +462,10 @@ class TransferChain:
     streams, each chunk behind ``gate`` if one is given (at most one chunk
     drains after a pause); without a gate, a plain transfer stream.
 
-    One chain per transfer owner; ``run`` calls serialize on the chain's
-    primary stream and must come from one host thread at a time.
+    One chain per transfer owner, for the life of the process: its streams
+    and events are never released (see the module docstring). ``run`` calls
+    serialize on the chain's primary stream and must come from one host
+    thread at a time.
     """
 
     def __init__(self, device_index: int, gate: Optional[TransferGate] = None):
@@ -489,23 +485,12 @@ class TransferChain:
             self._gated_tail = drv.create_event()
             self._last = drv.create_event()
         self._handles = tuple(handles)
-        self._closed = False
-        self._finalizer = weakref.finalize(
-            self,
-            _destroy_chain,
-            drv,
-            self._handles,
-            (*self._done, self._after, self._gated_tail, self._last),
-        )
-        # The driver context may be gone at interpreter exit.
-        self._finalizer.atexit = False
         if gate is not None:
             gate._add_chain(self)
 
     @property
     def stream(self) -> torch.cuda.Stream:
         """The primary stream: setup, finish and ``done`` run on it."""
-        assert not self._closed
         return self._streams[0]
 
     def run(
@@ -523,7 +508,6 @@ class TransferChain:
         ``done`` once everything has run. Setup and finish ops run ungated on
         the primary stream. Nothing is enqueued on ``after``: consumers wait
         through ``wait``."""
-        assert not self._closed
         drv = self._drv
         after_handle = after.cuda_stream
         if drv.is_capturing(after_handle):
@@ -573,6 +557,7 @@ class TransferChain:
             for k, op in enumerate(ops):
                 i = (k + 1) & 1
                 handle = handles[i]
+                last = i
                 result = wait_event(handle, done[i ^ 1], 0)
                 if result:
                     drv.check(result, "chunk chain (cuStreamWaitEvent)")
@@ -580,7 +565,6 @@ class TransferChain:
                 if result:
                     drv.check(result, "pause gate (cuStreamWaitValue32)")
                 torch.cuda.set_stream(streams[i])
-                last = i
                 op(streams[i])
                 result = record(done[i], handle)
                 if result:
@@ -588,8 +572,12 @@ class TransferChain:
         finally:
             torch.cuda.set_stream(streams[0])
             # Every chunk is ordered before the last; join it if it ran on the
-            # second stream.
+            # second stream, at that stream's end: a chunk that raised after
+            # enqueuing work never recorded its event.
             if last:
+                drv.check(
+                    record(done[1], handles[1]), "chunk chain join (cuEventRecord)"
+                )
                 drv.check(
                     wait_event(handles[0], done[1], 0),
                     "chunk chain join (cuStreamWaitEvent)",
@@ -605,7 +593,6 @@ class TransferChain:
         """Make ``stream`` wait for ``event`` (a ``done`` of a run) or the last
         run. Refused while this thread holds the chain's gate paused: the
         waiting stream would block on chunks parked behind its own pause."""
-        assert not self._closed
         gate = self.gate
         if (
             gate is not None
@@ -626,25 +613,8 @@ class TransferChain:
 
     def retired(self) -> bool:
         """Whether the last run's chunks have all completed."""
-        assert not self._closed
         tail = self._gated_tail if self.gate is not None else self._last
         return self._drv.events_done([tail])
-
-    def close(self) -> None:
-        """Release the chain's streams and events once its work completes."""
-        if not self._closed:
-            self._closed = True
-            if self.gate is not None:
-                self.gate._remove_chain(self)
-            self._finalizer()
-
-
-def _destroy_chain(drv: CudaDriver, streams, events) -> None:
-    # Both calls defer the release until queued work completes.
-    for event in events:
-        drv.event_destroy(event)
-    for stream in streams:
-        drv.stream_destroy(stream)
 
 
 # ---- foreground brackets ------------------------------------------------------
@@ -707,14 +677,16 @@ def _release(paused: List[TransferGate]) -> None:
         gate._pause_depth -= 1
         if gate._pause_depth:
             continue
-        stream = gate._pause_stream
-        gate._pause_stream = None
-        gate._pause_thread = None
-        # After the bracketed op, on the stream that issued the pause.
+        # After the bracketed op, on the stream that issued the pause. The
+        # gate stays owned until the resume is enqueued: a pause another
+        # thread enqueued before it would be undone by it.
         try:
-            gate.resume(stream)
+            gate.resume(gate._pause_stream)
         except BaseException as e:
             error = error or e
+        finally:
+            gate._pause_stream = None
+            gate._pause_thread = None
     if error is not None:
         raise error
 

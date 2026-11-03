@@ -1,13 +1,15 @@
 """Gated background transfers (``gated_transfer``).
 
 - CPU: foreground bracket bookkeeping over fake gates (nesting, link
-  filtering, one owner thread, exception-safe entry and exit, the in-flight
-  skip) and the watchdog's sampling.
+  filtering, one owner thread kept until the resume is enqueued,
+  exception-safe entry and exit, the in-flight skip) and the watchdog's
+  sampling.
 - 1 GPU: ``TransferChain`` over copy-engine chunks in every direction (D2D,
-  pinned H2D, D2H), dedicated streams, a held first chunk, the one-chunk drain
-  bound (within a run, across runs, with the pause landing mid-copy), the
-  bracket's link filter and ``wait`` guard on real gates, ``close``, the
-  capture refusal, and the watchdog forcing a stuck gate open.
+  pinned H2D, D2H), dedicated streams that outlive torch's host copies, a
+  held first chunk, the one-chunk drain bound (within a run, across runs,
+  with the pause landing mid-copy), chunks raising on either stream, the
+  bracket's link filter and ``wait`` guard on real gates, the capture refusal,
+  and the watchdog forcing a stuck gate open.
 - 2-4 GPUs: NCCL broadcast and allgather calls gated as plain chunk
   callables, and a paused root holding every rank.
 
@@ -19,6 +21,9 @@ from the host (both live in pinned memory) and check landed bytes in pinned
 host buffers.
 """
 
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 import unittest
@@ -197,6 +202,16 @@ class TestBracketBookkeeping(CustomTestCase):
             self.assertEqual(gate._pause_depth, 0)
             self.assertIsNone(gate._pause_thread)
 
+    def test_gate_stays_owned_until_its_resume_is_enqueued(self):
+        """Released any earlier, another thread could pause the gate before
+        the resume is enqueued, and the late resume would undo that pause."""
+        owners = []
+        self.nvlink.resume = lambda stream: owners.append(self.nvlink._pause_thread)
+        with paused_background_transfers(Link.NVLINK):
+            pass
+        self.assertEqual(owners, [threading.get_ident()])
+        self.assertIsNone(self.nvlink._pause_thread)
+
     def test_no_gates_no_bracket(self):
         with unittest.mock.patch.object(gated_transfer, "_gates", []):
             self.assertIs(
@@ -325,9 +340,7 @@ class TestTransferChainSingleGpu(CustomTestCase):
 
     def _chain(self, link=Link.NVLINK, gated=True):
         gate = get_transfer_gate(link, self.device.index) if gated else None
-        chain = TransferChain(self.device.index, gate)
-        self.addCleanup(chain.close)
-        return chain
+        return TransferChain(self.device.index, gate)
 
     def _src(self, nbytes):
         # Nonzero bytes, so a landed chunk is visible.
@@ -545,6 +558,37 @@ class TestTransferChainSingleGpu(CustomTestCase):
         self.assertTrue(_wait_until(chain.retired))
         self.assertTrue(torch.equal(dst, src.cpu()))
 
+    def test_raising_chunk_on_the_second_stream_stays_tracked(self):
+        """Chunks 0, 2, ... run on the chain's second stream. One that
+        enqueues work and then raises never records its event, and the work
+        it enqueued must still hold back ``retired`` and the bracket's
+        in-flight check."""
+        chain = self._chain()
+        gate = chain.gate
+        src = self._src(_MiB)
+        for failing in (0, 2):
+            with self.subTest(failing_chunk=failing):
+                blocker = _HostWord()
+                dst = self._pinned(_MiB)
+                torch.cuda.synchronize()
+                held = _Blocked(lambda s: dst.copy_(src, non_blocking=True), blocker)
+
+                def enqueue_then_raise(stream):
+                    held(stream)
+                    raise ValueError("chunk failed after enqueuing work")
+
+                ops = [lambda stream: None] * failing + [enqueue_then_raise]
+                with self.assertRaises(ValueError):
+                    chain.run(ops, self.after)
+                try:
+                    held.wait_reached()
+                    self.assertFalse(chain.retired())
+                    self.assertTrue(gate.has_pending())
+                finally:
+                    blocker.set(1)  # a failed check must not leave it parked
+                self.assertTrue(_wait_until(chain.retired))
+                self.assertTrue(torch.equal(dst, src.cpu()))
+
     def test_ungated_chain_tracks_its_last_run(self):
         chain = self._chain(gated=False)
         blocker = _HostWord()
@@ -559,14 +603,35 @@ class TestTransferChainSingleGpu(CustomTestCase):
         blocker.set(1)
         self.assertTrue(_wait_until(chain.retired))
 
-    def test_closed_chain_refuses_use(self):
-        chain = self._chain()
-        gate = chain.gate
-        chain.close()
-        self.assertEqual(gate._chains, [])
-        for use in (chain.retired, lambda: chain.wait(self.after)):
-            with self.assertRaises(AssertionError):
-                use()
+    def test_chain_streams_outlive_torch_host_copies(self):
+        """A pinned ``tensor.copy_`` in a chunk makes torch record the
+        chain's stream on the host block, and freeing the block records an
+        event on that stream. A chain that destroyed its streams once it was
+        collected crashed the process there."""
+        code = textwrap.dedent(
+            """
+            import gc
+            import torch
+            from sglang.srt.distributed.device_communicators.gated_transfer import (
+                TransferChain,
+            )
+
+            src = torch.ones(1 << 20, dtype=torch.uint8, device="cuda")
+            dst = torch.zeros(1 << 20, dtype=torch.uint8).pin_memory()
+            chain = TransferChain(torch.cuda.current_device())
+            copy = lambda stream: dst.copy_(src, non_blocking=True)
+            chain.run([copy], torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            del chain, copy
+            gc.collect()
+            del dst  # torch records an event on the chain's stream here
+            torch.cuda.synchronize()
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, timeout=300
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode()[-2000:])
 
     def test_pause_during_a_running_chunk_holds_the_next(self):
         """The case the event chaining exists for: the pause lands while
