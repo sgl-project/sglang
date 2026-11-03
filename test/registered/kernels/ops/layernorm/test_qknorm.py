@@ -82,5 +82,31 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
     triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "dtype,pad", [(torch.bfloat16, 0), (torch.float16, 0), (torch.bfloat16, 4)]
+)
+def test_two_rows_per_warp_match_one_row_per_warp(dtype: torch.dtype, pad: int) -> None:
+    """head_dim 128 runs two rows per warp; its bytes must equal the one-row-per-warp
+    kernel's. q and k slice one qkv row as Qwen3 passes them; 5 q heads put a q/k
+    boundary inside a row pair, the odd row count leaves the last warp one row, and
+    4099 tokens need more than one pass of the persistent grid on H100 and B200.
+    pad=4 leaves odd tokens only 8 B aligned, so the launcher must keep one row per warp."""
+    from sglang.kernels.ops.layernorm.norm import _jit_qknorm_module
+
+    T, Hq, Hk, D = 4099, 5, 2, 128
+    g = torch.Generator(device="cpu").manual_seed(0)
+    qkv = (3 * torch.randn(T, (Hq + 2 * Hk) * D + pad, generator=g)).to(DEVICE, dtype)
+    qw = (torch.rand(D, generator=g) + 0.5).to(DEVICE, dtype)
+    kw = (torch.rand(D, generator=g) + 0.5).to(DEVICE, dtype)
+    outputs = []
+    for half_warp in (False, True):
+        out = qkv.clone()
+        q = out[:, : Hq * D].view(T, Hq, D)
+        k = out[:, Hq * D : (Hq + Hk) * D].view(T, Hk, D)
+        _jit_qknorm_module(D, dtype, half_warp=half_warp).qknorm(q, k, qw, kw, 1e-6)
+        outputs.append(out)
+    assert torch.equal(outputs[0], outputs[1])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
