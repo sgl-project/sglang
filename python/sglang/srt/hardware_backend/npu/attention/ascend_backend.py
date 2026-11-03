@@ -12,7 +12,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -27,6 +26,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
+    use_fused_sparse_kv_offload,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -371,14 +371,19 @@ class AscendAttnBackend(AttentionBackend):
             use_mla_backend=model_runner.use_mla_backend,
             is_draft_worker=self.is_draft_worker,
         )
-        # Draft-decode steps and draft-extend use different attention backends
-        # over the same KV pool. They must also share its host KV and residency.
-        self.sparse_kv_manager = getattr(
-            self.token_to_kv_pool, "sparse_kv_manager", None
+        self.use_fused_sparse_kv = (
+            self.enable_sparsity_driven_kv_offload and use_fused_sparse_kv_offload()
+        )
+        self.sparse_kv_manager = (
+            getattr(self.token_to_kv_pool, "sparse_kv_manager", None)
+            if self.enable_sparsity_driven_kv_offload
+            else None
         )
         if self.enable_sparsity_driven_kv_offload and self.sparse_kv_manager is None:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.dispatch import (
+                create_sparse_kv_manager,
+            )
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
-                SparseKVCacheManager,
                 register_sparse_kv_manager,
             )
             from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -392,14 +397,9 @@ class AscendAttnBackend(AttentionBackend):
                 capture_bs, _ = get_batch_sizes_to_capture(model_runner)
                 graph_batch_capacity = max(capture_bs)
 
-            self.sparse_kv_manager = SparseKVCacheManager(
-                model_runner.req_to_token_pool,
-                model_runner.token_to_kv_pool_allocator,
-                sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
-                    model_config=model_runner.model_config
-                ),
-                copy_sfa_padded_query_heads=(
-                    next(
+            sparse_options = (
+                dict(
+                    copy_sfa_padded_query_heads=next(
                         (
                             padding
                             for padding in (1, 2, 4, 8, 16, 32, 64, 128)
@@ -408,14 +408,26 @@ class AscendAttnBackend(AttentionBackend):
                             // get_parallel().attn_tp_size
                         ),
                         None,
-                    )
-                    if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-                    else None
-                ),
-                graph_batch_capacity=graph_batch_capacity,
-                paged_kv_cache=self.token_to_kv_pool,
+                    ),
+                    graph_batch_capacity=graph_batch_capacity,
+                    paged_kv_cache=self.token_to_kv_pool,
+                )
+                if self.use_fused_sparse_kv
+                else dict(
+                    graph_batch_capacity=graph_batch_capacity,
+                    paged_kv_cache=self.token_to_kv_pool,
+                )
             )
-            if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
+            self.sparse_kv_manager = create_sparse_kv_manager(
+                model_runner.req_to_token_pool,
+                model_runner.token_to_kv_pool_allocator,
+                sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
+                    model_config=model_runner.model_config
+                ),
+                fused=self.use_fused_sparse_kv,
+                options=sparse_options,
+            )
+            if self.use_fused_sparse_kv:
                 self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
@@ -838,16 +850,11 @@ class AscendAttnBackend(AttentionBackend):
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
-        if (
-            self.enable_sparsity_driven_kv_offload
-            and self.sparse_kv_manager.indexer_impl != "lim"
-        ):
+        if self.enable_sparsity_driven_kv_offload and not self.use_fused_sparse_kv:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
             )
 
-            # Native LIM and its device copy kernels do not launch ACL host
-            # callbacks. Avoid a polling reporter thread for this graph path.
             register_npu_host_callback_stream(
                 torch.npu.current_stream(self.device), self.device
             )
@@ -1562,11 +1569,11 @@ class AscendAttnBackend(AttentionBackend):
             )
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
-                    forward_sparsity_driven_kv_offload,
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.dispatch import (
+                    get_sparse_kv_attention,
                 )
 
-                return forward_sparsity_driven_kv_offload(
+                return get_sparse_kv_attention(fused=self.use_fused_sparse_kv)(
                     self,
                     q,
                     k,
@@ -3019,11 +3026,11 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache = False
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
-                    forward_sparsity_driven_kv_offload,
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.dispatch import (
+                    get_sparse_kv_attention,
                 )
 
-                return forward_sparsity_driven_kv_offload(
+                return get_sparse_kv_attention(fused=self.use_fused_sparse_kv)(
                     self,
                     q,
                     k,

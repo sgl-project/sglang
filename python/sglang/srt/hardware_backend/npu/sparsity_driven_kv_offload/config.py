@@ -37,17 +37,8 @@ def use_fused_sparse_kv_offload() -> bool:
 
 
 def is_copy_sfa_decode_graph_eligible(seq_lens_cpu) -> bool:
-    """Require every live row to have enough tokens to populate its cache.
-
-    C defaults to K=2048. Larger native LIM caches use host gather until C
-    visible tokens exist, so those batches must also stay outside this graph.
-    """
-    if not envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
-        return True
-    capacity = envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() or 2048
-    return seq_lens_cpu is not None and not any(
-        0 < int(length) < capacity for length in seq_lens_cpu.tolist()
-    )
+    """Dense and sparse rows share the fused graph, regardless of length."""
+    return True
 
 
 def is_sparsity_driven_kv_offload_enabled(

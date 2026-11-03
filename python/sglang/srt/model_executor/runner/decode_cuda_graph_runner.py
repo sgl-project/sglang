@@ -1095,7 +1095,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         sparse_kv_manager = getattr(attn_backend, "sparse_kv_manager", None)
         forward_batch.sparse_kv_copy_sfa_capture = bool(
-            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+            getattr(attn_backend, "use_fused_sparse_kv", False)
             and sparse_kv_manager is not None
             and self.captured_req_width == 1
             and forward_batch.forward_mode.is_decode()
