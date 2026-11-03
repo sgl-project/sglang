@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.scheduler_host_sync_logger import SchedulerHostSyncLogger
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -355,6 +356,10 @@ class SchedulerMetricsReporter:
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
+        )
+        self.scheduler_host_sync_logger = SchedulerHostSyncLogger.maybe_create(
+            enable_metrics=self.enable_metrics,
+            stage_recorder=self.scheduler_stage_metrics,
         )
 
     def _install_device_timer_on_runners(self):

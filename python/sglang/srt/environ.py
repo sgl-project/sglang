@@ -360,6 +360,10 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Count host-device syncs (torch sync debug mode) by scheduler stage, forward
+    # mode and call site; needs --enable-metrics. Debugging only: it slows the loop.
+    SGLANG_LOG_SCHEDULER_HOST_SYNCS_TARGET = EnvStr("")
+    SGLANG_LOG_SCHEDULER_HOST_SYNCS_INTERVAL = EnvFloat(60.0)
     # Read by JIT kernel headers (sgl_kernel/logging.h): DEBUG | INFO | WARNING | ERROR.
     SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)

@@ -1356,6 +1356,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between scheduler-status log lines.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>60.0</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_SCHEDULER_HOST_SYNCS_TARGET</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated targets (<code>stdout</code> or a directory) for periodic <code>scheduler.host_syncs</code> JSON records: host-device syncs reported by torch's sync debug mode, counted by scheduler stage, forward mode and Python call site, plus the launched batches per forward mode. Requires <code>--enable-metrics</code>. Debugging only; it slows the scheduler loop.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_SCHEDULER_HOST_SYNCS_INTERVAL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between host-sync records.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>60.0</code></td>
+    </tr>
   </tbody>
 </table>
 
