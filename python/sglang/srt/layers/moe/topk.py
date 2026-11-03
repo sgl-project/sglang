@@ -2003,7 +2003,11 @@ def _mask_topk_ids_padded_region(
     if not topk_ids.is_cuda:
         if _is_npu:
             return
-        rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+        rows = torch.arange(
+            topk_ids.shape[0],
+            dtype=num_token_non_padded.dtype,
+            device=topk_ids.device,
+        )
         topk_ids.masked_fill_((rows >= num_token_non_padded)[:, None], fill_value)
         return
     # TODO: let the kernel support other dtypes
@@ -2014,7 +2018,12 @@ def _mask_topk_ids_padded_region(
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        indices = torch.arange(
+            0,
+            topk_ids.shape[0],
+            dtype=num_token_non_padded.dtype,
+            device=topk_ids.device,
+        )
         topk_ids[indices >= num_token_non_padded, :] = fill_value
 
 
@@ -2025,13 +2034,22 @@ def _zero_topk_weights_padded_region(
     if num_token_non_padded is None:
         return
     if not topk_weights.is_cuda:
-        rows = torch.arange(topk_weights.shape[0], device=topk_weights.device)
+        rows = torch.arange(
+            topk_weights.shape[0],
+            dtype=num_token_non_padded.dtype,
+            device=topk_weights.device,
+        )
         topk_weights.masked_fill_((rows >= num_token_non_padded)[:, None], 0.0)
         return
     if _can_fuse_padded_region(topk_weights):
         _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
         return
-    indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
+    indices = torch.arange(
+        0,
+        topk_weights.shape[0],
+        dtype=num_token_non_padded.dtype,
+        device=topk_weights.device,
+    )
     topk_weights[indices >= num_token_non_padded, :] = 0.0
 
 
@@ -2901,7 +2919,11 @@ def _post_process_topk_ids(
     if _is_npu:
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         if recorder_topk_ids is not None and num_token_non_padded is not None:
-            rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+            rows = torch.arange(
+                topk_ids.shape[0],
+                dtype=num_token_non_padded.dtype,
+                device=topk_ids.device,
+            )
             recorder_topk_ids = recorder_topk_ids.masked_fill(
                 (rows >= num_token_non_padded)[:, None], -1
             )
