@@ -130,10 +130,18 @@ class Mm(msgspec.Struct):
     ] = False
     enable_token_space_preprocess_cache: A[
         bool,
-        "Cache the token-space processor's features per media, keyed by its source, "
-        "in memory within --mm-preprocess-cache-size-mb. Requires "
-        "--token-space-preprocess-cache-trust-url.",
+        "Cache the token-space processor's features per media, keyed by its source: "
+        "in memory within --mm-preprocess-cache-size-mb, or in "
+        "--token-space-preprocess-cache-dir. Requires --token-space-preprocess-cache-trust-url.",
     ] = False
+    token_space_preprocess_cache_dir: A[
+        Optional[str],
+        "Directory for the token-space preprocess cache instead of memory, shared by "
+        "every process that sees it, e.g. an RL job's engines and trainers. Nothing "
+        "in it is deleted, so give each job a fresh directory and remove it with the "
+        "job. Values are unpickled on read, so only trusted processes may write it. "
+        "Requires --enable-token-space-preprocess-cache.",
+    ] = None
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(

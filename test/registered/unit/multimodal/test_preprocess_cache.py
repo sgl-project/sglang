@@ -1,5 +1,34 @@
+"""Multimodal preprocess caches: media identity, keys, the in-memory LRU and the disk store.
+
+DiskPreprocessCache(dir)
+  one process writes, another reads the dir -> every field back, video metadata too;
+      umask file mode; a file deleted mid-read (ESTALE) is a miss
+  a key whose file exists -> not rewritten
+
+snapshot_media / parse_content_hash
+  hash strings -> strict, normalized format
+  same bytes as bytes, path, base64, PIL or tensor -> one identity
+  ImageData wrapper -> the image's identity, not the wrapper's
+  same path or URL with new contents -> miss; relative local path -> its file bytes
+  PIL and non-contiguous tensor -> snapshotted; PIL palette and transparency count
+
+build_artifact_key / build_processor_fingerprint / item hashes
+  processor and kwargs -> in the key; canonicalization keeps types; lossy values rejected
+  output-affecting config -> new fingerprint
+  item hash namespace -> covers identity and processor output; MultimodalDataItem shares it
+
+MultimodalPreprocessCache
+  byte and entry bounds -> LRU eviction; compatible lookup atomic, bypass not a miss
+  claimed miss vs racing incompatible entry -> rejected; GPU values -> not copied
+  concurrent misses -> one computation; cancelling the owner or a joiner spares the other
+  batch lookup_or_claim -> owned and joined misses; cancelled waiter spares the computer
+  clear -> no repopulation from in-flight work; new single-flight and miss generations
+  disabled -> neither joins nor retains
+"""
+
 import asyncio
 import base64
+import errno
 import os
 import tempfile
 import unittest
@@ -13,8 +42,10 @@ from PIL import Image
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.multimodal.cache import (
     CacheMiss,
+    DiskPreprocessCache,
     MultimodalPreprocessCache,
     build_artifact_key,
+    build_cache_key,
     build_processor_fingerprint,
     estimate_cache_size_bytes,
     parse_content_hash,
@@ -26,6 +57,61 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestDiskPreprocessCache(unittest.TestCase):
+    def test_another_process_reads_what_one_wrote(self):
+        """A trainer opening serving's directory gets every field back, video metadata included."""
+        from transformers.video_utils import VideoMetadata
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        key = build_cache_key("video.mp4")
+        value = {
+            "pixel_values_videos": torch.arange(6.0).reshape(2, 3),
+            "second_per_grid_ts": [0.5],
+            "video_metadata": [VideoMetadata(total_num_frames=4, fps=2.0)],
+        }
+        DiskPreprocessCache(directory.name)[key] = value
+
+        reader = DiskPreprocessCache(directory.name)
+        loaded = reader.get(key)
+        self.assertTrue(
+            torch.equal(loaded["pixel_values_videos"], value["pixel_values_videos"])
+        )
+        self.assertEqual(loaded["second_per_grid_ts"], [0.5])
+        self.assertEqual(loaded["video_metadata"], value["video_metadata"])
+        self.assertIsNone(reader.get(build_cache_key("image.png")))
+        # The temporary file was renamed into place, so no partial file is left.
+        files = [path for path in Path(directory.name).rglob("*") if path.is_file()]
+        self.assertEqual(
+            [path.name for path in files], [key.removeprefix("sha256:") + ".pt"]
+        )
+        # Readable by other users as the umask allows, unlike a 0600 tempfile.
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o666 & ~umask)
+        # On NFS a file removed mid-read fails with ESTALE; that is a miss too.
+        with patch(
+            "torch.load", side_effect=OSError(errno.ESTALE, "Stale file handle")
+        ):
+            self.assertIsNone(reader.get(key))
+
+    def test_a_written_key_is_not_rewritten(self):
+        """Concurrent misses on one image must not each serialize and rewrite its file."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        key = build_cache_key("image.png")
+        first = DiskPreprocessCache(directory.name)
+        first[key] = torch.zeros(1024)
+        inode = first._path(key).stat().st_ino
+
+        second = DiskPreprocessCache(directory.name)
+        with patch("torch.save", wraps=torch.save) as save:
+            second[key] = torch.ones(1024)
+        self.assertEqual(first._path(key).stat().st_ino, inode)
+        self.assertEqual(save.call_count, 0)
+        self.assertTrue(torch.equal(second.get(key), torch.zeros(1024)))
 
 
 class TestMediaIdentity(unittest.TestCase):

@@ -22,7 +22,8 @@ TokenSpaceProcessor.process(media, IDs)
   worker_thread_device d, no processor pool -> inline processing on device d
   item feature cache, [B A] after [A] with another prompt -> only B loaded, same output
   item feature cache, same image on another device -> loaded again
-  one map, processors of another checkpoint or mm_process_config -> loaded again
+  item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
+  one map, processors of another checkpoint, mm_process_config or library version -> loaded again
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy and serving spec keep the legacy processor's loader and worker defaults
@@ -30,6 +31,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
   budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
+  --token-space-preprocess-cache-dir -> the core caches on disk
   adjacent images -> two offsets from mm_spans, not one scanned run
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
@@ -40,6 +42,7 @@ import asyncio
 import base64
 import contextlib
 import io
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -57,6 +60,7 @@ from sglang.srt.managers.multimodal_processor import (
     get_mm_processor,
     import_processors,
 )
+from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreprocessCache
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
@@ -233,12 +237,15 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         hf_config=None,
         mm_process_config=None,
         item_feature_cache=None,
+        keep_mm_features_on_device=False,
     ):
         processor = TokenSpaceProcessor.for_strategy(strategy_class)(
             hf_config,
             _bare_tokenizer(),
             processor_config=MultimodalProcessorConfig(
-                mm_process_config=mm_process_config or {}, mm_processor_worker_num=1
+                mm_process_config=mm_process_config or {},
+                mm_processor_worker_num=1,
+                keep_mm_features_on_device=keep_mm_features_on_device,
             ),
             item_feature_cache=item_feature_cache,
         )
@@ -372,16 +379,67 @@ class TestTokenSpaceProcessor(unittest.TestCase):
             [call.args[0] for call in load.await_args_list], [[image], None, [image]]
         )
 
+    def test_item_feature_cache_reuses_features_from_another_gpu(self):
+        """Serving on cuda:0 without a video device, then a trainer rank on cuda:3 with one."""
+        image = Image.new("RGB", (2, 1))
+        processor = self._processor(hf_config=_CHECKPOINT, item_feature_cache={})
+        load = AsyncMock(wraps=processor._load_media_lists)
+        with (
+            patch.object(processor, "_load_media_lists", load),
+            patch.object(
+                processor,
+                "_temporary_fast_processor_cuda_pool",
+                lambda device: contextlib.nullcontext(),
+            ),
+        ):
+            asyncio.run(
+                processor.process([image], input_ids=[1, IMAGE], image_device="cuda:0")
+            )
+            asyncio.run(
+                processor.process(
+                    [image],
+                    input_ids=[1, IMAGE],
+                    image_device="cuda:3",
+                    video_device="cuda:3",
+                )
+            )
+        self.assertEqual(
+            [call.args[0] for call in load.await_args_list], [[image], None]
+        )
+
+    def test_item_feature_cache_hit_joins_the_misses_on_their_device(self):
+        """With features kept on the device, a hit loaded on the CPU must not meet a miss in torch.cat."""
+        image = Image.new("RGB", (2, 1))
+        item_feature_cache = {}
+        asyncio.run(
+            self._processor(
+                hf_config=_CHECKPOINT, item_feature_cache=item_feature_cache
+            ).process([image], input_ids=[1, IMAGE], image_device="meta")
+        )
+        (cached,) = item_feature_cache.values()
+        self.assertEqual(cached["pixel_values"].device.type, "cpu")
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT,
+            item_feature_cache=item_feature_cache,
+            keep_mm_features_on_device=True,
+        )
+        output = asyncio.run(
+            processor.process([image], input_ids=[1, IMAGE], image_device="meta")
+        )
+        self.assertEqual(output["pixel_values"].device.type, "meta")
+
     def test_item_feature_cache_is_shared_only_by_matching_processors(self):
-        """A trainer and serving may share one map; another checkpoint or config must miss."""
+        """A trainer and serving may share one map; another checkpoint, config or upgrade must miss."""
         image = Image.new("RGB", (2, 1))
         item_feature_cache = {}
         loaded = []
-        for name_or_path, mm_process_config in (
-            ("ckpt", {}),
-            ("ckpt", {}),
-            ("other", {}),
-            ("ckpt", {"image": {"max_pixels": 4}}),
+        for name_or_path, mm_process_config, transformers_version in (
+            ("ckpt", {}, "5.0"),
+            ("ckpt", {}, "5.0"),
+            ("other", {}, "5.0"),
+            ("ckpt", {"image": {"max_pixels": 4}}, "5.0"),
+            ("ckpt", {}, "5.1"),
         ):
             processor = self._processor(
                 hf_config=PretrainedConfig(name_or_path=name_or_path),
@@ -389,10 +447,13 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                 item_feature_cache=item_feature_cache,
             )
             load = AsyncMock(wraps=processor._load_media_lists)
-            with patch.object(processor, "_load_media_lists", load):
+            with (
+                patch.object(processor, "_load_media_lists", load),
+                patch("transformers.__version__", transformers_version),
+            ):
                 asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
             loaded.append(load.await_args.args[0])
-        self.assertEqual(loaded, [[image], None, [image], [image]])
+        self.assertEqual(loaded, [[image], None, [image], [image], [image]])
 
     def test_media_sources_must_be_lists(self):
         # A bare source would otherwise be iterated item by item, e.g. a URL per character.
@@ -618,8 +679,34 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
 
     def test_served_core_caches_only_when_enabled(self):
         """The switch picks the cache: a budget or trusted URLs alone must not turn it on."""
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for cache_args, cache_type in (
+            (
+                dict(
+                    mm_preprocess_cache_size_mb=8,
+                    token_space_preprocess_cache_trust_url=True,
+                ),
+                type(None),
+            ),
+            (
+                dict(
+                    mm_preprocess_cache_size_mb=8,
+                    token_space_preprocess_cache_trust_url=True,
+                    enable_token_space_preprocess_cache=True,
+                ),
+                MultimodalPreprocessCache,
+            ),
+            (
+                dict(
+                    token_space_preprocess_cache_trust_url=True,
+                    enable_token_space_preprocess_cache=True,
+                    token_space_preprocess_cache_dir=directory.name,
+                ),
+                DiskPreprocessCache,
+            ),
+        ):
+            with self.subTest(**cache_args):
                 reset_context()
                 self.addCleanup(reset_context)
                 server_args = ServerArgs(
@@ -628,19 +715,14 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                     mm_process_config={},
                     enable_token_space_processor=True,
                     mm_processor_worker_num=1,
-                    mm_preprocess_cache_size_mb=8,
-                    token_space_preprocess_cache_trust_url=True,
-                    enable_token_space_preprocess_cache=enabled,
+                    **cache_args,
                 )
                 publish(server_args, role="test")
                 processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
                     _ImageWidthStrategy, TokenSpaceServingSpec
                 )(None, server_args, _bare_tokenizer(), None)
                 self.addCleanup(processor.shutdown)
-                self.assertIs(
-                    processor._core._item_feature_cache,
-                    processor._mm_preprocess_cache if enabled else None,
-                )
+                self.assertIsInstance(processor._core._item_feature_cache, cache_type)
 
     def test_chat_media_reach_a_partially_expanded_request(self):
         """Chat sends every turn's image; only the new turn's placeholder expands."""
