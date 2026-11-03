@@ -75,7 +75,7 @@ class AdaptiveSpecPolicy(Protocol):
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
 
     @property
-    def required_steps(self) -> list[int]: ...
+    def start_steps(self) -> list[int]: ...
 
     def prebuild_order(self) -> list[int]: ...
 
@@ -132,7 +132,7 @@ class AdaptiveController:
         required ones; ``None`` builds every candidate step.
         """
         self.params.set_cuda_graph_bs(cuda_graph_bs)
-        required = set(self.params.required_steps) | {self.worker.speculative_num_steps}
+        required = set(self.params.start_steps) | {self.worker.speculative_num_steps}
 
         spent_gb = 0.0
         for steps in self.params.prebuild_order():
@@ -143,6 +143,8 @@ class AdaptiveController:
                 and memory_budget_gb is not None
                 and spent_gb >= memory_budget_gb
             ):
+                # Not a break: the worker's initial step is required but may
+                # sort after optional steps when it is not a slot's start step.
                 continue
             # Cost is known only after capture, so the last optional build may
             # overshoot the budget by one state.
