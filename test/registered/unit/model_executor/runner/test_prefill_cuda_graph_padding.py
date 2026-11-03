@@ -5,6 +5,7 @@ from unittest import mock
 import torch
 
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
@@ -54,6 +55,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             _original_forward_mode=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
+            original_global_num_tokens_cpu=None,
             return_logprob=False,
             input_ids=list(range(num_tokens)),
             extend_prefix_lens_cpu=[0],
@@ -283,6 +285,35 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                     batch.global_num_tokens_cpu = [4, 4]
                     batch.can_run_dp_prefill_cuda_graph = all(votes)
                     self.assertEqual(runner.can_run_graph(batch), expected)
+
+    def test_padded_idle_context_keeps_dp_replay_decision_uniform(self):
+        """An idle peer's dummy context can exceed every real request's length."""
+        runner = self._make_runner()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.capture_num_tokens = [8, 8192]
+        runner.max_num_tokens = 8192
+        for bound in ("max_seq_len", "max_context_size"):
+            for limit in (4096, 8192):
+                with self.subTest(bound=bound, limit=limit):
+                    setattr(runner, bound, limit)
+                    active = self._make_forward_batch(8192)
+                    active.batch_size = 2
+                    active.seq_lens_cpu = torch.tensor([4096, 4096])
+                    active.extend_prefix_lens_cpu = [0, 0]
+                    idle = self._make_forward_batch(8192)
+                    for batch in (active, idle):
+                        batch.original_global_num_tokens_cpu = [8192, 0]
+                        batch.global_num_tokens_cpu = [8192, 8192]
+                        batch.can_run_dp_prefill_cuda_graph = True
+                        batch.dp_padding_mode = DpPaddingMode.MAX_LEN
+                    self.assertEqual(
+                        [runner.can_run_graph(batch) for batch in (active, idle)],
+                        [limit >= 8192] * 2,
+                    )
+                    # Aggregate tokens must not bound real multi-request batches.
+                    active.original_global_num_tokens_cpu = [8192, 8192]
+                    self.assertTrue(runner.can_run_graph(active))
+            setattr(runner, bound, None)
 
     def test_context_and_sequence_bounds_both_apply(self):
         runner = self._make_runner()
