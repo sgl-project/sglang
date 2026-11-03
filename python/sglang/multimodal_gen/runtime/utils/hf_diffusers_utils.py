@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import shutil
+import tempfile
 import time
 from functools import reduce
 from pathlib import Path
@@ -482,9 +483,19 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
 
         config["quantization_config"] = normalized_quant_config
         try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, sort_keys=True)
-                f.write("\n")
+            # HF snapshot files are symlinks to shared blobs: replace, don't write through.
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(config_path), suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, sort_keys=True)
+                    f.write("\n")
+                shutil.copymode(config_path, tmp_path)
+                os.replace(tmp_path, config_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
         except OSError as exc:
             logger.warning(
                 "Could not persist normalized ModelOpt config at %s (%s); "
@@ -512,7 +523,7 @@ def get_diffusers_component_config(
 
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
-    if "scheduler" in component_path:
+    if "scheduler" in os.path.basename(os.path.normpath(component_path)):
         config_names.append("scheduler_config.json")
     else:
         config_names.append("config.json")
@@ -612,6 +623,10 @@ def maybe_download_lora(
         if guessed is None and current_platform.is_rocm():
             guessed = _best_guess_weight_name(
                 model_name_or_path, file_extension=".safetensors"
+            )
+        if guessed is None:
+            raise FileNotFoundError(
+                f"No .safetensors LoRA weights found in {local_path}"
             )
         return os.path.join(local_path, guessed)
 
@@ -745,13 +760,16 @@ def _resolve_remote_repo_model_index_path(
         # Cache-aware: no local_dir, so the selected Hub reuses its cache and
         # revalidates the remote file when online.
         return hf_hub_download(repo_id=model_name_or_path, filename=filename)
-    except EntryNotFoundError:
-        if filename == "model_index.json":
-            return _resolve_remote_repo_model_index_path(
-                model_name_or_path, "modular_model_index.json"
-            )
-        raise
     except Exception as online_err:
+        # LocalEntryNotFoundError (Hub unreachable) subclasses EntryNotFoundError.
+        if isinstance(online_err, EntryNotFoundError) and not isinstance(
+            online_err, LocalEntryNotFoundError
+        ):
+            if filename == "model_index.json":
+                return _resolve_remote_repo_model_index_path(
+                    model_name_or_path, "modular_model_index.json"
+                )
+            raise
         cached_path = None
         if not envs.SGLANG_USE_MODELSCOPE.get():
             from huggingface_hub import try_to_load_from_cache
@@ -863,12 +881,16 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             config["_class_name"],
         )
         return config
-    except EntryNotFoundError:
+    except EntryNotFoundError as e:
         logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
-        local_path = maybe_download_model(model_name_or_path)
+        # Hub unreachable: use only the cache.
+        offline = isinstance(e, LocalEntryNotFoundError)
+        local_path = maybe_download_model(
+            model_name_or_path, download=not offline, skip_overlay_resolution=offline
+        )
         config_path = os.path.join(local_path, "config.json")
         if not os.path.exists(config_path):
             raise ValueError(
@@ -1118,8 +1140,7 @@ def maybe_download_model(
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
-                    # In CI, if validation fails after download, we have a serious issue
-                    # If cleanup was performed, the next retry should get a fresh download
+                    # Not retried: the handler below re-raises it as a ValueError.
                     raise ValueError(
                         f"CI validation failed for downloaded model at {local_path}. "
                         f"Some safetensors shards are missing. Cleanup performed: {cleanup_performed}."

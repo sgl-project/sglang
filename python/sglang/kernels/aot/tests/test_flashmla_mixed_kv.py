@@ -6,7 +6,7 @@ from sgl_kernel.flash_mla import (
     get_mla_metadata,
 )
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import (
+from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
     ceil_pow2_scale,
     dequantize_dsv41_packed_main_kv,
     quantize_dsv41_packed_main_kv,

@@ -127,7 +127,7 @@ Insert a key-value pair into the tree.
 | **Mutation** | Creates new leaf nodes; updates component data on overlapping nodes; frees duplicate KV indices; may split nodes; updates LRU lists and evictable sizes |
 | **Complexity** | **O(K + D·C)** |
 
-**Algorithm detail** (the resumable insert steps: `_insert_walk_step` / `_insert_commit_step` / `_insert_tail_step`):
+**Algorithm detail** (the resumable insert steps: `_insert_walk_step` / `_insert_overlap_step` / `_insert_commit_step` / `_insert_tail_step`):
 1. At each existing node, calls `_touch_node` → promotes to MRU via `node_has_component_data()`
 2. If key diverges mid-node, calls `_split_node` → `redistribute_on_node_split()` per component
 3. For each overlapping node, calls `update_component_on_insert_overlap()` per component — returns `consumed_from` index; the tree frees `value[dup_start:consumed_from]` as duplicate pool indices
@@ -269,7 +269,7 @@ Each component implements these hooks. See `base.py` for the ABC and docstrings.
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_walk_step` | returns `prefix_len` |
+| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_overlap_step` | returns `prefix_len` |
 | `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_walk_step` | no-op |
 | `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_commit_step` | no-op |
 

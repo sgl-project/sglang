@@ -417,6 +417,7 @@ class MlxModelRunner:
                 )
                 return
             req.kv.mamba_ping_pong_track_buffer = track_buffer
+            req.kv.mamba_ping_pong_empty = [False]
             req.kv.mamba_next_track_idx = 0
             req.kv.mamba_last_track_idx = 0
 

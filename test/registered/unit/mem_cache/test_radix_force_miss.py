@@ -7,7 +7,7 @@ RadixCache.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -76,7 +76,7 @@ class TestZeroMatchResult(unittest.TestCase):
 class TestMatchKvCacheForceMiss(unittest.TestCase):
     def test_swa_branching_seqlen_is_cleared_without_new_branch(self):
         class _StubTreeCache:
-            def swa_reprefill_tail_tokens(self):
+            def swa_reprefill_tail_tokens(self, req=None):
                 return 0
 
             def match_prefix(self, params):

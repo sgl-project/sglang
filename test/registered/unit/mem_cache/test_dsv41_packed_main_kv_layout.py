@@ -6,19 +6,19 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.torch_quant import (
-    dequantize_dsv41_packed_main_kv,
-    fake_quant_compressed_kv,
-    quantize_dsv41_packed_main_kv,
-)
+from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_compressed_kv
 from sglang.srt.mem_cache.dsv41_main_kv_layout import (
     DSV41_MAIN_KV_LAYOUT,
     PackedMainKVView,
     make_dsv41_packed_main_kv_spec,
     resolve_dsv41_main_kv_layout_specs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
+    dequantize_dsv41_packed_main_kv,
+    quantize_dsv41_packed_main_kv,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -141,9 +141,13 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
 
         backend = SimpleNamespace(
             trtllm_attn=False,
+            mega_attn=False,
             tail_forward_metadata=None,
             forward_metadata=SimpleNamespace(late_layer_tail=None),
             token_to_kv_pool=SimpleNamespace(request_window=None),
+        )
+        backend._use_sparse_prefill = DeepseekV4AttnBackend._use_sparse_prefill.__get__(
+            backend
         )
         forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
         layer = SimpleNamespace(layer_id=0)
@@ -163,6 +167,10 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
                     "sglang.srt.layers.attention.deepseek_v4_backend.envs."
                     "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get",
                     return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_active",
+                    return_value=False,
                 ),
             ):
                 actual = DeepseekV4AttnBackend._low_ratio_prefill_reads_page_indices(

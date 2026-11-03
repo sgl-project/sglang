@@ -110,7 +110,9 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32)
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts,
@@ -141,6 +143,7 @@ class KimiMoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.num_shared_experts is not None:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -514,8 +517,8 @@ class KimiDeltaAttention(nn.Module):
             )
 
         if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
+            not forward_batch.logical_forward_mode.is_decode()
+            and not forward_batch.logical_forward_mode.is_target_verify()
         ):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
