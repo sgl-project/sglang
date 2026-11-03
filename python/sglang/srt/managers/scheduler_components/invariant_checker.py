@@ -8,8 +8,10 @@ from typing import (
     Callable,
     Deque,
     Dict,
+    Iterable,
     List,
     Optional,
+    Set,
     Tuple,
 )
 
@@ -52,6 +54,11 @@ logger = logging.getLogger(__name__)
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
+def _raise_if_any(reqs: Set[Req], message: str) -> None:
+    if reqs:
+        raise RuntimeError(f"{message}: {sorted(req.rid for req in reqs)}")
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
     disaggregation_mode: DisaggregationMode
@@ -66,9 +73,10 @@ class SchedulerInvariantChecker:
     # The lists that hold the live requests, by name (`Scheduler.request_lists`).
     get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
     get_chunked_req: Callable = field(default=lambda: None)
-    get_running_reqs: Callable = field(default=lambda: None)
-    # Under PP, the micro-batches' running batches and step batches.
-    get_pp_running_mbs: Callable = field(default=lambda: ())
+    get_running_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
+    get_prefill_launched_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
+    get_running_batches: Callable = field(default=lambda: ())
+    # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -471,8 +479,9 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
-    def maybe_check_request_lists(self) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, no request is in two lists."""
+    def maybe_check_request_lists(self, batch: ScheduleBatch) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, at the launch of `batch`: each
+        live request is in exactly one list, one that matches its state."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
         owners: Dict[Req, str] = {}
@@ -484,33 +493,39 @@ class SchedulerInvariantChecker:
                     )
                 owners[req] = name
 
-    def maybe_check_running_reqs(
-        self,
-        running_batch: Optional[ScheduleBatch],
-        last_batch: Optional[ScheduleBatch],
-    ) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
-        the unfinished ones the running batches and the steps decode, apart from
-        the chunked request. A launched prefill joins running at its merge."""
-        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            return
-        held = [
-            req
-            for b in (running_batch, *self.get_pp_running_mbs())
-            if b is not None
-            for req in b.reqs
-        ]
-        # An extend step decodes only the rows a mixed step took from a running
-        # batch; its other rows are launched prefills.
-        held += [
-            req
-            for b in (last_batch, *self.get_pp_mbs())
-            if b is not None
-            for req in (
-                (b.decoding_reqs or ()) if b.forward_mode.is_extend() else b.reqs
-            )
-        ]
-        self.get_running_reqs().check(held, chunked_req=self.get_chunked_req())
+        chunked_req = self.get_chunked_req()
+
+        def live(reqs: Iterable[Req]) -> Set[Req]:
+            return {
+                req for req in reqs if not req.finished() and req is not chunked_req
+            }
+
+        in_running_batch = {
+            req for b in self.get_running_batches() if b is not None for req in b.reqs
+        }
+        in_step = {
+            req for b in (batch, *self.get_pp_mbs()) if b is not None for req in b.reqs
+        }
+        running = set(self.get_running_reqs())
+
+        _raise_if_any(
+            live(in_running_batch | in_step) - owners.keys(),
+            "Requests held by a running batch or a step but in no list",
+        )
+        _raise_if_any(
+            in_running_batch & set(self.get_prefill_launched_reqs()),
+            "Requests in prefill_launched but in a running batch",
+        )
+        _raise_if_any(
+            live(in_running_batch) - running,
+            "Requests in a running batch but not in running",
+        )
+        # Only a step in flight takes a running request out of every running
+        # batch: a mixed step's decode row, or an overlap result that finishes it.
+        _raise_if_any(
+            {req for req in running - in_running_batch if req.inflight_steps <= 0},
+            "Requests in running but in no running batch or step",
+        )
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with

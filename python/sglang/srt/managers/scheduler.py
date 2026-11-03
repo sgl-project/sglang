@@ -292,7 +292,6 @@ from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -1370,7 +1369,9 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        self.running_reqs = RunningReqs()
+        # Requests merged into a running batch, until they finish or a retract,
+        # preemption or pause takes them out.
+        self.running_reqs = RequestList()
         # Prefill requests out of the chunked slot whose launched steps their next
         # holder has not taken yet: the running batch at the merge, the PD
         # transfer queue, HiSparse staging, or a requeue.
@@ -2650,8 +2651,10 @@ class Scheduler(
             get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
             get_running_reqs=lambda: self.running_reqs,
-            get_pp_running_mbs=lambda: (
-                self.running_mbs if get_parallel().pp_size > 1 else ()
+            get_prefill_launched_reqs=lambda: self.prefill_launched_reqs,
+            get_running_batches=lambda: (
+                self.running_batch,
+                *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
@@ -4154,7 +4157,6 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
-        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -4734,7 +4736,7 @@ class Scheduler(
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
         self._join_prefill_launched(batch)
-        self.invariant_checker.maybe_check_request_lists()
+        self.invariant_checker.maybe_check_request_lists(batch)
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step once its result is processed."""

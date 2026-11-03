@@ -35,7 +35,6 @@ from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -97,7 +96,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
-        scheduler.running_reqs = RunningReqs()
+        scheduler.running_reqs = RequestList()
         scheduler.prefill_launched_reqs = RequestList()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
