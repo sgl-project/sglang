@@ -419,9 +419,8 @@ def test_short_sparse_graph_lifecycle(
                 else:
                     plan, outputs = run()
                 check(plan, outputs)
-                assert int(manager.history_workspace[2].sum().cpu()) == 0
-            # Ragged chunk prefill publishes current KV and hydrates history
-            # once; the next chunk must reuse that continuous dense prefix.
+            # Ragged prefill publishes host KV and invalidates resident extents.
+            # The following decode is responsible for restoring its prefix.
             manager.reset_requests([1, 2])
             chunk_counts = [65, 128, 0]
             chunk_prefix = [64, 129, 0]
@@ -473,14 +472,22 @@ def test_short_sparse_graph_lifecycle(
 
             def check_chunk(ends):
                 torch.npu.synchronize()
-                for layer_id, cache in enumerate(manager.device_kv_buffer):
+                for layer_id, host in enumerate(manager.host_kv_buffer):
                     for r in range(2):
                         torch.testing.assert_close(
-                            cache[r + 1, : ends[r], 0].cpu(),
+                            host.view(-1, 576)[mapping[r, : ends[r]]],
                             payloads[layer_id][mapping[r, : ends[r]]],
                             rtol=0,
                             atol=0,
                         )
+                    assert manager.resident_begin[layer_id, 1:3].cpu().tolist() == [
+                        -1,
+                        -1,
+                    ]
+                    assert manager.resident_end[layer_id, 1:3].cpu().tolist() == [
+                        -1,
+                        -1,
+                    ]
 
             ends = set_chunk(chunk_prefix)
             publish_chunk()
@@ -495,7 +502,6 @@ def test_short_sparse_graph_lifecycle(
             else:
                 publish_chunk()
             check_chunk(ends)
-            assert int(manager.history_workspace[2].sum().cpu()) == 0
 
             # Refill the neighbor after the independent prefill reset, then
             # verify that reusing only request 1 preserves request 2's plan.

@@ -1,5 +1,7 @@
 """CPU contracts for native-only sparse offload and actual query geometry."""
 
+import importlib
+import sys
 import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -24,6 +26,24 @@ register_cpu_ci(est_time=3, stage="base-a")
 
 
 class TestLIMState(CustomTestCase):
+    def test_fused_attention_rejects_missing_host_publication_before_side_effects(self):
+        module_name = (
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention"
+        )
+        manager = SimpleNamespace(offload_v2=Mock())
+        backend = SimpleNamespace(sparse_kv_manager=manager)
+        with patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}):
+            attention = importlib.import_module(module_name)
+            with patch.object(torch, "cat") as cat:
+                with self.assertRaisesRegex(
+                    ValueError, "publishing current KV to host"
+                ):
+                    attention.forward_sparsity_driven_kv_offload(
+                        backend, None, None, None, None, None, save_kv_cache=False
+                    )
+            cat.assert_not_called()
+        manager.offload_v2.assert_not_called()
+
     def options(self, **kwargs):
         return dict(
             request_rows=3,

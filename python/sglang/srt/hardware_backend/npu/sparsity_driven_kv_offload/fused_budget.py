@@ -55,8 +55,7 @@ def resolve_sparse_kv_budget(
     adapter += (num_layers + 1) * (request_rows + 1) * 4
     slot_map = num_layers * (request_rows + 1) * context_len * 4
     stride = capacity
-    copy_bytes = batch * stride * 17 + tokens * 9
-    copy_bytes += num_layers * request_rows * 8 + request_rows * 12
+    copy_bytes = num_layers * request_rows * 8
     copy_bytes += tokens * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)
     copy_bytes += batch * (2 + stride // 128 + context_len // 128) * 4
     result = SparseKVBudget(

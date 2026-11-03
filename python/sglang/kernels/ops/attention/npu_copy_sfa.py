@@ -40,6 +40,7 @@ def fused_scatter_copy_sparse_flash_attention(
     operator=None,
     full_visible=False,
     resident_refresh_tail=False,
+    resident_inputs=None,
 ) -> None:
     """Copy resident KV and attend to selected combined-cache tokens.
 
@@ -84,7 +85,14 @@ def fused_scatter_copy_sparse_flash_attention(
         attention_out,
         scale_value,
     )
-    if resident_refresh_tail:
+    if resident_inputs is not None:
+        operator(
+            *inputs,
+            full_visible=full_visible,
+            resident_refresh_tail=resident_refresh_tail,
+            **resident_inputs,
+        )
+    elif resident_refresh_tail:
         operator(*inputs, full_visible=True, resident_refresh_tail=True)
     elif full_visible:
         operator(*inputs, full_visible=True)

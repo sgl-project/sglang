@@ -29,7 +29,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     prepare_mtp_rows,
-    sparse_query_width,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
@@ -180,22 +179,7 @@ class SparseKVCacheManager:
             (self.layer_num, self.size), -1, dtype=torch.int32, device=self.device
         )
         self.resident_end = torch.full_like(self.resident_begin, -1)
-        self.next_extents = tuple(
-            torch.empty(self.size, dtype=torch.int32, device=self.device)
-            for _ in range(3)
-        )
-        history_count = self.batch_capacity * self.device_cache_size
-        hs = torch.empty(history_count, dtype=torch.int64, device=self.device)
-        self.history_workspace = (
-            hs,
-            torch.empty_like(hs),
-            torch.empty(history_count, dtype=torch.bool, device=self.device),
-        )
         token_capacity = self.batch_capacity * self.max_query_width
-        self.current_workspace = (
-            torch.empty(token_capacity, dtype=torch.int64, device=self.device),
-            torch.empty(token_capacity, dtype=torch.bool, device=self.device),
-        )
         self.device_slot_map = [
             torch.full(
                 (self.size + 1, self._slot_map_width),
@@ -341,7 +325,14 @@ class SparseKVCacheManager:
         self.lim_adapter.reset_requests(req_ids_tensor)
 
     def copy_sfa_attention(
-        self, layer, query_nope, query_rope, query_heads, scale_value, plan
+        self,
+        layer,
+        query_nope,
+        query_rope,
+        query_heads,
+        scale_value,
+        plan,
+        current_inputs,
     ):
         batch = plan.request_slots.numel()
         rows = batch * plan.query_width
@@ -377,6 +368,16 @@ class SparseKVCacheManager:
             operator=self._copy_sfa_operator,
             full_visible=True,
             resident_refresh_tail=plan.query_width > 1,
+            resident_inputs={
+                "current": current_inputs[0],
+                "positions": current_inputs[1],
+                "valid": current_inputs[2],
+                "request_slots": plan.request_slots,
+                "req_to_token": self.req_to_token_pool.req_to_token,
+                "resident_begin": self.resident_begin[layer_idx],
+                "resident_end": self.resident_end[layer_idx],
+                "host_token_capacity": self.host_token_capacity,
+            },
         )
         valid = (
             plan.valid_rows[:, None].expand(batch, plan.query_width).reshape(rows, 1)
@@ -411,7 +412,7 @@ class SparseKVCacheManager:
         stream: torch.npu.Stream,
         plan=None,
     ):
-        """Publish new KV to paged host storage and maintain dense HBM rows."""
+        """Publish KV to paged host storage and return decode rows for CopySFA."""
         layer_idx = layer.layer_id - self.start_layer
         device = k.device
 
@@ -574,59 +575,15 @@ class SparseKVCacheManager:
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
 
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_kv_residency import (
-                stage_resident_kv,
-            )
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                # A prefill can rewrite an existing request's host prefix.
+                # Invalidate only this layer's resident extent.
+                requests = forward_batch.req_pool_indices.to(torch.long)
+                self.resident_begin[layer_idx].index_fill_(0, requests, -1)
+                self.resident_end[layer_idx].index_fill_(0, requests, -1)
+                return None
 
-            width = (
-                sparse_query_width(forward_batch)
-                if not forward_batch.forward_mode.is_extend_without_speculative()
-                else 1
-            )
-            if plan is not None:
-                lengths = plan.seq_lens
-                first = forward_batch.positions[
-                    : forward_batch.batch_size * width
-                ].view(forward_batch.batch_size, width)[:, 0]
-            elif not forward_batch.forward_mode.is_extend_without_speculative():
-                logical = forward_batch.batch_size * width
-                positions = forward_batch.positions[:logical].view(
-                    forward_batch.batch_size, width
-                )
-                lengths = positions[:, -1] + 1
-                first = positions[:, 0]
-            else:
-                lengths = forward_batch.seq_lens
-                first = extend_prefix_lens
-            current_workspace = self.current_workspace
-            if num_src_rows > current_workspace[0].numel():
-                # Chunked prefill can exceed decode scratch; these temporary
-                # tensors belong to that forward/captured graph's memory pool.
-                current_workspace = (
-                    torch.empty(num_src_rows, dtype=torch.int64, device=device),
-                    torch.empty(num_src_rows, dtype=torch.bool, device=device),
-                )
-            stage_resident_kv(
-                current=src_tensor,
-                source_indices=src_index,
-                host=dst_tensor,
-                host_address=self.dev_ptr_list[layer_idx],
-                cache=self.device_kv_buffer[layer_idx],
-                req_to_token=self.req_to_token_pool.req_to_token,
-                requests=forward_batch.req_pool_indices,
-                lengths=lengths,
-                first_positions=first,
-                token_requests=token_requests.contiguous(),
-                token_positions=token_positions.contiguous(),
-                token_valid=valid_mask,
-                old_begin=self.resident_begin[layer_idx],
-                old_end=self.resident_end[layer_idx],
-                next_extents=self.next_extents,
-                history_workspace=self.history_workspace,
-                current_workspace=current_workspace,
-                capacity=self.cache_capacity,
-                context_len=self.logical_max_context_len,
-            )
+            return src_tensor, token_positions, valid_mask
 
     def get_forward_kv(
         self,
