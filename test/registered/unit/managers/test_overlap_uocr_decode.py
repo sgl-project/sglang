@@ -19,6 +19,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -67,6 +68,7 @@ def _hooks(current_io):
         decode_graph_io=current_io,
         crop_transfer=Mock(),
         enable_overlap=False,
+        abort_windows=Mock(),
     )
 
 
@@ -300,7 +302,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         hooks._reuse.sources[1] = object()
         self.assertTrue(hooks.blocks_flush(ignore_waiting=True))
         hooks._reuse.sources.clear()
-        hooks._prefetch._parked["w0"] = SimpleNamespace(rid="w1")
+        hooks._prefetch._parked.join([FakeReq(rid="w1")])
         self.assertTrue(hooks.blocks_flush(ignore_waiting=False))
         self.assertFalse(hooks.blocks_flush(ignore_waiting=True))
 
@@ -308,8 +310,8 @@ class TestFlushWithDocumentState(CustomTestCase):
         """Held windows must get an answer, and the retained windows must be
         forgotten before the clear returns their KV to the pools."""
         hooks, _ = self._hooks()
-        held = SimpleNamespace(rid="w1")
-        hooks._prefetch._parked["w0"] = held
+        held = FakeReq(rid="w1")
+        hooks._prefetch._parked.join([held])
         hooks._reuse.docs["doc"] = object()
         seen = []
         scheduler = object.__new__(Scheduler)

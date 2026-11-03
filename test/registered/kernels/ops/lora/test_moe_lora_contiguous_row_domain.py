@@ -9,19 +9,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.lora.moe.activation import ActivationFn
+from sglang.kernels.ops.lora.moe.dispatch_contiguous import contiguous_m_pad_ceiling
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
-    contiguous_m_pad_ceiling,
 )
-from sglang.srt.lora.moe.plan import (
-    ActivationFn,
-    SelectedPlan,
-    _build_plan,
-    _load_plans,
-    _tile_table,
-)
+from sglang.srt.lora.moe.plan import SelectedPlan, _build_plan, _load_plans, _tile_table
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.utils import Phase
 from sglang.srt.runtime_context import get_context

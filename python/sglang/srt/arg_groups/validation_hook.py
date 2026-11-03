@@ -9,11 +9,10 @@ import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     declare_resolution,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig

@@ -9,6 +9,13 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -61,6 +68,19 @@ class TestSchedulerFlushCacheAfterRetract(CustomTestCase):
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
+        scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
+        scheduler.running_reqs = []
+        scheduler.dllm_config = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.hisparse_coordinator = None
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         scheduler.tree_cache = MagicMock()
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import ResolvedView
+from sglang.srt.arg_groups.model_override_base import ResolvedView
 
 from .config import WatermarkConfigError, _read_config_file, load_watermark_config
 from .core import resolve_watermark_request

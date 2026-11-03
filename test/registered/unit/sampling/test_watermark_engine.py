@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.arg_groups.fields.exec_ import ExecFeatures, ExecKernel
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.serving_hook import handle_watermark_config
 from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
 from sglang.srt.managers.io_struct import GenerateReqInput

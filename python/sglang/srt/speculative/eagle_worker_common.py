@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -23,7 +24,6 @@ from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.sampling.watermarking.synthid_request import is_enabled
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,

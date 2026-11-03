@@ -72,7 +72,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_topk,
     get_plan_stream,
     select_top_k_tokens,
     spec_stage_span,
@@ -83,6 +82,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+from sglang.srt.utils.common import fast_topk
 
 logger = logging.getLogger(__name__)
 
