@@ -308,7 +308,7 @@ def validate_input_length(
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
                 f"the maximum allowed length ({max_req_input_len} tokens). "
-                f"This model's maximum context length is {max_req_input_len} "
+                f"This model's maximum context length is {max_req_input_len - 1} "
                 f"tokens on this server. "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
