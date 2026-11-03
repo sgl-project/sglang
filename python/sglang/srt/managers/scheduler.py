@@ -4071,15 +4071,36 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
-        batch.input_ids = None
-
         if not batch.spec_algorithm.is_none():
+            # Spec: seed the relay with the transferred draft state (topk /
+            # hidden states / dsa topk) so the first draft decode after
+            # staging can run the cuda-graph path. Without the dsa seed the
+            # draft is forced eager, whose pre-DP-pad metadata init crashes
+            # under uneven DP batch sizes (stale page-table rows).
+            # build_disagg_draft_input stashes the relay only under overlap
+            # schedule; PP prefill forces overlap off, so stash explicitly.
+            seed = batch.spec_algorithm.build_disagg_draft_input(
+                batch, last_tokens, self.future_map
+            )
+            if seed is not None:
+                self.future_map.stash(
+                    batch.req_pool_indices, RelayPayload.from_draft_input(seed)
+                )
+            else:
+                # Standalone has no transferred draft state; the staged input
+                # only needs the bonus token.
+                self.future_map.stash(
+                    batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+                )
+            batch.input_ids = None
             batch.spec_info = self.future_map.make_staged_spec_input(
                 batch.req_pool_indices
             )
+        else:
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
+            batch.input_ids = None
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]

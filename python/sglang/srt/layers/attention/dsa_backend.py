@@ -32,6 +32,29 @@ from sglang.srt.runtime_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def rebuild_padded_draft_page_table(
+    metadata, forward_batch, topk_indices, req_to_token_pool
+):
+    """Rebuild ``metadata.page_table_1`` for a DP-padded eager draft batch.
+
+    Eager draft under DP-attention: the batch was padded to the global DP
+    size after this backend's metadata was planned, so the planned page table
+    has fewer rows than the padded ``topk_indices``. Rebuild the table for
+    the padded batch from ``req_to_token``; dummy padded rows get a valid
+    1-col row, their topk is all -1 (masked) so the gather is inert.
+    """
+    pt = metadata.page_table_1
+    max_seqlen_k = int(forward_batch.seq_lens.max().item())
+    rebuilt = req_to_token_pool.req_to_token[
+        forward_batch.req_pool_indices[: topk_indices.shape[0]],
+        : max(max_seqlen_k + 1, pt.shape[1]),
+    ]
+    object.__setattr__(metadata, "page_table_1", rebuilt.to(pt.dtype))
+    return metadata.page_table_1
+
+
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged_dsa,
@@ -2780,6 +2803,16 @@ class DeepseekSparseAttnBackend(
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
+            if (
+                metadata.page_table_1 is not None
+                and metadata.page_table_1.shape[0] != topk_indices.shape[0]
+            ):
+                rebuild_padded_draft_page_table(
+                    metadata,
+                    forward_batch,
+                    topk_indices,
+                    self.req_to_token_pool,
+                )
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
