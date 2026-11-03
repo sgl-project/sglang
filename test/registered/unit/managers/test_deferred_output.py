@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -53,6 +54,13 @@ def _scheduler():
     scheduler.chunked_req = None
     scheduler.hisparse_coordinator = None
     scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.prefill_launched_reqs = RequestList()
+    scheduler.running_reqs = []
+    scheduler.dllm_config = None
+    scheduler.disagg_prefill_bootstrap_queue = None
+    scheduler.disagg_prefill_transfer_queue = None
+    scheduler.disagg_decode_prealloc_queue = None
+    scheduler.disagg_decode_transfer_queue = None
     scheduler.ipc_channels = Mock()
     scheduler.rust_server = None
     streamer = object.__new__(SchedulerOutputStreamer)
