@@ -71,7 +71,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.chunked_reqs = _RequestList(ListKind.CHUNKED)
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
-        s.policy = Mock()
+        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192

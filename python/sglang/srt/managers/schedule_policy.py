@@ -204,11 +204,13 @@ class SchedulePolicy:
 
     def calc_priority(
         self,
-        waiting_queue: List[Req],
+        waiting: Iterable[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: Iterable[Req] = (),
-    ) -> None:
+    ) -> List[Req]:
+        """The waiting requests in the order the policy admits them."""
+        waiting_queue = list(waiting)
         policy = self._determine_active_policy(waiting_queue)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
@@ -271,6 +273,7 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
         self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
+        return waiting_queue
 
     def _touch_waiting_prefixes(
         self,

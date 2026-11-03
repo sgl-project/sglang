@@ -400,7 +400,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.waiting_queue.join([waiting])
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock()
+        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.disagg_prefill_bootstrap_queue = None
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None

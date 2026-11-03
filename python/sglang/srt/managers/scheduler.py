@@ -4363,18 +4363,18 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        waiting = list(self.waiting_queue)
-        self.policy.calc_priority(
-            waiting,
-            running_batch,
-            processed_tokens=self.processed_tokens_counter,
-            bootstrap_queue=(
-                self.disagg_prefill_bootstrap_queue.queue
-                if self.disagg_prefill_bootstrap_queue is not None
-                else []
-            ),
+        self.waiting_queue.replace(
+            self.policy.calc_priority(
+                self.waiting_queue,
+                running_batch,
+                processed_tokens=self.processed_tokens_counter,
+                bootstrap_queue=(
+                    self.disagg_prefill_bootstrap_queue.queue
+                    if self.disagg_prefill_bootstrap_queue is not None
+                    else []
+                ),
+            )
         )
-        self.waiting_queue.replace(waiting)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds

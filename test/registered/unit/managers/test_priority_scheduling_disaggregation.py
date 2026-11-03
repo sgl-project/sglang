@@ -995,8 +995,8 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
         scheduler.enable_priority_scheduling = True
-        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
-            waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: sorted(
+            waiting_queue, key=lambda req: -req.priority
         )
 
         new_batch = MagicMock()

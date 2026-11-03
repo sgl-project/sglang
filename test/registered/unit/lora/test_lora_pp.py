@@ -143,7 +143,9 @@ class TestAllPPLoras(CustomTestCase):
             is_mixed_chunk=False,
             dllm_config=None,
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
-            policy=mock.Mock(),
+            policy=mock.Mock(
+                calc_priority=lambda waiting, *args, **kwargs: list(waiting)
+            ),
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
             get_num_allocatable_reqs=lambda *args, **kwargs: 1,
