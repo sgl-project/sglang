@@ -579,7 +579,7 @@ def test_upstream_mla_indexer_scale_and_packed_kv_keys(fp8_packed):
 def test_c128_backup_respects_rank_ownership(backup_skip):
     controller = HybridCacheController.__new__(HybridCacheController)
     controller.page_size = 128
-    controller.backup_skip = backup_skip
+    controller.storage_config = SimpleNamespace(is_storage_writer=not backup_skip)
     controller.storage_backend_type = "npu_memcache"
     controller.mem_pool_host = _make_host_group()
     backend = controller.storage_backend = _make_memcache()
