@@ -19,7 +19,7 @@ from array import array
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Dict, Optional
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,

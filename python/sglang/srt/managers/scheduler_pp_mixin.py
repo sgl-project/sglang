@@ -24,10 +24,8 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
@@ -1670,6 +1668,12 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                if pp_proxy_tensors is not None:
+                    # Prevent allocator reuse of received tensors while the forward
+                    # stream is still consuming them.
+                    for tensor in pp_proxy_tensors.tensors.values():
+                        if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
+                            tensor.record_stream(self.forward_stream)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,

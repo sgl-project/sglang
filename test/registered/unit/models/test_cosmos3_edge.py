@@ -25,12 +25,9 @@ import torch
 
 from sglang.srt.configs.cosmos3 import Cosmos3EdgeConfig
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.cosmos3_edge import Cosmos3EdgeForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,

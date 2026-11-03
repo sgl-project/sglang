@@ -11,8 +11,9 @@ from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import (
     gpu_tensor_blake3,
     gpu_tensors_blake3,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

@@ -27,7 +27,6 @@ from sglang.srt.utils import register_xpu_device_properties_for_dynamo
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-
 logger = logging.getLogger(__name__)
 
 _fake_ops_registered = False
