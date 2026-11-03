@@ -26,7 +26,7 @@ template <int STATE_GROUP>
 torch::Tensor&
 all_gather(torch::Tensor& result, torch::Tensor& data, int dim, size_t numel, int data_size, int64_t handle);
 
-void reduce_scatter_outer_loop(torch::Tensor& output, torch::Tensor& data, size_t numel, int data_size, int64_t handle);
+void reduce_scatter_outer_loop(torch::Tensor& output, torch::Tensor& data, size_t numel, int64_t handle);
 
 void all_to_all(char* output_ptr, char* input_ptr, size_t data_size, int64_t handle);
 
