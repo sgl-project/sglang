@@ -933,7 +933,7 @@ class DefaultModelLoader(BaseModelLoader):
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
         except (KeyError, ValueError):
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.utils.hf_transformers import get_config
 
             hf_config = get_config(
                 model_config.model_path,

@@ -23,6 +23,7 @@ import tempfile
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
 
 logger = logging.getLogger(__name__)
@@ -198,10 +199,12 @@ def asm_kernel_available() -> bool:
     failure disables the kernel for the rest of the process."""
     global _available
     if _available is None:
-        arch = ""
-        if torch.version.hip and torch.cuda.is_available():
-            arch = torch.cuda.get_device_properties(0).gcnArchName
-        _available = arch.startswith("gfx950") and os.path.exists(_clang())
+        hip = current_arch().hip
+        _available = (
+            hip is not None
+            and hip.gcn_arch.startswith("gfx950")
+            and os.path.exists(_clang())
+        )
     return _available and _disabled_reason is None
 
 
@@ -301,9 +304,7 @@ def _magic_u32(d):
 
 
 def mtp_verify_attn_num_segments(num_seqs: int, num_kv_heads: int) -> int:
-    num_cus = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    num_cus = current_arch().num_sms
     segs = max(1, num_cus // max(1, num_seqs * num_kv_heads))
     segs = 1 << (segs.bit_length() - 1)
     return max(1, min(64, segs))
@@ -315,12 +316,7 @@ _SEG_PLAN_TARGET_WGS = None
 def _seg_plan_target_wgs() -> int:
     global _SEG_PLAN_TARGET_WGS
     if _SEG_PLAN_TARGET_WGS is None:
-        _SEG_PLAN_TARGET_WGS = max(
-            1,
-            torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count,
-        )
+        _SEG_PLAN_TARGET_WGS = max(1, current_arch().num_sms)
     return _SEG_PLAN_TARGET_WGS
 
 

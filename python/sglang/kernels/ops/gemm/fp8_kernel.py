@@ -8,10 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
-    get_device_core_count,
     get_device_name,
     is_cuda,
     is_gfx1250_supported,
@@ -679,7 +679,7 @@ if _is_hip:
         num_workgroups = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
             N, META["BLOCK_SIZE_N"]
         )
-        num_workgroups <= get_device_core_count()
+        num_workgroups <= current_arch().num_sms
 
     def select_w8a8_block_fp8_matmul_kernel(M, N, META):
         if use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):

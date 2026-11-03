@@ -13,7 +13,7 @@ import torch
 from sglang.srt.layers.layer_boundary import UnreducedOutput
 from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_attn_input
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -434,7 +434,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
     def test_tp6_does_not_use_aiter_fusion(self):
         self.assertFalse(self._evaluate_gate(dp_attention=False, tp_world_size=6))
 
-    PREFILL_MODES = (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL)
+    PREFILL_MODES = (ForwardMode.EXTEND, ForwardMode.MIXED)
     DECODE_MODES = (
         ForwardMode.DECODE,
         ForwardMode.TARGET_VERIFY,
