@@ -1898,6 +1898,36 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
+    def prepare_cp_metadata(self, batch, *, lengths=None, prefixes=None):
+        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+
+        if not (
+            is_sharded_cp_enabled(self.server_args)
+            and batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
+        if batch.prefill_cp_metadata is not None:
+            return
+        # Hybrid CP is selected by server args; only the full-attention backend
+        # owns the shared token layout and KV exchange workspace.
+        self.attn_backend.full_attn_backend._prepare_cp_metadata(
+            batch,
+            batch.extend_lens if lengths is None else lengths,
+            batch.prefix_lens if prefixes is None else prefixes,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import (
+            make_gdn_cp_conv_metadata,
+        )
+
+        metadata = batch.prefill_cp_metadata
+        metadata.gdn_conv_metadata = tuple(
+            make_gdn_cp_conv_metadata(metadata, device="cpu")
+        )
+        metadata.upload()
+        metadata.resolve_kv_slots(
+            self.req_to_token_pool.req_to_token, batch.out_cache_loc
+        )
+
     def forward(
         self,
         forward_batch: ForwardBatch,

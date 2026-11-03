@@ -4960,6 +4960,7 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            self.tp_worker.model_runner.prepare_cp_metadata(batch)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).

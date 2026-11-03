@@ -339,9 +339,10 @@ def _prepare_qkv_inputs(convolved, layer, width, *, fused=True):
     )
 
 
-def make_gdn_cp_conv_metadata(frame):
+def make_gdn_cp_conv_metadata(frame, *, device=None):
     """Cache length-dependent launch tensors to avoid per-layer blocking H2D copies."""
-    has_initial_state = torch.ones(1, device=frame.device, dtype=torch.bool)
+    device = frame.device if device is None else device
+    has_initial_state = _cp_metadata_tensor([True], device=device, dtype=torch.bool)
     by_count, metadata = {}, []
     for length in frame.lengths:
         width = (length + 64 * frame.world - 1) // (64 * frame.world) * 64
@@ -349,7 +350,7 @@ def make_gdn_cp_conv_metadata(frame):
         if count not in by_count:
             by_count[count] = dict(
                 query_start_loc=_cp_metadata_tensor(
-                    [0, count], device=frame.device, dtype=torch.int32
+                    [0, count], device=device, dtype=torch.int32
                 ),
                 has_initial_state=has_initial_state,
                 seq_lens_cpu=[count],
@@ -942,9 +943,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # tracking indices are unused here and their mask/nonzero queries
             # would synchronize the forward stream with the host.
             self.forward_metadata = None
-            self.cp_conv_metadata = make_gdn_cp_conv_metadata(
-                forward_batch.prefill_cp_metadata
-            )
+            self.cp_conv_metadata = forward_batch.prefill_cp_metadata.gdn_conv_metadata
+            if len(self.cp_conv_metadata) != forward_batch.batch_size:
+                raise ValueError(
+                    "GDN convolution metadata must be prepared with the CP batch"
+                )
             self.cp_state_slots = self.req_to_token_pool.get_mamba_indices(
                 forward_batch.req_pool_indices
             ).long()

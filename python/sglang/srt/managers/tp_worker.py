@@ -655,6 +655,7 @@ class TpModelWorker(BaseTpWorker):
                     # Replay reads restored main/indexer KV before the normal extend.
                     run_encoder_swa_replay(self, batch)
 
+            self.model_runner.prepare_cp_metadata(batch)
             forward_batch = ForwardBatch.init_new(
                 batch if folded is None else folded.batch,
                 self.model_runner,

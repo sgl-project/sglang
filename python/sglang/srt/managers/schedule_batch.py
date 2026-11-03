@@ -1880,6 +1880,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
     reqs: List[Req]
+    prefill_cp_metadata: Optional[ShardedContextParallelMetadata] = None
 
     # === Global config and shared resources (engine-lifetime; identical across batches) ===
     # Memory pool and cache
@@ -2277,6 +2278,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        self.prefill_cp_metadata = None
         self.mamba_track_checkpoints = None
         self.forward_mode = ForwardMode.EXTEND
 
@@ -3261,6 +3263,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def prepare_for_decode(self):
+        self.prefill_cp_metadata = None
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
@@ -3365,6 +3368,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        self.prefill_cp_metadata = None
         strip_beam_tail(self)
         if keep_indices is None:
             if isinstance(reqs_to_exclude, Req):
@@ -3450,6 +3454,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        self.prefill_cp_metadata = None
         strip_beam_tail(self)
         strip_beam_tail(other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -3563,6 +3568,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             mamba_track_checkpoints=self.mamba_track_checkpoints,
+            prefill_cp_metadata=self.prefill_cp_metadata,
             mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
             mamba_prefill_track_mask_cpu=self.mamba_prefill_track_mask_cpu,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,

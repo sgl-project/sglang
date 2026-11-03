@@ -592,52 +592,39 @@ class AttentionBackend(ABC):
             transport=get_parallel().attn_cp_transport,
         )
 
-    @profile_method("sglang.attention.prepare_cp_metadata")
-    def _init_cp_forward_metadata(self, forward_batch):
-        from sglang.srt.layers.cp.utils import (
-            ShardedContextParallelMetadata,
-            make_cp_attention_segments,
-        )
+    def _prepare_cp_metadata(self, batch, lengths, prefixes):
+        from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
 
-        if forward_batch.forward_mode.is_idle():
-            forward_batch.prefill_cp_metadata = None
-            return
-        if not forward_batch.forward_mode.is_extend_without_speculative():
-            raise ValueError("Ring CP only supports eager prefill")
-        metadata = ShardedContextParallelMetadata.from_prefill(
-            forward_batch,
+        metadata = ShardedContextParallelMetadata.plan_prefill(
+            lengths,
+            prefixes,
             self.device,
             cp_mode=self.prefill_cp_mode,
             residual_exchange=self.residual_exchange,
             previous=self.forward_metadata,
-        )
-        if metadata.layout.capacity > self.cp_exchange.capacity:
-            raise ValueError(
-                "Ring CP frame exceeds the startup workspace: "
-                f"active={metadata.layout.capacity}, reserved={self.cp_exchange.capacity}"
-            )
-        self.forward_metadata = metadata
-        forward_batch.prefill_cp_metadata = metadata
-        metadata.attention_segments = make_cp_attention_segments(
-            layout=metadata.layout,
-            rank=metadata.rank,
-            device=self.device,
+            request_indices=[req.kv.req_pool_idx for req in batch.reqs],
+            request_stride=self.req_to_token_pool.req_to_token.shape[1],
             packed_kv=self.cp_packed_kv,
             needs_kv_descale=self.kv_cache_dtype == torch.float8_e4m3fn,
         )
-        req_table = self.req_to_token_pool.req_to_token
-        metadata.kv_read_slots = torch.cat(
-            [
-                req_table[
-                    forward_batch.req_pool_indices[i : i + 1],
-                    metadata.rank : length : metadata.world,
-                ]
-                .reshape(-1)
-                .long()
-                // metadata.world
-                for i, length in enumerate(metadata.layout.seq_lens)
-            ]
-        )
+        if metadata.layout.capacity > self.cp_exchange.capacity:
+            raise ValueError("CP frame exceeds the startup KV workspace")
+        batch.prefill_cp_metadata = metadata
+
+    def _init_cp_forward_metadata(self, forward_batch):
+        if forward_batch.forward_mode.is_idle():
+            forward_batch.prefill_cp_metadata = None
+            return
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            raise ValueError("Sharded CP only supports eager prefill")
+        metadata = forward_batch.prefill_cp_metadata
+        if metadata is None:
+            raise RuntimeError(
+                "CP metadata must be prepared with the batch before forward"
+            )
+        metadata.original_non_padded = forward_batch.num_token_non_padded
+        metadata.record_stream(torch.cuda.current_stream())
+        self.forward_metadata = metadata
 
     @profile_method("sglang.attention.cp.forward")
     def forward_cp(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
@@ -651,12 +638,7 @@ class AttentionBackend(ABC):
         if save_kv_cache:
             to_cache = metadata.route("attention", "kv")
             local_kv = to_cache(torch.stack((k, v), dim=1))
-            write_slots = (
-                forward_batch.out_cache_loc.index_select(
-                    0, metadata.kv_write_indices
-                ).long()
-                // metadata.world
-            )
+            write_slots = metadata.kv_write_slots
             if write_slots.numel():
                 pool.set_kv_buffer(
                     layer,

@@ -475,6 +475,14 @@ def _check_backend(cache, packed, seq_lens, query_lens, expected, reference):
             ).exchange,
         )
     )
+    # Follow the serving order: CPU plan and upload before backend binding.
+    batch.reqs = [
+        SimpleNamespace(kv=SimpleNamespace(req_pool_idx=i))
+        for i in range(len(seq_lens))
+    ]
+    backend._prepare_cp_metadata(batch, query_lens, batch.extend_prefix_lens_cpu)
+    batch.prefill_cp_metadata.upload()
+    batch.prefill_cp_metadata.resolve_kv_slots(table, batch.out_cache_loc)
     backend.init_forward_metadata(batch)
     frame = batch.prefill_cp_metadata
     layer = SimpleNamespace(
@@ -1286,7 +1294,10 @@ class TestContextParallelMetadata(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gdn_metadata_does_not_read_device_state_on_host(self):
-        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.attention.linear.gdn_backend import (
+            GDNAttnBackend,
+            make_gdn_cp_conv_metadata,
+        )
 
         backend = object.__new__(GDNAttnBackend)
         backend.kernel_dispatcher = SimpleNamespace(use_context_parallel=True)
@@ -1307,6 +1318,9 @@ class TestContextParallelMetadata(unittest.TestCase):
             batch_size=3,
             mamba_track_checkpoints=checkpoints,
             mamba_track_mask=torch.tensor([True, False, True], device="cuda"),
+        )
+        batch.prefill_cp_metadata.gdn_conv_metadata = make_gdn_cp_conv_metadata(
+            batch.prefill_cp_metadata
         )
         torch.cuda.synchronize()
         mode = torch.cuda.get_sync_debug_mode()
@@ -1333,6 +1347,141 @@ class TestContextParallelMetadata(unittest.TestCase):
         batch.mamba_track_checkpoints = None
         with self.assertRaisesRegex(ValueError, "scheduler checkpoint"):
             backend.init_forward_metadata(batch)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cpu_planning_and_batched_upload_across_streams(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        schedule, forward = torch.cuda.Stream(), torch.cuda.Stream()
+        previous = None
+        for lengths, prefixes in (
+            ((129, 65), (7, 3)),
+            ((129, 65), (9, 5)),
+            ((1, 0), (0, 0)),
+        ):
+            # Planning may describe CUDA execution but must not initialize or
+            # synchronize CUDA, launch kernels, or upload individual indices.
+            with patch(
+                "torch.Tensor.to",
+                side_effect=AssertionError("CPU plan uploaded a tensor"),
+            ):
+                frame = ContextParallelMetadata.plan_prefill(
+                    lengths,
+                    prefixes,
+                    device,
+                    request_indices=(2, 0),
+                    request_stride=512,
+                    previous=previous,
+                    cp_mode="round-robin-split",
+                )
+            with torch.cuda.stream(schedule):
+                from sglang.srt.layers.attention.linear.gdn_backend import (
+                    make_gdn_cp_conv_metadata,
+                )
+
+                frame.gdn_conv_metadata = tuple(
+                    make_gdn_cp_conv_metadata(frame, device="cpu")
+                )
+                frame.upload()
+                self.assertEqual(len(frame.device_buffers), 1)
+                self.assertEqual(
+                    frame.gdn_conv_metadata[0]["has_initial_state"].dtype, torch.bool
+                )
+                # Preserve warmup's pointer specialization even for the bool
+                # metadata of a one-token request with empty CP peers.
+                for metadata in frame.gdn_conv_metadata:
+                    for name in ("has_initial_state", "query_start_loc"):
+                        self.assertEqual(metadata[name].data_ptr() % 16, 0)
+                table = (
+                    torch.arange(4 * 512, device=device, dtype=torch.int32).reshape(
+                        4, 512
+                    )
+                    * 2
+                )
+                locations = torch.arange(sum(lengths), device=device) * 2
+                frame.resolve_kv_slots(table, locations)
+            with torch.cuda.stream(forward):
+                forward.wait_stream(schedule)
+                frame.record_stream(forward)
+                actual = frame.kv_read_slots.clone()
+                writes = frame.kv_write_slots.clone()
+            forward.synchronize()
+            expected = torch.cat(
+                [
+                    torch.arange(n + p)[frame.rank :: frame.world] + slot * 512
+                    for n, p, slot in zip(lengths, prefixes, (2, 0))
+                ]
+            )
+            torch.testing.assert_close(actual.cpu(), expected.long())
+            torch.testing.assert_close(
+                writes.cpu(),
+                torch.tensor(frame.layout.new_kv_indices[frame.rank], dtype=torch.long),
+            )
+            self.assertTrue(
+                all(plan.send_indices.is_cuda for plan in frame.routes.values())
+            )
+            previous = frame
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_runner_prepares_then_backend_only_binds_metadata(self):
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        table = torch.arange(1024, dtype=torch.int32, device="cuda").reshape(2, 512) * 2
+        pool = SimpleNamespace(req_to_token=table)
+        full = SimpleNamespace(
+            device=table.device,
+            prefill_cp_mode="in-seq-split",
+            residual_exchange=None,
+            forward_metadata=None,
+            cp_packed_kv=False,
+            kv_cache_dtype=torch.bfloat16,
+            cp_exchange=SimpleNamespace(capacity=512),
+            req_to_token_pool=pool,
+        )
+        full._prepare_cp_metadata = lambda *args: AttentionBackend._prepare_cp_metadata(
+            full, *args
+        )
+        runner = SimpleNamespace(
+            server_args=SimpleNamespace(
+                attn_cp_size=2,
+                linear_attn_prefill_backend="flashqla_cp",
+                disaggregation_mode="prefill",
+                encoder_only=False,
+            ),
+            attn_backend=SimpleNamespace(full_attn_backend=full),
+            req_to_token_pool=pool,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            prefill_cp_metadata=None,
+            extend_lens=[129, 65],
+            prefix_lens=[7, 3],
+            reqs=[
+                SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1)),
+                SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0)),
+            ],
+            out_cache_loc=torch.arange(194, device="cuda") * 2,
+            num_token_non_padded=torch.tensor(194, device="cuda", dtype=torch.int32),
+        )
+        ModelRunner.prepare_cp_metadata(runner, batch)
+        frame = batch.prefill_cp_metadata
+        self.assertIsNone(full.forward_metadata)
+        self.assertEqual(len(frame.device_buffers), 1)
+        self.assertEqual(len(frame.gdn_conv_metadata), 2)
+        with patch.object(
+            ContextParallelMetadata,
+            "plan_prefill",
+            side_effect=AssertionError("Late CPU plan"),
+        ):
+            ModelRunner.prepare_cp_metadata(runner, batch)
+            AttentionBackend._init_cp_forward_metadata(full, batch)
+        self.assertIs(full.forward_metadata, frame)
+        torch.testing.assert_close(
+            frame.kv_read_slots.cpu(),
+            torch.cat((torch.arange(0, 136, 2) + 512, torch.arange(0, 68, 2))),
+        )
+        self.assertTrue(frame.gdn_conv_metadata[0]["has_initial_state"].item())
 
     def test_split_mode_changes_fa_layout_but_preserves_gdn_order(self):
         for lengths, prefixes in (
