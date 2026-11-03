@@ -6,7 +6,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
 
 @triton.jit
-def _history_metadata(
+def _restore_history(
     requests,
     lengths,
     first_positions,
@@ -16,18 +16,21 @@ def _history_metadata(
     next_begin,
     next_end,
     next_first,
-    source,
-    destination,
-    valid,
+    host_address,
+    cache,
     ROWS: tl.constexpr,
     CONTEXT: tl.constexpr,
     REQUEST_STRIDE: tl.constexpr,
     FIRST_STRIDE: tl.constexpr,
     C: tl.constexpr,
     STRIDE: tl.constexpr,
-    BLOCK: tl.constexpr,
+    HOST_ROWS: tl.constexpr,
+    FEATURES: tl.constexpr,
+    FEATURE_BLOCK: tl.constexpr,
+    OWNERS: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
 ):
-    tile = tl.program_id(0)
+    owner = tl.program_id(0)
     row = tl.program_id(1)
     req = tl.load(requests + row).to(tl.int32)
     length = tl.load(lengths + row).to(tl.int32)
@@ -38,26 +41,35 @@ def _history_metadata(
     safe = tl.where(active, req, 0)
     dense = length < C
     begin = tl.where(dense, 0, -1).to(tl.int32)
-    previous_begin = tl.load(old_begin + safe)
-    previous_end = tl.load(old_end + safe)
-    same_layout = (previous_begin >= 0) & ((previous_begin == 0) == (begin == 0))
-    offset = tile * BLOCK + tl.arange(0, BLOCK)
-    pos = offset
-    present = same_layout & (pos >= previous_begin) & (pos < previous_end)
-    restore = active & (begin >= 0) & (offset < STRIDE) & (pos < first) & ~present
-    physical = tl.load(
-        req_to_token + safe * REQUEST_STRIDE + pos, mask=restore, other=0
-    ).to(tl.int64)
-    restore = restore & (physical >= 0)
-    dst = safe.to(tl.int64) * STRIDE + pos
-    index = row.to(tl.int64) * STRIDE + offset
-    tl.store(source + index, tl.where(restore, physical, 0), mask=offset < STRIDE)
-    tl.store(destination + index, tl.where(restore, dst, 0), mask=offset < STRIDE)
-    tl.store(valid + index, restore, mask=offset < STRIDE)
-    if tile == 0:
+    if owner == 0:
         tl.store(next_begin + safe, begin, mask=active)
         tl.store(next_end + safe, length, mask=active)
         tl.store(next_first + safe, first, mask=active)
+    # Evaluate on device every time, including graph replay.
+    if active & dense:
+        previous_begin = tl.load(old_begin + safe)
+        previous_end = tl.load(old_end + safe)
+        missing_start = tl.where(previous_begin == 0, tl.maximum(previous_end, 0), 0)
+        feature = tl.arange(0, FEATURE_BLOCK)
+        host = host_address.to(tl.pointer_type(cache.dtype.element_ty))
+        for base in range(
+            missing_start + owner * ROW_BLOCK,
+            tl.minimum(first, STRIDE),
+            OWNERS * ROW_BLOCK,
+        ):
+            pos = base + tl.arange(0, ROW_BLOCK)
+            restore = (pos < STRIDE) & (pos < first)
+            physical = tl.load(
+                req_to_token + safe * REQUEST_STRIDE + pos, mask=restore, other=0
+            ).to(tl.int64)
+            restore = restore & (physical >= 0) & (physical < HOST_ROWS)
+            src = physical[:, None] * FEATURES + feature[None, :]
+            dst = (safe.to(tl.int64) * STRIDE + pos[:, None]) * FEATURES + feature[
+                None, :
+            ]
+            mask = restore[:, None] & (feature[None, :] < FEATURES)
+            value = tl.load(host + src, mask=mask, other=0)
+            tl.store(cache + dst, value, mask=mask)
 
 
 @triton.jit
@@ -122,9 +134,10 @@ def stage_resident_kv(
     """Stage current KV and refill only absent short history from host."""
     batch = requests.numel()
     stride = cache.shape[1]
-    hs, hd, hv = history_workspace
     nb, ne, nf = next_extents
-    _history_metadata[(triton.cdiv(stride, 128), batch)](
+    features = cache.numel() // (cache.shape[0] * stride)
+    owners = max(1, triton.cdiv(48, batch))
+    _restore_history[(owners, batch)](
         requests,
         lengths,
         first_positions,
@@ -134,28 +147,19 @@ def stage_resident_kv(
         nb,
         ne,
         nf,
-        hs,
-        hd,
-        hv,
+        host_address,
+        cache,
         old_begin.numel(),
         context_len,
         req_to_token.stride(0),
         first_positions.stride(0),
         capacity,
         stride,
-        128,
-    )
-    history_count = batch * stride
-    unidex_copy_inplace(
-        host,
-        cache,
-        hs[:history_count],
-        hd[:history_count],
-        hv[:history_count],
-        2,
-        2,
-        block_dim=48,
-        src_ptr=host_address,
+        host.numel() // features,
+        features,
+        triton.next_power_of_2(features),
+        owners,
+        16,
     )
     count = current.shape[0]
     cd, cv = current_workspace
