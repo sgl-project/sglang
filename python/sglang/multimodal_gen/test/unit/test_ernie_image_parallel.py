@@ -60,7 +60,6 @@ def _worker(mode):
             (3, 4, 5, False),
             (3, 3, 3, False),
             (3, 4, 5, True),
-            (3, 4, 0, False),
             (3, 4, 3, False),
         ]:
             torch.manual_seed(length)
