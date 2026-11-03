@@ -85,9 +85,6 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests * get_parallel().num_dp_ranks,
         )
 
-        # Other ranks compute the same ids (or join the gather below) and send
-        # nothing, so they keep no rows.
-        output_rank = is_scheduler_io_rank()
         super().__init__(
             num_tokens=num_tokens,
             max_batch_size=max_batch_size,
@@ -96,8 +93,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
-            allocate_host_cache=output_rank,
-            allocate_device_cache=output_rank,
+            # Other ranks compute the same ids (or join the gather below) and
+            # send nothing, so they keep no rows.
+            allocate_caches=is_scheduler_io_rank(),
         )
 
         # Rebuild the full token batch before routed-expert readback.
