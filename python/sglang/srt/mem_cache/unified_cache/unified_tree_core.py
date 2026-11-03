@@ -30,6 +30,7 @@ import torch
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import get_cp_sharded_padded
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -741,7 +742,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node = stack.pop()
             # The root anchors every chain and is seeded with an empty hash list.
             if node is not self.root_node and node.hash_value is None:
-                node.hash_value = compute_node_hash_values(node, self.page_size)
+                node.hash_value = compute_node_hash_values(node, self.logical_page_size)
                 filled += 1
             stack.extend(node.children.values())
         return filled
@@ -1101,18 +1102,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Read-only FULL-device match, independent of auxiliary components; the
         third result counts the whole deepest node (a partial match pins it all)."""
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        key = key.page_aligned(self.page_size)
+        key = key.page_aligned(self.logical_page_size)
         node = self.root_node
         matched_len = 0
         pinned_len = 0
         while len(key) > 0:
-            child = node.children.get(key.child_key(self.page_size))
+            child = node.children.get(key.child_key(self.logical_page_size))
             if child is None:
                 break
             value = child.component_data[BASE_COMPONENT_TYPE].value
             if value is None:
                 break
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(key, page_size=self.logical_page_size)
             if prefix_len == 0:
                 break
             matched_len += prefix_len
@@ -1623,7 +1624,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.hash_value, child.hash_value = split_node_hash_value(
-            child.hash_value, split_len, self.page_size
+            child.hash_value, split_len, self.logical_page_size
         )
         new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
@@ -1693,7 +1694,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             BASE_COMPONENT_TYPE
         ].reclaimable_value_len(new_node)
         if self.enable_storage or self.enable_external_cache_linker:
-            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+            new_node.hash_value = compute_node_hash_values(
+                new_node, self.logical_page_size
+            )
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -2625,7 +2628,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if total_len == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
-        child_key = key.child_key(self.page_size)
+        child_key = key.child_key(self.logical_page_size)
         matched_length = 0
         host_prefix_len = 0
         refilled_host_node = None
@@ -2635,14 +2638,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             # Under joint_lru an access to only the prefix keeps the suffix's recency.
             suffix_time = node.last_access_time if self.joint_lru is not None else None
             self._touch_node(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match(key, page_size=self.logical_page_size)
 
-            matched_host_value = host_value[:prefix_len]
-            matched_hash_value = hash_value[: prefix_len // self.page_size]
+            local_prefix_len = prefix_len
+            if is_cp_sharded_padded():
+                local_prefix_len = get_cp_sharded_padded(local_prefix_len)
+            matched_host_value = host_value[:local_prefix_len]
+            matched_hash_value = hash_value[: prefix_len // self.logical_page_size]
 
             key = key[prefix_len:]
-            host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len // self.page_size :]
+            host_value = host_value[local_prefix_len:]
+            hash_value = hash_value[prefix_len // self.logical_page_size :]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
@@ -2673,7 +2679,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     host_prefix_len += prefix_len
 
             if len(key):
-                child_key = key.child_key(self.page_size)
+                child_key = key.child_key(self.logical_page_size)
 
         result = InsertResult(
             prefix_len=(matched_length if self.is_write_back else host_prefix_len),
@@ -3078,10 +3084,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         pos = 0
         remaining = key
         while pos < end and len(remaining) > 0:
-            child = node.children.get(remaining.child_key(self.page_size))
+            child = node.children.get(remaining.child_key(self.logical_page_size))
             if child is None or (child.evicted and not child.backuped):
                 return
-            prefix_len = child.key.match(remaining, page_size=self.page_size)
+            prefix_len = child.key.match(remaining, page_size=self.logical_page_size)
             if prefix_len == 0:
                 return
             yield child, pos, prefix_len

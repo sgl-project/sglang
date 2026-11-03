@@ -35,6 +35,14 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
+    _ceil_group_count,
+    from_cp_sharded,
+    from_cp_sharded_expanded_indices,
+    get_cp_sharded_padded,
+    get_cp_sharded_padded_owned_indices,
+)
 from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRACTION
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -138,9 +146,9 @@ class _StagedPrefetch(msgspec.Struct):
     extra_key: Optional[str]
     cache_salt: Optional[str]
     matched_len: int
-    num_tokens: int
+    num_tokens: int  # Logical tokens across all CP ranks.
     occupied_tokens: int
-    host_indices: torch.Tensor
+    host_indices: torch.Tensor  # This rank's physical host rows.
     aux_xfers: list[PoolTransfer]
     hash_values: list[str]
     operation_id: int
@@ -151,9 +159,12 @@ class _OngoingBufferLoadBack(msgspec.Struct):
 
     The full host bounce, and any redundant device slots a component's load
     context reports, remain owned here until the copy completes.
-    ``load_transfers`` is the transfer list submitted to H2D; ``aux_xfers``
-    retains the original staging owners and ``load_contexts`` each
-    component's part in the load.
+    ``load_transfers`` is the transfer list submitted to H2D; alias indices
+    stay in the source pool's domain. ``aux_xfers`` retains the original
+    staging owners and ``load_contexts`` each component's part in the load.
+    In CP, ``BufferModePipeline._allocate_and_queue_load_back`` expands
+    ``device_indices`` for tree insertion with
+    ``from_cp_sharded_expanded_indices``.
     """
 
     request: CacheRequestHandle
@@ -304,19 +315,31 @@ class BufferModePipeline:
         # Clamp by admission headroom: pins must leave room for the largest
         # allowed request, else a queued hold can wedge admission permanently
         # (pool full, nothing retractable). No-headroom pools take no pins.
+        global_size = full_pool.size
+        if is_cp_sharded_padded():
+            logical_page_size = cache.tree_core.logical_page_size
+            # Reserve one complete CP page group for each context tail.
+            max_context_len = (
+                _ceil_group_count(max_context_len, logical_page_size)
+                * logical_page_size
+            )
+            global_size = from_cp_sharded(global_size)
         self.anchor_lock_cap_tokens = max(
             0,
             min(
-                int(envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size),
-                full_pool.size - max_context_len,
+                int(envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * global_size),
+                global_size - max_context_len,
             ),
         )
         if self.anchor_lock_cap_tokens == 0:
+            global_size = full_pool.size
+            if is_cp_sharded_padded():
+                global_size = from_cp_sharded(global_size)
             logger.warning(
                 "BufferModePipeline anchor_lock_cap_tokens=0 (pool=%d, "
                 "max_context_len=%d): every prefetch launches with its splice "
                 "base unpinned. Shrink --context-length or grow the KV pool.",
-                full_pool.size,
+                global_size,
                 max_context_len,
             )
         else:
@@ -441,8 +464,11 @@ class BufferModePipeline:
     def _shared_load_reserve_requests(self) -> list[tuple[str, int]]:
         cc = self._cache.cache_controller
         anchor = cc.mem_pool_host.anchor_entry.host_pool
+        local_prefetch_threshold = self._cache.prefetch_threshold
+        if is_cp_sharded_padded():
+            local_prefetch_threshold = get_cp_sharded_padded(local_prefetch_threshold)
         min_full_tokens = _minimum_full_transfer_tokens(
-            anchor, self._cache.prefetch_threshold
+            anchor, local_prefetch_threshold
         )
         requests = [(anchor.pool_label, min_full_tokens)]
         for component in self._swa_components():
@@ -516,6 +542,7 @@ class BufferModePipeline:
         )
 
     def _log_backup_dropped(self, num_tokens: int) -> None:
+        """Count dropped storage-page intents in local physical row units."""
         cache = self._cache
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
@@ -538,6 +565,9 @@ class BufferModePipeline:
         if entry is None:
             return None
         num_pages = len(transfer.device_indices) // entry.host_pool.page_size
+        if is_cp_sharded_padded() and transfer.name in (PoolName.KV, PoolName.SWA):
+            # Cache rows span a complete CP group per stored page.
+            num_pages = get_cp_sharded_padded(num_pages)
         if num_pages == 0 or num_pages > len(hash_values):
             return None
         return list(hash_values[-num_pages:])
@@ -559,6 +589,9 @@ class BufferModePipeline:
             return keys
         entry = self._cache.cache_controller.mem_pool_host.entry_map[transfer.name]
         page_size = entry.host_pool.page_size
+        if is_cp_sharded_padded() and transfer.name in (PoolName.KV, PoolName.SWA):
+            # Trim cache rows before projecting the transfer to local slots.
+            page_size = from_cp_sharded(page_size)
         rows = transfer.device_indices
         assert rows is not None and len(rows) == len(keys) * page_size
         transfer.device_indices = rows[-tail * page_size :]
@@ -670,7 +703,10 @@ class BufferModePipeline:
         span = self._queued_span_key(intent)
         refs = self._queued_span_refs.get(span, 0)
         if refs == 0:
-            self.write_backlog_tokens_ += span[1]
+            local_tokens = span[1]
+            if is_cp_sharded_padded():
+                local_tokens = get_cp_sharded_padded(local_tokens)
+            self.write_backlog_tokens_ += local_tokens
         self._queued_span_refs[span] = refs + 1
 
     def _release_queued_span(self, intent: _UnifiedBackupIntent) -> None:
@@ -678,7 +714,10 @@ class BufferModePipeline:
         refs = self._queued_span_refs[span]
         if refs == 1:
             del self._queued_span_refs[span]
-            self.write_backlog_tokens_ -= span[1]
+            local_tokens = span[1]
+            if is_cp_sharded_padded():
+                local_tokens = get_cp_sharded_padded(local_tokens)
+            self.write_backlog_tokens_ -= local_tokens
         else:
             self._queued_span_refs[span] = refs - 1
 
@@ -941,6 +980,8 @@ class BufferModePipeline:
             device_value, keys_by_pool, transfers = launch
             sizing_xfers = [t for t in transfers if t.indices_from_pool is None]
             kv_tokens = len(device_value)
+            if is_cp_sharded_padded():
+                kv_tokens = get_cp_sharded_padded(kv_tokens)
             if self._backup_oversize(kv_tokens, sizing_xfers):
                 # A permanently unstageable head must not block the queue.
                 self._drop_queue_head(intent_tokens, dropped=True)
@@ -1093,6 +1134,18 @@ class BufferModePipeline:
         # One ack id per write: a node may have several pools in flight.
         self._backup_ack_seq += 1
         ack_id = -(1 << 40) - self._backup_ack_seq
+        if is_cp_sharded_padded():
+            # Fresh launch descriptors become the local D2H operands.
+            device_value = get_cp_sharded_padded_owned_indices(device_value)
+            for transfer in transfers:
+                if (
+                    transfer.name in (PoolName.KV, PoolName.SWA)
+                    and transfer.device_indices is not None
+                    and transfer.indices_from_pool is None
+                ):
+                    transfer.device_indices = get_cp_sharded_padded_owned_indices(
+                        transfer.device_indices
+                    )
         host_indices = cc.write(
             device_value,
             node_id=ack_id,
@@ -1311,6 +1364,8 @@ class BufferModePipeline:
         # Parked ops hold no pin: release and re-take at the next attempt,
         # which is also how a moved anchor gets noticed.
         self.release_anchor_lock(request)
+        if is_cp_sharded_padded():
+            tokens = from_cp_sharded(tokens)
         self._cache._log_storage_prefetch_deferred(tokens, "host_capacity")
         return False
 
@@ -1542,6 +1597,8 @@ class BufferModePipeline:
                 for t in f.aux_xfers
                 if t.name == component.pool_name and t.host_indices is not None
             )
+            if is_cp_sharded_padded():
+                staged_tokens = from_cp_sharded(staged_tokens)
             window_start = span_end - staged_tokens
             repair_end = min(matched_len, span_end)
             missing_ranges = (
@@ -1677,16 +1734,20 @@ class BufferModePipeline:
         if (num_tokens == 0 and not has_aux) or prefix_tokens is None:
             return None
         key = info.prefetch_key
+        global_num_tokens = num_tokens
+        if is_cp_sharded_padded():
+            global_num_tokens = from_cp_sharded(global_num_tokens)
         return _StagedPrefetch(
             request=request,
             key_tokens=array(
                 "q",
-                prefix_tokens + list(key.token_ids[: num_tokens + int(key.is_bigram)]),
+                prefix_tokens
+                + list(key.token_ids[: global_num_tokens + int(key.is_bigram)]),
             ),
             extra_key=key.extra_key,
             cache_salt=key.cache_salt,
             matched_len=len(prefix_tokens),
-            num_tokens=num_tokens,
+            num_tokens=global_num_tokens,
             occupied_tokens=occupied_tokens,
             host_indices=info.host_indices[:num_tokens],
             aux_xfers=aux_xfers,
@@ -1768,7 +1829,7 @@ class BufferModePipeline:
         assert req.prefix_len == splice_base
         prefix_indices = self._cache.prefix_device_indices(req)
         trim_tokens = splice_base - f.matched_len
-        assert trim_tokens % cache.page_size == 0, (
+        assert trim_tokens % cache.tree_core.logical_page_size == 0, (
             f"staged splice trim not page-aligned req={req.rid}: "
             f"matched={f.matched_len} splice_base={splice_base}"
         )
@@ -1793,6 +1854,14 @@ class BufferModePipeline:
                 slice(start - window.start, end - window.start)
                 for start, end in window.missing_ranges
             ]
+            if is_cp_sharded_padded():
+                host_parts = [
+                    slice(
+                        get_cp_sharded_padded(part.start),
+                        get_cp_sharded_padded(part.stop),
+                    )
+                    for part in host_parts
+                ]
             for i, transfer in enumerate(load_xfers):
                 if transfer.name != pool_name:
                     continue
@@ -1833,6 +1902,9 @@ class BufferModePipeline:
             )
             if window_dev is None:
                 continue
+            if is_cp_sharded_padded() and pool_name in (PoolName.KV, PoolName.SWA):
+                # Tree insertion uses logical rows; leave the H2D descriptor local.
+                window_dev = from_cp_sharded_expanded_indices(window_dev)
             ct = component.component_type
             window = plan.windows[ct]
             assert len(window_dev) == window.num_tokens
@@ -1905,7 +1977,10 @@ class BufferModePipeline:
         load_back_id: int,
         load_xfers: list[PoolTransfer],
     ) -> tuple[Optional[_OngoingBufferLoadBack], str]:
-        if not self._ensure_full_capacity(plan.full_tokens):
+        local_full_tokens = plan.full_tokens
+        if is_cp_sharded_padded():
+            local_full_tokens = get_cp_sharded_padded(local_full_tokens)
+        if not self._ensure_full_capacity(local_full_tokens):
             return None, "full"
         cache = self._cache
         load_contexts: list[BufferLoadBackContext] = []
@@ -1919,6 +1994,8 @@ class BufferModePipeline:
             # Not staging, so these stay out of the aux_xfers the ack frees.
             load_xfers.extend(load_context.load_xfers)
         trim_tokens = plan.device_prefix_len - f.matched_len
+        if is_cp_sharded_padded():
+            trim_tokens = get_cp_sharded_padded(trim_tokens)
         device_indices = cache.cache_controller.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
@@ -1928,6 +2005,9 @@ class BufferModePipeline:
             load_context.finalize_allocation(success=device_indices is not None)
         if device_indices is None:
             return None, "full_or_aux"
+        if is_cp_sharded_padded():
+            # This allocator returns local H2D rows; state holds the tree view.
+            device_indices = from_cp_sharded_expanded_indices(device_indices)
         return (
             _OngoingBufferLoadBack(
                 request=f.request,

@@ -7,6 +7,8 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
+    from_cp_sharded,
+    get_cp_sharded_padded,
     get_cp_sharded_padded_cache_indices,
     get_cp_sharded_padded_cache_transfer_indices,
 )
@@ -96,8 +98,8 @@ class SWAComponent(TreeComponent):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.full_window_pages = (
-            self.sliding_window_size + params.page_size - 1
-        ) // params.page_size
+            self.sliding_window_size + self.logical_page_size - 1
+        ) // self.logical_page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
         # The running device-eviction walk's leaf-collapse mode.
@@ -144,7 +146,11 @@ class SWAComponent(TreeComponent):
             value = cd.value if cd.value is not None else cd.host_value
             if value is None:
                 break
-            covered += len(value)
+            value_len = len(value)
+            # Host values count local rows; device values already span logical tokens.
+            if is_cp_sharded_padded() and cd.value is None:
+                value_len = from_cp_sharded(value_len)
+            covered += value_len
             if cd.value is not None and cd.host_value is None:
                 unbacked.append(cur)
             cur = cur.parent
@@ -374,8 +380,11 @@ class SWAComponent(TreeComponent):
                 # worth of pages, cap swa_host_hit at sliding_window_size
                 # here so the scheduler budget matches the actual device-pool
                 # consumption.
-                swa_host_hit += len(cd.host_value)
-                n_swa += len(cd.host_value)
+                global_tokens = len(cd.host_value)
+                if is_cp_sharded_padded():
+                    global_tokens = from_cp_sharded(global_tokens)
+                swa_host_hit += global_tokens
+                n_swa += global_tokens
             else:
                 break
             node = node.parent
@@ -620,6 +629,8 @@ class SWAComponent(TreeComponent):
         child_swa_host_value = child.component_data[self.component_type].host_value
         if child_swa_host_value is not None:
             split_len = len(new_parent.key)
+            if is_cp_sharded_padded():
+                split_len = get_cp_sharded_padded(split_len)
             new_parent.component_data[
                 self.component_type
             ].host_value = child_swa_host_value[:split_len].clone()
@@ -1062,7 +1073,7 @@ class SWAComponent(TreeComponent):
         sw_pages = self.full_window_pages
         if sw_pages == 0:
             return PreparePrefetchResult()
-        prefetch_pages = prefetch_tokens // self.cache.page_size
+        prefetch_pages = prefetch_tokens // self.logical_page_size
         if prefetch_pages >= sw_pages:
             num_pages = sw_pages
         elif prefetch_pages > 0 and self.tree_core.is_root(node_id):
@@ -1098,7 +1109,10 @@ class SWAComponent(TreeComponent):
             if self._unified_allocator() is not None
             else cd.value
         )
-        num_pages = len(rows) // self._swa_kv_pool_host.page_size
+        local_tokens = len(rows)
+        if is_cp_sharded_padded():
+            local_tokens = get_cp_sharded_padded(local_tokens)
+        num_pages = local_tokens // self._swa_kv_pool_host.page_size
         if num_pages == 0 or num_pages > len(hash_values):
             return {self.pool_name: []}
         return {self.pool_name: list(hash_values[-num_pages:])}
@@ -1166,7 +1180,10 @@ class SWAComponent(TreeComponent):
                     # host only, collect it
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
-                    n_swa += len(cd.host_value)
+                    global_tokens = len(cd.host_value)
+                    if is_cp_sharded_padded():
+                        global_tokens = from_cp_sharded(global_tokens)
+                    n_swa += global_tokens
                 cur = cur.parent
 
             if not backed_up:
@@ -1317,6 +1334,8 @@ class SWAComponent(TreeComponent):
                 cd = target.component_data[ct]
                 assert cd.value is not None and cd.host_value is None
                 size = len(cd.value)
+                if is_cp_sharded_padded():
+                    size = get_cp_sharded_padded(size)
                 cd.host_value = xfer.host_indices[offset : offset + size].clone()
                 offset += size
             assert offset == len(xfer.host_indices)
@@ -1335,6 +1354,8 @@ class SWAComponent(TreeComponent):
                 cd_n = n.component_data[ct]
                 cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
                 n_tokens = len(cd_n.host_value)
+                if is_cp_sharded_padded():
+                    n_tokens = from_cp_sharded(n_tokens)
                 swa_chunk = device_indices[offset : offset + n_tokens].clone()
                 self.tree_core.set_component_device_value(
                     n.id, self.component_type, swa_chunk
@@ -1343,7 +1364,10 @@ class SWAComponent(TreeComponent):
                 full_chunks.append(cd_full_n.value)
                 swa_chunks.append(swa_chunk)
                 offset += n_tokens
-            assert offset == len(xfer.host_indices)
+            global_tokens = len(xfer.host_indices)
+            if is_cp_sharded_padded():
+                global_tokens = from_cp_sharded(global_tokens)
+            assert offset == global_tokens
             # rebuild the mapping for the loaded SWA chunk, defer to orchestrator level
             if full_chunks:
                 cache_actions.append(RebuildFullToSWAMapping(full_chunks, swa_chunks))
@@ -1435,7 +1459,10 @@ class SWAComponent(TreeComponent):
             return
 
         # Buffer covers token range [loaded_start, total_len).
-        loaded_start = insert_result.total_len - window_require_pages * page_size
+        global_tokens = window_require_pages * page_size
+        if is_cp_sharded_padded():
+            global_tokens = from_cp_sharded(global_tokens)
+        loaded_start = insert_result.total_len - global_tokens
 
         # Walk leaf → anchor; ``pos`` is the right edge of ``cur`` in tokens.
         pos, cur = insert_result.total_len, target
@@ -1445,7 +1472,11 @@ class SWAComponent(TreeComponent):
             fill_start = max(node_start, loaded_start)
             fill_len = pos - fill_start
             buf_off = fill_start - loaded_start
-            slice_ = host_indices[buf_off : buf_off + fill_len]
+            local_fill_len = fill_len
+            if is_cp_sharded_padded():
+                buf_off = get_cp_sharded_padded(buf_off)
+                local_fill_len = get_cp_sharded_padded(local_fill_len)
+            slice_ = host_indices[buf_off : buf_off + local_fill_len]
 
             cd = cur.component_data[ct]
             if cd.host_value is None and fill_len > 0:
@@ -1466,7 +1497,13 @@ class SWAComponent(TreeComponent):
 
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
-            self._release_swa_host(host_indices[: pos - loaded_start], cache_actions)
+            local_tokens = pos - loaded_start
+            if is_cp_sharded_padded():
+                local_tokens = get_cp_sharded_padded(local_tokens)
+            self._release_swa_host(
+                host_indices[:local_tokens],
+                cache_actions,
+            )
 
     def drive_host_eviction(
         self,
@@ -1551,6 +1588,9 @@ class SWAComponent(TreeComponent):
         if isinstance(action, RebuildFullToSWAMapping):
             assert len(action.full_indices) == len(action.swa_indices)
             for full, swa in zip(action.full_indices, action.swa_indices):
+                if is_cp_sharded_padded():
+                    full = get_cp_sharded_padded_cache_indices(full)
+                    swa = get_cp_sharded_padded_cache_indices(swa)
                 storage.bind_window(sub_pool, full, swa)
             return
         if isinstance(action, RecoverEvictedSWA):

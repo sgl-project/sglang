@@ -45,6 +45,7 @@ def _staged_fixture(full_match=2):
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.tree_core = SimpleNamespace(
         page_size=2,
+        logical_page_size=2,
         is_eagle=False,
         enable_storage=True,
         prefetch_anchor_info=lambda node: (None, None),

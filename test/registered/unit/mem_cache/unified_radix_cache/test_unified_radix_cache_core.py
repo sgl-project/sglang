@@ -1915,6 +1915,44 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.assert_not_called()
         cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.assert_not_called()
 
+    def test_backup_capacity_failure_does_not_prepare_transfers(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = SimpleNamespace(
+            mem_pool_host=SimpleNamespace(
+                anchor_entry=SimpleNamespace(
+                    host_pool=SimpleNamespace(shared_allocation_domain=None),
+                    host_evict_fn=None,
+                ),
+                available_size=lambda: 0,
+            ),
+        )
+        cache.evict_host = mock.Mock(return_value=0)
+        transfers = mock.Mock()
+        transfers.values.side_effect = AssertionError(
+            "flatten before capacity decision"
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.unified_radix_cache.is_cp_sharded_padded",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.unified_radix_cache.get_cp_sharded_padded",
+                side_effect=lambda value, **kwargs: value // 2,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.unified_radix_cache.get_cp_sharded_padded_owned_indices",
+                side_effect=AssertionError("projection before capacity decision"),
+            ) as projection,
+        ):
+            self.assertIsNone(
+                cache._execute_kv_backup(1, torch.arange(8), transfers, [])
+            )
+        cache.evict_host.assert_called_once_with(4)
+        projection.assert_not_called()
+        transfers.values.assert_not_called()
+
     def test_backup_publish_node_ids_collects_component_nodes_once(self):
         comp_xfers = {
             ComponentType.SWA: [PoolTransfer(name=PoolName.SWA, nodes_to_load=[3, 4])],

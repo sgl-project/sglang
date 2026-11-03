@@ -27,7 +27,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
     from_cp_sharded,
+    from_cp_sharded_expanded_indices,
+    get_cp_sharded_padded,
     get_cp_sharded_padded_cache_indices,
+    get_cp_sharded_padded_owned_indices,
 )
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
@@ -564,6 +567,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
 
+        local_storage_prefetch_threshold = storage_prefetch_threshold
+        if is_cp_sharded_padded():
+            local_storage_prefetch_threshold = get_cp_sharded_padded(
+                local_storage_prefetch_threshold
+            )
         attach_hybrid_pool_to_unified_cache(
             self,
             params,
@@ -571,7 +579,7 @@ class UnifiedRadixCache(BasePrefixCache):
             load_cache_event=self.load_cache_event,
             storage_backend=storage_backend,
             storage_extra_config=storage_extra_config,
-            storage_prefetch_threshold=storage_prefetch_threshold,
+            storage_prefetch_threshold=local_storage_prefetch_threshold,
         )
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
@@ -584,12 +592,17 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.set_host_memory_buffer_only()
             swa = self.component_of(TREE_WINDOW)
             auxiliary_swa = self.components.get(ComponentType.AUXILIARY_SWA)
+            local_storage_prefetch_threshold = storage_prefetch_threshold
+            if is_cp_sharded_padded():
+                local_storage_prefetch_threshold = get_cp_sharded_padded(
+                    local_storage_prefetch_threshold
+                )
             validate_buffer_only_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs,
                 host_pool_group=self.host_pool_group,
                 swa_component=swa,
                 auxiliary_swa_component=auxiliary_swa,
-                storage_prefetch_threshold=storage_prefetch_threshold,
+                storage_prefetch_threshold=local_storage_prefetch_threshold,
             )
             self.buffer_pipeline = self.component_of(TREE_TOKEN).create_buffer_pipeline(
                 max_context_len=get_model().context_length or 0,
@@ -1947,7 +1960,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
+        # Capacity and eviction here count physical host rows on this rank.
         kv_tokens = len(device_value)
+        if is_cp_sharded_padded():
+            kv_tokens = get_cp_sharded_padded(kv_tokens)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
         if (
             anchor_entry.host_pool.shared_allocation_domain is None
@@ -1960,6 +1976,18 @@ class UnifiedRadixCache(BasePrefixCache):
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Keep cache addresses on the tree and local rows on transfer queues.
+        if is_cp_sharded_padded():
+            device_value = get_cp_sharded_padded_owned_indices(device_value)
+            for transfer in aux_xfers:
+                if (
+                    transfer.name in (PoolName.KV, PoolName.SWA)
+                    and transfer.device_indices is not None
+                    and transfer.indices_from_pool is None
+                ):
+                    transfer.device_indices = get_cp_sharded_padded_owned_indices(
+                        transfer.device_indices
+                    )
         # Preserve the ordinary controller API when no shard owner is present.
         start_owner = self.tree_core.rotation_phase_of(node_id)
         shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
@@ -2132,6 +2160,26 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
+        if is_cp_sharded_padded():
+            # Keep queued H2D descriptors in their original pool domain; give
+            # the tree expanded views of the non-aliased FULL/SWA rows.
+            device_indices = from_cp_sharded_expanded_indices(device_indices)
+            comp_xfers = {
+                component: [
+                    replace(
+                        transfer,
+                        device_indices=from_cp_sharded_expanded_indices(
+                            transfer.device_indices
+                        ),
+                    )
+                    if transfer.name in (PoolName.KV, PoolName.SWA)
+                    and transfer.device_indices is not None
+                    and transfer.indices_from_pool is None
+                    else transfer
+                    for transfer in transfers
+                ]
+                for component, transfers in comp_xfers.items()
+            }
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._apply_cache_actions(
             self.tree_core.commit_load_back(
@@ -2348,7 +2396,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
-        ).page_aligned(self.page_size)
+        ).page_aligned(self.tree_core.logical_page_size)
         assume_stored = (
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
         )
@@ -2463,7 +2511,10 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
-            self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+            local_tokens = len(prefetch_key)
+            if is_cp_sharded_padded():
+                local_tokens = get_cp_sharded_padded(local_tokens)
+            self.cache_controller.prefetch_tokens_occupied += local_tokens
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
@@ -2659,9 +2710,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         allocated_tokens = len(host_indices)
         if completed_tokens < allocated_tokens:
+            global_tokens = allocated_tokens - completed_tokens
+            if is_cp_sharded_padded():
+                global_tokens = from_cp_sharded(global_tokens)
             self._resolve_storage_prefetch_tokens(
                 request,
-                allocated_tokens - completed_tokens,
+                global_tokens,
                 reason="deadline" if operation.deadline_expired else "storage_transfer",
             )
         if (
@@ -2669,7 +2723,12 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.enable_storage_metrics
             and self.storage_metrics_collector is not None
         ):
-            self.storage_metrics_collector.log_prefetched_tokens(completed_tokens)
+            global_completed_tokens_2 = completed_tokens
+            if is_cp_sharded_padded():
+                global_completed_tokens_2 = from_cp_sharded(global_completed_tokens_2)
+            self.storage_metrics_collector.log_prefetched_tokens(
+                global_completed_tokens_2
+            )
 
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
@@ -2678,7 +2737,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 request, completed_tokens, hash_value
             )
 
-        fetched_key = prefetch_key[:completed_tokens]
+        global_completed_tokens = completed_tokens
+        if is_cp_sharded_padded():
+            global_completed_tokens = from_cp_sharded(global_completed_tokens)
+        fetched_key = prefetch_key[:global_completed_tokens]
         insert_result = self.tree_core.insert_host(
             last_host_node_id,
             fetched_key,
@@ -2711,10 +2773,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # The commit emits via commit_actions only; the walk's were applied above.
             assert not insert_result.cache_actions
 
-            self.cache_controller.mem_pool_host.free(
-                host_indices[: insert_result.prefix_len]
-            )
-            loaded_from_storage = completed_tokens - insert_result.prefix_len
+            local_prefix_len = insert_result.prefix_len
+            if is_cp_sharded_padded():
+                local_prefix_len = get_cp_sharded_padded(local_prefix_len)
+            self.cache_controller.mem_pool_host.free(host_indices[:local_prefix_len])
+            loaded_from_storage = global_completed_tokens - insert_result.prefix_len
             # Cache mode has only completed L3 -> L2 here. Keep the usable
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
@@ -2722,7 +2785,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        local_tokens = len(prefetch_key)
+        if is_cp_sharded_padded():
+            local_tokens = get_cp_sharded_padded(local_tokens)
+        self.cache_controller.prefetch_tokens_occupied -= local_tokens
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
         if loaded_from_storage > 0:
@@ -2950,7 +3016,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _handle_storage_prefetch_anchor_loss(self, request: CacheRequestHandle) -> None:
         operation = self.ongoing_prefetch[request].operation
-        storage_hit_end = operation.storage_start + operation.storage_hit_count
+        global_storage_hit_count = operation.storage_hit_count
+        if is_cp_sharded_padded():
+            global_storage_hit_count = from_cp_sharded(global_storage_hit_count)
+        storage_hit_end = operation.storage_start + global_storage_hit_count
         self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="anchor_lost")
         self.revoke_pending_prefetch(request)
         self.storage_prefetch_retries.refetch(request.rid, storage_hit_end)
@@ -3091,7 +3160,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if requested <= 0 or operation.deadline_expired:
             return
         stats = self._prefetch_outcome_stats
-        hit = max(0, min(operation.storage_hit_count, requested))
+        global_storage_hit_count = operation.storage_hit_count
+        if is_cp_sharded_padded():
+            global_storage_hit_count = from_cp_sharded(global_storage_hit_count)
+        hit = max(0, min(global_storage_hit_count, requested))
         if revoked:
             if hit > 0:
                 stats["revoked_insufficient"] += 1
@@ -3118,7 +3190,10 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 return operation.buffer_host_occupied_units
             return len(host_indices) if host_indices is not None else 0
-        return len(prefetch_key)
+        local_tokens = len(prefetch_key)
+        if is_cp_sharded_padded():
+            local_tokens = get_cp_sharded_padded(local_tokens)
+        return local_tokens
 
     def _alloc_prefetch_aux_staging(
         self, info: _OngoingPrefetch, hit_tokens: int
@@ -3173,7 +3248,13 @@ class UnifiedRadixCache(BasePrefixCache):
             if operation.sidecar_hash_values is not None
             else hit_tokens
         )
-        trim_tokens = min(hit_tokens, max(0, full_match_len - operation.storage_start))
+        local_tokens = max(0, full_match_len - operation.storage_start)
+        if is_cp_sharded_padded():
+            local_tokens = get_cp_sharded_padded(local_tokens)
+        trim_tokens = min(
+            hit_tokens,
+            local_tokens,
+        )
         if trim_tokens == 0:
             return info, hit_tokens, original_hit_tokens
         assert trim_tokens % self.page_size == 0
@@ -3183,15 +3264,21 @@ class UnifiedRadixCache(BasePrefixCache):
         prefix_tokens, extra_key, cache_salt = prefix_ctx
         # Prefix context excludes the boundary token; the suffix owns it even
         # when all FULL pages are trimmed and only sidecars remain to fetch.
-        new_prefix_tokens = prefix_tokens + list(old_key.token_ids[:trim_tokens])
+        global_trim_tokens = trim_tokens
+        if is_cp_sharded_padded():
+            global_trim_tokens = from_cp_sharded(global_trim_tokens)
+        new_prefix_tokens = prefix_tokens + list(old_key.token_ids[:global_trim_tokens])
         self.buffer_pipeline._prefetch_prefix_ctx[request] = (
             new_prefix_tokens,
             extra_key,
             cache_salt,
         )
+        global_trim_tokens = trim_tokens
+        if is_cp_sharded_padded():
+            global_trim_tokens = from_cp_sharded(global_trim_tokens)
         info = info._replace(
             prefetch_key=RadixKey(
-                old_key.raw_token_ids()[trim_tokens:],
+                old_key.raw_token_ids()[global_trim_tokens:],
                 extra_key=old_key.extra_key,
                 is_bigram=old_key.is_bigram,
                 cache_salt=old_key.cache_salt,
@@ -3273,8 +3360,11 @@ class UnifiedRadixCache(BasePrefixCache):
             if buffer_mode:
                 # IO commit pins the splice base; a parked op held no pin, so a
                 # moved or vanished anchor is detected (and recovered) here.
+                global_storage_hit_count = operation.storage_hit_count
+                if is_cp_sharded_padded():
+                    global_storage_hit_count = from_cp_sharded(global_storage_hit_count)
                 anchor, full_match_len = self.buffer_pipeline.try_lock_anchor(
-                    request, operation.storage_hit_count
+                    request, global_storage_hit_count
                 )
                 if anchor == "anchor_lost":
                     self._prefetch_outcome_stats["declined_anchor_lost"] += 1
@@ -3300,8 +3390,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                     self.revoke_pending_prefetch(request)
                     return True
+                global_storage_hit_count = operation.storage_hit_count
+                if is_cp_sharded_padded():
+                    global_storage_hit_count = from_cp_sharded(global_storage_hit_count)
                 if self.buffer_pipeline.staged_span_covered(
-                    request, operation.storage_hit_count
+                    request, global_storage_hit_count
                 ):
                     # Live tree already covers the span: nothing left to
                     # splice, so skip the storage read.
@@ -3318,11 +3411,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     operation, info, hit_tokens, aux_hit_tokens
                 )
             aux_hit_tokens = hit_tokens
+            local_prefetch_threshold = self.prefetch_threshold
+            if is_cp_sharded_padded():
+                local_prefetch_threshold = get_cp_sharded_padded(
+                    local_prefetch_threshold
+                )
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
                 allow_partial=True,
-                min_tokens=self.prefetch_threshold,
+                min_tokens=local_prefetch_threshold,
                 evict_host=self.evict_host,
             )
             if host_indices is None:
@@ -3330,12 +3428,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
                 self.revoke_pending_prefetch(request)
+                global_storage_hit_count = operation.storage_hit_count
+                if is_cp_sharded_padded():
+                    global_storage_hit_count = from_cp_sharded(global_storage_hit_count)
                 self.storage_prefetch_retries.poll_miss(
-                    request.rid, operation.storage_start + operation.storage_hit_count
+                    request.rid,
+                    operation.storage_start + global_storage_hit_count,
                 )
-                self._log_storage_prefetch_deferred(
-                    max(alloc_len, aux_hit_tokens), "host_capacity"
-                )
+                global_tokens = max(alloc_len, aux_hit_tokens)
+                if is_cp_sharded_padded():
+                    global_tokens = from_cp_sharded(global_tokens)
+                self._log_storage_prefetch_deferred(global_tokens, "host_capacity")
                 return True
             if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
                 # Same outcome as a KV shortfall: nothing stays staged.
@@ -3344,16 +3447,26 @@ class UnifiedRadixCache(BasePrefixCache):
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
                 self.revoke_pending_prefetch(request)
+                global_storage_hit_count = operation.storage_hit_count
+                if is_cp_sharded_padded():
+                    global_storage_hit_count = from_cp_sharded(global_storage_hit_count)
                 self.storage_prefetch_retries.poll_miss(
-                    request.rid, operation.storage_start + operation.storage_hit_count
+                    request.rid,
+                    operation.storage_start + global_storage_hit_count,
                 )
-                self._log_storage_prefetch_deferred(
-                    max(alloc_len, aux_hit_tokens), "host_capacity"
-                )
+                global_tokens = max(alloc_len, aux_hit_tokens)
+                if is_cp_sharded_padded():
+                    global_tokens = from_cp_sharded(global_tokens)
+                self._log_storage_prefetch_deferred(global_tokens, "host_capacity")
                 return True
 
+            global_tokens = hit_tokens - alloc_len
+            if is_cp_sharded_padded():
+                global_tokens = from_cp_sharded(global_tokens)
             self._resolve_storage_prefetch_tokens(
-                request, hit_tokens - alloc_len, reason="host_capacity"
+                request,
+                global_tokens,
+                reason="host_capacity",
             )
             operation.storage_hit_count = alloc_len
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
@@ -3379,15 +3492,18 @@ class UnifiedRadixCache(BasePrefixCache):
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
+                global_hit_tokens = hit_tokens
+                if is_cp_sharded_padded():
+                    global_hit_tokens = from_cp_sharded(global_hit_tokens)
                 if hit_tokens > 0:
-                    self._record_storage_prefetch_hit(request, hit_tokens)
+                    self._record_storage_prefetch_hit(request, global_hit_tokens)
                 if operation.is_terminated():
                     # A storage miss can retry; a policy deadline cannot.
                     if hit_tokens > 0:
                         reason = None
                         if operation.deadline_expired:
                             reason = "deadline"
-                        elif hit_tokens < self.prefetch_threshold:
+                        elif global_hit_tokens < self.prefetch_threshold:
                             reason = "below_threshold"
                         self._finish_storage_prefetch(
                             request, fulfilled_tokens=0, reason=reason
@@ -3399,7 +3515,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
-                if hit_tokens < self.prefetch_threshold:
+                if global_hit_tokens < self.prefetch_threshold:
                     # Below-threshold hits are not worth the transfer.
                     self._account_prefetch_outcome(operation, revoked=True)
                     self._finish_storage_prefetch(

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -244,7 +245,7 @@ class StorageOperation:
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
-        self.completed_tokens = 0
+        self.completed_tokens = 0  # Physical host rows completed on this rank.
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -253,7 +254,7 @@ class StorageOperation:
         self.all_hash_values: Optional[List[str]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
-        # Absolute token offset at which this storage-prefetched span starts.
+        # Absolute logical token offset, across all CP ranks, of this span.
         self.storage_start = 0
 
         self.id = StorageOperation.counter
@@ -336,6 +337,9 @@ class HiCacheController:
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        self.logical_page_size = self.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.io_backend = io_backend
         self.enable_storage = False
         self.storage_backend = None
@@ -554,6 +558,11 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if is_cp_sharded_padded():
+            raise NotImplementedError(
+                "HiCache storage backends do not support a sharded --cp-kv-layout "
+                "yet; host caching without a storage backend is supported."
+            )
         key_scheme = get_memory().hicache_storage_key_scheme
         if key_scheme != "unified" and self.storage_host_pool.layout == "page_unified":
             raise ValueError(

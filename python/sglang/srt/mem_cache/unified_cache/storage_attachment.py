@@ -14,6 +14,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
+    _ceil_group_count,
+    get_cp_sharded_padded,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -145,6 +150,11 @@ class StorageAttachment:
         try:
             prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
             if cache.host_memory_mode == "buffer_only":
+                local_prefetch_threshold = prefetch_threshold
+                if is_cp_sharded_padded():
+                    local_prefetch_threshold = get_cp_sharded_padded(
+                        local_prefetch_threshold
+                    )
                 validate_buffer_only_stack(
                     sidecar_pool_specs=cache.sidecar_pool_specs,
                     host_pool_group=cache.host_pool_group,
@@ -152,13 +162,18 @@ class StorageAttachment:
                     auxiliary_swa_component=cache.components.get(
                         ComponentType.AUXILIARY_SWA
                     ),
-                    storage_prefetch_threshold=prefetch_threshold,
+                    storage_prefetch_threshold=local_prefetch_threshold,
                 )
             # New workers must see the requested policy from their first operation.
             self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
+            local_prefetch_threshold = prefetch_threshold
+            if is_cp_sharded_padded():
+                local_prefetch_threshold = get_cp_sharded_padded(
+                    local_prefetch_threshold
+                )
             controller.attach_storage_backend(
                 storage_backend=storage_backend,
-                prefetch_threshold=prefetch_threshold,
+                prefetch_threshold=local_prefetch_threshold,
                 model_name=served_model_name,
                 storage_backend_extra_config=extra_config,
                 host_pools=controller.mem_pool_host.entries,
@@ -308,9 +323,17 @@ class StorageAttachment:
             for ct in (ComponentType.SWA, ComponentType.AUXILIARY_SWA):
                 component = cache.components.get(ct)
                 if component is not None:
+                    logical_page_size = cache.tree_core.logical_page_size
                     configured = max(
-                        configured, component.full_window_pages * cache.page_size
+                        configured,
+                        component.full_window_pages * logical_page_size,
                     )
+        if is_cp_sharded_padded():
+            # Storage prefetch consumes complete logical groups.
+            logical_page_size = cache.tree_core.logical_page_size
+            configured = (
+                _ceil_group_count(configured, logical_page_size) * logical_page_size
+            )
         return configured
 
     def _resolve_metrics_collector(

@@ -527,6 +527,14 @@ pub struct ComponentState {
     pub(crate) evict_device_request_cnt: usize,
 }
 
+/// Convert a global KV token span to the local host-slot span.
+pub(crate) fn get_cp_sharded_padded(value: usize, cp_size: Option<usize>) -> usize {
+    match cp_size {
+        None => value,
+        Some(size) => value / size,
+    }
+}
+
 /// Convert a local KV count to global tokens; ordinary counts stay unchanged.
 pub(crate) fn from_cp_sharded(value: usize, cp_size: Option<usize>) -> usize {
     match cp_size {
@@ -678,7 +686,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) dynamo_kv_event_format: bool,
     /// Queued placement events, drained by take_events.
     pub(crate) kv_event_queue: Vec<KvCacheEvent<K::Atom>>,
-    /// Namespaced event hashes, seeded only by cache_salt; events omit extra_key.
+    /// Physical-page event hashes for namespaced or CP caches, seeded only by cache_salt.
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
@@ -1117,6 +1125,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         };
         let new_node = self.arena.node_mut(new_node_id);
         new_node.key = key;
+        new_node.cp_size = self.cp_size;
         new_node.parent = Some(parent_id);
         new_node.namespace = ns;
         new_node.hit_count = hit_count;
@@ -1443,7 +1452,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         key: &K,
         namespace: KeyNamespaceRef<'_>,
     ) -> (usize, NodeId, usize) {
-        let aligned_key_len = key.atom_len() / self.page_size * self.page_size;
+        let mut aligned_key_len = key.atom_len() / self.page_size * self.page_size;
+        if self.cp_size.is_some() {
+            // CP keys span complete groups of physical pages.
+            let logical_page_size = from_cp_sharded(self.page_size, self.cp_size);
+            aligned_key_len = aligned_key_len / logical_page_size * logical_page_size;
+        }
         let mut node_id = self.arena.root();
         let mut offset = 0;
         let mut pinned_len = 0;
@@ -1451,7 +1465,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let Some(child_id) = self.arena.child_on_page_in_namespace(
                 node_id,
                 namespace,
-                key.page_at(offset, self.page_size),
+                key.page_at(offset, from_cp_sharded(self.page_size, self.cp_size)),
             ) else {
                 break;
             };
@@ -1459,7 +1473,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if !child.has_device_value(FULL) {
                 break;
             }
-            let prefix_len = key.match_len(offset, &child.key, self.page_size);
+            let prefix_len = key.match_len(
+                offset,
+                &child.key,
+                from_cp_sharded(self.page_size, self.cp_size),
+            );
             if prefix_len == 0 {
                 break;
             }
@@ -2490,8 +2508,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
         child.key = key_tail;
-        let (new_node_hash, child_hash) =
-            crate::node::split_node_hash_value(child.hash_value.take(), split_len, self.page_size);
+        let (new_node_hash, child_hash) = crate::node::split_node_hash_value(
+            child.hash_value.take(),
+            split_len,
+            from_cp_sharded(self.page_size, self.cp_size),
+        );
         child.hash_value = child_hash;
         self.arena.node_mut(new_node_id).hash_value = new_node_hash;
         let child_handle = self.arena.node(child_id).id;
@@ -2626,7 +2647,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let tokens = self.component_reclaimable_value_len_(new_node_id, FULL);
         self.inc_evictable_size(FULL, tokens);
         if self.enable_storage || self.enable_external_cache_linker {
-            let hash_values = self.arena.compute_node_hash_values(new_node_id, page_size);
+            let hash_values = self
+                .arena
+                .compute_node_hash_values(new_node_id, from_cp_sharded(page_size, self.cp_size));
             self.arena.node_mut(new_node_id).hash_value = Some(hash_values);
         }
 
@@ -3816,14 +3839,23 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if !self.enable_kv_cache_events {
             return;
         }
-        if self.arena.node(node_id).hash_value.is_none() {
+        let mut needs_storage_hash = self.arena.node(node_id).hash_value.is_none();
+        if self.cp_size.is_some() {
+            // CP storage hashes span groups; events keep separate physical-page hashes.
+            needs_storage_hash = false;
+        }
+        if needs_storage_hash {
             let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
         let extra_key = self.arena.node(node_id).namespace.extra_key_arc();
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
-        let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
+        let mut namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
+        if self.cp_size.is_some() {
+            // CP events use the physical-page chain even in the default namespace.
+            namespaced = true;
+        }
         if namespaced {
             self.ensure_namespaced_event_hashes_(node_id);
         }
@@ -3895,11 +3927,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if !self.enable_kv_cache_events {
             return;
         }
-        if self.arena.node(node_id).hash_value.is_none() {
+        let mut needs_storage_hash = self.arena.node(node_id).hash_value.is_none();
+        if self.cp_size.is_some() {
+            // CP storage hashes span groups; events keep separate physical-page hashes.
+            needs_storage_hash = false;
+        }
+        if needs_storage_hash {
             let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
-        let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
+        let mut namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
+        if self.cp_size.is_some() {
+            // CP events use the physical-page chain even in the default namespace.
+            namespaced = true;
+        }
         if namespaced {
             self.ensure_namespaced_event_hashes_(node_id);
         }
@@ -4017,7 +4058,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let Some(child_id) = self.arena.child_on_page_in_namespace(
                 node_id,
                 namespace,
-                key.page_at(matched_length, self.page_size),
+                key.page_at(
+                    matched_length,
+                    from_cp_sharded(self.page_size, self.cp_size),
+                ),
             ) else {
                 break;
             };
@@ -4025,7 +4069,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.touch_node_(node_id);
             let matched_start = matched_length;
             let node = self.arena.node(node_id);
-            let prefix_len = key.match_len(matched_length, &node.key, self.page_size);
+            let prefix_len = key.match_len(
+                matched_length,
+                &node.key,
+                from_cp_sharded(self.page_size, self.cp_size),
+            );
             let node_key_len = node.key.atom_len();
             matched_length += prefix_len;
 
@@ -4052,12 +4100,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     node_id,
                     FULL,
                     host_value
-                        .narrow(0, matched_start as i64, prefix_len as i64)
+                        .narrow(
+                            0,
+                            get_cp_sharded_padded(matched_start, self.cp_size) as i64,
+                            get_cp_sharded_padded(prefix_len, self.cp_size) as i64,
+                        )
                         .copy(),
                 );
                 if self.arena.node(node_id).hash_value.is_none() {
-                    let first_page = matched_start / self.page_size;
-                    let last_page = matched_length / self.page_size;
+                    let first_page = matched_start / from_cp_sharded(self.page_size, self.cp_size);
+                    let last_page = matched_length / from_cp_sharded(self.page_size, self.cp_size);
                     self.arena.node_mut(node_id).hash_value =
                         Some(hash_value[first_page..last_page].to_vec());
                 }
@@ -4118,7 +4170,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         {
             // The suffix moves into a right-sized list; the matched head drops.
             let mut hash_value = hash_value;
-            let suffix = hash_value.split_off(matched_length / self.page_size);
+            let suffix = hash_value
+                .split_off(matched_length / from_cp_sharded(self.page_size, self.cp_size));
             self.arena.node_mut(new_node_id).hash_value = Some(suffix);
         }
         self.arena.set_host_value(
@@ -4127,12 +4180,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             host_value
                 .narrow(
                     0,
-                    matched_length as i64,
-                    (total_len - matched_length) as i64,
+                    get_cp_sharded_padded(matched_length, self.cp_size) as i64,
+                    get_cp_sharded_padded(total_len - matched_length, self.cp_size) as i64,
                 )
                 .copy(),
         );
-        let child_map_key = self.arena.node(new_node_id).key.child_key(self.page_size);
+        let child_map_key = self
+            .arena
+            .node(new_node_id)
+            .key
+            .child_key(from_cp_sharded(self.page_size, self.cp_size));
         let displaced = self
             .arena
             .insert_child_edge(node_id, child_map_key, new_node_id);
@@ -4481,7 +4538,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if node_id == root_id || self.arena.node(node_id).hash_value.is_some() {
                 continue;
             }
-            let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
+            let hash_values = self
+                .arena
+                .compute_node_hash_values(node_id, from_cp_sharded(self.page_size, self.cp_size));
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
             filled += 1;
         }
@@ -4928,11 +4987,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut spans = Vec::new();
         let mut node_id = self.arena.root();
         let mut pos = 0;
-        while pos < end && key.atom_len() - pos >= self.page_size {
+        while pos < end && key.atom_len() - pos >= from_cp_sharded(self.page_size, self.cp_size) {
             let Some(child_id) = self.arena.child_on_page_in_namespace(
                 node_id,
                 namespace,
-                key.page_at(pos, self.page_size),
+                key.page_at(pos, from_cp_sharded(self.page_size, self.cp_size)),
             ) else {
                 break;
             };
@@ -4940,7 +4999,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if !child.has_device_value(FULL) && !child.has_host_value(FULL) {
                 break;
             }
-            let prefix_len = key.match_len(pos, &child.key, self.page_size);
+            let prefix_len = key.match_len(
+                pos,
+                &child.key,
+                from_cp_sharded(self.page_size, self.cp_size),
+            );
             if prefix_len == 0 {
                 break;
             }
@@ -5033,8 +5096,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Buffer-mode staging rounds the SWA window to complete tree pages;
         // matched prefixes and storage-hit lengths use those same logical pages.
         // Splitting at an unaligned offset would break the radix page keys.
-        if !window_start.is_multiple_of(self.page_size)
-            || !window_end.is_multiple_of(self.page_size)
+        if !window_start.is_multiple_of(from_cp_sharded(self.page_size, self.cp_size))
+            || !window_end.is_multiple_of(from_cp_sharded(self.page_size, self.cp_size))
         {
             return Err("attach_swa_window boundaries must be page aligned".into());
         }
@@ -5258,7 +5321,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 continue;
             };
             let node = self.arena.node(node_id);
-            if node.namespace == KeyNamespace::default() {
+            let mut unexpected_event_hashes = node.namespace == KeyNamespace::default();
+            if self.cp_size.is_some() {
+                // CP storage uses group hashes, so a separate default-namespace event chain is valid.
+                unexpected_event_hashes = false;
+            }
+            if unexpected_event_hashes {
                 errors.push(format!(
                     "[Events] default-namespace node {node_handle} carries event hashes"
                 ));
@@ -5327,7 +5395,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     ));
                 }
                 if let Some(value) = child.try_host_value(FULL)
-                    && value.size()[0] as usize != child.key.atom_len()
+                    && from_cp_sharded(value.size()[0] as usize, self.cp_size)
+                        != child.key.atom_len()
                 {
                     errors.push(format!(
                         "[Tree] node {child_id} Full host value length {} != key length {}",

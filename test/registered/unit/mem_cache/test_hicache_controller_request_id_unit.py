@@ -30,6 +30,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def _hybrid_ctrl(page_size=2):
     ctrl = HybridCacheController.__new__(HybridCacheController)
     ctrl.page_size = page_size
+    ctrl.logical_page_size = page_size
     ctrl.storage_backend = MagicMock()
     return ctrl
 

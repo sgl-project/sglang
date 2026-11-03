@@ -20,6 +20,7 @@ use crate::unified_tree_core::{
     CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore, from_cp_sharded,
+    get_cp_sharded_padded,
 };
 
 /// SWA component driver; owns the SWA device/host value slots.
@@ -176,7 +177,7 @@ impl SwaComponent {
             covered_tokens += if on_device {
                 cur.device_value_len(SWA)
             } else if on_host {
-                cur.host_value_len(SWA)
+                from_cp_sharded(cur.host_value_len(SWA), tree_core.cp_size)
             } else {
                 break;
             };
@@ -271,7 +272,10 @@ impl SwaComponent {
         // a hit-shrunk window mid-tree is missing its head, so drop it.
         // Root anchors are complete windows of their own.
         if node_id != tree_core.arena.root()
-            && window_require_pages < self.sliding_window_size.div_ceil(page_size)
+            && window_require_pages
+                < self
+                    .sliding_window_size
+                    .div_ceil(from_cp_sharded(page_size, tree_core.cp_size))
         {
             self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
             return;
@@ -283,7 +287,8 @@ impl SwaComponent {
         let insert_result = insert_result.expect("target implies an insert result");
 
         // The buffer covers token range [loaded_start, total_len).
-        let loaded_start = insert_result.total_len - window_require_pages * page_size;
+        let loaded_start = insert_result.total_len
+            - from_cp_sharded(window_require_pages * page_size, tree_core.cp_size);
 
         // Walk leaf -> anchor; pos is the right edge of cur in tokens.
         let mut pos = insert_result.total_len;
@@ -295,7 +300,11 @@ impl SwaComponent {
             let fill_start = node_start.max(loaded_start);
             let fill_len = pos - fill_start;
             let buf_off = fill_start - loaded_start;
-            let slice = host_indices.narrow(0, buf_off as i64, fill_len as i64);
+            let slice = host_indices.narrow(
+                0,
+                get_cp_sharded_padded(buf_off, tree_core.cp_size) as i64,
+                get_cp_sharded_padded(fill_len, tree_core.cp_size) as i64,
+            );
             let parent = cur_node
                 .try_parent()
                 .expect("prefetch walk reached a root before the anchor");
@@ -321,7 +330,11 @@ impl SwaComponent {
         // Buffer prefix that fell outside the anchor->leaf path.
         if pos > loaded_start {
             self.release_swa_host_(
-                host_indices.narrow(0, 0, (pos - loaded_start) as i64),
+                host_indices.narrow(
+                    0,
+                    0,
+                    get_cp_sharded_padded(pos - loaded_start, tree_core.cp_size) as i64,
+                ),
                 cache_actions,
             );
         }
@@ -419,7 +432,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 // sliding window worth of pages, cap swa_host_hit at
                 // sliding_window_size so the scheduler budget matches the
                 // actual device-pool consumption.
-                let host_len = node.host_value_len(SWA);
+                let host_len = from_cp_sharded(node.host_value_len(SWA), tree_core.cp_size);
                 swa_host_hit += host_len;
                 n_swa += host_len;
             } else {
@@ -643,7 +656,12 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             Node::redistribute_child_device_value(new_parent, child, SWA, split_len);
         }
         if child.has_host_value(SWA) {
-            Node::redistribute_child_host_value(new_parent, child, SWA, split_len);
+            Node::redistribute_child_host_value(
+                new_parent,
+                child,
+                SWA,
+                get_cp_sharded_padded(split_len as usize, tree_core.cp_size) as i64,
+            );
             // Device-tombstoned sides park in the host LRU. Host-locked
             // halves stay out of it: in-flight IO holds them, and host
             // acquire removed the node at 0->1.
@@ -962,7 +980,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                         // Host only, collect it.
                         backed_up.push(host_value.shallow_clone());
                         nodes_to_load.push(cur.id);
-                        n_swa += host_value.size()[0] as usize;
+                        n_swa += from_cp_sharded(host_value.size()[0] as usize, tree_core.cp_size);
                     } else {
                         return Err(TreeCoreRuntimeError::SwaLoadBackMissingValue {
                             node_id: cur.id,
@@ -1099,7 +1117,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                         "SWA backup target {} is not device-only",
                         target.id
                     );
-                    let size = target.device_value_len(SWA) as i64;
+                    let size =
+                        get_cp_sharded_padded(target.device_value_len(SWA), tree_core.cp_size)
+                            as i64;
                     tree_core.arena.set_host_value(
                         target_idx,
                         SWA,
@@ -1125,7 +1145,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                         .arena
                         .resolve(loaded_id)
                         .expect("load-back transfers must reference live nodes");
-                    let n_tokens = tree_core.arena.host_value_len(loaded_idx, SWA) as i64;
+                    let n_tokens = from_cp_sharded(
+                        tree_core.arena.host_value_len(loaded_idx, SWA),
+                        tree_core.cp_size,
+                    ) as i64;
                     let swa_chunk = device_indices.narrow(0, offset, n_tokens).copy();
                     tree_core.set_component_device_value_(
                         loaded_idx,
@@ -1145,7 +1168,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     .host_indices
                     .as_ref()
                     .expect("SWA LOAD_BACK commit requires host indices");
-                assert_eq!(offset, host_indices.size()[0]);
+                assert_eq!(
+                    offset,
+                    from_cp_sharded(host_indices.size()[0] as usize, tree_core.cp_size) as i64
+                );
                 // Rebuild the full->swa mapping for the loaded chunks at the orchestration layer.
                 if !full_chunks.is_empty() {
                     cache_actions.push(Box::new(RebuildFullToSwaMapping {

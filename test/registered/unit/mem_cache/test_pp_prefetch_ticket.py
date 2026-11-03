@@ -45,6 +45,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
+        c.logical_page_size = c.page_size
         c.storage_config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=2,
@@ -351,6 +352,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         """A large local hit must not discard a prefix that fits on every stage."""
         c = self.c
         c.page_size = c.prefetch_threshold = 256
+        c.logical_page_size = c.page_size
         key = RadixKey(array("q", range(8193)), is_bigram=True)
         hashes = get_storage_hash_str(key, page_size=256)
         c.storage_backend_type = "file"
