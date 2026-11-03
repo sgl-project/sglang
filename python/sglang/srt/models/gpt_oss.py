@@ -90,6 +90,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     make_pp_layers,
@@ -256,6 +257,8 @@ class GptOssSparseMoeBlock(nn.Module):
         scheme = getattr(self.experts, "scheme", None)
         if (
             envs.SGLANG_GFX1250_W4A8_BYPASS_TOPK.get()
+            and _is_hip
+            and is_gfx1250_supported()
             and getattr(scheme, "routes_from_router_logits", False)
             and get_moe_a2a_backend().is_none()
             and get_exec().moe.expert_distribution_recorder_mode is None
