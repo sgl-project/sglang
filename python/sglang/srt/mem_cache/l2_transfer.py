@@ -85,9 +85,7 @@ class L2TransferEngine:
         if envs.SGLANG_DEBUG_HICACHE_VERIFY.get():
             from sglang.srt.mem_cache.hicache_verify import HiCacheVerifier
 
-            self._verifier = HiCacheVerifier(
-                resolve_rows=self._resolve_device_indices
-            )
+            self._verifier = HiCacheVerifier(resolve_rows=self._resolve_device_indices)
 
     @contextmanager
     def on_current_stream(self):

@@ -120,9 +120,7 @@ class TestHiCacheVerify(CustomTestCase):
     def setUp(self):
         transfer_module._timing_events_supported.cache_clear()
         self.addCleanup(transfer_module._timing_events_supported.cache_clear)
-        patcher = mock.patch.object(
-            transfer_module, "device_module", _FakeDeviceModule
-        )
+        patcher = mock.patch.object(transfer_module, "device_module", _FakeDeviceModule)
         patcher.start()
         self.addCleanup(patcher.stop)
 
