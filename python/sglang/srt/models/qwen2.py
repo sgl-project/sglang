@@ -117,7 +117,6 @@ class Qwen2MLP(nn.Module):
             and not deterministic.enable_deterministic_inference
             and deterministic.rl_on_policy_target is None
         )
-        self.quack_swiglu_min_tokens = envs.SGLANG_QUACK_SWIGLU_GEMM_MIN_TOKENS.get()
 
     def forward(
         self,
@@ -150,7 +149,6 @@ class Qwen2MLP(nn.Module):
             and not torch.compiler.is_compiling()
             and type(self.gate_up_proj) is MergedColumnParallelLinear
             and quack_swiglu_gemm_supported(x, self.gate_up_proj.weight)
-            and x.shape[0] >= self.quack_swiglu_min_tokens
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:

@@ -1595,9 +1595,7 @@ class Envs:
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     # SM120 dense gated MLPs: fuse SiLU-and-mul into the gate_up GEMM (quack).
-    # Below the token floor, cuBLAS >= 13.4 plus SiluAndMul measured faster.
     SGLANG_ENABLE_QUACK_SWIGLU_GEMM = EnvBool(False)
-    SGLANG_QUACK_SWIGLU_GEMM_MIN_TOKENS = EnvInt(512)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 

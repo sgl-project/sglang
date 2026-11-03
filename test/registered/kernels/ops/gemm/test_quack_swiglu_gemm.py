@@ -22,15 +22,25 @@ def _swiglu_ref(x, w_gate_up):
     return nn.functional.silu(gate) * up
 
 
-class TestTileWidth(CustomTestCase):
-    def test_tile_width_avoids_partial_wave(self):
-        """On 188 SMs, 128-wide tiles at M=512 make 192 tiles (a wave plus 4)
-        and 192-wide tiles at M=768 make 192 too; both must pick a width that
+class TestTileShape(CustomTestCase):
+    def test_tile_shape_avoids_partial_wave(self):
+        """On 188 SMs, 128x128 tiles at M=512 make 192 tiles (a wave plus 4)
+        and 128x192 tiles at M=768 make 192 too; both must pick a shape that
         fills the waves instead."""
-        from sglang.kernels.ops.gemm.quack_swiglu_gemm import _tile_n
+        from sglang.kernels.ops.gemm.quack_swiglu_gemm import _tile_shape
 
-        self.assertEqual(_tile_n(512, 2 * INTER, 188), 160)
-        self.assertEqual(_tile_n(768, 2 * INTER, 188), 128)
+        self.assertEqual(_tile_shape(512, 2 * INTER, 188), (128, 160))
+        self.assertEqual(_tile_shape(768, 2 * INTER, 188), (128, 128))
+
+    def test_64_row_tiles_only_in_one_wave(self):
+        """At M=256 128-row tiles leave most SMs idle and 64x160 tiles fill one
+        wave. At M=384 and M=448 every 64-row shape needs a second wave, where
+        128-row tiles are faster, even though 64x128 has no more work per SM."""
+        from sglang.kernels.ops.gemm.quack_swiglu_gemm import _tile_shape
+
+        self.assertEqual(_tile_shape(256, 2 * INTER, 188), (64, 160))
+        self.assertEqual(_tile_shape(384, 2 * INTER, 188), (128, 128))
+        self.assertEqual(_tile_shape(448, 2 * INTER, 188), (128, 160))
 
 
 @unittest.skipIf(
@@ -51,11 +61,11 @@ class TestQuackSwigluGemm(CustomTestCase):
 
     def test_kernel_reads_gate_up_layout_in_place(self):
         """SGLang stacks the merged weight as [gate; up]; reading it as
-        interleaved or swapped halves changes every output. M covers all
-        three tile widths and partial M tiles."""
+        interleaved or swapped halves changes every output. M covers both
+        tile heights, all three tile widths and partial M tiles."""
         from sglang.kernels.ops.gemm.quack_swiglu_gemm import quack_swiglu_gemm
 
-        for m in (512, 600, 768, 2049):
+        for m in (1, 256, 300, 512, 600, 768, 2049):
             with self.subTest(m=m):
                 torch.manual_seed(m)
                 x = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16)
@@ -106,16 +116,18 @@ class TestQuackSwigluGemm(CustomTestCase):
         expected, _ = mlp.down_proj(mlp.act_fn(base(x)[0] + 1.0))
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
-    def test_token_floor_selects_path(self):
-        """Batches below SGLANG_QUACK_SWIGLU_GEMM_MIN_TOKENS keep cuBLAS plus
-        SiluAndMul; batches at the floor take the fused GEMM."""
+    def test_mlp_takes_fused_path(self):
+        """With the flag on, decode-sized and prefill-sized batches both take
+        the fused GEMM and match the fp32 MLP."""
         mlp = self._mlp()
-        floor = envs.SGLANG_QUACK_SWIGLU_GEMM_MIN_TOKENS.get()
-        self.assertFalse(self._run(mlp, floor - 1)[2])
-        x, out, fused = self._run(mlp, floor)
-        self.assertTrue(fused)
-        ref = _swiglu_ref(x, mlp.gate_up_proj.weight) @ mlp.down_proj.weight.float().t()
-        self.assertLess(((out.float() - ref).norm() / ref.norm()).item(), 1e-2)
+        for m in (1, 256, 2048):
+            with self.subTest(m=m):
+                x, out, fused = self._run(mlp, m)
+                self.assertTrue(fused)
+                ref = _swiglu_ref(x, mlp.gate_up_proj.weight)
+                ref = ref @ mlp.down_proj.weight.float().t()
+                err = (out.float() - ref).norm() / ref.norm()
+                self.assertLess(err.item(), 1e-2)
 
 
 if __name__ == "__main__":
