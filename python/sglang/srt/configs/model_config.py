@@ -35,7 +35,6 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
     UocrDocumentConfig,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
@@ -902,10 +901,13 @@ class ModelConfig:
             enable_multimodal
             and not self.is_lm_only
             and (
-                hasattr(self.hf_config, "audio_config")
-                or hasattr(
-                    getattr(self.hf_config, "thinker_config", None), "audio_config"
+                getattr(self.hf_config, "audio_config", None) is not None
+                or getattr(
+                    getattr(self.hf_config, "thinker_config", None),
+                    "audio_config",
+                    None,
                 )
+                is not None
                 or getattr(self.hf_config, "sound_config", None) is not None
                 or is_audio_model(self.hf_config.architectures)
             )
@@ -2080,6 +2082,9 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
+        # Deferred: the registry imports every quantization method's kernels.
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",

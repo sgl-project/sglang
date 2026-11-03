@@ -30,10 +30,17 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+    MAX_ROWS as DECODE_POST_COMBINE_MAX_ROWS,
+)
+from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+    mhc_post_combine_norm_decode,
+)
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
@@ -245,6 +252,14 @@ class HcNextBoundary(NamedTuple):
     hc: Optional[HcSubLayer] = None
     accepts_mxfp8_deepgemm: bool = False
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None
+    extend: bool = False
+
+
+def is_local_extend(forward_batch: Optional[ForwardBatch]) -> bool:
+    if forward_batch is None:
+        return False
+    mode = forward_batch.forward_mode
+    return mode.is_extend() and not mode.is_target_verify()
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -276,6 +291,7 @@ def make_boundary(
     hc: Optional[HcSubLayer] = None,
     accepts_mxfp8_deepgemm: bool = False,
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None,
+    extend: bool = False,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -293,6 +309,7 @@ def make_boundary(
         hc=hc,
         accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
         mega_moe_input=mega_moe_input,
+        extend=extend,
     )
 
 
@@ -659,6 +676,18 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
+def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
+    return (
+        0 < rows <= DECODE_POST_COMBINE_MAX_ROWS
+        and get_platform().is_blackwell
+        and cfg.pre_from_prev
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and not cfg.cp_prefill
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -675,6 +704,7 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and next.hc is not None
+        and next.extend
         and _can_use_mega_mhc(cfg)
         and y.shape[0] > 0
     ):
@@ -707,6 +737,27 @@ def _post_fusion(
         if moe_input is not None:
             moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
+    if (
+        next is not None
+        and next.norm_fusable
+        and _can_use_decode_post_combine(cfg, y.shape[0])
+    ):
+        quant = next.accepts_mxfp8
+        updated, normalized, q, sf = mhc_post_combine_norm_decode(
+            y,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next.norm.weight,
+            next.norm.variance_epsilon,
+            quant=quant,
+        )
+        if quant:
+            return HcState(
+                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
+            )
+        return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
         and next.norm_fusable

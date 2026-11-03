@@ -16,7 +16,7 @@ from typing import (
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -38,10 +38,10 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -83,7 +83,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+        UocrSchedulerRuntime,
+    )
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -152,7 +154,9 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
-    uocr_doc_hooks: Optional[UocrDocHooks] = None
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # Hands requests out of the scheduler's prefill_launched_reqs.
+    leave_prefill_launched: Callable = lambda reqs: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -423,8 +427,8 @@ class SchedulerBatchResultProcessor:
                             req, up_to_tick=batch.forward_iter
                         )
                     elif (
-                        self.uocr_doc_hooks is not None
-                        and self.uocr_doc_hooks.consume_spliced_prefill(req)
+                        self.uocr_runtime is not None
+                        and self.uocr_runtime.consume_spliced_prefill(req)
                     ):
                         # The overlap pages' text is already the first outputs.
                         req.update_finish_state()
@@ -461,6 +465,7 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
+                            self.leave_prefill_launched([req])
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     if discard_finish_reason is None:
