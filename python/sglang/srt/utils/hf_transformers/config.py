@@ -279,12 +279,10 @@ class HfModelConfigParser(ModelConfigParserBase):
         elif isinstance(config, DeepseekV41Config):
             config._name_or_path = model
         elif config.model_type in ("lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni"):
-            from sglang.srt.configs import (
-                Lfm3AudioConfig,
-                Lfm3Config,
-                Lfm3OmniConfig,
-                Lfm3VlConfig,
-            )
+            from sglang.srt.configs.lfm3 import Lfm3Config
+            from sglang.srt.configs.lfm3_audio import Lfm3AudioConfig
+            from sglang.srt.configs.lfm3_omni import Lfm3OmniConfig
+            from sglang.srt.configs.lfm3_vl import Lfm3VlConfig
 
             config_class = {
                 "lfm3": Lfm3Config,
