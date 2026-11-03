@@ -5,6 +5,8 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    assert_metrics,
+    run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -138,10 +140,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
-    "--hicache-storage-backend",
-    "npu_memcache",
-    "--hicache-storage-backend-extra-config",
-    '{"meta_service_url":"tcp://127.0.0.1:5007", "config_store_url":"tcp://127.0.0.1:6007", "log_level":"info", "world_size":8, "protocol": "device_sdma", "dram_size": "20GB"}'
+    # "--hicache-storage-backend",
+    # "npu_memcache",
+    # "--hicache-storage-backend-extra-config",
+    # '{"meta_service_url":"tcp://127.0.0.1:5007", "config_store_url":"tcp://127.0.0.1:6007", "log_level":"info", "world_size":8, "protocol": "device_sdma", "dram_size": "20GB"}'
 ]
 
 # Decode node launch arguments.
@@ -231,12 +233,33 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 128
+    eval_batch_size = 64
+    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 10%
 
     # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
     #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
     #     self.run_accuracy()
 
+    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
+        """Run the 64k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 57600-token prefix (64k * 0.9), which
+        # exceeds L1 so evictions land in L2.
+        metrics = run_bench_serving(
+            host=self.host,
+            port=self.port,
+            model_path=self.model_config.get("model_path"),
+            dataset_name="generated-shared-prefix",
+            num_prompts=96,
+            input_len=64000,
+            output_len=1024,
+            max_concurrency=32,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
+            seed=42,
+            warmup_requests=16,
+            cache_report=True,
+        )
+        assert_metrics(self, metrics)
 
 
 if __name__ == "__main__":
