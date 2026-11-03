@@ -251,6 +251,19 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
                 target_updated |= role == "target"
+            # A custom loader can reject on some tensor-parallel ranks only: agree
+            # on the result so that every rank reports the same outcome and
+            # flushes the cache if any rank applied the update.
+            flags = torch.tensor(
+                [int(not success), int(target_updated)], dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                flags, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+            )
+            if success and flags[0].item():
+                success = False
+                message = "The update was rejected on another tensor-parallel rank."
+            target_updated = bool(flags[1].item())
             if success or target_updated:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
