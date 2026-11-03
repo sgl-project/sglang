@@ -589,7 +589,7 @@ def handle_multi_item_scoring(server_args: Any):
 
 
 def handle_deterministic_inference(server_args: Any):
-    from sglang.srt.server_args import (
+    from sglang.srt.arg_groups.choices import (
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
 
