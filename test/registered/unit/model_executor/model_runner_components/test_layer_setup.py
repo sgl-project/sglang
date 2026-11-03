@@ -9,8 +9,10 @@ from torch import nn
 
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     check_layer_types_hybrid_swa_split,
+    check_mha_dcp_kv_heads,
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
@@ -193,6 +195,29 @@ class TestCheckLayerTypesHybridSWASplit(CustomTestCase):
         check_layer_types_hybrid_swa_split(
             model=model, model_config=_hybrid_swa_model_config()
         )
+
+
+class TestMhaDcpKvHeads(CustomTestCase):
+    def test_checks_actual_heads_for_local_hybrid_layers(self):
+        # Global IDs can be sparse within one PP stage; non-KV layers are skipped.
+        model = _attention_layers({7: -1, 11: -1})
+        model.layers.append(nn.Identity())
+        model.layers[1].tp_k_head_num = model.layers[1].tp_v_head_num = 2
+        pool = SimpleNamespace()
+        pool.layer_router = KVLayerRouter.from_layer_maps(
+            pool,
+            [
+                (str(i), SimpleNamespace(head_num=heads), {i: 0})
+                for i, heads in ((7, 1), (11, 2))
+            ],
+        )
+        check_mha_dcp_kv_heads(model=model, kv_pool=pool)
+        for attr in ("tp_k_head_num", "tp_v_head_num"):
+            with self.subTest(attr=attr), patch.object(model.layers[1], attr, 1):
+                with self.assertRaisesRegex(
+                    ValueError, r"layer 11:.*requires \(2, 2\)"
+                ):
+                    check_mha_dcp_kv_heads(model=model, kv_pool=pool)
 
 
 if __name__ == "__main__":

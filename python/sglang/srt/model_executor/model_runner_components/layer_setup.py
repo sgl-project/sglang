@@ -184,6 +184,24 @@ def resolve_layer_indices(
     )
 
 
+def check_mha_dcp_kv_heads(*, model: nn.Module, kv_pool) -> None:
+    """Check the loaded layers against their local pool, including PP/hybrid maps."""
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    for layer in model.modules():
+        if not isinstance(layer, RadixAttention):
+            continue
+        heads = kv_pool.layer_router.layer(layer.layer_id).view.head_num
+        actual = (layer.tp_k_head_num, layer.tp_v_head_num)
+        expected = (heads, heads)
+        if actual != expected:
+            raise ValueError(
+                f"MHA/GQA HiCache + DCP layer {layer.layer_id}: attention has "
+                f"K/V heads {actual}, but the local KV pool requires {expected}. "
+                "The model's K/V projections must match the DCP layout."
+            )
+
+
 def check_layer_types_hybrid_swa_split(*, model: nn.Module, model_config: ModelConfig):
     """Fail if `layer_types` put a layer in the KV pool its attention does not use.
 
