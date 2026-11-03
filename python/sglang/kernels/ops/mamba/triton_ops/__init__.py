@@ -1,3 +1,4 @@
+from .mamba1_scan_prefill import mamba1_scan_prefill
 from .mamba_ssm import PAD_SLOT_ID
 from .ssd_combined import mamba_chunk_scan_combined
 from .ssu_dispatch import (
@@ -9,5 +10,6 @@ __all__ = [
     "PAD_SLOT_ID",
     "selective_state_update",
     "mamba_chunk_scan_combined",
+    "mamba1_scan_prefill",
     "initialize_mamba_selective_state_update_backend",
 ]
