@@ -296,6 +296,27 @@ def _require_gpus(n: int) -> None:
         raise unittest.SkipTest(f"need {n} GPUs, have {available}")
 
 
+def _require_gated_model(repo_id: str) -> None:
+    """Skip when a gated checkpoint can be neither downloaded nor read from cache.
+
+    Fork PRs get no ``HF_TOKEN``, so the download fails with a 401 unless the
+    runner already has the model cached.
+    """
+    from huggingface_hub import get_token, snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    if get_token():
+        return
+    try:
+        snapshot_download(
+            repo_id, allow_patterns=["config.json"], local_files_only=True
+        )
+    except LocalEntryNotFoundError:
+        raise unittest.SkipTest(
+            f"{repo_id} is gated: needs HF_TOKEN or a cached copy"
+        ) from None
+
+
 class _DisaggTestBase(CustomTestCase):
     """Shared setup: launch cluster once per class, tear down at the end."""
 
@@ -305,6 +326,7 @@ class _DisaggTestBase(CustomTestCase):
     gpu_layout: dict[str, list[int]] = {}
     extra_role_args: dict[str, list[str]] = {}
     warmup_kwargs: dict = {}
+    gated_model: bool = False
 
     cluster: DisaggCluster | None = None
 
@@ -312,6 +334,8 @@ class _DisaggTestBase(CustomTestCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         _require_gpus(cls.required_gpus)
+        if cls.gated_model:
+            _require_gated_model(cls.model)
         cls.cluster = DisaggCluster(
             model=cls.model,
             name=cls.cluster_name,
@@ -384,6 +408,7 @@ class TestDisaggFlux3Image(_DisaggTestBase):
     """Real four-role T2I/i2i versus the same monolithic model and workload."""
 
     model = "black-forest-labs/flux-3-image-klein"
+    gated_model = True
     cluster_name = "flux3_split"
     gpu_layout = {
         "prompt_encoder": [0],
