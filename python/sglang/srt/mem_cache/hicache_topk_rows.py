@@ -67,11 +67,13 @@ class HostTopkRows:
     def copy_indices(
         device_indices: torch.Tensor, host_indices: torch.Tensor, stream
     ) -> TopkRowCopy:
-        """Copy the slot indices of a transfer to the host on stream. Call it
-        before submitting the KV copy, so the indices do not wait for the KV."""
+        """Copy the slot indices of a transfer to the host on stream, after the
+        current stream that produced them. Call it before submitting the KV
+        copy, so the indices do not wait for the KV."""
         device_indices_cpu = torch.empty(
             device_indices.shape, dtype=device_indices.dtype, pin_memory=True
         )
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             device_indices_cpu.copy_(device_indices, non_blocking=True)
             event = torch.cuda.Event()
