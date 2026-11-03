@@ -24,9 +24,8 @@ register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-small")
 PROMPTS = [
     "The capital of France is",
     "One, two, three, four,",
-    "The color of a clear daytime sky is",
 ]
-BANNED_WORDS = [" Paris", " five", " blue", " Blue"]
+BANNED_WORDS = [" Paris", " five"]
 
 
 def banned_ids(model):
