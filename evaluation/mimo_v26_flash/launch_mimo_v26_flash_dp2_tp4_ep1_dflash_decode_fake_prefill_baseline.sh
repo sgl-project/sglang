@@ -40,18 +40,18 @@ if [[ -n "${AITER_ROOT:-}" ]]; then
 fi
 export PYTHONPATH="${SGLANG_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-1}"
+# SGLANG_MXFP4_TO_FP8_128BLOCK=0 to enable weight-decompression based mxfp4 a8w4 support
+export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-0}"
+# PR36 uses the integrated SGLang A8W4 dispatcher for native MXFP4.
+
+
 export SGLANG_INT4_WEIGHT=0
 case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
   1)
     moe_weight_description="static FP8 blockscale MoE weights converted from MXFP4 at load time"
     ;;
   0)
-    if [[ -z "${AITER_CONFIG_FMOE:-}" ]]; then
-      echo "Native MXFP4 requires AITER_CONFIG_FMOE with Flash TP4 A16W4/A8W4 recipes" >&2
-      exit 2
-    fi
-    if [[ "${DRY_RUN:-0}" != "1" && ! -r "${AITER_CONFIG_FMOE}" ]]; then
+    if [[ -n "${AITER_CONFIG_FMOE:-}" && "${DRY_RUN:-0}" != "1" && ! -r "${AITER_CONFIG_FMOE}" ]]; then
       echo "AITER_CONFIG_FMOE is not readable: ${AITER_CONFIG_FMOE}" >&2
       exit 2
     fi
@@ -59,7 +59,7 @@ case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
     # The fused MoE RMSNorm path produces per-1x128 FP8 activations, not the
     # BF16 input expected by the native A16W4/A8W4 MoE wrappers.
     export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
-    moe_weight_description="native MXFP4 MoE weights; A16W4/A8W4 selected by AITER_CONFIG_FMOE"
+    moe_weight_description="native MXFP4 MoE weights; integrated SGLang A8W4 kernels"
     ;;
   *)
     echo "SGLANG_MXFP4_TO_FP8_128BLOCK must be 0 or 1" >&2

@@ -1,0 +1,33 @@
+model_dim,inter_dim,experts,topk,routing,num_tokens,kind,block_m,g1_bcm,g2,bcm,wpe,ksplit,us,best_2k,best_2k_us,best_1k,best_1k_us
+4096,256,256,8,uniform,1,2k,32,1,base,,,,42.4,2k bm32 g1bcm1 g2base,42.4,1k bm64 bcm1 w2 ks1,94.5
+4096,256,256,8,uniform,2,2k,64,2,base,,,,44.5,2k bm64 g1bcm2 g2base,44.5,1k bm64 bcm1 w2 ks1,94.6
+4096,256,256,8,uniform,4,2k,32,2,nt4,,,,45.4,2k bm32 g1bcm2 g2nt4,45.4,1k bm64 bcm1 w2 ks1,98.5
+4096,256,256,8,uniform,8,2k,32,2,nt4,,,,51.2,2k bm32 g1bcm2 g2nt4,51.2,1k bm64 bcm1 w2 ks1,102.1
+4096,256,256,8,uniform,16,2k,32,1,nt4,,,,68.6,2k bm32 g1bcm1 g2nt4,68.6,1k bm64 bcm1 w2 ks1,115.1
+4096,256,256,8,uniform,32,2k,64,1,nt4,,,,101.3,2k bm64 g1bcm1 g2nt4,101.3,1k bm64 bcm1 w2 ks1,121.7
+4096,256,256,8,uniform,64,2k,32,1,nt4,,,,118.7,2k bm32 g1bcm1 g2nt4,118.7,1k bm64 bcm2 w2 ks1,142.6
+4096,256,256,8,uniform,128,2k,32,1,base,,,,134.7,2k bm32 g1bcm1 g2base,134.7,1k bm64 bcm2 w2 ks1,157.8
+4096,256,256,8,uniform,256,2k,32,1,base,,,,145.6,2k bm32 g1bcm1 g2base,145.6,1k bm64 bcm2 w2 ks1,159.4
+4096,256,256,8,uniform,512,2k,32,1,nt4,,,,166.0,2k bm32 g1bcm1 g2nt4,166.0,1k bm64 bcm2 w2 ks1,166.9
+4096,256,256,8,uniform,1024,1k,64,,,2,2,1,216.1,2k bm64 g1bcm2 g2base,217.8,1k bm64 bcm2 w2 ks1,216.1
+4096,256,256,8,uniform,2048,2k,32,1,nt4,,,,329.8,2k bm32 g1bcm1 g2nt4,329.8,1k bm64 bcm1 w2 ks1,346.9
+4096,256,256,8,uniform,4096,1kq,64,,,1,,,498.1,2k bm64 g1bcm1 g2nt4,521.3,1kq bm64q bcm1,498.1
+4096,256,256,8,uniform,8192,1k,64,,,1,2,1,793.1,2k bm64 g1bcm1 g2nt4,915.8,1k bm64 bcm1 w2 ks1,793.1
+4096,256,256,8,uniform,16384,1k,64,,,1,2,1,1484.1,2k bm64 g1bcm1 g2nt4,1699.1,1k bm64 bcm1 w2 ks1,1484.1
+4096,256,256,8,uniform,32768,1k,64,,,1,2,1,2951.3,2k bm64 g1bcm1 g2nt4,3311.2,1k bm64 bcm1 w2 ks1,2951.3
+4096,512,256,8,uniform,1,2k,32,1,base,,,,41.9,2k bm32 g1bcm1 g2base,41.9,1k bm64 bcm2 w2 ks2,94.6
+4096,512,256,8,uniform,2,2k,32,2,base,,,,45.3,2k bm32 g1bcm2 g2base,45.3,1k bm64 bcm1 w2 ks2,99.2
+4096,512,256,8,uniform,4,2k,32,2,base,,,,51.1,2k bm32 g1bcm2 g2base,51.1,1k bm64 bcm1 w2 ks2,101.0
+4096,512,256,8,uniform,8,2k,32,1,base,,,,72.6,2k bm32 g1bcm1 g2base,72.6,1k bm64 bcm1 w2 ks2,108.0
+4096,512,256,8,uniform,16,2k,32,1,base,,,,111.6,2k bm32 g1bcm1 g2base,111.6,1k bm64 bcm2 w2 ks2,140.8
+4096,512,256,8,uniform,32,2k,32,2,base,,,,181.3,2k bm32 g1bcm2 g2base,181.3,1k bm64 bcm2 w2 ks2,205.3
+4096,512,256,8,uniform,64,2k,32,2,base,,,,232.8,2k bm32 g1bcm2 g2base,232.8,1k bm64 bcm2 w2 ks2,248.1
+4096,512,256,8,uniform,128,2k,32,2,base,,,,256.8,2k bm32 g1bcm2 g2base,256.8,1k bm64 bcm2 w2 ks2,272.8
+4096,512,256,8,uniform,256,2k,32,2,base,,,,267.4,2k bm32 g1bcm2 g2base,267.4,1k bm64 bcm2 w2 ks2,280.6
+4096,512,256,8,uniform,512,1k,64,,,2,2,2,294.3,2k bm32 g1bcm2 g2base,295.5,1k bm64 bcm2 w2 ks2,294.3
+4096,512,256,8,uniform,1024,1k,64,,,2,2,2,349.0,2k bm64 g1bcm2 g2base,382.0,1k bm64 bcm2 w2 ks2,349.0
+4096,512,256,8,uniform,2048,2k,64,2,base,,,,591.5,2k bm64 g1bcm2 g2base,591.5,1k bm64 bcm1 w2 ks2,616.6
+4096,512,256,8,uniform,4096,1k,64,,,1,2,2,852.0,2k bm64 g1bcm1 g2base,934.8,1k bm64 bcm1 w2 ks2,852.0
+4096,512,256,8,uniform,8192,1k,64,,,1,2,2,1468.2,2k bm64 g1bcm1 g2base,1576.9,1k bm64 bcm1 w2 ks2,1468.2
+4096,512,256,8,uniform,16384,1k,64,,,1,2,2,2718.9,2k bm64 g1bcm1 g2base,2877.4,1k bm64 bcm1 w2 ks2,2718.9
+4096,512,256,8,uniform,32768,1k,64,,,1,1,1,5206.7,2k bm64 g1bcm1 g2base,5513.6,1k bm64 bcm1 w1 ks1,5206.7
