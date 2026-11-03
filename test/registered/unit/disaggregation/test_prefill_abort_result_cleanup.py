@@ -21,10 +21,9 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _Req:
-    def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
+    def __init__(self, *, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
-        self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
             req_pool_idx=1 if allocated else None,
             kv_allocated_len=1 if allocated else 0,
@@ -81,6 +80,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 def _batch(req):
     return SimpleNamespace(
         reqs=[req],
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
@@ -183,7 +183,7 @@ class TestPrefillCompleteResult(CustomTestCase):
     def test_ready_observes_accepted_token_and_speculative_sidecars(self, cache):
         scheduler = _Scheduler()
         scheduler.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
-        req = _Req(inflight_middle_chunks=0)
+        req = _Req()
         req.to_finish = None
         req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
         draft = SimpleNamespace(
@@ -218,7 +218,7 @@ class TestPrefillCompleteResult(CustomTestCase):
     @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_aborted_final_result_never_publishes_ready(self, release):
         scheduler = _Scheduler()
-        req = _Req(inflight_middle_chunks=0)
+        req = _Req()
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
@@ -229,7 +229,7 @@ class TestPrefillCompleteResult(CustomTestCase):
     @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=True)
     def test_discarded_attempt_never_publishes_ready(self, force_retry):
         scheduler = _Scheduler()
-        req = _Req(inflight_middle_chunks=0)
+        req = _Req()
         req.to_finish = None
         retried = []
         scheduler.optimistic_release_and_requeue = lambda r: retried.append(r)

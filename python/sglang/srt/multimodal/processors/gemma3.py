@@ -1,12 +1,14 @@
 import re
 from typing import Dict, List, Union
 
-from sglang.srt.managers.multimodal_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
 from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
 # will be removed in the future
