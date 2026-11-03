@@ -93,26 +93,6 @@ def _reshape_kv_for_fia_nz(
     return tensor.view(-1, 1, num_heads * head_dim // tile_size, page_size, tile_size)
 
 
-def build_npu_page_table(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-) -> None:
-    """Build fixed-shape page tables on device, zeroing inactive entries."""
-    token_positions = (
-        torch.arange(page_table.shape[1], dtype=torch.int64, device=page_table.device)
-        * page_size
-    )
-    valid_pages = token_positions[None, :] < cache_seqlens[:, None]
-    # Use in-bounds indices for padding without data-dependent tensor shapes.
-    request_indices = torch.where(cache_seqlens > 0, req_pool_indices, 0)
-    token_positions = torch.where(valid_pages, token_positions, 0)
-    page_ids = req_to_token[request_indices[:, None], token_positions] // page_size
-    page_table.copy_(page_ids.masked_fill_(~valid_pages, 0))
-
-
 @dataclass
 class ForwardMetadata:
     # calculated map for kv positions [bs * maxseqlen]
@@ -385,7 +365,7 @@ class AscendAttnBackend(AttentionBackend):
             envs.SGLANG_ENABLE_WAR_BARRIER.set(True)
             self.quant_flash_attn = quant_flash_attn
             self.quant_flash_attn_metadata = quant_flash_attn_metadata
-            self.qfa_cache_layout = cache_layout
+            self.modelslim_cache_layout = cache_layout
             self.fa_num_heads = model_runner.model_config.get_num_attention_heads(
                 get_parallel().attn_tp_size
             )
@@ -984,7 +964,7 @@ class AscendAttnBackend(AttentionBackend):
         if bs == 0:
             return
         query_len = metadata.uniform_query_len
-        groups = self.fa_num_heads // self.qfa_cache_layout.local_kv_heads
+        groups = self.fa_num_heads // self.modelslim_cache_layout.local_kv_heads
         metadata.fa_layout_q_descale = (
             "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
         )
@@ -1003,13 +983,25 @@ class AscendAttnBackend(AttentionBackend):
             metadata.actual_seq_lengths_kv.masked_fill_(seq_lens == 0, 0)
         # Build the page table on device; the static width avoids host max()
         # and keeps graph addresses fixed.
-        build_npu_page_table(
-            req_to_token=self.req_to_token,
-            req_pool_indices=forward_batch.req_pool_indices[:bs],
-            cache_seqlens=metadata.actual_seq_lengths_kv,
-            page_table=metadata.block_tables,
-            page_size=self.page_size,
+        token_positions = (
+            torch.arange(
+                metadata.block_tables.shape[1],
+                dtype=torch.int64,
+                device=metadata.block_tables.device,
+            )
+            * self.page_size
         )
+        valid_pages = token_positions[None, :] < metadata.actual_seq_lengths_kv[:, None]
+        # Use in-bounds indices for padding without data-dependent tensor shapes.
+        request_indices = torch.where(
+            metadata.actual_seq_lengths_kv > 0,
+            forward_batch.req_pool_indices[:bs],
+            0,
+        )
+        token_positions = torch.where(valid_pages, token_positions, 0)
+        page_ids = self.req_to_token[request_indices[:, None], token_positions]
+        page_ids = page_ids // self.page_size
+        metadata.block_tables.copy_(page_ids.masked_fill_(~valid_pages, 0))
         if metadata.uniform_query_len is None:
             torch.cumsum(
                 forward_batch.extend_seq_lens[:bs],
@@ -1019,8 +1011,8 @@ class AscendAttnBackend(AttentionBackend):
             )
         metadata.fa_metadata = self.quant_flash_attn_metadata(
             self.fa_num_heads,
-            self.qfa_cache_layout.local_kv_heads,
-            self.qfa_cache_layout.key_head_dim,
+            self.modelslim_cache_layout.local_kv_heads,
+            self.modelslim_cache_layout.key_head_dim,
             1,
             cu_seqlens_q=metadata.cu_seqlens_q,
             seqused_kv=metadata.actual_seq_lengths_kv,
@@ -2160,21 +2152,6 @@ class AscendAttnBackend(AttentionBackend):
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return kv_cached, k_rope_cached
 
-    def _prepare_mxfp8_query(self, query, layer, scale_layout):
-        query, q_scale = layer.scheme.quantize_query(query)
-        kv_heads = layer.tp_k_head_num
-        groups = layer.tp_q_head_num // kv_heads
-        scale_pairs = q_scale.shape[-1] // 2
-        q_scale = q_scale.reshape(query.shape[0], layer.tp_q_head_num, scale_pairs, 2)
-        # Use the layout selected once for the shared QFA metadata plan.
-        if scale_layout == "N2TGD":
-            q_scale = (
-                q_scale.view(query.shape[0], kv_heads, groups, scale_pairs, 2)
-                .permute(1, 0, 2, 3, 4)
-                .contiguous()
-            )
-        return query, q_scale
-
     def forward_extend(
         self,
         q,
@@ -2303,8 +2280,8 @@ class AscendAttnBackend(AttentionBackend):
                         (0, layer.tp_q_head_num, layer.v_head_dim), dtype=torch.bfloat16
                     )
                 else:
-                    query, q_scale = self._prepare_mxfp8_query(
-                        query, layer, self.forward_metadata.fa_layout_q_descale
+                    query, q_scale = layer.scheme.prepare_query(
+                        query, self.forward_metadata.fa_layout_q_descale
                     )
                     k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
                         layer.layer_id
@@ -3228,8 +3205,8 @@ class AscendAttnBackend(AttentionBackend):
                         (0, layer.tp_q_head_num, layer.v_head_dim), dtype=torch.bfloat16
                     )
                 else:
-                    query, q_scale = self._prepare_mxfp8_query(
-                        query, layer, self.forward_metadata.fa_layout_q_descale
+                    query, q_scale = layer.scheme.prepare_query(
+                        query, self.forward_metadata.fa_layout_q_descale
                     )
                     k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
                         layer.layer_id
@@ -3743,8 +3720,8 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-            query, q_scale = self._prepare_mxfp8_query(
-                query, layer, self.forward_metadata.fa_layout_q_descale
+            query, q_scale = layer.scheme.prepare_query(
+                query, self.forward_metadata.fa_layout_q_descale
             )
             k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             attn_output, _ = self.quant_flash_attn(
@@ -4149,8 +4126,8 @@ class AscendAttnBackend(AttentionBackend):
                         (0, layer.tp_q_head_num, layer.v_head_dim), dtype=torch.bfloat16
                     )
                 else:
-                    query, q_scale = self._prepare_mxfp8_query(
-                        query, layer, self.forward_metadata.fa_layout_q_descale
+                    query, q_scale = layer.scheme.prepare_query(
+                        query, self.forward_metadata.fa_layout_q_descale
                     )
                     k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
                         layer.layer_id
