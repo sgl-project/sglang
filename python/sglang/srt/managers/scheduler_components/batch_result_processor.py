@@ -25,9 +25,8 @@ from sglang.srt.layers.logits_processor import (
     TokenCustomizedInfo,
 )
 from sglang.srt.managers.auxiliary_output import CommittedTokens
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
     mamba_lazy_spec_in_window,

@@ -2,8 +2,6 @@
 Multi-modality utils
 """
 
-from __future__ import annotations
-
 import copy
 import hashlib
 import mmap
@@ -14,7 +12,7 @@ from abc import abstractmethod
 from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,7 +32,7 @@ from sglang.srt.managers.mm_schedule import (
     DataEmbeddingFunc,
     get_embedding_and_mask,
 )
-from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalInputs, MultimodalProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import (
@@ -54,9 +52,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import MultimodalInputs
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -1643,8 +1638,6 @@ def _feature_has_shm(feat) -> bool:
 
 def has_shm_features(recv_reqs):
     """Return True if any request in the list contains ShmPointerMMData."""
-    from sglang.srt.managers.schedule_batch import MultimodalInputs
-
     for req in recv_reqs:
         if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
@@ -1675,8 +1668,6 @@ def _discard_tensor_or_list(value) -> None:
 
 def discard_shm_features(obj) -> None:
     """Release SHM features that will not be consumed by this request."""
-    from sglang.srt.managers.schedule_batch import MultimodalInputs
-
     if isinstance(obj, BaseBatchReq):
         for sub_obj in obj.batch:
             discard_shm_features(sub_obj)
@@ -1711,8 +1702,6 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    from sglang.srt.managers.schedule_batch import MultimodalInputs
-
     if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
     # Handle batch requests
