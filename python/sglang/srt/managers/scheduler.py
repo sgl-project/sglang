@@ -303,6 +303,7 @@ from sglang.srt.managers.utils import (
     allocate_distinct_stream,
     is_health_check_generate_req,
     is_war_barrier_enabled,
+    make_abort_req,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -394,10 +395,7 @@ from sglang.srt.utils.hf_transformers import (
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.weight_versions import (
-    compute_weight_version_spans,
-    record_weight_version_events,
-)
+from sglang.srt.utils.weight_versions import record_weight_version_events
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -2786,7 +2784,7 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             output_streamer=self.output_streamer,
             send_abort=lambda req, finished_reason: self.send_abort_output(
-                _make_abort_req(req, finished_reason=finished_reason), req
+                make_abort_req(req, finished_reason=finished_reason), req
             ),
         )
 
@@ -3289,7 +3287,7 @@ class Scheduler(
             return
 
         if error_msg := self.validate_dllm_request(req):
-            abort_req = _make_abort_req(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3694,7 +3692,7 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            abort_req = _make_abort_req(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3726,7 +3724,7 @@ class Scheduler(
         for req in reqs:
             self._release_aborted_request(req)
             self.ipc_channels.send_to_tokenizer.send_output(
-                _make_abort_req(req, finished_reason=finished_reason), req
+                make_abort_req(req, finished_reason=finished_reason), req
             )
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -3766,7 +3764,7 @@ class Scheduler(
                 )
 
         self.send_abort_output(
-            _make_abort_req(
+            make_abort_req(
                 req_to_abort,
                 finished_reason={
                     "type": "abort",
@@ -4010,7 +4008,7 @@ class Scheduler(
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
+            make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4816,7 +4814,7 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_abort_output(
-                    _make_abort_req(req, finished_reason=abort_reason.to_json()),
+                    make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
             for req in reqs_to_abort:
@@ -6045,7 +6043,7 @@ class Scheduler(
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.send_abort_output(
-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -6073,7 +6071,7 @@ class Scheduler(
                 if req.finished_reason is None:
                     req.finish_outside_step(FINISH_ABORT())
                 self._release_aborted_request(req)
-                self.send_abort_output(_make_abort_req(req), req)
+                self.send_abort_output(make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
@@ -6134,12 +6132,12 @@ class Scheduler(
                     self.tree_cache,
                     get_disagg().disaggregation_decode_retraction_backup,
                 )
-                self.send_abort_output(_make_abort_req(req), req)
+                self.send_abort_output(make_abort_req(req), req)
             for req in held:
                 req.finish_outside_step(FINISH_ABORT())
                 self._release_aborted_request(req)
                 self.send_abort_output(
-                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                    make_abort_req(req, finished_reason=recv_req.finished_reason), req
                 )
 
         # Delete requests in the running batch
@@ -6258,7 +6256,7 @@ class Scheduler(
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
                 self.send_abort_output(
-                    _make_abort_req(req, finished_reason=abort_reason.to_json()), req
+                    make_abort_req(req, finished_reason=abort_reason.to_json()), req
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
@@ -6756,18 +6754,3 @@ def run_scheduler_process(
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
-
-
-def _make_abort_req(
-    req: Req, finished_reason: Optional[FinishReasonDict] = None
-) -> AbortReq:
-    return AbortReq(
-        rid=req.rid,
-        finished_reason=finished_reason,
-        weight_versions=compute_weight_version_spans(
-            req.weight_version_events,
-            current_version=get_serving().weight_version,
-            num_output_tokens=len(req.output_ids),
-        ),
-        prefill_weight_versions=req.prefill_weight_versions,
-    )

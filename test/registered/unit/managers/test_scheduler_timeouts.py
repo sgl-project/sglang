@@ -100,7 +100,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
 class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -158,7 +158,7 @@ class TestQueuedAbort(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()

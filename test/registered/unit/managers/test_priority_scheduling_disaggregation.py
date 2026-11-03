@@ -130,7 +130,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = self._new_req(priority=10)
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         ):
             scheduler._add_request_to_queue(req)
@@ -150,7 +150,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 req = self._new_req(priority=10)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(req)
@@ -178,7 +178,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 incoming = self._new_req(priority=priority)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(incoming)
@@ -458,7 +458,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.tree_cache = MagicMock()
 
         with (
-            patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
+            patch("sglang.srt.managers.utils.get_serving") as get_serving,
             patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
         ):
             get_serving.return_value.weight_version = None
