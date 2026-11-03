@@ -11,11 +11,13 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeRequest,
     DecodeTransferQueue,
-    HiCacheRestoreResult,
     SchedulerDisaggregationDecodeMixin,
     _PendingPublish,
 )
-from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreGatedKVReceiver
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    HiCacheRestoreGatedKVReceiver,
+    HiCacheRestoreResult,
+)
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import publish, reset_context
