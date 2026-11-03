@@ -56,10 +56,6 @@ class Requirements(msgspec.Struct, frozen=True):
     dtypes: frozenset[str] = frozenset()
     # the decode CUDA graph backends the served steps run under
     decode_graph_backends: frozenset[str] = frozenset({"full", "disabled"})
-    # the prefill CUDA graph backends, for a spec that also covers prefill or
-    # extend steps. Empty means the spec covers neither, and SGLang then neither
-    # checks the prefill graph backend nor expects any prefill graph to run it.
-    prefill_graph_backends: frozenset[str] = frozenset()
     # a server argument -> its accepted values, as resolved for this server
     server_args: Mapping[str, frozenset] = {}
     # an HF config field -> the value the kernels are built for
@@ -88,10 +84,6 @@ class BuildContext(msgspec.Struct, frozen=True):
     widths: tuple[int, ...]  # decode step rows to build, ascending
     tokens_per_request: int
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
-    # prefill token counts to build, ascending: the captured prefill graph
-    # buckets. Empty when prefill graphs are off or the spec declares no
-    # prefill_graph_backends, and a spec that covers only decode ignores it.
-    prefill_widths: tuple[int, ...] = ()
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
     binding: Any = None
 
@@ -410,7 +402,6 @@ class BuiltMegakernel(Protocol):
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
-    prefill_widths: tuple[int, ...]  # the prefill buckets it built; () for a decode-only spec
     draft_sampler: Optional[Callable[..., Callable[[int], Optional[Callable]]]]
     draft_loop: Optional[Callable]
     draft_extend: Optional[Callable]

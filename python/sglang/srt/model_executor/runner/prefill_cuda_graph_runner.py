@@ -1955,9 +1955,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             post_warmup_hook=post_warmup_hook,
         )
-        # out is None: capture_one does not return the captured output.
-        for capture_hook in self.model_runner.prefill_capture_tail_hooks:
-            capture_hook(self, None, forward_batch, num_tokens)
 
     def load_batch(
         self, forward_batch: ForwardBatch, **kwargs
