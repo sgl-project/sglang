@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
@@ -287,6 +287,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             grammar_manager=[],
             enable_fpm=False,
             enable_priority_scheduling=False,
+            kv_events_publisher=SimpleNamespace(emit_kv_metrics=MagicMock()),
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
                     update_scheduler_stats=lambda stats: None,
@@ -503,7 +504,9 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         )
         tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
         reporter.scheduler = SimpleNamespace(
-            enable_hierarchical_cache=True, tree_cache=tree_cache
+            enable_hierarchical_cache=True,
+            tree_cache=tree_cache,
+            kv_events_publisher=SimpleNamespace(emit_kv_metrics=MagicMock()),
         )
         reporter.stats = SchedulerStats()
         return reporter
