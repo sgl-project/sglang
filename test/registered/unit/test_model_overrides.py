@@ -2007,10 +2007,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
         """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
         and its speculative verify path is not; AITER prefill attention never is."""
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         cases = [
             # (gfx950, MLA model, prefill backend, speculative algorithm, accepted)
