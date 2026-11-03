@@ -332,6 +332,7 @@ NARROW_DISTRIBUTIONS = [
     "two_values",
     "signed_zero",
     "all_equal",
+    "all_zero",
 ]
 
 
@@ -370,6 +371,10 @@ def _single_bin_scores(kind, batch, width, device):
         out[:, : width // 2] = -0.0
         out[:, -1024:] = 1e-6
         return out
+    if kind == "all_zero":
+        # Only +0.0: any subset is exact, but the deterministic mode must still
+        # take indices 0..k-1 (the zero-bin shortcut may not apply there).
+        return torch.zeros((batch, width), dtype=torch.float32, device=device)
     # Control: the bin overflows too, but the candidates are bit-identical, so
     # any subset is correct and this must keep passing.
     return torch.full((batch, width), 0.5, dtype=torch.float32, device=device)
@@ -461,6 +466,7 @@ def _mode_check() -> None:
             (4, 65536),
             (12, 40960),
             (34, 131076),
+            (1, 131072),  # ROCm: the split path
         ]:
             torch.manual_seed(_narrow_seed(dist, batch, seq))
             width = (seq + 3) & ~3
@@ -488,10 +494,11 @@ _EXACT_MODE_CHECKS: dict[int, tuple[subprocess.Popen, object]] = {}
 def _start_exact_mode_checks():
     """Start the per-mode subprocesses at module start, so their JIT builds overlap
     this process's build and tests instead of running after them."""
-    if is_hip() or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         yield
         return
-    for mode in (MODE_EXACT, MODE_DETERMINISTIC):
+    # ROCm runs EXACT in-process by default, so only DETERMINISTIC needs its own process there.
+    for mode in (MODE_DETERMINISTIC,) if is_hip() else (MODE_EXACT, MODE_DETERMINISTIC):
         log = tempfile.TemporaryFile(mode="w+")
         with envs.SGLANG_TOPK_V2_MODE.override(mode):
             proc = subprocess.Popen(
@@ -508,8 +515,16 @@ def _start_exact_mode_checks():
         log.close()
 
 
-@pytest.mark.skipif(is_hip(), reason="ROCm runs EXACT in-process by default")
-@pytest.mark.parametrize("mode", [MODE_EXACT, MODE_DETERMINISTIC])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param(
+            MODE_EXACT,
+            marks=pytest.mark.skipif(is_hip(), reason="ROCm runs EXACT in-process by default"),
+        ),
+        MODE_DETERMINISTIC,
+    ],
+)
 def test_topk_v2_exact_modes(mode: int) -> None:
     """EXACT / DETERMINISTIC in their own process, since one process builds one mode."""
     proc, log = _EXACT_MODE_CHECKS[mode]
