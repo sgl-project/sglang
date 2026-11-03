@@ -45,12 +45,8 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-    flatten_nested_list,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
@@ -60,8 +56,9 @@ from sglang.srt.models.gemma4_mm import (
     Gemma4MultimodalEmbedder,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, flatten_nested_list
 
 logger = logging.getLogger(__name__)
 

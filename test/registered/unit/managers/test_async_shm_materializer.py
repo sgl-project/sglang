@@ -6,14 +6,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.scheduler_components.request_receiver import (
-    SchedulerRequestReceiver,
-)
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     AsyncShmMaterializer,
     ShmPointerMMData,
     create_async_shm_materializer,
     estimate_shm_bytes,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.request_receiver import (
+    UocrRequestReceiver,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -246,14 +246,26 @@ class AsyncShmMaterializerTest(CustomTestCase):
         coordinator.cancel_receive()
 
         # The receiver stops pulling at the materializer's batch, and only then.
-        limit_reached = SchedulerRequestReceiver.recv_limit_reached
-        receiver = SimpleNamespace(
-            max_recv_per_poll=-1, async_shm_materializer=coordinator
+        limit_reached = UocrRequestReceiver.recv_limit_reached
+        receiver = UocrRequestReceiver(
+            recv_from_tokenizer=None,
+            recv_from_rpc=None,
+            recv_skipper=None,
+            input_blocker=None,
+            mm_receiver=None,
+            server_args=None,
+            model_config=None,
+            max_recv_per_poll=-1,
+            stream_output=Mock(),
+            get_last_batch=lambda: None,
+            rust_server_mode=False,
+            async_shm_materializer=coordinator,
+            submit_crop_prefetch=Mock(),
         )
         limit = coordinator.max_recv_per_poll
         self.assertFalse(limit_reached(receiver, limit - 1))
         self.assertTrue(limit_reached(receiver, limit))
-        receiver.async_shm_materializer = None
+        object.__setattr__(receiver, "async_shm_materializer", None)
         self.assertFalse(limit_reached(receiver, 10_000))
 
     def test_estimate_deduplicates_pointer_name(self):

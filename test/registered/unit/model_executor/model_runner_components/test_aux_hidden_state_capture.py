@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     configure_aux_hidden_state_capture,
 )
