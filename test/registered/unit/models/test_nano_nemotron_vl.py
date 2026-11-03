@@ -8,18 +8,15 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs import NemotronHConfig
-from sglang.srt.configs.nemotron_h import MOE
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.configs.nemotron_h import MOE, NemotronHConfig
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.nano_nemotron_vl import (
     NemotronH_Nano_VL_V2,
     NemotronH_Omni_Reasoning_V3,
 )
 from sglang.srt.multimodal.evs import EVS, EVSEmbeddingResult
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

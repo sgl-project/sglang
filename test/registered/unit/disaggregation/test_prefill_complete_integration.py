@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+import torch
+
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
@@ -22,6 +24,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -344,6 +348,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
             clear_pending_chunk_send=Mock(),
+            prefill_launched_reqs=Mock(),
             waiting_queue=[],
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -414,6 +419,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
             clear_pending_chunk_send=Mock(),
+            prefill_launched_reqs=Mock(),
             waiting_queue=[],
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -454,6 +460,7 @@ class TestAllocationIntegration(CustomTestCase):
                             check_bootstrap=Mock(return_value=False),
                             has_bootstrapped_waiting_req=Mock(return_value=True),
                             optimistic_release_and_requeue=Mock(),
+                            prefill_launched_reqs=RequestList(),
                         )
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
@@ -478,6 +485,42 @@ class TestAllocationIntegration(CustomTestCase):
                             )
                     finally:
                         override.restore()
+
+    def test_yielded_request_requeues_after_its_chunk_once_bootstrap_completes(self):
+        # The yield is decided before its chunk in flight is processed; a bootstrap
+        # completing in between must not leave the request without a next holder.
+        req = Req("yielded", "", list(range(12)), SamplingParams())
+        req.inflight_middle_chunks = 1
+        req.extend_end = 4
+        req.pending_bootstrap = False
+        batch = SimpleNamespace(
+            reqs=[req], spec_info=None, prefill_stats=None, dp_cooperation_info=None
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([7]),
+            next_draft_input=None,
+            copy_done=None,
+        )
+        scheduler = SimpleNamespace(
+            chunked_req=None,
+            batch_result_processor=SimpleNamespace(
+                snapshot_auxiliary_output_starts=Mock(return_value=[]),
+                move_logprobs_to_cpu=Mock(),
+                consume_auxiliary_output=Mock(),
+            ),
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+            optimistic_release_and_requeue=Mock(),
+            metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
+            maybe_send_health_check_signal=Mock(),
+        )
+
+        SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
+            scheduler, batch, result
+        )
+
+        scheduler.optimistic_release_and_requeue.assert_called_once_with(req)
+        self.assertEqual(req.inflight_middle_chunks, 0)
 
     def inflight_scheduler(self, reqs):
         scheduler = SchedulerDisaggregationPrefillMixin()
