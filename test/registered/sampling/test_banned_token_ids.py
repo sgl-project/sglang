@@ -1,5 +1,6 @@
 """--sampling-banned-token-ids: the banned ids never appear in the output or
-in the returned top logprobs, with and without EAGLE3 speculative decoding."""
+in the returned top logprobs. The EAGLE3 case is in
+test_banned_token_ids_eagle3.py."""
 
 import unittest
 
@@ -9,16 +10,14 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=150, stage="extra-a", runner_config="1-gpu-small")
 
 # Each prompt's greedy continuation starts with one of the banned words.
 PROMPTS = [
@@ -90,7 +89,9 @@ class TestBannedTokenIds(CustomTestCase):
 
 class TestBannedWordsAreTheGreedyContinuation(CustomTestCase):
     """Positive control: without the flag, each prompt's greedy continuation
-    starts with a banned id, so the banned-id tests cannot pass vacuously."""
+    starts with a banned id, so the banned-id tests cannot pass vacuously. It
+    needs its own server: the flag is server-wide, so the same server cannot
+    show the unbanned continuation."""
 
     model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -117,28 +118,6 @@ class TestBannedWordsAreTheGreedyContinuation(CustomTestCase):
             )
             self.assertEqual(resp.status_code, 200, resp.text)
             self.assertIn(resp.json()["output_ids"][0], self.banned, text)
-
-
-class TestBannedTokenIdsEagle3(TestBannedTokenIds):
-    model = DEFAULT_TARGET_MODEL_EAGLE3
-    extra_args = [
-        "--dtype",
-        "float16",
-        "--attention-backend",
-        "triton",
-        "--speculative-algorithm",
-        "EAGLE3",
-        "--speculative-draft-model-path",
-        DEFAULT_DRAFT_MODEL_EAGLE3,
-        "--speculative-num-steps",
-        "3",
-        "--speculative-eagle-topk",
-        "1",
-        "--speculative-num-draft-tokens",
-        "4",
-        "--mem-fraction-static",
-        "0.7",
-    ]
 
 
 if __name__ == "__main__":
