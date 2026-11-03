@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
@@ -67,7 +67,6 @@ class TestCheckTreeCacheGate(CustomTestCase):
             req_to_token_pool=MagicMock(),
             pool_stats_observer=pool_stats_observer,
             get_last_batch=lambda: None,
-            get_running_batch=lambda: None,
             scheduler_stage_metrics=None,
         )
 
@@ -205,9 +204,9 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
             get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
             get_request_lists=lambda: {
-                "chunked": [] if self.chunked_req is None else [self.chunked_req]
+                "chunked": [] if self.chunked_req is None else [self.chunked_req],
+                "running": self.running_batch.reqs,
             },
             scheduler_stage_metrics=None,
         )
