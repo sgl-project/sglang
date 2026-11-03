@@ -360,12 +360,8 @@ class TestSamplingParamsVerify(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "logit_bias"):
                     self._make(logit_bias={"0": value}).verify(self.VOCAB_SIZE)
 
-    def test_logit_bias_native_range_is_not_capped(self):
-        """Native /generate accepts any finite bias; only OpenAI requests cap it.
-
-        An int bias is a valid JSON number, so the type guard must not narrow to
-        float.
-        """
+    def test_logit_bias_outside_openai_range_is_accepted(self):
+        """Integer biases and values outside OpenAI's range must remain accepted."""
         self._make(logit_bias={"0": -1e4, "1": 5, "31999": 1e4}).verify(self.VOCAB_SIZE)
 
     def test_logit_bias_beyond_overflow_bound_is_rejected(self):
