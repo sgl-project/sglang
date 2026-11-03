@@ -926,6 +926,8 @@ class TokenizerControlMixin:
         success, message = await self._weight_update_session_call(
             self.modelexpress_communicator, obj
         )
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success:
             self._update_weight_version_if_provided(obj.weight_version)
         return ModelExpressWeightUpdateReqOutput(success=success, message=message)

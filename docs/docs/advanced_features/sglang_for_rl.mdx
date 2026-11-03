@@ -391,7 +391,7 @@ for endpoint, payload in (
     response.raise_for_status()
 ```
 
-The explicit cache flush runs while generation is paused; `flush_cache=False` avoids flushing twice. The refit response contains `success` and `message`. The server records the installed version after all tensor-parallel workers succeed. Speculative draft models and incompatible shared or derived weight-cache modes are rejected.
+The explicit cache flush runs while generation is paused; `flush_cache=False` avoids flushing twice. The refit response contains `success` and `message`. The server records the installed version after all tensor-parallel workers succeed. Pipeline parallelism, speculative draft models, and incompatible shared or derived weight-cache modes are rejected.
 
 For trainer publication and cache settings, see the [ModelExpress S3 refit guide](https://github.com/ai-dynamo/modelexpress/blob/0af7e9e4438394588710b8b213cafec5e78db8de/docs/S3_DELTA_WEIGHT_REFIT.md#sglang-backend).
 

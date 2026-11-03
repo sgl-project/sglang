@@ -498,7 +498,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation=(
                 "Wall time of the most recent update_weights_from_<source> call on "
                 "this scheduler rank (seconds). `source` label is one of: disk, "
-                "distributed, tensor, ipc. Event-detection via "
+                "distributed, tensor, ipc, modelexpress. Event-detection via "
                 "changes(...[<range>]) > 0 — no separate counter needed."
             ),
             labelnames=[*labels.keys(), "source"],
@@ -1487,7 +1487,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def observe_weight_load(self, duration_seconds: float, source: str) -> None:
         # Edge-triggered: engine is paused during the update, so log_stats
         # won't fire — write the gauge inline at end of update_weights_from_*.
-        # `source` is "disk" | "distributed" | "tensor" | "ipc".
+        # `source` is "disk" | "distributed" | "tensor" | "ipc" | "modelexpress".
         self.weight_load_duration_seconds.labels(**self.labels, source=source).set(
             duration_seconds
         )

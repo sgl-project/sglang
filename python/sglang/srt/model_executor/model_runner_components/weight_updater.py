@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
@@ -84,6 +85,20 @@ def _unsupported_derived_weight_cache_error(
     return None
 
 
+def _combine_tp_results(success: bool, message: str) -> tuple[bool, str]:
+    """All-gather each TP rank's result; succeed only if every rank did."""
+    results = [(success, message)]
+    if torch.distributed.is_initialized():
+        group = get_parallel().tp_group.cpu_group
+        results = [None] * torch.distributed.get_world_size(group=group)
+        torch.distributed.all_gather_object(results, (success, message), group=group)
+    return all(ok for ok, _ in results), " | ".join(msg for _, msg in results if msg)
+
+
+class _ModelExpressClient(msgspec.Struct):
+    generator: Any = None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -96,23 +111,50 @@ class WeightUpdater:
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
+    _modelexpress: _ModelExpressClient = field(default_factory=_ModelExpressClient)
 
     def update_weights_from_modelexpress(self, weight_version: str) -> tuple[bool, str]:
-        """Stage and install one version while generation is paused."""
-        self._assert_weight_cache_inactive("update_weights_from_modelexpress")
-        error = _unsupported_derived_weight_cache_error(self.get_model())
-        if error is not None:
-            raise RuntimeError(error)
-
+        """Stage one version on every TP rank, then install it only if all staged it."""
+        generator = staged = None
         try:
+            self._assert_weight_cache_inactive("update_weights_from_modelexpress")
+            error = _unsupported_derived_weight_cache_error(self.get_model())
+            if error is not None:
+                raise RuntimeError(error)
+
             from modelexpress_rl import WeightVersionRef
             from modelexpress_rl.inference.engines.sglang import (
                 get_modelexpress_generator,
             )
 
-            generator = get_modelexpress_generator(self.get_model_runner())
+            if self._modelexpress.generator is None:
+                self._modelexpress.generator = get_modelexpress_generator(
+                    self.get_model_runner()
+                )
+            generator = self._modelexpress.generator
             staged = generator.stage_weight(version=WeightVersionRef(weight_version))
+            success, message = True, ""
+        except Exception as exc:
+            success, message = False, str(exc)
+
+        success, message = _combine_tp_results(success, message)
+        if not success:
+            if staged is not None:
+                try:
+                    staged.release()
+                except Exception:
+                    logger.exception(
+                        "Failed to release staged ModelExpress weight version %s",
+                        weight_version,
+                    )
+            return False, message
+
+        try:
             try:
+                if not staged.applied:
+                    DefaultModelLoader.restore_weights_before_loading(
+                        self.get_model(), torch.device(self.device)
+                    )
                 install_metrics = generator.apply_weight(staged)
                 logger.info(
                     "ModelExpress refit metrics version=%s: %s",
@@ -124,18 +166,13 @@ class WeightUpdater:
             success, message = True, ""
         except Exception as exc:
             success, message = False, str(exc)
+        return _combine_tp_results(success, message)
 
-        # Combine TP results before reporting success to the scheduler.
-        results = [(success, message)]
-        if torch.distributed.is_initialized():
-            group = get_parallel().tp_group.cpu_group
-            results = [None] * torch.distributed.get_world_size(group=group)
-            torch.distributed.all_gather_object(
-                results, (success, message), group=group
-            )
-        return all(ok for ok, _ in results), " | ".join(
-            msg for _, msg in results if msg
-        )
+    def close_modelexpress(self) -> None:
+        """Close the ModelExpress client if a refit created one."""
+        if self._modelexpress.generator is not None:
+            self._modelexpress.generator.close()
+            self._modelexpress.generator = None
 
     def init_weights_update_group(
         self,

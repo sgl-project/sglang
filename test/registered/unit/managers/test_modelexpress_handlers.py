@@ -4,37 +4,31 @@ import asyncio
 import json
 import sys
 from types import MethodType, ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import ANY, AsyncMock, MagicMock, call
 
 import pytest
 import torch
 
-sys.modules.setdefault("sgl_kernel", MagicMock())
-for name in ("quantization", "scalar_type", "flash_attn", "flash_mla", "mamba"):
-    sys.modules.setdefault(f"sgl_kernel.{name}", MagicMock())
-
-from sglang.srt.arg_groups.overrides import (  # noqa: E402
+from sglang.srt.arg_groups.overrides import (
     modelexpress_transport_of,
     modelexpress_url_of,
 )
-from sglang.srt.managers import scheduler as scheduler_module  # noqa: E402
-from sglang.srt.managers.io_struct import (  # noqa: E402
+from sglang.srt.managers import scheduler as scheduler_module
+from sglang.srt.managers.io_struct import (
     ModelExpressWeightUpdateReqOutput,
     UpdateWeightsFromModelExpressReqInput,
 )
-from sglang.srt.managers.scheduler_components.weight_updater import (  # noqa: E402
+from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
-from sglang.srt.managers.tokenizer_control_mixin import (  # noqa: E402
-    TokenizerControlMixin,
-)
-from sglang.srt.model_executor.model_runner_components import (  # noqa: E402
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.srt.model_executor.model_runner_components import (
     weight_updater as weight_updater_module,
 )
-from sglang.srt.model_executor.model_runner_components.weight_updater import (  # noqa: E402
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -64,11 +58,16 @@ def modelexpress_modules(monkeypatch):
         "_unsupported_derived_weight_cache_error",
         lambda model: None,
     )
+    monkeypatch.setattr(
+        weight_updater_module.DefaultModelLoader,
+        "restore_weights_before_loading",
+        MagicMock(),
+    )
     parallel = SimpleNamespace(tp_group=SimpleNamespace(cpu_group=object()))
     monkeypatch.setattr(weight_updater_module, "get_parallel", lambda: parallel)
     monkeypatch.setattr(
         "sglang.srt.managers.scheduler_components.weight_updater.get_parallel",
-        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None)),
+        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None), pp_size=1),
     )
     return integration
 
@@ -76,6 +75,7 @@ def modelexpress_modules(monkeypatch):
 class Staged:
     def __init__(self, version_id):
         self.version_id = version_id
+        self.applied = False
         self.released = 0
         self.release_error = None
         self.metrics = {}
@@ -94,6 +94,8 @@ class Generator:
         self.closed = 0
         self.stage_error = None
         self.apply_error = None
+        self.release_error = None
+        self.serving_version = None
 
     def stage_weight(self, *, version):
         if self.stage_error is not None:
@@ -104,6 +106,9 @@ class Generator:
                 raise RuntimeError("another generator update is still active")
             return staged
         staged = Staged(version.version_id)
+        # MX returns an already-applied handle for the version it serves.
+        staged.applied = version.version_id == self.serving_version
+        staged.release_error = self.release_error
         self.staged.append(staged)
         return staged
 
@@ -165,11 +170,31 @@ def test_update_stages_applies_and_releases_without_a_prepare_request(
     assert installed is True
 
 
+@pytest.mark.parametrize("serving", [False, True])
+def test_packed_weights_are_restored_only_right_before_a_reload(serving):
+    generator = Generator()
+    generator.serving_version = "2" if serving else None
+    updater = model_updater(generator)
+    restore = weight_updater_module.DefaultModelLoader.restore_weights_before_loading
+    apply_weight = generator.apply_weight
+
+    def apply_after_restore(staged):
+        assert restore.call_count == int(not serving)
+        apply_weight(staged)
+
+    generator.apply_weight = apply_after_restore
+
+    assert updater.update_weights_from_modelexpress("2") == (True, "")
+    assert generator.applied == generator.staged
+    if not serving:
+        restore.assert_called_once_with(updater.get_model(), torch.device("cpu"))
+
+
 @pytest.mark.parametrize("success", [True, False])
 @pytest.mark.parametrize(
     "flush_options", [{}, {"flush_cache": False}, {"torch_empty_cache": True}]
 )
-def test_scheduler_flushes_before_recording_success(success, flush_options):
+def test_scheduler_records_version_before_flushing(success, flush_options):
     events = MagicMock()
     events.update.return_value = (success, "updated" if success else "stage failed")
     events.flush.return_value = True
@@ -180,6 +205,7 @@ def test_scheduler_flushes_before_recording_success(success, flush_options):
         flush_cache=events.flush,
         is_fully_idle=MagicMock(),
         scheduler=SimpleNamespace(record_weight_version_change=events.record),
+        metrics_collector=events.metrics,
     )
     request = UpdateWeightsFromModelExpressReqInput(weight_version="2", **flush_options)
 
@@ -189,13 +215,14 @@ def test_scheduler_flushes_before_recording_success(success, flush_options):
     assert result.message == ("updated" if success else "stage failed")
     expected = [call.update(request)]
     if success:
+        expected.append(call.record(new_version="2"))
         if request.flush_cache:
             expected.append(call.flush(empty_cache=request.torch_empty_cache))
-        expected.append(call.record(new_version="2"))
+    expected.append(call.metrics.observe_weight_load(ANY, "modelexpress"))
     assert events.mock_calls == expected
 
 
-def test_failed_post_update_flush_does_not_record_version():
+def test_failed_post_update_flush_still_records_version():
     record = MagicMock()
     scheduler = SchedulerWeightUpdaterManager(
         tp_worker=SimpleNamespace(
@@ -214,7 +241,7 @@ def test_failed_post_update_flush_does_not_record_version():
 
     assert result.success is False
     assert "cache was not flushed" in result.message
-    record.assert_not_called()
+    record.assert_called_once_with(new_version="2")
 
 
 def test_scheduler_rejects_draft_models_before_updating():
@@ -233,6 +260,29 @@ def test_scheduler_rejects_draft_models_before_updating():
 
     assert result.success is False
     assert "draft models" in result.message
+    update.assert_not_called()
+
+
+def test_scheduler_rejects_pipeline_parallelism_before_updating(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler_components.weight_updater.get_parallel",
+        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None), pp_size=2),
+    )
+    update = MagicMock()
+    scheduler = SchedulerWeightUpdaterManager(
+        tp_worker=SimpleNamespace(update_weights_from_modelexpress=update),
+        draft_worker=None,
+        memory_saver_adapter=None,
+        flush_cache=MagicMock(),
+        is_fully_idle=MagicMock(),
+    )
+
+    result = scheduler.update_weights_from_modelexpress(
+        UpdateWeightsFromModelExpressReqInput(weight_version="2")
+    )
+
+    assert result.success is False
+    assert "pipeline parallelism" in result.message
     update.assert_not_called()
 
 
@@ -256,24 +306,45 @@ def test_model_updater_honors_native_weight_cache_restrictions(monkeypatch, cach
                 else None
             ),
         )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    reports = []
 
-    with pytest.raises(RuntimeError, match="cache"):
-        updater.update_weights_from_modelexpress("2")
+    def gather(results, local, group):
+        reports.append(local)
+        results[:] = [local, local]
 
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    # Raising here would kill the server instead of failing the request.
+    success, message = updater.update_weights_from_modelexpress("2")
+
+    assert success is False
+    assert "cache" in message
+    # The rejecting rank still joins the gather; skipping it would hang its peers.
+    assert [ok for ok, _ in reports] == [False]
     assert generator.staged == []
     assert generator.applied == []
 
 
-@pytest.mark.parametrize("initialized", [False, True])
-def test_scheduler_shutdown_closes_only_initialized_client(monkeypatch, initialized):
+@pytest.mark.parametrize("refitted", [False, True])
+def test_shutdown_closes_only_a_client_that_a_refit_created(
+    modelexpress_modules, refitted
+):
     generator = Generator()
-    runner = model_updater(generator if initialized else None).get_model_runner()
-    scheduler = SimpleNamespace(
-        hisparse_coordinator=None,
-        tree_cache=MagicMock(),
-        decode_offload_manager=None,
-        tp_worker=SimpleNamespace(model_runner=runner),
-    )
+    updater = model_updater(generator)
+    if refitted:
+        assert updater.update_weights_from_modelexpress("2") == (True, "")
+        assert updater.update_weights_from_modelexpress("3") == (True, "")
+
+    updater.close_modelexpress()
+    updater.close_modelexpress()
+
+    assert modelexpress_modules.get_modelexpress_generator.call_count == int(refitted)
+    assert generator.closed == int(refitted)
+
+
+def test_scheduler_shutdown_closes_the_modelexpress_client(monkeypatch):
+    scheduler = MagicMock()
     monkeypatch.setattr(
         scheduler_module, "destroy_global_experts_capturer", lambda: None
     )
@@ -286,8 +357,8 @@ def test_scheduler_shutdown_closes_only_initialized_client(monkeypatch, initiali
 
     scheduler_module.Scheduler.release_host_resources(scheduler)
 
-    assert generator.closed == int(initialized)
-    assert hasattr(runner, "modelexpress_generator") is initialized
+    weight_updater = scheduler.tp_worker.model_runner.weight_updater
+    weight_updater.close_modelexpress.assert_called_once_with()
 
 
 @pytest.mark.parametrize("endpoint_key", ["url", "server_url"])
@@ -398,24 +469,61 @@ def test_tp_reports_remote_failure_after_local_update_and_cleanup(monkeypatch):
 
     def gather(results, local, group):
         reports.append(local)
+        if len(reports) == 1:
+            # Nothing is installed until every rank has staged.
+            assert generator.applied == []
+            results[:] = [local, (True, "")]
+            return
         assert generator.applied == generator.staged
         assert generator.staged[0].released == 1
         results[:] = [
             local,
-            (False, "rank 1 stage failed"),
+            (False, "rank 1 apply failed"),
         ]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     success, message = updater.update_weights_from_modelexpress("2")
 
     assert success is False
-    assert "rank 1 stage failed" in message
-    assert reports == [(True, "")]
+    assert "rank 1 apply failed" in message
+    assert reports == [(True, ""), (True, "")]
 
 
+@pytest.mark.parametrize("failing_rank", [0, 1])
+def test_staging_failure_on_any_rank_installs_nothing(monkeypatch, failing_rank):
+    generator = Generator()
+    # A failed release must not escape once the ranks disagreed.
+    generator.release_error = RuntimeError("lease unavailable")
+    if failing_rank == 0:
+        generator.stage_error = RuntimeError("rank 0 stage failed")
+    peer = (False, "rank 1 stage failed") if failing_rank == 1 else (True, "")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    reports = []
+
+    def gather(results, local, group):
+        reports.append(local)
+        results[:] = [local, peer]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    success, message = model_updater(generator).update_weights_from_modelexpress("2")
+
+    assert success is False
+    assert f"rank {failing_rank} stage failed" in message
+    restore = weight_updater_module.DefaultModelLoader.restore_weights_before_loading
+    restore.assert_not_called()
+    assert generator.applied == []
+    assert [s.released for s in generator.staged] == ([1] if failing_rank else [])
+    # The rank that failed to stage still joins the agreement.
+    assert [ok for ok, _ in reports] == [failing_rank == 1]
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
 @pytest.mark.parametrize("remote_success", [False, True])
 @pytest.mark.parametrize("paused", [False, True])
-def test_tokenizer_reports_all_ranks_without_extra_fanout(remote_success, paused):
+def test_tokenizer_reports_all_ranks_without_extra_fanout(
+    remote_success, paused, multimodal
+):
     results = [
         ModelExpressWeightUpdateReqOutput(success=True),
         ModelExpressWeightUpdateReqOutput(
@@ -429,6 +537,7 @@ def test_tokenizer_reports_all_ranks_without_extra_fanout(remote_success, paused
         is_pause=paused,
         auto_create_handle_loop=MagicMock(),
         modelexpress_communicator=AsyncMock(return_value=results),
+        mm_processor=MagicMock() if multimodal else None,
         _update_weight_version_if_provided=MagicMock(),
     )
     tokenizer._weight_update_session_call = MethodType(
@@ -456,8 +565,15 @@ def test_tokenizer_reports_all_ranks_without_extra_fanout(remote_success, paused
 
     assert result.success is remote_success
     tokenizer.modelexpress_communicator.assert_awaited_once_with(request)
+    if multimodal:
+        clear = tokenizer.mm_processor.clear_preprocess_cache
+        assert clear.call_count == int(remote_success)
     if remote_success:
         tokenizer._update_weight_version_if_provided.assert_called_once_with("2")
     else:
         assert "rank 1 load failed" in result.message
         tokenizer._update_weight_version_if_provided.assert_not_called()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
