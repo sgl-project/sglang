@@ -2747,14 +2747,8 @@ class Scheduler(
             ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: (
-                self.disagg_prefill_bootstrap_queue
-            ),
-            get_disagg_prefill_transfer_queue=lambda: (
-                self.disagg_prefill_transfer_queue
-            ),
+            get_request_lists=self.request_lists,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
-            get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: (
                 self.metrics_reporter.spec_total_num_accept_tokens
             ),

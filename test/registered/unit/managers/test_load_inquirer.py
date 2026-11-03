@@ -70,10 +70,8 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             get_chunked_req=lambda: chunked_req,
             get_recent_cache_hit_rate=lambda: 0.75,
             get_stats=None,
-            get_disagg_prefill_bootstrap_queue=None,
-            get_disagg_prefill_transfer_queue=None,
+            get_request_lists=None,
             get_disagg_decode_prealloc_queue=None,
-            get_disagg_decode_transfer_queue=None,
             get_spec_total_num_accept_tokens=None,
             get_spec_total_num_forward_ct=None,
             get_total_prefill_uncached_tokens=None,
@@ -238,6 +236,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             metrics_reporter=SimpleNamespace(recent_cache_hit_rate=0.75),
             waiting_queue=[req],
             chunked_req=None,
+            request_lists=None,
         )
 
         Scheduler.init_load_inquirer(scheduler)

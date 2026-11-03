@@ -1021,8 +1021,7 @@ class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
-            waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
             pool_stats_observer=types.SimpleNamespace(
@@ -1046,8 +1045,6 @@ class TestIdleMetrics(CustomTestCase):
 
     def test_idle_publishes_refreshed_kv_metrics(self):
         self.reporter.current_scheduler_metrics_enabled = True
-        self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(queue=[])
-        self.scheduler.disagg_prefill_transfer_queue = []
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
             queue=[], pre_allocated_token_counts=lambda: (0, 0)
         )
