@@ -140,7 +140,9 @@ class TestSm120Nvfp4MoeSwiglu(CustomTestCase):
         gen = torch.Generator().manual_seed(7)
         w = _make_weights(num_experts, hidden, inter, gen)
         x, ids, weights = _make_inputs(96, num_experts, top_k, hidden, gen)
-        ids[:, 0] = 3  # 96 tokens on one expert: three full units
+        # Route all 96 tokens to expert 3 (three full units). Top-k ids are unique
+        # per token, so only rows that do not already pick expert 3 are rewritten.
+        ids[~(ids == 3).any(dim=1), 0] = 3
         ids[5, 2:] = -1
         ids[9, :] = -1  # every expert skipped: the output row is zero
         _assert_bitwise(
