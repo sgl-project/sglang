@@ -251,6 +251,10 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+def _should_use_aiter_quick_reduce(group_name: str) -> bool:
+    return is_hip() and group_name == "tp" and envs.SGLANG_USE_AITER_QUICK_REDUCE.get()
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -453,11 +457,28 @@ class GroupCoordinator:
         self.use_symmetric_memory = use_symmetric_memory
         self.is_allocation_symmetric = is_allocation_symmetric
         self.debug_check_symmetric_mempool = debug_check_symmetric_mempool
+        self.use_aiter_quick_reduce = _should_use_aiter_quick_reduce(group_name)
         if is_hip():
-            from sglang.srt.distributed.device_communicators.quick_all_reduce import (
-                QuickAllReduce,
-                qr_rocm_arch_available,
-            )
+            if self.use_aiter_quick_reduce:
+                try:
+                    # Use AITER's native QuickReduce implementation.
+                    # QuickReduce is considered before AITER custom AR.
+                    from aiter.dist.device_communicators.quick_all_reduce import (
+                        QuickAllReduce,
+                        qr_rocm_arch_available,
+                    )
+                except (ImportError, AttributeError) as e:
+                    logger.warning(
+                        "AITER QuickReduce is unavailable (%s); falling back to "
+                        "SGLang QuickReduce",
+                        e,
+                    )
+                    self.use_aiter_quick_reduce = False
+            if not self.use_aiter_quick_reduce:
+                from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+                    QuickAllReduce,
+                    qr_rocm_arch_available,
+                )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:
@@ -518,14 +539,26 @@ class GroupCoordinator:
 
             if is_hip():
                 try:
-                    # Initialize a custom quick all-reduce implementation for AMD
-                    # when rocm >= gfx942. Quick reduce is designed as a
-                    # complement to custom allreduce.
-                    # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                    # Initialize QuickReduce for AMD when ROCm >= gfx942. The
+                    # opt-in AITER path uses its native implementation, thresholds,
+                    # quantization settings, and QR-before-custom-AR policy.
                     if qr_rocm_arch_available():
                         self.qr_comm = QuickAllReduce(
                             group=self.cpu_group, device=self.device
                         )
+                        if self.use_aiter_quick_reduce:
+                            if self.qr_comm.disabled:
+                                logger.warning(
+                                    "[AR] AITER QuickReduce was requested but is "
+                                    "disabled; verify "
+                                    "AITER_QUICK_REDUCE_QUANTIZATION and platform "
+                                    "support"
+                                )
+                            else:
+                                logger.info(
+                                    "[AR] Using AITER QuickReduce with "
+                                    "QuickReduce-before-custom-AR selection"
+                                )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         elif self.world_size > 1 and is_hip():
@@ -973,6 +1006,17 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        use_aiter_quick_reduce = getattr(self, "use_aiter_quick_reduce", False)
+        # Prefer AITER QuickReduce before custom AR. Keep this policy
+        # scoped to the explicit AITER QuickReduce opt-in so the default
+        # SGLang communicator ordering remains unchanged.
+        if (
+            use_aiter_quick_reduce
+            and self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return "qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
@@ -991,7 +1035,8 @@ class GroupCoordinator:
         ):
             return "pcie_ipc"
         if (
-            self.qr_comm is not None
+            not use_aiter_quick_reduce
+            and self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):

@@ -137,6 +137,7 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator
     )
+    coordinator.use_aiter_quick_reduce = False
     coordinator.world_size = 2
     coordinator.unique_name = "test"
     coordinator.hpu_communicator = None
@@ -169,6 +170,54 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
         outplace_all_reduce_method="ca",
     )
     coordinator.pynccl_comm.all_reduce.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("is_hip", "group_name", "enabled", "expected"),
+    [
+        (True, "tp", True, True),
+        (True, "tp", False, False),
+        (True, "dp", True, False),
+        (False, "tp", True, False),
+    ],
+)
+def test_aiter_quick_reduce_is_opt_in_for_hip_tp_only(
+    is_hip, group_name, enabled, expected
+):
+    with (
+        patch.object(parallel_state, "is_hip", return_value=is_hip),
+        parallel_state.envs.SGLANG_USE_AITER_QUICK_REDUCE.override(enabled),
+    ):
+        assert parallel_state._should_use_aiter_quick_reduce(group_name) is expected
+
+
+@pytest.mark.parametrize(
+    ("use_aiter_quick_reduce", "quick_reduce_eligible", "expected"),
+    [
+        (True, True, "qr"),
+        (True, False, "ca"),
+        (False, True, "ca"),
+    ],
+)
+def test_aiter_quick_reduce_selection_policy(
+    use_aiter_quick_reduce, quick_reduce_eligible, expected
+):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.use_aiter_quick_reduce = use_aiter_quick_reduce
+    coordinator.qr_comm = Mock(disabled=False)
+    coordinator.qr_comm.should_quick_allreduce.return_value = quick_reduce_eligible
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+
+    method = coordinator._resolve_outplace_all_reduce_method(
+        Mock(), should_use_pymscclpp_allreduce=False
+    )
+
+    assert method == expected
+    if expected == "qr":
+        coordinator.ca_comm.should_custom_ar.assert_not_called()
 
 
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])

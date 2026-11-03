@@ -1023,6 +1023,10 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Select AITER's native QuickReduce communicator for TP groups and prefer
+    # it before custom all-reduce. AITER_QUICK_REDUCE_QUANTIZATION configures
+    # and enables the codec (for example, INT4).
+    SGLANG_USE_AITER_QUICK_REDUCE = EnvBool(False)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
     # INT4 at every size.
