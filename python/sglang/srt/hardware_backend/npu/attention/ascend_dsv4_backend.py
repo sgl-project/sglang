@@ -111,27 +111,66 @@ def _ds41_ops():
 
 
 @functools.cache
-def _dsv41_a3_ops():
-    """BF16 A3 operators from ops-transformer (including LI V3 candidates).
+def _dsv41_a3_op_module(name):
+    """Resolve an ops-transformer vendor wheel or the full package's binding."""
+    from importlib import import_module
+    from importlib.metadata import entry_points
 
-    Import the standard bindings, not the A5 mixed-quant DSL bundle. The
-    supplemental package must include SMLA's matching AICPU metadata kernel.
-    """
-    from cann_ops_transformer.ops.attention import (  # noqa: F401
-        lightning_indexer_v2,
-        sparse_flash_mla,
-        sparse_lightning_indexer,
+    # Vendor bindings (notably CompressorV2) require the base ops namespace
+    # during import. Let its entrypoint loader select providers before any
+    # physical imports can register older bindings from the base package.
+    import_module("cann_ops_transformer.ops")
+    providers = list(entry_points(group="cann_ops_transformer.ops", name=name))
+    if len(providers) > 1:
+        raise RuntimeError(
+            f"Multiple ops-transformer providers for {name}: "
+            f"{[provider.value for provider in providers]}; keep one provider."
+        )
+    module_name = (
+        providers[0].module
+        if providers
+        else f"cann_ops_transformer.ops.attention.{name}"
     )
+    # Some entrypoints export a module rather than an attribute named after
+    # the operator directory, so EntryPoint.load() is not interchangeable.
+    return import_module(module_name)
+
+
+@functools.cache
+def _dsv41_a3_ops():
+    """BF16 A3 operators, with matching SMLA metadata and LI V3 candidates."""
+    for name in (
+        "lightning_indexer_v2",
+        "sparse_flash_mla",
+        "sparse_lightning_indexer",
+    ):
+        _dsv41_a3_op_module(name)
 
     ops = torch.ops.cann_ops_transformer
-    # Resolve the V3 overload now so an older V2-only package fails at init.
-    return SimpleNamespace(
-        attention=ops.sparse_flash_mla,
-        metadata=ops.sparse_flash_mla_metadata,
-        indexer=ops.lightning_indexer.default,
-        candidate=ops.lightning_indexer.candidate,
-        sparse_indexer=ops.sparse_lightning_indexer,
-    )
+    try:
+        return SimpleNamespace(
+            attention=ops.sparse_flash_mla,
+            metadata=ops.sparse_flash_mla_metadata,
+            indexer=ops.lightning_indexer.default,
+            candidate=ops.lightning_indexer.candidate,
+            sparse_indexer=ops.sparse_lightning_indexer,
+        )
+    except AttributeError as exc:
+        raise RuntimeError(
+            "DSV4.1 A3 requires SMLA/metadata, SparseLightningIndexer and "
+            "lightning_indexer.candidate. Check ops-transformer import warnings "
+            "and use a compatible base package with vendor entrypoint support; "
+            "an already registered older Indexer cannot be replaced safely."
+        ) from exc
+
+
+@functools.cache
+def _dsv41_a3_compressor_kernel():
+    from importlib import import_module
+
+    package = _dsv41_a3_op_module("compressor_v2")
+    module = import_module(f"{package.__name__}.compressor")
+    return module.compressor_op_builder.load().compressor
 
 
 @torch.library.custom_op("sglang::dsv41_a3_compressor", mutates_args=("state_cache",))
@@ -149,11 +188,7 @@ def _dsv41_a3_compressor(
     # The upstream Python wrapper declares no mutations although CompressorV2
     # updates its cycle bank. Expose the actual contract to graph tracing; the
     # C++ binding and ACLNN kernel themselves are reused without modification.
-    from cann_ops_transformer.ops.attention.compressor_v2.compressor import (
-        compressor_op_builder,
-    )
-
-    return compressor_op_builder.load().compressor(
+    return _dsv41_a3_compressor_kernel()(
         x,
         wkv,
         wgate,
@@ -2882,11 +2917,7 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_has_low_ratio and not is_npu_arch35():
             _dsv41_a3_ops()
             # Load CompressorV2 before capture, not from inside a graph.
-            from cann_ops_transformer.ops.attention.compressor_v2.compressor import (
-                compressor_op_builder,
-            )
-
-            compressor_op_builder.load()
+            _dsv41_a3_compressor_kernel()
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )

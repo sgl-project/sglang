@@ -6,11 +6,13 @@ the numerical correctness of the external kernels.
 """
 
 import ast
+import functools
+import importlib.metadata
 import os
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 import torch.nn.functional as F
@@ -496,6 +498,154 @@ class TestA3Backend(unittest.TestCase):
                 self.assertEqual(namespace["_kernel_num_heads"](layer, 1), expected)
 
 
+class TestA3OpLoading(unittest.TestCase):
+    def setUp(self):
+        self.ns = _definitions(
+            BACKEND,
+            {"_dsv41_a3_op_module", "_dsv41_a3_compressor_kernel"},
+            {"functools": functools},
+        )
+        self.load_module = self.ns["_dsv41_a3_op_module"]
+
+    @staticmethod
+    def _provider(name, package="cann_ops_transformer_testvendor"):
+        return importlib.metadata.EntryPoint(
+            name=name,
+            value=f"{package}.ops.attention.{name}:{name}",
+            group="cann_ops_transformer.ops",
+        )
+
+    def test_loads_base_registration_before_arbitrary_vendor_module(self):
+        name = "sparse_lightning_indexer"
+        provider = self._provider(name)
+        module = ModuleType(provider.module)
+        with (
+            patch.object(importlib, "import_module", return_value=module) as imported,
+            patch.object(
+                importlib.metadata, "entry_points", return_value=[provider]
+            ) as entries,
+        ):
+            self.assertIs(self.load_module(name), module)
+        entries.assert_called_once_with(group="cann_ops_transformer.ops", name=name)
+        self.assertEqual(
+            imported.call_args_list,
+            [call("cann_ops_transformer.ops"), call(provider.module)],
+        )
+
+    def test_full_package_without_vendor_falls_back_to_base_module(self):
+        name = "lightning_indexer_v2"
+        module = ModuleType(f"cann_ops_transformer.ops.attention.{name}")
+        with (
+            patch.object(importlib, "import_module", return_value=module) as imported,
+            patch.object(importlib.metadata, "entry_points", return_value=[]),
+        ):
+            self.assertIs(self.load_module(name), module)
+        self.assertEqual(
+            imported.call_args_list,
+            [call("cann_ops_transformer.ops"), call(module.__name__)],
+        )
+
+    def test_module_discovery_and_import_are_cached(self):
+        name = "sparse_flash_mla"
+        provider = self._provider(name)
+        module = ModuleType(provider.module)
+        with (
+            patch.object(importlib, "import_module", return_value=module) as imported,
+            patch.object(
+                importlib.metadata, "entry_points", return_value=[provider]
+            ) as entries,
+        ):
+            self.assertIs(self.load_module(name), module)
+            self.assertIs(self.load_module(name), module)
+        self.assertEqual(imported.call_count, 2)
+        entries.assert_called_once()
+
+    def test_broken_vendor_import_is_not_hidden_by_base_fallback(self):
+        name = "sparse_lightning_indexer"
+        provider = self._provider(name)
+        failure = ImportError("vendor binding dependency missing")
+
+        def import_module(module_name):
+            if module_name == provider.module:
+                raise failure
+            return ModuleType(module_name)
+
+        with (
+            patch.object(
+                importlib, "import_module", side_effect=import_module
+            ) as imported,
+            patch.object(importlib.metadata, "entry_points", return_value=[provider]),
+        ):
+            with self.assertRaises(ImportError) as raised:
+                self.load_module(name)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(
+            imported.call_args_list,
+            [call("cann_ops_transformer.ops"), call(provider.module)],
+        )
+
+    def test_multiple_vendor_providers_fail_instead_of_selecting_arbitrarily(self):
+        name = "lightning_indexer_v2"
+        providers = [
+            self._provider(name, package) for package in ("vendor_a", "vendor_b")
+        ]
+        with (
+            patch.object(importlib, "import_module") as imported,
+            patch.object(importlib.metadata, "entry_points", return_value=providers),
+        ):
+            with self.assertRaisesRegex(RuntimeError, name):
+                self.load_module(name)
+        imported.assert_called_once_with("cann_ops_transformer.ops")
+
+    def test_missing_candidate_overload_is_reported_during_initialization(self):
+        ops = SimpleNamespace(
+            sparse_flash_mla=Mock(),
+            sparse_flash_mla_metadata=Mock(),
+            lightning_indexer=SimpleNamespace(default=Mock()),
+            sparse_lightning_indexer=Mock(),
+        )
+        loader = Mock()
+        namespace = _definitions(
+            BACKEND,
+            {"_dsv41_a3_ops"},
+            {
+                "functools": functools,
+                "SimpleNamespace": SimpleNamespace,
+                "torch": SimpleNamespace(ops=SimpleNamespace(cann_ops_transformer=ops)),
+                "_dsv41_a3_op_module": loader,
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "candidate"):
+            namespace["_dsv41_a3_ops"]()
+        self.assertEqual(
+            loader.call_args_list,
+            [
+                call("lightning_indexer_v2"),
+                call("sparse_flash_mla"),
+                call("sparse_lightning_indexer"),
+            ],
+        )
+
+    def test_compressor_uses_selected_vendor_builder_and_caches_loaded_kernel(self):
+        package = ModuleType(
+            "cann_ops_transformer_othercmp.ops.attention.compressor_v2"
+        )
+        kernel = Mock()
+        builder = SimpleNamespace(
+            load=Mock(return_value=SimpleNamespace(compressor=kernel))
+        )
+        module = ModuleType(f"{package.__name__}.compressor")
+        module.compressor_op_builder = builder
+        loader = Mock(return_value=package)
+        self.ns["_dsv41_a3_op_module"] = loader
+        with patch.object(importlib, "import_module", return_value=module) as imported:
+            self.assertIs(self.ns["_dsv41_a3_compressor_kernel"](), kernel)
+            self.assertIs(self.ns["_dsv41_a3_compressor_kernel"](), kernel)
+        loader.assert_called_once_with("compressor_v2")
+        imported.assert_called_once_with(module.__name__)
+        builder.load.assert_called_once()
+
+
 class TestA3CompressorContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -505,6 +655,7 @@ class TestA3CompressorContract(unittest.TestCase):
             {"torch": torch, "__name__": __name__},
             operator_namespace="sglang_test_a3",
         )
+        cls.namespace = namespace
         cls.op = namespace["_dsv41_a3_compressor"]
 
     @staticmethod
@@ -541,12 +692,9 @@ class TestA3CompressorContract(unittest.TestCase):
             state.add_(1)
             return x.new_zeros((4, wkv.shape[0]))
 
-        name = "cann_ops_transformer.ops.attention.compressor_v2.compressor"
-        module = ModuleType(name)
-        module.compressor_op_builder = SimpleNamespace(
-            load=lambda: SimpleNamespace(compressor=compressor)
-        )
-        with patch.dict("sys.modules", {name: module}):
+        with patch.dict(
+            self.namespace, {"_dsv41_a3_compressor_kernel": lambda: compressor}
+        ):
             result = self.op(**inputs)
         self.assertEqual(result.shape, (4, 512))
         self.assertEqual(result.dtype, torch.bfloat16)
