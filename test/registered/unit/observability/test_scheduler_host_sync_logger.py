@@ -1,15 +1,19 @@
 """SchedulerHostSyncLogger counts torch sync-debug reports by scheduler stage,
-forward mode and call site, and dumps them with the launched batches."""
+forward mode and call site, and dumps them with the launched batches. The
+scheduler calls its launch and result hooks once per step."""
 
 import unittest
 import warnings
 from collections import Counter
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
@@ -153,6 +157,66 @@ class TestSchedulerHostSyncLogger(CustomTestCase):
         (sync,) = self.records[0][1]["syncs"]
         self.assertEqual(sync["stage"], SCHEDULER_STAGE_RUN_BATCH)
         self.assertIn("test_counts_real_device_read", sync["call_site"])
+
+
+class TestSchedulerCallsHostSyncLogger(CustomTestCase):
+    def test_launch_and_result_hooks_run_once_per_step(self):
+        host_sync_logger = Mock(spec=["on_step_launch", "on_step_result"])
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.metrics_reporter = Mock(
+            spec=[
+                "record_scheduler_active",
+                "log_batch_result_stats",
+                "update_device_timer",
+            ]
+        )
+        scheduler.metrics_reporter.scheduler_host_sync_logger = host_sync_logger
+        scheduler.scheduler_stage_metrics = None
+        scheduler.forward_ct = 0
+        scheduler._sched_idled = False
+        scheduler.processed_tokens_counter = 0
+        scheduler.scripted_scheduler_hook = None
+        scheduler.dllm_config = None
+        scheduler.enable_fpm = False
+        # The rest of a step's bookkeeping is out of scope here.
+        for name in (
+            "profiler_manager",
+            "invariant_checker",
+            "deferred_responses",
+            "publish_load_snapshot",
+            "load_publisher",
+            "load_inquirer",
+            "batch_result_processor",
+            "tree_cache",
+            "_on_step_processed",
+            "_record_step_counters",
+            "_maybe_clear_mm_inputs",
+            "maybe_send_health_check_signal",
+        ):
+            setattr(scheduler, name, Mock())
+
+        batches = [
+            SimpleNamespace(
+                reqs=[],
+                extend_num_tokens=0,
+                forward_mode=ForwardMode.DECODE,
+                add_inflight_step=Mock(),
+            )
+            for _ in range(2)
+        ]
+        for batch in batches:
+            Scheduler._on_step_launch(scheduler, batch)
+            Scheduler.process_batch_result(scheduler, batch, GenerationBatchResult())
+
+        self.assertEqual(
+            host_sync_logger.mock_calls,
+            [
+                call.on_step_launch(batches[0]),
+                call.on_step_result(batches[0]),
+                call.on_step_launch(batches[1]),
+                call.on_step_result(batches[1]),
+            ],
+        )
 
 
 if __name__ == "__main__":
