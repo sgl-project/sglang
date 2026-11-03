@@ -74,30 +74,33 @@ class TestSamplingMaskValidation(CustomTestCase):
                         self.manager._validate_one_request(req, req.input_ids)
 
     def test_mixed_batch_forwards_zero_count_for_logprob_disabled_items(self):
-        """Disabled items must not contribute their raw count to a shared topk."""
+        """Disabled items must not contribute their raw count to a shared topk.
+
+        Each enabled item keeps its own count.
+        """
         self.manager.model_config.vocab_size = 32
         self.manager.preferred_sampling_params = None
         self.manager.sampling_params_class = SamplingParams
         self.manager.tokenizer = None
         self.manager.fake_bootstrap_room_counter = 0
         req = GenerateReqInput(
-            input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+            input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
             sampling_params={},
-            return_logprob=[True, False, False],
-            top_logprobs_num=[5, 33, "many"],
+            return_logprob=[True, False, False, True],
+            top_logprobs_num=[5, 33, "many", 7],
         )
         req.normalize_batch_and_arguments()
         self.manager.rid_to_state = {
             rid: SimpleNamespace(time_stats=APIServerReqTimeStats()) for rid in req.rid
         }
         forwarded_counts = []
-        for i in range(3):
+        for i in range(4):
             self.manager._validate_one_request(req[i], req[i].input_ids)
             tokenized_request = self.manager._create_tokenized_object(
                 req[i], "", req[i].input_ids
             )
             forwarded_counts.append(tokenized_request.top_logprobs_num)
-        self.assertEqual(forwarded_counts, [5, 0, 0])
+        self.assertEqual(forwarded_counts, [5, 0, 0, 7])
 
     def test_accepts_hard_exclusion(self):
         class BoundMask(DisallowedTokensLogitsProcessor):
