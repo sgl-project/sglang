@@ -14,19 +14,15 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
@@ -681,6 +677,14 @@ def run_eagle_verify(
     )
     if post is not None:
         predict, accept_lens, accept_index, new_seq_lens, bonus_tokens = post[:5]
+        if (c := target_worker.model_runner.canary_manager) is not None:
+            c.on_verify_accept(
+                logits_output=logits_output,
+                verify_forward_batch=verify_forward_batch,
+                predict=predict,
+                accept_lens=accept_lens,
+                num_draft_tokens=num_draft_tokens,
+            )
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch, logits_output, predict, accept_index=accept_index
@@ -696,6 +700,7 @@ def run_eagle_verify(
             new_seq_lens=new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
+            kv_weight_version_record=forward_batch_output.kv_weight_version_record,
             extra_keep_alive_refs=[verify_forward_batch],
             prepared_draft_extend_inputs=post[5],
         )
@@ -823,6 +828,15 @@ def run_eagle_verify(
             num_draft_tokens=num_draft_tokens,
         )
 
+    if (c := target_worker.model_runner.canary_manager) is not None:
+        c.on_verify_accept(
+            logits_output=logits_output,
+            verify_forward_batch=verify_forward_batch,
+            predict=predict,
+            accept_lens=accept_lens,
+            num_draft_tokens=num_draft_tokens,
+        )
+
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
     # verify_forward_batch transitively holds verify-time GPU tensors
@@ -840,6 +854,7 @@ def run_eagle_verify(
         new_seq_lens=new_seq_lens,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
+        kv_weight_version_record=forward_batch_output.kv_weight_version_record,
         extra_keep_alive_refs=[verify_forward_batch],
         prepared_draft_extend_inputs=prepared_draft_inputs,
     )

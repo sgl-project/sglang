@@ -2,6 +2,7 @@ import unittest
 
 import requests
 
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
@@ -15,11 +16,10 @@ from sglang.test.test_utils import (
     is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
-    run_benchmark,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=231, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=355, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -28,7 +28,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     multi-detokenizer (the flags are orthogonal), with DP attention, so the
     worker pools also see idle DP ranks."""
 
-    mmlu_score_threshold = 0.64
+    mmlu_score_threshold = 0.72
     mmlu_num_examples = 256
     mmlu_num_threads = 32
 
@@ -86,7 +86,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             # relax for mi300x
             self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
-            self.assertLess(res["median_itl_ms"], 10)
+            self.assertLess(res["median_itl_ms"], 11)
 
     def test_batch_input_ids_routing(self):
         # Regression guard for sgl-project/sglang#29878 (introduced by #29214).

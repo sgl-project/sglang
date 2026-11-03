@@ -9,7 +9,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 
@@ -56,6 +56,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.dllm_config = None
         s.chunked_req = None
         s.enable_hisparse = False
+        s.invariant_checker = Mock()
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()
