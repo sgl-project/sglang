@@ -1,8 +1,14 @@
+from itertools import accumulate
 from typing import Optional, Tuple, Union
 
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.kernels.ops.attention.fla.index import (
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+)
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
@@ -1193,6 +1199,41 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return core_attn_out
 
+    def _get_extend_chunk_tables(self, forward_batch, forward_metadata):
+        """FLA chunk tables of an eager Triton extend, built once per forward from
+        the host lengths; otherwise the first GDN layer reads them back from the
+        device. Below one 64-token chunk the output kernel picks a smaller chunk,
+        so those batches keep deriving their own tables."""
+        tables = getattr(forward_metadata, "extend_chunk_tables", None)
+        if tables is not None:
+            return tables
+        tables = (None, None)
+        lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        query_start_loc = forward_metadata.query_start_loc
+        if (
+            isinstance(
+                getattr(self.kernel_dispatcher, "extend_kernel", None), TritonGDNKernel
+            )
+            and lens is not None
+            and len(lens) + 1 == query_start_loc.numel()
+            and sum(lens) >= FLA_CHUNK_SIZE
+        ):
+            cu_seqlens = torch.tensor(
+                [0, *accumulate(lens)], dtype=query_start_loc.dtype
+            )
+            pin = is_pin_memory_available(query_start_loc.device)
+            tables = tuple(
+                (t.pin_memory() if pin else t).to(
+                    query_start_loc.device, non_blocking=pin
+                )
+                for t in (
+                    prepare_chunk_indices(cu_seqlens, FLA_CHUNK_SIZE),
+                    prepare_chunk_offsets(cu_seqlens, FLA_CHUNK_SIZE),
+                )
+            )
+        forward_metadata.extend_chunk_tables = tables
+        return tables
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -1429,6 +1470,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     dtype=torch.float32,
                     device=ssm_states.device,
                 )
+            chunk_indices, chunk_offsets = self._get_extend_chunk_tables(
+                forward_batch, forward_metadata
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1438,6 +1482,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
