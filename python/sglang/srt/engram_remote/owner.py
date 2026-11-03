@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Single pinned-Host owner for the real DSV4.1 Engram layers 1 and 14.
 
 Startup is intentionally explicit: this program allocates ~188.83 GiB pinned
