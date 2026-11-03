@@ -16,9 +16,12 @@ import time
 import unittest
 import urllib.request
 from multiprocessing import spawn
+from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.entrypoints import uvicorn_worker_spawn
+from uvicorn.config import LOGGING_CONFIG
+
+from sglang.srt.entrypoints import http_server, uvicorn_worker_spawn
 from sglang.srt.entrypoints.uvicorn_worker_spawn import (
     skip_main_reimport_in_spawned_workers,
 )
@@ -93,6 +96,58 @@ class TestUvicornWorkerSpawn(CustomTestCase):
         with skip_main_reimport_in_spawned_workers():
             data = spawn.get_preparation_data("inside")
             self.assertTrue(any(k in data for k in _MAIN_KEYS))
+
+    def test_http_server_starts_uvicorn_workers_inside_the_context(self):
+        original = spawn.get_preparation_data
+        main_keys_seen_by_workers = []
+
+        def fake_uvicorn_run(app_path, **kwargs):
+            data = spawn.get_preparation_data("worker")
+            main_keys_seen_by_workers.append([k for k in _MAIN_KEYS if k in data])
+
+        serving = SimpleNamespace(
+            tokenizer_worker_num=2,
+            enable_http2=False,
+            enable_ssl_refresh=False,
+            enable_http_worker_reuseport=False,
+            host="127.0.0.1",
+            port=30000,
+            fastapi_root_path="",
+            ssl_certfile=None,
+            ssl_keyfile=None,
+            ssl_ca_certs=None,
+            ssl_keyfile_password=None,
+        )
+        with (
+            mock.patch.object(
+                uvicorn_worker_spawn,
+                "_launched_by_sglang_entrypoint",
+                return_value=True,
+            ),
+            mock.patch.object(http_server, "get_serving", return_value=serving),
+            mock.patch.object(
+                http_server,
+                "get_observability",
+                return_value=SimpleNamespace(log_level_http=None, log_level="error"),
+            ),
+            mock.patch.object(http_server, "set_global_state"),
+            mock.patch.object(http_server, "_global_state", None),
+            mock.patch.object(http_server, "write_data_for_multi_tokenizer"),
+            mock.patch.object(http_server, "set_uvicorn_logging_configs"),
+            mock.patch.dict(LOGGING_CONFIG["loggers"]),
+            mock.patch.object(http_server.uvicorn, "run", side_effect=fake_uvicorn_run),
+        ):
+            http_server._setup_and_run_http_server(
+                server_args=None,
+                tokenizer_manager=mock.Mock(),
+                template_manager=None,
+                port_args=None,
+                scheduler_infos=[{}],
+                subprocess_watchdog=None,
+            )
+
+        self.assertEqual(main_keys_seen_by_workers, [[]])
+        self.assertIs(spawn.get_preparation_data, original)
 
     def test_workers_serve_although_main_module_is_slow(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
