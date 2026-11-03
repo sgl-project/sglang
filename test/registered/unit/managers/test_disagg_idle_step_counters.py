@@ -596,7 +596,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             prefetch_prefill_dp_rank_queries=Mock(), queue=[]
         )
-        scheduler.process_decode_queue = Mock()
+        scheduler.process_decode_queue = Mock(return_value=False)
         scheduler.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )

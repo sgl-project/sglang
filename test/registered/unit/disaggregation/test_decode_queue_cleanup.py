@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -630,6 +631,95 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertIs(queue._publish_destination.call_args.kwargs["decode_req"], live)
         self.assertTrue(released.awaiting_publish)
         self.assertFalse(live.awaiting_publish)
+
+
+def _admit_req(**overrides):
+    fields = dict(
+        grammar=None,
+        output_dsa_topk_indices=None,
+        kv=SimpleNamespace(retraction_backup=None),
+        hidden_states_tensor=object(),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class TestAdmissionOverlap(CustomTestCase):
+    def test_scope_uses_admitted_requests_and_keeps_host_read_paths_stock(self):
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            enable_hisparse=False,
+        )
+        disagg = SimpleNamespace(
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_enable_radix_cache=False,
+        )
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            for enabled in (False, True):
+                with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled):
+                    scope = (
+                        SchedulerDisaggregationDecodeMixin._nonblocking_admit_in_scope
+                    )
+                    self.assertEqual(
+                        scope(scheduler, SimpleNamespace(reqs=[_admit_req()])), enabled
+                    )
+                    self.assertFalse(
+                        scope(
+                            scheduler,
+                            SimpleNamespace(reqs=[_admit_req(grammar=object())]),
+                        )
+                    )
+
+    def test_seed_is_ordered_on_forward_stream_without_schedule_wait(self):
+        for nonblocking in (False, True):
+            batch = MagicMock()
+            batch.is_empty.return_value = False
+            calls = []
+
+            @contextlib.contextmanager
+            def forward_context():
+                calls.append("enter_forward")
+                yield
+                calls.append("leave_forward")
+
+            scheduler = SimpleNamespace(
+                _get_new_prebuilt_batch=lambda _: batch,
+                _nonblocking_admit_in_scope=lambda _: nonblocking,
+                _verify_kv_checksums=lambda _: calls.append("verify"),
+                ngram_embedding_manager=MagicMock(),
+                chunked_req=None,
+                future_map=object(),
+                enable_overlap=True,
+                schedule_stream=MagicMock(),
+                forward_stream=MagicMock(),
+                forward_stream_ctx=forward_context(),
+            )
+            batch.process_prebuilt.side_effect = lambda _: calls.append("seed")
+            result = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, object()
+            )
+            self.assertIs(result, batch)
+            if nonblocking:
+                self.assertEqual(
+                    calls, ["verify", "enter_forward", "seed", "leave_forward"]
+                )
+                scheduler.schedule_stream.wait_stream.assert_not_called()
+                scheduler.forward_stream.wait_stream.assert_called_once_with(
+                    scheduler.schedule_stream
+                )
+                batch.req_pool_indices.record_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+                batch.seq_lens.record_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+            else:
+                self.assertEqual(calls, ["verify", "seed"])
+                scheduler.schedule_stream.wait_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+                scheduler.forward_stream.wait_stream.assert_not_called()
 
 
 if __name__ == "__main__":

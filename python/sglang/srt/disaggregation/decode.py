@@ -3623,6 +3623,10 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
+        defer_prealloc = (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+        )
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3642,7 +3646,7 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.process_decode_queue()
+            prealloc_deferred = self.process_decode_queue(defer_prealloc=defer_prealloc)
 
             # overlap + spec + grammar is unsupported (would desync DP ranks).
             process_last_batch_early = self.should_process_last_batch_early(
@@ -3666,9 +3670,15 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                # Allocation may read page indices back to the host. Submit it
+                # before the scheduler's WAR wait, after launching this forward.
+                if prealloc_deferred:
+                    self._preallocate_new_requests()
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
+                if prealloc_deferred:
+                    self._preallocate_new_requests()
                 batch_result = None
                 self._sched_idled = True
 
@@ -3747,6 +3757,11 @@ class SchedulerDisaggregationDecodeMixin:
         batch = self._get_new_prebuilt_batch(running_batch)
         if batch is None:
             return None
+        nonblocking = self._nonblocking_admit_in_scope(batch)
+        if self.enable_overlap and not nonblocking:
+            # A finished request can still have a redundant forward writing a
+            # row the admitted request will seed.
+            self.schedule_stream.wait_stream(self.forward_stream)
         # Verify after host restore and before process_prebuilt caches any KV.
         self._verify_kv_checksums(batch)
         if batch.is_empty():
@@ -3754,8 +3769,39 @@ class SchedulerDisaggregationDecodeMixin:
         self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=self.chunked_req
         )
-        batch.process_prebuilt(self.future_map)
+        if nonblocking:
+            # Reused FutureMap rows are seeded after the previous forward and
+            # before the next one, without parking the host behind that forward.
+            self.forward_stream.wait_stream(self.schedule_stream)
+            with self.forward_stream_ctx:
+                batch.process_prebuilt(self.future_map)
+            batch.req_pool_indices.record_stream(self.forward_stream)
+            batch.seq_lens.record_stream(self.forward_stream)
+        else:
+            batch.process_prebuilt(self.future_map)
         return batch
+
+    def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
+        # EAGLE's seed uses pinned async_h2d_stack already. Other seed paths,
+        # host restores and grammar may read device results back to the host.
+        return (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+            and self.enable_overlap
+            and self.spec_algorithm.is_eagle()
+            and not self.enable_hisparse
+            # Cache checkpointing may free/rebind allocator pages on this stream;
+            # keep that work ordered with the scheduler's subsequent allocations.
+            and not get_disagg().disaggregation_decode_enable_radix_cache
+            and get_disagg().disaggregation_decode_host_receive_threshold == 1
+            and all(
+                req.grammar is None
+                and req.output_dsa_topk_indices is None
+                and req.kv.retraction_backup is None
+                and req.hidden_states_tensor is not None
+                for req in batch.reqs
+            )
+        )
 
     def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
@@ -3922,10 +3968,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        if self.enable_overlap:
-            # A finished request can still have one redundant forward in flight.
-            # Drain it before a prebuilt request seeds a potentially reused row.
-            self.schedule_stream.wait_stream(self.forward_stream)
         return new_batch
 
     def _start_host_restores(self: Scheduler) -> None:
@@ -3999,8 +4041,13 @@ class SchedulerDisaggregationDecodeMixin:
                 )
         return {id(req) for req, done in zip(pending, ready.tolist()) if done}
 
+    def _preallocate_new_requests(self: Scheduler) -> None:
+        req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+        self.disagg_decode_transfer_queue.extend(req_conns)
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def process_decode_queue(self: Scheduler):
+    def process_decode_queue(self: Scheduler, defer_prealloc: bool = False) -> bool:
+        """Return whether the overlap loop must preallocate after its launch."""
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
         elif (
@@ -4024,7 +4071,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue.join(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
-            return
+            return False
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -4032,10 +4079,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
+        prealloc_deferred = False
         if self.polling_count % self.polling_interval == 0:
             if get_disagg().disaggregation_decode_host_receive_threshold == 1:
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-                self.disagg_decode_transfer_queue.extend(req_conns)
+                if defer_prealloc:
+                    prealloc_deferred = True
+                else:
+                    self._preallocate_new_requests()
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
@@ -4048,3 +4098,4 @@ class SchedulerDisaggregationDecodeMixin:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+        return prealloc_deferred
