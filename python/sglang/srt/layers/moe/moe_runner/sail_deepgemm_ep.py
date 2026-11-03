@@ -1327,6 +1327,15 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
 
         assert self.swiglu_limit is None
 
+        # DeepGEMM's W4A16 masked kernel has no SBO entry point: it takes no
+        # signal and reports no block_m/threshold. Fail before running anything
+        # rather than leave combine waiting for a signal that never arrives.
+        if running_state.get("down_gemm_overlap_args", None) is not None:
+            raise NotImplementedError(
+                "W4A16 masked down GEMM does not support single-batch overlap; "
+                "remove --enable-single-batch-overlap when serving this model."
+            )
+
         hidden_states = runner_input.hidden_states
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m
@@ -1386,34 +1395,13 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             (num_groups, m, k), device=down_input.device, dtype=torch.bfloat16
         )
 
-        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
-        if down_gemm_overlap_args is None:
-            gemm_overlap_args_dict = {}
-        else:
-            down_gemm_overlap_args.start_event.record()
-            max_block_n = (
-                160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
-            )
-            gemm_overlap_args_dict = {
-                "overlap_args": down_gemm_overlap_args,
-                "max_block_n": max_block_n,
-            }
-
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_masked(
+        deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_masked(
             down_input,
             (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
-            **gemm_overlap_args_dict,
         )
-
-        meta_overlap_args = running_state.get("meta_overlap_args", None)
-        # meta_overlap_args may be set without overlap, so guard the unpack.
-        if meta_overlap_args is not None and deep_gemm_return_value is not None:
-            block_m, threshold = deep_gemm_return_value
-            meta_overlap_args["block_m"] = block_m
-            meta_overlap_args["threshold"] = threshold
 
         return down_output
 
