@@ -192,6 +192,7 @@ def offload_max_total_tokens(
 
 
 def _copy_rows(
+    *,
     k_dst: torch.Tensor,
     v_dst: torch.Tensor,
     dst: torch.Tensor,
@@ -261,11 +262,15 @@ class QSAKVHostOffload:
         # Pageable memory of the exact size, page-locked with cudaHostRegister:
         # torch's pinned caching allocator rounds each block up to a power of two.
         dims = (self.num_layers, host_rows, *row_shape)
-        self.host_k = alloc_with_host_register(
-            dims, dtype, "cpu", pin_memory, HostTensorAllocator()
-        )
-        self.host_v = alloc_with_host_register(
-            dims, dtype, "cpu", pin_memory, HostTensorAllocator()
+        self.host_k, self.host_v = (
+            alloc_with_host_register(
+                dims=dims,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=pin_memory,
+                allocator=HostTensorAllocator(),
+            )
+            for _ in range(2)
         )
         self.pin_memory = pin_memory
         self.host_bytes = 2 * self.host_k.numel() * self.host_k.element_size()
@@ -297,17 +302,13 @@ class QSAKVHostOffload:
         """Verify mode: the new K/V the full pool holds at ``loc`` -> device
         rows ``rows`` and host rows ``loc``."""
         loc = loc.long()
-        _copy_rows(
-            self.dev_k[layer_idx],
-            self.dev_v[layer_idx],
-            rows.long(),
-            pool_k,
-            pool_v,
-            loc,
-        )
-        _copy_rows(
-            self.host_k[layer_idx], self.host_v[layer_idx], loc, pool_k, pool_v, loc
-        )
+        for k_dst, v_dst, dst in (
+            (self.dev_k[layer_idx], self.dev_v[layer_idx], rows.long()),
+            (self.host_k[layer_idx], self.host_v[layer_idx], loc),
+        ):
+            _copy_rows(
+                k_dst=k_dst, v_dst=v_dst, dst=dst, k_src=pool_k, v_src=pool_v, src=loc
+            )
 
     def check(self, what: str, layer_idx: int, actual, expected) -> None:
         """Verify mode: offloaded tensors must equal the full pool's bit for bit."""
@@ -409,12 +410,12 @@ class QSAKVHostOffload:
     ) -> None:
         """Device rows ``rows`` -> host rows ``loc`` (their logical slots)."""
         _copy_rows(
-            self.host_k[layer_idx],
-            self.host_v[layer_idx],
-            loc.long(),
-            self.dev_k[layer_idx],
-            self.dev_v[layer_idx],
-            rows.long(),
+            k_dst=self.host_k[layer_idx],
+            v_dst=self.host_v[layer_idx],
+            dst=loc.long(),
+            k_src=self.dev_k[layer_idx],
+            v_src=self.dev_v[layer_idx],
+            src=rows.long(),
         )
 
     def gather_context(
@@ -427,7 +428,12 @@ class QSAKVHostOffload:
         v = torch.empty_like(k)
         dst = torch.arange(rows, dtype=torch.int64, device=self.device)
         _copy_rows(
-            k, v, dst, self.host_k[layer_idx], self.host_v[layer_idx], slots.long()
+            k_dst=k,
+            v_dst=v,
+            dst=dst,
+            k_src=self.host_k[layer_idx],
+            v_src=self.host_v[layer_idx],
+            src=slots.long(),
         )
         return k, v
 
@@ -472,8 +478,13 @@ class QSAKVHostOffload:
         req = row_req.long()
         group_req = req[::q]
         first_new = seq[::q] - 1  # committed length of each request
-        self._load_ring(layer_idx, group_req, first_new, q)
-        self._drop_remapped(layer_idx, group_req)
+        self._load_ring(
+            layer_idx=layer_idx,
+            group_req=group_req,
+            first_new=first_new,
+            rows_per_request=q,
+        )
+        self._drop_remapped(layer_idx=layer_idx, group_req=group_req)
 
         pos = positions.long()
         valid = (pos >= 0) & (pos < seq[:, None])
@@ -486,7 +497,14 @@ class QSAKVHostOffload:
         slot = blk_slot[req_x, blk.clamp(min=0)].long()
         miss = need & (slot < 0)
         if bool(miss.any()):
-            self._swap_in(layer_idx, group_req, blk, slot, need, miss)
+            self._swap_in(
+                layer_idx=layer_idx,
+                group_req=group_req,
+                blk=blk,
+                slot=slot,
+                need=need,
+                miss=miss,
+            )
             slot = blk_slot[req_x, blk.clamp(min=0)].long()
         hit_g, hit_c = need.nonzero(as_tuple=True)
         self.slot_age[layer_idx][group_req[hit_g], slot[hit_g, hit_c]] = self._step
@@ -534,12 +552,12 @@ class QSAKVHostOffload:
                 + offsets[load_c]
             )
             _copy_rows(
-                self.dev_k[layer_idx],
-                self.dev_v[layer_idx],
-                dst,
-                self.host_k[layer_idx],
-                self.host_v[layer_idx],
-                src0[load_g, load_c].long(),
+                k_dst=self.dev_k[layer_idx],
+                v_dst=self.dev_v[layer_idx],
+                dst=dst,
+                k_src=self.host_k[layer_idx],
+                v_src=self.host_v[layer_idx],
+                src=src0[load_g, load_c].long(),
             )
         # A block that re-enters the ring is rewritten there: drop its LRU copy.
         for b in (block, block + 1):
@@ -614,10 +632,10 @@ class QSAKVHostOffload:
         self.slot_src[layer_idx][req, victim] = src
         dst = req[:, None] * self.region + self.tail_rows + victim[:, None] * cr
         _copy_rows(
-            self.dev_k[layer_idx],
-            self.dev_v[layer_idx],
-            (dst + offsets).reshape(-1),
-            self.host_k[layer_idx],
-            self.host_v[layer_idx],
-            src.long().reshape(-1),
+            k_dst=self.dev_k[layer_idx],
+            v_dst=self.dev_v[layer_idx],
+            dst=(dst + offsets).reshape(-1),
+            k_src=self.host_k[layer_idx],
+            v_src=self.host_v[layer_idx],
+            src=src.long().reshape(-1),
         )
