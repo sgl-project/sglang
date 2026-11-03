@@ -1,4 +1,4 @@
-"""Pre-LIM request metadata for decode and chain-MTP LIM + Copy-SFA."""
+"""Opt-in pre-LIM metadata preparation for Q1 LIM + Copy-SFA."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import triton.language as tl
 @triton.jit
 def _prepare_kernel(
     seq_ptr,
-    positions_ptr,
     slot_ptr,
     last_ptr,
     src_table_ptr,
@@ -26,8 +25,7 @@ def _prepare_kernel(
     B: tl.constexpr,
     ROWS: tl.constexpr,
     CAPACITY: tl.constexpr,
-    QUERY_WIDTH: tl.constexpr,
-    HAS_POSITIONS: tl.constexpr,
+    FULL_VISIBLE: tl.constexpr,
     SRC_COLS: tl.constexpr,
     DST_COLS: tl.constexpr,
     SRC_S0: tl.constexpr,
@@ -54,21 +52,13 @@ def _prepare_kernel(
 
     if tile == 0:
         raw_slot = tl.load(slot_ptr + row).to(tl.int64)
-        active_length = tl.load(seq_ptr + row).to(tl.int64)
-        raw_length = active_length
-        if HAS_POSITIONS:
-            raw_length = (
-                tl.load(positions_ptr + row * QUERY_WIDTH + QUERY_WIDTH - 1).to(
-                    tl.int64
-                )
-                + 1
-            )
-        valid = (
-            (raw_slot > 0) & (raw_slot < ROWS) & (active_length > 0) & (raw_length > 0)
-        )
+        raw_length = tl.load(seq_ptr + row).to(tl.int64)
+        valid = (raw_slot > 0) & (raw_slot < ROWS) & (raw_length > 0)
         safe_slot = tl.where(valid, raw_slot, ROWS).to(tl.int32)
         length = tl.where(valid, raw_length, 0).to(tl.int32)
-        prefix = length
+        prefix = tl.where(
+            FULL_VISIBLE, length, ((tl.maximum(length - 1, 0) // 128) * 128)
+        ).to(tl.int32)
         sparse = valid & (prefix >= CAPACITY)
         previous = tl.load(last_ptr + safe_slot).to(tl.int32)
         warm = sparse & (previous >= 0) & (prefix >= previous)
@@ -102,10 +92,9 @@ def fused_prepare_lim_metadata(
     cache_sizes,
     capacity: int,
     request_rows: int,
-    query_width: int = 1,
-    positions=None,
+    full_visible: bool,
 ) -> None:
-    """Fill request inputs and source pages; positions supply the actual visible length."""
+    """Fill fixed-address Q1 inputs and LIM source table in one Triton launch."""
     if seq_lens.dtype not in (torch.int32, torch.int64):
         raise TypeError("seq_lens must be int32 or int64")
     if request_slots.dtype not in (torch.int32, torch.int64):
@@ -119,16 +108,6 @@ def fused_prepare_lim_metadata(
     if not isinstance(request_rows, int) or request_rows <= 0:
         raise ValueError("request_rows must be positive")
     batch = seq_lens.numel()
-    if positions is not None and (
-        positions.device != seq_lens.device
-        or positions.ndim != 1
-        or positions.numel() != batch * query_width
-        or not positions.is_contiguous()
-        or positions.dtype not in (torch.int32, torch.int64)
-    ):
-        raise ValueError("positions must be contiguous same-device integer [B*Q].")
-    if not 1 <= query_width <= 16:
-        raise ValueError("query_width must be in [1,16]")
     if batch <= 0 or request_slots.numel() != batch:
         raise ValueError("seq_lens and request_slots must have equal nonzero length")
     if seq_lens.device.type != "npu" or request_slots.device != seq_lens.device:
@@ -191,7 +170,6 @@ def fused_prepare_lim_metadata(
     block = 128
     _prepare_kernel[(triton.cdiv(cols, block), batch)](
         seq_lens,
-        positions if positions is not None else seq_lens,
         request_slots,
         last_prefix,
         block_table,
@@ -207,8 +185,7 @@ def fused_prepare_lim_metadata(
         batch,
         request_rows,
         capacity,
-        query_width,
-        positions is not None,
+        full_visible,
         block_table.shape[1],
         cols,
         block_table.stride(0),

@@ -7,6 +7,9 @@ import torch
 
 pytest.importorskip("torch_npu")
 
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
+    prepare_lim_rows,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_metadata import (
     fused_prepare_lim_metadata,
 )
@@ -18,15 +21,8 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_me
     "slot_dtype,length_dtype", [(torch.int32, torch.int32), (torch.int64, torch.int64)]
 )
 @pytest.mark.parametrize("src_cols,dst_cols", [(32, 512), (500, 513), (513, 513)])
-@pytest.mark.parametrize("query_width", [1, 4])
 def test_npu_graph_replay_matches_torch_reference(
-    active_rows,
-    capacity,
-    slot_dtype,
-    length_dtype,
-    src_cols,
-    dst_cols,
-    query_width,
+    active_rows, capacity, slot_dtype, length_dtype, src_cols, dst_cols
 ):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("This test requires an available Ascend NPU")
@@ -63,7 +59,7 @@ def test_npu_graph_replay_matches_torch_reference(
             cache_sizes=cache_size,
             capacity=capacity,
             request_rows=rows,
-            query_width=query_width,
+            full_visible=True,
         )
 
     # Compile and initialize outside capture; a successful import is not a
@@ -112,8 +108,41 @@ def test_npu_graph_replay_matches_torch_reference(
             last_prefix[slot] = length_values[i] - 128 if i % 2 == 0 else -1
         if replay == 3:
             last_prefix[slot_values[4]] = length_values[4] + 128
+        (
+            old_safe,
+            old_lengths,
+            old_prefix,
+            old_sparse,
+            old_valid,
+            old_state,
+            old_next,
+        ) = prepare_lim_rows(
+            lengths, slots, last_prefix, capacity, rows, full_visible=True
+        )
+        old_table = torch.zeros_like(out_table)
+        old_table[:, :src_cols].copy_(src_table)
         graph.replay()
         torch.npu.synchronize()
+        # Preserve LIMDecodeAdapter's existing mixed/short CPU fallback rule:
+        # a positive length below C forces every next-prefix entry to -1.
+        cpu_lengths = lengths.cpu().tolist()
+        mixed_short = any(0 < int(length) < capacity for length in cpu_lengths)
+        if mixed_short:
+            old_next.fill_(-1)
+            next_prefix.fill_(-1)
+
+        for actual, old in (
+            (safe, old_safe),
+            (out_len, old_lengths),
+            (prefix, old_prefix),
+            (sparse, old_sparse),
+            (valid, old_valid),
+            (state, old_state),
+            (next_prefix, old_next),
+            (cache_size, old_sparse.to(torch.int32) * capacity),
+            (out_table, old_table),
+        ):
+            torch.testing.assert_close(actual.cpu(), old.cpu())
 
         host_slots, host_lengths, host_src = (
             slots.cpu().tolist(),
@@ -135,7 +164,7 @@ def test_npu_graph_replay_matches_torch_reference(
             expected_sparse.append(sp)
             expected_valid.append(ok)
             expected_state.append(-1 if warm else (-2 if sp else -3))
-            expected_next.append(pre if sp else -1)
+            expected_next.append(pre if sp and not mixed_short else -1)
             expected_cache.append(capacity if sp else 0)
         pairs = [
             (safe, expected_safe),

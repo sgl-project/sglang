@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
-
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    is_copy_sfa_decode_graph_eligible,
+)
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -373,6 +375,14 @@ def _local_decode_cuda_graph_vote(
 ) -> bool:
     """This rank's vote for the decode graph (min-reduced across dp ranks)."""
     if disable_cuda_graph:
+        return False
+    if (
+        local_batch is not None
+        and local_batch.forward_mode.is_decode()
+        and not is_copy_sfa_decode_graph_eligible(local_batch.seq_lens_cpu)
+    ):
+        # Reuse the existing min-reduced graph vote. A short row on either
+        # replica must keep all EP participants on the same execution path.
         return False
     return (
         local_batch is None

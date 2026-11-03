@@ -32,13 +32,16 @@ def processor_string():
             step = call - skip
             if torch.distributed.get_rank() != 0 or step == 0:
                 return logits
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import (
+                host_callback,
+            )
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 get_sparse_kv_manager,
             )
 
             manager = get_sparse_kv_manager()
             adapter = manager.lim_adapter if manager is not None else None
-            if adapter is None:
+            if adapter is None or not adapter.is_native:
                 raise RuntimeError("Native LIM manager is required")
             prefix = adapter.last_prefix.cpu().tolist()
             owners = [
@@ -49,7 +52,7 @@ def processor_string():
             record = {
                 "sampling_step": step,
                 "raw_sampling_call": call,
-                "last_owner_layer_id": max(owners, default=None),
+                "last_owner_layer_id": max(owners),
                 "active_owner_count": len(owners),
                 "K": adapter.top_k,
                 "C": adapter.capacity,
@@ -63,6 +66,7 @@ def processor_string():
                 * manager.paged_kv_cache.index_k_buffer.element_size(),
                 "managed_hbm_budget_bytes": manager.budget.managed_hbm_bytes,
                 "host_kv_budget_bytes": manager.budget.host_kv_bytes,
+                "framework_acl_reporter_count": len(host_callback._REPORTERS),
             }
             with Path(params["miss_log"]).open("a") as file:
                 file.write(json.dumps(record) + "\n")

@@ -1054,11 +1054,21 @@ class Envs:
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
-    # Per-request resident capacity; 0 uses configured max query width * TopK.
-    # Native LIM owns the resident mapping for every offloaded target.
+    # Per-request resident token capacity; 0 defaults to model TopK or auto-sizes
+    # from the manager HBM budget. Legacy/reference use LRU when C > K;
+    # native LIM maintains its own resident mapping.
     SGLANG_NPU_SPARSE_KV_CACHE_SIZE = EnvInt(0)
     # Per-rank persistent manager allocations, in MiB; 0 leaves the cap unset.
     SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB = EnvInt(0)
+    # Experimental Q1 indexer/cache implementations. li_reference and lim use
+    # the same page-aligned prefix + visible tail attention policy.
+    SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
+    SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA = EnvBool(False)
+    SGLANG_NPU_FUSED_LIM_PRE_METADATA = EnvBool(False)
+    # Experimental MTP path; requires a matching full-visible LIM kernel.
+    SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE = EnvBool(False)
+    # Optional operator-enabled library; loaded once before graph capture.
+    SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
@@ -2097,9 +2107,6 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
-    "SGLANG_NPU_MTP_SEPARATE_KV_TAIL": _DeprecatedEnv(
-        note="The separate KV tail was removed; full-visible LIM is always used."
-    ),
     "SGLANG_NPU_LIM_LIBRARY": _DeprecatedEnv(
         note="LIM is loaded from sgl-kernel-npu; external library paths are ignored."
     ),

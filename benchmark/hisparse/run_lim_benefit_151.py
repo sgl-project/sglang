@@ -1,4 +1,4 @@
-"""Run the native LIM matrix on 151 while auditing target-device process ownership.
+"""Run the LIM A/B matrix on 151 while auditing target-device process ownership.
 
 Run on the 151 host. Uses only stdlib and the existing container runner. A
 foreign process on the target device invalidates the run; only this task's
@@ -110,23 +110,55 @@ def run(args):
     )
     thread = threading.Thread(target=monitor, daemon=True)
     thread.start()
-    # Compare native widths with their required resident-union capacities.
-    cases = [(1, 8192), (4, 8192), (8, 16384), (14, 28672)]
+    # B, prefix, C, TopK set difference, tail, shared layers, hotset layout.
+    cases = [
+        (1, 32768, 2048, 128, 1, 1, "scattered"),
+        (1, 32768, 2048, 1024, 1, 1, "scattered"),
+        (4, 32768, 2048, 128, 1, 1, "scattered"),
+        (4, 8192, 2048, 1024, 128, 1, "scattered"),
+        (4, 32768, 4096, 1024, 1, 1, "scattered"),
+        (1, 32768, 4096, 1024, 1, 4, "scattered"),
+        (4, 32768, 4096, 1024, 1, 1, "prefix"),
+        (1, 32768, 4096, 1024, 1, 4, "prefix"),
+        (4, 131072, 4096, 1024, 1, 1, "prefix"),
+    ]
     records = []
     started = stamp()
     try:
-        for width, capacity in cases:
+        for batch, length, capacity, misses, tail, layers, layout in cases:
             if invalid.is_set():
                 break
-            name = f"q{width}-c{capacity}"
+            name = (
+                f"b{batch}-l{length}-c{capacity}-m{misses}-t{tail}-x{layers}-{layout}"
+            )
             command = [
                 "bash",
                 str(args.task_root / "run_lim_151.sh"),
-                "--widths",
-                str(width),
+                "--modes",
+                "li_reference,lim",
+                "--batch",
+                str(batch),
+                "--context",
+                str(length),
                 "--capacity",
                 str(capacity),
-                "--timing",
+                "--misses",
+                str(misses),
+                "--tail",
+                str(tail),
+                "--layers",
+                str(layers),
+                "--hotset-layout",
+                layout,
+                "--include-new-token-d2h",
+                "--warmup",
+                "10",
+                "--iterations",
+                str(args.iterations),
+                "--rounds",
+                str(args.rounds),
+                "--pairs-per-graph",
+                "8",
                 "--output",
                 str(args.output_dir / f"{name}.json"),
             ]
@@ -203,5 +235,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", type=int, choices=range(16), default=7)
+    parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--rounds", type=int, default=7)
     parser.add_argument("--monitor-interval", type=float, default=2)
     run(parser.parse_args())

@@ -328,9 +328,36 @@ class DSANPUIndexerMixin:
 
             backend = get_attn_backend()
             manager = getattr(backend, "sparse_kv_manager", None)
-            if manager is not None and not is_prefill:
+            if manager is not None and manager.lim_adapter is not None:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+                    use_native_mtp_verify,
+                )
+
+                if use_native_mtp_verify(backend, forward_batch, manager):
+                    if use_quant_indexer:
+                        raise ValueError("Native MTP LIM requires BF16 index keys.")
+                    plan = manager.lim_adapter.select_mtp(
+                        manager,
+                        query=q.view(-1, self.n_heads, self.head_dim),
+                        weights=weights,
+                        key=past_key_states,
+                        block_table=block_table,
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                    )
+                    backend.forward_metadata.sparse_kv_lim_plan = plan
+                    return plan.source_ids
+
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.spec_info is None
+                and manager is not None
+                and manager.lim_adapter is not None
+            ):
                 if use_quant_indexer:
-                    raise ValueError("Native LIM requires BF16 index keys.")
+                    raise ValueError(
+                        "LIM/reference decode does not support quantized index keys."
+                    )
                 plan = manager.lim_adapter.select(
                     manager,
                     query=q.view(-1, self.n_heads, self.head_dim),
@@ -339,6 +366,7 @@ class DSANPUIndexerMixin:
                     block_table=block_table,
                     forward_batch=forward_batch,
                     layer_id=layer_id,
+                    reference_indexer=torch_npu.npu_lightning_indexer,
                 )
                 backend.forward_metadata.sparse_kv_lim_plan = plan
                 return plan.source_ids

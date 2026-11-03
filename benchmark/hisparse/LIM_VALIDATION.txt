@@ -1,7 +1,3 @@
-Historical validation: the modes and commands below are pinned to their
-recorded revisions. For the current native-only implementation, dynamic MTP,
-and short-row graph checks, see README_native.md.
-
 Experimental Ascend LIM sparse KV offload
 ========================================
 
