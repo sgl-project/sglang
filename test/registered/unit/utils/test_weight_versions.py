@@ -6,10 +6,11 @@ from unittest.mock import patch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -493,7 +494,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v1"),
         ):
             accepted = Scheduler._set_or_validate_priority(scheduler, req)
@@ -513,10 +514,10 @@ class TestMakeAbortReq(CustomTestCase):
             WeightVersionEvent(old_version="v1", num_output_tokens=3)
         )
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v2"),
         ):
-            abort_req = _make_abort_req(req)
+            abort_req = make_abort_req(req)
 
         self.assertIsInstance(abort_req, AbortReq)
         self.assertEqual(abort_req.rid, "r0")

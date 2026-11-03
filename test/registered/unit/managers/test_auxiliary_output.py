@@ -19,6 +19,10 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -28,6 +32,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -513,7 +518,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         copy_done=copy_done,
         auxiliary_host_output=host_output,
     )
-    req = SimpleNamespace(
+    req = FakeReq(
         output_ids=[],
         finished_len=None,
         to_finish=None,
@@ -548,14 +553,15 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         batch_result_processor=processor,
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
-        disagg_prefill_transfer_queue=[],
-        prefill_launched_reqs=Mock(),
+        disagg_prefill_transfer_queue=_RequestList(ListKind.PD_SENDING),
+        prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
         checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
     )
 
+    scheduler.prefill_launched_reqs.join([req])
     SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
         scheduler,
         batch,

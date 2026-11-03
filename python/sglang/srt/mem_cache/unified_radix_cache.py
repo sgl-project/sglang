@@ -1469,7 +1469,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         if self.enable_session_radix_cache and is_finished:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+            from sglang.srt.managers.req_types import FINISH_ABORT
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
                 self.session_refs.register_session_ref(
@@ -3879,7 +3879,7 @@ class UnifiedRadixCache(BasePrefixCache):
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
         if failed:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+            from sglang.srt.managers.req_types import FINISH_ABORT
 
             for req in failed:
                 req.skip_radix_cache_insert = True
