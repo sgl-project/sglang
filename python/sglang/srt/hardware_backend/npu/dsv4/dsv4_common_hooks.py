@@ -109,8 +109,6 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
-
     def c4_state_indices():
         ring_size = req_to_token_pool.get_dsv4_c4_state_ring_size()
         if is_npu_arch35():
@@ -124,12 +122,14 @@ def dsv4_state_payloads(
         ]
         kv_pool = req_to_token_pool._dsv4_allocator.get_kvcache()
         swa_locs = kv_pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
-        rows = swa_locs // kv_pool.swa_page_size * ring_size + swa_locs % ring_size
+        swa_pages = swa_locs // kv_pool.swa_page_size
+        rows = swa_pages * ring_size + swa_locs % ring_size
         return rows.to(torch.int32).cpu().numpy()
 
-    payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
-
-    return payloads
+    return {
+        AscendStateType.DSV4_C128: c128_kv_pages,
+        AscendStateType.DSV4_C4_STATE: c4_state_indices,
+    }
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):

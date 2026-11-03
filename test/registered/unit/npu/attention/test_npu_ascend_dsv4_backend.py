@@ -312,10 +312,11 @@ class TestC4StateTransferLayout(unittest.TestCase):
     )
     def test_payload_uses_each_peers_private_ring_size(self, _):
         def state_rows(ring_size):
-            req_pool = DSV4ReqToTokenTablesMixin.__new__(DSV4ReqToTokenTablesMixin)
-            req_pool.c128_page_size = 1
-            req_pool.req_to_c128_sidecar = torch.zeros((4, 1), dtype=torch.int32)
-            req_pool.get_dsv4_c4_state_ring_size = lambda: ring_size
+            req_pool = SimpleNamespace(
+                c128_page_size=1,
+                req_to_c128_sidecar=torch.zeros((4, 1), dtype=torch.int32),
+                get_dsv4_c4_state_ring_size=lambda: ring_size,
+            )
             payloads = dsv4_state_payloads(req_pool, 2, 13, page_size=1)
             return next(
                 payload()
@@ -393,18 +394,8 @@ class TestC4StateTransferLayout(unittest.TestCase):
 
         for ring_size, pages in ((8, [7, 3, 9]), (16, [2, 8, 5])):
             req_pool = self._a3_req_pool(ring_size, pages)
-            for seq_len in (
-                0,
-                1,
-                3,
-                4,
-                7,
-                8,
-                9,
-                13,
-                15,
-                16,
-                17,
+            # Exhaust short histories, then cross SWA page boundaries.
+            seq_lens = list(range(18)) + [
                 127,
                 128,
                 129,
@@ -416,7 +407,8 @@ class TestC4StateTransferLayout(unittest.TestCase):
                 256,
                 257,
                 263,
-            ):
+            ]
+            for seq_len in seq_lens:
                 with self.subTest(ring_size=ring_size, seq_len=seq_len):
                     payloads = dsv4_state_payloads(req_pool, 2, seq_len, page_size=128)
                     rows = payloads[AscendStateType.DSV4_C4_STATE]().tolist()
