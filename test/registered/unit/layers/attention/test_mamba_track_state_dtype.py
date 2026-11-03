@@ -221,8 +221,8 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
                     backend.state_layer_cache = lambda _: cache
                     expected_indices = torch.arange(2) if contiguous else indices
-                    # Fewer extend tokens than rows marks a padded batch.
-                    batch.extend_num_tokens = 4 if contiguous else 3
+                    # Fewer real tokens than rows marks a padded batch.
+                    metadata.logical_num_tokens = 4 if contiguous else 3
 
                     def convolve(_layer, _batch, x, states, slots):
                         torch.testing.assert_close(slots, expected_indices)

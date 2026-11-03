@@ -111,7 +111,6 @@ def _batch(extend_lens, prefix_lens, track=None):
         extend_seq_lens=torch.tensor(extend_lens, device=dev),
         extend_prefix_lens=torch.tensor(prefix_lens, device=dev),
         extend_start_loc=torch.tensor(starts, device=dev),
-        extend_num_tokens=sum(extend_lens),
         extend_seq_lens_cpu=list(extend_lens),
         extend_prefix_lens_cpu=list(prefix_lens),
         tbo_parent_token_range=None,
@@ -267,6 +266,37 @@ class TestGDNPrefillGraph(CustomTestCase):
                         track=track,
                         seed=100 + i,
                     )
+
+    def test_eager_padded_rows_stay_zero(self):
+        """DP attention pads input_ids and extend_num_tokens past the batch's
+        real tokens but not the sequence lengths. The eager extend must keep
+        those rows zero, and its real rows must match the unpadded extend."""
+        self._setup(torch.float32)
+        lens, prefixes, num_rows = [37, 100], [0, 64], 160
+        total = sum(lens)
+        g = torch.Generator(device="cuda").manual_seed(5)
+        mixed = torch.randn(num_rows, DIM, generator=g, device="cuda")
+        a = torch.randn(num_rows, V_HEADS, generator=g, device="cuda")
+        b = torch.randn(num_rows, V_HEADS, generator=g, device="cuda")
+        mixed, a, b = (t.to(torch.bfloat16) for t in (mixed, a, b))
+        outs = {}
+        for rows in (total, num_rows):
+            backend = _backend(self.conv_pool.clone(), self.ssm_pool.clone())
+            batch = _batch(lens, prefixes)
+            batch.extend_num_tokens = rows
+            backend.init_forward_metadata(batch)
+            # Rows nothing stores would show as NaN instead of zero.
+            with patch.object(
+                torch,
+                "empty_like",
+                side_effect=lambda t, **kw: torch.full_like(t, float("nan"), **kw),
+            ):
+                outs[rows] = backend.forward_extend(
+                    self.layer, batch, mixed[:rows], a[:rows], b[:rows]
+                )
+        padded = outs[num_rows]
+        self.assertTrue(torch.equal(padded[:, :total], outs[total]))
+        self.assertTrue(bool((padded[:, total:] == 0).all()), "padded rows not zero")
 
 
 if __name__ == "__main__":

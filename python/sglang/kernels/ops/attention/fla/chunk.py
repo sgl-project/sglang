@@ -181,43 +181,24 @@ def _chunk_gated_delta_rule_fwd_normalized(
     return o.to(q.dtype), h
 
 
-def _chunk_gated_delta_rule_strided_qkv(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor],
-    inplace_update: bool,
-    chunk_indices: Optional[torch.LongTensor],
-    chunk_offsets: Optional[torch.LongTensor],
-    no_padding_rows: bool,
-):
+def chunk_gated_delta_rule_reads_strided_qk(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Whether chunk_gated_delta_rule with use_qk_l2norm_in_kernel reads these
+    q / k views (and a matching v) without copying them."""
+    return l2norm_fwd_strided_supported(q) and l2norm_fwd_strided_supported(k)
+
+
+def _chunk_gated_delta_rule_strided_qkv(q, k, v, **kwargs):
     """ChunkGatedDeltaRuleFunction.forward with use_qk_l2norm_in_kernel for
     row-strided q / k / v views, without input_guard's contiguous copies of
-    them: q / k are normalized from the views and v is read in place."""
-
-    def contiguous(t):
-        return None if t is None else t.contiguous()
-
+    them: q / k are normalized from the views and v is read in place. The
+    other tensors get the guard's .contiguous()."""
+    kwargs = {
+        key: t.contiguous() if isinstance(t, torch.Tensor) else t
+        for key, t in kwargs.items()
+    }
     with custom_device_ctx(q.device.index):
         return _chunk_gated_delta_rule_fwd_normalized(
-            q=l2norm_fwd_strided(q),
-            k=l2norm_fwd_strided(k),
-            v=v,
-            g=g.contiguous(),
-            beta=beta.contiguous(),
-            scale=scale,
-            initial_state=contiguous(initial_state),
-            initial_state_indices=contiguous(initial_state_indices),
-            cu_seqlens=contiguous(cu_seqlens),
-            inplace_update=inplace_update,
-            chunk_indices=contiguous(chunk_indices),
-            chunk_offsets=contiguous(chunk_offsets),
-            no_padding_rows=no_padding_rows,
+            q=l2norm_fwd_strided(q), k=l2norm_fwd_strided(k), v=v, **kwargs
         )
 
 
@@ -349,8 +330,7 @@ def chunk_gated_delta_rule(
     if (
         use_qk_l2norm_in_kernel
         and not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
-        and l2norm_fwd_strided_supported(q)
-        and l2norm_fwd_strided_supported(k)
+        and chunk_gated_delta_rule_reads_strided_qk(q, k)
     ):
         o, h = _chunk_gated_delta_rule_strided_qkv(
             q=q,

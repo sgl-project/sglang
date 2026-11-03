@@ -6,7 +6,10 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 
 if not is_cpu():
-    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.kernels.ops.attention.fla.chunk import (
+        chunk_gated_delta_rule,
+        chunk_gated_delta_rule_reads_strided_qk,
+    )
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode,
     )
@@ -42,7 +45,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
-    supports_strided_extend_qkv: bool = is_cuda()
+
+    def extend_reads_strided_qkv(self, q: torch.Tensor, k: torch.Tensor) -> bool:
+        return is_cuda() and chunk_gated_delta_rule_reads_strided_qk(q, k)
 
     def packed_decode(
         self,
