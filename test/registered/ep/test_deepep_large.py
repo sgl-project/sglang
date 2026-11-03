@@ -180,6 +180,10 @@ class TestElasticScaleUp4To5To6CudaGraph(
 ):
     """CI entry point for the registered Elastic EP scale test."""
 
+    # Scaling mutates the live service from EP4 to EP6 and cannot be replayed
+    # against the same process after a post-scale assertion failure.
+    expect_server_exit = True
+
 
 if __name__ == "__main__":
     unittest.main()
