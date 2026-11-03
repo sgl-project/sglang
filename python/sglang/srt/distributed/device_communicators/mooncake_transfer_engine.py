@@ -277,6 +277,10 @@ class MooncakeTransferEngine:
     def get_session_id(self):
         return self.session_id
 
+    def refresh_session(self, peer_session_id: str) -> int:
+        """Refresh one cached peer without unregistering local memory."""
+        return self.engine.refresh_session(peer_session_id)
+
     def send_probe(self, peer_session_id: str) -> int:
         return self.engine.send_probe(peer_session_id)
 

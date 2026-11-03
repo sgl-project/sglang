@@ -35,6 +35,7 @@ def _manager(
     *, enabled: bool = True, status: KVPoll | None = KVPoll.WaitingForInput
 ) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
+    manager.enable_failed_session_repair = False
     manager.customized_info_enabled = False
     manager.enable_deferred_decode_kv_release = enabled
     manager.request_status = {} if status is None else {ROOM: status}

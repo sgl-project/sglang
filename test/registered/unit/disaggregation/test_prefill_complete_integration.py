@@ -99,6 +99,7 @@ class TestAllocationIntegration(CustomTestCase):
 
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.enable_failed_session_repair = False
         mgr.customized_info_enabled = False
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])

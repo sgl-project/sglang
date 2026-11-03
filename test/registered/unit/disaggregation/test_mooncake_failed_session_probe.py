@@ -23,6 +23,7 @@ ROOM = 7
 
 def _manager(probe_rc: int = -1, idle_timeout: float = 600.0) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
+    manager.enable_failed_session_repair = False
     manager.session_lock = threading.Lock()
     manager.failed_sessions = {SESSION}
     manager.session_failures = defaultdict(int, {SESSION: 1})

@@ -168,6 +168,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.enable_custom_mem_pool = False
                     manager.max_transfer_batch_indices = 0
                     manager.bootstrap_port = 1234
+                    manager.enable_failed_session_repair = False
                     manager.session_lock = threading.Lock()
                     manager.failure_lock = threading.Lock()
                     manager.failed_sessions = set()
@@ -381,6 +382,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.pp_size = 1
+        manager.enable_failed_session_repair = False
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 2})
@@ -494,6 +496,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.max_transfer_batch_indices = 0
         manager.enable_trace = manager.enable_staging = False
         manager.bootstrap_port = 1234
+        manager.enable_failed_session_repair = False
         manager.session_lock = threading.Lock()
         manager.failure_lock = threading.Lock()
         manager.failed_sessions = set()
@@ -546,6 +549,7 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_mooncake_probe_recovery_keeps_a_layout_rejection(self):
         """A probe clears the transport blacklist but not a layout rejection."""
         manager = object.__new__(MooncakeKVManager)
+        manager.enable_failed_session_repair = False
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 1})
@@ -615,6 +619,7 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.enable_failed_session_repair = False
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
         sender.conclude_state = None
@@ -756,6 +761,7 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.enable_failed_session_repair = False
         manager.customized_info_enabled = True
         manager.kv_args = SimpleNamespace(
             aux_data_ptrs=[0x1000] * 8,
