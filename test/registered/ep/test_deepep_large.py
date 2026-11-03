@@ -26,7 +26,7 @@ if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
 from manual.ep.test_elastic_scale import (
-    TestElasticScaleUp4To5To6CudaGraph as _TestElasticScaleUp4To5To6CudaGraph,
+    TestElasticScaleUp4To6 as _TestElasticScaleUp4To6,
 )
 from manual.ep.test_nixl_ep import (
     TestNixlMoeMooncakeElasticEP as _TestNixlMoeMooncakeElasticEP,
@@ -175,9 +175,7 @@ class TestNixlMoeMooncakeElasticEP(_TestNixlMoeMooncakeElasticEP):
     """CI entry point for the registered NIXL/Mooncake Elastic EP test."""
 
 
-class TestElasticScaleUp4To5To6CudaGraph(
-    _TestElasticScaleUp4To5To6CudaGraph
-):
+class TestElasticScaleUp4To6(_TestElasticScaleUp4To6):
     """CI entry point for the registered Elastic EP scale test."""
 
     # Scaling mutates the live service from EP4 to EP6 and cannot be replayed
