@@ -67,8 +67,10 @@ MROPE = {
 
 def decode_positions(layer, positions):
     if layer.table_rope_positions_ndim == 2:
-        # Distinct axes also cover models with precomputed spatial decode positions.
-        return torch.stack([positions, positions + 5, positions * 3])
+        # Distinct axes also cover models with precomputed spatial decode positions;
+        # the decode graph runner passes a [:, :bs] slice of a [3, max_bs] buffer.
+        padded = torch.nn.functional.pad(positions, (0, 8))
+        return torch.stack([padded, padded + 5, padded * 3])[:, : len(positions)]
     return positions
 
 

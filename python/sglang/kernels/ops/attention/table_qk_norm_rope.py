@@ -105,8 +105,8 @@ def table_qk_norm_rope_(
     ``match_cuda`` preserves the reduction and rounding of the separate CUDA
     QK-norm and RoPE kernels for head dimensions 64/128/256. It requires BF16
     QKV with contiguous columns, contiguous BF16 weights, a contiguous FP32
-    or BF16 rotary table, and contiguous int32/int64 positions on the same CUDA
-    device. Row-strided QKV is supported.
+    or BF16 rotary table, and int32/int64 positions with unit token stride on
+    the same CUDA device. Row-strided QKV and MRoPE positions are supported.
 
     MRoPE passes [3, T] positions and ``MRotaryEmbedding.axis_map``, the axis
     each rotary lane reads its position from. A BF16 table rotates in BF16 to
@@ -124,7 +124,7 @@ def table_qk_norm_rope_(
         assert cos_sin_cache.is_contiguous()
         num_axes = () if axis_map is None else (3,)
         assert positions.shape == (*num_axes, qkv.shape[0])
-        assert positions.is_contiguous()
+        assert positions.stride(-1) == 1
         assert positions.dtype in (torch.int32, torch.int64)
         if axis_map is not None:
             assert axis_map.shape == (head_dim // 2,) and axis_map.is_contiguous()
