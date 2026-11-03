@@ -233,6 +233,10 @@ class DeviceMixin:
         """[Planned] Return platform-specific communicator class, or None for default."""
         return None
 
+    def get_vmm_backend_class(self) -> type | None:
+        """Return this device's VmmBackend subclass, or None if it has no VMM support."""
+        return None
+
     # ---- Misc ----
 
     @classmethod
