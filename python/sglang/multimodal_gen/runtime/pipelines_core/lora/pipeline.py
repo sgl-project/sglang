@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
+    is_gguf_linear,
     replace_submodule,
     wrap_with_lora_layer,
 )
@@ -496,14 +497,11 @@ class LoRAPipeline(ComposedPipelineBase):
         base._offload_param_prefix = name
         base._packed_weight_cpu = data
 
-    def _reject_lora_on_packed_weights(self) -> None:
-        """Fail before any layer is replaced if a target has no plain weight.
+    def _reject_lora_on_packed_weights(self, merge_mode: str = "auto") -> None:
+        """Validate packed targets before wrapping layers or materializing offload.
 
-        ``BaseLayerWithLoRA`` reads ``base_layer.weight``, which a
-        weight-packing quantization (GGUF) does not expose -- it registers
-        ``qweight``. Checking up front keeps a rejected request from leaving the
-        model half converted, and covers the dynamic ``set_lora`` API as well as
-        a startup ``--lora-path``.
+        GGUF linears support a separate dynamic delta, never a packed-weight
+        merge. Other packing methods still require their own LoRA integration.
         """
         for module_name in ("transformer", "transformer_2", "fake_score_transformer"):
             module = self.modules.get(module_name)
@@ -514,9 +512,17 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
                 params = dict(layer.named_parameters(recurse=False))
                 if "weight" not in params and "qweight" in params:
+                    if is_gguf_linear(layer):
+                        if merge_mode == "merge":
+                            raise ValueError(
+                                "GGUF LoRA requires dynamic mode; packed weights cannot be merged."
+                            )
+                        if getattr(layer, "tp_size", 1) != 1:
+                            raise ValueError("GGUF LoRA currently requires TP=1.")
+                        continue
                     raise ValueError(
                         f"LoRA is not supported on {module_name}.{name}: its "
-                        "weights are stored packed (GGUF), which an adapter "
+                        "weights use an unsupported packed format, which an adapter "
                         "cannot be merged into or applied alongside. Serve the "
                         "unquantized checkpoint to use LoRA."
                     )
@@ -691,7 +697,10 @@ class LoRAPipeline(ComposedPipelineBase):
 
     @staticmethod
     def _uses_dtensor_weights(lora_layers: dict[str, BaseLayerWithLoRA]) -> bool:
-        return any(isinstance(layer.weight, DTensor) for layer in lora_layers.values())
+        return any(
+            isinstance(getattr(layer.base_layer, "weight", None), DTensor)
+            for layer in lora_layers.values()
+        )
 
     @staticmethod
     def _has_active_unmerged_lora(
@@ -1142,7 +1151,7 @@ class LoRAPipeline(ComposedPipelineBase):
         # Checked before disabling offload, which materializes every layer: on a
         # memory-constrained deployment that would OOM instead of returning the
         # unsupported-LoRA error. Offloaded placeholders still carry the name.
-        self._reject_lora_on_packed_weights()
+        self._reject_lora_on_packed_weights(merge_mode)
 
         # Layerwise keeps manager views; do not load_all.
         if not self.lora_initialized:
