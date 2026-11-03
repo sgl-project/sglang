@@ -10,8 +10,17 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils.common import async_h2d, is_npu
+from sglang.srt.runtime_context import (
+    get_schedule,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
+from sglang.srt.utils.common import (
+    async_h2d,
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+    is_npu,
+)
 
 _is_npu = is_npu()
 
@@ -69,10 +78,20 @@ class NgramEmbeddingManager:
         if use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 
+            if _is_npu:
+                use_ngram_embedding = any(
+                    isinstance(module, NgramEmbedding) for module in model.modules()
+                )
+
+        if use_ngram_embedding:
             # Sized to mirror req_to_token (indexed by req_pool_idx).
             token_table = torch.empty(
                 req_to_token_pool.req_to_token.shape[0],
-                model_config.context_len,
+                (
+                    req_to_token_pool.req_to_token.shape[1]
+                    if _is_npu
+                    else model_config.context_len
+                ),
                 dtype=torch.int32,
                 device=device,
             )
@@ -80,11 +99,20 @@ class NgramEmbeddingManager:
             assert chunked_prefill_size is not None and chunked_prefill_size > 0, (
                 "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
             )
+            buffer_requests = max_running_requests
+            buffer_tokens = chunked_prefill_size
+            if _is_npu and get_spec().speculative_algorithm is not None:
+                buffer_requests = max(
+                    get_cuda_graph_max_batch_size(max_running_requests),
+                    get_eager_max_batch_size(max_running_requests),
+                )
+                buffer_tokens = max(
+                    buffer_tokens,
+                    buffer_requests * max_speculative_num_draft_tokens(),
+                )
             for module in model.modules():
                 if isinstance(module, NgramEmbedding):
-                    module.init_buffers(
-                        max_running_requests, chunked_prefill_size, device
-                    )
+                    module.init_buffers(buffer_requests, buffer_tokens, device)
         engram_hasher = engram_stager = None
         if model_config.use_engram:
             from sglang.srt.layers.engram import EngramHasher
@@ -123,6 +151,17 @@ class NgramEmbeddingManager:
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             batch_size=forward_batch.batch_size,
+        )
+
+    def prepare_for_verify(self, forward_batch: ForwardBatch) -> None:
+        """Stage a linear verify chain; the next round overwrites its rejected tail."""
+        info = forward_batch.ngram_embedding_info
+        _update_token_table(
+            tokens=forward_batch.input_ids.to(self.table.dtype),
+            ne_token_table=self.table,
+            row_indices=forward_batch.req_pool_indices,
+            column_starts=info.column_starts,
+            req_lens=info.req_lens,
         )
 
     def update_after_verify(

@@ -1226,6 +1226,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if _is_npu and model_runner.ngram_embedding_manager.enabled:
+                ret._init_ngram_embedding_info(batch, device)
             if model_runner.model_config.model_is_mrope:
                 # DP padding can turn an idle rank into a target verify batch.
                 ret.mrope_positions = ret.positions.unsqueeze(0).expand(3, -1)
@@ -1322,6 +1324,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
+            if _is_npu and ret.forward_mode.is_target_verify():
+                model_runner.ngram_embedding_manager.prepare_for_verify(ret)
 
         if model_runner.model_config.model_is_mrope:
             if spec_mrope_positions is not None:
@@ -1575,6 +1579,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():
             column_starts, req_lens = self.seq_lens - 1, 1
+        elif _is_npu and self.forward_mode.is_target_verify():
+            column_starts = self.seq_lens
+            req_lens = self.spec_info.draft_token_num
+        elif _is_npu and self.forward_mode.is_idle():
+            column_starts, req_lens = 0, 0
         else:
             column_starts, req_lens = self.extend_prefix_lens, self.extend_seq_lens
         self.ngram_embedding_info = NgramEmbeddingInfo.create(

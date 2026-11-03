@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_module,
     get_device_sm,
     is_cpu,
     is_cuda,
@@ -1151,15 +1152,19 @@ class LongcatFlashForCausalLM(nn.Module):
         self.post_load_weights(weight_names=weight_names)
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed_tokens = self.model.embed_tokens
+        if isinstance(embed_tokens, NgramEmbedding):
+            embed_tokens = embed_tokens.word_embeder
+        return embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_module = get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -42,6 +42,7 @@ from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -75,7 +76,7 @@ from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
-from sglang.srt.runtime_context import get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -144,11 +145,16 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             ),
             rope_scaling=getattr(config, "rope_scaling", None),
             max_position_embeddings=config.max_position_embeddings,
-            quant_config=quant_config,
+            quant_config=(
+                None
+                if "self_attn" in getattr(config, "disable_quant_module", [])
+                else quant_config
+            ),
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix(f"self_attn", prefix),
             alt_stream=self.alt_stream,
+            is_nextn=True,
         )
 
         self.mlp = LongcatFlashMLP(
@@ -178,22 +184,28 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
+            attn_out = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
+                prev_topk_indices=prev_topk_indices,
             )
+            if isinstance(attn_out, tuple):
+                hidden_states, prev_topk_indices = attn_out
+            else:
+                hidden_states = attn_out
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
-        return hidden_states
+        return hidden_states, prev_topk_indices
 
 
 class LongcatFlashModelNextN(nn.Module):
@@ -205,7 +217,19 @@ class LongcatFlashModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.alt_stream = get_stream("alt")
+        if _is_npu:
+            config.index_share_for_mtp_iteration = getattr(
+                config,
+                "index_share_for_mtp_iteration",
+                getattr(config, "dsa_mtp_cli", False),
+            )
+        if _is_npu and not hasattr(config, "indexer_rope_interleave"):
+            config.indexer_rope_interleave = getattr(config, "rope_interleave", True)
+        self.alt_stream = (
+            get_stream("alt")
+            if not _is_npu or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -265,9 +289,14 @@ class LongcatFlashModelNextN(nn.Module):
             )
 
         residual_batch.start(forward_batch)
+        index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states = self.decoder(
-                positions, hidden_states, forward_batch, zero_allocator
+            hidden_states, topk_indices = self.decoder(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=index_topk_share.topk_indices,
             )
 
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
@@ -276,6 +305,8 @@ class LongcatFlashModelNextN(nn.Module):
             hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.final_layernorm
             )
+        index_topk_share.update(topk_indices)
+        index_topk_share.publish()
         return hidden_states
 
 
@@ -297,6 +328,8 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             config.vocab_size,
             config.hidden_size,
             quant_config=self.quant_config,
+            prefix="lm_head",
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -412,9 +445,10 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             self_attn.w_kc = bind_or_assign(
                 self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             )
-            self_attn.w_vc = bind_or_assign(
-                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-            )
+            w_vc = w_vc.contiguous().transpose(1, 2)
+            if _is_npu:
+                w_vc = w_vc.contiguous()
+            self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
             if (
                 hasattr(self_attn.kv_b_proj, "weight_scale")
                 and self_attn.w_scale is None
@@ -515,6 +549,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             "model.mtp.embed_tokens.weight": "embed_tokens.weight",
             "model.mtp.layers.0.eh_proj.weight": "eh_proj.weight",
             "model.mtp.layers.0.eh_proj.weight_scale_inv": "eh_proj.weight_scale_inv",
+            "model.mtp.layers.0.eh_proj.weight_scale": "eh_proj.weight_scale",
             "model.mtp.layers.0.enorm.m.weight": "enorm.weight",
             "model.mtp.layers.0.hnorm.m.weight": "hnorm.weight",
             "model.mtp.layers.0.input_layernorm.weight": "layers.0.input_layernorm.weight",
@@ -533,12 +568,24 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             "model.mtp.layers.0.self_attn.q_b_proj.weight_scale_inv": "layers.0.self_attn.q_b_proj.weight_scale_inv",
             "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight": "layers.0.mlp.down_proj.weight",
             "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight_scale_inv": "layers.0.mlp.down_proj.weight_scale_inv",
+            "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight_scale": "layers.0.mlp.down_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight": "layers.0.mlp.gate_proj.weight",
             "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight_scale_inv": "layers.0.mlp.gate_proj.weight_scale_inv",
+            "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight_scale": "layers.0.mlp.gate_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight": "layers.0.mlp.up_proj.weight",
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale_inv": "layers.0.mlp.up_proj.weight_scale_inv",
+            "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale": "layers.0.mlp.up_proj.weight_scale",
             "model.mtp.norm.weight": "layers.0.final_layernorm.weight",
         }
+        if _is_npu:
+            weight_names_mapping.update(
+                {
+                    "model.mtp.layers.0.self_attn.indexer.wq_b.weight": "layers.0.self_attn.indexer.wq_b.weight",
+                    "model.mtp.layers.0.self_attn.indexer.wk.weight": "layers.0.self_attn.indexer.wk.weight",
+                    "model.mtp.layers.0.self_attn.indexer.k_norm.weight": "layers.0.self_attn.indexer.k_norm.weight",
+                    "model.mtp.layers.0.self_attn.indexer.weights_proj.weight": "layers.0.self_attn.indexer.weights_proj.weight",
+                }
+            )
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
@@ -675,6 +722,8 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                         futures.append(
                             executor.submit(weight_loader, param, loaded_weight)
                         )
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
         self.post_load_weights()
 
 
