@@ -297,7 +297,7 @@ def _cp_allgather_and_save_kv_npu(
     """
 
     assert forward_batch.kv_cache_pruning_config is None, (
-        "seq parralel is not supported with kv_cache_pruning"
+        "seq parallel is not supported with kv_cache_pruning"
     )
     cache_loc = (
         forward_batch.out_cache_loc
@@ -1927,7 +1927,7 @@ class AscendAttnBackend(AttentionBackend):
                         else None
                     )
 
-                    # correct cache_loc to
+                    # correct cache_loc when the cache is pruned
                     kv_cache_pruned_num_list = []
                     head_range_list = []
                     if (
@@ -2204,7 +2204,7 @@ class AscendAttnBackend(AttentionBackend):
                             dim=0,
                         )
 
-                    # apdate statistics and pack kv cache
+                    # update statistics and pack kv cache
                     if forward_batch.kv_cache_pruning_config is not None:
                         assert forward_batch.is_first_chunk is not None
                         assert forward_batch.is_last_chunk is not None
@@ -2229,7 +2229,7 @@ class AscendAttnBackend(AttentionBackend):
                             q,
                             k_cache,
                             v_cache,
-                            "L,B,HN,D",  # L - sequence length, B - batch size, HN - head num, D - single head dimention size
+                            "L,B,HN,D",  # L - sequence length, B - batch size, HN - head num, D - single head dimension size
                             self.prune_state[layer.layer_id],  # current state
                             forward_batch.is_first_chunk,
                             forward_batch.is_last_chunk,
@@ -3264,7 +3264,7 @@ class AscendAttnBackend(AttentionBackend):
                 out_cache_loc = forward_batch.out_cache_loc
                 if forward_batch.kv_cache_pruning_config:
                     # head_split_list, head_size_list = forward_batch.kv_cache_pruning_config['head_layer_groups'][layer.layer_id]
-                    # assert len(head_split_list)==1, "NUPGraph implemented only for single group KV cache pruning"
+                    # assert len(head_split_list)==1, "NPUGraph implemented only for single group KV cache pruning"
                     out_cache_loc = (
                         out_cache_loc
                         - self.kv_cache_pruned_num_tensors[layer.layer_id][0]
@@ -3688,7 +3688,7 @@ class AscendAttnBackend(AttentionBackend):
 
                 if forward_batch.kv_cache_pruning_config:
                     assert self.forward_metadata.block_tables.shape[0] == 1
-                    # prune only on prefill. lets correct actual_seq_len_kv by pruned positions
+                    # prune only on prefill. let's correct actual_seq_len_kv by pruned positions
                     states_list = self.get_prune_state(layer.layer_id)
 
                     if len(states_list) == 1:

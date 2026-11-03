@@ -43,7 +43,7 @@ def read_kv_cache_pruning_config(
 
     if not get_bool_env_var("ASCEND_USE_FIA", "False"):  # initial impl is only for FIA
         raise RuntimeError(
-            f'Scheduler {get_bool_env_var("ASCEND_USE_FIA", "False")=} KV-CACHE PRUNING is currently implemented  only for Ascend FIA'
+            f'Scheduler {get_bool_env_var("ASCEND_USE_FIA", "False")=} KV-CACHE PRUNING is currently implemented only for Ascend FIA'
         )
 
     _kv_cache_pruning_config = get_default_kv_cache_pruning_config()
@@ -65,8 +65,8 @@ def read_kv_cache_pruning_config(
             kv_cache_size_in_pages = (int(kv_cache_size - 1) // page_size) + 1
             kv_cache_size = (
                 kv_cache_size_in_pages * page_size - 1
-            )  # without 1 because real occupation is kv_cahcE_size+1
-            # signle groups with all heads in them
+            )  # without 1 because real occupation is kv_cache_size+1
+            # single groups with all heads in them
             head_split_list = [num_kv_heads]
             head_size_list = [kv_cache_size]
             _kv_cache_pruning_config["head_layer_groups"] = [
@@ -158,7 +158,7 @@ def read_kv_cache_pruning_config(
     return _kv_cache_pruning_config
 
 
-# functions to multiply QxK with L,B,H,D layout L=seq length, B is batch_size, H is head num, D is head dimention size
+# functions to multiply QxK with L,B,H,D layout L=seq length, B is batch_size, H is head num, D is head dimension size
 def qk_mul_LBHD(query, key):
     L_q, B, H_q, D = query.shape
     L_kv, B, H_kv, D = key.shape
@@ -274,7 +274,7 @@ def real_prune_prefill_pack_empty_state(kv_cache_config, layer_idx, batch_size, 
     return kv_cache_state_list
 
 
-# function that detects most useless KV positions and eliminate them with repack for each head group separatly
+# function that detects most useless KV positions and eliminate them with repack for each head group separately
 def real_prune_prefill_pack_(
     kv_cache_pruning_config,
     q_head_num,
@@ -308,11 +308,11 @@ def real_prune_prefill_pack_(
 
     stat_size = min(prefill_stat_size, q_len)
 
-    # get dimention indexes for seq length (L) and head num (H)
+    # get dimension indexes for seq length (L) and head num (H)
     dim_L = get_layout_dim_index(layout, "L")
     dim_HN = get_layout_dim_index(layout, "HN")
 
-    # get heads groups (all heads in signle groups has same Kv cache size )
+    # get heads groups (all heads in single groups have same Kv cache size )
     head_split_list, head_size_list = kv_cache_pruning_config["head_layer_groups"][
         layer_idx
     ]
@@ -334,7 +334,7 @@ def real_prune_prefill_pack_(
             values_list.append(values.narrow(dim_HN, hs, hn))
             hs += hn
 
-    # process each heads group separatly
+    # process each heads group separately
     for hg, state_hg in enumerate(current_prune_state):
         kv_cache_pos_old = state_hg["kv_cache_pos"]
         kv_len_add = q_len - prefill_chunk_tail
@@ -520,7 +520,7 @@ def real_prune_prefill_pack_(
                 .values
             )
 
-        # agregate over all query positions
+        # aggregate over all query positions
         if kv_cache_pruning_config["prefill_chunk_stat_separate"]:
             assert attn_weights.shape[2] > kv_cache_pruning_config["prefill_chunk_tail"]
             # 2 separate statistics for last chunk and next chunk
@@ -578,7 +578,7 @@ def real_prune_prefill_pack_(
             kv_cache_stat_new_topk = kv_cache_stat_new_2ch
 
         kv_cache_pruned_num = 0
-        # check if prune is reuired for the heads group
+        # check if prune is required for the heads group
         if kv_len_new > kv_cache_size + 1:
             kv_cache_pruned_num = kv_len_new - (kv_cache_size + 1)
 
@@ -607,7 +607,7 @@ def real_prune_prefill_pack_(
             kv_cache_stat_new_masked_crop = kv_cache_stat_new_masked.narrow(
                 -1, kv_cache_size_old_guard, kv_len_new_crop
             )
-            # crop old from gatherd source
+            # crop old from gathered source
             kv_cache_stat_new_crop_2ch = kv_cache_stat_new_2ch.narrow(
                 -1, kv_cache_size_old_guard, kv_len_new_crop
             )
