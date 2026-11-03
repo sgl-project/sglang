@@ -4077,6 +4077,13 @@ class Scheduler(
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
+    def _clear_dllm_future(self, req):
+        buf = self.future_map.dllm_block_tokens_buf
+        slot = req.kv.req_pool_idx
+        if buf is not None and slot is not None:
+            with self.forward_stream_ctx if self.enable_overlap else nullcontext():
+                buf[slot] = -1
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -4086,14 +4093,18 @@ class Scheduler(
 
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+            if not self.dllm_config.requires_separate_context_encoding:
+                for req in self.dllm_manager.waiting_queue:
+                    if req.dllm_block_done and req.extend_end > req.prefix_len:
+                        if self.dllm_config.first_done_first_out_mode:
+                            self._clear_dllm_future(req)
+                        self.finish_dllm_forward(req)
 
         # Merge the prefill batch into the running batch
         reqs_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             reqs_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -5028,9 +5039,15 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(
-                                batch, future_indices, batch_result
-                            )
+                            if batch.is_dllm():
+                                if self.dllm_config.first_done_first_out_mode:
+                                    self.future_map.stash_dllm_block_tokens(
+                                        future_indices, batch_result.next_token_ids
+                                    )
+                            else:
+                                self._relay_forward_payload(
+                                    batch, future_indices, batch_result
+                                )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -5166,7 +5183,12 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                if batch_result.has_sampled_token_ids:
+                if batch.is_dllm():
+                    if self.dllm_config.first_done_first_out_mode:
+                        self.future_map.stash_dllm_block_tokens(
+                            batch.req_pool_indices, batch_result.next_token_ids
+                        )
+                elif batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
                         batch, batch.req_pool_indices, batch_result
@@ -6071,10 +6093,16 @@ class Scheduler(
             ):
                 # Finished in place, so a later abort in the same intake skips it.
                 if req.finished_reason is None:
-                    req.finish_outside_step(FINISH_ABORT())
+                    req.finish_outside_step(FINISH_ABORT(recv_req.abort_message))
                 self._release_aborted_request(req)
-                self.send_abort_output(_make_abort_req(req), req)
+                req.clear_requested_finish()
+                req.finished_output = True
+                self.send_abort_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
                 if req.kv.holds_kv or req.kv.holds_mamba:
+                    if self.dllm_config.first_done_first_out_mode:
+                        self._clear_dllm_future(req)
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
