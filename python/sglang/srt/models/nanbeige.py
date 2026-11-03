@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.configs import NanbeigeConfig
+from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled

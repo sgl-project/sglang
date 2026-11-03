@@ -59,7 +59,8 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput, Req
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
@@ -253,6 +254,17 @@ class RustServer:
         return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
 
     @classmethod
+    def _advertised_host(cls) -> str:
+        """The host this rank's listener is published at: the bound host, else
+        the address the interfaces answer on. A deployment whose service
+        discovery publishes another of the node's addresses overrides this."""
+        host = get_serving().host
+        if host in ("", "0.0.0.0", "::"):
+            # An unspecified bind address is not reachable from another node.
+            host = get_local_ip_auto(fallback="127.0.0.1")
+        return host
+
+    @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
         if get_exec().moe.is_ep_joiner:
@@ -264,11 +276,7 @@ class RustServer:
             # out, and the serving ranks' table is untouched.
             return []
         bind_host = get_serving().host
-        host = bind_host
-        if host in ("", "0.0.0.0", "::"):
-            # An unspecified bind address is not reachable from another
-            # node; advertise the address the interfaces answer on.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+        host = cls._advertised_host()
         # Nodes that rendezvous on loopback share this machine, so a loopback
         # listener reaches them; otherwise it is a likely misconfiguration.
         if get_parallel().nnodes > 1 and _is_loopback(host):
