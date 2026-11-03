@@ -1,4 +1,4 @@
-"""Real-manager Q4 cold LIM/CopySFA integration on one Ascend device."""
+"""Real-manager chain-MTP LIM/CopySFA integration on one Ascend device."""
 
 import json
 from contextlib import ExitStack
@@ -25,8 +25,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-K, C, Q, L = 2048, 12288, 4, 16389
-CONTEXT = (L + 127) // 128 * 128
+K = 2048
 
 
 class _IndexPool(MLATokenToKVPool):
@@ -47,13 +46,29 @@ class _IndexPool(MLATokenToKVPool):
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("async_checks", [False, True])
 @pytest.mark.parametrize("heads", [4, 8])
-@pytest.mark.parametrize("capacity", [11392, 12288, 16384, 16768])
-def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capacity):
+@pytest.mark.parametrize(
+    "query_width,capacity",
+    [
+        (2, 4096),
+        (3, 6144),
+        (4, 11392),
+        (4, 12288),
+        (4, 16384),
+        (4, 16768),
+        (5, 12288),
+        (8, 16384),
+        (14, 28672),
+    ],
+)
+def test_real_manager_mtp_owner_share_lifecycle(
+    graph, async_checks, heads, query_width, capacity
+):
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device_id = torch.npu.current_device()
     device = torch.device("npu", device_id)
     C = capacity
+    Q = query_width
     # Keep the rollback inside the sparse branch for both capacities. Falling
     # below C correctly produces zero resident-cache misses instead.
     L = max(16389, C + 261)
@@ -70,7 +85,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
     )
     # Graph metadata may reserve an extra speculative page outside host context.
     table = torch.nn.functional.pad(table, (0, 1))
-    token_rows = 16  # 12 logical rows plus a TP padding suffix.
+    token_rows = batch * Q + 4  # Include a TP padding suffix.
     query = torch.zeros(token_rows, 32, 128, dtype=torch.bfloat16, device=device)
     query[:, :, 0] = 1
     weights = torch.full((token_rows, 32), 1 / 32, dtype=query.dtype, device=device)
@@ -128,7 +143,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
         )
         for _ in layer
     ]
-    spec = SimpleNamespace(speculative_eagle_topk=1, speculative_num_draft_tokens=4)
+    spec = SimpleNamespace(speculative_eagle_topk=1, speculative_num_draft_tokens=Q)
     try:
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(async_checks))
@@ -272,6 +287,8 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
                             "graph": graph,
                             "async_checks": async_checks,
                             "heads": heads,
+                            "query_width": Q,
+                            "capacity": C,
                             "phase": "reuse",
                             "layer": i,
                             "max_abs": errors.abs().max().item(),
@@ -330,6 +347,8 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
                             "graph": graph,
                             "async_checks": async_checks,
                             "heads": heads,
+                            "query_width": Q,
+                            "capacity": C,
                             "phase": "rollback",
                             "layer": i,
                             "max_abs": errors.abs().max().item(),

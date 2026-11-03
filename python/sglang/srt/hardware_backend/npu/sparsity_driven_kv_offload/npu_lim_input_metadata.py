@@ -26,7 +26,6 @@ def _prepare_kernel(
     B: tl.constexpr,
     ROWS: tl.constexpr,
     CAPACITY: tl.constexpr,
-    FULL_VISIBLE: tl.constexpr,
     QUERY_WIDTH: tl.constexpr,
     HAS_POSITIONS: tl.constexpr,
     SRC_COLS: tl.constexpr,
@@ -69,9 +68,7 @@ def _prepare_kernel(
         )
         safe_slot = tl.where(valid, raw_slot, ROWS).to(tl.int32)
         length = tl.where(valid, raw_length, 0).to(tl.int32)
-        prefix = tl.where(
-            FULL_VISIBLE, length, ((tl.maximum(length - QUERY_WIDTH, 0) // 128) * 128)
-        ).to(tl.int32)
+        prefix = length
         sparse = valid & (prefix >= CAPACITY)
         previous = tl.load(last_ptr + safe_slot).to(tl.int32)
         warm = sparse & (previous >= 0) & (prefix >= previous)
@@ -105,7 +102,6 @@ def fused_prepare_lim_metadata(
     cache_sizes,
     capacity: int,
     request_rows: int,
-    full_visible: bool,
     query_width: int = 1,
     positions=None,
 ) -> None:
@@ -211,7 +207,6 @@ def fused_prepare_lim_metadata(
         batch,
         request_rows,
         capacity,
-        full_visible,
         query_width,
         positions is not None,
         block_table.shape[1],

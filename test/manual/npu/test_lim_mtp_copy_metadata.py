@@ -48,7 +48,7 @@ def test_fused_copy_sfa_metadata_width_and_graph(width, paged_host):
             sparse_rows=sparse,
             request_slots=slots,
             next_prefix=prefix,
-            tail_seq_lens=prefix,
+            seq_lens=prefix,
             last_prefix=last,
             actual_seq_lengths_kv=kv,
             num_cache_tokens=cache,

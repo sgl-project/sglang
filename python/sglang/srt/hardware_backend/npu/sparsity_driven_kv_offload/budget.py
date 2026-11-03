@@ -44,7 +44,6 @@ def resolve_sparse_kv_budget(
     copy_sfa_query_heads: int = 128,
     max_query_width: int = 1,
     graph_batch_capacity: int = 0,
-    device_tail_tokens: int = 0,
 ) -> SparseKVBudget:
     """Reserve the same native buffers allocated by the manager and adapter."""
     for name, value in (
@@ -61,8 +60,6 @@ def resolve_sparse_kv_budget(
         raise ValueError(f"Native LIM query width must be in [1,{MAX_QUERY_WIDTH}].")
     if not 1 <= copy_sfa_query_heads <= 128:
         raise ValueError("CopySFA padded query heads must be in [1,128].")
-    if device_tail_tokens not in (0, 256):
-        raise ValueError("A causal HBM tail requires 256 slots.")
     if cache_tokens < 0 or hbm_budget_bytes < 0:
         raise ValueError("Cache size and HBM budget must be nonnegative.")
     context_len = (context_len + 127) // 128 * 128
@@ -81,7 +78,7 @@ def resolve_sparse_kv_budget(
     )
     adapter += (num_layers + 1) * (request_rows + 1) * 4
     slot_map = num_layers * (request_rows + 1) * context_len * 4
-    stride = capacity + device_tail_tokens
+    stride = capacity
     copy_bytes = batch * stride * 17 + tokens * 9
     copy_bytes += num_layers * request_rows * 8 + request_rows * 12
     copy_bytes += tokens * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)

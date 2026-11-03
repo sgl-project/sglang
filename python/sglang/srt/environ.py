@@ -1059,8 +1059,6 @@ class Envs:
     SGLANG_NPU_SPARSE_KV_CACHE_SIZE = EnvInt(0)
     # Per-rank persistent manager allocations, in MiB; 0 leaves the cap unset.
     SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB = EnvInt(0)
-    # Explicit prefix-TopK plus causal HBM-tail experiment (different selection).
-    SGLANG_NPU_MTP_SEPARATE_KV_TAIL = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
@@ -2099,6 +2097,9 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_NPU_MTP_SEPARATE_KV_TAIL": _DeprecatedEnv(
+        note="The separate KV tail was removed; full-visible LIM is always used."
+    ),
     "SGLANG_NPU_LIM_LIBRARY": _DeprecatedEnv(
         note="LIM is loaded from sgl-kernel-npu; external library paths are ignored."
     ),

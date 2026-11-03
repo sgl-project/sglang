@@ -19,10 +19,10 @@ incompatible wheel fails before capture.
 `SGLANG_NPU_SPARSE_KV_CACHE_SIZE=0` selects `max_query_width * 2048` resident
 slots. Explicit C must cover that union, be page aligned, and be at most 32640.
 `SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB` caps persistent manager allocations.
-The optional `SGLANG_NPU_MTP_SEPARATE_KV_TAIL` experiment retains its distinct
-prefix-TopK plus causal-tail selection contract and adds 256 HBM slots per row.
+The separate 256-token HBM-tail experiment has been removed; setting its old
+environment variable emits a deprecation warning and does not change selection.
 
-In the default full-visible mode, L is the last actual query position plus one.
+In full-visible mode, L is the last actual query position plus one.
 For L < C, CopySFA receives `num_cache_tokens=0`, the actual L, and the row's
 real HBM page table. It attends all visible KV, including when K < L < C.
 For L >= C, it consumes native LIM's resident TopK plan. This threshold is per
@@ -45,8 +45,7 @@ python3 -m pytest -q \
   test/manual/npu/test_lim_short_dynamic.py \
   test/manual/npu/test_lim_mtp_copy_metadata.py \
   test/manual/npu/test_lim_pre_metadata_graph.py \
-  test/manual/npu/test_lim_mtp_manager.py \
-  test/manual/npu/test_mtp_separate_tail.py
+  test/manual/npu/test_lim_mtp_manager.py
 ```
 
 The mixed-row fixture checks FP32 attention, both KV layers, request/TP padding,

@@ -22,7 +22,7 @@ def _lim_copy_sfa_metadata_kernel(
     hbm_block_table_ptr,
     dram_block_table_ptr,
     host_block_table_ptr,
-    tail_seq_lens_ptr,
+    seq_lens_ptr,
     B: tl.constexpr,
     K: tl.constexpr,
     Q: tl.constexpr,
@@ -37,8 +37,6 @@ def _lim_copy_sfa_metadata_kernel(
     HOST_COLS: tl.constexpr,
     HOST_S0: tl.constexpr,
     HOST_S1: tl.constexpr,
-    TAIL_MODE: tl.constexpr,
-    FULL_VISIBLE: tl.constexpr,
 ):
     tile_id = tl.program_id(0).to(tl.int32)
     row_id = tl.program_id(1).to(tl.int32)
@@ -64,13 +62,6 @@ def _lim_copy_sfa_metadata_kernel(
     if tile_id * BLOCK < HBM_PAGES:
         hbm_base = row_id.to(tl.int64) * HBM_PAGES
         hbm_values = base_request * HBM_PAGES + col
-        if TAIL_MODE:
-            prefix = tl.maximum(tl.load(next_prefix_ptr + row_id), 0)
-            hbm_values = base_request * HBM_PAGES + tl.where(
-                (col < C // 128) | ~is_sparse,
-                col,
-                C // 128 + (prefix // 128 + col - C // 128) % 2,
-            )
         tl.store(
             hbm_block_table_ptr + hbm_base + col.to(tl.int64),
             hbm_values,
@@ -99,10 +90,8 @@ def _lim_copy_sfa_metadata_kernel(
             tl.store(topk_misses_ptr + row_id * Q + route, 0, mask=~active)
         tl.store(miss_counts_ptr + row_id, 0, mask=~active)
         cache_length = tl.where(active, C, 0).to(tl.int32)
-        seq_len = tl.load(tail_seq_lens_ptr + row_id)
+        seq_len = tl.load(seq_lens_ptr + row_id)
         sparse_length = C + Q - 1
-        if TAIL_MODE:
-            sparse_length = C + seq_len - tl.load(next_prefix_ptr + row_id)
         logical_length = tl.where(is_sparse, sparse_length, seq_len)
         tl.store(
             actual_seq_lengths_kv_ptr + row_id,
@@ -161,11 +150,9 @@ def fused_lim_copy_sfa_metadata(
     capacity: int,
     host_context_len: int,
     request_rows: int,
+    seq_lens: torch.Tensor,
     query_width: int = 1,
     host_block_table: torch.Tensor | None = None,
-    tail_seq_lens: torch.Tensor | None = None,
-    tail_tokens: int = 0,
-    full_visible: bool = True,
 ) -> None:
     """Update preallocated LIM / Copy-SFA metadata in one NPU kernel launch.
 
@@ -229,18 +216,14 @@ def fused_lim_copy_sfa_metadata(
         raise ValueError("all per-row metadata tensors must have shape [B].")
     if last_prefix.ndim != 1 or last_prefix.shape[0] != request_rows + 1:
         raise ValueError("last_prefix must have shape [request_rows + 1].")
-    if tail_tokens not in (0, 256):
-        raise ValueError("tail_tokens must be0 or256")
-    if tail_seq_lens is not None and (
-        tail_seq_lens.shape != (batch,)
-        or tail_seq_lens.dtype != torch.int32
-        or tail_seq_lens.device != source_ids.device
-        or not tail_seq_lens.is_contiguous()
+    if (
+        seq_lens.shape != (batch,)
+        or seq_lens.dtype != torch.int32
+        or seq_lens.device != source_ids.device
+        or not seq_lens.is_contiguous()
     ):
-        raise ValueError(
-            "Separate-tail sequence lengths must be contiguous same-device int32[B]."
-        )
-    if hbm_block_table.shape != (batch, (capacity + tail_tokens) // 128):
+        raise ValueError("Sequence lengths must be contiguous same-device int32[B].")
+    if hbm_block_table.shape != (batch, capacity // 128):
         raise ValueError("hbm_block_table must have shape [B, capacity // 128].")
     if dram_block_table.shape != (batch, host_context_len // 128):
         raise ValueError(
@@ -291,12 +274,7 @@ def fused_lim_copy_sfa_metadata(
     _validate_tensor("valid_rows", valid_rows, dtype=torch.bool, device=device)
     _validate_tensor("sparse_rows", sparse_rows, dtype=torch.bool, device=device)
 
-    if tail_seq_lens is None:
-        raise ValueError("Real sequence lengths are required for dense short rows.")
-    if not full_visible and tail_tokens != 256:
-        raise ValueError("Prefix/tail attention requires 256 HBM tail tokens.")
-
-    hbm_pages = (capacity + tail_tokens) // 128
+    hbm_pages = capacity // 128
     dram_pages = host_context_len // 128
     tiles = triton.cdiv(max(2048, hbm_pages, dram_pages), 2048)
     _lim_copy_sfa_metadata_kernel[(tiles, batch)](
@@ -313,7 +291,7 @@ def fused_lim_copy_sfa_metadata(
         hbm_block_table,
         dram_block_table,
         host_block_table if host_block_table is not None else dram_block_table,
-        tail_seq_lens if tail_seq_lens is not None else actual_seq_lengths_kv,
+        seq_lens,
         batch,
         2048,
         query_width,
@@ -328,8 +306,6 @@ def fused_lim_copy_sfa_metadata(
         host_block_table.shape[1] if host_block_table is not None else 0,
         host_block_table.stride(0) if host_block_table is not None else 0,
         host_block_table.stride(1) if host_block_table is not None else 0,
-        not full_visible,
-        full_visible,
     )
 
 

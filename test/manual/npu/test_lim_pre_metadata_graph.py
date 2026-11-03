@@ -18,9 +18,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_me
     "slot_dtype,length_dtype", [(torch.int32, torch.int32), (torch.int64, torch.int64)]
 )
 @pytest.mark.parametrize("src_cols,dst_cols", [(32, 512), (500, 513), (513, 513)])
-@pytest.mark.parametrize(
-    "full_visible,query_width", [(True, 1), (True, 4), (False, 1), (False, 4)]
-)
+@pytest.mark.parametrize("query_width", [1, 4])
 def test_npu_graph_replay_matches_torch_reference(
     active_rows,
     capacity,
@@ -28,7 +26,6 @@ def test_npu_graph_replay_matches_torch_reference(
     length_dtype,
     src_cols,
     dst_cols,
-    full_visible,
     query_width,
 ):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -66,7 +63,6 @@ def test_npu_graph_replay_matches_torch_reference(
             cache_sizes=cache_size,
             capacity=capacity,
             request_rows=rows,
-            full_visible=full_visible,
             query_width=query_width,
         )
 
@@ -129,7 +125,7 @@ def test_npu_graph_replay_matches_torch_reference(
         for slot, length in zip(host_slots, host_lengths):
             ok = slot > 0 and slot < rows and length > 0
             ln = int(length) if ok else 0
-            pre = ln if full_visible else max(ln - query_width, 0) // 128 * 128
+            pre = ln
             sp = ok and pre >= capacity
             old = int(last_prefix[slot if ok else rows].item())
             warm = sp and old >= 0 and pre >= old

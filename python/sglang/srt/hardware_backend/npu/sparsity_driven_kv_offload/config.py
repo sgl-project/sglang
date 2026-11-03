@@ -182,7 +182,6 @@ def get_sparse_kv_budget(
         hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
         max_query_width=get_sparse_kv_max_query_width(),
         copy_sfa_query_heads=copy_sfa_query_heads,
-        device_tail_tokens=256 if envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get() else 0,
         graph_batch_capacity=sparse_batch_capacity(
             request_rows,
             max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),

@@ -47,7 +47,6 @@ class LIMDecodeAdapter:
         self.batch_capacity = manager.batch_capacity
         self.max_query_width = manager.max_query_width
         self.top_k = manager.sparse_context_len
-        self.full_visible = not manager.separate_mtp_tail
         self.source_capacity = manager.max_context_len
         self.operator = load_fused_lim_operator()
         try:
@@ -162,7 +161,6 @@ class LIMDecodeAdapter:
             cache_sizes=self._pre_cache_sizes[:batch],
             capacity=self.capacity,
             request_rows=self.rows,
-            full_visible=self.full_visible,
             query_width=width,
         )
         scale = self.query_scale.view(-1)[: rows * query.shape[1]].view(
@@ -190,7 +188,7 @@ class LIMDecodeAdapter:
             miss_slots=self.miss_slots[:batch],
             miss_counts=self.miss_counts[:batch],
             operator=self.operator,
-            full_visible=self.full_visible,
+            full_visible=True,
         )
         self.last_prefix[layer_index].index_copy_(
             0, self._pre_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
@@ -229,9 +227,7 @@ class LIMDecodeAdapter:
             host_context_len=manager.max_context_len,
             request_rows=self.rows,
             query_width=plan.query_width,
-            tail_tokens=manager.tail_tokens,
-            tail_seq_lens=plan.seq_lens,
+            seq_lens=plan.seq_lens,
             host_block_table=self.block_table[:batch],
-            full_visible=self.full_visible,
         )
         return self.query_ends[plan.query_width - 1, :batch]

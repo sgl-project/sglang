@@ -25,8 +25,6 @@ def _history_metadata(
     FIRST_STRIDE: tl.constexpr,
     C: tl.constexpr,
     STRIDE: tl.constexpr,
-    Q: tl.constexpr,
-    FULL_VISIBLE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     tile = tl.program_id(0)
@@ -38,21 +36,20 @@ def _history_metadata(
         (req > 0) & (req < ROWS) & (length > 0) & (length <= CONTEXT) & (first >= 0)
     )
     safe = tl.where(active, req, 0)
-    prefix = tl.maximum(length - Q, 0) // 128 * 128
-    dense = length < C if FULL_VISIBLE else prefix < C
-    begin = tl.where(dense, 0, tl.where(FULL_VISIBLE, -1, prefix)).to(tl.int32)
+    dense = length < C
+    begin = tl.where(dense, 0, -1).to(tl.int32)
     previous_begin = tl.load(old_begin + safe)
     previous_end = tl.load(old_end + safe)
     same_layout = (previous_begin >= 0) & ((previous_begin == 0) == (begin == 0))
     offset = tile * BLOCK + tl.arange(0, BLOCK)
-    pos = tl.where(dense, offset, prefix + offset)
+    pos = offset
     present = same_layout & (pos >= previous_begin) & (pos < previous_end)
     restore = active & (begin >= 0) & (offset < STRIDE) & (pos < first) & ~present
     physical = tl.load(
         req_to_token + safe * REQUEST_STRIDE + pos, mask=restore, other=0
     ).to(tl.int64)
     restore = restore & (physical >= 0)
-    dst = safe.to(tl.int64) * STRIDE + tl.where(dense, pos, C + pos % 256)
+    dst = safe.to(tl.int64) * STRIDE + pos
     index = row.to(tl.int64) * STRIDE + offset
     tl.store(source + index, tl.where(restore, physical, 0), mask=offset < STRIDE)
     tl.store(destination + index, tl.where(restore, dst, 0), mask=offset < STRIDE)
@@ -77,7 +74,6 @@ def _current_metadata(
     valid,
     N: tl.constexpr,
     ROWS: tl.constexpr,
-    C: tl.constexpr,
     STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -91,7 +87,7 @@ def _current_metadata(
     end = tl.load(next_end + safe)
     first = tl.load(next_first + safe)
     copy = live & (begin >= 0) & (pos >= begin) & (pos < end)
-    dst = safe.to(tl.int64) * STRIDE + tl.where(begin == 0, pos, C + pos % 256)
+    dst = safe.to(tl.int64) * STRIDE + pos
     tl.store(destination + i, tl.where(copy, dst, 0), mask=i < N)
     tl.store(valid + i, copy, mask=i < N)
     # Historical copies have completed on this stream. One current token per
@@ -122,10 +118,8 @@ def stage_resident_kv(
     current_workspace,
     capacity,
     context_len,
-    query_width,
-    full_visible,
 ):
-    """Stage current KV and refill only absent short/ring history from host."""
+    """Stage current KV and refill only absent short history from host."""
     batch = requests.numel()
     stride = cache.shape[1]
     hs, hd, hv = history_workspace
@@ -149,8 +143,6 @@ def stage_resident_kv(
         first_positions.stride(0),
         capacity,
         stride,
-        query_width,
-        full_visible,
         128,
     )
     history_count = batch * stride
@@ -180,7 +172,6 @@ def stage_resident_kv(
         cv,
         count,
         old_begin.numel(),
-        capacity,
         stride,
         128,
     )

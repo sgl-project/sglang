@@ -89,7 +89,6 @@ class TestLIMState(CustomTestCase):
                 batch_capacity=8,
                 max_query_width=width,
                 sparse_context_len=2048,
-                separate_mtp_tail=False,
                 max_context_len=32768,
                 layer_num=2,
                 device="cpu",

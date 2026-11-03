@@ -17,7 +17,6 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
     load_copy_sfa_operator,
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     prepare_prefill_gather_rows,
 )
@@ -75,8 +74,6 @@ class SparseKVCacheManager:
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
         self.max_query_width = get_sparse_kv_max_query_width()
-        self.separate_mtp_tail = envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
-        self.tail_tokens = 256 if self.separate_mtp_tail else 0
         self.req_to_token_pool = req_to_token_pool
         self.max_context_len = (self.logical_max_context_len + 127) // 128 * 128
         self.sparse_context_len = int(sparse_context_len)
@@ -120,7 +117,6 @@ class SparseKVCacheManager:
             graph_batch_capacity=self.batch_capacity,
         )
         self.device_cache_size = self.budget.cache_tokens
-        self.device_kv_stride = self.device_cache_size + self.tail_tokens
         self.budget = replace(
             self.budget,
             host_kv_bytes=(
@@ -169,7 +165,7 @@ class SparseKVCacheManager:
                     torch.empty(
                         (
                             self.size,
-                            self.device_kv_stride,
+                            self.device_cache_size,
                             self.head_num,
                             self.head_dim,
                         ),
@@ -188,7 +184,7 @@ class SparseKVCacheManager:
             torch.empty(self.size, dtype=torch.int32, device=self.device)
             for _ in range(3)
         )
-        history_count = self.batch_capacity * self.device_kv_stride
+        history_count = self.batch_capacity * self.device_cache_size
         hs = torch.empty(history_count, dtype=torch.int64, device=self.device)
         self.history_workspace = (
             hs,
@@ -216,7 +212,7 @@ class SparseKVCacheManager:
             self.planner_actual_seq_lengths_kv
         )
         self.planner_hbm_block_table = torch.empty(
-            (self.batch_capacity, self.device_kv_stride // 128),
+            (self.batch_capacity, self.device_cache_size // 128),
             dtype=torch.int32,
             device=self.device,
         )
@@ -379,9 +375,8 @@ class SparseKVCacheManager:
             output,
             scale_value,
             operator=self._copy_sfa_operator,
-            full_visible=self.lim_adapter.full_visible,
-            resident_refresh_tail=self.lim_adapter.full_visible
-            and plan.query_width > 1,
+            full_visible=True,
+            resident_refresh_tail=plan.query_width > 1,
         )
         valid = (
             plan.valid_rows[:, None].expand(batch, plan.query_width).reshape(rows, 1)
@@ -631,8 +626,6 @@ class SparseKVCacheManager:
                 current_workspace=current_workspace,
                 capacity=self.cache_capacity,
                 context_len=self.logical_max_context_len,
-                query_width=width,
-                full_visible=not self.separate_mtp_tail,
             )
 
     def get_forward_kv(

@@ -1,5 +1,9 @@
 # Target-only offload and a separate MTP tail
 
+> Historical record: the separate HBM-tail experiment and its environment
+> variable have been removed. The measurements below describe an older
+> implementation and cannot be reproduced with the current framework.
+
 ## Draft KV policy
 
 The process-wide Ascend sparse-offload environment flag applies to the target
@@ -16,7 +20,7 @@ CopySFA tasks.
 
 ## Optional prefix-plus-tail selection
 
-`SGLANG_NPU_MTP_SEPARATE_KV_TAIL=1` enables a separate target HBM tail for the
+`SGLANG_NPU_MTP_SEPARATE_KV_TAIL=1` previously enabled a separate target HBM tail for the
 linear NEXTN3/1/4 path. This is an explicit selection contract, not a silent
 replacement for the existing exact2048 full-visible selection.
 
