@@ -636,8 +636,9 @@ class AttentionBackend(ABC):
         v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
         pool = self.token_to_kv_pool
         if save_kv_cache:
-            to_cache = metadata.route("attention", "kv")
-            local_kv = to_cache(torch.stack((k, v), dim=1))
+            local_kv = torch.stack((k, v), dim=1)
+            if metadata.layout_names["attention"] != metadata.layout_names["kv"]:
+                local_kv = metadata.route("attention", "kv")(local_kv)
             write_slots = metadata.kv_write_slots
             if write_slots.numel():
                 pool.set_kv_buffer(
