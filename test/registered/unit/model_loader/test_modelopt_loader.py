@@ -515,9 +515,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             is_draft_quantization_explicit=is_explicit,
         )
         spec = SimpleNamespace(speculative_draft_model_quantization=draft_quantization)
-        with patch(
-            "sglang.srt.model_loader.weight_utils.get_spec", return_value=spec
-        ):
+        with patch("sglang.srt.model_loader.weight_utils.get_spec", return_value=spec):
             return get_quant_config(model_config, LoadConfig(), {})
 
     def test_explicit_modelopt_fp4_draft_converts_block_fp8_experts(self):
