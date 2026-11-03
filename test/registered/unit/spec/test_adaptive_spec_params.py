@@ -402,13 +402,18 @@ class TestCandidateRestriction(CustomTestCase):
         # Slots: bs=1 -> [1,3,5,7], bs=8 -> [0,1,3], bs=32 -> [0,1], bs=64 -> [0].
         return AdaptiveSpeculativeParams(initial_steps=3)
 
-    def test_required_steps_are_the_slot_start_steps(self):
+    def test_start_steps_are_the_slot_start_steps(self):
         # initial_steps=3 is not a candidate of the bs=32 and bs=64 slots, so
         # they start on their middle candidate; a batch of that size activates
         # it before any feedback.
-        self.assertEqual(self._params().required_steps, [0, 1, 3])
+        params = self._params()
+        self.assertEqual(params.start_steps, [0, 1, 3])
+        # Feedback moves a slot's current step; the start steps are a snapshot.
+        for _ in range(40):
+            params.on_verify_complete([7, 7, 7], batch_size=1)
+        self.assertEqual(params.start_steps, [0, 1, 3])
 
-    def test_prebuild_order_puts_required_first_then_nearest_hops(self):
+    def test_prebuild_order_puts_start_steps_first_then_nearest_hops(self):
         self.assertEqual(self._params().prebuild_order(), [0, 1, 3, 5, 7])
 
     def test_restricted_policy_never_selects_a_dropped_step(self):

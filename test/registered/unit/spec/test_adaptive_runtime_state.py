@@ -55,18 +55,18 @@ class _FakePolicy:
         start_steps: list[int] | None = None,
     ):
         self.candidate_steps = candidate_steps or [1, 3]
-        self.start_steps = start_steps or []
+        self._start_steps = start_steps or []
         self.cuda_graph_bs = None
         self.feedback_step = None
         self.restricted_to = None
 
     @property
-    def required_steps(self) -> list[int]:
-        return sorted(set(self.start_steps))
+    def start_steps(self) -> list[int]:
+        return sorted(set(self._start_steps))
 
     def prebuild_order(self) -> list[int]:
-        required = self.required_steps
-        return required + [s for s in self.candidate_steps if s not in required]
+        start = self.start_steps
+        return start + [s for s in self.candidate_steps if s not in start]
 
     def restrict_candidates(self, allowed: set[int]) -> list[int]:
         self.restricted_to = set(allowed)
