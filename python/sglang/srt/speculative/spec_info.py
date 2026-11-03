@@ -482,7 +482,7 @@ def create_dummy_verify_input(
     being captured; adaptive spec captures each candidate with that config's
     leaves overridden.
     """
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 
     spec = get_spec_config()
 

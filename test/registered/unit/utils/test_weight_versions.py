@@ -4,7 +4,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
 from sglang.srt.managers.scheduler_components.deferred_responses import (
