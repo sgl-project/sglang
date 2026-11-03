@@ -1340,8 +1340,10 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            # The radix-4 route+sort launch zeroes the published latent for
+            # fused_moe, so route inside the block too.
             with zero_copy_context.set_moe_output(latent):
+                topk_output = self.topk(hidden_states, router_logits)
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()

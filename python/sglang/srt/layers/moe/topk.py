@@ -2055,6 +2055,7 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
@@ -2213,6 +2214,17 @@ def biased_grouped_topk_gpu(
             if moe_route_radix4.available() and moe_route_radix4.covered(
                 route_logits, route_bias, topk, num_expert_group, topk_group
             ):
+                from sglang.srt.layers.moe import aiter_presort
+
+                if aiter_presort.enabled(route_logits):
+                    return aiter_presort.route_and_register(
+                        route_logits,
+                        route_bias,
+                        topk,
+                        renormalize,
+                        scaling,
+                        num_token_non_padded,
+                    )
                 return moe_route_radix4.route_radix4(
                     route_logits, route_bias, topk, renormalize, scaling
                 )
@@ -2448,6 +2460,7 @@ def biased_grouped_topk_cpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
@@ -3058,6 +3071,7 @@ def select_experts(
                 num_fused_shared_experts=num_shared_topk_slots_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                num_token_non_padded=num_token_non_padded,
             )
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
