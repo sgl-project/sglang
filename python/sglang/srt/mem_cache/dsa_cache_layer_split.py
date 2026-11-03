@@ -36,17 +36,17 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
-    GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
-    RadixAttention,
     get_tensor_size_bytes,
-    maybe_detect_oob,
     unwrap_write_loc,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter

@@ -117,7 +117,7 @@ class _ModalityTable(dict):
     this module keeps its light import footprint."""
 
     def __missing__(self, name):
-        from sglang.srt.managers.schedule_batch import Modality
+        from sglang.srt.multimodal.modality import Modality
 
         self.update(
             {"image": Modality.IMAGE, "video": Modality.VIDEO, "audio": Modality.AUDIO}
@@ -351,9 +351,7 @@ class RustMmProcessor:
         import msgspec
         import torch
 
-        from sglang.srt.managers.schedule_batch import (
-            MultimodalProcessorOutput,
-        )
+        from sglang.srt.managers.req_types import MultimodalProcessorOutput
 
         # Ownership of the segments is not decided here: the drain loop
         # releases or discards every `ShmBuffer` once it knows whether the
@@ -396,7 +394,7 @@ class RustMmProcessor:
         import torch
 
         from sglang.srt.managers.mm_utils import ShmPointerMMData
-        from sglang.srt.managers.schedule_batch import MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
 
         feature = buffers[f"mm.feature.{index}"]
         if isinstance(feature, np.ndarray):

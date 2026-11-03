@@ -8,17 +8,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    kill_process_tree,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=80, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=80, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
