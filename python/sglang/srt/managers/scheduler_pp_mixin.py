@@ -24,10 +24,8 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
@@ -1301,9 +1299,9 @@ class SchedulerPPMixin:
         first decode after prefill) carries a degenerate row -- bonus token
         plus zero drafts over a chain topology -- whose drafts simply get
         rejected, costing acceptance rate, not correctness."""
+        from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
         from sglang.srt.speculative.eagle_utils import (
-            TreeMaskMode,
             build_tree_kernel_efficient,
             default_tree_mask_mode,
         )
