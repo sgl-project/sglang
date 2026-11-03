@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 
 
 def _is_cpu_feature(value: object) -> bool:
