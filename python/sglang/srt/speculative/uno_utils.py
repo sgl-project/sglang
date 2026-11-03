@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from flashinfer import top_k as _flashinfer_top_k
 
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
@@ -14,6 +13,11 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
 )
 from sglang.srt.speculative.spec_utils import fast_sample
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from flashinfer import top_k as _flashinfer_top_k
 
 _SPARSE_TOP_K_LIMIT = 128
 
@@ -136,12 +140,17 @@ def _build_sparse_target_support_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build compact support using the fastest available top-k primitive."""
     rows = batch_size * forward_width
-    topk_logits, topk_ids = _flashinfer_top_k(
-        next_token_logits.contiguous(),
-        max_top_k,
-        sorted=True,
-        deterministic=False,
-    )
+    if _is_cuda:
+        topk_logits, topk_ids = _flashinfer_top_k(
+            next_token_logits.contiguous(),
+            max_top_k,
+            sorted=True,
+            deterministic=False,
+        )
+    else:
+        topk_logits, topk_ids = torch.topk(
+            next_token_logits, max_top_k, dim=-1, sorted=True
+        )
 
     expanded_temperatures = torch.repeat_interleave(
         temperatures,
