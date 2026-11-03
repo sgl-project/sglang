@@ -356,7 +356,7 @@ class DSANPUIndexerMixin:
             ):
                 if use_quant_indexer:
                     raise ValueError(
-                        "LIM/reference decode does not support quantized index keys."
+                        "LIM decode does not support quantized index keys."
                     )
                 plan = manager.lim_adapter.select(
                     manager,
@@ -366,7 +366,6 @@ class DSANPUIndexerMixin:
                     block_table=block_table,
                     forward_batch=forward_batch,
                     layer_id=layer_id,
-                    reference_indexer=torch_npu.npu_lightning_indexer,
                 )
                 backend.forward_metadata.sparse_kv_lim_plan = plan
                 return plan.source_ids

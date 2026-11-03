@@ -62,7 +62,7 @@ def is_sparsity_driven_kv_offload_enabled(
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
         if indexer_impl != "legacy":
             raise ValueError(
-                "LIM/reference indexer requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1."
+                "LIM indexer requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1."
             )
         return False
 
@@ -87,14 +87,12 @@ def is_sparsity_driven_kv_offload_enabled(
         )
     if indexer_impl != "legacy":
         if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
-            raise ValueError(
-                "LIM/reference integration requires model index_topk=2048."
-            )
+            raise ValueError("LIM integration requires model index_topk=2048.")
         if get_schedule().page_size != 128:
-            raise ValueError("LIM/reference integration requires --page-size 128.")
+            raise ValueError("LIM integration requires --page-size 128.")
         if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
             raise ValueError(
-                "LIM/reference integration currently requires PP=1 and DCP disabled."
+                "LIM integration currently requires PP=1 and DCP disabled."
             )
     algorithm = (get_spec().speculative_algorithm or "NONE").upper()
     if algorithm != "NONE" and (
@@ -112,10 +110,9 @@ def is_sparsity_driven_kv_offload_enabled(
 
 def get_sparse_kv_indexer_impl() -> str:
     value = envs.SGLANG_NPU_SPARSE_KV_INDEXER.get()
-    if value not in ("legacy", "li_reference", "lim"):
+    if value not in ("legacy", "lim"):
         raise ValueError(
-            "SGLANG_NPU_SPARSE_KV_INDEXER must be legacy, li_reference or lim; "
-            f"got {value!r}."
+            f"SGLANG_NPU_SPARSE_KV_INDEXER must be legacy or lim; got {value!r}."
         )
     return value
 

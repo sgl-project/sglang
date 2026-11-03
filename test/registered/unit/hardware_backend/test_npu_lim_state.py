@@ -304,13 +304,13 @@ class TestLIMState(CustomTestCase):
             device="cpu",
             start_layer=0,
             paged_kv_cache=SimpleNamespace(get_index_k_buffer=lambda _: key),
+            device_slot_map=torch.empty((2, rows + 1, context), dtype=torch.int32),
         )
         with patch(
             "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim.load_fused_lim_operator",
             return_value=None,
         ):
             adapter = LIMDecodeAdapter(manager)
-        adapter.is_native = False
         self.assertIsNone(adapter.combined_kv)
         self.assertIsNone(adapter.combined_ids)
         self.assertEqual(adapter.last_prefix.shape, (2, rows + 1))
@@ -323,19 +323,24 @@ class TestLIMState(CustomTestCase):
             seq_lens_cpu=lengths,
         )
 
-        def reference_indexer(**_kwargs):
-            return torch.arange(top_k, dtype=torch.int32).expand(batch, 1, -1)
+        def native_indexer(*, source_ids, **_kwargs):
+            source_ids.copy_(
+                torch.arange(top_k, dtype=torch.int32).expand(batch, 1, -1)
+            )
 
-        plan = adapter.select(
-            manager,
-            query=torch.empty((batch, 32, 128), dtype=torch.bfloat16),
-            weights=torch.empty((batch, 32), dtype=torch.bfloat16),
-            key=key,
-            block_table=torch.zeros((batch, 32), dtype=torch.int32),
-            forward_batch=forward_batch,
-            layer_id=0,
-            reference_indexer=reference_indexer,
-        )
+        with patch(
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim.fused_lightning_indexer_manage",
+            side_effect=native_indexer,
+        ):
+            plan = adapter.select(
+                manager,
+                query=torch.empty((batch, 32, 128), dtype=torch.bfloat16),
+                weights=torch.empty((batch, 32), dtype=torch.bfloat16),
+                key=key,
+                block_table=torch.zeros((batch, 32), dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
         self.assertEqual(plan.request_slots.tolist(), [1, 2] + [rows] * (batch - 2))
         self.assertTrue(torch.all(plan.source_ids[2:] == -1))
         budget = resolve_sparse_kv_budget(

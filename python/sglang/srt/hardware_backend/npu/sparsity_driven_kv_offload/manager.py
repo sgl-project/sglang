@@ -665,7 +665,7 @@ class SparseKVCacheManager:
         """Plan cache residency and run the fused scatter/copy/SFA operator."""
         batch_size = forward_batch.batch_size
         if lim_plan is not None:
-            if self.lim_adapter is None or not self.lim_adapter.is_native:
+            if self.lim_adapter is None:
                 raise RuntimeError(
                     "Copy-SFA received a native plan without native LIM."
                 )

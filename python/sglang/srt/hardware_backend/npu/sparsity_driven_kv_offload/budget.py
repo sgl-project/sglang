@@ -73,7 +73,7 @@ def resolve_sparse_kv_budget(
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer, got {value!r}.")
 
-    if indexer_impl not in ("legacy", "li_reference", "lim"):
+    if indexer_impl not in ("legacy", "lim"):
         raise ValueError(f"Unknown sparse indexer implementation: {indexer_impl}.")
     if copy_sfa:
         if top_k != 2048 or (
@@ -93,7 +93,6 @@ def resolve_sparse_kv_budget(
         raise ValueError("Experimental MTP requires native LIM and Copy-SFA.")
     if mtp_full_visible and cache_tokens < 4 * top_k:
         raise ValueError("Experimental Q4 MTP requires capacity >= 4 * TopK.")
-    experimental = indexer_impl != "legacy"
     native = indexer_impl == "lim"
     batch_rows = sparse_batch_capacity(request_rows, graph_batch_capacity)
     map_width = (
@@ -103,11 +102,9 @@ def resolve_sparse_kv_budget(
     selected_kv_bytes = batch_rows * top_k * kv_bytes_per_token
     slot_ids_bytes = top_k * 8
     adapter_bytes = 0
-    if experimental:
+    if native:
         if top_k != 2048 or context_len > 2**21:
-            raise ValueError(
-                "LIM/reference requires TopK=2048 and context length <= 2**21."
-            )
+            raise ValueError("LIM requires TopK=2048 and context length <= 2**21.")
         adapter_bytes = (
             batch_rows
             * (
@@ -158,12 +155,12 @@ def resolve_sparse_kv_budget(
         )
     elif cache_tokens == 0:
         cache_tokens = top_k
-    if experimental:
+    if native:
         if auto_capacity:
             cache_tokens = min(32640, cache_tokens // 128 * 128)
         if cache_tokens > 32640 or cache_tokens % 128:
             raise ValueError(
-                "LIM/reference cache capacity must be a multiple of 128 and <= 32640."
+                "LIM cache capacity must be a multiple of 128 and <= 32640."
             )
     if cache_tokens < top_k:
         raise ValueError(

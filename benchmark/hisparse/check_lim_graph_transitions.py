@@ -72,7 +72,7 @@ def run(args):
     )
     outcomes = {}
     with allocator:
-        for mode in ("li_reference", "lim"):
+        for mode in ("lim",):
             case = FrameworkCase(mode, f, config)
             case.step(0)
             case.step(1)

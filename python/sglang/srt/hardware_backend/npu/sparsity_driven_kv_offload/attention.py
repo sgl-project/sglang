@@ -315,7 +315,6 @@ def forward_sparsity_driven_kv_offload(
             lim_plan=(
                 backend.forward_metadata.sparse_kv_lim_plan
                 if sparse_kv_manager.lim_adapter is not None
-                and sparse_kv_manager.lim_adapter.is_native
                 else None
             ),
         )
@@ -383,7 +382,7 @@ def forward_sparsity_driven_kv_offload(
                 selected_kv_buffer,
                 copy=unidex_copy_inplace,
             )
-        elif adapter is not None and adapter.is_native:
+        elif adapter is not None:
             plan = backend.forward_metadata.sparse_kv_lim_plan
             if plan is None:
                 raise RuntimeError(

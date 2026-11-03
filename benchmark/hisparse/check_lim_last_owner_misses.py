@@ -41,7 +41,7 @@ def processor_string():
 
             manager = get_sparse_kv_manager()
             adapter = manager.lim_adapter if manager is not None else None
-            if adapter is None or not adapter.is_native:
+            if adapter is None:
                 raise RuntimeError("Native LIM manager is required")
             prefix = adapter.last_prefix.cpu().tolist()
             owners = [

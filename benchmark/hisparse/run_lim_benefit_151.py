@@ -135,7 +135,7 @@ def run(args):
                 "bash",
                 str(args.task_root / "run_lim_151.sh"),
                 "--modes",
-                "li_reference,lim",
+                "lim,legacy",
                 "--batch",
                 str(batch),
                 "--context",
@@ -190,9 +190,6 @@ def run(args):
                     {
                         "case": name,
                         "us": data["median_us_per_decode"],
-                        "change_percent": data[
-                            "lim_vs_reference_latency_change_percent"
-                        ],
                         "misses": data["actual_steady_topk_misses"],
                     }
                 ),

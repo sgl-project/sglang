@@ -1,8 +1,8 @@
 """Measure the real sparse-KV manager/attention path with BF16 native LI/LIM.
 
 This is a fixed-input framework subpath benchmark, without model projections,
-weights, scheduler or sampling. New-token D2H is optional. The native and LI reference modes
-share prefix-TopK + visible-tail semantics. Legacy uses full-sequence TopK.
+weights, scheduler or sampling. New-token D2H is optional. LIM and legacy use
+prefix-TopK + visible-tail and full-sequence TopK selection semantics.
 Run on a dedicated Ascend A2/A3 device with the operator library installed.
 """
 
@@ -202,7 +202,6 @@ class FrameworkCase:
                 block_table=f.table,
                 forward_batch=self.batch,
                 layer_id=0,
-                reference_indexer=torch_npu.npu_lightning_indexer,
             )
             self.backend.forward_metadata.sparse_kv_lim_plan = plan
             self.latest_ids = plan.source_ids
@@ -486,20 +485,6 @@ def run(args):
         correctness[mode]["indexer_entry_and_new_token_d2h"] = (
             "pass (fixed projection boundary)"
         )
-    if "lim" in cases and "li_reference" in cases:
-        for route in (0, 1):
-            cases["li_reference"].step(route)
-            cases["lim"].step(route)
-            torch.npu.synchronize()
-            torch.testing.assert_close(
-                cases["lim"].outputs[route],
-                cases["li_reference"].outputs[route],
-                rtol=0.01,
-                atol=0.002,
-            )
-        correctness["lim_vs_li_reference"] = (
-            "attention output passes rtol=0.01, atol=0.002"
-        )
     graphs = {}
     for mode, case in cases.items():
         for _ in range(args.warmup):
@@ -598,10 +583,6 @@ def run(args):
             "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         },
     }
-    if "lim" in medians and "li_reference" in medians:
-        result["lim_vs_reference_latency_change_percent"] = (
-            medians["lim"] / medians["li_reference"] - 1
-        ) * 100
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
@@ -630,7 +611,7 @@ if __name__ == "__main__":
         default=1,
         help="IndexShare layers consuming one anchor plan",
     )
-    p.add_argument("--modes", default="li_reference,lim,legacy")
+    p.add_argument("--modes", default="lim,legacy")
     p.add_argument(
         "--include-new-token-d2h",
         action="store_true",

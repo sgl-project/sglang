@@ -11,8 +11,11 @@ resident capacity and does not increase TopK.
 
 The default remains legacy. Experimental modes are explicit:
   SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1
-  SGLANG_NPU_SPARSE_KV_INDEXER=li_reference|lim
+  SGLANG_NPU_SPARSE_KV_INDEXER=legacy|lim
   SGLANG_NPU_SPARSE_KV_CACHE_SIZE=4096
+
+The optional LI reference implementation has been removed. Historical LI reference
+measurements below are retained as archived results only.
 
 Alternatively set CACHE_SIZE=0 and SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB to derive C.
 This per-rank manager budget covers persistent resident KV, slot maps, policy

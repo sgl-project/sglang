@@ -1060,8 +1060,7 @@ class Envs:
     SGLANG_NPU_SPARSE_KV_CACHE_SIZE = EnvInt(0)
     # Per-rank persistent manager allocations, in MiB; 0 leaves the cap unset.
     SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB = EnvInt(0)
-    # Experimental Q1 indexer/cache implementations. li_reference and lim use
-    # the same page-aligned prefix + visible tail attention policy.
+    # Sparse KV offload indexer/cache implementation: legacy or native LIM.
     SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
     SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA = EnvBool(False)
     SGLANG_NPU_FUSED_LIM_PRE_METADATA = EnvBool(False)

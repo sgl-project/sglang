@@ -54,28 +54,23 @@ def prepare_lim_rows(
 
 class LIMDecodeAdapter:
     def __init__(self, manager):
-        self.impl = manager.indexer_impl
-        self.is_native = self.impl == "lim"
         self.capacity = manager.device_cache_size
         self.rows = manager.size
         self.batch_capacity = manager.batch_capacity
         self.top_k = manager.sparse_context_len
         self.full_visible = manager.copy_sfa_enabled
         self.fused_copy_metadata = (
-            self.is_native
-            and self.full_visible
-            and envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get()
+            self.full_visible and envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get()
         )
         self.fused_pre_metadata = (
-            self.is_native
-            and self.full_visible
+            self.full_visible
             and self.top_k == 2048
             and envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get()
         )
         self.source_capacity = (manager.max_context_len + 127) // 128 * 128
         self.width = self.top_k if self.full_visible else self.top_k + 128
         device = manager.device
-        self.operator = load_fused_lim_operator() if self.is_native else None
+        self.operator = load_fused_lim_operator()
         self.source_ids = torch.empty(
             (self.batch_capacity, 1, self.top_k), dtype=torch.int32, device=device
         )
@@ -166,15 +161,11 @@ class LIMDecodeAdapter:
         key = manager.paged_kv_cache.get_index_k_buffer(manager.start_layer)
         if key.dtype != torch.bfloat16 or manager.store_dtype != torch.bfloat16:
             raise ValueError(
-                "LIM/reference framework integration requires BF16 indexer and KV caches."
+                "LIM framework integration requires BF16 indexer and KV caches."
             )
         if key.ndim != 4 or key.shape[1:] != (128, 1, 128):
-            raise ValueError("LIM/reference requires PA index keys [pages,128,1,128].")
-        self.key_scale = (
-            torch.empty(key.shape[:3], dtype=torch.float32, device=device)
-            if self.is_native
-            else None
-        )
+            raise ValueError("LIM requires PA index keys [pages,128,1,128].")
+        self.key_scale = torch.empty(key.shape[:3], dtype=torch.float32, device=device)
 
     def reset_requests(self, request_slots):
         self.last_prefix[:, request_slots] = -1
@@ -189,7 +180,6 @@ class LIMDecodeAdapter:
         block_table,
         forward_batch,
         layer_id,
-        reference_indexer=None,
     ):
         batch = query.shape[0]
         use_fused_pre_metadata = self.fused_pre_metadata and query.shape[1] == 1
@@ -264,54 +254,36 @@ class LIMDecodeAdapter:
             table.zero_()
             table[:, : block_table.shape[1]].copy_(block_table)
         sources = self.source_ids[:batch]
-        if self.is_native:
-            # [:, :heads] would be strided for H32; view a contiguous prefix.
-            scale = self.query_scale.view(-1)[: batch * query.shape[1]].view(
-                batch, query.shape[1]
-            )
-            fused_lightning_indexer_manage(
-                weights=weights.contiguous(),
-                query_scale=scale,
-                query=query.contiguous(),
-                key_scale=self.key_scale,
-                key=key,
-                block_table=table,
-                query_ends=self.query_ends[:batch],
-                seq_lens=lengths,
-                prefix_lens=prefix,
-                cache_sizes=(
-                    self._pre_cache_sizes[:batch]
-                    if use_fused_pre_metadata
-                    else torch.where(sparse, self.capacity, 0).to(torch.int32)
-                ),
-                request_state=state,
-                request_slots=slots,
-                slot_pool=manager.device_slot_map[layer_index],
-                source_ids=sources,
-                device_slots=self.device_slots[:batch],
-                topk_misses=self.topk_misses[:batch],
-                miss_sources=self.miss_sources[:batch],
-                miss_slots=self.miss_slots[:batch],
-                miss_counts=self.miss_counts[:batch],
-                operator=self.operator,
-            )
-        else:
-            result = reference_indexer(
-                query=query.contiguous(),
-                key=key,
-                weights=weights.contiguous(),
-                actual_seq_lengths_query=self.query_ends[:batch],
-                actual_seq_lengths_key=torch.where(
-                    sparse, prefix, lengths.clamp(min=1)
-                ),
-                block_table=table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.top_k,
-                sparse_mode=3,
-            )
-            indices = result[0] if isinstance(result, (tuple, list)) else result
-            sources.copy_(indices.view(batch, 1, self.top_k))
+        # [:, :heads] would be strided for H32; view a contiguous prefix.
+        scale = self.query_scale.view(-1)[: batch * query.shape[1]].view(
+            batch, query.shape[1]
+        )
+        fused_lightning_indexer_manage(
+            weights=weights.contiguous(),
+            query_scale=scale,
+            query=query.contiguous(),
+            key_scale=self.key_scale,
+            key=key,
+            block_table=table,
+            query_ends=self.query_ends[:batch],
+            seq_lens=lengths,
+            prefix_lens=prefix,
+            cache_sizes=(
+                self._pre_cache_sizes[:batch]
+                if use_fused_pre_metadata
+                else torch.where(sparse, self.capacity, 0).to(torch.int32)
+            ),
+            request_state=state,
+            request_slots=slots,
+            slot_pool=manager.device_slot_map[layer_index],
+            source_ids=sources,
+            device_slots=self.device_slots[:batch],
+            topk_misses=self.topk_misses[:batch],
+            miss_sources=self.miss_sources[:batch],
+            miss_slots=self.miss_slots[:batch],
+            miss_counts=self.miss_counts[:batch],
+            operator=self.operator,
+        )
         # The native invalid-query fast path can leave reused output rows
         # untouched during graph replay. Never publish a previous request's IDs.
         sources.masked_fill_(~valid[:, None, None], -1)
@@ -341,7 +313,7 @@ class LIMDecodeAdapter:
 
         batch = forward_batch.batch_size
         rows = batch * 4
-        if not self.mtp_full_visible or not self.is_native or query.shape[0] < rows:
+        if not self.mtp_full_visible or query.shape[0] < rows:
             raise ValueError("Experimental native MTP requires Q4 native LIM.")
         if forward_batch.out_cache_loc is None:
             raise ValueError("Native MTP verify requires per-token KV locations.")
