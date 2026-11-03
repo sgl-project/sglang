@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 import requests
-
 from test_per_request_spec_opt_out_e2e import PROMPTS, response_token_ids
 
 # Prefixes from the saved 2026-11-02 run, before the FIRST divergent token.
@@ -90,6 +89,7 @@ PREFIX_OUTPUTS = {
 def install_probes():
     import numpy as np
     import torch
+
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative import eagle_utils
 

@@ -380,3 +380,7 @@ class TestPerRequestSpecOptOut(CustomTestCase):
         self.assertEqual(lengths.tolist(), [4, 1, 4])
         self.assertEqual((indices >= 0).sum(1).tolist(), [4, 1, 4])
         self.assertEqual(predict[indices[:, 0]].tolist(), [3, 3, 3])
+
+
+if __name__ == "__main__":
+    unittest.main()

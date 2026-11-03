@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 import requests
-
 from test_per_request_spec_opt_out_e2e import install_probes as base_probes
 from test_per_request_spec_opt_out_e2e import response_token_ids
 
@@ -28,6 +27,7 @@ def check_stream(previous, current):
 
 def install_probes():
     import torch
+
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative import eagle_worker_v2
 
@@ -78,27 +78,27 @@ def install_probes():
             values = [(k[locs].clone(), v[locs].clone()) for k, v in buffers]
             if req.rid in retained:
                 prev_locs, prev_values = retained[req.rid]
-                assert torch.equal(
-                    locs[: len(prev_locs)], prev_locs
-                ), "committed draft mapping changed"
+                assert torch.equal(locs[: len(prev_locs)], prev_locs), (
+                    "committed draft mapping changed"
+                )
                 for (k, v), (pk, pv) in zip(values, prev_values):
-                    assert torch.equal(
-                        k[: len(prev_locs)], pk
-                    ), "committed draft K changed"
-                    assert torch.equal(
-                        v[: len(prev_locs)], pv
-                    ), "committed draft V changed"
+                    assert torch.equal(k[: len(prev_locs)], pk), (
+                        "committed draft K changed"
+                    )
+                    assert torch.equal(v[: len(prev_locs)], pv), (
+                        "committed draft V changed"
+                    )
             snapshots.append((req.rid, row, old, new, locs, values, buffers))
         out = original(self, batch, result, **kw)
         torch.cuda.synchronize()
         tokens = result.next_token_ids.reshape(len(rows), -1)
         bonus = result.next_draft_input.bonus_tokens.tolist()
-        assert bonus == [
-            int(tokens[i, n - 1]) for i, n in enumerate(lengths)
-        ], "draft bonus token lost retained target token"
-        assert torch.equal(
-            batch.input_ids.reshape_as(tokens), tokens
-        ), "draft extend input differs from retained predictions"
+        assert bonus == [int(tokens[i, n - 1]) for i, n in enumerate(lengths)], (
+            "draft bonus token lost retained target token"
+        )
+        assert torch.equal(batch.input_ids.reshape_as(tokens), tokens), (
+            "draft extend input differs from retained predictions"
+        )
         for i, (rid, row, old, new, locs, values, buffers) in enumerate(snapshots):
             now_locs = table[row, :new].long().clone()
             assert len(now_locs.unique()) == new, "aliased committed draft slots"
@@ -341,9 +341,9 @@ def run():
                 "stream-normal",
                 body("stream-normal", prompts[0], n=80, ignore_eos=True),
             )
-            assert (
-                response_token_ids(s, 80) == baseline
-            ), "stream output differs from isolated"
+            assert response_token_ids(s, 80) == baseline, (
+                "stream output differs from isolated"
+            )
             assert s["meta_info"]["finish_reason"]["type"] == "length"
             flush()
             eos = stream("eos", body("eos", prompts[2], n=96))
@@ -370,15 +370,15 @@ def run():
             flush()
             for case in ("post-release-0", "post-release-1"):
                 r = post(case, body(case, prompts[0], n=80, ignore_eos=True))
-                assert (
-                    response_token_ids(r, 80) == baseline
-                ), "slot reuse changed output"
+                assert response_token_ids(r, 80) == baseline, (
+                    "slot reuse changed output"
+                )
                 flush()
             rows = [json.loads(x) for x in trace.read_text().splitlines()]
             ver = [x for x in rows if x["kind"] == "verify"]
-            assert any(
-                any(x["flags"]) and not all(x["flags"]) for x in ver
-            ), "no mixed verify"
+            assert any(any(x["flags"]) and not all(x["flags"]) for x in ver), (
+                "no mixed verify"
+            )
             assert any(
                 any(n > 1 for f, n in zip(x["flags"], x["lengths"]) if not f)
                 for x in ver
