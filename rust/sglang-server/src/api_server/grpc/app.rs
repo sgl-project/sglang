@@ -3,12 +3,13 @@
 //! The pre-bound socket, shared API runtime, and shutdown shape build on Rain
 //! Jiang's multi-protocol prototype in `sgl-project/sglang#36923`. The listener
 //! mounts the `api.v1` adapter on the transport-neutral
-//! [`crate::api_server::core::CoreHandle`] contract.
+//! [`crate::api_server::handlers::CoreHandle`] contract.
 
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
 use super::service::GrpcService;
+use crate::api_server::handlers::CoreHandle;
 
 /// Tonic's 4 MiB default is too small for large token or multimodal request
 /// bodies; keep the limit the Python-backed gRPC server established.
@@ -37,16 +38,21 @@ fn max_message_size() -> usize {
     }
 }
 
-/// Serve the already-constructed adapter on a pre-bound listener until the
-/// runtime-wide shutdown signal fires.
+/// Serve the already-constructed adapter on a pre-bound listener until a
+/// graceful drain of `core` ends or the runtime-wide shutdown signal fires.
 ///
-/// Selecting away from `serve_with_incoming` stops accepting without waiting
-/// indefinitely for unfinished streams. Once both transport futures return,
-/// the owner drops their shared API runtime, which cancels Tonic's active
-/// connection tasks within the frontend's bounded thread-join deadline.
+/// Once a drain ends with no request left in flight, Tonic's graceful
+/// shutdown stops accepting and lets the open connections finish, for up to
+/// [`GRACEFUL_CLOSE_TIMEOUT`](crate::api_server::handlers::GRACEFUL_CLOSE_TIMEOUT).
+/// Selecting away from the serve future (shutdown, a forced drain, or that
+/// deadline) stops accepting without waiting indefinitely for unfinished
+/// streams. Once both transport futures return, the owner drops their shared
+/// API runtime, which cancels Tonic's active connection tasks within the
+/// frontend's bounded thread-join deadline.
 pub(crate) async fn serve(
     listener: std::net::TcpListener,
     service: GrpcService,
+    core: CoreHandle,
     shutdown: flume::Receiver<()>,
 ) {
     let addr = listener.local_addr().ok();
@@ -64,7 +70,12 @@ pub(crate) async fn serve(
         .max_encoding_message_size(max_message_size);
     let serve = tonic::transport::Server::builder()
         .add_service(service)
-        .serve_with_incoming(incoming);
+        .serve_with_incoming_shutdown(incoming, {
+            let core = core.clone();
+            async move {
+                core.drain_ended().await;
+            }
+        });
 
     if let Some(addr) = addr {
         tracing::info!(%addr, "gRPC server listening");
@@ -75,6 +86,8 @@ pub(crate) async fn serve(
                 tracing::error!(%error, "gRPC serve exited");
             }
         }
+        // The HTTP listener logs why.
+        () = core.drain_close_deadline() => {}
         _ = shutdown.recv_async() => {
             tracing::info!("shutdown: stopping gRPC accepts; API runtime teardown cancels in-flight RPCs");
         }

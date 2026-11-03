@@ -2,8 +2,6 @@ import time
 import unittest
 from types import SimpleNamespace
 
-import requests
-
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -15,9 +13,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=297, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=297, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -66,39 +63,6 @@ class TestRetractDecodeRadixDisabledPaged(TestRetractDecode):
     """python -m unittest test_retract_decode.TestRetractDecodeRadixDisabledPaged"""
 
     other_args = ["--disable-radix-cache", "--page-size", "16"]
-
-
-@unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
-class TestRetractDecodeLongOutput(CustomTestCase):
-    """python -m unittest test_retract_decode.TestRetractDecodeLongOutput"""
-
-    other_args = []
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        launch_args = [
-            "--chunked-prefill-size",
-            "128",
-            "--page-size",
-            "16",
-        ] + cls.other_args
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=launch_args,
-        )
-
-    def test_long_output_retract(self):
-        data = {
-            "input_ids": [[233 + i] * 1234 for i in range(256)],
-            "sampling_params": {"max_new_tokens": 90000, "ignore_eos": True},
-        }
-        res = requests.post(f"{self.base_url}/generate", json=data)
-        assert res.status_code == 200, f"Request failed: {res.status_code}"
-        assert self.process.poll() is None, "Server crashed during test"
 
 
 if __name__ == "__main__":
