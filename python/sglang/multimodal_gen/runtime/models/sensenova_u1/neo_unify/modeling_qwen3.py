@@ -415,7 +415,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
     if (
-        q.is_cuda
+        q.device.type in ("cuda", "xpu")
         and q.dtype is torch.bfloat16
         and k.dtype is torch.bfloat16
         and cos.dtype is torch.bfloat16

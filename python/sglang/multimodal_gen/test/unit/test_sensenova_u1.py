@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
+from sglang.kernels.ops.diffusion.rope import rope_rotate_half_bitexact
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
@@ -60,8 +61,10 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     Qwen3MLP,
     _flash_or_sdpa,
     _sdpa_attn_func,
+    apply_rotary_pos_emb,
     create_block_causal_mask,
     position_ids_from_indexes,
+    rotate_half,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -1468,3 +1471,30 @@ def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
     assert outputs[1][1].device == layer_devices[-1]
     outputs[1] = (outputs[1][0], outputs[1][1].to(device), outputs[1][2])
     torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="needs an accelerator")
+@torch.inference_mode()
+def test_sensenova_u1_rope_uses_bitexact_kernel_on_accelerators():
+    """SenseNova's t/h/w rotate-half RoPE takes the fused kernel on CUDA and XPU, bit-exact vs eager."""
+    device = torch.device(torch.accelerator.current_accelerator().type, 0)
+    calls = []
+    kernel = rope_rotate_half_bitexact.fused_rope_rotate_half_bitexact
+
+    def counted(*args):
+        calls.append(args[0].shape[-1])
+        return kernel(*args)
+
+    with patch.object(
+        rope_rotate_half_bitexact, "fused_rope_rotate_half_bitexact", counted
+    ):
+        for head_dim in (64, 32):
+            q = torch.randn(1, 32, 256, head_dim, device=device, dtype=torch.bfloat16)
+            k = torch.randn(1, 8, 256, head_dim, device=device, dtype=torch.bfloat16)
+            cos = torch.randn(1, 256, head_dim, device=device, dtype=torch.bfloat16)
+            sin = torch.randn_like(cos)
+            output = apply_rotary_pos_emb(q, k, cos, sin)
+            c, s = cos.unsqueeze(1), sin.unsqueeze(1)
+            expected = (q * c + rotate_half(q) * s, k * c + rotate_half(k) * s)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert calls == [64, 64, 32, 32]
