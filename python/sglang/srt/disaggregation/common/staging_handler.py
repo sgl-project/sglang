@@ -1070,11 +1070,15 @@ def prefetch_staging_reqs(
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
+    upto_tokens: Optional[int] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
-    allocates staging during the GPU forward pass.
+    allocates staging during the GPU forward pass. With upto_tokens, only the
+    chunks covering the first upto_tokens tokens are requested: the decode ring
+    frees in FIFO order, so a long prefill that reserves all of its chunks up
+    front holds back every later transfer until its last chunk is written.
     """
     import zmq
 
@@ -1091,6 +1095,11 @@ def prefetch_staging_reqs(
         if total_pages == 0:
             continue
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
+        if upto_tokens is not None:
+            upto_pages = (upto_tokens + page_size - 1) // page_size
+            num_chunks = min(
+                num_chunks, (upto_pages + full_chunk_pages - 1) // full_chunk_pages
+            )
 
         for chunk_idx in range(num_chunks):
             stg_key = (room, chunk_idx, session_id)

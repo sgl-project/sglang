@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
     handle_staging_req,
+    prefetch_staging_reqs,
 )
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
@@ -37,6 +38,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
@@ -84,6 +86,57 @@ def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
     return StaticKVStorage(
         None, allocator, draft_token_to_kv_pool=draft, num_hidden_layers=total_kv_layers
     )
+
+
+class TestBatchStagingReservations(CustomTestCase):
+    def test_incremental_reservations_cover_each_chunk_once(self):
+        socket = Mock()
+        session = SimpleNamespace(
+            is_dummy=False,
+            dst_kv_indices=list(range(10)),
+            endpoint="127.0.0.1",
+            dst_port=1234,
+        )
+        requested, sockets = set(), {}
+        args = (7, {7: {"session": session}}, {"page_size": 16}, 32, requested, sockets)
+        with patch("zmq.Context.instance") as context:
+            context.return_value.socket.return_value = socket
+            prefetch_staging_reqs(*args, upto_tokens=16)
+            self.assertEqual(socket.send_multipart.call_count, 1)
+            prefetch_staging_reqs(*args, upto_tokens=33)
+            self.assertEqual(socket.send_multipart.call_count, 2)
+            prefetch_staging_reqs(*args, upto_tokens=160)
+            messages = [c.args[0] for c in socket.send_multipart.call_args_list]
+            self.assertEqual([int(m[2]) for m in messages], list(range(5)))
+            self.assertEqual(sum(int(m[3]) for m in messages), 10)
+            socket.reset_mock()
+            requested.clear()
+            session.is_dummy = True
+            prefetch_staging_reqs(*args, upto_tokens=32)
+            socket.send_multipart.assert_not_called()
+            session.is_dummy = False
+            prefetch_staging_reqs(*args)
+            self.assertEqual(socket.send_multipart.call_count, 5)
+
+    def test_master_switch_and_unsupported_manager_fallback(self):
+        prefetch = Mock()
+        manager = SimpleNamespace(
+            transfer_infos={7: {}}, _prefetch_staging_reqs=prefetch
+        )
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
+        )
+        batch = SimpleNamespace(reqs=[SimpleNamespace(bootstrap_room=7, extend_end=33)])
+        run = SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            run(scheduler, batch)
+            prefetch.assert_called_once_with(7, upto_tokens=33)
+        prefetch.reset_mock()
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
+            run(scheduler, batch)
+            prefetch.assert_called_once_with(7)
+        del manager._prefetch_staging_reqs
+        run(scheduler, batch)
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
