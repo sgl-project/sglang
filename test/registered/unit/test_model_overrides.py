@@ -2089,10 +2089,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # Every arch that may default to trtllm_mla on SM100 must get the
         # absorbed-MLA deterministic default, not the generic flashinfer one
         # (its MLA split-KV plan depends on the batch).
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
             _DEEPSEEK_FAMILY_ARCHS,
             _DETERMINISTIC_ABSORBED_MLA_ARCHS,
-            ResolvedView,
             _deterministic_attention_backend,
         )
 
