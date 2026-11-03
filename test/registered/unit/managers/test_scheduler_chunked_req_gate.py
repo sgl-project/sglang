@@ -33,7 +33,6 @@ def _make_req(
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_len = prefix_len
     req.extend_end = fill_len
-    req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False

@@ -754,16 +754,6 @@ class TestModuleReExports(CustomTestCase):
                 f"{name} listed in __all__ but not importable from package",
             )
 
-    def test_shim_module_exports_match(self):
-        import sglang.srt.utils.hf_transformers as pkg
-        import sglang.srt.utils.hf_transformers_utils as shim
-
-        for name in pkg.__all__:
-            self.assertTrue(
-                hasattr(shim, name),
-                f"{name} not available through shim module hf_transformers_utils",
-            )
-
 
 # ---------------------------------------------------------------------------
 # compat: _patch_removed_symbols

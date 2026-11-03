@@ -66,7 +66,7 @@ from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
-from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
+from sglang.srt.utils.hf_transformers import get_hf_text_config
 
 
 def can_enable_torch_compile(config: PretrainedConfig) -> bool:

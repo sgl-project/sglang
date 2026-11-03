@@ -723,10 +723,9 @@ def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
 @pytest.mark.parametrize("ratio", [0, 1, 2, 4, 128])
 @pytest.mark.parametrize("scenario", ["first", "next", "replay", "tail", "large"])
 def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
-    from sglang.kernels.ops.attention.flash_mla_interface import (
-        FlashMLASchedMeta,
-        flash_mla_with_kvcache,
-    )
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+    from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_with_kvcache
     from sglang.srt.mem_cache.dsv41_request_window import window_layout
     from sglang.srt.runtime_context import get_platform
 

@@ -93,7 +93,7 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers import get_processor
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
