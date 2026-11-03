@@ -48,6 +48,10 @@ use different `extra_backend_tag` values when these differ.
 The unified-cache external linker connects SGLang's GPU KV cache directly to
 Mooncake without a host-cache tier:
 
+For the complete architecture, deployment, validation, stress-test, monitoring,
+and community contribution workflow, see
+[Mooncake MNNVL/EGM and SGLang Direct Linker Deployment and Validation Guide](./MNNVL_EGM_DIRECT_LINKER_DEPLOYMENT_AND_VALIDATION.md).
+
 ```text
 SGLang GPU KV cache
         ↓ offload
