@@ -56,8 +56,8 @@ destroys them: torch may still record events on a stream a chunk used (a
 pinned ``tensor.copy_`` records its stream on the host block, and freeing the
 block later records an event there), so a chain lives as long as the process.
 
-In flight: a bracket pauses only gates whose chains have unretired chunks
-(``cuEventQuery`` on each chain's gated tail; a host flag keeps the drained
+In flight: a bracket pauses only gates whose chains have a run in flight
+(``cuEventQuery`` on each chain's last run; a host flag keeps the drained
 case free), so owners need not arm or disarm anything. The skip is sound when
 the chain's ``after`` stream is the bracketing stream: a run enqueued after
 the check then starts after the bracketed op.
@@ -98,124 +98,47 @@ from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from sglang.srt.utils.cuda_vmm_utils import check_drv
+
+try:
+    from cuda.bindings import driver as cu
+except ImportError:  # a build without cuda-python: no transfer can run
+    cu = None
+
 logger = logging.getLogger(__name__)
 
-# cuda.h: CUstreamWaitValue_flags / CUstreamWriteValue_flags / CUevent_flags /
-# CUstream_flags / CUresult / CUstreamCaptureMode / CUmemhostalloc flags
+# cuda.h: CUstreamWaitValue_flags / CUstreamWriteValue_flags
 CU_STREAM_WAIT_VALUE_EQ = 0x1
 # CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER is rejected (CUDA_ERROR_INVALID_VALUE)
 # on B200 / driver 13.4, so every write keeps the default fence.
 CU_STREAM_WRITE_VALUE_DEFAULT = 0x0
-_CU_EVENT_DISABLE_TIMING = 0x2
-_CU_STREAM_NON_BLOCKING = 0x1
-_CU_STREAM_CAPTURE_MODE_RELAXED = 2
-_CU_MEMHOSTALLOC_PORTABLE = 0x1
-_CU_MEMHOSTALLOC_DEVICEMAP = 0x2
-_CUDA_SUCCESS = 0
-_CUDA_ERROR_NOT_READY = 600
 
 
-class CudaDriver:
-    """The driver entry points gated transfers need, bound once via ctypes
-    (about 2 us per call, mostly driver time). The ``_v2`` names matter: the
-    bare stream memop symbols are the legacy, non-capturable ones. ``bind``
-    adds an entry point for a transfer that needs more."""
+def _create_event():
+    return check_drv(
+        cu.cuEventCreate(cu.CUevent_flags.CU_EVENT_DISABLE_TIMING), "cuEventCreate"
+    )
 
-    _instance: Optional[CudaDriver] = None
 
-    def __init__(self):
-        lib = ctypes.CDLL("libcuda.so.1")
-        void_p, u64, u32, uint = (
-            ctypes.c_void_p,
-            ctypes.c_uint64,
-            ctypes.c_uint32,
-            ctypes.c_uint,
-        )
-        self._get_error_name = lib.cuGetErrorName
-        self._get_error_name.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
-        self._lib = lib
-        bind = self.bind
-        self.wait32 = bind("cuStreamWaitValue32_v2", [void_p, u64, u32, uint])
-        self.write32 = bind("cuStreamWriteValue32_v2", [void_p, u64, u32, uint])
-        self.memcpy = bind("cuMemcpyAsync", [u64, u64, ctypes.c_size_t, void_p])
-        self.mem_host_alloc = bind(
-            "cuMemHostAlloc", [ctypes.POINTER(void_p), ctypes.c_size_t, uint]
-        )
-        self.mem_host_get_device_pointer = bind(
-            "cuMemHostGetDevicePointer_v2", [ctypes.POINTER(u64), void_p, uint]
-        )
-        self.stream_create = bind("cuStreamCreate", [ctypes.POINTER(void_p), uint])
-        self.stream_is_capturing = bind(
-            "cuStreamIsCapturing", [void_p, ctypes.POINTER(ctypes.c_int)]
-        )
-        self.exchange_capture_mode = bind(
-            "cuThreadExchangeStreamCaptureMode", [ctypes.POINTER(ctypes.c_int)]
-        )
-        self.event_create = bind("cuEventCreate", [ctypes.POINTER(void_p), uint])
-        self.event_record = bind("cuEventRecord", [void_p, void_p])
-        self.event_query = bind("cuEventQuery", [void_p])
-        self.stream_wait_event = bind("cuStreamWaitEvent", [void_p, void_p, uint])
-
-    def bind(self, name: str, argtypes) -> Callable[..., int]:
-        """The driver entry point ``name`` returning a ``CUresult``."""
-        fn = getattr(self._lib, name)
-        fn.argtypes = argtypes
-        fn.restype = ctypes.c_int
-        return fn
-
-    @classmethod
-    def get(cls) -> CudaDriver:
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def check(self, result: int, what: str) -> None:
-        if result != _CUDA_SUCCESS:
-            name = ctypes.c_char_p()
-            self._get_error_name(result, ctypes.byref(name))
-            raise RuntimeError(
-                f"{what} failed: {(name.value or b'?').decode()} ({result})"
-            )
-
-    def create_event(self) -> int:
-        event = ctypes.c_void_p()
-        self.check(
-            self.event_create(ctypes.byref(event), _CU_EVENT_DISABLE_TIMING),
-            "cuEventCreate",
-        )
-        return event.value
-
-    def create_stream(self) -> int:
-        stream = ctypes.c_void_p()
-        self.check(
-            self.stream_create(ctypes.byref(stream), _CU_STREAM_NON_BLOCKING),
-            "cuStreamCreate",
-        )
-        return stream.value
-
-    def is_capturing(self, stream_handle: int) -> bool:
-        status = ctypes.c_int()
-        self.check(
-            self.stream_is_capturing(stream_handle, ctypes.byref(status)),
-            "cuStreamIsCapturing",
-        )
-        return status.value != 0
-
-    def events_done(self, events: Sequence[int]) -> bool:
-        """Whether every event has completed. Queries in relaxed capture
-        mode: a query is otherwise an unsafe call that invalidates a global
-        capture running on another thread."""
-        mode = ctypes.c_int(_CU_STREAM_CAPTURE_MODE_RELAXED)
-        self.check(self.exchange_capture_mode(ctypes.byref(mode)), "capture mode")
-        try:
-            for event in events:
-                result = self.event_query(event)
-                if result == _CUDA_ERROR_NOT_READY:
-                    return False
-                self.check(result, "cuEventQuery")
-            return True
-        finally:
-            self.exchange_capture_mode(ctypes.byref(mode))
+def _events_done(events) -> bool:
+    """Whether every event has completed. Queries in relaxed capture mode: a
+    query is otherwise an unsafe call that invalidates a global capture
+    running on another thread."""
+    mode = check_drv(
+        cu.cuThreadExchangeStreamCaptureMode(
+            cu.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+        ),
+        "capture mode",
+    )
+    try:
+        for event in events:
+            result = cu.cuEventQuery(event)
+            if result[0] == cu.CUresult.CUDA_ERROR_NOT_READY:
+                return False
+            check_drv(result, "cuEventQuery")
+        return True
+    finally:
+        cu.cuThreadExchangeStreamCaptureMode(mode)
 
 
 class Link(enum.Flag):
@@ -245,10 +168,10 @@ class CopyChunk:
         self.copies = copies
 
     def __call__(self, stream: torch.cuda.Stream) -> None:
-        drv = CudaDriver.get()
+        handle = stream.cuda_stream
         for dst, src, nbytes in self.copies:
-            drv.check(
-                drv.memcpy(dst, src, nbytes, stream.cuda_stream),
+            check_drv(
+                cu.cuMemcpyAsync(dst, src, nbytes, handle),
                 "transfer chunk (cuMemcpyAsync)",
             )
 
@@ -263,38 +186,30 @@ class TransferGate:
     def __init__(self, link: Link, device_index: int):
         self.link = link
         self.device_index = device_index
-        self._drv = CudaDriver.get()
         # Pinned, device-mapped host memory: the GPU waits on it and the
         # watchdog opens it with a plain store, no stream needed. Never freed
         # (the registry lives as long as the process).
-        host = ctypes.c_void_p()
-        device_ptr = ctypes.c_uint64()
         with torch.cuda.device(device_index):
-            self._drv.check(
-                self._drv.mem_host_alloc(
-                    ctypes.byref(host),
-                    64,
-                    _CU_MEMHOSTALLOC_PORTABLE | _CU_MEMHOSTALLOC_DEVICEMAP,
+            host = check_drv(
+                cu.cuMemHostAlloc(
+                    64, cu.CU_MEMHOSTALLOC_PORTABLE | cu.CU_MEMHOSTALLOC_DEVICEMAP
                 ),
                 "cuMemHostAlloc",
             )
-            self._drv.check(
-                self._drv.mem_host_get_device_pointer(
-                    ctypes.byref(device_ptr), host, 0
-                ),
-                "cuMemHostGetDevicePointer",
+            device_ptr = check_drv(
+                cu.cuMemHostGetDevicePointer(host, 0), "cuMemHostGetDevicePointer"
             )
-        self._word = ctypes.c_uint32.from_address(host.value)
+        self._word = ctypes.c_uint32.from_address(host)
         self._word.value = 0
-        self.address = device_ptr.value
+        self.address = int(device_ptr)
         self._seq = 0
         self._lock = threading.Lock()
         self._chains: List[weakref.ref] = []
-        # True from a chain's run until a query sees every gated tail retired.
+        # True from a chain's run until a query sees every chain's last run
+        # retired.
         self._maybe_pending = False
-        self._runs = 0
-        # Bracket state, owned by one thread at a time.
-        self._pause_depth = 0
+        # Bracket state: the thread whose bracket paused the gate resumes it,
+        # on the stream that paused it.
         self._pause_stream: Optional[torch.cuda.Stream] = None
         self._pause_thread: Optional[int] = None
         # Watchdog: (sequence number, first seen at) of a held pause.
@@ -311,18 +226,11 @@ class TransferGate:
         self._write(0, stream)
 
     def _write(self, value: int, stream: torch.cuda.Stream) -> None:
-        self._drv.check(
-            self._drv.write32(
+        check_drv(
+            cu.cuStreamWriteValue32(
                 stream.cuda_stream, self.address, value, CU_STREAM_WRITE_VALUE_DEFAULT
             ),
             "pause word (cuStreamWriteValue32)",
-        )
-
-    def enqueue_wait(self, stream_handle: int) -> None:
-        """Make ``stream_handle`` wait until the gate is open."""
-        self._drv.check(
-            self._drv.wait32(stream_handle, self.address, 0, CU_STREAM_WAIT_VALUE_EQ),
-            "pause gate (cuStreamWaitValue32)",
         )
 
     def word(self) -> int:
@@ -340,24 +248,19 @@ class TransferGate:
 
     def _note_run(self) -> None:
         with self._lock:
-            self._runs += 1
             self._maybe_pending = True
 
     def has_pending(self) -> bool:
-        """Whether a chain on this gate may still have gated chunks to run."""
+        """Whether a chain on this gate may still have a run in flight."""
         if not self._maybe_pending:
             return False
         with self._lock:
-            runs = self._runs
-            # A chain never destroys its events, so a live chain's are
-            # always safe to query.
+            # A chain notes a run under this lock once it has recorded it, so
+            # no run noted meanwhile is cleared. A chain never destroys its
+            # events, so a live chain's are always safe to query.
             chains = [chain for chain in (ref() for ref in self._chains) if chain]
-            if not self._drv.events_done([chain._gated_tail for chain in chains]):
-                return True
-            # A chain run on another thread since the snapshot stays pending.
-            if self._runs == runs:
-                self._maybe_pending = False
-            return False
+            self._maybe_pending = not _events_done([chain._last for chain in chains])
+            return self._maybe_pending
 
 
 _gates: List[TransferGate] = []
@@ -472,26 +375,26 @@ class TransferChain:
         assert gate is None or gate.device_index == device_index
         self.gate = gate
         self.device_index = device_index
-        self._drv = drv = CudaDriver.get()
         with torch.cuda.device(device_index):
-            handles = [drv.create_stream() for _ in range(2 if gate else 1)]
+            self._handles = tuple(
+                check_drv(
+                    cu.cuStreamCreate(cu.CUstream_flags.CU_STREAM_NON_BLOCKING),
+                    "cuStreamCreate",
+                )
+                for _ in range(2 if gate else 1)
+            )
             self._streams = tuple(
-                torch.cuda.ExternalStream(h, device=torch.device("cuda", device_index))
-                for h in handles
+                torch.cuda.ExternalStream(
+                    int(h), device=torch.device("cuda", device_index)
+                )
+                for h in self._handles
             )
             # _done[k % 2]: recorded after chunk k, waited on by chunk k + 1.
-            self._done = (drv.create_event(), drv.create_event())
-            self._after = drv.create_event()
-            self._gated_tail = drv.create_event()
-            self._last = drv.create_event()
-        self._handles = tuple(handles)
+            self._done = (_create_event(), _create_event())
+            self._after = _create_event()
+            self._last = _create_event()
         if gate is not None:
             gate._add_chain(self)
-
-    @property
-    def stream(self) -> torch.cuda.Stream:
-        """The primary stream: setup, finish and ``done`` run on it."""
-        return self._streams[0]
 
     def run(
         self,
@@ -508,50 +411,50 @@ class TransferChain:
         ``done`` once everything has run. Setup and finish ops run ungated on
         the primary stream. Nothing is enqueued on ``after``: consumers wait
         through ``wait``."""
-        drv = self._drv
         after_handle = after.cuda_stream
-        if drv.is_capturing(after_handle):
+        if check_drv(cu.cuStreamIsCapturing(after_handle), "cuStreamIsCapturing"):
             raise RuntimeError("background transfers cannot be graph-captured")
         primary = self._handles[0]
         stream = self._streams[0]
-        drv.check(drv.event_record(self._after, after_handle), "cuEventRecord")
-        drv.check(drv.stream_wait_event(primary, self._after, 0), "cuStreamWaitEvent")
+        check_drv(cu.cuEventRecord(self._after, after_handle), "cuEventRecord")
+        check_drv(cu.cuStreamWaitEvent(primary, self._after, 0), "cuStreamWaitEvent")
         # Every op runs with its stream current, so ops written against the
         # current stream (torch ops, PyNcclCommunicator) need no adapting.
         caller_stream = torch.cuda.current_stream(self.device_index)
+        gated = self.gate is not None and bool(ops)
         try:
             torch.cuda.set_stream(stream)
             for op in setup:
                 op(stream)
-            if self.gate is None:
+            if gated:
+                self._run_gated(ops)
+            else:
                 for op in ops:
                     op(stream)
-            elif ops:
-                self._run_gated(ops)
             for op in finish:
                 op(stream)
         finally:
             torch.cuda.set_stream(caller_stream)
             # Also when an op raised: what ran so far is still tracked.
-            drv.check(drv.event_record(self._last, primary), "cuEventRecord")
+            check_drv(cu.cuEventRecord(self._last, primary), "cuEventRecord")
+            if gated:
+                self.gate._note_run()
         if done is not None:
             done.record(stream)
 
     def _run_gated(self, ops: Sequence[ChunkOp]) -> None:
-        drv = self._drv
-        gate = self.gate
         handles, streams, done = self._handles, self._streams, self._done
         wait_event, record, wait32 = (
-            drv.stream_wait_event,
-            drv.event_record,
-            drv.wait32,
+            cu.cuStreamWaitEvent,
+            cu.cuEventRecord,
+            cu.cuStreamWaitValue32,
         )
-        word = gate.address
+        word = self.gate.address
         # Every gate is read behind an event wait: chunk k runs on stream
         # (k + 1) % 2 and waits for the event of what precedes it, so chunk 0
         # (on the second stream) waits for the setup ops and the whole
         # previous run, which all ran on the primary stream.
-        drv.check(record(done[0], handles[0]), "chunk chain (cuEventRecord)")
+        check_drv(record(done[0], handles[0]), "chunk chain (cuEventRecord)")
         last = 0
         try:
             for k, op in enumerate(ops):
@@ -559,33 +462,29 @@ class TransferChain:
                 handle = handles[i]
                 last = i
                 result = wait_event(handle, done[i ^ 1], 0)
-                if result:
-                    drv.check(result, "chunk chain (cuStreamWaitEvent)")
+                if result[0]:
+                    check_drv(result, "chunk chain (cuStreamWaitEvent)")
                 result = wait32(handle, word, 0, CU_STREAM_WAIT_VALUE_EQ)
-                if result:
-                    drv.check(result, "pause gate (cuStreamWaitValue32)")
+                if result[0]:
+                    check_drv(result, "pause gate (cuStreamWaitValue32)")
                 torch.cuda.set_stream(streams[i])
                 op(streams[i])
                 result = record(done[i], handle)
-                if result:
-                    drv.check(result, "chunk chain (cuEventRecord)")
+                if result[0]:
+                    check_drv(result, "chunk chain (cuEventRecord)")
         finally:
             torch.cuda.set_stream(streams[0])
             # Every chunk is ordered before the last; join it if it ran on the
             # second stream, at that stream's end: a chunk that raised after
             # enqueuing work never recorded its event.
             if last:
-                drv.check(
+                check_drv(
                     record(done[1], handles[1]), "chunk chain join (cuEventRecord)"
                 )
-                drv.check(
+                check_drv(
                     wait_event(handles[0], done[1], 0),
                     "chunk chain join (cuStreamWaitEvent)",
                 )
-            drv.check(
-                record(self._gated_tail, handles[0]), "gated tail (cuEventRecord)"
-            )
-            gate._note_run()
 
     def wait(
         self, stream: torch.cuda.Stream, event: Optional[torch.cuda.Event] = None
@@ -594,11 +493,7 @@ class TransferChain:
         run. Refused while this thread holds the chain's gate paused: the
         waiting stream would block on chunks parked behind its own pause."""
         gate = self.gate
-        if (
-            gate is not None
-            and gate._pause_depth
-            and gate._pause_thread == threading.get_ident()
-        ):
+        if gate is not None and gate._pause_thread == threading.get_ident():
             raise RuntimeError(
                 "waiting on a gated transfer inside a bracket that paused it "
                 "would deadlock"
@@ -606,15 +501,14 @@ class TransferChain:
         if event is not None:
             stream.wait_event(event)
         else:
-            self._drv.check(
-                self._drv.stream_wait_event(stream.cuda_stream, self._last, 0),
+            check_drv(
+                cu.cuStreamWaitEvent(stream.cuda_stream, self._last, 0),
                 "cuStreamWaitEvent",
             )
 
     def retired(self) -> bool:
-        """Whether the last run's chunks have all completed."""
-        tail = self._gated_tail if self.gate is not None else self._last
-        return self._drv.events_done([tail])
+        """Whether the last run has completed."""
+        return _events_done([self._last])
 
 
 # ---- foreground brackets ------------------------------------------------------
@@ -635,14 +529,9 @@ class _PausedTransfers:
         capturing = None
         try:
             for gate in _gates:
-                if not gate.link & self._links:
-                    continue
-                owner = gate._pause_thread
-                if owner is not None:
-                    if owner == me:
-                        gate._pause_depth += 1
-                        paused.append(gate)
-                    # Paused by another thread, which resumes it.
+                # A paused gate is resumed by the bracket that paused it: an
+                # enclosing one on this thread, or one on another thread.
+                if not gate.link & self._links or gate._pause_thread is not None:
                     continue
                 if not gate._maybe_pending:
                     continue
@@ -656,7 +545,6 @@ class _PausedTransfers:
                     gate._pause_thread = me
                 stream = torch.cuda.current_stream(gate.device_index)
                 gate._pause_stream = stream
-                gate._pause_depth = 1
                 paused.append(gate)
                 gate.pause(stream)
         except BaseException:
@@ -669,14 +557,11 @@ class _PausedTransfers:
 
 
 def _release(paused: List[TransferGate]) -> None:
-    """Undo ``paused`` (innermost last). Every gate is released even if a
+    """Resume the gates a bracket paused. Every gate is released even if a
     resume raises; the first error is raised after the loop."""
     error = None
     while paused:
         gate = paused.pop()
-        gate._pause_depth -= 1
-        if gate._pause_depth:
-            continue
         # After the bracketed op, on the stream that issued the pause. The
         # gate stays owned until the resume is enqueued: a pause another
         # thread enqueued before it would be undone by it.
@@ -696,7 +581,7 @@ def background_transfers_pending(links: Link) -> bool:
     (some gate has chunks that may still be in flight). Lets a caller skip
     work it does only to make a bracket safe."""
     return any(
-        gate.link & links and (gate._maybe_pending or gate._pause_depth)
+        gate.link & links and (gate._maybe_pending or gate._pause_thread is not None)
         for gate in _gates
     )
 

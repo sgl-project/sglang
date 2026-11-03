@@ -35,7 +35,6 @@ import torch.multiprocessing as mp
 from sglang.srt.distributed.device_communicators import gated_transfer
 from sglang.srt.distributed.device_communicators.gated_transfer import (
     CU_STREAM_WAIT_VALUE_EQ,
-    CudaDriver,
     Link,
     TransferChain,
     TransferGate,
@@ -48,6 +47,7 @@ from sglang.srt.distributed.device_communicators.gated_transfer import (
     paused_background_transfers,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.cuda_vmm_utils import check_drv
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,8 +69,6 @@ def _fake_gate(link, pending=True):
     gate.device_index = 0
     gate._lock = threading.Lock()
     gate._maybe_pending = pending
-    gate._runs = 0
-    gate._pause_depth = 0
     gate._pause_stream = None
     gate._pause_thread = None
     gate.calls = []
@@ -102,7 +100,6 @@ class TestBracketBookkeeping(CustomTestCase):
                 pass
             self.assertEqual(self.nvlink.calls, [("pause", "stream")])
         self.assertEqual(self.nvlink.calls, [("pause", "stream"), ("resume", "stream")])
-        self.assertEqual(self.nvlink._pause_depth, 0)
         self.assertIsNone(self.nvlink._pause_thread)
 
     def test_bracket_pauses_only_its_links(self):
@@ -158,7 +155,7 @@ class TestBracketBookkeeping(CustomTestCase):
         thread.start()
         other_inside.wait(10)
         with paused_background_transfers(Link.NVLINK):
-            self.assertEqual(self.nvlink._pause_depth, 1)
+            self.assertEqual(self.nvlink._pause_thread, thread.ident)
         self.assertEqual(self.nvlink.calls, [("pause", "stream")])
         release.set()
         thread.join(10)
@@ -169,7 +166,7 @@ class TestBracketBookkeeping(CustomTestCase):
             with paused_background_transfers(Link.NVLINK):
                 raise ValueError
         self.assertEqual(self.nvlink.calls[-1], ("resume", "stream"))
-        self.assertEqual(self.nvlink._pause_depth, 0)
+        self.assertIsNone(self.nvlink._pause_thread)
 
     def test_failed_entry_resumes_what_it_paused(self):
         """A bracket whose entry raises never reaches __exit__."""
@@ -183,7 +180,6 @@ class TestBracketBookkeeping(CustomTestCase):
                 pass
         self.assertEqual(self.nvlink.calls, [("pause", "stream"), ("resume", "stream")])
         for gate in (self.nvlink, self.h2d, self.d2h):
-            self.assertEqual(gate._pause_depth, 0)
             self.assertIsNone(gate._pause_thread)
 
     def test_failed_resume_still_releases_every_gate(self):
@@ -199,7 +195,6 @@ class TestBracketBookkeeping(CustomTestCase):
         self.assertEqual(self.nvlink.calls, [("pause", "stream"), ("resume", "stream")])
         self.assertEqual(self.d2h.calls, [("pause", "stream"), ("resume", "stream")])
         for gate in (self.nvlink, self.h2d, self.d2h):
-            self.assertEqual(gate._pause_depth, 0)
             self.assertIsNone(gate._pause_thread)
 
     def test_gate_stays_owned_until_its_resume_is_enqueued(self):
@@ -232,7 +227,7 @@ class TestBracketBookkeeping(CustomTestCase):
         self.assertFalse(background_transfers_pending(Link.NVLINK))
         self.assertTrue(background_transfers_pending(Link.NVLINK | Link.PCIE))
         # A paused gate stays relevant until its bracket resumes it.
-        self.nvlink._pause_depth = 1
+        self.nvlink._pause_thread = threading.get_ident()
         self.assertTrue(background_transfers_pending(Link.NVLINK))
 
     def test_chunk_spans_and_copy_chunks(self):
@@ -292,11 +287,11 @@ class _Blocked:
         self.reached = _HostWord()
 
     def __call__(self, stream):
-        drv = CudaDriver.get()
-        drv.check(drv.write32(stream.cuda_stream, self.reached.address, 1, 0), "marker")
-        drv.check(
-            drv.wait32(
-                stream.cuda_stream, self.word.address, 1, CU_STREAM_WAIT_VALUE_EQ
+        cu, handle = gated_transfer.cu, stream.cuda_stream
+        check_drv(cu.cuStreamWriteValue32(handle, self.reached.address, 1, 0), "marker")
+        check_drv(
+            cu.cuStreamWaitValue32(
+                handle, self.word.address, 1, CU_STREAM_WAIT_VALUE_EQ
             ),
             "blocker",
         )
@@ -671,26 +666,28 @@ class TestTransferChainSingleGpu(CustomTestCase):
             chain.run(ops, self.after, done=done)
         with torch.cuda.stream(self.control):
             with paused_background_transfers(Link.NVLINK):
-                self.assertEqual(nvlink.gate._pause_depth, 1)
-                self.assertEqual(h2d.gate._pause_depth, 0)
+                self.assertEqual(nvlink.gate._pause_thread, threading.get_ident())
+                self.assertIsNone(h2d.gate._pause_thread)
                 # Harmless: the chain owns its streams; its chunks just park.
                 nvlink.run([], self.after)
                 with self.assertRaises(RuntimeError):
                     # The waiting stream would block on its own pause.
                     nvlink.wait(self.control, dones[0])
                 h2d.wait(self.control, dones[1])  # another link's gate: fine
-            self.assertEqual(nvlink.gate._pause_depth, 0)
+            self.assertIsNone(nvlink.gate._pause_thread)
         blocker.set(1)
         for done in dones:
             self.assertTrue(_wait_until(done.query))
         self.control.synchronize()
+        # Including the empty run issued inside the bracket.
+        self.assertTrue(_wait_until(lambda: nvlink.retired() and h2d.retired()))
         for dst in dsts:
             self.assertTrue(torch.equal(dst, src))
         # Drained: the next bracket pauses nothing.
         with torch.cuda.stream(self.control):
             with paused_background_transfers(Link.NVLINK | Link.PCIE):
-                self.assertEqual(nvlink.gate._pause_depth, 0)
-                self.assertEqual(h2d.gate._pause_depth, 0)
+                self.assertIsNone(nvlink.gate._pause_thread)
+                self.assertIsNone(h2d.gate._pause_thread)
 
     def test_watchdog_forces_a_stuck_pause_open(self):
         """A pause whose resume never comes: the watchdog opens the gate and
@@ -868,7 +865,7 @@ def _run_nccl_chunks(rank, port):
     with foreground.change_state(enable=True):
         with paused_background_transfers(Link.NVLINK):
             foreground.all_reduce(x)
-    assert gate._seq == pauses + 1 and gate._pause_depth == 0
+    assert gate._seq == pauses + 1 and gate._pause_thread is None
     blocker.set(1)  # host only: nothing waits on the GPU before the release
     chain.wait(consumer, done)
     read = torch.cuda.Event()
