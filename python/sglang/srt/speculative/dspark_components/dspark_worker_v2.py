@@ -79,6 +79,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    make_sim_draw_generator,
     target_model_type,
     verify_logits_adjustments_are_noop,
 )
@@ -357,6 +358,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._simulate_acc_len > 0
             else None
         )
+        self._sim_generator = (
+            make_sim_draw_generator(target_worker.random_seed)
+            if self._simulated_correct_len is not None
+            else None
+        )
         # The simulated acceptance draw (and sim bonus seed) before the draft launch,
         # where the host waits on the previous verify anyway; off with real acceptance.
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
@@ -423,6 +429,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=self.device,
                 tp_sync=self._tp_sync,
                 simulated_correct_len=self._simulated_correct_len,
+                sim_generator=self._sim_generator,
                 simulate_fold=envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
                 fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
                 accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
@@ -503,6 +510,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
             rejection_noise=self._rejection_noise,
+            sim_generator=self._sim_generator,
         )
 
         self._forced_budget_frac: Optional[float] = None

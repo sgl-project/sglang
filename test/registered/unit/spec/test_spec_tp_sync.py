@@ -1,12 +1,30 @@
 import unittest
+from types import SimpleNamespace
 
-from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite, parse_spec_tp_sync
+from sglang.srt.environ import envs
+from sglang.srt.speculative.spec_tp_sync import (
+    SpecTpSync,
+    SpecTpSyncSite,
+    parse_spec_tp_sync,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 DRAFT = SpecTpSyncSite.DSPARK_DRAFT
+ACCEPT_SAMPLE = SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
+
+
+def _tp_sync(env_value):
+    """A SpecTpSync on rank 1 of 2; ``env_value`` None leaves SGLANG_SPEC_TP_SYNC unset."""
+    group = SimpleNamespace(world_size=2, rank_in_group=1)
+    with envs.SGLANG_SPEC_TP_SYNC.override("all"):
+        if env_value is None:
+            envs.SGLANG_SPEC_TP_SYNC.clear()
+        else:
+            envs.SGLANG_SPEC_TP_SYNC.set(env_value)
+        return SpecTpSync(group)
 
 
 class TestParseSpecTpSync(CustomTestCase):
@@ -24,6 +42,21 @@ class TestParseSpecTpSync(CustomTestCase):
         # Ranks with the same logits draw the same draft noise.
         self.assertNotIn(DRAFT, parse_spec_tp_sync("rng"))
         self.assertIn(DRAFT, parse_spec_tp_sync("dspark-draft"))
+
+
+class TestRankIdenticalSkip(CustomTestCase):
+    def test_unset_env_skips_only_the_accept_sample_site(self):
+        sync = _tp_sync(None)
+        for site in SpecTpSyncSite:
+            with self.subTest(site=site):
+                self.assertTrue(sync.enabled(site))
+                self.assertEqual(sync.syncs_rank_identical(site), site != ACCEPT_SAMPLE)
+
+    def test_explicit_env_is_followed_exactly(self):
+        # "all" set on purpose (e.g. to debug a divergence) keeps every broadcast.
+        self.assertTrue(_tp_sync("all").syncs_rank_identical(ACCEPT_SAMPLE))
+        self.assertFalse(_tp_sync("rng,-9").syncs_rank_identical(ACCEPT_SAMPLE))
+        self.assertTrue(_tp_sync("rng").syncs_rank_identical(ACCEPT_SAMPLE))
 
 
 if __name__ == "__main__":

@@ -81,6 +81,87 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(_worker(mode="compact"), _sampling_info())
 
 
+@pytest.mark.parametrize(
+    "info_kw,block_verification,noise,shard",
+    [
+        (dict(is_all_greedy=True, is_any_greedy=True), False, False, False),
+        (dict(), False, False, False),
+        (dict(), False, True, False),
+        (dict(), False, False, True),
+        (dict(is_any_greedy=True), False, True, False),
+        (dict(need_top_k_sampling=True), False, True, True),
+        (dict(need_top_p_sampling=True), False, True, True),
+        (dict(), True, True, True),
+    ],
+)
+def test_rank_identical_iff_no_per_rank_generator(
+    monkeypatch, info_kw, block_verification, noise, shard
+):
+    """The accept-sample broadcast is skipped only when accept_draws_rank_identical
+    holds, so it must be false exactly when the step runs AcceptSampling, whose
+    draws come from each rank's own torch generator."""
+    calls = []
+    out = (torch.zeros(1), torch.zeros(1), torch.zeros(1))
+
+    def kernel(name):
+        def run(**kwargs):
+            calls.append(name)
+            return out
+
+        return SimpleNamespace(execute=run)
+
+    monkeypatch.setattr(dspark_verify, "AcceptGreedy", kernel("greedy"))
+    monkeypatch.setattr(dspark_verify, "AcceptSampling", kernel("classic"))
+    monkeypatch.setattr(dspark_verify, "BlockwiseRejection", kernel("blockwise"))
+    monkeypatch.setattr(
+        dspark_verify, "accept_sampling_sharded", kernel("sharded").execute
+    )
+    monkeypatch.setattr(dspark_verify, "_draft_probs", lambda *args: None)
+    monkeypatch.setattr(
+        dspark_verify,
+        "SelectMixedAccept",
+        SimpleNamespace(
+            execute=lambda **kw: SimpleNamespace(
+                correct_len=None, bonus=None, cap_trim_lens=None
+            )
+        ),
+    )
+    info = _sampling_info(temperatures=None, **info_kw)
+    block = SimpleNamespace(
+        greedy_mask=None,
+        greedy_draft=False,
+        corrected_logits=None,
+        temperatures=None,
+        vocab_shard=(
+            SimpleNamespace(
+                start=0, width=1, gather=SimpleNamespace(gather_stacked=None)
+            )
+            if shard
+            else None
+        ),
+        noise=SimpleNamespace(key=0, offset=None),
+    )
+    rejection_noise = object() if noise else None
+    dspark_verify.accept_draft_tokens(
+        candidates=None,
+        target_logits=torch.zeros(STRIDE, 4),
+        draft_block=block,
+        sampling_info=info,
+        draft_input=None,
+        gamma=GAMMA,
+        verify_num_draft_tokens=STRIDE,
+        block_verification=block_verification,
+        rejection_noise=rejection_noise,
+    )
+    identical = dspark_verify.accept_draws_rank_identical(
+        draft_block=block,
+        sampling_info=info,
+        block_verification=block_verification,
+        rejection_noise=rejection_noise,
+    )
+    assert identical == ("classic" not in calls), calls
+
+
 # ---------------------------------------------------------------- GPU parity
 
 

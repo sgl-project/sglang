@@ -54,6 +54,10 @@ _RNG = frozenset(
     }
 )
 
+# With SGLANG_SPEC_TP_SYNC unset, these skip their broadcast on a step whose caller
+# shows every rank computes the same values (counter-based draws from the server seed).
+_RANK_IDENTICAL_SKIP = frozenset({SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE})
+
 _PRESETS = {
     "all": _ALL,
     "off": frozenset(),
@@ -120,19 +124,36 @@ def parse_spec_tp_sync(spec: str) -> frozenset[SpecTpSyncSite]:
 class SpecTpSync:
     """Broadcasts a speculative decision from rank 0 to its TP group."""
 
+    # Stand-ins built with __new__ keep every selected broadcast.
+    _rank_identical_skip: frozenset[SpecTpSyncSite] = frozenset()
+
     def __init__(self, tp_group) -> None:
         self._tp_group = tp_group
         # Parsed even on a single rank so a typo fails on every deployment.
         sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
         self._sites = sites if tp_group.world_size > 1 else frozenset()
-        if sites != _ALL and tp_group.world_size > 1 and tp_group.rank_in_group == 0:
-            logger.warning(
-                "Speculative TP sync limited to %s.",
-                [f"{int(s)}:{s.slug}" for s in sorted(sites)] or "no site",
-            )
+        # An explicit SGLANG_SPEC_TP_SYNC, "all" included, is followed exactly.
+        self._rank_identical_skip = (
+            frozenset() if envs.SGLANG_SPEC_TP_SYNC.is_set() else _RANK_IDENTICAL_SKIP
+        )
+        if tp_group.world_size > 1 and tp_group.rank_in_group == 0:
+            if sites != _ALL:
+                logger.warning(
+                    "Speculative TP sync limited to %s.",
+                    [f"{int(s)}:{s.slug}" for s in sorted(sites)] or "no site",
+                )
+            elif self._rank_identical_skip:
+                logger.info(
+                    "Speculative TP sync skips %s on steps with counter-based draws.",
+                    [f"{int(s)}:{s.slug}" for s in sorted(self._rank_identical_skip)],
+                )
 
     def enabled(self, site: SpecTpSyncSite) -> bool:
         return site in self._sites
+
+    def syncs_rank_identical(self, site: SpecTpSyncSite) -> bool:
+        """Whether ``site`` broadcasts on a step whose values every rank computes alike."""
+        return site in self._sites and site not in self._rank_identical_skip
 
     def sync(self, site: SpecTpSyncSite, values: torch.Tensor) -> torch.Tensor:
         if site in self._sites:

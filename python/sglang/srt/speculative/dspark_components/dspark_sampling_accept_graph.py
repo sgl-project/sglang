@@ -45,6 +45,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     StaticVerifyIO,
     accept_draft_tokens,
+    accept_draws_rank_identical,
     build_accept_outs,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -89,15 +90,23 @@ def sampling_accept_commit_lens(
         temperatures=params.temperatures[:bs],
         greedy_draft=draft_sampler.greedy_draft,
     )
+    # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
+    sampling_info = GraphSamplingInfo(temperatures=params.temperatures[:bs])
     correct_len, bonus, cap_trim_lens = accept_draft_tokens(
         candidates=io.candidates,
         target_logits=io.logits,
         draft_block=draft_block,
-        # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
-        sampling_info=GraphSamplingInfo(temperatures=params.temperatures[:bs]),
+        sampling_info=sampling_info,
         draft_input=None,
         gamma=stride - 1,
         verify_num_draft_tokens=stride,
+        block_verification=block_verification,
+        rejection_noise=rejection_noise,
+    )
+    # Fixed per capture: the region routes no top-k / top-p step (_sampling_graph_eligible).
+    rank_identical = epilogue.sim_draws_rank_identical and accept_draws_rank_identical(
+        draft_block=draft_block,
+        sampling_info=sampling_info,
         block_verification=block_verification,
         rejection_noise=rejection_noise,
     )
@@ -115,6 +124,7 @@ def sampling_accept_commit_lens(
         verify_num_draft_tokens=stride,
         tp_sync=tp_sync,
         sync_site=SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
+        rank_identical=rank_identical,
         simulated_correct_len=epilogue.simulated_correct_len,
         target_logits=bonus_logits,
         out=epilogue.read_accept(bs),
