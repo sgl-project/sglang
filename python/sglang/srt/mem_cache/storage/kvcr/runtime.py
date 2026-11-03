@@ -243,16 +243,23 @@ class KVCRRuntime:
                 self._close_buffers()
             raise
 
-    def encode(self, key: object) -> bytes:
-        if not isinstance(key, bytes):
-            raise TypeError("KVCR keys must be encoded layout keys")
+    def encode_to_framework(self, key: bytes) -> bytes:
         return key
 
-    def decode(self, key: bytes) -> int:
+    def decode_from_framework(self, framework_key: object) -> bytes:
+        if not isinstance(framework_key, bytes):
+            raise TypeError("KVCR keys must be encoded layout keys")
+        return framework_key
+
+    def encode_to_router(self, key: bytes) -> int:
         decoded = self._layout.decode_key(key)
         if decoded is None:
             raise ValueError("Unknown KVCR layout key")
         return int(decoded[1][:16], 16)
+
+    def decode_from_router(self, router_key: int | bytes) -> bytes:
+        # A router hash names a page across all pools, so it has no single key.
+        raise NotImplementedError("no single KVCR key per router hash")
 
     def log_stats(self, *, force=False):
         if not self._telemetry_enabled:
