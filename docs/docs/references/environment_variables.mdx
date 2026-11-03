@@ -1224,7 +1224,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEBUG_HICACHE_VERIFY</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Debug check of the HiCache host tier: hash every row backed up from the GPU and compare every host-to-GPU load-back with it, logging mismatches as errors and periodic counts as info. Covers MHA, MLA and Mamba device pools; other rows are counted as unverified. Synchronizes on every transfer, so use it for debugging only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Debug check of the HiCache host tier: hash every row backed up from the GPU and compare every host-to-GPU load-back with it, logging mismatches as errors and periodic counts as info. Covers MHA, MLA and Mamba device pools; other rows are counted as unverified. Turned off when a storage backend or PD decode host receive is in use. Synchronizes on every transfer, so use it for debugging only.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

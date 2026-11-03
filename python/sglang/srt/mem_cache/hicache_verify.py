@@ -10,8 +10,9 @@ Rows are read from MHA (K/V), MLA (KV) and Mamba (conv/temporal) device pools.
 Rows of other pools, and host slots with no recorded backup (for example
 packed draft-model layers, which have no backup transfer of their own), are
 counted as unverified. Every check synchronizes the transfer stream, so this
-is for debugging only. Host slots filled from a storage backend never pass a
-device-to-host backup, so the check is turned off when one is attached.
+is for debugging only. Host slots filled from a storage backend, or by a
+prefill peer under PD decode host receive, never pass a device-to-host backup,
+so the check is turned off when either is in use.
 """
 
 from __future__ import annotations

@@ -183,6 +183,15 @@ class TestRegistrationBurstOrder(CustomTestCase):
 
         self.assertEqual(order, ["v1", "complete", "threads"])
 
+    def test_attach_turns_off_the_hicache_verify_check(self):
+        order: List[str] = []
+        pool = _fake_pool("kv")
+        controller = _controller(HiCacheController, pool, pool)
+
+        _attach(controller, RecordingBackend(order), order)
+
+        controller.l2_transfer_engine.disable_verifier.assert_called_once()
+
     def test_base_hook_failure_rolls_the_attach_back(self):
         # On the base path the hook runs inside the attach's guarded section,
         # so a backend failure rolls the backend back through the existing
