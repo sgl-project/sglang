@@ -458,6 +458,14 @@ class QSAKVHostOffload:
         if self.fused is not None:
             self.fused.num_real.fill_(num_requests)
 
+    def real_rows(self, *, num_rows: int, rows_per_request: int) -> torch.Tensor:
+        """Device mask of the forward's query rows that belong to real requests,
+        not CUDA-graph padding (no host sync: graph-capturable)."""
+        rows = torch.arange(num_rows, device=self.device)
+        if self.fused is None:
+            return rows >= 0
+        return rows < self.fused.num_real * rows_per_request
+
     @property
     def graph_safe(self) -> bool:
         return self.use_fused

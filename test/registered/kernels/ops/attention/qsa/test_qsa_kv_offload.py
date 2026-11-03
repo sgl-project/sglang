@@ -274,6 +274,8 @@ def test_fused_resolve_in_cuda_graph_with_padding(request):
         )  # fmt: skip
         for got, ref in zip(actual, expected):
             assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+        real_rows = offload.real_rows(num_rows=requests, rows_per_request=1)
+        assert real_rows.tolist() == [r < real for r in range(requests)]
         if real < requests:
             assert bool((rows[real:] == -1).all())
             after = (fused.blk_slot, fused.slot_blk, fused.ring, fused.ring_src)

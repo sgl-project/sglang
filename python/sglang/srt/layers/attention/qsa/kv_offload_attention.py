@@ -172,12 +172,13 @@ def forward_offloaded_attention(
     positions = backend._expand_block_indices(topk_indices, metadata)
     row_requests = backend._row_requests(forward_batch=forward_batch, metadata=metadata)
     num_rows, width = positions.shape
+    rows_per_request = num_rows // forward_batch.batch_size
     rows = offload.resolve_rows(
         layer_idx=layer_idx,
         positions=positions,
         row_seq_lens=metadata.sequence_lengths,
         row_req=row_requests,
-        rows_per_request=num_rows // forward_batch.batch_size,
+        rows_per_request=rows_per_request,
     )
     # Valid positions lead each row, so column ids keep the packing order.
     columns = torch.arange(width, dtype=torch.int32, device=rows.device)
@@ -201,13 +202,18 @@ def forward_offloaded_attention(
             row_requests=row_requests,
             sequence_lengths=metadata.sequence_lengths,
         )
+        # CUDA-graph padding rows resolve to no device row by design.
+        real_rows = offload.real_rows(
+            num_rows=num_rows, rows_per_request=rows_per_request
+        )
+        reference_positions = torch.where(real_rows[:, None], positions, -1)
         offload.check(
             what="decode gather",
             layer_idx=layer_idx,
             actual=_pack_gathered_kv(source=source, indices=indices),
             expected=_pack_gathered_kv(
                 source=reference,
-                indices=positions.to(torch.int32).contiguous(),
+                indices=reference_positions.to(torch.int32).contiguous(),
             ),
         )
     indices = indices.to(torch.int32).contiguous()
