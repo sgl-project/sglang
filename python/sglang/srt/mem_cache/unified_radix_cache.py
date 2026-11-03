@@ -2270,6 +2270,21 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    def _align_c128_storage_prefetch(
+        self, last_host_node_id: NodeId, prefetch_key: RadixKey
+    ) -> RadixKey:
+        """Align the span to C128 storage groups when the component is present."""
+        c128_component = self.components.get(ComponentType.C128)
+        if c128_component is None:
+            return prefetch_key
+        prefetch_length = min(
+            len(prefetch_key),
+            c128_component.align_storage_prefetch_length(
+                last_host_node_id, len(prefetch_key)
+            ),
+        )
+        return prefetch_key[:prefetch_length]
+
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
@@ -2333,22 +2348,13 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
         ).page_aligned(self.page_size)
+        prefetch_key = self._align_c128_storage_prefetch(
+            last_host_node_id, prefetch_key
+        )
         assume_stored = (
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
         )
         prefetch_length = len(prefetch_key)
-        c128_component = self.components.get(ComponentType.C128)
-        if c128_component is not None:
-            prefetch_length = min(
-                prefetch_length,
-                c128_component.align_storage_prefetch_length(
-                    last_host_node_id, prefetch_length
-                ),
-            )
-            prefetch_key = prefetch_key[:prefetch_length]
-            assume_stored = (
-                assume_stored and storage_start + prefetch_length == storage_hit_end
-            )
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
