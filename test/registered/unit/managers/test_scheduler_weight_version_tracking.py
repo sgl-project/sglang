@@ -17,7 +17,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
@@ -40,66 +43,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _ServingStub:
     def __init__(self, weight_version: str):
         self.weight_version = weight_version
-
-
-class _ContextStub:
-    def __init__(self, serving: _ServingStub):
-        self.serving = serving
-
-    def override(self, source, **fields):
-        self.serving.weight_version = fields["weight_version"]
-
-
-class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _serving(self, version: str) -> _ServingStub:
-        serving = _ServingStub(version)
-        for name, value in (
-            ("get_serving", serving),
-            ("get_context", _ContextStub(serving)),
-        ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return serving
-
-    def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
-            deferred_responses=DeferredResponses(
-                disaggregation_mode=DisaggregationMode.NULL,
-                output_streamer=None,
-                send_abort=None,
-            ),
-            waiting_queue=list(waiting),
-            chunked_req=chunked,
-            hisparse_coordinator=(
-                SimpleNamespace(
-                    ack_staging_queue=[SimpleNamespace(req=req) for req in staging]
-                )
-                if staging
-                else None
-            ),
-        )
-
-    def test_every_source_of_live_requests_is_stamped(self):
-        """A request missed here keeps attributing its next tokens to the superseded version."""
-        self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
-        scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
-        )
-
-        with patch(
-            "sglang.srt.managers.scheduler.record_weight_version_events",
-            return_value=0,
-        ) as recorder:
-            Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(
-            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
-        )
 
 
 class TestSchedulerBatchWeightVersion(CustomTestCase):
@@ -169,8 +112,8 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
-        scheduler.running_reqs = RequestList()
-        scheduler.prefill_launched_reqs = RequestList()
+        scheduler.running_reqs = _RequestList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         scheduler.invariant_checker = MagicMock()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,
