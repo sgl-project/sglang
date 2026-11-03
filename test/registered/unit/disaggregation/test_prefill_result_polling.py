@@ -31,7 +31,10 @@ from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -175,8 +178,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.chunked_req = None
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
-        self.running_reqs = RequestList()
-        self.prefill_launched_reqs = RequestList()
+        self.running_reqs = _RequestList(ListKind.DECODING)
+        self.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
         self.invariant_checker = Mock()
         self.uocr_runtime = None
         self.waiting_queue = []
@@ -1262,8 +1265,8 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.dllm_config = None
-        self.running_reqs = RequestList()
-        self.prefill_launched_reqs = RequestList()
+        self.running_reqs = _RequestList(ListKind.DECODING)
+        self.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)

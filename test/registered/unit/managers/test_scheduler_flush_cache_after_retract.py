@@ -12,7 +12,10 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -60,7 +63,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
-        scheduler.prefill_launched_reqs = RequestList()
+        scheduler.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
         scheduler.running_reqs = []
         scheduler.dllm_config = None
         scheduler.disagg_prefill_bootstrap_queue = None

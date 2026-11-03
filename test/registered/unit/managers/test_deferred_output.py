@@ -18,7 +18,10 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -54,7 +57,7 @@ def _scheduler():
     scheduler.chunked_req = None
     scheduler.hisparse_coordinator = None
     scheduler.collect_inflight_reqs = lambda: set()
-    scheduler.prefill_launched_reqs = RequestList()
+    scheduler.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
     scheduler.running_reqs = []
     scheduler.dllm_config = None
     scheduler.disagg_prefill_bootstrap_queue = None

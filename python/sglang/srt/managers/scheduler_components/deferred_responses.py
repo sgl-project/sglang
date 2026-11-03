@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 
 if TYPE_CHECKING:
     from sglang.srt.managers.deferred_output import ResponseCompletion
@@ -36,8 +37,8 @@ class DeferredResponses:
     def held_reqs(self) -> List[Req]:
         return [req for req, _ in self.held.values()]
 
-    def request_lists(self) -> Dict[str, List[Req]]:
-        return {"deferred": self.held_reqs()}
+    def request_lists(self) -> Dict[ListKind, List[Req]]:
+        return {ListKind.DEFERRED: self.held_reqs()}
 
     def defer(self, req: Req, completion: ResponseCompletion) -> None:
         if self.disaggregation_mode != DisaggregationMode.NULL:

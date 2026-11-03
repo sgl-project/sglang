@@ -25,7 +25,18 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -288,7 +299,10 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -1369,11 +1383,11 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # Requests merged into a running batch, until they finish or a retract,
         # preemption or pause takes them out.
-        self.running_reqs = RequestList()
+        self.running_reqs = _RequestList(ListKind.DECODING)
         # Prefill requests out of the chunked slot whose launched steps their next
         # holder has not taken yet: the running batch at the merge, the PD
         # transfer queue, HiSparse staging, or a requeue.
-        self.prefill_launched_reqs = RequestList()
+        self.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -4666,24 +4680,24 @@ class Scheduler(
             if not req.finished()
         ]
 
-    def request_lists(self) -> Dict[str, List[Req]]:
-        """The lists that hold the live requests, by name. A request is in at
+    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
+        """The lists that hold the live requests, by kind. A request is in at
         most one."""
         lists = {
-            "waiting": self.waiting_queue,
-            "grammar": self.grammar_manager.grammar_queue,
-            "chunked": [] if self.chunked_req is None else [self.chunked_req],
-            "prefill_launched": list(self.prefill_launched_reqs),
-            "running": list(self.running_reqs),
+            ListKind.WAITING: self.waiting_queue,
+            ListKind.GRAMMAR: self.grammar_manager.grammar_queue,
+            ListKind.CHUNKED: [] if self.chunked_req is None else [self.chunked_req],
+            ListKind.PD_PREFILLING: self.prefill_launched_reqs,
+            ListKind.DECODING: self.running_reqs,
         }
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
-            lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
+            lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
         if self.disagg_prefill_transfer_queue is not None:
-            lists["prefill_transfer"] = self.disagg_prefill_transfer_queue
+            lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
             # Its staging queue is the part of this queue the current round runs.
-            lists["dllm"] = self.dllm_manager.waiting_queue
+            lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
         components = (
             self.disagg_decode_prealloc_queue,
             self.disagg_decode_transfer_queue,
@@ -5669,25 +5683,25 @@ class Scheduler(
 
         lists = self.request_lists()
         if for_health_check:
-            busy_lists = {"chunked", "waiting"}
+            busy_lists = {ListKind.CHUNKED, ListKind.WAITING}
             if not self._engine_paused:
-                busy_lists.add("decode_retracted")
+                busy_lists.add(ListKind.PD_RETRACTED)
         else:
             busy_lists = lists.keys() - {
                 # Their steps are counted through the batches above.
-                "running",
-                "prefill_launched",
+                ListKind.DECODING,
+                ListKind.PD_PREFILLING,
                 # Only its staging part is counted, above.
-                "dllm",
+                ListKind.DLLM,
                 # Held across a weight update, whose cache flush needs idle.
-                "decode_held",
+                ListKind.PD_HELD,
                 # Counted by uocr blocks_flush below.
-                "uocr_parked",
+                ListKind.UOCR_PARKED,
                 # Finished, and held only on the output rank; all ranks must agree.
-                "deferred",
+                ListKind.DEFERRED,
             }
         if ignore_waiting:
-            busy_lists.discard("waiting")
+            busy_lists.discard(ListKind.WAITING)
             # A PD-decode request waiting with its transferred KV still owns
             # its request row; a flush would free it.
             idle &= not any(r.kv.holds_kv for r in self.waiting_queue)

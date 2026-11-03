@@ -31,7 +31,10 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -95,7 +98,7 @@ def _empty_request_lists(s):
     s.waiting_queue = []
     s.grammar_manager = SimpleNamespace(grammar_queue=[])
     s.chunked_req = None
-    s.prefill_launched_reqs = RequestList()
+    s.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
     s.disagg_prefill_transfer_queue = None
     s.disagg_prefill_bootstrap_queue = None
     s.disagg_decode_prealloc_queue = None
@@ -113,7 +116,7 @@ def _empty_request_lists(s):
 def _scheduler():
     s = _Scheduler.__new__(_Scheduler)
     s.running_batch = ScheduleBatch(reqs=[])
-    s.running_reqs = RequestList()
+    s.running_reqs = _RequestList(ListKind.DECODING)
     s.invariant_checker = _invariant_checker(s)
     s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
@@ -167,7 +170,7 @@ def _launch(s, batch):
 class TestRequestList(CustomTestCase):
     def test_join_keeps_order_and_leaving_mid_iteration_is_safe(self):
         a, b, c, outsider = (_req(rid) for rid in "abcx")
-        running = RequestList()
+        running = _RequestList(ListKind.DECODING)
         running.join([a, b])
         running.join([c, b])
         _finish(b)
@@ -200,7 +203,7 @@ class TestRequestListsCheck(CustomTestCase):
         self.s.running_reqs.join([req])
         self.s.waiting_queue.append(req)
 
-        with self.assertRaisesRegex(RuntimeError, "a is in both waiting and running"):
+        with self.assertRaisesRegex(RuntimeError, "a is in both WAITING and DECODING"):
             self.check(ScheduleBatch(reqs=[]))
 
     def test_fails_a_launched_row_in_no_list(self):
@@ -319,7 +322,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.running_batch = running
         s.last_batch = None
-        s.running_reqs = RequestList()
+        s.running_reqs = _RequestList(ListKind.DECODING)
         s.running_reqs.join(running.reqs)
         s.disaggregation_mode = DisaggregationMode.NULL
         s.dllm_config = None

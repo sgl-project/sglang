@@ -90,6 +90,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_swa_tokens,
     kv_private_tokens,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.utils import GenerationBatchResult, is_war_barrier_enabled
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -1067,11 +1068,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
         return retracted, held
 
-    def request_lists(self) -> Dict[str, List[Req]]:
+    def request_lists(self) -> Dict[ListKind, List[Req]]:
         return {
-            "decode_prealloc": [decode_req.req for decode_req in self.queue],
-            "decode_retracted": self.retracted_queue,
-            "decode_held": self.held_rebootstrap_reqs,
+            ListKind.PD_PREALLOC: [decode_req.req for decode_req in self.queue],
+            ListKind.PD_RETRACTED: self.retracted_queue,
+            ListKind.PD_HELD: self.held_rebootstrap_reqs,
         }
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
@@ -2851,11 +2852,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
 
-    def request_lists(self) -> Dict[str, List[Req]]:
+    def request_lists(self) -> Dict[ListKind, List[Req]]:
         return {
-            "decode_transfer": [decode_req.req for decode_req in self.queue],
+            ListKind.PD_RECEIVING: [decode_req.req for decode_req in self.queue],
             # Aborted, with KV held until the transfer drains.
-            "decode_releasing": [
+            ListKind.PD_RELEASING: [
                 decode_req.req for decode_req, *_ in self._deferred_releases
             ],
         }
