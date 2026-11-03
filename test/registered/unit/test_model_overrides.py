@@ -2007,10 +2007,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
         """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
         and its speculative verify path is not."""
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         cases = [
             # (gfx950, MLA model, prefill backend, speculative algorithm, accepted)
@@ -2050,10 +2048,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_deterministic_aiter_prefill_only_on_gfx950_without_mla(self):
         """AITER prefill attention is accepted in deterministic mode only on gfx950,
         for non-MLA models, without speculative decoding and with a bf16 KV cache."""
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         cases = [
             # (gfx950, MLA model, speculative algorithm, KV cache dtype, accepted)
@@ -2095,8 +2091,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         """Deterministic AITER prefill puts prompt splits on its 128-row query tile:
         page size becomes 128 unless it is already a multiple, and a chunked-prefill
         size that is not a multiple of 128 is refused."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _deterministic_aiter_prefill_page_size,
         )
 
