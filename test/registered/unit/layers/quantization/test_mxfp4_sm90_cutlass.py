@@ -734,6 +734,7 @@ def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
     [
         (4, 4, 256, 256, 2),
         (16, 8, 768, 384, 2),
+        (16, 17, 768, 384, 2),  # two full repack chunks and a tail
         (256, 8, 1024, 1024, 4),
     ],
 )
@@ -792,7 +793,9 @@ def test_dsv4_apply_matches_flashinfer_direct(
     layer.moe_ep_rank = 0
     method.runner.config.layer = layer
 
+    weight_ptrs = (layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr())
     method.process_weights_after_loading(layer)
+    assert (layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr()) == weight_ptrs
 
     with get_context().override_server_args():
         out_sglang = method.apply(
@@ -808,6 +811,8 @@ def test_dsv4_apply_matches_flashinfer_direct(
     ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(
         w2.view(torch.uint8).contiguous(), "fp4"
     )
+    assert torch.equal(layer.w13_weight, ref_w13)
+    assert torch.equal(layer.w2_weight, ref_w2)
     ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(
         w13_s_u8, group_size=GROUP_SIZE
     )

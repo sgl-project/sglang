@@ -30,6 +30,16 @@ if TYPE_CHECKING:
 _GROUP_SIZE = 32
 
 
+def _interleave_mxfp4_weights_inplace(weight: torch.Tensor) -> torch.Tensor:
+    from flashinfer.fused_moe import interleave_moe_weights_for_sm90_mixed_gemm
+
+    weight = weight.view(torch.uint8).contiguous()
+    # Experts are independent: bound scratch to eight instead of a full layer.
+    for block in weight.split(8):
+        block.copy_(interleave_moe_weights_for_sm90_mixed_gemm(block, "fp4"))
+    return weight
+
+
 class Mxfp4FlashinferCutlassMoEMethod:
     """FlashInfer MXFP4 MoE: W4A16/W4A8 on SM90 and W4A8 on SM120."""
 
@@ -202,15 +212,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
             else:
                 from flashinfer.fused_moe import (
                     interleave_moe_scales_for_sm90_mixed_gemm,
-                    interleave_moe_weights_for_sm90_mixed_gemm,
                 )
 
-                w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
-                    layer.w13_weight.data.view(torch.uint8).contiguous(), "fp4"
-                )
-                w2_il = interleave_moe_weights_for_sm90_mixed_gemm(
-                    layer.w2_weight.data.view(torch.uint8).contiguous(), "fp4"
-                )
+                w13_il = _interleave_mxfp4_weights_inplace(layer.w13_weight.data)
+                w2_il = _interleave_mxfp4_weights_inplace(layer.w2_weight.data)
                 w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
                     w13_scale_u8, group_size=_GROUP_SIZE
                 )
@@ -231,7 +236,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 else "flashinfer_cutlass_sm90"
             )
         )
-        # SM90 creates full-size interleaved copies; release old layouts per layer.
+        # Release SM90 preprocessing scratch and old scale layouts per layer.
         if not self._use_mxfp8_act_scaling:
             torch.cuda.empty_cache()
 
