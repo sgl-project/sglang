@@ -303,13 +303,20 @@ def apply_fp8_w8a16_linear(
     the ``[out, in]`` weight, which keeps the scale multiply an O(M*N) pass
     over the output instead of an O(N*K) pass over the weight. The scale is
     applied in FP32 rather than rounded to ``x.dtype`` first, since FP8 values
-    are exact in bf16/fp16 but the scale itself is not.
+    are exact in bf16/fp16 but the scale itself is not. FP16 activations take
+    the scaled-weight path instead, because the unscaled GEMM could overflow.
     ``input_scale`` is intentionally unused.
     """
+    # Real loaders store weight_scale as [N, 1] (channelwise) or a scalar;
+    # flatten so it broadcasts against the trailing ``out`` dim of the output.
+    scale = layer.weight_scale.to(torch.float32).reshape(-1)
+    if x.dtype == torch.float16:
+        # FP16 has a narrow range: an unscaled GEMM can overflow to inf even
+        # when the scaled result is finite, so scale the weight beforehand.
+        weight = (layer.weight.t().to(torch.float32) * scale.view(-1, 1)).to(x.dtype)
+        return F.linear(x, weight, bias)
     weight = layer.weight.t().to(x.dtype)
-    output = F.linear(x, weight).to(torch.float32)
-    scale = layer.weight_scale.to(torch.float32)
-    output = output * scale
+    output = F.linear(x, weight).to(torch.float32) * scale
     output = output.to(x.dtype)
     if bias is not None:
         output = output + bias

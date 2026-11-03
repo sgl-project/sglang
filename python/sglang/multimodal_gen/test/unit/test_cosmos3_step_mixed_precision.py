@@ -304,6 +304,33 @@ class TestInstallAndDispatch(unittest.TestCase):
         )
         torch.testing.assert_close(out.float(), reference, rtol=0.05, atol=0.05)
 
+    def test_w8a16_loader_shaped_n1_scale(self):
+        # Real loaders (H100/B200) store weight_scale as [N, 1].
+        torch.manual_seed(0)
+        x = torch.randn(3, 8, dtype=torch.bfloat16)
+        scale = torch.rand(5, 1, dtype=torch.float32) * 0.1 + 0.95
+        w_fp8 = (torch.randn(5, 8) / 8 / scale).to(torch.float8_e4m3fn)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(w_fp8.t().contiguous(), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+
+        out = apply_fp8_w8a16_linear(layer, x, None)
+        reference = torch.nn.functional.linear(x.float(), w_fp8.float() * scale)
+        torch.testing.assert_close(out.float(), reference, rtol=0.05, atol=0.05)
+
+    def test_w8a16_fp16_does_not_overflow_before_scaling(self):
+        # K=512, x=1, w=256, scale=1/256 -> 512; the unscaled dot is 131072.
+        x = torch.ones(2, 512, dtype=torch.float16)
+        w_fp8 = torch.full((4, 512), 256.0).to(torch.float8_e4m3fn)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(w_fp8.t().contiguous(), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(
+            torch.full((4, 1), 1 / 256), requires_grad=False
+        )
+        out = apply_fp8_w8a16_linear(layer, x, None)
+        self.assertTrue(torch.isfinite(out).all())
+        torch.testing.assert_close(out.float(), torch.full((2, 4), 512.0))
+
     def test_install_wraps_hf_quant_config_variant(self):
         # The `modelopt_fp8` hf_quant_config path uses a different
         # ModelOptFp8LinearMethod class (modelopt_quant.py); the installer

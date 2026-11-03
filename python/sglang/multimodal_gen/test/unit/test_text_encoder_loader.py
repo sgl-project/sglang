@@ -252,6 +252,20 @@ def test_comfy_full_precision_nvfp4_unswizzles_scale_once_at_load():
     assert torch.equal(layer.weight_scale.data, swizzled)
 
 
+def test_comfy_nvfp4_matmul_path_skips_unswizzled_scale_copy():
+    # The scaled_mm_nvfp4 path reads swizzled scales only; it must not carry
+    # an extra unswizzled copy per layer.
+    method = ComfyNvfp4LinearMethod.__new__(ComfyNvfp4LinearMethod)
+    layer = nn.Module()
+    swizzled = torch.randint(0, 255, (128, 4), dtype=torch.uint8)
+    layer.weight_scale = nn.Parameter(swizzled, requires_grad=False)
+
+    method.process_weights_after_loading(layer)
+
+    assert "_weight_scale_linear" not in dict(layer.named_buffers())
+    assert torch.equal(layer.weight_scale.data, swizzled)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_comfy_scalar_embedding_matches_kitchen_kernel():
     pytest.importorskip("comfy_kitchen")

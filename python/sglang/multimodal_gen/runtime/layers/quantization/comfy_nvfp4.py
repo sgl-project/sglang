@@ -146,6 +146,11 @@ class ComfyNvfp4LinearMethod(ComfyFullPrecisionNvfp4LinearMethod):
         if quantize_nvfp4 is None or scaled_mm_nvfp4 is None:
             raise ImportError("Comfy NVFP4 matmul requires comfy-kitchen")
 
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        # scaled_mm_nvfp4 reads the swizzled scales directly; skip the
+        # parent's unswizzled copy, which this path never reads.
+        return
+
     def apply(self, layer: nn.Module, x: torch.Tensor, bias=None) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, shape[-1])
