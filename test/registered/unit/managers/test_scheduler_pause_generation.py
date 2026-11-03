@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
@@ -33,7 +33,10 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -98,8 +101,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
-        scheduler.running_reqs = RequestList()
-        scheduler.prefill_launched_reqs = RequestList()
+        scheduler.running_reqs = _RequestList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
@@ -128,7 +131,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
         scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue = None
+        scheduler.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.dllm_config = None
@@ -896,12 +899,18 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc_queue.scheduler = scheduler
         prealloc_queue.queue = []
-        prealloc_queue.retracted_queue = []
-        prealloc_queue.held_rebootstrap_reqs = []
+        prealloc_queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+        prealloc_queue.held_rebootstrap_reqs = _RequestList(
+            ListKind.PD_HELD, abort=prealloc_queue._abort_held
+        )
         prealloc_queue.add = MagicMock()
         scheduler.disagg_decode_prealloc_queue = prealloc_queue
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer_queue.queue = []
+        transfer_queue._deferred_releases = []
+        scheduler.disagg_decode_transfer_queue = transfer_queue
         scheduler.deferred_responses = MagicMock()
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
@@ -916,7 +925,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertIsInstance(aborted.finished_reason, FINISH_ABORT)
         self.assertIsNone(kept.finished_reason)
-        self.assertEqual(prealloc_queue.held_rebootstrap_reqs, [kept])
+        self.assertEqual(list(prealloc_queue.held_rebootstrap_reqs), [kept])
         scheduler.tree_cache.finish.assert_called_once()
         ((abort, sent_req), _) = scheduler.send_abort_output.call_args
         self.assertEqual((abort.rid, sent_req), ("aborted", aborted))
