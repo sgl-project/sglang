@@ -45,6 +45,8 @@ control endpoint. The SGLang workers import read-only GPU mappings and run the
 existing `engram_gather` kernel against them. Lookup IDs and rows do not pass
 through the control endpoint. The current compatible provider protocol is in
 [vLLM #64082](https://github.com/vllm-project/vllm/pull/64082).
+The complete four-GPU owner, P TP2, D TP2 and router launch recipe is in
+`examples/engram_shared/`, including a routed request.
 
 ```bash
 sglang serve --model-path /models/DeepSeek-V4.1-Flash --tp-size 2 \
@@ -65,7 +67,9 @@ control network. The control channel is not encrypted.
 During graceful shutdown SGLang synchronizes GPU work, unmaps its views and
 releases owner leases. The owner retains backing if a client loses control
 without detaching; establish that the consumer GPU context is gone before
-forcing owner teardown. The importer uses FABRIC handles so it is designed
+forcing owner teardown. Send SIGTERM to each SGLang launcher PID rather than
+the full process group so workers can detach in order. The importer uses
+FABRIC handles so it is designed
 for one NVLink/IMEX domain. Only same-host GB200 import and serving have been
 validated so far; a second host is required to qualify remote NVL72 reads.
 
