@@ -12,9 +12,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
-# DeepSeek-V4's vocabulary. On B200, FlashInfer gives a row different bits at 37 rows and
+# MiniCPM5-2B's vocabulary. On B200, FlashInfer gives a row different bits at 37 rows and
 # above than at fewer rows.
-VOCAB = 129280
+VOCAB = 130560
 ROWS_PER_REQUEST = 6
 
 
