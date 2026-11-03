@@ -70,8 +70,8 @@ def _warmup_eplb_communication(group):
         send = torch.zeros(1, dtype=torch.int32, device=get_device().device)
         recv = torch.empty((world_size, 1), dtype=torch.int32, device=send.device)
         dist.all_reduce(send, group=group)
-        # The group's first batch_isend_irecv must involve every rank. Warm all
-        # peer channels here so later migrations can safely skip idle ranks.
+        # Pre-initialize every peer channel before serving; later migrations
+        # may involve only ranks that actually send or receive weights.
         ops = []
         for peer in range(world_size):
             if peer != rank:
