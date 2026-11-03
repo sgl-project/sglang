@@ -29,7 +29,8 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
 from sglang.srt.models.unlimited_ocr_v2_support.window_params import KEY_KEEP
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import MultimodalDataItem, Req
+    from sglang.srt.managers.req_types import MultimodalDataItem
+    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +266,10 @@ class DocPrefetch:
     def held_count(self) -> int:
         """Follow-up windows held off the waiting queue."""
         return len(self._parked) + len(self._released)
+
+    def held_reqs(self) -> List[Req]:
+        """Follow-up windows held off the waiting queue, parked then released."""
+        return [*self._parked.values(), *self._released]
 
     def release_early(self, rid: str) -> None:
         """Free a window's early embeddings once it no longer needs them."""
