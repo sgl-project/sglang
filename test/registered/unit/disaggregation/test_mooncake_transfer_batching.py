@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
@@ -413,6 +414,53 @@ class TestDcpPackLifetime(CustomTestCase):
 
 
 class TestMooncakeEarlySend(CustomTestCase):
+    def test_sharded_cp_sends_every_logical_page_from_every_rank(self):
+        for cp_size, pages, chunk_size in ((2, 1, 1), (4, 1, 1), (4, 7, 3)):
+            for rank in range(cp_size):
+                with self.subTest(cp_size=cp_size, pages=pages, rank=rank):
+                    manager = SimpleNamespace(
+                        enable_all_cp_ranks_for_transfer=True,
+                        ring_cp_sharded=True,
+                        is_dummy_cp_rank=False,
+                        attn_cp_size=cp_size,
+                        attn_cp_rank=rank,
+                        add_transfer_request=MagicMock(),
+                    )
+                    sender = SimpleNamespace(
+                        kv_mgr=manager,
+                        bootstrap_room=1,
+                        aux_index=0,
+                        trace_ctx=MagicMock(),
+                        curr_idx=0,
+                        num_kv_indices=pages,
+                        _record_transfer_indices=MagicMock(),
+                    )
+                    sender._prepare_send_indices = lambda ids, state: (
+                        CommonKVSender._prepare_send_indices(sender, ids, state)
+                    )
+                    for start in range(0, pages, chunk_size):
+                        end = min(start + chunk_size, pages)
+                        ids = np.arange(start, end, dtype=np.int32) + 100
+                        with patch(
+                            "sglang.srt.disaggregation.common.conn.get_parallel",
+                            return_value=SimpleNamespace(
+                                enable_dsa_cache_layer_split=False
+                            ),
+                        ):
+                            MooncakeKVSender.send(sender, ids)
+                        args = manager.add_transfer_request.call_args.args
+                        np.testing.assert_array_equal(args[1], ids)
+                        self.assertEqual(args[2], slice(start, end))
+                        self.assertEqual(args[3], end == pages)
+
+    def setUp(self):
+        config = patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_disagg",
+            return_value=SimpleNamespace(disaggregation_require_bulk=False),
+        )
+        config.start()
+        self.addCleanup(config.stop)
+
     def test_sender_queues_event_once_without_waiting_on_scheduler(self):
         for last in (False, True):
             with self.subTest(last=last):
@@ -498,6 +546,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         manager = SimpleNamespace(
             enable_trace=False,
             enable_staging=False,
+            ring_cp_sharded=False,
             enable_deferred_decode_kv_release=True,
             _staging_outstanding=defaultdict(int),
             request_status={1: KVPoll.WaitingForInput},

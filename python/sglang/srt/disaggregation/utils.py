@@ -1562,6 +1562,9 @@ def setup_state_kv_args(
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
+    kv_args.state_cp_size = mamba_pool.cp_size if mamba_pool is not None else 1
+    kv_args.state_cp_rank = getattr(mamba_pool, "cp_rank", 0)
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []

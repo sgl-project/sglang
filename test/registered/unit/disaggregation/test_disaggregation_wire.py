@@ -1031,6 +1031,7 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager = object.__new__(CommonKVManager)
                 manager.attn_cp_size = cp_size
                 manager.attn_cp_rank = cp_rank
+                manager.kv_args = SimpleNamespace(state_cp_size=1)
                 with get_context().override_server_args(
                     enable_dsa_cache_layer_split=layer_split,
                     enable_cp_tp_group_sharing=sharing,
@@ -1045,6 +1046,7 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
         manager.attn_cp_size = 8
         manager.attn_cp_rank = 3
         manager.is_hybrid_mla_backend = False
+        manager.kv_args = SimpleNamespace(state_cp_size=1)
 
         with get_context().override_server_args(
             enable_dsa_cache_layer_split=False,
@@ -1053,6 +1055,29 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager._get_dsa_cache_transfer_skip_flags(None),
                 (False, True),
             )
+
+    def test_sharded_mamba_state_is_sent_by_its_owner(self):
+        for slot in range(1, 9):
+            with self.subTest(slot=slot):
+                senders = []
+                for rank in range(4):
+                    manager = object.__new__(MooncakeKVManager)
+                    manager.attn_cp_size = 4
+                    manager.attn_cp_rank = rank
+                    manager.is_hybrid_mla_backend = False
+                    manager.kv_args = SimpleNamespace(
+                        state_cp_size=4, state_cp_rank=rank
+                    )
+                    with get_context().override_server_args(
+                        enable_dsa_cache_layer_split=False,
+                        enable_cp_tp_group_sharing=False,
+                    ):
+                        _, skip_state = manager._get_dsa_cache_transfer_skip_flags(None)
+                    if not skip_state:
+                        indices = manager.local_mamba_state_indices([slot])
+                        if indices is not None:
+                            senders.append((rank, indices))
+                self.assertEqual(senders, [((slot - 1) % 4, [(slot - 1) // 4 + 1])])
 
 
 class TestQwen4StateWire(unittest.TestCase):

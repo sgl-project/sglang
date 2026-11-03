@@ -537,6 +537,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.enable_staging = bool(self.kv_manager.enable_staging)
+        self.transfer_queue.enable_staging = self.enable_staging
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 

@@ -73,6 +73,8 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
+    state_cp_size: int = 1
+    state_cp_rank: int = 0
     state_types: List[StateType]
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
@@ -141,6 +143,19 @@ class BaseKVManager(ABC):
         whose digest covers a different byte range, e.g. a TP width mismatch where
         each decode rank receives only a slice of what the sender digested."""
         return True
+
+    def local_mamba_state_indices(self, indices: List[int]) -> Optional[List[int]]:
+        """Map logical state slots on the owning sender; other CP ranks skip them."""
+        world = self.kv_args.state_cp_size
+        if world == 1:
+            return indices
+        if len(indices) != 1 or indices[0] <= 0:
+            raise ValueError(
+                "CP Mamba transfer requires one positive logical state slot"
+            )
+        if (indices[0] - 1) % world != self.kv_args.state_cp_rank:
+            return None
+        return [(indices[0] - 1) // world + 1]
 
     @abstractmethod
     def __init__(
