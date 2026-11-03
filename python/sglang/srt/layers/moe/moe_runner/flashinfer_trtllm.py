@@ -670,6 +670,10 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
     layer.trtllm_padded_hidden_size = (
         padded_hidden_size if padded_hidden_size != hidden_size else None
     )
+    layer.trtllm_fp4_layout_padded = (
+        w13_weight.shape != layer.w13_weight.shape
+        or w2_weight.shape != layer.w2_weight.shape
+    )
 
     (
         gemm1_weights_fp4_shuffled,
@@ -712,6 +716,105 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
 
     # Update intermediate_size_per_partition to reflect any padding applied
     layer.intermediate_size_per_partition = intermediate_size
+
+
+def _fp4_block_scale_interleave_sources(
+    shape: torch.Size, device: torch.device
+) -> torch.Tensor:
+    """Source position of every output byte of ``nvfp4_block_scale_interleave``.
+
+    The kernel only moves bytes, so running it on the bytes of each element's
+    flat index recovers the permutation without restating its layout here.
+    """
+    from flashinfer import nvfp4_block_scale_interleave
+
+    numel = shape.numel()
+    positions = torch.arange(numel, device=device, dtype=torch.int64)
+    sources = torch.zeros(numel, device=device, dtype=torch.int64)
+    shift = 0
+    while (numel - 1) >> shift:
+        plane = ((positions >> shift) & 0xFF).to(torch.uint8).view(shape)
+        moved = nvfp4_block_scale_interleave(plane).reshape(-1)
+        sources |= moved.to(torch.int64) << shift
+        shift += 8
+    if not torch.equal(sources.sort().values, positions):
+        raise RuntimeError(
+            f"nvfp4_block_scale_interleave is not a permutation for shape "
+            f"{tuple(shape)}; the TRT-LLM scale layout cannot be undone."
+        )
+    return sources
+
+
+def _inverse_permutation(indices: torch.Tensor) -> torch.Tensor:
+    if not torch.equal(
+        indices.sort().values,
+        torch.arange(indices.numel(), device=indices.device),
+    ):
+        raise RuntimeError(
+            "flashinfer TRT-LLM row permutation is not a bijection, so the "
+            "FP4 MoE layout cannot be undone for a weight update."
+        )
+    return torch.argsort(indices)
+
+
+def restore_fp4_moe_weights_from_flashinfer_trtllm(
+    layer: Module, cache_permute_indices: dict
+) -> None:
+    """Undo the shuffles of ``align_fp4_moe_weights_for_flashinfer_trtllm`` in place.
+
+    Every step is a byte permutation, so restoring and aligning again leaves
+    experts that a weight update does not rewrite bit-identical. Only for
+    layouts that needed no padding.
+    """
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    epilogue_tile_m = 128
+    is_gated = layer.moe_runner_config.is_gated
+    for weight_name, scale_name in (
+        ("w13_weight", "w13_weight_scale"),
+        ("w2_weight", "w2_weight_scale"),
+    ):
+        weight = getattr(layer, weight_name).data.view(torch.uint8)
+        scale = getattr(layer, scale_name).data.view(torch.uint8)
+        if weight_name == "w13_weight":
+            weight_indices = _maybe_get_cached_w3_w1_permute_indices(
+                cache_permute_indices,
+                weight[0],
+                epilogue_tile_m,
+                is_gated_act_gemm=is_gated,
+            )
+            scale_indices = _maybe_get_cached_w3_w1_permute_indices(
+                cache_permute_indices,
+                scale[0],
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+                is_gated_act_gemm=is_gated,
+            )
+        else:
+            weight_indices = get_w2_permute_indices_with_cache(
+                cache_permute_indices, weight[0], epilogue_tile_m
+            )
+            scale_indices = get_w2_permute_indices_with_cache(
+                cache_permute_indices, scale[0], epilogue_tile_m, num_elts_per_sf=16
+            )
+
+        inverse = _inverse_permutation(weight_indices.to(weight.device))
+        weight.copy_(weight[:, inverse])
+
+        sources_key = ("fp4_block_scale_interleave", tuple(scale.shape[1:]))
+        sources = cache_permute_indices.get(sources_key)
+        if sources is None:
+            sources = _fp4_block_scale_interleave_sources(scale[0].shape, scale.device)
+            cache_permute_indices[sources_key] = sources
+        permuted_rows = torch.empty_like(scale)
+        permuted_rows.view(scale.shape[0], -1)[:, sources] = scale.reshape(
+            scale.shape[0], -1
+        )
+        inverse = _inverse_permutation(scale_indices.to(scale.device))
+        scale.copy_(permuted_rows[:, inverse])
 
 
 def get_activation_type(activation: str, is_gated: bool = True) -> int:

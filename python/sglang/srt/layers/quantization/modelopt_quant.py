@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
     swizzle_blockscale,
+    unswizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
@@ -2845,6 +2846,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
+        w13_scales_rescaled = False
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             runner_config = layer.moe_runner_config
             is_situ = runner_config.activation == "situ"
@@ -2868,6 +2870,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     block_scales.copy_(
                         block_scales.float().mul_(ratios[:, :, None, None])
                     )
+                    w13_scales_rescaled = True
                     copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
                     copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
                 copy_or_rebind_param(
@@ -2973,6 +2976,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            # Rescaled E4M3 block scales cannot be recovered exactly.
+            if not w13_scales_rescaled and not layer.trtllm_fp4_layout_padded:
+                layer._fp4_moe_repack = "trtllm"
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -3051,6 +3057,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_blockscale_swizzled,
             )
 
+            if self.enable_flashinfer_cutlass_moe and not intermediate_size_pad:
+                layer._fp4_moe_repack = "cutlass"
+
             if self._is_cutedsl_v2_standard:
                 # CuteDSL v2 only: convert blockscales to MMA layout for
                 # CuteDslMoEWrapper.  The v1 (deepep) path uses the
@@ -3096,6 +3105,36 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Undo the in-place FP4 repack before a weight update.
+
+        `process_weights_after_loading` permutes weights and block scales in
+        place, so running it again on experts an update did not rewrite would
+        permute them twice. Restoring the checkpoint layout first keeps those
+        experts bit-identical.
+        """
+        repack = getattr(layer, "_fp4_moe_repack", None)
+        if repack is None or getattr(layer, "inference_moe_w13_interleaved", False):
+            return
+        layer._fp4_moe_repack = None
+        if repack == "trtllm":
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                restore_fp4_moe_weights_from_flashinfer_trtllm,
+            )
+
+            restore_fp4_moe_weights_from_flashinfer_trtllm(
+                layer, self._cache_permute_indices
+            )
+            return
+        for scale_name, swizzled_name in (
+            ("w13_weight_scale", "w13_blockscale_swizzled"),
+            ("w2_weight_scale", "w2_blockscale_swizzled"),
+        ):
+            scale = getattr(layer, scale_name)
+            # A separately allocated swizzled copy leaves the source scale intact.
+            if getattr(layer, swizzled_name, None) is scale:
+                scale.data.copy_(unswizzle_blockscale(scale.data))
 
     @property
     def load_up_proj_weight_first(self) -> bool:
