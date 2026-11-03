@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC
 from enum import Enum
 from typing import TYPE_CHECKING, Iterable, Optional
@@ -10,7 +11,11 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
@@ -18,6 +23,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.layers.cp.utils import CPAttentionLayout, CPQueryBatch
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -149,6 +155,9 @@ class AttentionBackend(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Return token-major K/V buffers and physical slots for a fused writer."""
         return None
+
+    def warmup(self, model_runner: ModelRunner):
+        """Prepare instance-owned resources before capture and serving."""
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
@@ -481,3 +490,300 @@ class AttentionBackend(ABC):
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
         return None
+
+    def _init_cp_attention(self, runner, *, packed_kv=False):
+        """Bind the attention backend to the pre-budgeted CP KV exchange."""
+        from sglang.srt.distributed import (
+            get_attn_cp_group,
+            get_moe_tensor_parallel_world_size,
+        )
+        from sglang.srt.layers.cp.utils import TokenExchangeStream
+
+        self.device = runner.device
+        self.token_to_kv_pool = runner.token_to_kv_pool
+        self.req_to_token_pool = runner.req_to_token_pool
+        self.kv_cache_dtype = runner.token_to_kv_pool.dtype
+        pool = getattr(runner.token_to_kv_pool, "full_kv_pool", runner.token_to_kv_pool)
+        if (
+            getattr(runner.token_to_kv_pool, "full_attention_cp_size", 1)
+            != get_attn_cp_group().world_size
+            or pool.page_size * get_attn_cp_group().world_size != runner.page_size
+        ):
+            raise ValueError("Sharded CP requires physically sharded KV storage")
+        self.cp_exchange = runner.cp_kv_exchange
+        if self.cp_exchange is None:
+            raise ValueError("CP KV workspace must be reserved before KV-pool sizing")
+        expected_dtype = runner.dtype if pool.dtype == torch.float8_e5m2 else pool.dtype
+        exchange = self.cp_exchange
+        if (
+            exchange.buffers.dtype != expected_dtype
+            or exchange.kv_heads != pool.head_num
+            or exchange.head_dim != pool.head_dim
+        ):
+            raise ValueError("Reserved CP workspace does not match the KV pool")
+        self.cp_packed_kv = packed_kv
+        self.forward_metadata = None
+        self.logged_execution = False
+        self.residual_exchange = None
+        self.prefill_cp_mode = (
+            "in-seq-split"
+            if get_parallel().cp_strategy in (None, "zigzag")
+            else "round-robin-split"
+        )
+        self.kv_index_translator = runner.kv_index_translator
+        self.max_context_len = runner.model_config.context_len
+        if get_moe_tensor_parallel_world_size() > 1:
+            self.residual_exchange = TokenExchangeStream(
+                group=get_attn_cp_group().device_group,
+                device=runner.device,
+            )
+
+    @staticmethod
+    def reserve_cp_kv_exchange(runner):
+        """Reserve transport and backend scratch before the KV-pool memory budget."""
+        from sglang.srt.distributed import get_attn_cp_group
+        from sglang.srt.layers.cp.utils import RingKVExchange
+
+        backend = (
+            get_exec().kernel.prefill_attention_backend
+            or get_exec().kernel.attention_backend
+        )
+        capability = torch.cuda.get_device_capability(runner.device)
+        expected = "fa3" if capability == (9, 0) else "trtllm_mha"
+        if capability not in ((9, 0), (10, 0), (10, 3)) or backend != expected:
+            raise ValueError(
+                "Sharded CP uses fa3 on Hopper and trtllm_mha on Blackwell"
+            )
+        heads = runner.model_config.get_num_attention_heads(get_parallel().attn_tp_size)
+        kv_heads = runner.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        head_dim = runner.model_config.head_dim
+        dtype = (
+            runner.dtype
+            if runner.kv_cache_dtype == torch.float8_e5m2
+            else runner.kv_cache_dtype
+        )
+        if head_dim not in (64, 128, 256) or kv_heads < 1 or heads % kv_heads:
+            raise ValueError(
+                "CP attention requires head_dim 64/128/256 and an integral GQA ratio"
+            )
+        if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError("CP attention requires BF16 or FP8 E4M3 computation")
+        if backend == "trtllm_mha":
+            from sglang.srt.layers.attention.trtllm_mha_backend import (
+                get_trtllm_workspace,
+                validate_cp_attention_support,
+            )
+
+            validate_cp_attention_support(
+                head_dim=head_dim, q_heads=heads, kv_heads=kv_heads, dtype=dtype
+            )
+            get_trtllm_workspace(runner.device)
+        return RingKVExchange.reserve(
+            group=get_attn_cp_group().device_group,
+            context_len=runner.model_config.context_len,
+            max_requests=get_schedule().max_running_requests,
+            cp_size=get_parallel().attn_cp_size,
+            q_heads=heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            device=runner.device,
+            dtype=dtype,
+            stream=torch.cuda.current_stream(),
+            transport=get_parallel().attn_cp_transport,
+        )
+
+    @profile_method("sglang.attention.prepare_cp_metadata")
+    def _init_cp_forward_metadata(self, forward_batch):
+        from sglang.srt.layers.cp.utils import (
+            ShardedContextParallelMetadata,
+            make_cp_attention_segments,
+        )
+
+        if forward_batch.forward_mode.is_idle():
+            forward_batch.prefill_cp_metadata = None
+            return
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            raise ValueError("Ring CP only supports eager prefill")
+        metadata = ShardedContextParallelMetadata.from_prefill(
+            forward_batch,
+            self.device,
+            cp_mode=self.prefill_cp_mode,
+            residual_exchange=self.residual_exchange,
+            previous=self.forward_metadata,
+        )
+        if metadata.layout.capacity > self.cp_exchange.capacity:
+            raise ValueError(
+                "Ring CP frame exceeds the startup workspace: "
+                f"active={metadata.layout.capacity}, reserved={self.cp_exchange.capacity}"
+            )
+        self.forward_metadata = metadata
+        forward_batch.prefill_cp_metadata = metadata
+        metadata.attention_segments = make_cp_attention_segments(
+            layout=metadata.layout,
+            rank=metadata.rank,
+            device=self.device,
+            packed_kv=self.cp_packed_kv,
+            needs_kv_descale=self.kv_cache_dtype == torch.float8_e4m3fn,
+        )
+        req_table = self.req_to_token_pool.req_to_token
+        metadata.kv_read_slots = torch.cat(
+            [
+                req_table[
+                    forward_batch.req_pool_indices[i : i + 1],
+                    metadata.rank : length : metadata.world,
+                ]
+                .reshape(-1)
+                .long()
+                // metadata.world
+                for i, length in enumerate(metadata.layout.seq_lens)
+            ]
+        )
+
+    @profile_method("sglang.attention.cp.forward")
+    def forward_cp(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        metadata = forward_batch.prefill_cp_metadata
+        q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+        pool = self.token_to_kv_pool
+        if save_kv_cache:
+            to_cache = metadata.route("attention", "kv")
+            local_kv = to_cache(torch.stack((k, v), dim=1))
+            write_slots = (
+                forward_batch.out_cache_loc.index_select(
+                    0, metadata.kv_write_indices
+                ).long()
+                // metadata.world
+            )
+            if write_slots.numel():
+                pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(write_slots, physical=True),
+                    local_kv[:, 0],
+                    local_kv[:, 1],
+                    layer.k_scale,
+                    layer.v_scale,
+                )
+        key = pool.get_key_buffer(layer.layer_id).index_select(
+            0, metadata.kv_read_slots
+        )
+        value = pool.get_value_buffer(layer.layer_id).index_select(
+            0, metadata.kv_read_slots
+        )
+        k_descale = v_descale = None
+        if pool.dtype == torch.float8_e4m3fn:
+            # Match TP FA3: cast Q without a Q scale, retain quantized K/V,
+            # and apply the cache's inverse scales inside the attention kernel.
+            q = q.to(pool.dtype)
+            if layer.k_scale is not None:
+                descale_shape = (
+                    metadata.attention_segments[0].cu_q.numel() - 1,
+                    layer.tp_k_head_num,
+                )
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+        elif pool.dtype == torch.float8_e5m2:
+            # FA3's native FP8 path supports E4M3; keep the existing E5M2
+            # cache conversion until the attention kernel supports that format.
+            key, value = key.to(q.dtype), value.to(q.dtype)
+            if layer.k_scale is not None:
+                key = key * layer.k_scale
+            if layer.v_scale is not None:
+                value = value * layer.v_scale
+        else:
+            q = q.to(pool.dtype)
+        if not self.logged_execution:
+            logger.info(
+                "RING_CP_EXECUTED rank=%d cp_size=%d q_heads=%d kv_heads=%d local_q=%d local_kv=%d cache_dtype=%s compute_dtype=%s",
+                metadata.rank,
+                metadata.world,
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                q.shape[0],
+                metadata.kv_read_slots.numel(),
+                self.kv_cache_dtype,
+                q.dtype,
+            )
+            self.logged_execution = True
+        output, _ = self._forward_cp_attention(
+            q=q,
+            local_kv=torch.stack((key, value)),
+            layout=metadata.layout,
+            segments=metadata.attention_segments,
+            scale=layer.scaling,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        return output.flatten(1)
+
+    @torch.inference_mode()
+    def _forward_cp_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        local_kv: torch.Tensor,
+        layout: CPAttentionLayout,
+        segments: tuple[CPQueryBatch, ...],
+        scale: float | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.layers.attention.merge_state import merge_state
+
+        exchange = self.cp_exchange
+        if (
+            layout.world_size != exchange.world
+            or layout.capacity > exchange.buffers.shape[2]
+        ):
+            raise ValueError("Ring layout exceeds its workspace")
+        if q.shape[0] != len(layout.query_indices[exchange.rank]):
+            raise ValueError("Queries must follow the local CP query layout")
+        expected_kv = (
+            2,
+            sum(layout.kv_lens[exchange.rank]),
+            *exchange.buffers.shape[3:],
+        )
+        if (
+            local_kv.shape != expected_kv
+            or local_kv.dtype != exchange.buffers.dtype
+            or local_kv.device != exchange.buffers.device
+        ):
+            raise ValueError("KV must contain only this rank's packed cache shard")
+        if (
+            q.dtype != local_kv.dtype
+            or q.shape[-1] != local_kv.shape[-1]
+            or q.shape[1] % local_kv.shape[2]
+        ):
+            raise ValueError("Incompatible Q/KV dtype, head dimension or GQA ratio")
+        # Pack once for all ring steps; restore the public query order once.
+        q = q.index_select(0, segments[0].query_indices)
+        output = torch.zeros_like(q, dtype=torch.float32)
+        lse = torch.full(q.shape[:2], -torch.inf, device=q.device, dtype=torch.float32)
+        scale = q.shape[-1] ** -0.5 if scale is None else scale
+        for owner, kv in exchange.shards(local_kv, active_tokens=layout.capacity):
+            if q.shape[0]:
+                partial, partial_lse = self._forward_cp_shard(
+                    q=q,
+                    kv=kv,
+                    segments=segments[owner],
+                    scale=scale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                merge_state(
+                    prefix_output=output,
+                    prefix_lse=lse,
+                    suffix_output=partial,
+                    suffix_lse=partial_lse,
+                    output=output,
+                    output_lse=lse,
+                )
+        restore = segments[0].restore_indices
+        # FP8 FA3 returns BF16, just as on the TP backend. Accumulate ring
+        # contributions and LSE in FP32, then round only the final output.
+        output_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+        return output.to(output_dtype).index_select(0, restore), lse.index_select(
+            0, restore
+        )

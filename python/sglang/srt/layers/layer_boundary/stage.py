@@ -183,6 +183,41 @@ class StageBoundary:
             Compute input in the selected read's format (possibly quantized).
             Updates forward_batch.residual_stream with the resulting residual.
         """
+        if (
+            forward_batch.prefill_cp_metadata is not None
+            and self.declaration.cp_layout is not None
+        ):
+            from sglang.srt.layers.layer_boundary.prepare import (
+                prepare_sharded_cp_attention,
+                prepare_sharded_cp_ffn,
+            )
+
+            stream = stream_of(forward_batch)
+            if self.kind is StageKind.ATTENTION:
+                if (
+                    call.get("capture") is not None
+                    or call.get("capture_gathered") is not None
+                ):
+                    raise ValueError(
+                        "Sharded CP does not support auxiliary hidden-state capture"
+                    )
+                return prepare_sharded_cp_attention(
+                    hidden_states,
+                    stream,
+                    forward_batch,
+                    self.norm,
+                    layout=self.declaration.cp_layout,
+                    quant_format=call.get("quant_format", ""),
+                    post_residual_addition=call.get("post_residual_addition"),
+                )
+            return prepare_sharded_cp_ffn(
+                hidden_states,
+                stream,
+                forward_batch,
+                self.norm,
+                next_layout=self.declaration.cp_next_layout,
+                defer_cp_residual=self.declaration.sparse,
+            )
         if cache is not None:
             call["cache"] = cache
         prepare = (

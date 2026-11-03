@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
@@ -481,6 +482,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
         return indices.clamp(0, query_start_loc[-1] - 1)
 
+    @profile_method("sglang.mamba.prepare_state_tracking")
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -1428,6 +1430,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.update_verify_buffers_to_fill_after_draft(
                 spec_info=spec_info, cuda_graph_bs=cuda_graph_bs
             )
+
+    def warmup(self, model_runner: ModelRunner):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.warmup(model_runner)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():

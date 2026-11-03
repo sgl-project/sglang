@@ -393,6 +393,22 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+    if decode in ("flashqla", "flashqla_cp") or verify in ("flashqla", "flashqla_cp"):
+        raise ValueError(
+            "FlashQLA is prefill-only; select --linear-attn-prefill-backend"
+        )
+    if prefill in ("flashqla", "flashqla_cp"):
+        if cfg.enable_deterministic_inference:
+            raise ValueError(
+                "FlashQLA prefill does not support deterministic inference"
+            )
+        declare_resolution(
+            server_args,
+            "flashqla_prefill",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
     cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (

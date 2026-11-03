@@ -86,6 +86,10 @@ def should_run_flashinfer_autotune(
         # Sharded P pools only implement logical-page extend; warm them through
         # real extend batches until the dummy owns a rotation-aware allocation.
         return False
+    from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+
+    if is_sharded_cp_enabled():
+        return False
     if get_exec().kernel.disable_flashinfer_autotune:
         return False
     if get_exec().deterministic.enable_deterministic_inference:

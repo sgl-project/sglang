@@ -94,6 +94,86 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     return {}
 
 
+def _resolve_sharded_hybrid_cp(server_args):
+    """Validate physical KV/state sharding before selecting the existing CP layout."""
+    import torch
+
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    cfg = resolving_view(server_args)
+    active = (
+        cfg.attn_cp_size > 1
+        and cfg.linear_attn_prefill_backend == "flashqla_cp"
+        and not cfg.encoder_only
+    )
+    if cfg.enable_mxfp4_mega and (not active or cfg.moe_a2a_backend != "megamoe"):
+        raise ValueError(
+            "--enable-mxfp4-mega requires sharded CP and --moe-a2a-backend megamoe"
+        )
+    if not active:
+        return
+    config = model_config_of(server_args)
+    ep = cfg.tp_size if cfg.moe_a2a_backend == "deepep" else cfg.ep_size
+    if (
+        config.hf_config.architectures[0] != "Qwen3_5MoeForConditionalGeneration"
+        or cfg.attn_cp_size != cfg.tp_size
+        or cfg.dp_size != 1
+        or cfg.attn_dp_size != 1
+        or cfg.pp_size != 1
+        or cfg.moe_dp_size != 1
+        or cfg.dcp_size != 1
+        or cfg.disaggregation_mode != "prefill"
+        or not (
+            (ep == 1 and cfg.moe_a2a_backend == "none")
+            or (ep == cfg.tp_size and cfg.moe_a2a_backend in ("deepep", "megamoe"))
+        )
+    ):
+        raise ValueError(
+            "Sharded CP requires Qwen3.5 MoE PD prefill, CP=TP>=2, DP=PP=MoE-DP=1, and TP experts or pure EP with DeepEP/MegaMoE"
+        )
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "mooncake_tcp"):
+        raise ValueError("Sharded CP KV transfer requires Mooncake")
+    if config.is_multimodal and not cfg.language_only:
+        raise ValueError(
+            "Sharded CP multimodal prefill requires --language-only; inline vision encoding is unsupported"
+        )
+    if (
+        cfg.speculative_algorithm is not None
+        or cfg.enable_lora
+        or cfg.enable_hierarchical_cache
+        or cfg.enable_pdmux
+        or cfg.enable_unified_memory
+        or cfg.enable_int8_mamba_checkpoint
+        or cfg.enable_linear_replayssm
+        or cfg.enable_memory_saver
+        or not cfg.page_size
+        or cfg.page_size % cfg.attn_cp_size
+        or config.dtype != torch.bfloat16
+        or not cfg.max_running_requests
+    ):
+        raise ValueError(
+            "Sharded CP requires BF16, a page size divisible by CP, explicit max-running-requests, and ordinary KV/Mamba pools without speculation, LoRA, HiCache, PD-mux or state compression"
+        )
+    prefill = attention_backends_of(cfg)[0]
+    if prefill not in ("fa3", "trtllm_mha"):
+        raise ValueError("Sharded CP uses fa3 on Hopper or trtllm_mha on Blackwell")
+    if prefill == "fa3" and cfg.kv_cache_dtype == "fp8_e5m2":
+        raise ValueError("FlashAttention3 does not support fp8_e5m2")
+    if cfg.decode_attention_backend not in (None, prefill):
+        raise ValueError(
+            "Sharded CP prefill does not use a separate decode attention backend"
+        )
+    graph = cfg.cuda_graph_config
+    for phase in Phase.ALL:
+        graph = with_phase(graph, phase, backend=Backend.DISABLED)
+    declare_resolution(
+        server_args,
+        "sharded_hybrid_cp",
+        attention_backend=prefill,
+        cuda_graph_config=graph,
+    )
+
+
 def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
@@ -101,6 +181,7 @@ def handle_context_parallelism(server_args: Any):
     # own qualified NPU/MUSA build would still hit the original rejection
     # at this later, nested call.
     run_hook(validate_prefill_cp_platform, server_args)
+    _resolve_sharded_hybrid_cp(server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:

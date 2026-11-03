@@ -257,7 +257,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
-from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks, enable_nvtx_ranges
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -1019,6 +1019,29 @@ class ModelRunner:
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
+        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+
+        self.cp_kv_exchange = None
+        if is_sharded_cp_enabled():
+            from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+            from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+                warmup_context_parallel,
+            )
+
+            warmup_context_parallel(self)
+            self.cp_kv_exchange = AttentionBackend.reserve_cp_kv_exchange(self)
+        if get_exec().moe.enable_mxfp4_mega:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+            from sglang.srt.layers.moe.sm90_mxfp4_mega import warmup_experts
+
+            for module in self.model.modules():
+                if isinstance(module, FusedMoE):
+                    warmup_experts(
+                        module,
+                        device=torch.device(self.device),
+                        dtype=self.dtype,
+                        context_len=self.model_config.context_len,
+                    )
         self.init_kv_cache_configurator(draft_parallel_layout)
         expert_slots = None
         if get_exec().moe.enable_paged_experts and (
@@ -1409,6 +1432,7 @@ class ModelRunner:
         )
 
         # Register model for layerwise NVTX profiling if enabled
+        enable_nvtx_ranges(get_exec().comm.enable_layerwise_nvtx_marker)
         if get_exec().comm.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
@@ -1989,6 +2013,7 @@ class ModelRunner:
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             return
+        pool.mamba_pool.synchronize()
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
@@ -2021,6 +2046,7 @@ class ModelRunner:
                     state_ids.ids(forward_batch.mamba_cow_src_indices),
                     state_ids.ids(forward_batch.mamba_cow_dst_indices),
                 )
+        pool.mamba_pool.synchronize()
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class TboAttnBackend(AttentionBackend):
@@ -48,6 +49,11 @@ class TboAttnBackend(AttentionBackend):
             primary=creator(),
             children=[creator() for _ in range(2)],
         )
+
+    def warmup(self, model_runner: ModelRunner):
+        self.primary.warmup(model_runner)
+        for child in self.children:
+            child.warmup(model_runner)
 
     def _children_use_cuda_graph(self) -> bool:
         """Whether the TBO child backends participate in CUDA-graph capture/replay.

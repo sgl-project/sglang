@@ -621,3 +621,133 @@ def _tp_all_reduce_with_scattered_residual(
     scattered_states += residual
     residual = tensor_model_parallel_all_reduce(hidden_states)
     return read.read(residual, norm)
+
+
+def prepare_sharded_cp_attention(
+    hidden_states,
+    stream,
+    forward_batch,
+    norm,
+    *,
+    layout,
+    quant_format="",
+    post_residual_addition=None,
+):
+    """Move a hybrid CP residual and contribution onto the consumer's token rows."""
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+    hidden_states = stream.complete(hidden_states)
+    hidden_states, residual = stream.input(hidden_states)
+    metadata = forward_batch.prefill_cp_metadata
+    destination = metadata.layout_names[layout]
+    row_indices = None
+    fuse_reorder_norm = (
+        hidden_states.is_cuda
+        and hidden_states.ndim == 2
+        and residual is not None
+        and residual.shape == hidden_states.shape
+        and residual.dtype == hidden_states.dtype
+        and hidden_states.stride(1) == residual.stride(1) == 1
+        and isinstance(norm, GemmaRMSNorm)
+        and not norm.is_torch_compile
+    )
+    if metadata.pending_residual is not None:
+        target, pending = metadata.pending_residual
+        if target != destination or metadata.current != destination:
+            raise ValueError("Prefetched residual does not match the next layer")
+        residual = pending.wait()
+        metadata.pending_residual = None
+    if metadata.current is None:
+        plan = metadata.gather_scatter_plans[destination]
+        indices = plan.reduce_indices.narrow(
+            0, metadata.rank * plan.padded_rows, plan.local_rows
+        )
+        if fuse_reorder_norm:
+            row_indices = indices
+        else:
+            hidden_states = hidden_states.index_select(0, indices)
+            if residual is not None:
+                residual = residual.index_select(0, indices)
+    elif metadata.current != destination:
+        plan = metadata.exchange_plan(metadata.current, destination)
+        fuse_reorder_norm = fuse_reorder_norm and not plan.restore_identity
+        hidden_states = plan.apply(hidden_states, restore_order=not fuse_reorder_norm)
+        if residual is not None:
+            residual = plan.apply(residual, restore_order=not fuse_reorder_norm)
+        if fuse_reorder_norm:
+            row_indices = plan.restore_indices
+    metadata.current = destination
+    forward_batch.num_token_non_padded = metadata.local_token_count(
+        row_indices.numel() if row_indices is not None else hidden_states.shape[0]
+    )
+    if post_residual_addition is not None or quant_format:
+        raise ValueError("Ring CP does not support fused residual/quant additions")
+    if row_indices is not None:
+        hidden_states, residual = norm(hidden_states, residual, row_indices=row_indices)
+    elif residual is None:
+        residual = hidden_states
+        if hidden_states.shape[0]:
+            hidden_states = norm(hidden_states)
+    elif hidden_states.shape[0]:
+        hidden_states, residual = norm(hidden_states, residual)
+    stream.write(residual)
+    return hidden_states
+
+
+def prepare_sharded_cp_ffn(
+    hidden_states,
+    stream,
+    forward_batch,
+    norm,
+    *,
+    next_layout=None,
+    defer_cp_residual=False,
+):
+    """Normalize local rows and gather only the operand required by TP experts."""
+    from sglang.srt.layers.layer_boundary.row_transport import (
+        launch_cp_residual_exchange,
+    )
+
+    hidden_states = stream.complete(hidden_states)
+    hidden_states, residual = stream.input(hidden_states)
+    if hidden_states.shape[0]:
+        hidden_states, residual = norm(hidden_states, residual)
+    metadata = forward_batch.prefill_cp_metadata
+    if metadata.moe_tp:
+        # Norm and residual remain local; TP experts need all real rows.
+        # TP experts preserve rank order; RS writes the next attention layout.
+        metadata.mlp_destination = metadata.current
+        residual_plan = None
+        if metadata.residual_exchange is not None and next_layout is not None:
+            destination = metadata.layout_names[next_layout]
+            if destination != metadata.current:
+                if (
+                    metadata.pending_residual is not None
+                    or metadata.queued_residual is not None
+                ):
+                    raise RuntimeError("Previous residual exchange was not consumed")
+                metadata.mlp_destination = destination
+                if residual is not None:
+                    residual_plan = metadata.exchange_plan(
+                        metadata.current, destination
+                    )
+        hidden_states = metadata.token_collectives().gather(
+            hidden_states, rank_ordered=True
+        )
+        if residual_plan is not None:
+            # This event opens the MoE compute window, including shared experts.
+            # The model submits the exchange after enqueueing shared/routing
+            # kernels, but keeps this GPU boundary. Waiting on its later compute
+            # stream would miss the shared GEMMs or serialize behind the experts.
+            ready = torch.cuda.current_stream(residual.device).record_event()
+            metadata.queued_residual = (
+                metadata.mlp_destination,
+                residual_plan,
+                residual,
+                ready,
+            )
+            if not defer_cp_residual:
+                launch_cp_residual_exchange(metadata)
+        forward_batch.num_token_non_padded = metadata.total_non_padded
+    stream.write(residual)
+    return hidden_states

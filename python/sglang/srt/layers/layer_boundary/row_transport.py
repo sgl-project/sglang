@@ -159,3 +159,38 @@ class TransportExit:
 
     def _record(self, output):
         return self.stream.record(output, self.update)
+
+
+def launch_cp_residual_exchange(metadata):
+    """Submit at the model's compute window, before its output collective."""
+    if metadata.queued_residual is None:
+        return
+    destination, plan, residual, ready = metadata.queued_residual
+    pending = metadata.residual_exchange.submit(plan, residual, ready=ready)
+    metadata.pending_residual = (destination, pending)
+    metadata.queued_residual = None
+
+
+def finish_sharded_cp_ffn(hidden_states, residual, *, forward_batch):
+    """Complete the TP sum while returning rows for the next hybrid layer."""
+    metadata = forward_batch.prefill_cp_metadata
+    if metadata.moe_tp:
+        if metadata.queued_residual is not None:
+            raise RuntimeError(
+                "Deferred residual exchange missed its MoE compute window"
+            )
+        destination = metadata.mlp_destination
+        if destination is not None and destination != metadata.current:
+            hidden_states = metadata.moe_output_plans[
+                metadata.current, destination
+            ].apply(hidden_states)
+            metadata.current = destination
+        else:
+            hidden_states = metadata.token_collectives().reduce_scatter(
+                hidden_states, rank_ordered=True
+            )
+        metadata.mlp_destination = None
+        forward_batch.num_token_non_padded = metadata.local_token_count(
+            hidden_states.shape[0]
+        )
+    return hidden_states, residual

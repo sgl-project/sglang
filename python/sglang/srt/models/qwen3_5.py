@@ -54,6 +54,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_gather_full_sequence_states,
+    cp_shard_position_ids,
+    is_sharded_cp_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -248,8 +253,28 @@ def _qwen3_5_stage_facts(
     quantized input its projection takes."""
     sparse = _qwen3_5_is_moe(config)
     return (
-        declare_attn(read=attn_read),
-        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+        declare_attn(
+            read=attn_read,
+            cp_layout=(
+                "attention"
+                if config.layers_block_type[layer_id] == "attention"
+                else "contiguous"
+            )
+            if is_sharded_cp_enabled()
+            else None,
+        ),
+        declare_ffn(
+            sparse=sparse,
+            next_layer_sparse=sparse,
+            cp_layout="current" if is_sharded_cp_enabled() else None,
+            cp_next_layout=(
+                "attention"
+                if config.layers_block_type[layer_id + 1] == "attention"
+                else "contiguous"
+            )
+            if is_sharded_cp_enabled() and layer_id + 1 < config.num_hidden_layers
+            else None,
+        ),
     )
 
 
@@ -981,6 +1006,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        if (
+            forward_batch.prefill_cp_metadata is not None
+            and hidden_states.shape[0] == 0
+        ):
+            raw = hidden_states.new_empty((0, self.conv_dim))
+            gates = hidden_states.new_empty((0, self.num_v_heads))
+            self.attn(forward_batch, mixed_qkv=raw, a=gates, b=gates)
+            return hidden_states
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -1206,7 +1239,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-        if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        # Empty CP shards still enter attention to keep collective order aligned.
+        if not forward_batch.forward_mode.is_idle() and (
+            hs.shape[0] > 0 or forward_batch.prefill_cp_metadata is not None
+        ):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1618,6 +1654,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        if forward_batch.prefill_cp_metadata is not None:
+            positions = cp_shard_position_ids(positions, forward_batch)
+            if hidden_states.shape[0] == 0:
+                q = hidden_states.new_empty((0, self.num_heads * self.head_dim))
+                k = v = hidden_states.new_empty((0, self.num_kv_heads * self.head_dim))
+                self.attn(q, k, v, forward_batch)
+                return hidden_states
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,
@@ -1654,7 +1697,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-        if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        # Empty CP shards still enter attention to keep collective order aligned.
+        if not forward_batch.forward_mode.is_idle() and (
+            hs.shape[0] > 0 or forward_batch.prefill_cp_metadata is not None
+        ):
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1981,6 +2027,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
             skip_empty=True,
         )
+
+        if forward_batch.prefill_cp_metadata is not None:
+            hidden_states = cp_gather_full_sequence_states(hidden_states, forward_batch)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

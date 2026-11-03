@@ -344,6 +344,8 @@ class StageDeclaration:
     attn_tp_gather: Optional[Callable] = None
     sum_impl: Optional[SumImplementation] = None
     row_transport: Optional[RowTransport] = None
+    cp_layout: Optional[str] = None
+    cp_next_layout: Optional[str] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -442,6 +444,8 @@ def declare_attn(
     in_token_order=False,
     sum_impl=None,
     row_transport=None,
+    cp_layout=None,
+    cp_next_layout=None,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -489,6 +493,8 @@ def declare_attn(
         in_token_order=in_token_order,
         sum_impl=sum_impl,
         row_transport=row_transport,
+        cp_layout=cp_layout,
+        cp_next_layout=cp_next_layout,
     )
 
 
@@ -504,6 +510,8 @@ def declare_ffn(
     output_complete=False,
     sum_impl=None,
     row_transport=None,
+    cp_layout=None,
+    cp_next_layout=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -538,6 +546,8 @@ def declare_ffn(
         output_complete=output_complete,
         sum_impl=sum_impl,
         row_transport=row_transport,
+        cp_layout=cp_layout,
+        cp_next_layout=cp_next_layout,
     )
 
 

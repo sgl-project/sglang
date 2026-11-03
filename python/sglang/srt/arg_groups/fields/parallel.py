@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Optional
+from typing import Literal, Optional
 
 import msgspec
 
@@ -154,6 +154,13 @@ class Parallel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    attn_cp_transport: A[
+        Literal["nccl", "symm_rma"],
+        Arg(
+            help="KV exchange transport for sharded CP full attention.",
+            choices=["nccl", "symm_rma"],
+        ),
+    ] = "nccl"
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the compute strategy with --cp-strategy.",
