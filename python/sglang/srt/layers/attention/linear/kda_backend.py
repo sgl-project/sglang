@@ -429,7 +429,7 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]":
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         kernel = self.effective_extend_kernel(
             kwargs.get("lower_bound"), q.shape[1], query_start_loc.numel() - 1
         )

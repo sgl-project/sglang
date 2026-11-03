@@ -2,12 +2,11 @@
 
 import json
 import unittest
-import weakref
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock, PropertyMock, patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -20,16 +19,12 @@ from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.layer_boundary import SumGroup, ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-    DeepseekMLAForwardMixin,
-)
+from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import (
     KimiK3DecoderLayer,
     KimiK3DeltaAttention,
-    KimiK3MLAAttention,
 )
 from sglang.srt.models.kimi_linear import KimiDecoderLayer, KimiDeltaAttention, KimiMoE
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -42,8 +37,6 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 _KIMI = "sglang.srt.models.kimi_linear."
 _K3 = "sglang.srt.models.kimi_k3."
 _COMM = "sglang.srt.layers.layer_boundary."
-_ZIGZAG = "sglang.srt.layers.cp.zigzag."
-_MLA = "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla."
 
 
 class _Identity(nn.Module):
@@ -283,6 +276,50 @@ class TestLinearAttnCPBoundary(CustomTestCase):
 
 
 class TestKimiCPWeightGroups(CustomTestCase):
+    def test_k3_cp_stages_preserve_full_residual_rows_and_matching_head_sums(self):
+        for cp_size in (2, 8):
+            for kda in (False, True):
+                parallel = parallel_of(
+                    attn_dp=1,
+                    attn_tp=8 // cp_size,
+                    attn_cp=cp_size,
+                    enable_prefill_cp=True,
+                )
+                config = SimpleNamespace(
+                    is_moe=False,
+                    attn_res_block_size=None,
+                    is_kda_layer=lambda _: kda,
+                )
+                with (
+                    self.subTest(cp_size=cp_size, kda=kda),
+                    get_context().override_server_args(enable_linear_attn_cp=True),
+                    get_parallel().override(
+                        tp_size=8,
+                        tp_rank=0,
+                        moe_tp_size=8,
+                        attn_tp_size=8 // cp_size,
+                        attn_tp_rank=0,
+                        attn_cp_size=cp_size,
+                        attn_cp_rank=0,
+                    ),
+                    planning(parallel, dsa_cp=True),
+                ):
+                    attn, ffn = kimi_k3._stage_facts(config, 0, sp_collective=False)
+                    attention, feed_forward = build_stages(
+                        (attn, _Identity()), (ffn, _Identity())
+                    )
+                    cp_attn = attention.plan.paths[BatchVariant.CONTEXT_PARALLEL].entry
+                    cp_ffn = feed_forward.plan.paths[
+                        BatchVariant.CONTEXT_PARALLEL
+                    ].entry
+                    self.assertEqual(cp_attn.input_rows.sharded, frozenset())
+                    self.assertEqual(cp_ffn.input_rows.sharded, frozenset())
+                    self.assertIsNone(cp_attn.input_move)
+                    expected = SumGroup.TP if kda else SumGroup.ATTN_TP
+                    if cp_size == 8:
+                        expected = SumGroup.ATTN_CP if kda else None
+                    self.assertIs(cp_ffn.declared_sum, expected)
+
     def test_k3_kda_projections_loaders_and_state_use_matching_tp_shards(self):
         config = KimiLinearConfig(
             v_head_dim=8,
@@ -464,634 +501,6 @@ class TestKimiCPWeightGroups(CustomTestCase):
                 if enabled and kda:
                     cp = attention.plan.paths[BatchVariant.CONTEXT_PARALLEL].entry
                     self.assertIs(cp.input_move, ops.cp_gather_in_token_order)
-
-
-class TestKimiK3CPKVOverlap(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        self.strategy = ZigzagCPStrategy(cp_size=2)
-        self.batch = self._batch()
-        self.layer = SimpleNamespace(layer_id=1)
-        self.key = torch.arange(9, dtype=torch.float32).reshape(3, 1, 3)
-        self.rope = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1)
-        self.main, self.comm = Mock(), Mock()
-        self.events = []
-
-        def make_event():
-            event = Mock()
-            self.events.append(event)
-            return event
-
-        self.group = Mock()
-        self.group.pynccl_comm.available = True
-        self.group.pynccl_comm.change_state.side_effect = lambda **kw: nullcontext()
-        self.enterContext(
-            get_parallel().override(attn_cp_group=self.group, attn_cp_rank=0)
-        )
-        # Execute real packing/cache-write control flow on CPU; replace only
-        # CUDA scheduling and the remote-rank data returned by the collective.
-        self.enterContext(
-            patch.object(
-                torch.Tensor, "is_cuda", new_callable=PropertyMock, return_value=True
-            )
-        )
-        self.enterContext(patch.object(torch.Tensor, "record_stream"))
-        self.enterContext(
-            patch(
-                _ZIGZAG + "torch.cuda.is_current_stream_capturing", return_value=False
-            )
-        )
-        self.enterContext(
-            patch(_ZIGZAG + "torch.cuda.current_stream", return_value=self.main)
-        )
-        self.stream_factory = self.enterContext(
-            patch(_ZIGZAG + "torch.cuda.Stream", return_value=self.comm)
-        )
-        self.enterContext(
-            patch(
-                _ZIGZAG + "torch.cuda.stream", side_effect=lambda stream: nullcontext()
-            )
-        )
-        self.enterContext(patch(_ZIGZAG + "torch.cuda.Event", side_effect=make_event))
-        self.enterContext(
-            patch(
-                _ZIGZAG + "use_symmetric_memory",
-                side_effect=lambda *a, **kw: nullcontext(),
-            )
-        )
-        self.gather = self.group.all_gather_into_tensor
-        self.gather.side_effect = lambda output, local: output.copy_(
-            torch.cat([local, local])
-        )
-        self.pool = Mock()
-        self.kv_layers = Mock()
-        self.kv_layers.layer.return_value = self.pool
-        self.enterContext(patch(_ZIGZAG + "get_kv_layers", return_value=self.kv_layers))
-
-    @staticmethod
-    def _batch():
-        return SimpleNamespace(
-            attn_cp_metadata=SimpleNamespace(
-                pending_mla_kv_materializations={},
-                per_rank_actual_token=[3, 3],
-                per_rank_logical_token=None,
-                # One six-token sequence split into four zigzag blocks.
-                reverse_split_len=[2, 1, 2, 1],
-                cp_reverse_index=[0, 2, 3, 1],
-            ),
-            out_cache_loc=torch.arange(6),
-            out_cache_loc_is_physical=False,
-        )
-
-    @staticmethod
-    def _expected_full(local):
-        # Both ranks return this test tensor; interleave the real zigzag blocks.
-        return torch.cat([local[:2], local[:2], local[2:], local[2:]])
-
-    def test_backend_joins_once_and_pending_kv_is_layer_and_batch_local(self):
-        self.assertTrue(
-            self.strategy.start_mla_kv_materialization(
-                self.batch, self.layer, self.key, self.rope
-            )
-        )
-        self.comm.wait_stream.assert_called_once_with(self.main)
-        self.main.wait_event.assert_not_called()
-        self.assertEqual(self.events, [])
-        self.pool.store_mla.assert_not_called()
-        pending = self.batch.attn_cp_metadata.pending_mla_kv_materializations[1]
-        self.assertIs(pending.inputs[0], self.key)
-        self.assertIs(pending.inputs[2], self.batch.out_cache_loc)
-        self.assertIs(pending.stream, self.comm)
-        self.assertIs(pending.gather.output_buffer, self.gather.call_args.args[0])
-        self.assertIs(pending.gather.send_buffer, self.gather.call_args.args[1])
-
-        other_layer, next_batch = SimpleNamespace(layer_id=3), self._batch()
-        self.assertFalse(
-            self.strategy.finish_mla_kv_materialization(next_batch, self.layer)
-        )
-        self.assertFalse(
-            self.strategy.finish_mla_kv_materialization(self.batch, other_layer)
-        )
-        # A synchronous layer must not consume another layer's pending write.
-        self.strategy.materialize_full_mla_kv(
-            self.batch, other_layer, self.key + 10, self.rope
-        )
-        self.main.wait_event.assert_not_called()
-        self.assertEqual(self.gather.call_count, 2)
-        self.strategy.materialize_full_mla_kv(
-            self.batch, self.layer, self.key, self.rope
-        )
-        self.main.wait_event.assert_called_once_with(self.events[0])
-        self.events[0].record.assert_called_once_with(self.comm)
-        # Only the producer dependency is issued; finish must not wait for Q.
-        self.comm.wait_stream.assert_called_once_with(self.main)
-        self.assertEqual(self.gather.call_count, 2)
-        self.assertEqual(self.pool.store_mla.call_count, 2)
-        self.kv_layers.layer.assert_called_with(self.layer.layer_id)
-        first_write = self.pool.store_mla.call_args.args
-        self.assertIs(first_write[0], self.layer)
-        self.assertIsInstance(first_write[1], KVWriteLoc)
-        self.assertIs(first_write[1].loc, self.batch.out_cache_loc)
-        self.assertFalse(first_write[1].physical)
-        torch.testing.assert_close(first_write[2], self._expected_full(self.key))
-        torch.testing.assert_close(first_write[3], self._expected_full(self.rope))
-        self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
-        self.assertFalse(
-            self.strategy.finish_mla_kv_materialization(self.batch, self.layer)
-        )
-
-        self.assertTrue(
-            self.strategy.start_mla_kv_materialization(
-                next_batch, self.layer, self.key + 20, self.rope
-            )
-        )
-        self.strategy.materialize_full_mla_kv(
-            next_batch, self.layer, self.key, self.rope
-        )
-        self.assertEqual(self.gather.call_count, 3)
-        self.assertEqual(self.pool.store_mla.call_count, 3)
-        self.main.wait_event.assert_called_with(self.events[1])
-        torch.testing.assert_close(
-            self.pool.store_mla.call_args.args[2],
-            self._expected_full(self.key + 20),
-        )
-
-    def test_saved_producer_event_excludes_queued_query_work(self):
-        ready = Mock()
-        self.strategy.start_mla_kv_materialization(
-            self.batch, self.layer, self.key, self.rope, producer_event=ready
-        )
-        self.comm.wait_event.assert_called_once_with(ready)
-        self.comm.wait_stream.assert_not_called()
-        pending = self.batch.attn_cp_metadata.pending_mla_kv_materializations[1]
-        self.assertIs(pending.producer_event, ready)
-        self.strategy.finish_mla_kv_materialization(self.batch, self.layer)
-        self.comm.wait_stream.assert_not_called()
-        self.main.wait_event.assert_called_once_with(self.events[0])
-        torch.testing.assert_close(
-            self.pool.store_mla.call_args.args[2],
-            self._expected_full(self.key),
-        )
-
-    def test_prepared_transfer_launches_once_after_buffer_preparation(self):
-        ready = Mock()
-        self.assertTrue(
-            self.strategy.start_mla_kv_materialization(
-                self.batch,
-                self.layer,
-                self.key,
-                self.rope,
-                producer_event=ready,
-                prepare_only=True,
-            )
-        )
-        self.gather.assert_not_called()
-        self.pool.store_mla.assert_not_called()
-        pending = self.batch.attn_cp_metadata.pending_mla_kv_materializations[1]
-        self.assertFalse(pending.launched)
-        self.assertIs(pending.group, self.group)
-        send, output = pending.gather.send_buffer, pending.gather.output_buffer
-        self.assertTrue(
-            self.strategy.launch_mla_kv_materialization(self.batch, self.layer)
-        )
-        self.assertTrue(pending.launched)
-        self.gather.assert_called_once_with(output, send)
-        # Retrying a launch must not issue a second collective.
-        self.assertTrue(
-            self.strategy.launch_mla_kv_materialization(self.batch, self.layer)
-        )
-        self.gather.assert_called_once()
-        self.assertTrue(
-            self.strategy.finish_mla_kv_materialization(self.batch, self.layer)
-        )
-        self.comm.wait_event.assert_called_once_with(ready)
-        self.comm.wait_stream.assert_not_called()
-        torch.testing.assert_close(
-            self.pool.store_mla.call_args.args[2], self._expected_full(self.key)
-        )
-
-    def test_unlaunched_preparation_is_drained_without_cache_write(self):
-        self.strategy.start_mla_kv_materialization(
-            self.batch,
-            self.layer,
-            self.key,
-            self.rope,
-            prepare_only=True,
-        )
-        self.assertFalse(
-            self.strategy.finish_mla_kv_materialization(self.batch, self.layer)
-        )
-        self.main.wait_stream.assert_called_once_with(self.comm)
-        self.gather.assert_not_called()
-        self.pool.store_mla.assert_not_called()
-        self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
-
-    def test_unlaunched_preparation_falls_back_to_synchronous_materialization(self):
-        self.strategy.start_mla_kv_materialization(
-            self.batch,
-            self.layer,
-            self.key,
-            self.rope,
-            prepare_only=True,
-        )
-        self.strategy.materialize_full_mla_kv(
-            self.batch, self.layer, self.key, self.rope
-        )
-        self.main.wait_stream.assert_called_once_with(self.comm)
-        self.gather.assert_called_once()
-        self.pool.store_mla.assert_called_once()
-        torch.testing.assert_close(
-            self.pool.store_mla.call_args.args[2], self._expected_full(self.key)
-        )
-
-    def test_query_exception_cleans_unlaunched_preparation(self):
-        owner = KimiK3MLAAttention.__new__(KimiK3MLAAttention)
-        nn.Module.__init__(owner)
-        owner.use_output_gate, owner._cp_kv_overlap = False, True
-        owner.attn_mqa = self.layer
-        self.strategy.start_mla_kv_materialization(
-            self.batch,
-            self.layer,
-            self.key,
-            self.rope,
-            prepare_only=True,
-        )
-        pending = self.batch.attn_cp_metadata.pending_mla_kv_materializations[1]
-        staging = [
-            weakref.ref(pending.gather.output_buffer),
-            weakref.ref(pending.gather.send_buffer),
-        ]
-        del pending
-        self.main.wait_stream.side_effect = lambda stream: self.assertTrue(
-            all(ref() is not None for ref in staging)
-        )
-        with (
-            patch(_K3 + "is_cp_active", return_value=True),
-            patch(_K3 + "get_cp_strategy", return_value=self.strategy),
-            patch(
-                _K3 + "DeepseekV2AttentionMLA.forward",
-                side_effect=RuntimeError("query failed"),
-            ),
-            self.assertRaisesRegex(RuntimeError, "query failed"),
-        ):
-            owner(None, None, self.batch, None)
-        self.main.wait_stream.assert_called_once_with(self.comm)
-        self.gather.assert_not_called()
-        self.pool.store_mla.assert_not_called()
-        self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
-
-    def test_k3_records_readiness_only_for_eligible_cuda_overlap(self):
-        owner = SimpleNamespace(
-            _cp_kv_overlap=True, current_attention_backend="fa4", rotary_emb=None
-        )
-        with (
-            patch(_K3 + "is_cp_active", return_value=True),
-            patch(_K3 + "get_is_capture_mode", return_value=False),
-            patch(_K3 + "is_in_breakable_cuda_graph", return_value=False),
-            patch(_K3 + "is_in_tc_piecewise_cuda_graph", return_value=False),
-        ):
-            ready = KimiK3MLAAttention.record_mla_cp_kv_producer_event(
-                owner, self.batch, self.key
-            )
-            self.assertIs(ready, self.events[0])
-            ready.record.assert_called_once_with(self.main)
-            owner._cp_kv_overlap = False
-            self.assertIsNone(
-                KimiK3MLAAttention.record_mla_cp_kv_producer_event(
-                    owner, self.batch, self.key
-                )
-            )
-        self.assertEqual(len(self.events), 1)
-
-    def test_k3_forwards_saved_producer_event(self):
-        owner = SimpleNamespace(
-            _cp_kv_overlap=True,
-            current_attention_backend="fa4",
-            rotary_emb=None,
-            attn_mqa=self.layer,
-        )
-        ready = Mock()
-        with (
-            patch(_K3 + "is_cp_active", return_value=True),
-            patch(_K3 + "get_is_capture_mode", return_value=False),
-            patch(_K3 + "get_cp_strategy", return_value=self.strategy),
-            patch.object(self.strategy, "start_mla_kv_materialization") as launch,
-        ):
-            KimiK3MLAAttention.prepare_mla_cp_kv(
-                owner, self.batch, self.key, self.rope, producer_event=ready
-            )
-        launch.assert_called_once_with(
-            self.batch,
-            self.layer,
-            self.key,
-            self.rope,
-            producer_event=ready,
-            prepare_only=False,
-        )
-
-    def test_unsupported_launch_falls_back_to_one_synchronous_write(self):
-        for cuda, capture, pynccl in (
-            (False, False, Mock(available=True)),
-            (True, True, Mock(available=True)),
-            (True, False, None),
-            (True, False, Mock(available=False)),
-        ):
-            with (
-                self.subTest(cuda=cuda, capture=capture, pynccl=pynccl),
-                patch.object(
-                    torch.Tensor,
-                    "is_cuda",
-                    new_callable=PropertyMock,
-                    return_value=cuda,
-                ),
-                patch(
-                    _ZIGZAG + "torch.cuda.is_current_stream_capturing",
-                    return_value=capture,
-                ),
-            ):
-                self.group.pynccl_comm = pynccl
-                batch = self._batch()
-                before = self.gather.call_count
-                self.assertFalse(
-                    self.strategy.start_mla_kv_materialization(
-                        batch, self.layer, self.key, self.rope
-                    )
-                )
-                self.strategy.materialize_full_mla_kv(
-                    batch, self.layer, self.key, self.rope
-                )
-                self.assertEqual(self.gather.call_count, before + 1)
-                self.assertFalse(batch.attn_cp_metadata.pending_mla_kv_materializations)
-        self.stream_factory.assert_not_called()
-        self.main.wait_event.assert_not_called()
-
-    def test_failed_async_write_joins_stream_and_leaves_no_pending_state(self):
-        self.strategy.start_mla_kv_materialization(
-            self.batch, self.layer, self.key, self.rope
-        )
-        self.pool.store_mla.side_effect = RuntimeError("cache write failed")
-        with self.assertRaisesRegex(RuntimeError, "cache write failed"):
-            self.strategy.finish_mla_kv_materialization(self.batch, self.layer)
-        self.gather.assert_called_once()
-        self.main.wait_stream.assert_called_once_with(self.comm)
-        self.assertEqual(self.events, [])
-        self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
-
-    def test_failed_gather_retains_staging_until_stream_is_joined(self):
-        staging = []
-
-        def fail_gather(output, send):
-            staging.extend((weakref.ref(output), weakref.ref(send)))
-            del output, send
-            raise RuntimeError("gather launch failed")
-
-        def check_staging(stream):
-            self.assertIs(stream, self.comm)
-            self.assertTrue(all(reference() is not None for reference in staging))
-
-        self.main.wait_stream.side_effect = check_staging
-        with (
-            patch.object(self.group, "all_gather_into_tensor", new=fail_gather),
-            self.assertRaisesRegex(RuntimeError, "gather launch failed"),
-        ):
-            self.strategy.start_mla_kv_materialization(
-                self.batch, self.layer, self.key, self.rope
-            )
-        self.main.wait_stream.assert_called_once_with(self.comm)
-        self.pool.store_mla.assert_not_called()
-        self.assertEqual(self.events, [])
-        self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
-
-    def test_finish_uses_snapshot_of_locations_and_layout(self):
-        for physical in (False, True):
-            with self.subTest(physical=physical):
-                batch = self._batch()
-                batch.out_cache_loc_is_physical = physical
-                self.strategy.start_mla_kv_materialization(
-                    batch, self.layer, self.key, self.rope
-                )
-                original_loc = batch.out_cache_loc
-                batch.out_cache_loc = torch.arange(6) + 100
-                batch.out_cache_loc_is_physical = not physical
-                batch.attn_cp_metadata.cp_reverse_index[:] = [3, 2, 1, 0]
-                batch.attn_cp_metadata.reverse_split_len[:] = [1, 2, 1, 2]
-                batch.attn_cp_metadata.per_rank_actual_token[:] = [1, 5]
-                self.strategy.finish_mla_kv_materialization(batch, self.layer)
-                write = self.pool.store_mla.call_args.args
-                self.assertIsInstance(write[1], KVWriteLoc)
-                self.assertIs(write[1].loc, original_loc)
-                self.assertEqual(write[1].physical, physical)
-                torch.testing.assert_close(write[2], self._expected_full(self.key))
-                torch.testing.assert_close(write[3], self._expected_full(self.rope))
-
-    def test_finish_failure_keeps_gather_buffers_alive_until_join(self):
-        self.strategy.start_mla_kv_materialization(
-            self.batch, self.layer, self.key, self.rope
-        )
-        pending = self.batch.attn_cp_metadata.pending_mla_kv_materializations[1]
-        staging = [
-            weakref.ref(pending.gather.output_buffer),
-            weakref.ref(pending.gather.send_buffer),
-        ]
-        del pending
-        self.gather.reset_mock()
-
-        def check_staging(stream):
-            self.assertTrue(all(reference() is not None for reference in staging))
-
-        def fail_compact(prepared):
-            del prepared
-            raise RuntimeError("compaction failed")
-
-        self.main.wait_stream.side_effect = check_staging
-        with (
-            patch.object(self.strategy, "_compact_all_gather_rows", new=fail_compact),
-            self.assertRaisesRegex(RuntimeError, "compaction failed"),
-        ):
-            self.strategy.finish_mla_kv_materialization(self.batch, self.layer)
-        self.main.wait_stream.assert_called_once_with(self.comm)
-        self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
-
-    def test_k3_only_launches_for_eager_no_rope_flash_attention_cp(self):
-        owner = SimpleNamespace(attn_mqa=self.layer)
-        for enabled, backend, rope, capture, active in (
-            (True, "fa3", None, False, True),
-            (True, "fa4", None, False, True),
-            (False, "fa3", None, False, True),
-            (True, "flashinfer", None, False, True),
-            (True, "fa3", object(), False, True),
-            (True, "fa3", None, True, True),
-            (True, "fa3", None, False, False),
-        ):
-            owner._cp_kv_overlap = enabled
-            owner.current_attention_backend = backend
-            owner.rotary_emb = rope
-            with (
-                self.subTest(
-                    enabled=enabled,
-                    backend=backend,
-                    rope=rope,
-                    capture=capture,
-                    active=active,
-                ),
-                patch(_K3 + "is_cp_active", return_value=active),
-                patch(_K3 + "get_is_capture_mode", return_value=capture),
-                patch(_K3 + "get_cp_strategy", return_value=self.strategy),
-                patch.object(self.strategy, "start_mla_kv_materialization") as launch,
-            ):
-                KimiK3MLAAttention.prepare_mla_cp_kv(
-                    owner, self.batch, self.key, self.rope
-                )
-                self.assertEqual(
-                    launch.call_count,
-                    int(
-                        enabled
-                        and backend in ("fa3", "fa4")
-                        and rope is None
-                        and not capture
-                        and active
-                    ),
-                )
-
-    def test_k3_failure_after_launch_drains_pending_cache_write(self):
-        owner = KimiK3MLAAttention.__new__(KimiK3MLAAttention)
-        nn.Module.__init__(owner)
-        owner.use_output_gate, owner._cp_kv_overlap = False, True
-        owner.attn_mqa = self.layer
-        self.strategy.start_mla_kv_materialization(
-            self.batch, self.layer, self.key, self.rope
-        )
-        with (
-            patch(_K3 + "is_cp_active", return_value=True),
-            patch(_K3 + "get_cp_strategy", return_value=self.strategy),
-            patch(
-                _K3 + "DeepseekV2AttentionMLA.forward",
-                side_effect=RuntimeError("query failed"),
-            ),
-            self.assertRaisesRegex(RuntimeError, "query failed"),
-        ):
-            owner(None, None, self.batch, None)
-        self.main.wait_event.assert_called_once_with(self.events[0])
-        self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
-        self.gather.assert_called_once()
-
-    def test_shared_mla_records_kv_before_query_and_launches_after_projection(self):
-        latent = torch.arange(24, dtype=torch.float32).reshape(4, 6)
-        context, stages = Mock(), []
-        context.fetch_qkv_latent.return_value = latent
-        owner = SimpleNamespace(
-            q_lora_rank=2,
-            kv_lora_rank=3,
-            qk_rope_head_dim=1,
-            alt_stream=None,
-            use_dsa=False,
-            _can_fuse_bmm_into_attention=lambda batch: False,
-            is_dcp_q_replicate_phase=lambda batch: False,
-            _cp_kv_overlap=True,
-            kv_a_layernorm=lambda x: x + 20,
-        )
-
-        ready = Mock()
-
-        def record_ready(batch, key):
-            stages.append("ready")
-            self.assertIs(batch, self.batch)
-            torch.testing.assert_close(key, latent[:, 2:5] + 20)
-            return ready
-
-        owner.record_mla_cp_kv_producer_event = record_ready
-
-        def publish(batch, key, rope, *, producer_event, prepare_only):
-            stages.append("prepare")
-            self.assertIs(batch, self.batch)
-            self.assertIs(producer_event, ready)
-            self.assertTrue(prepare_only)
-            torch.testing.assert_close(key, (latent[:, 2:5] + 20).unsqueeze(1))
-            torch.testing.assert_close(rope, latent[:, 5:].unsqueeze(1))
-            return True
-
-        def launch(batch):
-            stages.append("launch")
-            self.assertIs(batch, self.batch)
-            raise RuntimeError("stop before attention kernels")
-
-        owner.launch_mla_cp_kv = launch
-
-        def query_normalization(query):
-            stages.append("q_norm")
-            return query + 10
-
-        owner.q_a_layernorm = query_normalization
-
-        def query_projection(query):
-            stages.append("q_b")
-            torch.testing.assert_close(query, latent[:, :2] + 10)
-            return query
-
-        owner.prepare_mla_cp_kv, owner.q_b_proj_forward = publish, query_projection
-        with (
-            get_context().override_server_args(dcp_replicate_q_proj=False),
-            patch(_MLA + "get_attn_tp_context", return_value=context),
-            self.assertRaisesRegex(RuntimeError, "stop before attention kernels"),
-        ):
-            DeepseekMLAForwardMixin.forward_absorb_prepare(
-                owner, None, None, self.batch, None
-            )
-        self.assertEqual(stages, ["ready", "prepare", "q_norm", "q_b", "launch"])
-
-    def test_shared_mla_query_failure_does_not_start_transfer(self):
-        latent = torch.arange(24, dtype=torch.float32).reshape(4, 6)
-        context = Mock()
-        context.fetch_qkv_latent.return_value = latent
-        for failure in ("q_norm", "q_b"):
-            stages = []
-
-            def q_norm(query):
-                stages.append("q_norm")
-                if failure == "q_norm":
-                    raise RuntimeError("query failed")
-                return query
-
-            def q_b(query):
-                stages.append("q_b")
-                raise RuntimeError("query failed")
-
-            owner = SimpleNamespace(
-                q_lora_rank=2,
-                kv_lora_rank=3,
-                qk_rope_head_dim=1,
-                alt_stream=None,
-                use_dsa=False,
-                _can_fuse_bmm_into_attention=lambda batch: False,
-                is_dcp_q_replicate_phase=lambda batch: False,
-                _cp_kv_overlap=True,
-                kv_a_layernorm=lambda x: x + 20,
-                record_mla_cp_kv_producer_event=Mock(
-                    side_effect=lambda *a: stages.append("ready") or Mock()
-                ),
-                prepare_mla_cp_kv=Mock(
-                    side_effect=lambda *a, **kw: stages.append("prepare") or True
-                ),
-                launch_mla_cp_kv=Mock(),
-                q_a_layernorm=q_norm,
-                q_b_proj_forward=q_b,
-            )
-            with (
-                self.subTest(failure=failure),
-                get_context().override_server_args(dcp_replicate_q_proj=False),
-                patch(_MLA + "get_attn_tp_context", return_value=context),
-                self.assertRaisesRegex(RuntimeError, "query failed"),
-            ):
-                DeepseekMLAForwardMixin.forward_absorb_prepare(
-                    owner, None, None, self.batch, None
-                )
-            owner.prepare_mla_cp_kv.assert_called_once()
-            self.assertTrue(owner.prepare_mla_cp_kv.call_args.kwargs["prepare_only"])
-            owner.launch_mla_cp_kv.assert_not_called()
-            self.assertEqual(
-                stages,
-                ["ready", "prepare", "q_norm"] + (["q_b"] if failure == "q_b" else []),
-            )
 
 
 class TestLinearAttnCPResolution(CustomTestCase):

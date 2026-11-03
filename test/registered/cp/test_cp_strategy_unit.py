@@ -615,69 +615,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(torch.equal(helper_x, expected_x))
             self.assertTrue(torch.equal(helper_positions, expected_positions))
 
-    def test_zigzag_balanced_gather_reuses_collective_output(self):
-        # Include physical alignment padding: the collective only transports
-        # the equal logical rows, so its output still needs no compaction.
-        for logical, physical in ((None, [3, 3]), ([3, 3], [4, 4])):
-            with self.subTest(logical=logical, physical=physical):
-                meta = SimpleNamespace(
-                    per_rank_logical_token=logical,
-                    per_rank_actual_token=physical,
-                )
-                fb = SimpleNamespace(attn_cp_metadata=meta)
-                expected = torch.arange(12).view(6, 2)
-                local = torch.full((physical[0], 2), -1, dtype=expected.dtype)
-                local[:3] = expected[:3]
-                group = Mock()
-                collective_output = []
-
-                def gather(output, input_tensor):
-                    self.assertTrue(torch.equal(input_tensor, expected[:3]))
-                    output.copy_(expected)
-                    collective_output.append(output)
-
-                group.all_gather_into_tensor.side_effect = gather
-                with get_parallel().override(attn_cp_rank=0, attn_cp_group=group):
-                    result = ZigzagCPStrategy(cp_size=2)._all_gather_reorganized(
-                        local, fb
-                    )
-
-                self.assertTrue(torch.equal(result, expected))
-                self.assertIs(result, collective_output[0])
-
-    def test_zigzag_unequal_gather_compacts_rank_padding(self):
-        for logical, physical in ((None, [3, 2]), ([3, 2], [4, 4])):
-            with self.subTest(logical=logical, physical=physical):
-                meta = SimpleNamespace(
-                    per_rank_logical_token=logical,
-                    per_rank_actual_token=physical,
-                )
-                fb = SimpleNamespace(attn_cp_metadata=meta)
-                # A sentinel in rank 1's collective padding must disappear.
-                payload = torch.arange(18).view(6, 1, 3)
-                payload[-1].fill_(-1)
-                expected = payload[:5]
-                local = torch.full((physical[1], 1, 3), -2, dtype=payload.dtype)
-                local[:2] = payload[3:5]
-                group = Mock()
-                collective_output = []
-
-                def gather(output, input_tensor):
-                    self.assertTrue(torch.equal(input_tensor[:2], payload[3:5]))
-                    self.assertEqual(input_tensor.shape[0], 3)
-                    self.assertEqual(torch.count_nonzero(input_tensor[2]).item(), 0)
-                    output.copy_(payload)
-                    collective_output.append(output)
-
-                group.all_gather_into_tensor.side_effect = gather
-                with get_parallel().override(attn_cp_rank=1, attn_cp_group=group):
-                    result = ZigzagCPStrategy(cp_size=2)._all_gather_reorganized(
-                        local, fb
-                    )
-
-                self.assertTrue(torch.equal(result, expected))
-                self.assertNotEqual(result.data_ptr(), collective_output[0].data_ptr())
-
     def test_zigzag_gathers_hidden_states_to_original_order(self):
         cp_size = 4
         seq_lens = [11, 13]
