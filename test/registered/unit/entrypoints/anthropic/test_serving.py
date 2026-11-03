@@ -210,6 +210,22 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(converted.routed_dp_rank, 3)
         self.assertEqual(converted.disagg_prefill_dp_rank, 2)
 
+    def test_messages_preserves_cache_salt_through_native_conversion(self):
+        for stream in (False, True):
+            for overrides, expected in (
+                ({}, None),
+                ({"cache_salt": None}, None),
+                ({"cache_salt": ""}, ""),
+                ({"cache_salt": "tenant-a"}, "tenant-a"),
+                ({"cache_salt": "tenant-b"}, "tenant-b"),
+            ):
+                with self.subTest(stream=stream, cache_salt=expected):
+                    request = self._anthropic_request(stream=stream, **overrides)
+                    converted = self._serving()._convert_to_chat_completion_request(
+                        request
+                    )
+                    self.assertEqual(converted.cache_salt, expected)
+
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
             [

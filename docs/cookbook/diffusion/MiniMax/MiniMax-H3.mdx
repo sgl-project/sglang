@@ -808,6 +808,57 @@ SGLang projects those adapter factors onto the pruned coordinates at load time.
 A structurally modified checkpoint without that metadata still fails closed,
 and packed GGUF weights remain incompatible with LoRA.
 
+### Pika H3 Flex: six-step adapters
+
+[Pika-Labs/Pika-H3-Flex](https://huggingface.co/Pika-Labs/Pika-H3-Flex) is
+MiniMax-H3 plus two FP32 PEFT LoRA adapters (rank/alpha 128): `fl2va` for the
+FL2VA partition (`t2va`, `fl2va`) and `ref2va` for the Ref2VA partition. The
+adapters were post-trained for a fixed six-step sampler: knots
+`1000/750/500/250/100/40`, shifted per modality (video 12, audio 3), with a
+re-noising update. Each step predicts x0 and then re-noises it to the next
+sigma with fresh noise. Pika notes that generic six-step Euler is not
+equivalent, so do not serve these files through the `--lora-path` recipe
+above.
+
+Pass the repository directly to `--model-path`. Its registered model overlay
+downloads only the two adapters (about 5.5 GB) and checks their sha256 against
+Pika's manifests. It then links the base `FL2VA/` and `Ref2VA/` partitions
+from `MiniMaxAI/MiniMax-H3` at the revision the adapters pin, so an existing
+MiniMax-H3 download is reused. The matching adapter loads at startup, and
+`model_index.json` turns on the six-step re-noising schedule. There,
+`stochastic_sampling` requires `dmd_denoising_steps`, which carries the
+knots. The adapter stays unmerged (`--lora-merge-mode dynamic`) unless a merge
+mode is passed: a BF16 merge rounds away about a third of its update.
+
+```bash Command
+# t2va / fl2va
+sglang serve --model-path Pika-Labs/Pika-H3-Flex --port 30010
+
+# ref2va
+sglang serve --model-path Pika-Labs/Pika-H3-Flex --model-variant ref2va --port 30010
+```
+
+Use the requests in [Generate video and audio](#4-generate-video-and-audio)
+with `"model": "Pika-Labs/Pika-H3-Flex"` and `num_inference_steps: 6`. That is
+the default, and any other value is rejected. Omit `flow_shift` and
+`audio_flow_shift` to keep the trained 12 / 3. `--lora-path` cannot replace
+the bundled adapter, and `quality: "high"` is not supported.
+
+On 1× H200 with the default memory policy, 5-second requests took the
+following times:
+
+| Task | Canvas | Warm latency |
+| --- | --- | --- |
+| `t2va` | 1344×768 | 37 s |
+| `fl2va` | 1344×768 | 42 s (cold) |
+| `ref2va` (2 images + 1 video with audio) | 1344×768 | 260 s |
+
+Most of the `ref2va` time goes to its long packed sequence, which includes
+the reference video and two 2048-pixel reference images.
+
+Pika H3 Flex is a Model Derivative of MiniMax H3 by Mellis, Inc., distributed
+under the MiniMax H3 Community License Agreement.
+
 ### PDD acceleration LoRAs
 
 [Alibaba PAI's MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs)

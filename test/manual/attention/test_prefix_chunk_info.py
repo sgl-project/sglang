@@ -2,9 +2,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -217,7 +218,7 @@ class TestPrefixChunkInfo(CustomTestCase):
             mock_backend = SimpleNamespace(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
-                kv_index_translator=KVIndexTranslator(
+                runner_ids=RunnerIds(
                     req_to_token=self.req_to_token_pool.req_to_token,
                     token_to_kv_pool_allocator=None,
                     token_to_kv_pool=self.token_to_kv_pool,
