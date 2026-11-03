@@ -2468,6 +2468,9 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    # Chunk-aligned length of the fixed system-prompt prefix; the scheduler
+    # stops mamba tracking at this boundary.
+    system_prefix_boundary: Optional[int] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

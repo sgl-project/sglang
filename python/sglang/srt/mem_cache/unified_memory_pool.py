@@ -73,6 +73,21 @@ class UnifiedMambaSlotAllocator:
         # drainable holes since alloc flushes the peer before extending.
         return self._multi_ended_allocator.schedulable_available_size()
 
+    def debug_stats(self) -> dict:
+        # Snapshot for the scheduler's [MambaAudit] log line. The unified pool
+        # has no hard free list and no lifetime alloc/free counters (the byte
+        # coordinating MultiEndedAllocator owns allocation), so report the
+        # slot-conservation view and mark the lifetime counters unavailable
+        # (-1); the audit's `unaccounted` reconciliation only consumes
+        # size/free, which available_size() supplies meaningfully here.
+        return {
+            "size": self._max_size,
+            "free": self.available_size(),
+            "alloc_total": -1,
+            "free_total": -1,
+            "group_degraded": -1,
+        }
+
     @property
     def free_slots(self) -> torch.Tensor:
         # Watermark-derived physical free-list for the invariant checker.

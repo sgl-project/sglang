@@ -57,6 +57,21 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
+def _system_kv_cap(req, page_size: int) -> Optional[int]:
+    """Page-aligned token length to retain in the radix tree for ``req``.
+
+    When ``--system-prompt`` is set, the fixed shared prefix is cached but the
+    per-request suffix is freed (not retained), so the tree key is truncated to
+    ``system_prefix_boundary``. Returns None (no cap) when unset or when the
+    boundary does not fit a whole page.
+    """
+    boundary = getattr(req, "system_prefix_boundary", None)
+    if boundary is None or boundary <= 0:
+        return None
+    capped = (boundary // page_size) * page_size
+    return capped if capped > 0 else None
+
+
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
@@ -465,8 +480,19 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
+        # Fixed system prompt: retain only the shared system prefix in the radix
+        # tree and free the per-request suffix. We truncate ONLY the tree key
+        # (token_ids for the key), keeping `kv_indices` full so the suffix pages
+        # [key_len:] are still freed below -> no pool leak.
+        _cap_len = _system_kv_cap(req, self.page_size)
+        if _cap_len is not None:
+            _cap_len = min(_cap_len, len(token_ids))
+            key_token_ids = token_ids[:_cap_len]
+        else:
+            key_token_ids = token_ids
+
         radix_key = RadixKey(
-            token_ids,
+            key_token_ids,
             req.extra_key,
             is_bigram=self.is_eagle,
             cache_salt=req.cache_salt,
@@ -541,7 +567,21 @@ class RadixCache(BasePrefixCache):
         # With page_size > 1 the partial page stays in the request's row but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
         # checkpoint or release_kv_cache frees the rest.
-        req.kv.protect_prefix(len(new_indices))
+        if (
+            getattr(req, "system_prefix_boundary", None) is not None
+            and len(new_indices) < req.kv.cache_protected_len
+        ):
+            # Fixed system prompt: the donated key is capped at the chunk-aligned
+            # system boundary, which can sit BELOW the extent the request matched
+            # at admission (deep keys inserted by boundary-less requests extend
+            # the shared system node). Pages in [len(new_indices),
+            # cache_protected_len) belong to that matched node —
+            # release_kv_cache frees [cache_protected_len, up_to), so shrinking
+            # here would hand tree-referenced pages back to the allocator
+            # (silent KV corruption on later matches). Keep the matched extent.
+            pass
+        else:
+            req.kv.protect_prefix(len(new_indices))
 
         self.unlock(req.lock)
         req.lock = self.lock(new_last_node)

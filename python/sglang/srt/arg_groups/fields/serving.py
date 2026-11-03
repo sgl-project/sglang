@@ -55,6 +55,17 @@ class Serving(msgspec.Struct):
         int,
         "The worker num of the detokenizer manager.",
     ] = 1
+    system_prompt: A[
+        Optional[str],
+        Arg(
+            help="A fixed system prompt shared by all chat requests. The value is "
+            "either the prompt text itself or a path to a file whose contents are "
+            "used (an existing path is auto-detected and read as UTF-8). When set, "
+            "the shared prefix's tokens are tokenized once and cached, and its "
+            "attention KV / linear-attention state is pinned in the radix cache so "
+            "clients can omit the system message.",
+        ),
+    ] = None
     skip_tokenizer_init: A[
         bool, "If set, skip init tokenizer and pass input_ids in generate request."
     ] = False
