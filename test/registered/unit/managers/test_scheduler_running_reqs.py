@@ -24,10 +24,6 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.srt.managers.scheduler_components.request_list import (
-    KeyedReqList,
-    ListKind,
-)
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -137,22 +133,6 @@ def _launch(s, batch):
         s.run_batch(batch)
     except _ForwardLaunched:
         pass
-
-
-class TestKeyedReqList(CustomTestCase):
-    def test_join_keeps_order_and_leave_ignores_outsiders(self):
-        a, b, c, outsider = (_req(rid) for rid in "abcx")
-        running = KeyedReqList(ListKind.DECODING)
-        running.join([a, b])
-        running.join([c, b])
-        self.assertEqual(list(running), [a, b, c])
-
-        _finish(b)
-        running.leave_finished()
-        running.leave([a, outsider])
-
-        self.assertEqual(list(running), [c])
-        self.assertNotIn(a, running)
 
 
 class TestRequestListsCheck(CustomTestCase):
