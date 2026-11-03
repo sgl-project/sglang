@@ -7,6 +7,7 @@ translates field annotations into argparse arguments.
 import argparse
 import unittest
 
+from sglang.srt.arg_groups.argparse_actions import DeprecatedChoiceToFlagAction
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.runtime_context import get_model, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -30,6 +31,21 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         # resolution normalises, so resolve here the way a launcher would.
         server_args.resolve_once()
         return server_args
+
+    def test_deprecated_choice_alias_accepts_a_wrapper_suppress_default(self):
+        """A wrapper re-registering server args (e.g. under a prefix) passes default=SUPPRESS."""
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "--x-monokernel-backend",
+            action=DeprecatedChoiceToFlagAction,
+            dest="x_monokernel_backend",
+            flags={"amd": ("x_enable_amd_monokernel", "--x-enable-amd-monokernel")},
+            default=argparse.SUPPRESS,
+        )
+        self.assertNotIn("x_monokernel_backend", vars(parser.parse_args([])))
+        args = parser.parse_args(["--x-monokernel-backend", "amd"])
+        self.assertTrue(args.x_enable_amd_monokernel)
+        self.assertNotIn("x_monokernel_backend", vars(args))
 
     def test_aliases_and_dest(self):
         """Field name drives dest; long forms and short aliases both work."""
