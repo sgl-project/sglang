@@ -498,11 +498,14 @@ class TestAllocationIntegration(CustomTestCase):
         # The yield is decided before its chunk in flight is processed; a bootstrap
         # completing in between must not leave the request without a next holder.
         req = Req("yielded", "", list(range(12)), SamplingParams())
-        req.inflight_middle_chunks = 1
         req.extend_end = 4
         req.pending_bootstrap = False
         batch = SimpleNamespace(
-            reqs=[req], spec_info=None, prefill_stats=None, dp_cooperation_info=None
+            reqs=[req],
+            middle_chunk_reqs=(req,),
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
         )
         result = GenerationBatchResult(
             logits_output=None,
@@ -528,7 +531,6 @@ class TestAllocationIntegration(CustomTestCase):
         )
 
         scheduler.optimistic_release_and_requeue.assert_called_once_with(req)
-        self.assertEqual(req.inflight_middle_chunks, 0)
 
     def inflight_scheduler(self, reqs):
         scheduler = SchedulerDisaggregationPrefillMixin()

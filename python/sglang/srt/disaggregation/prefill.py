@@ -1020,7 +1020,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.inflight_middle_chunks <= 0:
+            if req not in batch.middle_chunk_reqs:
                 req.time_stats.set_prefill_finished_time()
 
                 # Its KV never landed: abort instead of sending it to decode.
@@ -1128,8 +1128,6 @@ class SchedulerDisaggregationPrefillMixin:
 
             else:
                 # being chunked reqs' prefill is not finished
-                req.inflight_middle_chunks -= 1
-
                 # Still chunking while it holds the chunked slot or has another
                 # step in flight; otherwise it yielded, and this was its last step.
                 still_chunking = self.chunked_req is req or req.inflight_steps > 1

@@ -943,11 +943,6 @@ class Req(ReqDllmMixin):
         # no rebind.
         self.kv_rotation_base: Optional[int] = None
 
-        # Whether or not if it is chunked. It increments whenever
-        # it is chunked, and decrement whenever chunked request is
-        # processed.
-        self.inflight_middle_chunks = 0
-
         # The launched steps carrying this request whose results are not
         # processed yet.
         self.inflight_steps = 0
@@ -1785,7 +1780,6 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
-        self.inflight_middle_chunks = 0
         self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv.reset_for_retract()
@@ -2205,6 +2199,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    # The rows that run a middle (not final) prefill chunk in this step.
+    middle_chunk_reqs: Tuple[Req, ...] = ()
 
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
@@ -2396,6 +2392,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        middle_chunk_reqs: Tuple[Req, ...] = (),
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -2421,6 +2418,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 chunked_req,
                 model_config.vocab_size,
             ),
+            middle_chunk_reqs=middle_chunk_reqs,
             dllm_config=dllm_config,
         )
         return batch
@@ -3099,6 +3097,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Stale residue from this object's life as a prefill batch; the
         # extend-merge path would exclude (silently drop) that req otherwise.
         self.chunked_req = None
+        # Also stale residue; a decode row runs no prefill chunk.
+        self.middle_chunk_reqs = ()
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None
@@ -3725,6 +3725,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ScheduleBatch(
             reqs=self.reqs[:],
             launched_reqs=self.launched_reqs,
+            middle_chunk_reqs=self.middle_chunk_reqs,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,

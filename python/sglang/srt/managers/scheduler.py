@@ -3967,8 +3967,8 @@ class Scheduler(
         (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
         the top of the scheduling step stops the next chunk from launching; the
         chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later, so the batch-result processors keep
-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+        the result lands a step later; its batch still lists the request in
+        ``middle_chunk_reqs``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
         ``process_batch_result_prefill`` via its chunked branch (the finished req
         is excluded from streaming and its logprob offset is still accounted).
@@ -4546,9 +4546,6 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
-
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
@@ -4561,10 +4558,14 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            # A parked chunked request runs no chunk in this batch.
+            middle_chunk_reqs=(
+                (self.chunked_req,) if self.chunked_req in can_run_set else ()
+            ),
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+        new_batch.contains_last_prefill_chunk = len(can_run_list) != len(
+            new_batch.middle_chunk_reqs
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
@@ -4747,16 +4748,13 @@ class Scheduler(
         self.prefill_launched_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests whose queued result commits their last output by length."""
-        if not self.enable_skip_finishing_decode or not self.result_queue:
+        """Requests whose step in flight commits their last output by length."""
+        if not self.enable_skip_finishing_decode:
             return []
-        # At scheduling time the overlap loop has processed every result but the last.
-        assert len(self.result_queue) == 1
-        queued_reqs = set(self.result_queue[0][0].reqs)
         return [
             req
             for req in batch.reqs
-            if req in queued_reqs
+            if req.inflight_steps > 0
             and req.beam_group is None
             and req.next_output_finishes_by_length()
         ]
