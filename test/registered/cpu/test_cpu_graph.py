@@ -1050,6 +1050,18 @@ class TestCPUGraph(CustomTestCase):
         forward_batch2.return_hidden_states_before_norm = True
         self.assertFalse(runner._can_run_prefill_graph(forward_batch2))
 
+    def test_prefill_graph_allows_logprob_with_eager_logits_tail(self):
+        runner = _make_cpu_graph_runner()
+        runner.prefill_graphs = {128: object()}
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=128, batch_size=2)
+        forward_batch.return_logprob = True
+
+        runner._prefill_uses_eager_logits_tail = True
+        self.assertTrue(runner._can_run_prefill_graph(forward_batch))
+
+        runner._prefill_uses_eager_logits_tail = False
+        self.assertFalse(runner._can_run_prefill_graph(forward_batch))
+
     def test_prefill_graph_forwards_extend_kwargs(self):
         runner = _make_cpu_graph_runner()
         runner._prefill_uses_eager_logits_tail = False
