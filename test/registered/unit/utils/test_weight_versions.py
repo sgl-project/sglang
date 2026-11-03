@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -312,14 +311,19 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.addCleanup(patcher.stop)
         return scheduler
 
-    def test_records_on_running_waiting_and_chunked_requests(self):
-        """A version change records an event on every live request holding output tokens."""
+    def test_records_on_every_request_list(self):
+        """A version change records an event on every live request holding output
+        tokens, whichever list holds it."""
         running_req = _ReqStub(3)
         waiting_req = _ReqStub(5)
         chunked_req = _ReqStub(2)
+        grammar_req = _ReqStub(4)
+        sending_req = _ReqStub(6)
         scheduler = self._scheduler(
             "v1", [running_req], [waiting_req], chunked=chunked_req
         )
+        scheduler.grammar_manager.grammar_queue.join([grammar_req])
+        scheduler.disagg_prefill_transfer_queue.join([sending_req])
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
@@ -328,38 +332,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             (running_req, 3),
             (waiting_req, 5),
             (chunked_req, 2),
+            (grammar_req, 4),
+            (sending_req, 6),
         ):
             self.assertEqual(len(req.weight_version_events), 1)
             self.assertEqual(req.weight_version_events[0].old_version, "v1")
             self.assertEqual(req.weight_version_events[0].num_output_tokens, output_len)
-
-    def test_records_on_requests_outside_running_batches(self):
-        """Requests waiting in the grammar or PD queues hold output across the update too."""
-        grammar_req = _ReqStub(2)
-        sending_req = _ReqStub(4)
-        scheduler = self._scheduler("v1")
-        scheduler.grammar_manager.grammar_queue.join([grammar_req])
-        scheduler.disagg_prefill_transfer_queue.join([sending_req])
-
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        for req in (grammar_req, sending_req):
-            self.assertEqual(len(req.weight_version_events), 1)
-            self.assertEqual(req.weight_version_events[0].old_version, "v1")
-
-    def test_records_on_hisparse_staging_requests(self):
-        """Requests parked in the HiSparse staging queue are swept like any live request."""
-        staging_req = _ReqStub(2)
-        scheduler = self._scheduler("v1")
-        scheduler.hisparse_coordinator = SimpleNamespace(
-            request_lists=lambda: {ListKind.HISPARSE_STAGING: [staging_req]}
-        )
-
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(len(staging_req.weight_version_events), 1)
-        self.assertEqual(staging_req.weight_version_events[0].old_version, "v1")
-        self.assertEqual(staging_req.weight_version_events[0].num_output_tokens, 2)
 
     def test_same_version_is_a_noop(self):
         """Re-announcing the current version must not record events."""

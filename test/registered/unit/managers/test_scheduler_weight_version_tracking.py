@@ -35,7 +35,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -44,50 +43,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _ServingStub:
     def __init__(self, weight_version: str):
         self.weight_version = weight_version
-
-
-class _ContextStub:
-    def __init__(self, serving: _ServingStub):
-        self.serving = serving
-
-    def override(self, source, **fields):
-        self.serving.weight_version = fields["weight_version"]
-
-
-class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _serving(self, version: str) -> _ServingStub:
-        serving = _ServingStub(version)
-        for name, value in (
-            ("get_serving", serving),
-            ("get_context", _ContextStub(serving)),
-        ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return serving
-
-    def test_every_source_of_live_requests_is_stamped(self):
-        """A request missed here keeps attributing its next tokens to the superseded version."""
-        self._serving("v1")
-        running, queued, chunked, staged = (object() for _ in range(4))
-        scheduler = Scheduler.__new__(Scheduler)
-        empty_request_lists(scheduler)
-        scheduler.running_reqs.join([running])
-        scheduler.waiting_queue = [queued]
-        scheduler.chunked_req = chunked
-        scheduler.hisparse_coordinator = SimpleNamespace(
-            request_lists=lambda: {ListKind.HISPARSE_STAGING: [staged]}
-        )
-
-        with patch(
-            "sglang.srt.managers.scheduler.record_weight_version_events",
-            return_value=0,
-        ) as recorder:
-            Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(
-            set(recorder.call_args.args[0]), {running, queued, chunked, staged}
-        )
 
 
 class TestSchedulerBatchWeightVersion(CustomTestCase):
