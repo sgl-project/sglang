@@ -7,6 +7,7 @@ import pytest
 import torch
 from prometheus_client import CollectorRegistry
 from safetensors.torch import save_file
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
@@ -545,6 +546,20 @@ def test_disabled_merge_offload_binding_keeps_only_manager_view(snapshot_base):
     )
     assert layer.cpu_weight is None
     assert base._packed_weight_cpu.data_ptr() == stored.data_ptr()
+
+
+@pytest.mark.parametrize("allow_merge", [True, False])
+def test_base_storage_lifetime_after_offload_rebind(allow_merge):
+    """A restore view can keep the original storage alive after offload replaces it."""
+    base = torch.nn.Linear(4, 4, bias=False)
+    original_storage = StorageWeakRef(base.weight.untyped_storage())
+    layer = wrap_with_lora_layer(base, snapshot_base=False, allow_merge=allow_merge)
+
+    # Layerwise offload replaces Parameter.data after startup LoRA wrapping.
+    base.weight.data = torch.empty(1, dtype=base.weight.dtype)
+    assert original_storage.expired() == (not allow_merge)
+    del layer
+    assert original_storage.expired()
 
 
 def test_cached_merge_restores_untouched_base_view():
