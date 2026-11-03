@@ -196,6 +196,8 @@ class SchedulePolicy:
         uniboost_gamma: Optional[float] = None,
         uniboost_bin_size: int = 256,
         uniboost_clock: str = "tokens",
+        uniboost_adaptive_gamma: bool = False,
+        uniboost_adaptive_max_jump_s: float = 60.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -212,10 +214,23 @@ class SchedulePolicy:
             else uniboost.DEFAULT_GAMMA[self.uniboost_clock]
         )
         self.uniboost_bin_size = uniboost_bin_size
+        is_uniboost = self.policy == CacheAwarePolicy.UNIBOOST
+        wall = self.uniboost_clock is uniboost.UniBoostClock.WALL
+        if is_uniboost and uniboost_adaptive_gamma and not wall:
+            raise ValueError(
+                "--uniboost-adaptive-gamma requires --uniboost-clock wall "
+                "(the response-time tail fit is in wall seconds)"
+            )
         self.uniboost_rate: Optional[uniboost.TokenClockRate] = (
-            uniboost.TokenClockRate()
-            if self.policy == CacheAwarePolicy.UNIBOOST
-            and self.uniboost_clock is uniboost.UniBoostClock.WALL
+            uniboost.TokenClockRate() if is_uniboost and wall else None
+        )
+        self.uniboost_adaptive: Optional[uniboost.AdaptiveGamma] = (
+            uniboost.AdaptiveGamma(
+                gamma0=self.uniboost_gamma,
+                bin_size=uniboost_bin_size,
+                max_jump_s=uniboost_adaptive_max_jump_s,
+            )
+            if is_uniboost and uniboost_adaptive_gamma
             else None
         )
 
@@ -356,6 +371,25 @@ class SchedulePolicy:
             enable_priority_scheduling=self.enable_priority_scheduling,
             priority_sign=self.priority_sign,
         )
+
+    def record_completed_requests(self, reqs: List[Req]) -> None:
+        """Feeds finished requests' response times to adaptive uniboost gamma."""
+        if self.uniboost_adaptive is None:
+            return
+        latencies, works = uniboost.completed_response_times(reqs)
+        if not latencies:
+            return
+        gamma = self.uniboost_adaptive.record(
+            latencies_s=latencies,
+            works=works,
+            rate_tokens_per_s=(
+                self.uniboost_rate.tokens_per_s
+                if self.uniboost_rate is not None
+                else None
+            ),
+        )
+        if gamma is not None:
+            self.uniboost_gamma = gamma
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (

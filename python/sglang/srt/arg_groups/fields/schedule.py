@@ -109,7 +109,8 @@ class Schedule(msgspec.Struct):
                 "gamma orders more like FCFS (stronger anti-starvation), smaller "
                 "gamma more like shortest-uncached-work first. Units follow "
                 "--uniboost-clock: per token under 'tokens' (default 1e-4), 1/s under "
-                "'wall' (default 0.1)."
+                "'wall' (default 0.1). With --uniboost-adaptive-gamma this is the "
+                "starting value."
             ),
         ),
     ] = None
@@ -131,7 +132,14 @@ class Schedule(msgspec.Struct):
             choices=["tokens", "wall"],
         ),
     ] = "tokens"
-
+    uniboost_adaptive_gamma: A[
+        bool,
+        "Adapt the uniboost gamma online from the response-time tail of completed requests (gamma-Ada, UniBoost Eq. 9): ln(5) / (t99 - t95) over the last 128 requests, EMA-smoothed, floored by --uniboost-adaptive-max-jump-s. Requires --uniboost-clock wall.",
+    ] = False
+    uniboost_adaptive_max_jump_s: A[
+        float,
+        "Max-jump bound of adaptive uniboost gamma, in wall seconds: gamma is floored so that the largest boost any request can get, b_gamma(bin_size / prefill token rate), stays within this, which bounds how long a newcomer can delay a waiting request.",
+    ] = 60.0
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

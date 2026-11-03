@@ -1,8 +1,10 @@
 import math
+import re
 import unittest
 from array import array
 from unittest.mock import patch
 
+from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
@@ -10,6 +12,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.uniboost import (
+    AdaptiveGamma,
     TokenClockRate,
     UniBoostClock,
     boost,
@@ -264,6 +267,87 @@ class TestTokenClockRate(CustomTestCase):
         self.assertAlmostEqual(rate.tokens_per_s, 36_700.0, delta=1.0)
 
 
+class TestAdaptiveGamma(CustomTestCase):
+    LN5 = math.log(5.0)
+
+    def _adaptive(self, **kwargs):
+        args = dict(
+            gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
+        )
+        args.update(kwargs)
+        return AdaptiveGamma(**args)
+
+    def _feed(self, adaptive, latencies, rate, works=None, times=200):
+        works = works if works is not None else [0] * len(latencies)
+        gamma = None
+        for _ in range(times):
+            gamma = adaptive.record(
+                latencies_s=latencies, works=works, rate_tokens_per_s=rate
+            )
+        return gamma
+
+    def test_estimator_and_ema(self):
+        # Latencies 0..99 s: interpolated p95 = 94.05, p99 = 98.01, width 3.96 s.
+        adaptive = AdaptiveGamma(
+            gamma0=0.1, bin_size=256, max_jump_s=60.0, window=128, min_samples=64
+        )
+        gamma = adaptive.record(
+            latencies_s=[float(t) for t in range(100)],
+            works=[0] * 100,
+            rate_tokens_per_s=None,
+        )
+        expected = 0.8 * 0.1 + 0.2 * (self.LN5 / 3.96)
+        self.assertAlmostEqual(gamma, expected, delta=expected * 1e-12)
+
+    def test_jump_floor_bounds_the_largest_boost(self):
+        # A degenerate fat tail must not drive gamma below the point where
+        # b_gamma(k / rate) equals the jump bound, at any rate.
+        for rate in (2_000.0, 20_000.0):
+            with self.subTest(rate=rate):
+                gamma = self._feed(self._adaptive(), [0.0] * 15 + [1e9], rate)
+                jump_s = boost(256 / rate, gamma)
+                self.assertLessEqual(jump_s, 60.0)
+                self.assertGreaterEqual(jump_s, 59.9)
+
+    def test_thin_tail_reaches_the_upper_clip(self):
+        gamma = self._feed(self._adaptive(), [30.0] * 16, 2_000.0)
+        self.assertAlmostEqual(gamma, AdaptiveGamma.GAMMA_MAX_S, places=10)
+
+    def test_unmeasured_rate_uses_the_outer_floor(self):
+        gamma = self._feed(self._adaptive(), [0.0] * 15 + [1e9], None)
+        self.assertAlmostEqual(gamma, AdaptiveGamma.GAMMA_MIN_S)
+
+    def test_fatter_large_work_tail_fits_the_small_work_tail(self):
+        # Small-work latencies 0..15 s, large-work ones 1000x: the overall fit
+        # would follow the starved large requests toward the floor.
+        adaptive = self._adaptive(window=32, min_samples=8)
+        lats = [float(t) for t in range(16)] + [1000.0 * t for t in range(16)]
+        works = [100] * 16 + [100_000] * 16
+        adaptive.record(latencies_s=lats, works=works, rate_tokens_per_s=None)
+        small_fit = AdaptiveGamma._tail_gamma_hat([float(t) for t in range(16)])
+        self.assertEqual(adaptive._tail_fit(), (small_fit, "small-work"))
+
+    def test_log_reports_raw_fit_floor_and_pinned_share(self):
+        adaptive = self._adaptive()
+        with self.assertLogs("sglang.srt.managers.uniboost", level="INFO") as cm:
+            self._feed(adaptive, [0.0] * 15 + [1e9], 2_000.0)
+        line = cm.output[-1]
+        self.assertLess(float(re.search(r"fit=([\d.eE+-]+)", line).group(1)), 1e-6)
+        self.assertGreater(float(re.search(r"floor=([\d.eE+-]+)", line).group(1)), 0.07)
+        self.assertGreaterEqual(int(re.search(r"pinned=(\d+)%", line).group(1)), 99)
+
+    def test_warmup_and_initial_clip(self):
+        adaptive = self._adaptive()
+        self.assertIsNone(
+            adaptive.record(
+                latencies_s=[5.0] * 7, works=[0] * 7, rate_tokens_per_s=None
+            )
+        )
+        self.assertEqual(adaptive.gamma, 0.09)
+        low = AdaptiveGamma(gamma0=1e-4, bin_size=256, max_jump_s=60.0)
+        self.assertEqual(low.gamma, AdaptiveGamma.GAMMA_MIN_S)
+
+
 class TestSchedulePolicyUniBoost(CustomTestCase):
     def test_calc_priority_stamps_once_and_sorts(self):
         cold = _make_req("cold", list(range(100_000)))
@@ -310,6 +394,37 @@ class TestSchedulePolicyUniBoost(CustomTestCase):
         with self.assertLogs("sglang.srt.managers.schedule_policy", level="WARNING"):
             policy = _policy(tree_cache=RadixCache.create_simulated(disable=True))
         self.assertIs(policy.policy, CacheAgnosticPolicy.FCFS)
+
+    def test_adaptive_gamma_requires_the_wall_clock(self):
+        with self.assertRaisesRegex(ValueError, "requires --uniboost-clock wall"):
+            _policy(uniboost_adaptive_gamma=True, uniboost_clock="tokens")
+        self.assertIsNone(
+            _policy(policy="fcfs", uniboost_adaptive_gamma=True).uniboost_adaptive
+        )
+
+    def test_completed_requests_feed_adaptive_gamma(self):
+        policy = _policy(
+            uniboost_gamma=0.09, uniboost_clock="wall", uniboost_adaptive_gamma=True
+        )
+
+        def finished(rid, latency_s):
+            req = _make_req(rid, [1, 2, 3])
+            req.time_stats.set_scheduler_recv_time(100.0)
+            req.time_stats.set_completion_time(100.0 + latency_s)
+            req.finished_reason = FINISH_LENGTH(length=8)
+            return req
+
+        streaming = _make_req("streaming", [1])
+        unstamped = finished("unstamped", 5.0)
+        unstamped.time_stats.completion_time = 0.0
+        policy.record_completed_requests([streaming, unstamped, finished("ok", 60.0)])
+        self.assertEqual(list(policy.uniboost_adaptive._samples), [(60.0, 3)])
+
+        policy.record_completed_requests(
+            [finished(f"r{i}", t) for i, t in enumerate(range(1, 35))]
+        )
+        self.assertNotEqual(policy.uniboost_gamma, 0.09)
+        self.assertEqual(policy.uniboost_gamma, policy.uniboost_adaptive.gamma)
 
 
 if __name__ == "__main__":

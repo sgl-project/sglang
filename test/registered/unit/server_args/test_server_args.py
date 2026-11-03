@@ -5530,6 +5530,16 @@ class TestUniBoostPolicyArgs(CustomTestCase):
             self._checked(schedule_policy="uniboost", uniboost_gamma=0.0)
         with self.assertRaisesRegex(AssertionError, "--uniboost-bin-size must be >= 1"):
             self._checked(schedule_policy="uniboost", uniboost_bin_size=0)
+        with self.assertRaisesRegex(AssertionError, "requires --uniboost-clock wall"):
+            self._checked(schedule_policy="uniboost", uniboost_adaptive_gamma=True)
+        with self.assertRaisesRegex(
+            AssertionError, "requires --schedule-policy uniboost"
+        ):
+            self._checked(
+                schedule_policy="lpm",
+                uniboost_adaptive_gamma=True,
+                uniboost_clock="wall",
+            )
 
     def test_other_policies_ignore_uniboost_knobs(self):
         self._checked(schedule_policy="lpm", uniboost_gamma=0.0)

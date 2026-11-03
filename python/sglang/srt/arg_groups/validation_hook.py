@@ -277,6 +277,17 @@ def check_server_args(server_args: Any):
             "--uniboost-gamma must be > 0"
         )
         assert cfg.uniboost_bin_size >= 1, "--uniboost-bin-size must be >= 1"
+    if cfg.uniboost_adaptive_gamma:
+        assert cfg.schedule_policy == "uniboost", (
+            "--uniboost-adaptive-gamma requires --schedule-policy uniboost"
+        )
+        assert cfg.uniboost_clock == "wall", (
+            "--uniboost-adaptive-gamma requires --uniboost-clock wall "
+            "(the response-time tail fit is in wall seconds)"
+        )
+        assert cfg.uniboost_adaptive_max_jump_s > 0, (
+            "--uniboost-adaptive-max-jump-s must be > 0"
+        )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",

@@ -562,5 +562,7 @@ POSITIONAL_FIELD_ORDER = (
     "uniboost_gamma",
     "uniboost_bin_size",
     "uniboost_clock",
+    "uniboost_adaptive_gamma",
+    "uniboost_adaptive_max_jump_s",
 )
 # fmt: on

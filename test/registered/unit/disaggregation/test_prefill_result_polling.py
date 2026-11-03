@@ -234,6 +234,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.load_inquirer = SimpleNamespace(get_loads=Mock())
         self.enable_fpm = False
         self._record_step_counters = Mock()
+        self.policy = Mock()
         self._maybe_clear_mm_inputs = Mock()
         self.maybe_send_health_check_signal = Mock()
         self.disagg_prefill_transfer_queue = _sending()
