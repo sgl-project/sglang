@@ -812,7 +812,9 @@ stabilize_flashinfer_jit_paths() {
 
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.13.post1"
-    NIXL_VERSION="1.3.0"
+    # NIXL 1.4.1 includes PyTorch-versioned EP extensions, including Torch
+    # 2.14, while retaining the Torch 2.11-2.13 variants used by other CI.
+    NIXL_VERSION="1.4.1"
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
     NIXL_BIN_NAME="nixl-cu13"

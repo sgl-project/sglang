@@ -11,11 +11,19 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=526, stage="extra-b", runner_config="8-gpu-h200")
+from test.manual.ep.test_elastic_scale import (
+    TestElasticScaleUp4To5To6CudaGraph as _TestElasticScaleUp4To5To6CudaGraph,
+)
+from test.manual.ep.test_nixl_ep import (
+    TestNixlMoeMooncakeElasticEP as _TestNixlMoeMooncakeElasticEP,
+)
+
+register_cuda_ci(est_time=1050, stage="base-c", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -23,6 +31,8 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        if is_in_ci():
+            raise unittest.SkipTest("DeepEP large tests are disabled in CI")
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -101,6 +111,8 @@ class TestDeepseekMTP(CustomTestCase):
 class TestDeepseekV32TBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        if is_in_ci():
+            raise unittest.SkipTest("DeepEP large tests are disabled in CI")
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -148,6 +160,16 @@ class TestDeepseekV32TBO(CustomTestCase):
         acc_length, speed = send_one_prompt(args)
 
         print(f"{speed=:.2f}")
+
+
+class TestNixlMoeMooncakeElasticEP(_TestNixlMoeMooncakeElasticEP):
+    """CI entry point for the registered NIXL/Mooncake Elastic EP test."""
+
+
+class TestElasticScaleUp4To5To6CudaGraph(
+    _TestElasticScaleUp4To5To6CudaGraph
+):
+    """CI entry point for the registered Elastic EP scale test."""
 
 
 if __name__ == "__main__":
