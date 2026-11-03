@@ -1828,6 +1828,7 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
 class TestHiSparseStagedSpecRelay(CustomTestCase):
     def test_builds_lightweight_eagle_relay_handle(self):
         future_map = object.__new__(FutureMap)
+        future_map._deferred_relay = None
         future_map.spec_algo = SpeculativeAlgorithm.EAGLE
         future_map.dsa_topk_indices_buf = None
         future_indices = torch.tensor([2, 5], device="cpu")
@@ -1840,6 +1841,7 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
     @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
     def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
         future_map = object.__new__(FutureMap)
+        future_map._deferred_relay = None
         future_map.spec_algo = SpeculativeAlgorithm.EAGLE
         future_map.device = torch.device("cpu")
         future_map.need_topk = True

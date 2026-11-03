@@ -15,6 +15,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -107,6 +108,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.draft_runner
+        # An unchanged top-k-1 batch reads these rows before this runner's next
+        # replay, so the generic relay lease need not copy them out.
+        self.keep_hidden_in_place = spec_relay_bypass_enabled()
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:
@@ -711,8 +715,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if out.next_token_logits is None
                 else out.next_token_logits[:raw_bs]
             ),
-            # CUDA graph replay reuses its captured output storage. These states
-            # survive into the next draft step, so detach them from that buffer.
-            hidden_states=out.hidden_states[:raw_bs].clone(),
+            # The unchanged megakernel batch consumes the graph-owned rows before
+            # replay; every other path detaches the recurrent state from that buffer.
+            hidden_states=(
+                out.hidden_states[:raw_bs]
+                if self.keep_hidden_in_place
+                else out.hidden_states[:raw_bs].clone()
+            ),
         )
         return out

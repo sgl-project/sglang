@@ -5316,7 +5316,13 @@ class Scheduler(
         if self.uocr_runtime is not None:
             # The decode graph reads its relay; a step it did not publish seeds it.
             self.uocr_runtime.relay_result(batch, batch_result, future_indices)
-        self.future_map.stash(future_indices, payload)
+        self.future_map.relay(
+            future_indices,
+            payload,
+            draft_input=batch_result.next_draft_input,
+            accepted_lengths=batch_result.accept_lens,
+            allow_defer=batch.beam_tail is None,
+        )
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
