@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mixed_precision import (
+    MixedPrecisionConfig,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
 )
@@ -587,5 +590,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             post_load_hook(model)
 
         _warn_if_expected_param_dtype_missing(model, quant_spec.param_dtype)
+        if isinstance(quant_spec.runtime_quant_config, MixedPrecisionConfig):
+            quant_spec.runtime_quant_config.log_resolved_plan()
 
         return model
