@@ -47,7 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix, flatten_nested_list, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
 

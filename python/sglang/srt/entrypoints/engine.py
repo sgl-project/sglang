@@ -51,7 +51,7 @@ import torch
 import uvloop
 import zmq
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     resolved_view,
     resolving_view,
@@ -88,7 +88,6 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
-    ReturnHiddenStatesMode,
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
@@ -107,6 +106,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     run_multi_detokenizer_router_process,
     write_data_for_multi_tokenizer,
 )
+from sglang.srt.managers.req_types import ReturnHiddenStatesMode
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts

@@ -60,7 +60,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 logger = logging.getLogger(__name__)
 

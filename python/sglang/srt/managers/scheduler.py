@@ -292,7 +292,6 @@ from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -387,7 +386,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_confidential_compute, is_npu
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
@@ -1370,7 +1369,9 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        self.running_reqs = RunningReqs()
+        # Requests merged into a running batch, until they finish or a retract,
+        # preemption or pause takes them out.
+        self.running_reqs = RequestList()
         # Prefill requests out of the chunked slot whose launched steps their next
         # holder has not taken yet: the running batch at the merge, the PD
         # transfer queue, HiSparse staging, or a requeue.
@@ -2650,8 +2651,10 @@ class Scheduler(
             get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
             get_running_reqs=lambda: self.running_reqs,
-            get_pp_running_mbs=lambda: (
-                self.running_mbs if get_parallel().pp_size > 1 else ()
+            get_prefill_launched_reqs=lambda: self.prefill_launched_reqs,
+            get_running_batches=lambda: (
+                self.running_batch,
+                *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
@@ -3964,8 +3967,8 @@ class Scheduler(
         (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
         the top of the scheduling step stops the next chunk from launching; the
         chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later, so the batch-result processors keep
-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+        the result lands a step later; its batch still names the request as its
+        ``chunked_req``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
         ``process_batch_result_prefill`` via its chunked branch (the finished req
         is excluded from streaming and its logprob offset is still accounted).
@@ -4154,7 +4157,6 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
-        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -4544,9 +4546,6 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
-
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
@@ -4561,8 +4560,9 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+        # A parked chunked request runs no chunk in this batch.
+        new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
+            self.chunked_req in can_run_set
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
@@ -4734,7 +4734,7 @@ class Scheduler(
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
         self._join_prefill_launched(batch)
-        self.invariant_checker.maybe_check_request_lists()
+        self.invariant_checker.maybe_check_request_lists(batch)
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step once its result is processed."""
@@ -4745,16 +4745,13 @@ class Scheduler(
         self.prefill_launched_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests whose queued result commits their last output by length."""
-        if not self.enable_skip_finishing_decode or not self.result_queue:
+        """Requests whose step in flight commits their last output by length."""
+        if not self.enable_skip_finishing_decode:
             return []
-        # At scheduling time the overlap loop has processed every result but the last.
-        assert len(self.result_queue) == 1
-        queued_reqs = set(self.result_queue[0][0].reqs)
         return [
             req
             for req in batch.reqs
-            if req in queued_reqs
+            if req.inflight_steps > 0
             and req.beam_group is None
             and req.next_output_finishes_by_length()
         ]
@@ -5666,53 +5663,49 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        if not ignore_waiting:
-            idle &= len(self.waiting_queue) == 0
+        lists = self.request_lists()
+        if for_health_check:
+            busy_lists = {"chunked", "waiting"}
+            if not self._engine_paused:
+                busy_lists.add("decode_retracted")
         else:
+            busy_lists = lists.keys() - {
+                # Their steps are counted through the batches above.
+                "running",
+                "prefill_launched",
+                # Only its staging part is counted, above.
+                "dllm",
+                # Held across a weight update, whose cache flush needs idle.
+                "decode_held",
+                # Counted by uocr blocks_flush below.
+                "uocr_parked",
+                # Finished, and held only on the output rank; all ranks must agree.
+                "deferred",
+            }
+        if ignore_waiting:
+            busy_lists.discard("waiting")
             # A PD-decode request waiting with its transferred KV still owns
             # its request row; a flush would free it.
             idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
-
-        if (
-            for_health_check
-            and not self._engine_paused
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_prealloc_queue is not None
-        ):
-            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+        idle &= not any(lists.get(name) for name in busy_lists)
 
         if not for_health_check:
-            # Grammar queue and prefill transfer queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
             idle &= not self.request_receiver.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
                     ignore_waiting=ignore_waiting
                 )
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_transfer_queue) == 0
-                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-                if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.decode_offload_manager is not None
+            ):
+                idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -6133,20 +6126,21 @@ class Scheduler(
                     # an ack racing back is never dropped.
                     decode_req.kv_receiver.abort()
 
-            # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        discard_kv_cache_backup(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+            # Retracted requests hold a KV backup; held ones hold no KV.
+            retracted, held = self.disagg_decode_prealloc_queue.take_aborted(recv_req)
+            for req in retracted:
+                discard_kv_cache_backup(
+                    req,
+                    self.tree_cache,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+                self.send_abort_output(_make_abort_req(req), req)
+            for req in held:
+                req.finish_outside_step(FINISH_ABORT())
+                self._release_aborted_request(req)
+                self.send_abort_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

@@ -50,7 +50,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     resolve_image_processor_backend,
 )
