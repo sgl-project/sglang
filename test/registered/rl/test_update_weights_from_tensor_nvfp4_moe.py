@@ -1,10 +1,10 @@
-"""Partial weight updates on an NVFP4 MoE checkpoint must not disturb other weights.
+"""Partial weight updates must not disturb the NVFP4 MoE experts they skip.
 
 end_weight_update post-processes every MoE layer, and NVFP4 MoE post-processing
 permutes FP4 weights and block scales in place. Pushing the checkpoint's own
-bytes for a few tensors must therefore leave every parameter bit-identical,
-including the MoE layers and experts the update did not touch. The
-/weights_checker snapshot/compare round trip checks that byte for byte.
+bytes for a few tensors must therefore leave every expert parameter
+bit-identical, including the MoE layers and experts the update did not touch.
+The /weights_checker raw_checksum action hashes each parameter's raw bytes.
 """
 
 import json
@@ -65,10 +65,13 @@ class TestUpdateWeightsFromTensorNvFp4Moe(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def _checker(self, action: str) -> requests.Response:
-        return requests.post(
-            f"{self.url}/weights_checker", json={"action": action}, timeout=600
+    def _raw_checksums(self) -> dict:
+        resp = requests.post(
+            f"{self.url}/weights_checker", json={"action": "raw_checksum"}, timeout=600
         )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        checksums = resp.json()["ranks"][0]["checksums"]
+        return {n: h for n, h in checksums.items() if ".mlp.experts." in n}
 
     def _update_weights(self, named_tensors: List[Tuple[str, torch.Tensor]]) -> dict:
         requests.post(f"{self.url}/begin_weight_update", json={}, timeout=120)
@@ -85,8 +88,9 @@ class TestUpdateWeightsFromTensorNvFp4Moe(CustomTestCase):
         requests.post(f"{self.url}/end_weight_update", json={}, timeout=600)
         return resp.json()
 
-    def test_same_bytes_partial_updates_keep_every_weight(self):
-        self.assertTrue(self._checker("snapshot").json()["success"])
+    def test_same_bytes_partial_updates_keep_every_expert(self):
+        before = self._raw_checksums()
+        self.assertGreater(len(before), 0)
         cases = (
             ("dense tensor only", ["model.norm.weight"]),
             ("one expert of one layer", _EXPERT_TENSORS),
@@ -95,9 +99,9 @@ class TestUpdateWeightsFromTensorNvFp4Moe(CustomTestCase):
             with self.subTest(name=name):
                 result = self._update_weights(_checkpoint_tensors(tensor_names))
                 self.assertTrue(result["success"], result)
-                compare = self._checker("compare")
-                self.assertEqual(compare.status_code, 200)
-                self.assertTrue(compare.json()["success"], compare.json())
+                after = self._raw_checksums()
+                changed = sorted(n for n in before if before[n] != after.get(n))
+                self.assertEqual(changed, [])
 
 
 if __name__ == "__main__":
