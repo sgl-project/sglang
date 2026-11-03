@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     get_gpu_count,
 )
 
-register_cuda_ci(est_time=396, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=396, stage="extra-a", runner_config="2-gpu-large")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -72,6 +72,8 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                     "python3",
                     "-m",
                     "mooncake.http_metadata_server",
+                    "--host",
+                    "127.0.0.1",
                     "--port",
                     str(cls.mooncake_metadata_port),
                 ],

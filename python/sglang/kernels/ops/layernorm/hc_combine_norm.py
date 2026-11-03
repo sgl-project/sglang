@@ -73,7 +73,7 @@ def hc_combine_norm(
     # Four CTAs per row trade redundant statistics for more concurrent loads
     # when only a few speculative tokens are being processed; wider batches have
     # enough rows to split the 5120 columns fewer ways.
-    parts = 4 if m <= 8 else (2 if m <= 48 else 1)
+    parts = _parts_for(m, 5120)
     _hc_combine_norm[(m, parts)](
         x, pre, weight, y, x.stride(0), pre.stride(0), eps, parts, num_warps=8
     )
@@ -88,6 +88,7 @@ def _hc_combine_norm_mxfp8_kernel(
     Y,
     Q,
     S,
+    M,
     SX: tl.constexpr,
     SP: tl.constexpr,
     EPS: tl.constexpr,
@@ -97,27 +98,32 @@ def _hc_combine_norm_mxfp8_kernel(
     SLICE: tl.constexpr,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
-    h = tl.arange(0, BLOCK)
-    m = h < K
-    value = tl.full((BLOCK,), 0, tl.float32)
-    for c in tl.static_range(4):
-        pre = tl.load(P + row * SP + c).to(tl.float32)
-        x = tl.load(X + row * SX + c * K + h, m, 0).to(tl.float32)
-        value += x * pre
-    # The unfused combine stores BF16 before RMSNorm reads it.
-    value = value.to(tl.bfloat16).to(tl.float32)
-    inv_rms = tl.rsqrt(tl.sum(value * value, 0) / K + EPS)
-    weight = tl.load(W + h, m, 0).to(tl.float32)
-    y = (value * inv_rms * weight).to(tl.bfloat16)
-    tl.store(Y + row * K + h, y, m & (h >= part * SLICE) & (h < (part + 1) * SLICE))
-    mxfp8_epilogue(
-        y, row, Q, S, K, BLOCK, GROUPS, part * (SLICE // 32), (part + 1) * (SLICE // 32)
-    )
+    if row < M:
+        h = tl.arange(0, BLOCK)
+        m = h < K
+        value = tl.full((BLOCK,), 0, tl.float32)
+        for c in tl.static_range(4):
+            pre = tl.load(P + row * SP + c).to(tl.float32)
+            x = tl.load(X + row * SX + c * K + h, m, 0).to(tl.float32)
+            value += x * pre
+        # The unfused combine stores BF16 before RMSNorm reads it.
+        value = value.to(tl.bfloat16).to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(value * value, 0) / K + EPS)
+        weight = tl.load(W + h, m, 0).to(tl.float32)
+        y = (value * inv_rms * weight).to(tl.bfloat16)
+        slice_mask = (h >= part * SLICE) & (h < (part + 1) * SLICE)
+        tl.store(Y + row * K + h, y, m & slice_mask)
+        g_lo, g_hi = part * (SLICE // 32), (part + 1) * (SLICE // 32)
+        mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, g_lo, g_hi)
+    else:
+        # Padding scale entries are disjoint from the live rows above.
+        off = ((row - M) * tl.num_programs(1) + part) * 512 + tl.arange(0, 512)
+        pad_row = ((off // 4) % 4) * 32 + ((off // 16) % 32)
+        tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
 
 
-def _parts_for(k: int) -> int:
-    # Row splits: recomputing the statistic beats running 6 CTAs on 148 SMs.
-    parts = 4
+def _parts_for(m: int, k: int) -> int:
+    parts = 4 if m <= 8 else (2 if m <= 48 else 1)
     while parts > 1 and (k % (parts * 32)):
         parts //= 2
     return parts
@@ -125,7 +131,8 @@ def _parts_for(k: int) -> int:
 
 def _alloc(m, k, device):
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
-    s = torch.zeros(
+    # The kernel zeroes the padding rows' scales; no separate memset.
+    s = torch.empty(
         (k // 32) * (triton.cdiv(m, 128) * 128), dtype=torch.uint8, device=device
     )
     return q, s
@@ -134,20 +141,26 @@ def _alloc(m, k, device):
 def hc_combine_norm_mxfp8(
     x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
 ):
-    """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``."""
+    """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``.
+
+    Every CTA of a row computes the whole row's reduction in the same order, so
+    the outputs do not depend on the grid split."""
     m = x.shape[0]
     assert m <= 128, "the MXFP8 scale swizzle addresses a single 128-row tile"
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
     q, s = _alloc(m, k, x.device)
-    parts = _parts_for(k)
-    _hc_combine_norm_mxfp8_kernel[(m, parts)](
+    parts = _parts_for(m, k)
+    # Programs past the last row each zero one 512-byte block of padding scales.
+    pad_blocks = triton.cdiv(s.numel(), 512) if m % 128 else 0
+    _hc_combine_norm_mxfp8_kernel[(m + triton.cdiv(pad_blocks, parts), parts)](
         x,
         pre,
         weight,
         y,
         q,
         s,
+        m,
         SX=x.stride(0),
         SP=pre.stride(0),
         EPS=eps,
