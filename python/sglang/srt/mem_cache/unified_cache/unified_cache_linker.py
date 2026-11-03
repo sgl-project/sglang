@@ -188,6 +188,12 @@ class UnifiedCacheLinker(ABC):
         """Read all layers; the future completes after all device writes stop."""
         return None
 
+    def submit_lookup(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> Future[list[int]] | None:
+        """Submit a non-blocking lookup for prefetch mode."""
+        return None
+
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
@@ -264,10 +270,13 @@ class ExternalCacheHitMarker(NamedTuple):
 @dataclass
 class _ExternalCachePrefetch:
     key: RadixKey
+    hashes: list[str]
+    device_hit_len: int
     anchor_node_id: NodeId
     anchor_lock: DecLockRefParams
+    lookup_future: Future[list[int]] | None
     component_transfers: list[tuple[TreeComponent, PoolTransfer]]
-    future: Future[bool] | None = None
+    load_future: Future[bool] | None = None
     timeout_s: float = 0.0
     wait_started: float | None = None
     discard: bool = False
@@ -432,46 +441,34 @@ class UnifiedCacheLinkerWrapper:
         ]
         if any(t is None for t in lookups):
             return
+        anchor_node_id = req.last_node
+        anchor_lock = self.cache.inc_lock_ref(anchor_node_id).to_dec_params()
         try:
-            # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
-            restorable = self.cache_linker.lookup(req.rid, lookups)
+            lookup_future = self.cache_linker.submit_lookup(req.rid, lookups)
         except Exception:
-            logger.warning("External linker prefetch lookup failed", exc_info=True)
-            restorable = []
-        pages = self._sync_restorable_prefix(
-            restorable, num_pages=len(hashes), device_hit_pages=0
-        )
-        if not pages:
+            logger.warning(
+                "External linker prefetch lookup submission failed", exc_info=True
+            )
+            lookup_future = None
+        accepted = torch.tensor([lookup_future is not None], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+        if not accepted.item():
+            if lookup_future is not None:
+                lookup_future.cancel()
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
             return
-        end = start + pages * page
         state = _ExternalCachePrefetch(
-            key[:end],
-            req.last_node,
-            self.cache.inc_lock_ref(req.last_node).to_dec_params(),
-            [],
+            key=key,
+            hashes=hashes,
+            device_hit_len=start,
+            anchor_node_id=anchor_node_id,
+            anchor_lock=anchor_lock,
+            lookup_future=lookup_future,
+            component_transfers=[],
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
         )
         self.prefetches[request] = state
-        try:
-            for component in self._components:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOAD, None, hashes[:pages]
-                )
-                if transfer is None:
-                    break
-                state.component_transfers.append((component, transfer))
-            if len(state.component_transfers) == len(self._components):
-                state.future = self.cache_linker.prefetch(
-                    [t for _, t in state.component_transfers]
-                )
-        except Exception:
-            logger.warning("External linker prefetch submission failed", exc_info=True)
-        accepted = torch.tensor([state.future is not None], dtype=torch.int)
-        self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
-        if not accepted.item():
-            self._cancel_prefetch(request)
-            self.check_prefetch_events()
 
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         state = self.prefetches.get(request)
@@ -502,8 +499,9 @@ class UnifiedCacheLinkerWrapper:
         state = self.prefetches.get(request)
         if state is not None:
             state.discard = True
-            if state.future is not None:
-                state.future.cancel()
+            future = state.lookup_future or state.load_future
+            if future is not None:
+                future.cancel()
 
     def prefetch_size(self, pool: PoolName) -> int:
         """Device slots still owned by prefetch, including discarded writes."""
@@ -517,10 +515,33 @@ class UnifiedCacheLinkerWrapper:
     def check_prefetch_events(self) -> None:
         if not self.prefetches:
             return
-        pending = list(self.prefetches.items())
+        lookup_pending = [
+            (request, state)
+            for request, state in self.prefetches.items()
+            if state.lookup_future is not None
+        ]
+        if lookup_pending:
+            ready = torch.tensor(
+                [state.lookup_future.done() for _, state in lookup_pending],
+                dtype=torch.int,
+            )
+            self.cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
+            for (request, _), done in zip(lookup_pending, ready.tolist()):
+                if done:
+                    self._finish_prefetch_lookup(request)
+
+        if not self.prefetches:
+            return
+        pending = [
+            (request, state)
+            for request, state in self.prefetches.items()
+            if state.lookup_future is None
+        ]
+        if not pending:
+            return
         progress = []
         for _, state in pending:
-            future = state.future
+            future = state.load_future
             done = future is None or future.done()
             landed = False
             try:
@@ -537,13 +558,57 @@ class UnifiedCacheLinkerWrapper:
             if done:
                 self._finish_prefetch(request, publish=bool(landed))
 
+    def _finish_prefetch_lookup(self, request: CacheRequestHandle) -> None:
+        state = self.prefetches.get(request)
+        if state is None or state.lookup_future is None:
+            return
+        future = state.lookup_future
+        assert future.done()
+        try:
+            restorable = [] if future.cancelled() else future.result()
+        except Exception:
+            logger.warning("External linker prefetch lookup failed", exc_info=True)
+            restorable = []
+        if state.discard:
+            restorable = []
+
+        pages = self._sync_restorable_prefix(
+            restorable, num_pages=len(state.hashes), device_hit_pages=0
+        )
+        if not pages:
+            self._finish_prefetch(request, publish=False)
+            return
+
+        state.lookup_future = None
+        end = state.device_hit_len + pages * self.cache.page_size
+        state.key = state.key[:end]
+        try:
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, state.hashes[:pages]
+                )
+                if transfer is None:
+                    break
+                state.component_transfers.append((component, transfer))
+            if len(state.component_transfers) == len(self._components):
+                state.load_future = self.cache_linker.prefetch(
+                    [transfer for _, transfer in state.component_transfers]
+                )
+        except Exception:
+            logger.warning("External linker prefetch submission failed", exc_info=True)
+        accepted = torch.tensor([state.load_future is not None], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+        if not accepted.item():
+            self._cancel_prefetch(request)
+
     def _finish_prefetch(self, request: CacheRequestHandle, *, publish: bool) -> None:
         state = self.prefetches.pop(request, None)
         if state is None:
             return
-        # Event polling or reset/close has already quiesced every device writer.
-        if state.future is not None:
-            assert state.future.done()
+        # Event polling or reset/close has quiesced the active backend operation.
+        for future in (state.lookup_future, state.load_future):
+            if future is not None:
+                assert future.done()
         end = len(state.key)
         try:
             if not publish:
