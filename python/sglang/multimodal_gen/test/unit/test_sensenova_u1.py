@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
     modeling_fm_modules,
+    modeling_qwen3,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOChatConfig,
@@ -1498,3 +1499,30 @@ def test_sensenova_u1_rope_uses_bitexact_kernel_on_accelerators():
             expected = (q * c + rotate_half(q) * s, k * c + rotate_half(k) * s)
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
     assert calls == [64, 64, 32, 32]
+
+
+@pytest.mark.skipif(
+    not (hasattr(torch, "xpu") and torch.xpu.is_available()),
+    reason="needs an XPU device",
+)
+@torch.inference_mode()
+def test_sensenova_u1_xpu_unmasked_attention_uses_flash():
+    """Unmasked XPU attention takes sgl-kernel flash attention; set_attn_backend('sdpa') still forces SDPA."""
+    q = torch.randn(1, 512, 32, 128, device="xpu", dtype=torch.bfloat16)
+    k = torch.randn(1, 600, 8, 128, device="xpu", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    expected = _sdpa_attn_func(q, k, v)
+    flash = modeling_qwen3.xpu_flash_attn
+    with patch.object(
+        flash, "flash_attn_varlen_func", wraps=flash.flash_attn_varlen_func
+    ) as calls:
+        # Measured worst case over 5 seeds at this and the 2048x2048 shape: 3.9e-3.
+        torch.testing.assert_close(_flash_or_sdpa(q, k, v), expected, rtol=0, atol=1e-2)
+        previous = modeling_qwen3.set_attn_backend("sdpa")
+        try:
+            torch.testing.assert_close(
+                _flash_or_sdpa(q, k, v), expected, rtol=0, atol=0
+            )
+        finally:
+            modeling_qwen3.set_attn_backend(previous)
+    assert calls.call_count == 1

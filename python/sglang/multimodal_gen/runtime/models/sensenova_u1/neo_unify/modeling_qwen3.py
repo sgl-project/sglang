@@ -25,6 +25,7 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.utils.common import is_xpu
 
 from .transformers_compat import (
     causal_mask_kwargs,
@@ -39,6 +40,16 @@ try:
 except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash envs
     flash_attn_func = None  # type: ignore
     _HAS_FLASH_ATTN = False
+
+if is_xpu():
+    import sgl_kernel.flash_attn as xpu_flash_attn
+
+    # sgl-kernel-xpu flash attention needs BMG or later.
+    XPU_FLASH_ATTN_SUPPORTED = xpu_flash_attn.is_fa3_supported()
+else:
+    XPU_FLASH_ATTN_SUPPORTED = False
+# Head sizes sgl-kernel-xpu flash attention accepts (probed on Arc Pro B60).
+XPU_FLASH_ATTN_HEAD_SIZES = (64, 80, 96, 128, 192, 256)
 
 
 # Attention backend dispatch.
@@ -162,6 +173,40 @@ def _sdpa_attn_func(
     return out.transpose(1, 2).contiguous()
 
 
+def _xpu_flash_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+) -> torch.Tensor:
+    # [B, S, H, D] with equal lengths per batch row, packed for the varlen kernel.
+    batch_size, query_length = q.shape[:2]
+    key_length = k.shape[1]
+    query_offsets = torch.arange(
+        0,
+        (batch_size + 1) * query_length,
+        query_length,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    key_offsets = torch.arange(
+        0, (batch_size + 1) * key_length, key_length, dtype=torch.int32, device=q.device
+    )
+    output = xpu_flash_attn.flash_attn_varlen_func(
+        q.reshape(-1, *q.shape[2:]),
+        k.reshape(-1, *k.shape[2:]),
+        v.reshape(-1, *v.shape[2:]),
+        query_offsets,
+        key_offsets,
+        query_length,
+        key_length,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    return output.view(batch_size, query_length, *output.shape[1:])
+
+
 def _flash_or_sdpa(
     q,
     k,
@@ -270,6 +315,15 @@ def _flash_or_sdpa(
     # back to SDPA even if the user asked for ``flash`` — the alternative
     # (crashing on first forward) is worse, and ``set_attn_backend('flash')``
     # already guarded against the "package missing" case.
+    if (
+        q.device.type == "xpu"
+        and XPU_FLASH_ATTN_SUPPORTED
+        and q.shape[-1] in XPU_FLASH_ATTN_HEAD_SIZES
+        and get_attn_backend() != "sdpa"
+        and attention_mask is None
+        and dropout_p == 0.0
+    ):
+        return _xpu_flash_attn(q, k, v, softmax_scale=softmax_scale, causal=causal)
     if backend == "flash" and q.device.type == "cuda" and attention_mask is None:
         return flash_attn_func(
             q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal
