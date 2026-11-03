@@ -48,7 +48,7 @@ class DeferredResponses:
             raise ValueError("deferred responses do not support PD disaggregation")
         if not req.finished() or req.finished_output:
             raise ValueError("only finished, unstreamed responses can be deferred")
-        if req in self.held:
+        if any(held.rid == req.rid for held in self.held):
             raise ValueError(f"response {req.rid!r} is already deferred")
         self.held.join([(req, completion)])
         req.defer_output = True
