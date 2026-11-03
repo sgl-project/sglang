@@ -67,6 +67,43 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
     assert sampler_runs == [True]
 
 
+def test_rebuilt_worker_gets_this_runs_loras_not_the_previous_prompts() -> None:
+    """ComfyUI reuses a cached MODEL across prompts; its executor remembers the
+    LoRAs of the last prompt, which the new worker must not load again."""
+    runtime = SGLDiffusionGenerator()
+    previous = {"lora_nickname": ["a", "b"], "lora_path": ["a", "b"]}
+    current = {"lora_nickname": ["c"], "lora_path": ["c"]}
+    sent = []
+
+    def executor(lora_input):
+        ex = SimpleNamespace(
+            generator=object(),
+            _sgld_reload={"model_path": "z.safetensors"},
+            _lora_input=previous,
+            begin_sampler_run=lambda: None,
+        )
+        ex.set_lora = lambda **kw: (sent.append(kw), setattr(ex, "_lora_input", kw))
+        runtime.load_model = lambda **kwargs: setattr(runtime, "generator", object())
+        runtime.ensure_executor(ex, lora_input=lora_input)
+        return ex
+
+    assert executor(None)._lora_input is None and sent == []
+    assert executor(current)._lora_input == current and sent == [current]
+    # Mid-run (no run-level LoRA given): the adapters it last set are resent.
+    sent.clear()
+    runtime.load_model = None
+    ex = SimpleNamespace(
+        generator=object(),
+        _sgld_reload={"model_path": "z.safetensors"},
+        _lora_input=previous,
+        begin_sampler_run=lambda: None,
+    )
+    ex.set_lora = lambda **kw: sent.append(kw)
+    runtime.load_model = lambda **kwargs: setattr(runtime, "generator", object())
+    runtime.ensure_executor(ex)
+    assert sent == [previous]
+
+
 def test_ensure_is_noop_when_executor_still_owns_live_worker() -> None:
     runtime = SGLDiffusionGenerator()
     gen = object()

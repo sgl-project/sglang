@@ -199,6 +199,40 @@ def test_each_sampler_run_merges_exactly_its_models_loras() -> None:
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+def test_rebuilt_worker_loads_only_this_runs_loras() -> None:
+    """ComfyUI reuses a cached MODEL across prompts. When the sampler wrapper
+    rebuilds the worker, the new worker must load this run's LoRAs, not the
+    ones the cached executor served for the previous prompt."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        SGLDiffusionGenerator,
+    )
+
+    runtime = SGLDiffusionGenerator()
+    workers = []
+
+    def load_model(**kwargs):
+        runtime.generator = Mock()
+        workers.append(runtime.generator)
+
+    runtime.load_model = load_model
+    runtime._is_live = lambda: True
+    ex = _executor(Mock())  # a worker this runtime no longer owns
+    ex._sgld_reload = {"model_path": "z.safetensors"}
+    ex._ensure_runtime = runtime.ensure_executor
+    for previous, current in (([("A", 0.5)], []), ([("A", 0.5)], [("B", 0.25)])):
+        ex._lora_input = _lora_input(previous)
+        runtime.generator = None  # the previous worker was replaced
+        ex.sampler_sample_wrapper(lambda *a, **k: None, _sampler(current))
+        worker = workers[-1]
+        worker.unmerge_lora_weights.assert_not_called()
+        if current:
+            worker.set_lora.assert_called_once_with(**_lora_input(current))
+            assert ex._lora_input == _lora_input(current)
+        else:
+            worker.set_lora.assert_not_called()
+            assert ex._lora_input is None
+
+
 def test_failed_lora_switch_is_not_recorded_as_active() -> None:
     ex = _executor(Mock())
     ex._lora_input = _lora_input([("A", 0.5)])

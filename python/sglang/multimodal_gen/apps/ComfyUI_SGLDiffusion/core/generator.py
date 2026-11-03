@@ -104,6 +104,9 @@ def _looks_like_gguf(path: str) -> bool:
     )
 
 
+# ensure_executor default: resend the adapters the executor last set.
+_LAST_LORA = object()
+
 _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
 NATIVE_MODEL_TYPES = tuple(_NATIVE_MODEL_TYPES.values())
 
@@ -501,8 +504,12 @@ class SGLDiffusionGenerator:
             and self._is_live()
         )
 
-    def ensure_executor(self, executor) -> None:
-        """Rebuild the worker if this cached executor no longer owns it."""
+    def ensure_executor(self, executor, lora_input=_LAST_LORA) -> None:
+        """Rebuild the worker if this cached executor no longer owns it.
+
+        The new worker gets ``lora_input``; by default (mid-run) the adapters
+        the executor last set.
+        """
         self._active_executor = executor
         if self._owns_live(executor):
             return
@@ -517,7 +524,9 @@ class SGLDiffusionGenerator:
         )
         self.load_model(**reload)
         executor.generator = self.generator
-        lora = executor._lora_input
+        lora = executor._lora_input if lora_input is _LAST_LORA else lora_input
+        # The new worker has no adapters loaded.
+        executor._lora_input = None
         if lora and lora.get("lora_nickname"):
             executor.set_lora(**lora)
         # The new worker's session cache starts empty, so conditioning the

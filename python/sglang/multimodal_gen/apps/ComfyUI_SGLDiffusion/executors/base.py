@@ -237,10 +237,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
         """Run cache is evicted on the next bind of a newer id for this executor."""
 
     def sampler_sample_wrapper(self, executor, *args, **kwargs):
-        if self._ensure_runtime is not None:
-            self._ensure_runtime(self)
         model_wrap = args[0] if args else kwargs["model_wrap"]
         desired = model_wrap.model_patcher.model_options.get("sgld_lora_input")
+        if self._ensure_runtime is not None:
+            # A rebuilt worker gets this run's LoRAs, not the ones this cached
+            # executor served last (ComfyUI reuses a MODEL across prompts).
+            self._ensure_runtime(self, lora_input=desired)
         if desired != self._lora_input:
             if self._lora_input is not None:
                 self.generator.unmerge_lora_weights()
