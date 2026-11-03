@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import math
 from copy import copy
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Dict, Optional, Tuple
 
 import msgspec
@@ -262,6 +262,9 @@ class QSAMTPSharedSparseIndices:
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 
+    # The QSA K/V host offload of the pool, if any (set with the pool).
+    _kv_offload = None
+
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
@@ -269,6 +272,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
+        self._kv_offload = getattr(self.token_to_kv_pool, "kv_offload", None)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
             self.token_to_kv_pool
         )
@@ -979,6 +983,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._require_chain_speculation(forward_mode, spec_info)
         if self.token_to_kv_pool is None:
             self.token_to_kv_pool = getattr(self.runner, "token_to_kv_pool", None)
+            self._kv_offload = getattr(self.token_to_kv_pool, "kv_offload", None)
             self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
                 self.token_to_kv_pool
             )
@@ -1398,9 +1403,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         rows = metadata.row_req_pool_indices
         return rows if rows is not None else forward_batch.req_pool_indices
 
-    @property
-    def _kv_offload(self):
-        return getattr(self.token_to_kv_pool, "kv_offload", None)
+    def _gather_tables(self, *, forward_batch, metadata, source):
+        """(slot table, row -> request) the decode gathers read K/V through."""
+        if source is not None:
+            return source.slot_table, source.row_requests
+        return self.req_to_token_pool.req_to_token, self._row_requests(
+            forward_batch=forward_batch, metadata=metadata
+        )
 
     def _store_kv(self, layer, forward_batch, k, v) -> None:
         offload = self._kv_offload
@@ -1421,7 +1430,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         else:
             rows = offload.extend_rows(forward_batch.out_cache_loc.numel())
         pool = self.token_to_kv_pool
-        layer_idx = pool._transfer_full_attention_id(layer.layer_id)
+        layer_idx = pool.full_attention_layer_index(layer.layer_id)
         if offload.verify:
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
@@ -1465,7 +1474,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         ]
         pool = self.token_to_kv_pool
         offload = self._kv_offload
-        layer_idx = pool._transfer_full_attention_id(layer.layer_id)
+        layer_idx = pool.full_attention_layer_index(layer.layer_id)
         k, v = offload.gather_context(layer_idx=layer_idx, slots=slots)
         pool_k = pool.layer_router.read(layer.layer_id).key()
         pool_v = pool.layer_router.read(layer.layer_id).value()
@@ -1498,7 +1507,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Decode / target verify over the offload's per-forward device-row table."""
         pool = self.token_to_kv_pool
         offload = self._kv_offload
-        layer_idx = pool._transfer_full_attention_id(layer.layer_id)
+        layer_idx = pool.full_attention_layer_index(layer.layer_id)
         metadata = self._resolve_metadata(forward_batch)
         positions = self._expand_block_indices(topk_indices, metadata)
         num_rows, width = positions.shape
@@ -1524,11 +1533,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
         )
         if offload.verify:
-            reference = self._pool_gather_source(
+            reference = QSAKVGatherSource(
                 k_buffer=pool_k,
                 v_buffer=pool_v,
-                forward_batch=forward_batch,
-                metadata=metadata,
+                slot_table=self.req_to_token_pool.req_to_token,
+                row_requests=self._row_requests(
+                    forward_batch=forward_batch, metadata=metadata
+                ),
+                sequence_lengths=metadata.sequence_lengths,
             )
             offload.check(
                 what="decode gather",
@@ -1539,8 +1551,22 @@ class QwenSparseAttnBackend(AttentionBackend):
                     indices=positions.to(torch.int32).contiguous(),
                 ),
             )
-        return self._forward_gathered_attention(
-            q=q, layer=layer, metadata=metadata, topk_indices=indices, source=source
+        indices = indices.to(torch.int32).contiguous()
+        trtllm_decode = _resolve_trtllm_sparse_decode()
+        attention = (
+            self._forward_varlen_sparse
+            if trtllm_decode is None
+            else partial(self._forward_trtllm_sparse, trtllm_decode=trtllm_decode)
+        )
+        return attention(
+            q=q,
+            k_buffer=source.k_buffer,
+            v_buffer=source.v_buffer,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            topk_indices=indices,
+            source=source,
         )
 
     @staticmethod
@@ -1660,13 +1686,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+            kc,
+            vc,
             layer,
+            forward_batch,
             metadata,
             indices.to(torch.int32).contiguous(),
             trtllm_decode,
-            self._pool_gather_source(
-                k_buffer=kc, v_buffer=vc, forward_batch=forward_batch, metadata=metadata
-            ),
             new_kv=(k, v, loc, width),
         )
 
@@ -1974,12 +2000,15 @@ class QwenSparseAttnBackend(AttentionBackend):
     def _forward_trtllm_sparse(
         self,
         q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
         layer,
+        forward_batch,
         metadata,
         topk_indices: torch.Tensor,
         trtllm_decode,
-        source: QSAKVGatherSource,
         new_kv=None,
+        source: Optional[QSAKVGatherSource] = None,
     ) -> torch.Tensor:
         """Pack selected KV at page-aligned row strides for FlashInfer's paged decode,
         driven by a static arange block table and the per-row valid counts."""
@@ -1992,8 +2021,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         pages_per_row = (topk + page - 1) // page
         stride = pages_per_row * page
         device = q.device
-        k_buffer, v_buffer = source.k_buffer, source.v_buffer
-        sequence_lens = source.sequence_lengths
+        sequence_lens = (
+            metadata.sequence_lengths if source is None else source.sequence_lengths
+        )
         if metadata.is_cuda_graph:
             valid_counts = metadata.fa2_valid_counts
             if valid_counts is None:
@@ -2020,14 +2050,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         if new_kv is not None:
             k, v, loc, width = new_kv
+            slot_table, row_requests = self._gather_tables(
+                forward_batch=forward_batch, metadata=metadata, source=source
+            )
             fused_kv_prepare(
                 k_buffer,
                 v_buffer,
                 k,
                 v,
                 loc,
-                source.slot_table,
-                source.row_requests,
+                slot_table,
+                row_requests,
                 topk_indices,
                 sequence_lens,
                 valid_counts,
@@ -2048,11 +2081,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             qwen_sparse_valid_counts_triton(
                 sequence_lens, topk_indices, valid_counts, batch, topk
             )
+            slot_table, row_requests = self._gather_tables(
+                forward_batch=forward_batch, metadata=metadata, source=source
+            )
             qwen_sparse_kv_extraction_compact_triton(
                 k_buffer,
                 v_buffer,
-                source.slot_table,
-                source.row_requests,
+                slot_table,
+                row_requests,
                 topk_indices,
                 sequence_lens,
                 cu_strided,
@@ -2146,50 +2182,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
-        return self._forward_gathered_attention(
-            q=q,
-            layer=layer,
-            metadata=metadata,
-            topk_indices=topk_indices,
-            source=self._pool_gather_source(
-                k_buffer=k_buffer,
-                v_buffer=v_buffer,
-                forward_batch=forward_batch,
-                metadata=metadata,
-            ),
-        )
 
-    def _pool_gather_source(
-        self, k_buffer, v_buffer, forward_batch, metadata
-    ) -> QSAKVGatherSource:
-        return QSAKVGatherSource(
-            k_buffer=k_buffer,
-            v_buffer=v_buffer,
-            slot_table=self.req_to_token_pool.req_to_token,
-            row_requests=self._row_requests(
-                forward_batch=forward_batch, metadata=metadata
-            ),
-            sequence_lengths=metadata.sequence_lengths,
-        )
-
-    def _forward_gathered_attention(
-        self,
-        q: torch.Tensor,
-        layer,
-        metadata,
-        topk_indices: torch.Tensor,
-        source: QSAKVGatherSource,
-    ) -> torch.Tensor:
         topk_indices = topk_indices.to(torch.int32).contiguous()
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
-                q, layer, metadata, topk_indices, trtllm_decode, source
+                q,
+                k_buffer,
+                v_buffer,
+                layer,
+                forward_batch,
+                metadata,
+                topk_indices,
+                trtllm_decode,
             )
 
-        k_buffer, v_buffer = source.k_buffer, source.v_buffer
+        return self._forward_varlen_sparse(
+            q, k_buffer, v_buffer, layer, forward_batch, metadata, topk_indices
+        )
+
+    def _forward_varlen_sparse(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+        source: Optional[QSAKVGatherSource] = None,
+    ) -> torch.Tensor:
+        """Packed varlen decode (FA2/FA4, or ROCm) after the compact gather."""
         batch, topk = topk_indices.shape
-        sequence_lens = source.sequence_lengths
+        sequence_lens = (
+            metadata.sequence_lengths if source is None else source.sequence_lengths
+        )
         if metadata.is_cuda_graph:
             valid_counts = metadata.fa2_valid_counts
             cu_seqlens_k = metadata.fa2_cu_seqlens_k
@@ -2220,11 +2247,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
+        slot_table, row_requests = self._gather_tables(
+            forward_batch=forward_batch, metadata=metadata, source=source
+        )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
             v_buffer,
-            source.slot_table,
-            source.row_requests,
+            slot_table,
+            row_requests,
             topk_indices,
             sequence_lens,
             cu_seqlens_k,

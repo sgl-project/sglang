@@ -141,54 +141,93 @@ def offload_layout_from_config(
     )
 
 
-def offload_max_total_tokens(
-    *,
-    available_bytes: int,
-    cell_bytes: int,
-    offloaded_bytes_per_token: int,
-    device_rows: int,
-    page_size: int,
-    host_size_gb: float,
-    verify: bool = False,
-) -> int:
-    """Logical KV pool size with the QSA K/V on the host.
+class QSAKVOffloadBudget(msgspec.Struct, frozen=True):
+    """GPU and host cost of the offload, for the KV pool sizing."""
 
-    Per logical token the GPU keeps the cell minus the offloaded K/V (the QSA
-    index and any draft pool; the whole cell in verify mode); the device rows
-    hold full K/V rows. The host budget caps the pool at its K/V rows
-    (``size + page_size`` rows).
-    """
-    if host_size_gb <= 0:
-        raise ValueError("--qsa-kv-offload-host-size must be positive")
-    gpu_cell = cell_bytes - (0 if verify else offloaded_bytes_per_token)
-    if gpu_cell <= 0:
-        raise ValueError(
-            f"QSA K/V offload: per-token GPU cost {gpu_cell} B is not positive"
+    # K/V bytes per logical token of the offloaded layers (all of them).
+    offloaded_bytes_per_token: int
+    # Device rows per request slot, and the scratch plus padding page.
+    region_rows: int
+    fixed_rows: int
+    # Hot-cache tables per request slot, all layers.
+    table_bytes_per_slot: int
+    host_size_gb: float
+    page_size: int
+    # Verify mode keeps the full GPU pool: the whole cell stays on the GPU.
+    verify: bool = False
+
+    def slot_bytes(self) -> int:
+        return self.region_rows * self.offloaded_bytes_per_token + (
+            self.table_bytes_per_slot
         )
-    avail = available_bytes - (device_rows + page_size) * offloaded_bytes_per_token
-    if avail <= 0:
-        raise ValueError(
-            "QSA K/V offload: the hot cache and extend scratch "
-            f"({device_rows} rows x {offloaded_bytes_per_token} B) exceed the "
-            f"{available_bytes / 2**30:.2f} GiB KV budget; lower "
-            "--qsa-kv-offload-hot-blocks or --max-running-requests"
+
+    def gpu_cell(self, cell_bytes: int) -> int:
+        cell = cell_bytes - (0 if self.verify else self.offloaded_bytes_per_token)
+        if cell <= 0:
+            raise ValueError(f"QSA K/V offload: per-token GPU cost {cell} B")
+        return cell
+
+    def host_tokens(self) -> int:
+        if self.host_size_gb <= 0:
+            raise ValueError("--qsa-kv-offload-host-size must be positive")
+        host_rows = int(self.host_size_gb * GB) // self.offloaded_bytes_per_token
+        return host_rows - self.page_size
+
+    def max_total_tokens(
+        self, *, available_bytes: int, cell_bytes: int, num_request_slots: int
+    ) -> int:
+        """Logical KV pool size for ``num_request_slots`` request slots.
+
+        Per logical token the GPU keeps the cell minus the offloaded K/V (the
+        QSA index and any draft pool); each request slot costs its device rows
+        and tables. The host budget caps the pool at its K/V rows.
+        """
+        fixed = num_request_slots * self.slot_bytes() + (
+            self.fixed_rows * self.offloaded_bytes_per_token
         )
-    gpu_tokens = avail // gpu_cell
-    host_tokens = int(host_size_gb * GB) // offloaded_bytes_per_token - page_size
-    tokens = min(gpu_tokens, host_tokens) // page_size * page_size
-    logger.info(
-        "QSA K/V offload sizing: device rows %d (%.2f GiB), GPU %d B/token "
-        "allows %d tokens, host %.1f GB / %d B allows %d tokens -> %d tokens",
-        device_rows,
-        (device_rows + page_size) * offloaded_bytes_per_token / 2**30,
-        gpu_cell,
-        gpu_tokens,
-        host_size_gb,
-        offloaded_bytes_per_token,
-        host_tokens,
-        tokens,
+        if available_bytes <= fixed:
+            raise ValueError(
+                f"QSA K/V offload: the hot cache of {num_request_slots} request "
+                f"slots ({fixed / 2**30:.2f} GiB) exceeds the "
+                f"{available_bytes / 2**30:.2f} GiB KV budget; lower "
+                "--qsa-kv-offload-hot-blocks or --max-running-requests"
+            )
+        gpu_tokens = (available_bytes - fixed) // self.gpu_cell(cell_bytes)
+        tokens = min(gpu_tokens, self.host_tokens())
+        logger.info(
+            "QSA K/V offload sizing: %d request slots, hot cache %.2f GiB, GPU "
+            "allows %d tokens, host %.1f GB allows %d tokens",
+            num_request_slots,
+            fixed / 2**30,
+            gpu_tokens,
+            self.host_size_gb,
+            self.host_tokens(),
+        )
+        return tokens // self.page_size * self.page_size
+
+    def tokens_with_unused_slots(
+        self, *, max_total_tokens: int, cell_bytes: int, unused_slots: int
+    ) -> int:
+        """Pool size once ``unused_slots`` budgeted request slots are not built:
+        their GPU bytes hold logical tokens instead, up to the host budget."""
+        extra = unused_slots * self.slot_bytes() // self.gpu_cell(cell_bytes)
+        tokens = min(max_total_tokens + extra, self.host_tokens())
+        return tokens // self.page_size * self.page_size
+
+
+def offload_table_bytes_per_slot(
+    *, num_layers: int, hot_blocks: int, compress_ratio: int, context_len: int
+) -> int:
+    """Upper bound of the per-request-slot hot-cache tables of either resolve:
+    block->slot (int32 per block of the context), per-slot block, age, LRU
+    order, marks and source records, and the ring records."""
+    per_layer = (
+        (context_len // compress_ratio + 2 * TAIL_BLOCKS) * 4
+        + hot_blocks * (8 + 8 + 2 * 4 + 4 + 4 * compress_ratio)
+        + TAIL_BLOCKS * (8 + 4 * compress_ratio)
+        + 8
     )
-    return tokens
+    return num_layers * per_layer
 
 
 def _copy_rows(
@@ -464,8 +503,8 @@ class QSAKVHostOffload:
         the rows of one request contiguous and ``rows_per_request`` of them;
         ``row_seq_lens`` is each row's query position + 1. Returns int32
         ``[R, W]`` device rows, ``-1`` exactly where the position is not
-        attended (``< 0`` or ``>= row_seq_lens``). Call after ``bind``, before
-        the forward's new K/V are stored at ``new_token_rows``.
+        attended (``< 0`` or ``>= row_seq_lens``). Call after ``bind``; the
+        forward's new K/V may already be stored at ``new_token_rows``.
         """
         cr, q = self.cr, rows_per_request
         num_rows, width = positions.shape

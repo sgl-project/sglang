@@ -10,15 +10,19 @@ radix remaps of resident blocks and rejected speculative tokens.
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.arg_groups.qsa_kv_offload_hook import check_qsa_kv_offload_args
 from sglang.srt.mem_cache.qsa_kv_offload import (
     QSAKVHostOffload,
+    QSAKVOffloadBudget,
     QSAKVOffloadLayout,
     compute_offload_layout,
-    offload_max_total_tokens,
+    offload_table_bytes_per_slot,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -68,40 +72,178 @@ class TestOffloadLayout(CustomTestCase):
             )
 
 
+def _budget(**overrides):
+    values = dict(
+        offloaded_bytes_per_token=1000,
+        region_rows=100,
+        fixed_rows=64,
+        table_bytes_per_slot=5000,
+        host_size_gb=1000,
+        page_size=64,
+    )
+    values.update(overrides)
+    return QSAKVOffloadBudget(**values)
+
+
+# Per request slot: 100 rows x 1000 B + 5000 B of tables.
+_SLOT_BYTES = 100 * 1000 + 5000
+
+
 class TestOffloadSizing(CustomTestCase):
     def test_gpu_bound(self):
-        # 100 B/token stay on the GPU; the host allows far more.
-        tokens = offload_max_total_tokens(
-            available_bytes=10**9,
-            cell_bytes=1100,
-            offloaded_bytes_per_token=1000,
-            device_rows=1000 - 64,
-            page_size=64,
-            host_size_gb=1000,
+        # 1100 - 1000 = 100 B per logical token stay on the GPU.
+        tokens = _budget().max_total_tokens(
+            available_bytes=10**9, cell_bytes=1100, num_request_slots=9
         )
-        self.assertEqual(tokens, (10**9 - 1000 * 1000) // 100 // 64 * 64)
+        fixed = 9 * _SLOT_BYTES + 64 * 1000
+        self.assertEqual(tokens, (10**9 - fixed) // 100 // 64 * 64)
 
     def test_host_bound(self):
-        tokens = offload_max_total_tokens(
-            available_bytes=10**12,
-            cell_bytes=1100,
-            offloaded_bytes_per_token=1000,
-            device_rows=0,
-            page_size=64,
-            host_size_gb=1,
+        tokens = _budget(host_size_gb=1).max_total_tokens(
+            available_bytes=10**12, cell_bytes=1100, num_request_slots=9
         )
         self.assertEqual(tokens, (10**9 // 1000 - 64) // 64 * 64)
 
     def test_hot_cache_larger_than_budget(self):
-        with self.assertRaisesRegex(ValueError, "exceed"):
-            offload_max_total_tokens(
-                available_bytes=10**6,
-                cell_bytes=1100,
-                offloaded_bytes_per_token=1000,
-                device_rows=10**4,
-                page_size=64,
-                host_size_gb=1,
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            _budget().max_total_tokens(
+                available_bytes=10**6, cell_bytes=1100, num_request_slots=9
             )
+
+    def test_verify_mode_keeps_the_full_cell(self):
+        tokens = _budget(verify=True).max_total_tokens(
+            available_bytes=10**9, cell_bytes=1100, num_request_slots=9
+        )
+        fixed = 9 * _SLOT_BYTES + 64 * 1000
+        self.assertEqual(tokens, (10**9 - fixed) // 1100 // 64 * 64)
+
+    def test_unused_slots_hold_tokens(self):
+        # Sized for 33 request slots, but the request pool only gets 12.
+        budget = _budget()
+        sized = budget.max_total_tokens(
+            available_bytes=10**9, cell_bytes=1100, num_request_slots=33
+        )
+        grown = budget.tokens_with_unused_slots(
+            max_total_tokens=sized, cell_bytes=1100, unused_slots=21
+        )
+        direct = budget.max_total_tokens(
+            available_bytes=10**9, cell_bytes=1100, num_request_slots=12
+        )
+        self.assertGreater(grown, sized)
+        self.assertLessEqual(abs(grown - direct), 64)
+        capped = _budget(host_size_gb=0.1).tokens_with_unused_slots(
+            max_total_tokens=sized, cell_bytes=1100, unused_slots=21
+        )
+        self.assertEqual(capped, (10**8 // 1000 - 64) // 64 * 64)
+
+    def test_table_bytes_grow_with_context_and_hot_blocks(self):
+        def table(hot, ctx):
+            return offload_table_bytes_per_slot(
+                num_layers=12, hot_blocks=hot, compress_ratio=CR, context_len=ctx
+            )
+
+        self.assertGreater(table(512, 262144), table(512, 8192))
+        self.assertGreater(table(4096, 8192), table(512, 8192))
+
+
+_QSA_HF_CONFIG = SimpleNamespace(
+    indexer_n_heads=4,
+    indexer_kv_heads=1,
+    indexer_head_dim=128,
+    indexer_budget=2048,
+    indexer_compress_ratio=CR,
+)
+
+
+def _offload_args(**overrides):
+    graphs = SimpleNamespace(
+        decode=SimpleNamespace(backend=Backend.DISABLED),
+        prefill=SimpleNamespace(backend=Backend.DISABLED),
+    )
+    values = dict(
+        qsa_kv_offload_host_size=40,
+        qsa_kv_offload_hot_blocks=1024,
+        max_running_requests=8,
+        chunked_prefill_size=4096,
+        max_prefill_tokens=16384,
+        page_size=64,
+        enable_hierarchical_cache=False,
+        enable_hisparse=False,
+        enable_lmcache=False,
+        enable_mixed_chunk=False,
+        enable_dp_attention=False,
+        enable_prefill_cp=False,
+        attn_cp_size=1,
+        dcp_size=1,
+        disaggregation_mode="null",
+        pp_size=1,
+        speculative_algorithm=None,
+        speculative_eagle_topk=None,
+        speculative_num_draft_tokens=None,
+        cuda_graph_config=graphs,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestOffloadArgs(CustomTestCase):
+    def test_accepts_a_supported_config(self):
+        check_qsa_kv_offload_args(_offload_args(), _QSA_HF_CONFIG)
+        check_qsa_kv_offload_args(
+            _offload_args(
+                speculative_algorithm="NEXTN",
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                qsa_kv_offload_hot_blocks=2048,
+            ),
+            _QSA_HF_CONFIG,
+        )
+
+    def test_refusals(self):
+        cases = {
+            "compressed QSA": (dict(), SimpleNamespace()),
+            "host-size": (dict(qsa_kv_offload_host_size=0), _QSA_HF_CONFIG),
+            "max-running-requests": (dict(max_running_requests=None), _QSA_HF_CONFIG),
+            "chunked prefill": (dict(chunked_prefill_size=-1), _QSA_HF_CONFIG),
+            "hierarchical-cache": (
+                dict(enable_hierarchical_cache=True),
+                _QSA_HF_CONFIG,
+            ),
+            "hisparse": (dict(enable_hisparse=True), _QSA_HF_CONFIG),
+            "lmcache": (dict(enable_lmcache=True), _QSA_HF_CONFIG),
+            "mixed-chunk": (dict(enable_mixed_chunk=True), _QSA_HF_CONFIG),
+            "dp-attention": (dict(enable_dp_attention=True), _QSA_HF_CONFIG),
+            "prefill-cp": (dict(enable_prefill_cp=True), _QSA_HF_CONFIG),
+            "attn-cp-size": (dict(attn_cp_size=2), _QSA_HF_CONFIG),
+            "dcp-size": (dict(dcp_size=2), _QSA_HF_CONFIG),
+            "disaggregation": (dict(disaggregation_mode="decode"), _QSA_HF_CONFIG),
+            "pp-size": (dict(pp_size=2), _QSA_HF_CONFIG),
+            "NGRAM": (dict(speculative_algorithm="NGRAM"), _QSA_HF_CONFIG),
+            "eagle-topk": (
+                dict(speculative_algorithm="EAGLE", speculative_eagle_topk=4),
+                _QSA_HF_CONFIG,
+            ),
+            "disable-cuda-graph": (
+                dict(
+                    cuda_graph_config=SimpleNamespace(
+                        decode=SimpleNamespace(backend=Backend.FULL),
+                        prefill=SimpleNamespace(backend=Backend.DISABLED),
+                    )
+                ),
+                _QSA_HF_CONFIG,
+            ),
+            "is below 2048": (
+                dict(
+                    speculative_algorithm="NEXTN",
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=4,
+                ),
+                _QSA_HF_CONFIG,
+            ),
+        }
+        for message, (overrides, hf_config) in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                check_qsa_kv_offload_args(_offload_args(**overrides), hf_config)
 
 
 class _OffloadSim:

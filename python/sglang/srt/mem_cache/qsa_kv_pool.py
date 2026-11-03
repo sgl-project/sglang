@@ -290,6 +290,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
 
+    def full_attention_layer_index(self, layer_id: int) -> int:
+        """Index of a full-attention (QSA) layer among this pool's QSA layers."""
+        return self._transfer_full_attention_id(layer_id)
+
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[
             self._transfer_full_attention_id(layer_id)

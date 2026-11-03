@@ -2288,14 +2288,14 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--qsa-kv-offload-host-size`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pinned host memory for the offloaded QSA K/V in GB. Caps the logical KV pool together with the GPU budget.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pinned host memory for the offloaded QSA K/V in GB per TP rank. Caps the logical KV pool together with the GPU budget.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--qsa-kv-offload-hot-blocks`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GPU cache size per request and QSA layer, in compressed indexer blocks. Must hold one forward's selected blocks of every query row of a request.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`4096`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GPU cache size per request and QSA layer, in compressed indexer blocks. Must hold one forward's selected blocks of every query row of a request (at least the indexer's block top-k times the verify rows). Each block costs compress_ratio K/V rows per QSA layer per request slot (Qwen3.8-Flash-Next with a BF16 KV cache: about 0.1 GB per request slot at 1024).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1024`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
 </tbody>
