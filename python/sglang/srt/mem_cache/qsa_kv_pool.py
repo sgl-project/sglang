@@ -21,7 +21,13 @@ from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import (
+    GB,
+    HybridLinearKVPool,
+    MambaPool,
+    MHATokenToKVPool,
+)
+from sglang.srt.mem_cache.qsa_kv_offload import QSAKVHostOffload, QSAKVOffloadLayout
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +123,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
+        kv_offload_layout: Optional[QSAKVOffloadLayout] = None,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -132,6 +139,26 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
+        full_kv_pool = None
+        if kv_offload_layout is not None:
+            if (
+                quant_method is not None
+                or post_capture_active
+                or full_kv_pool_class is not None
+            ):
+                raise ValueError("QSA K/V offload needs a plain unquantized K/V pool")
+            # The GPU keeps only the hot-cache and scratch rows of the K/V.
+            full_kv_pool = MHATokenToKVPool(
+                size=kv_offload_layout.device_rows,
+                page_size=page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=len(full_attention_layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                kv_cache_layout="nhd",
+            )
         super().__init__(
             size=size,
             dtype=dtype,
@@ -148,6 +175,17 @@ class QSATokenToKVPool(HybridLinearKVPool):
             full_kv_pool_class=full_kv_pool_class,
             quant_method=quant_method,
             post_capture_active=post_capture_active,
+            full_kv_pool=full_kv_pool,
+        )
+        self.kv_offload = (
+            None
+            if kv_offload_layout is None
+            else QSAKVHostOffload(
+                layout=kv_offload_layout,
+                k_buffers=self.full_kv_pool.k_buffer,
+                v_buffers=self.full_kv_pool.v_buffer,
+                host_rows=size + page_size,
+            )
         )
         if (
             min(

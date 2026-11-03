@@ -339,6 +339,34 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
+        self._qsa_kv_offload = None
+        if get_memory().enable_qsa_kv_offload and not kvc.is_draft_worker:
+            self._qsa_kv_offload = self._qsa_kv_offload_sizing(kvc, num_layers)
+
+    @staticmethod
+    def _qsa_kv_offload_sizing(
+        kvc: KVCacheConfigurator, num_layers: int
+    ) -> tuple[int, int]:
+        """(offloaded K/V bytes per logical token, device rows) of the QSA layers."""
+        from sglang.srt.mem_cache.qsa_kv_offload import offload_layout_from_config
+
+        model_config = kvc.model_config
+        kv_heads = model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        kv_bytes = (
+            kv_heads
+            * (model_config.head_dim + model_config.v_head_dim)
+            * num_layers
+            * torch._utils._element_size(kvc.kv_cache_dtype)
+        )
+        layout = offload_layout_from_config(
+            hf_config=model_config.hf_config,
+            num_request_slots=get_schedule().max_running_requests + 1,
+            page_size=get_schedule().page_size,
+        )
+        return kv_bytes, layout.device_rows
+
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
         # args to config cell size
@@ -659,6 +687,20 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
+        if self._qsa_kv_offload is not None:
+            from sglang.srt.mem_cache.qsa_kv_offload import offload_max_total_tokens
+
+            kv_bytes, device_rows = self._qsa_kv_offload
+            return MemoryPoolConfig(
+                max_total_num_tokens=offload_max_total_tokens(
+                    available_bytes=available_bytes,
+                    cell_bytes=self._cell_size,
+                    offloaded_bytes_per_token=kv_bytes,
+                    device_rows=device_rows,
+                    page_size=page_size,
+                    host_size_gb=get_memory().qsa_kv_offload_host_size,
+                )
+            )
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

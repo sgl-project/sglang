@@ -2586,6 +2586,16 @@ class KVCacheConfigurator:
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
             )
+            if get_memory().enable_qsa_kv_offload and not self.is_draft_worker:
+                from sglang.srt.mem_cache.qsa_kv_offload import (
+                    offload_layout_from_config,
+                )
+
+                extra_args["kv_offload_layout"] = offload_layout_from_config(
+                    hf_config=self.model_config.hf_config,
+                    num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                    page_size=self.pool_page_size,
+                )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
