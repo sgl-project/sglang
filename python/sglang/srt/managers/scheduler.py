@@ -4369,6 +4369,7 @@ class Scheduler(
                     if self.disagg_prefill_bootstrap_queue is not None
                     else []
                 ),
+                chunked_req=self.chunked_req,
             )
         )
 
@@ -4459,6 +4460,9 @@ class Scheduler(
             if adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                continue
+            # Set by the uniboost commit gate for this pass only.
+            if req.uniboost_commit_hold:
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests

@@ -22,12 +22,20 @@ import logging
 import math
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
+
+# Commit-gate frontier: tokens compared just past a waiting request's current
+# match point; an earlier extender that shares them will extend that match.
+COMMIT_GATE_FRONTIER_TOKENS = 256
+# Commit-gate cap on the cumulative hold of one request, in wall seconds. One
+# extender's prefill takes well under a minute at 256k context on 8xH200, so a
+# longer hold means the extender is not committing (e.g. retraction churn).
+COMMIT_GATE_MAX_HOLD_S = 120.0
 
 
 class UniBoostClock(Enum):
@@ -282,6 +290,7 @@ def sort_waiting_queue(
     clock: UniBoostClock,
     rate_tokens_per_s: Optional[float],
     temporary_deprioritized: Set[str],
+    leader_of: Dict[str, str],
     enable_priority_scheduling: bool,
     priority_sign: int,
 ) -> None:
@@ -290,9 +299,13 @@ def sort_waiting_queue(
     Wall clock: A(r) is in seconds and work becomes u(r) / rate seconds, so
     gamma is in 1/s; until the rate is measured the boost is 0 (FCFS).
 
-    In-batch prefix-dedup followers sort last, as under the other cache-aware
-    policies. Ties break by A(r), then rid.
+    In-batch prefix-dedup followers sort just behind their leader (the queued
+    request whose admission populates the shared prefix), not behind every
+    other request: a follower behind the whole queue also sits behind every
+    later arrival and has no starvation bound. A follower whose leader left
+    the queue goes last. Ties break by A(r), then rid.
     """
+    req_by_rid = {r.rid: r for r in waiting_queue} if leader_of else {}
     wall = clock is UniBoostClock.WALL
 
     def arrival(r: Req) -> float:
@@ -307,15 +320,62 @@ def sort_waiting_queue(
             return arrival(r)
         return arrival(r) - boost(w / rate_tokens_per_s, gamma)
 
+    # Smaller than any gap between two unrelated requests' phi in either unit.
+    eps = 1e-3 if wall else 1.0
+
     def key(r: Req):
         group, rank = 0, phi(r)
         if r.rid in temporary_deprioritized:
-            group, rank = 1, 0.0
+            leader = req_by_rid.get(leader_of.get(r.rid))
+            if leader is not None:
+                rank = phi(leader) + eps
+            else:
+                group, rank = 1, 0.0
         if enable_priority_scheduling:
             return (r.priority * priority_sign, group, rank, arrival(r), r.rid)
         return (group, rank, arrival(r), r.rid)
 
     waiting_queue.sort(key=key)
+
+
+def mark_commit_holds(
+    waiting_queue: Sequence[Req], *, chunked_req: Optional[Req], now_s: float
+) -> None:
+    """Holds a request out of this admission pass while an earlier extender
+    will extend its matched prefix by at least one frontier page.
+
+    The extender is the in-flight chunked prefill or a waiting request that
+    sorts (and so admits) before it. Admitting first would prefill, uncached,
+    the tokens the extender is about to commit to the radix tree. The hold
+    ends with that one extender; COMMIT_GATE_MAX_HOLD_S bounds the total.
+    waiting_queue must already be in admission order.
+    """
+    frontier = COMMIT_GATE_FRONTIER_TOKENS
+
+    def extends_match(extender: Optional[Req], k: int, ids) -> bool:
+        if extender is None:
+            return False
+        e_ids = extender.origin_input_ids
+        return (
+            len(e_ids) >= k + frontier
+            and e_ids[k : k + frontier] == ids[k : k + frontier]
+        )
+
+    for i, r in enumerate(waiting_queue):
+        r.uniboost_commit_hold = False
+        k = r.num_matched_prefix_tokens
+        if k <= 0:
+            continue
+        ids = r.origin_input_ids
+        if not (
+            extends_match(chunked_req, k, ids)
+            or any(extends_match(w, k, ids) for w in waiting_queue[:i])
+        ):
+            continue
+        if r.uniboost_commit_hold_first_s is None:
+            r.uniboost_commit_hold_first_s = now_s
+        if now_s - r.uniboost_commit_hold_first_s <= COMMIT_GATE_MAX_HOLD_S:
+            r.uniboost_commit_hold = True
 
 
 def completed_response_times(reqs: Sequence[Req]) -> tuple[List[float], List[int]]:

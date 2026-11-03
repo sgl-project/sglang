@@ -243,6 +243,7 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: Iterable[Req] = (),
+        chunked_req: Optional[Req] = None,
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
@@ -264,7 +265,7 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif policy == CacheAwarePolicy.UNIBOOST:
-            self._sort_by_uniboost(waiting_queue, processed_tokens)
+            self._sort_by_uniboost(waiting_queue, processed_tokens, chunked_req)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -347,6 +348,7 @@ class SchedulePolicy:
         self,
         waiting_queue: List[Req],
         processed_tokens: int,
+        chunked_req: Optional[Req],
     ) -> None:
         now_s = time.perf_counter()
         if self.uniboost_rate is not None:
@@ -354,8 +356,9 @@ class SchedulePolicy:
         uniboost.stamp_arrivals(
             waiting_queue, processed_tokens=processed_tokens, now_s=now_s
         )
+        leader_of: Dict[str, str] = {}
         temporary_deprioritized = self._compute_prefix_matches(
-            waiting_queue, CacheAwarePolicy.UNIBOOST
+            waiting_queue, CacheAwarePolicy.UNIBOOST, leader_of=leader_of
         )
         uniboost.sort_waiting_queue(
             waiting_queue,
@@ -368,9 +371,12 @@ class SchedulePolicy:
                 else None
             ),
             temporary_deprioritized=temporary_deprioritized,
+            leader_of=leader_of,
             enable_priority_scheduling=self.enable_priority_scheduling,
             priority_sign=self.priority_sign,
         )
+        # Reads the admission order, so it runs after the sort.
+        uniboost.mark_commit_holds(waiting_queue, chunked_req=chunked_req, now_s=now_s)
 
     def record_completed_requests(self, reqs: List[Req]) -> None:
         """Feeds finished requests' response times to adaptive uniboost gamma."""
@@ -439,10 +445,19 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown schedule_policy: {policy=}")
 
     def _compute_prefix_matches(
-        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+        self,
+        waiting_queue: List[Req],
+        policy: CacheAwarePolicy,
+        leader_of: Optional[Dict[str, str]] = None,
     ) -> Set[int]:
+        """Returns the in-batch prefix-dedup followers. With leader_of, also
+        fills follower rid -> rid of the queued request that first inserted
+        the shared prefix (its leader)."""
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        # With leader_of, simulated-tree values hold the inserting request's
+        # index in inserted_by, so a match's deepest value names its leader.
+        inserted_by: List[str] = []
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
@@ -476,7 +491,19 @@ class SchedulePolicy:
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
                     temporary_deprioritized.add(r.rid)
+                    if leader_of is not None:
+                        path = self.waiting_queue_radix_tree.path_device_indices(
+                            match_result.last_device_node
+                        )
+                        leader_of[r.rid] = inserted_by[int(path[-1])]
                 else:
+                    if leader_of is not None:
+                        value = torch.full(
+                            (len(prefix_ids),), len(inserted_by), dtype=torch.int64
+                        )
+                        inserted_by.append(r.rid)
+                    else:
+                        value = torch.empty(len(prefix_ids), dtype=torch.bool)
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
@@ -485,7 +512,7 @@ class SchedulePolicy:
                                 extra_key=extra_key,
                                 cache_salt=cache_salt,
                             ),
-                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                            value=value,
                         )
                     )
         return temporary_deprioritized
@@ -515,7 +542,8 @@ class SchedulePolicy:
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.UNIBOOST)
             or budget < 2 * page_size
         ):
             return None
@@ -1741,9 +1769,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and get_schedule().schedule_policy in (
+                "shortest-prefill-first",
+                "uniboost",
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER

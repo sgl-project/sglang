@@ -12,11 +12,13 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.uniboost import (
+    COMMIT_GATE_MAX_HOLD_S,
     AdaptiveGamma,
     TokenClockRate,
     UniBoostClock,
     boost,
     geometric_bin,
+    mark_commit_holds,
     sort_waiting_queue,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -50,6 +52,7 @@ def _sort(
     clock=UniBoostClock.TOKENS,
     rate=None,
     deprioritized=(),
+    leader_of=None,
     priority=False,
 ):
     queue = list(reqs)
@@ -60,6 +63,7 @@ def _sort(
         clock=clock,
         rate_tokens_per_s=rate,
         temporary_deprioritized=set(deprioritized),
+        leader_of=leader_of or {},
         enable_priority_scheduling=priority,
         priority_sign=-1,
     )
@@ -171,10 +175,38 @@ class TestTokenClockSort(CustomTestCase):
         fresh = _req("fresh", 500)
         self.assertEqual(_sort([replay, fresh]), ["fresh", "replay"])
 
-    def test_dedup_follower_sorts_last(self):
+    def test_dedup_follower_sorts_just_behind_its_leader(self):
+        # Without this, a follower sorts behind every later arrival and has
+        # no starvation bound; "late" saves less than its arrival lag.
+        leader = _req("leader", 4_096, arrival=0)
+        follower = _req("follower", 256, arrival=500)
+        late = _req("late", 256, arrival=30_000)
+        order = _sort(
+            [leader, follower, late],
+            deprioritized={"follower"},
+            leader_of={"follower": "leader"},
+        )
+        self.assertEqual(order, ["leader", "follower", "late"])
+
+    def test_followers_of_one_leader_keep_arrival_order(self):
+        # A rid tie-break would let a later small-rid follower take the
+        # leader role on every pass and starve an early one.
+        leader = _req("leader", 4_096, arrival=0)
+        early = _req("zz_early", 256, arrival=500)
+        late = _req("aa_late", 256, arrival=30_000)
+        order = _sort(
+            [leader, early, late],
+            deprioritized={"zz_early", "aa_late"},
+            leader_of={"zz_early": "leader", "aa_late": "leader"},
+        )
+        self.assertEqual(order, ["leader", "zz_early", "aa_late"])
+
+    def test_follower_whose_leader_left_sorts_last(self):
         follower = _req("follower", 256, arrival=0)
         other = _req("other", 250_000, arrival=1_000_000)
-        order = _sort([follower, other], deprioritized={"follower"})
+        order = _sort(
+            [follower, other], deprioritized={"follower"}, leader_of={"follower": "x"}
+        )
         self.assertEqual(order, ["other", "follower"])
 
     def test_priority_is_the_primary_key(self):
@@ -265,6 +297,54 @@ class TestTokenClockRate(CustomTestCase):
                 tokens, now = tokens + step, now + 1.0
                 rate.observe(tokens, now)
         self.assertAlmostEqual(rate.tokens_per_s, 36_700.0, delta=1.0)
+
+
+class TestCommitGate(CustomTestCase):
+    """A request waits while an earlier extender will extend its match by at
+    least one frontier page; the hold is bounded by COMMIT_GATE_MAX_HOLD_S."""
+
+    @staticmethod
+    def _matched(rid, ids, matched):
+        req = _make_req(rid, ids)
+        req.num_matched_prefix_tokens = matched
+        return req
+
+    def setUp(self):
+        self.trunk = _make_req("trunk", list(range(3_000)))
+        self.sibling = self._matched("sib", list(range(1_500)), 1_000)
+
+    def test_holds_behind_the_chunked_prefill(self):
+        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=0.0)
+        self.assertTrue(self.sibling.uniboost_commit_hold)
+
+    def test_holds_only_behind_a_waiting_extender_that_sorts_first(self):
+        mark_commit_holds([self.trunk, self.sibling], chunked_req=None, now_s=0.0)
+        self.assertFalse(self.trunk.uniboost_commit_hold)
+        self.assertTrue(self.sibling.uniboost_commit_hold)
+        mark_commit_holds([self.sibling, self.trunk], chunked_req=None, now_s=0.0)
+        self.assertFalse(self.sibling.uniboost_commit_hold)
+
+    def test_cap_releases_a_never_committing_extender(self):
+        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=0.0)
+        later = COMMIT_GATE_MAX_HOLD_S + 1.0
+        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=later)
+        self.assertFalse(self.sibling.uniboost_commit_hold)
+
+    def test_no_hold_when_the_extension_is_not_shared(self):
+        diverging = _make_req("trunk", list(range(1_000)) + list(range(9_000, 12_000)))
+        mark_commit_holds([self.sibling], chunked_req=diverging, now_s=0.0)
+        self.assertFalse(self.sibling.uniboost_commit_hold)
+        short = _make_req("trunk", list(range(1_255)))  # 255 < one frontier page
+        mark_commit_holds([self.sibling], chunked_req=short, now_s=0.0)
+        self.assertFalse(self.sibling.uniboost_commit_hold)
+        unmatched = self._matched("fresh", list(range(3_000)), 0)
+        mark_commit_holds([unmatched], chunked_req=self.trunk, now_s=0.0)
+        self.assertFalse(unmatched.uniboost_commit_hold)
+
+    def test_hold_is_cleared_when_the_extender_is_gone(self):
+        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=0.0)
+        mark_commit_holds([self.sibling], chunked_req=None, now_s=1.0)
+        self.assertFalse(self.sibling.uniboost_commit_hold)
 
 
 class TestAdaptiveGamma(CustomTestCase):
@@ -360,6 +440,18 @@ class TestSchedulePolicyUniBoost(CustomTestCase):
         self.assertEqual(hot.uniboost_arrival_tokens, 500)
         self.assertEqual([r.rid for r in queue], ["hot", "cold"])
 
+    def test_calc_priority_finds_the_dedup_leader(self):
+        # follower shares leader's prefix in the queue: it sorts right behind
+        # leader even though "short" would otherwise outrank it.
+        prefix = list(range(10_000))
+        leader = _make_req("leader", prefix + [1])
+        follower = _make_req("follower", prefix + [2])
+        short = _make_req("short", list(range(900_000, 900_300)))
+        queue = [leader, follower, short]
+        policy = _policy(uniboost_gamma=1e-9)
+        queue = policy.calc_priority(queue, processed_tokens=0)
+        self.assertEqual([r.rid for r in queue], ["short", "leader", "follower"])
+
     def test_wall_clock_measures_the_rate_from_processed_tokens(self):
         # Disjoint token ids: a shared prefix would make hot a dedup follower.
         cold = _make_req("cold", list(range(100_000)))
@@ -425,6 +517,19 @@ class TestSchedulePolicyUniBoost(CustomTestCase):
         )
         self.assertNotEqual(policy.uniboost_gamma, 0.09)
         self.assertEqual(policy.uniboost_gamma, policy.uniboost_adaptive.gamma)
+
+    def test_chunk_limit_reserves_for_short_waiters(self):
+        policy = _policy()
+        continuation = _make_req("continuation", list(range(16384)))
+        continuation.full_untruncated_fill_ids = list(range(16384))
+        waiting = [_make_req("a", list(range(512))), _make_req("b", list(range(1024)))]
+        limit = policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256)
+        self.assertEqual(limit, 2560)
+        self.assertIsNone(
+            _policy(policy="lpm").shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256
+            )
+        )
 
 
 if __name__ == "__main__":

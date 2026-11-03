@@ -30,6 +30,7 @@ class _Req:
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
+        self.uniboost_commit_hold = False
 
     def init_next_round_input(self, tree_cache=None):
         pass

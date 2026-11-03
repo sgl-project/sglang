@@ -212,10 +212,10 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
-        override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
-        )
+    def create_shortest_prefill_adder(
+        self, *, chunk_tokens=4096, schedule_policy="shortest-prefill-first"
+    ):
+        override = get_context().override_server_args(schedule_policy=schedule_policy)
         override.install()
         self.addCleanup(override.restore)
         self.mock_tree_cache.supports_mamba.return_value = False
@@ -265,6 +265,21 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertIsNone(req.extend_end)
         self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_uniboost_rejects_second_unfinished_chunk(self):
+        # uniboost shares the reserving chunk limit; a request that does not fit
+        # whole must not start a second tracked chunked prefill.
+        adder = self.create_shortest_prefill_adder(
+            chunk_tokens=512, schedule_policy="uniboost"
+        )
+        req = self.create_shared_req("second-chunk")
+        req.full_untruncated_fill_ids = list(range(1024))
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
