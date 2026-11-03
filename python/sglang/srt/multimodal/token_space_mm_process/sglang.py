@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.cache import (
     CONTENT_HASH_PREFIX,
+    DiskPreprocessCache,
     MultimodalPreprocessCache,
     resolve_multimodal_item_hash,
 )
@@ -127,24 +128,29 @@ class TokenSpaceSGLangProcessor:
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
         )
         # As legacy: each tokenizer worker takes its share of the budget; zero disables it.
-        self._mm_preprocess_cache = MultimodalPreprocessCache(
-            max_size_bytes=(mm.mm_preprocess_cache_size_mb or 0)
+        cache_size_bytes = (
+            (mm.mm_preprocess_cache_size_mb or 0)
             * 1024
             * 1024
             // get_serving().tokenizer_worker_num
         )
+        self._mm_preprocess_cache = MultimodalPreprocessCache(
+            max_size_bytes=cache_size_bytes
+        )
+        item_feature_cache = None
+        if mm.enable_token_space_preprocess_cache:
+            item_feature_cache = (
+                self._mm_preprocess_cache
+                if mm.token_space_preprocess_cache_dir is None
+                else DiskPreprocessCache(mm.token_space_preprocess_cache_dir)
+            )
         self._core = TokenSpaceProcessor.for_strategy(strategy_class)(
             hf_config,
             _processor,
             processor_config=processor_config,
             # nvJPEG and GPU video decode use bare "cuda", cuda:0 on a pool thread.
             worker_thread_device=server_args.base_gpu_id if is_cuda_alike() else None,
-            # Its keys are media URLs, so it is used only when they are trusted.
-            item_feature_cache=(
-                self._mm_preprocess_cache
-                if mm.enable_token_space_preprocess_cache
-                else None
-            ),
+            item_feature_cache=item_feature_cache,
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
@@ -332,6 +338,7 @@ class TokenSpaceSGLangProcessor:
         return resolve_hf_image_token_counts(self._core._processor, images)
 
     def clear_preprocess_cache(self) -> None:
+        # Weights do not change preprocessing, and other processes share the disk cache.
         self._mm_preprocess_cache.clear()
 
     def shutdown(self) -> None:

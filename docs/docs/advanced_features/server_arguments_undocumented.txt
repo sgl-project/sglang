@@ -61,6 +61,7 @@
 --mm-global-cache-backend
 --mm-io-worker-num
 --mm-preprocess-cache-size-mb
+--token-space-preprocess-cache-dir
 --mm-processor-worker-num
 --otlp-service-name
 --prefill-kv-cache-dequant-dtype
