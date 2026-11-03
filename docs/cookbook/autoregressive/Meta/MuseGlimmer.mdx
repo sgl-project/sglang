@@ -92,7 +92,7 @@ Muse Glimmer is a multimodal reasoning model. You can serve Muse Glimmer in four
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><strong>NVFP4</strong></td>
-      <td style={{padding: "9px 12px"}}><code>RadixArk/Muse-Glimmer-NVFP4</code></td>
+      <td style={{padding: "9px 12px"}}><code>nvidia/Muse-Glimmer-30B-NVFP4</code></td>
       <td style={{padding: "9px 12px"}}>Text only. Ready to serve, no conversion needed.</td>
     </tr>
     <tr>
@@ -113,13 +113,13 @@ Muse Glimmer is a multimodal reasoning model. You can serve Muse Glimmer in four
   </tbody>
 </table>
 
-**Resources:** [Muse-Glimmer-30B (BF16)](https://huggingface.co/meta-models/Muse-Glimmer-30B) · [Muse-Glimmer-30B-assistant (DFlash draft)](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) · [Muse-Glimmer-30B-GGUF](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF) · [Muse-Glimmer-NVFP4](https://huggingface.co/RadixArk/Muse-Glimmer-NVFP4) · MLX · [q4](https://huggingface.co/RadixArk/Muse-Glimmer-q4-MLX) · [q4km-gs128](https://huggingface.co/RadixArk/Muse-Glimmer-q4km-gs128-MLX) · [q4k-dynamic](https://huggingface.co/RadixArk/Muse-Glimmer-q4k-dynamic-MLX).
+**Resources:** [Muse-Glimmer-30B (BF16)](https://huggingface.co/meta-models/Muse-Glimmer-30B) · [Muse-Glimmer-30B-assistant (DFlash draft)](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) · [Muse-Glimmer-30B-GGUF](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF) · [Muse-Glimmer-NVFP4](https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4) · MLX · [q4](https://huggingface.co/RadixArk/Muse-Glimmer-q4-MLX) · [q4km-gs128](https://huggingface.co/RadixArk/Muse-Glimmer-q4km-gs128-MLX) · [q4k-dynamic](https://huggingface.co/RadixArk/Muse-Glimmer-q4k-dynamic-MLX).
 
 ## 2. Configuration Tips
 
 **The GGUF format is text only.** SGLang has no `mmproj` path. You cannot use the vision GGUF files. Use the BF16 checkpoint for multimodal input.
 
-**The NVFP4 checkpoint.** `RadixArk/Muse-Glimmer-NVFP4` is a ready-to-serve NVFP4 + MXFP8 checkpoint. No conversion needed — point `--model-path` straight at it.
+**The NVFP4 checkpoint.** `nvidia/Muse-Glimmer-30B-NVFP4` is a ready-to-serve NVFP4 + MXFP8 checkpoint. No conversion needed — point `--model-path` straight at it.
 
 **The DFlash draft.** `meta-models/Muse-Glimmer-30B-assistant` is the vendor's native draft export and serves directly. No conversion needed.
 
