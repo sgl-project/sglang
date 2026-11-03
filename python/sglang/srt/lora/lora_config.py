@@ -39,6 +39,25 @@ class LoRAConfig:
             self.hf_config = self.get_lora_config()
             self.added_tokens_config = self.get_added_tokens_config()
 
+        # A malformed adapter_config.json (or --lora-path pointing at the wrong
+        # directory) used to fail on the first of these lookups with a bare
+        # KeyError that named neither the file nor the field.
+        if not isinstance(self.hf_config, dict):
+            raise ValueError(
+                f"Invalid LoRA adapter config ({self.path}): adapter_config.json "
+                f"must contain a JSON object, got {type(self.hf_config).__name__}."
+            )
+        missing = [
+            field
+            for field in ("target_modules", "r", "lora_alpha")
+            if field not in self.hf_config
+        ]
+        if missing:
+            raise ValueError(
+                f"Invalid LoRA adapter config ({self.path}): missing required "
+                f"field(s) {missing} in adapter_config.json."
+            )
+
         self.target_modules = self.hf_config["target_modules"]
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
