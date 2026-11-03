@@ -4,7 +4,8 @@ TBO=1 runs the FP4-asymmetric two-child TBO path instead; there TEST_CUDA_GRAPH=
 captures and replays REPLAY_ITERS times (default 3), with each child writing its
 expert output directly into its own combine staging view.
 MODE=low_latency (default normal) or MORI_ENABLE_SDMA=1 runs either path on the
-AsyncLL send/recv kernels, which fall back to bf16 dispatch and combine.
+AsyncLL send/recv kernels, which dispatch fp4 as MXFP8 (bf16 on gfx1250 or
+older AITER) and combine in bf16.
 The identity expert checks buffer correctness, not AITER performance.
 """
 
@@ -71,6 +72,14 @@ class _Group:
 
 def _deepep_mode():
     return DeepEPMode(os.environ.get("MODE", "normal"))
+
+
+def _async_ll_fp4_dispatch() -> str:
+    # AsyncLL has no fp4 dispatch; FP4-weight MoE takes MXFP8 where AITER can,
+    # bf16 on gfx1250 (its a8w4 MoE takes no pre-quantized activation).
+    if not adapter.is_gfx1250_supported() and adapter._aiter_supports_mxfp8_dispatch():
+        return "mxfp8"
+    return "bf16"
 
 
 def _expected_unique_destinations(topk_ids: torch.Tensor, experts_per_rank: int):
@@ -192,7 +201,9 @@ def main():
     # Older MORI builds have no AsyncLL and no async_ll field.
     assert impl._uses_async_ll == async_ll
     assert getattr(impl.mori_op.cfg, "async_ll", False) == async_ll
-    expected_dispatch = "bf16" if async_ll and dispatch == "fp4" else dispatch
+    expected_dispatch = (
+        _async_ll_fp4_dispatch() if async_ll and dispatch == "fp4" else dispatch
+    )
     assert impl.dispatch_dtype.name == expected_dispatch, impl.dispatch_dtype
     # MORI builds without the saturation fix fall back to blockwise fp8.
     expected_combine = combine
@@ -377,7 +388,7 @@ def _run_tbo(rank, world_size):
     else:
         assert children[0]._launch_config == adapter._MoriEPv2LaunchConfig(32, 4, 48, 4)
     dispatch = children[0].dispatch_dtype.name
-    assert dispatch == ("bf16" if async_ll else "fp4"), dispatch
+    assert dispatch == (_async_ll_fp4_dispatch() if async_ll else "fp4"), dispatch
     assert children[0].mori_op is not children[1].mori_op
     probe_trim = os.environ.get("PROBE_TBO_TRIM", "0") == "1"
     if probe_trim:

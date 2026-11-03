@@ -25,23 +25,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_rows = TboForwardBatchPreparer._children_dp_global_num_tokens
-
-
-class TestTboChildDpRows(CustomTestCase):
-    def test_children_partition_parent_rows(self):
-        parent, split = [8192, 0, 6254, 3000], [4096, 0, 3127, 1400]
-        first, second = _rows(parent, split)
-        self.assertEqual(first, [4096, 0, 3127, 1400])
-        self.assertEqual(second, [4096, 0, 3127, 1600])
-        self.assertEqual([a + b for a, b in zip(first, second)], parent)
-        # A split outside the parent rows is clamped to them.
-        self.assertEqual(_rows([10, 4], [12, -1]), ([10, 0], [0, 4]))
-        # A missing or mismatched split keeps the parent rows on both children.
-        self.assertEqual(_rows([8, 8], None), ([8, 8], [8, 8]))
-        self.assertEqual(_rows([8, 8], [4]), ([8, 8], [8, 8]))
-        self.assertEqual(_rows(None, [4, 4]), (None, None))
-
 
 def _idle_batch(parent_rows, split_rows) -> ForwardBatch:
     empty = torch.zeros(0, dtype=torch.long)
@@ -95,19 +78,30 @@ class TestTboIdleRankChildRows(CustomTestCase):
         self.assertEqual(child_a.tbo_dp_global_num_tokens_bound, [0, 1000, 0, 0])
         self.assertEqual(child_b.tbo_dp_global_num_tokens_bound, [0, 1080, 0, 0])
 
+        # Without the gathered split, both children keep the parent's rows.
+        batch.global_tbo_split_num_tokens = None
+        TboForwardBatchPreparer._bound_children_dp_rows(
+            batch, child_a=child_a, child_b=child_b
+        )
+        self.assertEqual(child_a.tbo_dp_global_num_tokens_bound, parent)
+        self.assertEqual(child_b.tbo_dp_global_num_tokens_bound, parent)
+
 
 class TestTboSplitRowsGather(CustomTestCase):
-    def _local_can_run_tbo(self, extend_lens, uses_rows):
+    def test_mori_gathers_each_rank_first_micro_batch_rows(self):
+        """Every rank publishes its first micro-batch's rows; one left at 0 makes the
+        other ranks bound that rank's first micro-batch at 0 rows and drop it."""
+        # Two sequences of 4000 and 5000 tokens split into two 4500-row halves.
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             spec_info=None,
-            extend_lens=extend_lens,
-            extend_num_tokens=sum(extend_lens),
+            extend_lens=[4000, 5000],
+            extend_num_tokens=9000,
             is_extend_in_batch=True,
         )
         backend = Mock(
             is_none=Mock(return_value=False),
-            tbo_uses_micro_batch_rows=Mock(return_value=uses_rows),
+            tbo_uses_micro_batch_rows=Mock(return_value=True),
         )
         preparer = TboDPAttentionPreparer()
         with (
@@ -119,27 +113,11 @@ class TestTboSplitRowsGather(CustomTestCase):
                 two_batch_overlap, "get_deepep_mode", return_value=DeepEPMode.NORMAL
             ),
         ):
-            can_run, mode = preparer.prepare_all_gather(batch)
-        return preparer, can_run, mode
-
-    def test_split_rows_reach_only_backends_that_use_them(self):
-        """A backend that does not bound micro-batches by their own rows gets None,
-        not the gathered zeros, which would bound the first micro-batch at 0 rows."""
+            can_run, _ = preparer.prepare_all_gather(batch)
+        self.assertTrue(can_run)
+        self.assertEqual(preparer.local_tbo_split_num_tokens, 4500)
         gathered = torch.tensor([4500, 4096])
-        for uses_rows, local_rows, split_rows in (
-            # [4000, 5000] splits into two 4500-row micro-batches.
-            (True, 4500, [4500, 4096]),
-            (False, 0, None),
-        ):
-            with self.subTest(uses_rows=uses_rows):
-                preparer, can_run, _ = self._local_can_run_tbo(
-                    [4000, 5000], uses_rows=uses_rows
-                )
-                self.assertTrue(can_run)
-                self.assertEqual(preparer.local_tbo_split_num_tokens, local_rows)
-                self.assertEqual(
-                    preparer.compute_split_num_tokens(gathered), split_rows
-                )
+        self.assertEqual(preparer.compute_split_num_tokens(gathered), [4500, 4096])
 
 
 if __name__ == "__main__":

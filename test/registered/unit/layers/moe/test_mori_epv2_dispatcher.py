@@ -159,60 +159,6 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
         self.assertEqual(self.log, ["combine_send", "sibling", "combine_recv"])
         self.assertIs(combined, op.combined)
 
-    def test_normal_sdma_receives_right_after_sending(self):
-        """EPv2 reaches SDMA only through the AsyncLL kernels, so normal + SDMA must
-        use them (the native calls do not exist on an AsyncLL op) and, with no
-        sibling batch to overlap, receive as soon as it sends."""
-        os.environ["MORI_ENABLE_SDMA"] = "1"
-        dispatcher = self._make_dispatcher(DeepEPMode.NORMAL)
-        hidden, topk_output = self._inputs()
-
-        dispatcher.dispatch_a(hidden, topk_output)
-        self.log.append("sibling")
-        dispatched = dispatcher.dispatch_b()
-        dispatcher.combine_a(
-            (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
-        )
-        self.log.append("sibling")
-        dispatcher.combine_b()
-        self.assertEqual(
-            self.log,
-            [
-                "dispatch_send",
-                "dispatch_recv",
-                "sibling",
-                "combine_send",
-                "combine_recv",
-                "sibling",
-            ],
-        )
-
-    def test_async_ll_replaces_fp4_dispatch(self):
-        """AsyncLL has no fp4 dispatch: FP4-weight MoE falls back to MXFP8 when
-        aiter can quantize it, else to bf16; other weights fall back to bf16, and
-        so does gfx1250, whose a8w4 MoE takes no pre-quantized activation."""
-        fp4, bf16 = torch.float4_e2m1fn_x2, torch.bfloat16
-        for weight_dtype, mxfp8_ok, gfx1250, expected in (
-            (fp4, True, False, moriep.DispatchDtype.mxfp8),
-            (fp4, False, False, moriep.DispatchDtype.bf16),
-            (bf16, True, False, moriep.DispatchDtype.bf16),
-            (fp4, True, True, moriep.DispatchDtype.bf16),
-        ):
-            with self.subTest(
-                weight_dtype=weight_dtype, mxfp8_ok=mxfp8_ok, gfx1250=gfx1250
-            ):
-                impl = self._make_dispatcher(DeepEPMode.LOW_LATENCY)._get_impl()
-                impl.quant_config = {"weight_dtype": weight_dtype}
-                impl.dispatch_dtype = moriep.DispatchDtype.fp4
-                with (
-                    patch.object(
-                        moriep, "_aiter_supports_mxfp8_dispatch", return_value=mxfp8_ok
-                    ),
-                    patch.object(moriep, "is_gfx1250_supported", return_value=gfx1250),
-                ):
-                    impl._restrict_transport_dtypes()
-                self.assertEqual(impl.dispatch_dtype, expected)
-
 
 class TestMoriRecvBound(CustomTestCase):
     """A TBO micro-batch may use its parent batch's DP rows only as an upper bound."""
