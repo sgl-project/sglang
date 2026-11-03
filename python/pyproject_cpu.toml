@@ -71,6 +71,7 @@ dependencies = [
   "triton==3.8.0",
   "uvicorn",
   "uvloop",
+  "websockets",
   "xxhash",
   "xgrammar==0.2.7",
   "zstandard",
