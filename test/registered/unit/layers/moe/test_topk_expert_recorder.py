@@ -1,3 +1,4 @@
+import unittest
 """Keep TRT-LLM routing observable when expert recording is enabled."""
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
@@ -34,3 +35,5 @@ class TestTopKExpertRecorder(CustomTestCase):
                         else TopKOutputFormat.STANDARD
                     )
                     self.assertEqual(router.topk_config.output_format, expected)
+if __name__ == "__main__":
+    unittest.main()
