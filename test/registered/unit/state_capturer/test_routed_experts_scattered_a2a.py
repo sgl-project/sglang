@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
 from sglang.srt.state_capturer.base import BaseDeviceCache
@@ -157,14 +158,13 @@ class TestOutputRankHostCache(CustomTestCase):
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
     def _capturer(self, attn_tp_rank):
-        parallel = SimpleNamespace(
-            num_dp_ranks=1, pp_rank=0, attn_tp_rank=attn_tp_rank, attn_cp_rank=0
-        )
         hf_text_config = SimpleNamespace(
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
         with (
-            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            get_parallel().override(
+                num_dp_ranks=1, pp_rank=0, attn_tp_rank=attn_tp_rank, attn_cp_rank=0
+            ),
             mock.patch.object(
                 re_mod,
                 "get_schedule",

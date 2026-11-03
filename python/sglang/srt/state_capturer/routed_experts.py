@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_resources,
     get_schedule,
+    is_scheduler_io_rank,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -26,16 +27,6 @@ def _is_scattered_a2a_backend() -> bool:
     """Return whether routed tokens are scattered across attention-TP ranks."""
     backend = get_moe_a2a_backend()
     return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
-
-
-def _is_output_rank() -> bool:
-    # Must match the scheduler's is_rank_zero: only that rank sends outputs.
-    parallel = get_parallel()
-    return (
-        parallel.pp_rank == 0
-        and parallel.attn_tp_rank == 0
-        and parallel.attn_cp_rank == 0
-    )
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
@@ -102,7 +93,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
-            allocate_host_cache=_is_output_rank(),
+            allocate_host_cache=is_scheduler_io_rank(),
         )
 
         # Rebuild the full token batch before routed-expert readback.
