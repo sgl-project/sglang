@@ -66,6 +66,16 @@ class RequestRetirer:
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
+    def release_for_resume(self, req: Req) -> None:
+        """Release a decoding request that will resume (uniboost decode
+        time-slicing): its KV is checkpointed into the radix tree, the
+        finished-request lifecycle, so it resumes from its own cache; OOM
+        retraction instead drops the uncached tail to free the space now."""
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.retract_req(req)
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        req.reset_for_retract()
+
     # Public while `Scheduler.release_aborted_request` still delegates here.
     def release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""

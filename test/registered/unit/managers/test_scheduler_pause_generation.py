@@ -134,6 +134,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
+        scheduler.decode_preemptor = None
         scheduler.disagg_prefill_bootstrap_queue = None
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None

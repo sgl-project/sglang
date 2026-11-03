@@ -85,6 +85,19 @@ CLIP_MAX_NEW_TOKENS = int(
 )
 
 
+def running_request_token_reserve(req: Req, new_token_ratio: float) -> float:
+    """KV tokens admission holds back for a running request's remaining decode."""
+    # Fixed-length requests cannot benefit from the early-EOS estimate.
+    ratio = 1.0 if req.sampling_params.ignore_eos else new_token_ratio
+    return (
+        min(
+            (req.sampling_params.max_new_tokens - len(req.output_ids)),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        * ratio
+    )
+
+
 @lru_cache(maxsize=1)
 def _use_exact_chunk_fill() -> bool:
     """Whether to charge the chunked-prefill compute budget in tokens (gfx95 only).
@@ -878,15 +891,7 @@ class PrefillAdder:
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        # Fixed-length requests cannot benefit from the early-EOS estimate.
-        ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * ratio
-        )
+        return running_request_token_reserve(req, self.new_token_ratio)
 
     @property
     def rem_total_tokens(self):

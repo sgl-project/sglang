@@ -140,6 +140,18 @@ class Schedule(msgspec.Struct):
         float,
         "Max-jump bound of adaptive uniboost gamma, in wall seconds: gamma is floored so that the largest boost any request can get, b_gamma(bin_size / prefill token rate), stays within this, which bounds how long a newcomer can delay a waiting request.",
     ] = 60.0
+    uniboost_preempt_wait_s: A[
+        float,
+        "Decode time-slicing for --schedule-policy uniboost, in wall seconds; 0 disables it. When a request still waiting for its first token has queued this long and the KV pool cannot fit it, the scheduler releases the longest-decoded running requests into the radix cache (each resumes from its cached KV) and admits the waiter first. Requires the radix cache with full attention only (no SWA or mamba) and no PD disaggregation.",
+    ] = 0.0
+    uniboost_preempt_quantum_tokens: A[
+        int,
+        "Tokens a request must decode after its latest admission before --uniboost-preempt-wait-s may release it; doubles with each release of the same request.",
+    ] = 512
+    uniboost_preempt_max_per_req: A[
+        int,
+        "Maximum number of times --uniboost-preempt-wait-s releases one request.",
+    ] = 2
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

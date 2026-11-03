@@ -5544,6 +5544,29 @@ class TestUniBoostPolicyArgs(CustomTestCase):
     def test_other_policies_ignore_uniboost_knobs(self):
         self._checked(schedule_policy="lpm", uniboost_gamma=0.0)
 
+    def test_decode_time_slicing_needs_uniboost_and_the_radix_cache(self):
+        # Released decodes resume only from their radix-cached KV, and only
+        # the uniboost policy stamps the arrival times the trigger reads.
+        with self.assertRaisesRegex(
+            AssertionError, "--uniboost-preempt-wait-s requires --schedule-policy"
+        ):
+            self._checked(schedule_policy="lpm", uniboost_preempt_wait_s=30.0)
+        with self.assertRaisesRegex(AssertionError, "requires the radix cache"):
+            self._checked(
+                schedule_policy="uniboost",
+                uniboost_preempt_wait_s=30.0,
+                disable_radix_cache=True,
+            )
+        with self.assertRaisesRegex(
+            AssertionError, "--uniboost-preempt-quantum-tokens must be >= 1"
+        ):
+            self._checked(
+                schedule_policy="uniboost",
+                uniboost_preempt_wait_s=30.0,
+                uniboost_preempt_quantum_tokens=0,
+            )
+        self._checked(schedule_policy="uniboost", uniboost_preempt_wait_s=30.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -288,6 +288,24 @@ def check_server_args(server_args: Any):
         assert cfg.uniboost_adaptive_max_jump_s > 0, (
             "--uniboost-adaptive-max-jump-s must be > 0"
         )
+    assert cfg.uniboost_preempt_wait_s >= 0, "--uniboost-preempt-wait-s must be >= 0"
+    if cfg.uniboost_preempt_wait_s > 0:
+        assert cfg.schedule_policy == "uniboost", (
+            "--uniboost-preempt-wait-s requires --schedule-policy uniboost"
+        )
+        assert not cfg.disable_radix_cache, (
+            "--uniboost-preempt-wait-s requires the radix cache "
+            "(released requests resume from their cached KV)"
+        )
+        assert cfg.disaggregation_mode == "null", (
+            "--uniboost-preempt-wait-s is not supported with PD disaggregation"
+        )
+        assert cfg.uniboost_preempt_quantum_tokens >= 1, (
+            "--uniboost-preempt-quantum-tokens must be >= 1"
+        )
+        assert cfg.uniboost_preempt_max_per_req >= 1, (
+            "--uniboost-preempt-max-per-req must be >= 1"
+        )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",

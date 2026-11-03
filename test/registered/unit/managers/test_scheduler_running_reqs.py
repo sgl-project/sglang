@@ -103,6 +103,7 @@ def _scheduler():
     # process_batch_result, with the mode-specific processing mocked
     s.publish_load_snapshot = Mock()
     s.policy = Mock()
+    s.decode_preemptor = None
     s.load_publisher = MagicMock()
     s.load_inquirer = MagicMock()
     s.batch_result_processor = MagicMock()

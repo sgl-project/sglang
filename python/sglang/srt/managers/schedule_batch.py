@@ -65,6 +65,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     NamedTuple,
@@ -867,6 +868,10 @@ class Req(ReqDllmMixin):
         # when its first hold began (bounds the cumulative hold).
         self.uniboost_commit_hold = False
         self.uniboost_commit_hold_first_s: Optional[float] = None
+        # UniBoost decode time-slicing (decode_preemption.py): releases so far,
+        # and len(output_ids) at the latest admission (the quantum counts from it).
+        self.num_preemptions = 0
+        self.preempt_resume_output_len = 0
 
     def get_mm_token_counts(self) -> Tuple[int, int, int]:
         """Return per-modality prompt counts, scanning media at most once."""
@@ -3046,6 +3051,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
         )
+
+    def preempt_decode(
+        self, indices: Tuple[int, ...], *, release: Callable[[Req], None]
+    ) -> List[Req]:
+        """Release the requests at ``indices`` with ``release`` and drop them
+        from the batch; returns them in index order."""
+        drop = set(indices)
+        preempted = [self.reqs[i] for i in sorted(drop)]
+        for req in preempted:
+            release(req)
+        self.filter_batch(
+            keep_indices=[i for i in range(len(self.reqs)) if i not in drop]
+        )
+        return preempted
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status

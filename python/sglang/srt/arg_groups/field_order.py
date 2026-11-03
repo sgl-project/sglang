@@ -564,5 +564,8 @@ POSITIONAL_FIELD_ORDER = (
     "uniboost_clock",
     "uniboost_adaptive_gamma",
     "uniboost_adaptive_max_jump_s",
+    "uniboost_preempt_wait_s",
+    "uniboost_preempt_quantum_tokens",
+    "uniboost_preempt_max_per_req",
 )
 # fmt: on
