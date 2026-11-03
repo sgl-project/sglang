@@ -138,7 +138,7 @@ class IpcModelLoader(BaseModelLoader):
                 f"{preloaded_weights_bytes=}"
             )
         logger.info(
-            f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
+            f"[IpcModelLoader] Fetched {len(entries)} state entries from daemon "
             f"(transport={self._transport_backend.name}) "
             f"in {time.perf_counter() - tic:.2f}s"
         )
@@ -292,6 +292,7 @@ class IpcModelLoader(BaseModelLoader):
             # is inference-only, so autograd must never write into it.
             new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
+            return new_param
         else:
             # register_buffer raises KeyError if the name already exists as a
             # parameter or plain attribute (not a buffer). This happens when
@@ -302,6 +303,62 @@ class IpcModelLoader(BaseModelLoader):
             elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
+            return tensor
+
+    @staticmethod
+    def _capture_tensor_aliases(model, registered):
+        """Remember direct references which module parameter replacement cannot update.
+
+        Runtime dataclasses (for example MoE routing configs) can retain a
+        Parameter without registering it as module state. Bind those references
+        to the imported tensors; do not run weight transformations again.
+        """
+        from dataclasses import fields, is_dataclass
+
+        names = {id(tensor): name for name, tensor in registered.items()}
+        aliases, visited = [], set()
+
+        def visit(obj):
+            if id(obj) in visited:
+                return
+            visited.add(id(obj))
+            attributes = (
+                vars(obj).items()
+                if isinstance(obj, nn.Module)
+                else ((field.name, getattr(obj, field.name)) for field in fields(obj))
+            )
+            for key, value in attributes:
+                if isinstance(value, torch.Tensor) and id(value) in names:
+                    aliases.append((obj, key, names[id(value)], value))
+                elif not isinstance(value, type) and is_dataclass(value):
+                    visit(value)
+
+        for module in model.modules():
+            visit(module)
+        return aliases
+
+    @staticmethod
+    def _set_plain_module_value(model, name, value):
+        """Attach exact daemon-exported derived state as a plain attribute."""
+        parts = name.split(".")
+        obj = model
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        leaf_name = parts[-1]
+        if leaf_name in obj._parameters or leaf_name in obj._buffers:
+            raise RuntimeError(
+                f"[IpcModelLoader] Derived attribute {name} collides with registered state"
+            )
+        if not hasattr(obj, leaf_name):
+            raise RuntimeError(f"[IpcModelLoader] Derived attribute is missing: {name}")
+        setattr(obj, leaf_name, value)
+
+    @staticmethod
+    def _set_plain_module_tensor(model, name, tensor):
+        """Attach an exact daemon-exported derived tensor as a plain attribute."""
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"derived tensor entry is not a Tensor: {name}")
+        IpcModelLoader._set_plain_module_value(model, name, tensor)
 
     def _load_zero_copy_mode(
         self,
@@ -345,19 +402,36 @@ class IpcModelLoader(BaseModelLoader):
         }
         existing_buffers = {name: buf for name, buf in model.named_buffers()}
         existing_names = set(existing_params) | set(existing_buffers)
+        aliases = self._capture_tensor_aliases(
+            model, {**existing_params, **existing_buffers}
+        )
+        replacements = {}
 
         imported_refs = []
         imported_count = 0
         mismatched = []
         new_params_count = 0
+        plain_tensor_count = 0
+        plain_value_count = 0
         map_tic = time.perf_counter()
 
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
+            if entry.get("is_plain_value", False):
+                self._set_plain_module_value(model, name, entry.get("value"))
+                plain_value_count += 1
+                continue
             imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
+
+            if entry.get("is_plain_tensor", False):
+                self._set_plain_module_tensor(model, name, imported_tensor)
+                imported_refs.append(imported_tensor)
+                imported_count += 1
+                plain_tensor_count += 1
+                continue
 
             if name in existing_names:
                 # Existing parameter/buffer — validate shape/dtype
@@ -377,7 +451,9 @@ class IpcModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            replacements[name] = self._set_module_tensor(
+                model, name, imported_tensor, is_param=is_param
+            )
             imported_refs.append(imported_tensor)
             imported_count += 1
 
@@ -394,6 +470,12 @@ class IpcModelLoader(BaseModelLoader):
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
+
+        for obj, key, name, previous in aliases:
+            if name in replacements and getattr(obj, key) is previous:
+                # Preserve explicit daemon-exported derived attributes and the
+                # original registration kind, including frozen dataclass fields.
+                object.__setattr__(obj, key, replacements[name])
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
@@ -441,7 +523,9 @@ class IpcModelLoader(BaseModelLoader):
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
-            f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
+            f"({new_params_count} new post-quant, "
+            f"{plain_tensor_count} plain derived tensors, "
+            f"{plain_value_count} plain derived values), time={map_elapsed:.3f}s"
         )
 
         return model
