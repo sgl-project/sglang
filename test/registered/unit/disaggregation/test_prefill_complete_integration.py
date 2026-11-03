@@ -502,7 +502,7 @@ class TestAllocationIntegration(CustomTestCase):
         req.pending_bootstrap = False
         batch = SimpleNamespace(
             reqs=[req],
-            middle_chunk_reqs=(req,),
+            chunked_req=req,
             spec_info=None,
             prefill_stats=None,
             dp_cooperation_info=None,

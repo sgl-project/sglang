@@ -369,7 +369,7 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                is_middle_chunk = req in batch.middle_chunk_reqs
+                is_middle_chunk = req is batch.chunked_req
                 should_commit_output = (
                     not req.finished() and not req.is_retracted and not is_middle_chunk
                 )
@@ -538,7 +538,7 @@ class SchedulerBatchResultProcessor:
                 if req.is_retracted:
                     continue
 
-                is_middle_chunk = req in batch.middle_chunk_reqs
+                is_middle_chunk = req is batch.chunked_req
                 if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
@@ -693,10 +693,10 @@ class SchedulerBatchResultProcessor:
     ):
         """Validate PP skip output comm correctness.
 
-        - When skip=True: all reqs must be middle chunks (in batch.middle_chunk_reqs)
+        - When skip=True: all reqs must run a middle chunk (be batch.chunked_req)
           so placeholder zeros are never consumed via req.output_ids.append().
         - When skip=False: at least one req should consume next_token_ids
-          (not in batch.middle_chunk_reqs), otherwise warn.
+          (not be batch.chunked_req), otherwise warn.
         """
         if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
             return
@@ -704,22 +704,23 @@ class SchedulerBatchResultProcessor:
         if not getattr(result, "skipped_output_comm", False):
             if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
                 has_consumed_output = any(
-                    req not in batch.middle_chunk_reqs
+                    req is not batch.chunked_req
                     for req in batch.reqs
                     if not req.finished() and not req.is_retracted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
-                    middle_chunk_rids = [r.rid for r in batch.middle_chunk_reqs]
+                    chunked = batch.chunked_req
                     logger.warning(
                         f"PP non-skip output comm: no req consumed next_token_ids. "
                         f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
-                        f"num_reqs={len(batch.reqs)}, middle_chunk_rids={middle_chunk_rids}"
+                        f"num_reqs={len(batch.reqs)}, "
+                        f"chunked_rid={chunked.rid if chunked else None}"
                     )
             return
 
         for req in batch.reqs:
             if not req.finished() and not req.is_retracted:
-                assert req in batch.middle_chunk_reqs, (
+                assert req is batch.chunked_req, (
                     f"PP skip output comm invariant violated: req {req.rid} "
                     f"runs no middle chunk but output was skipped "
                     f"(contains_last_prefill_chunk="
@@ -1004,7 +1005,7 @@ class SchedulerBatchResultProcessor:
                     req.grammar is None
                     or req.is_retracted
                     or req.finished()
-                    or req in batch.middle_chunk_reqs
+                    or req is batch.chunked_req
                 ):
                     continue
                 self._accept_grammar_tokens(req, next_token_ids[i])

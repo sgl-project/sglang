@@ -530,7 +530,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     batch = SimpleNamespace(
         reqs=[req],
-        middle_chunk_reqs=(),
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,

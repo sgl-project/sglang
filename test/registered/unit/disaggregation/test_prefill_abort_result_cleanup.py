@@ -80,7 +80,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 def _batch(req):
     return SimpleNamespace(
         reqs=[req],
-        middle_chunk_reqs=(),
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,

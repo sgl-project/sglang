@@ -1020,7 +1020,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req not in batch.middle_chunk_reqs:
+            if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
 
                 # Its KV never landed: abort instead of sending it to decode.

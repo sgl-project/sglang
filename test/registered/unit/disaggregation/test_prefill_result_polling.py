@@ -1077,7 +1077,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         req.extend_end = end
                         self.chunked_req = req if end < 12 else None
                         batch.chunked_req = self.chunked_req
-                        batch.middle_chunk_reqs = (req,) if end < 12 else ()
+                        batch.chunked_req = req if end < 12 else None
                         return super().run_batch(batch)
 
                     def checkpoint_disagg_prefill(self, req):
@@ -1154,7 +1154,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
                             self.chunked_req = batch.chunked_req = req
-                            batch.middle_chunk_reqs = (req,)
+                            batch.chunked_req = req
                         return super().run_batch(batch)
 
                     def process_input_requests(self, inputs):

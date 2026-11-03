@@ -86,7 +86,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
             req.request_finish = MethodType(Req.request_finish, req)
         batch = SimpleNamespace(
             reqs=reqs,
-            middle_chunk_reqs=(),
+            chunked_req=None,
             return_logprob=False,
             prefill_stats=None,
         )
@@ -287,7 +287,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 last = _PrefillReq(rid="last", return_hidden_states="last")
                 batch = SimpleNamespace(
                     reqs=[middle, last],
-                    middle_chunk_reqs=(middle,),
+                    chunked_req=middle,
                     decoding_reqs=[],
                     return_logprob=False,
                     return_hidden_states=True,
@@ -340,7 +340,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
         req.return_sampling_mask = True
         batch = SimpleNamespace(
             reqs=[req],
-            middle_chunk_reqs=(req,),
+            chunked_req=req,
             return_logprob=False,
             return_hidden_states=False,
             return_hidden_states_mode=CaptureHiddenMode.NULL,
@@ -389,7 +389,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
             req.kv = SimpleNamespace(kv_committed_len=0)
         batch = SimpleNamespace(
             reqs=[prefill_req, decode_req],
-            middle_chunk_reqs=(),
+            chunked_req=None,
             decoding_reqs=[decode_req],
             return_logprob=False,
             return_hidden_states=False,

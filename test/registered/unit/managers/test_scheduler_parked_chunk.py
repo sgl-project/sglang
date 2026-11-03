@@ -123,10 +123,10 @@ def _scheduler(chunked_req, waiting):
 
 
 def _build_prefill(s):
-    """Run one admission pass; return the requests and the record it builds."""
+    """Run one admission pass; return its requests and its chunked_req."""
 
     def capture(can_run_list, *args, **kwargs):
-        raise _BatchBuilt(list(can_run_list), kwargs["middle_chunk_reqs"])
+        raise _BatchBuilt(list(can_run_list), kwargs["chunked_req"])
 
     with (
         get_context().override_server_args(pp_max_micro_batch_size=4),
@@ -178,20 +178,19 @@ class TestParkedChunk(CustomTestCase):
         # The chunk does not fit this pass, but a smaller request is admitted.
         _Adder.park = True
         self.addCleanup(setattr, _Adder, "park", True)
-        reqs, middle_chunk_reqs = _build_prefill(s)
+        reqs, batch_chunked_req = _build_prefill(s)
         self.assertEqual(reqs, [admitted])
-        self.assertEqual(middle_chunk_reqs, ())
-        self.assertIs(s.chunked_req, chunked)
+        self.assertIs(batch_chunked_req, chunked)
 
         # The next pass runs the request's final chunk.
         _Adder.park = False
-        reqs, middle_chunk_reqs = _build_prefill(s)
+        reqs, batch_chunked_req = _build_prefill(s)
         self.assertEqual(reqs, [chunked])
         self.assertIsNone(s.chunked_req)
 
         batch = SimpleNamespace(
             reqs=reqs,
-            middle_chunk_reqs=middle_chunk_reqs,
+            chunked_req=batch_chunked_req,
             decoding_reqs=None,
             return_logprob=False,
             return_hidden_states=False,

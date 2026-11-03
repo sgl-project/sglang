@@ -3967,8 +3967,8 @@ class Scheduler(
         (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
         the top of the scheduling step stops the next chunk from launching; the
         chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later; its batch still lists the request in
-        ``middle_chunk_reqs``, so the batch-result processors skip the aborted chunk:
+        the result lands a step later; its batch still names the request as its
+        ``chunked_req``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
         ``process_batch_result_prefill`` via its chunked branch (the finished req
         is excluded from streaming and its logprob offset is still accounted).
@@ -4558,14 +4558,11 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
-            # A parked chunked request runs no chunk in this batch.
-            middle_chunk_reqs=(
-                (self.chunked_req,) if self.chunked_req in can_run_set else ()
-            ),
         )
 
-        new_batch.contains_last_prefill_chunk = len(can_run_list) != len(
-            new_batch.middle_chunk_reqs
+        # A parked chunked request runs no chunk in this batch.
+        new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
+            self.chunked_req in can_run_set
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
