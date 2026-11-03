@@ -16,13 +16,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.rust_server.multimodal import (  # noqa: E402
     RustMmProcessor,
     RustMmSpec,
 )
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestWrapEncoded(CustomTestCase):

@@ -16,12 +16,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_triton import (
-    fused_post_expert_norm_weighted_sum,
-)
-from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_trtllm import (
+from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce import (
     FusedPostExpertNormWeightedSumTRTLLM,
 )
+from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
+    fused_post_expert_norm_weighted_sum,
+)
+from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
     finalize_with_post_expert_norm,
@@ -31,7 +32,7 @@ from sglang.srt.utils.common import next_power_of_2, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.muse_spark.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
+    from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
         FinalizePushWorkspace,
     )
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -110,6 +111,7 @@ class MuseSpark1xBf16Experts(nn.Module):
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=num_local_experts,
+            runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
             hidden_size=expert_hidden_size,
             intermediate_size_per_partition=intermediate_size,
             top_k=top_k,

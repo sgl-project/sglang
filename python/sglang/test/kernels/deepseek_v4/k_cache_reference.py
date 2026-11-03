@@ -12,7 +12,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     PADDED_SCALE_PER_TOKEN,
     TILE_SIZE,
 )
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.kvcache.dsv4_main_kv_store import NopeFp8RopeBf16Pack
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -209,7 +209,7 @@ def dequantize_k_cache_paged_ref(
     page_table_1_flattened: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """Pure-torch reference for ``dsv4.dequant_k_cache.dequantize_k_cache_paged``.
+    """Pure-torch reference for ``dsv4.dequant_k_cache.dequantize_k_cache_paged_dsv4``.
 
     Decodes the same v4 paged layout with vectorized torch indexing instead of
     a Triton kernel.

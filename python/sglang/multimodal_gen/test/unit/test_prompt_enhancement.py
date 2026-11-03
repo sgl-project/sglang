@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -369,7 +370,8 @@ def server(monkeypatch, tmp_path):
             path = tmp_path / f"{batch.request_id}_{idx}.png"
             Image.new("RGB", (16, 16), "red").save(path)
             paths.append(str(path))
-        return OutputBatch(output_file_paths=paths)
+        image_bytes = [open(path, "rb").read() for path in paths]
+        return OutputBatch(output_file_paths=paths, output_image_bytes=image_bytes)
 
     monkeypatch.setattr(async_scheduler_client, "forward", forward)
     app = http_server.create_app(args)
@@ -595,7 +597,7 @@ def test_enhancer_failure_does_not_queue_video_or_leak_uploads(
     server.args.pipeline_config = WanT2V480PConfig()
     server.args.input_save_path = None
     server.args.output_path = None
-    monkeypatch.setattr(video_api.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
     async def fail(request):
         return httpx.Response(503, text="upstream secret")

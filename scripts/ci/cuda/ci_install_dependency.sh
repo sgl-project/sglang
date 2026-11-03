@@ -400,11 +400,22 @@ setup_cargo_cache() {
         mkdir -p "${CARGO_TARGET_DIR}"
     fi
 
+    # Cargo checks path crates by mtime and all runners share one checkout path,
+    # so rebuild them unless this target dir was built from the same rust/ tree.
+    CARGO_TREE_STAMP="${CARGO_TARGET_DIR}/.rust-tree"
+    CARGO_TREE_KEY="$(git -C "${REPO_ROOT}" rev-parse HEAD:rust 2>/dev/null || true)"
+    if [ -z "${CARGO_TREE_KEY}" ] || [ "$(cat "${CARGO_TREE_STAMP}" 2>/dev/null)" != "${CARGO_TREE_KEY}" ]; then
+        git -C "${REPO_ROOT}" ls-files -z rust | (cd "${REPO_ROOT}" && xargs -0 touch)
+    fi
+    rm -f "${CARGO_TREE_STAMP}"
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
 release_cargo_cache_lock() {
     if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
+        # Only reached after a successful build.
+        [ -z "${CARGO_TREE_KEY:-}" ] || echo "${CARGO_TREE_KEY}" > "${CARGO_TREE_STAMP}"
         flock --unlock 9
         exec 9>&-
         CARGO_TARGET_LOCK_HELD=0
@@ -679,7 +690,7 @@ install_sglang_kernel() {
         else
             WHEEL_ARCH="x86_64"
         fi
-        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
+        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp311-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
         if [ -z "$KERNEL_WHL" ]; then
             echo "ERROR: No matching sgl-kernel wheel found in python/sglang/kernels/aot/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
             ls -alh python/sglang/kernels/aot/dist/
@@ -846,6 +857,46 @@ install_extra_deps() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_msa() {
+    # MiniMax MSA sparse-attention kernels: MiniMax-M3.1 imports them at startup on
+    # Blackwell. Same commit and layout as docker/Dockerfile.cu134; editable because
+    # prefill JIT-compiles against its CUTLASS submodule.
+    if [ "$IS_BLACKWELL" != "1" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+    local msa_commit msa_dir
+    msa_commit=$(sed -n 's/^ARG MSA_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "${REPO_ROOT}/docker/Dockerfile.cu134")
+    if [ -z "$msa_commit" ]; then
+        echo "FATAL: no MSA_COMMIT default in docker/Dockerfile.cu134"
+        exit 1
+    fi
+    msa_dir="${HOME}/.cache/sglang-ci/minimax-msa/${msa_commit}"
+    # Runner containers share ${HOME}/.cache: without the lock, one job's rm -rf
+    # deletes the tree another job is still cloning.
+    mkdir -p "${HOME}/.cache/sglang-ci"
+    exec 8>"${HOME}/.cache/sglang-ci/minimax-msa.lock"
+    flock --exclusive 8
+    if [ ! -f "${msa_dir}/.complete" ]; then
+        rm -rf "$msa_dir"
+        git init -q "$msa_dir"
+        git -C "$msa_dir" remote add origin https://github.com/MiniMax-AI/MSA.git
+        _git_with_github_auth git -C "$msa_dir" fetch -q --depth 1 origin "$msa_commit"
+        git -C "$msa_dir" checkout -q --detach FETCH_HEAD
+        _git_with_github_auth git -C "$msa_dir" submodule update -q --init --recursive
+        touch "${msa_dir}/.complete"
+    fi
+    $PIP_CMD install --no-deps -e "$msa_dir" $PIP_INSTALL_SUFFIX
+    if [ -f "${msa_dir}/integrations/sglang/pyproject.toml" ]; then
+        $PIP_CMD install --no-deps -e "${msa_dir}/integrations/sglang" $PIP_INSTALL_SUFFIX
+    fi
+    flock --unlock 8
+    exec 8>&-
+    python3 -c "import inference, msa_v1; print(f'MSA {inference.__file__}')"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 prepare_runner() {
     bash "${SCRIPT_DIR}/prepare_runner.sh"
 
@@ -963,6 +1014,7 @@ main() {
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
     install_extra_deps
+    install_msa
     install_nccl
     prepare_runner
     setup_ld_library_path

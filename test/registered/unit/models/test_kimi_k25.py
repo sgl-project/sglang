@@ -19,8 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
@@ -47,6 +46,7 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
@@ -75,7 +75,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _MoonViT3dTower:
