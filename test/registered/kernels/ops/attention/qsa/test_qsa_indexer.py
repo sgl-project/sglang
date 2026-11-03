@@ -235,6 +235,41 @@ def test_fused_q_prep_fp8_matches_eager_cast():
     assert_fp8_within_one_ulp(q_new, q_ref.to(torch.float8_e4m3fn))
 
 
+def test_rope_does_not_sync_host():
+    """Index Q and K RoPE read the load-time RoPE reservation, like the attention
+    RoPE before them; a per-call cache length check would sync once per layer."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(13)
+    rotary = _make_rotary([24, 20, 20], True, device, dtype)
+    indexer = _make_indexer(rotary, device, dtype)
+    tokens = 64
+    hidden = torch.randn(tokens, HIDDEN, device=device, dtype=dtype)
+    positions = (
+        torch.arange(5000, 5000 + tokens, device=device)
+        .unsqueeze(0)
+        .expand(3, -1)
+        .contiguous()
+    )
+    pool = FakePool(4096, 4096, device, dtype)
+    cache_loc = torch.arange(1, tokens + 1, device=device)
+    keys = torch.randn(tokens, 1, HEAD_DIM, device=device, dtype=dtype)
+
+    def run():
+        indexer.project_qk(hidden, positions, pool=pool, cache_loc=cache_loc)
+        indexer.project_qk(hidden, positions)
+        indexer.normalize_compressed_keys(keys, positions)
+
+    run()  # JIT compilation and lazy buffers stay outside the check
+    torch.cuda.synchronize()
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        run()
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+
+
 def _selected_score_multisets(logits, block_indices):
     """Sorted logits of the selected blocks per row, so tied blocks compare equal."""
     out = []
