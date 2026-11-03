@@ -164,14 +164,16 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
-    TokenizerWorker,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_worker import (
+    TokenizerWorker,
+    get_tokenizer_worker_class,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
