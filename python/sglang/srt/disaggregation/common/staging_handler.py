@@ -1050,7 +1050,7 @@ def prefetch_staging_reqs(
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
                 if ep not in prefetch_sockets:
-                    sock = zmq.Context().socket(zmq.PUSH)
+                    sock = zmq.Context.instance().socket(zmq.PUSH)
                     if na.is_ipv6:
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)

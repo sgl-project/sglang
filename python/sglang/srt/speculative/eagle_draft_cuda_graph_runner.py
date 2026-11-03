@@ -15,12 +15,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -169,6 +166,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        # Select device capabilities before allocating static inputs.
+        self.backend = resolve_decode_backend(self)
+
         # Static buffers
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -297,8 +297,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.attention_variant_sizes = self.megakernel_served
 
-        self.backend = resolve_decode_backend(self)
-
         # Capture
         try:
             with model_capture_mode():
@@ -326,7 +324,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # Helpers
     # -----------------------------------------------------------------
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
     def _make_graph_key(self, bs, variant_label=None, attention_variant=None):
         # variant_label is _GREEDY_VARIANT or None.
