@@ -128,6 +128,15 @@ class TestSchedulerHostSyncLogger(CustomTestCase):
         self.logger.on_step_launch(_batch("DECODE"))
         self.assertEqual(self.records[0][1]["total_syncs"], 0)
 
+    def test_warns_once_when_hook_is_replaced(self):
+        self.logger.on_step_launch(_batch("DECODE"))
+        warnings.showwarning = lambda *args, **kwargs: None
+        with self.assertLogs(host_sync_module.logger, level="WARNING") as logs:
+            self.logger.on_step_launch(_batch("DECODE"))
+            self.logger.on_step_launch(_batch("DECODE"))
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("no longer counted", logs.output[0])
+
     @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
     def test_counts_real_device_read(self):
         self._debug_mode.stop()

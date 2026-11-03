@@ -14,6 +14,7 @@ event waits are not reported by torch's sync debug mode and are not counted.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -34,6 +35,8 @@ from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+logger = logging.getLogger(__name__)
 
 _SYNC_WARNING = "called a synchronizing CUDA operation"
 _TORCH_DIR = os.path.dirname(torch.__file__) + os.sep
@@ -61,6 +64,10 @@ def _call_site(frame, depth: int = _CALL_SITE_DEPTH) -> str:
 
 
 class SchedulerHostSyncLogger:
+    """Process-global and never restored: the first launched batch sets torch's
+    sync debug mode, adds a warnings filter and replaces ``warnings.showwarning``
+    for the rest of the process."""
+
     def __init__(
         self,
         targets: List[str],
@@ -75,6 +82,8 @@ class SchedulerHostSyncLogger:
         self._syncs: Counter = Counter()
         self._launched_batches: Counter = Counter()
         self._started = False
+        self._show = None
+        self._hook_replaced = False
         self._last_dump_time = time.monotonic()
 
     @staticmethod
@@ -121,6 +130,7 @@ class SchedulerHostSyncLogger:
             else:
                 show_other(message, category, filename, lineno, file, line)
 
+        self._show = show
         warnings.showwarning = show
         torch.cuda.set_sync_debug_mode("warn")
 
@@ -133,6 +143,12 @@ class SchedulerHostSyncLogger:
         now = time.monotonic()
         if now - self._last_dump_time < self.dump_interval:
             return
+        if warnings.showwarning is not self._show and not self._hook_replaced:
+            self._hook_replaced = True
+            logger.warning(
+                "warnings.showwarning was replaced after host-sync logging "
+                "started; host syncs are no longer counted."
+            )
         if not self._syncs and not self._launched_batches:
             self._last_dump_time = now
             return
