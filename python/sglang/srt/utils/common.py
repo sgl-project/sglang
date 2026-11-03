@@ -3603,7 +3603,7 @@ def build_model_info_fields(model_config, server_args) -> Dict[str, Any]:
 
     Shared by the HTTP server and the Rust frontend's launch configuration.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.model_override_base import resolving_view
     from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 
     result = {

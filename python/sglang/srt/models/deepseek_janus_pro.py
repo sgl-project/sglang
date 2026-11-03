@@ -20,14 +20,16 @@ import collections
 import math
 import os
 from array import array
-from dataclasses import field
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from itertools import repeat
 from typing import (
     Callable,
+    Dict,
     Final,
     Iterable,
+    List,
     Literal,
     Optional,
     Sequence,
@@ -44,7 +46,7 @@ from torch import Tensor, _assert, nn
 from torch.nn.init import trunc_normal_
 from transformers import AutoModel, PreTrainedModel
 
-from sglang.srt.configs.janus_pro import *
+from sglang.srt.configs.janus_pro import MultiModalityConfig, SigLIPVisionCfg
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig

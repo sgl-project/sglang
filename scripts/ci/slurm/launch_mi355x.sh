@@ -6,7 +6,7 @@
 # salloc's (prefill_workers + decode_workers) nodes -- one server per node --
 # and runs the Docker harness: prefill server(s) on the first nodes, decode
 # server(s) on the rest, a standalone load balancer on the prefill node, then an
-# sglang.bench_serving concurrency sweep over MORI. Default recipe is 1P1D (2
+# sglang.benchmark.serving concurrency sweep over MORI. Default recipe is 1P1D (2
 # nodes); see the drive.sh note on reserving 2P2D / 1P3D / 3P1D.
 #
 # Required environment variables (set by the GitHub Actions workflow):
@@ -1208,7 +1208,7 @@ $PREFILL_WAIT_ROUTER
       echo "=== concurrency=\$C ==="
       OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
       rm -f \$OUT
-      python3 -m sglang.bench_serving --backend sglang \
+      python3 -m sglang.benchmark.serving --backend sglang \
         --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \
         --dataset-name random --random-input-len $ISL --random-output-len $OSL \
         --random-range-ratio $RRR --max-concurrency \$C \

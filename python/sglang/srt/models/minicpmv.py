@@ -44,7 +44,7 @@ import torch.types
 from PIL import Image
 from torch import nn
 from torch.nn.init import trunc_normal_
-from transformers import PretrainedConfig
+from transformers import LlamaConfig, PretrainedConfig
 
 from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -61,7 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
-from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.minicpmv_vit import (
     MiniCPMV_Merger,
     MiniCPMV_VisionTransformer,

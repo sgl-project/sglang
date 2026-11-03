@@ -386,7 +386,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_confidential_compute, is_npu
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,

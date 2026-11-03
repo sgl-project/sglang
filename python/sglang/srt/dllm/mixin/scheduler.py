@@ -16,7 +16,8 @@ from sglang.srt.runtime_context import get_exec, get_schedule
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.utils import GenerationBatchResult
 
 
 class SchedulerDllmMixin:
