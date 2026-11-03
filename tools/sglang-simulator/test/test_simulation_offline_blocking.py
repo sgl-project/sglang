@@ -3,7 +3,6 @@ import json
 import pytest
 from test_simulation_sglang_serving import (
     SIM_CONFIGS,
-    SOL_CONFIG_NAME,
     SGLangServingRunner,
     assert_decode_metrics,
 )
@@ -32,8 +31,7 @@ def _relative_error(actual, expected):
 def _run_mode(mode, tmp_path):
     case_dir = tmp_path / mode
     case_dir.mkdir()
-    # The SOL-database AISimulate example configuration.
-    runner = SGLangServingRunner(SIM_CONFIGS[SOL_CONFIG_NAME], case_dir, mode=mode)
+    runner = SGLangServingRunner(SIM_CONFIGS["aisimulate_sol"], case_dir, mode=mode)
     try:
         metrics = runner.benchmark(
             case_dir / "benchmark.json", request_rate=REQUEST_RATE, seed=SEED

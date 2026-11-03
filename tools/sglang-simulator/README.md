@@ -115,10 +115,8 @@ The maintained tests define the supported first-version scope:
   equivalent logical results in `OFFLINE` and `BLOCKING` modes;
 - [`test/test_simulation_cache_hit_ratio.py`](test/test_simulation_cache_hit_ratio.py):
   reusable-prefix accounting and cache-tier hit metrics across repeated runs;
-- [`test/test_aisimulate_import.py`](test/test_aisimulate_import.py):
-  estimator-SDK import errors;
 - [`test/test_aisimulate_predictor.py`](test/test_aisimulate_predictor.py):
-  real-SDK prefill/decode prediction and predictor configuration registry.
+  real-SDK prefill/decode prediction and prefix reuse in SOL and SILICON modes.
 
 From `tools/sglang-simulator`:
 
@@ -310,7 +308,6 @@ python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.p
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
-python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_import.py
 python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
 ```
 
