@@ -1066,7 +1066,7 @@ class EngramEmbedding(nn.Module):
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
         self.remote_table = None
-        if os.environ.get("SGLANG_EXPERIMENTAL_REMOTE_ENGRAM") == "1":
+        if envs.SGLANG_EXPERIMENTAL_REMOTE_ENGRAM.get():
             if (
                 config.placement != EngramPlacement.CPU
                 or config.replication != EngramReplication.NONE

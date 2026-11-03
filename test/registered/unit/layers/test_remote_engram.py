@@ -7,6 +7,11 @@ from unittest import mock
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 
 def load_adapter():
     path = Path(__file__).parents[4] / "python/sglang/srt/layers/remote_engram.py"
@@ -16,7 +21,7 @@ def load_adapter():
     return module
 
 
-class RemoteEngramValidationTest(unittest.TestCase):
+class RemoteEngramValidationTest(CustomTestCase):
     def setUp(self):
         self.module = load_adapter()
 
@@ -65,8 +70,9 @@ class RemoteEngramValidationTest(unittest.TestCase):
         one = self.module.RemoteEngramTable(4, 256, 1)
         two = self.module.RemoteEngramTable(4, 256, 14)
         one.loaded = two.loaded = {"weight", "scale"}
-        with mock.patch.dict(os.environ, {"ENGRAM_SHARED_READ_PLAN": "1"}), mock.patch(
-            "torch.cuda.stream", return_value=nullcontext()
+        with (
+            mock.patch.dict(os.environ, {"ENGRAM_SHARED_READ_PLAN": "1"}),
+            mock.patch("torch.cuda.stream", return_value=nullcontext()),
         ):
             one.finish_load(0, 2)
             runtime.context.prime.assert_not_called()

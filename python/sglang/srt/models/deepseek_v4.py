@@ -3993,7 +3993,7 @@ class DeepseekV4Model(nn.Module):
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
         remote_prefetch = (
-            os.environ.get("SGLANG_EXPERIMENTAL_REMOTE_ENGRAM") == "1"
+            envs.SGLANG_EXPERIMENTAL_REMOTE_ENGRAM.get()
             and os.environ.get("ENGRAM_SHARED_PREFETCH") == "1"
         )
         if self.engram_hasher is not None and remote_prefetch:
