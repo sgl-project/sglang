@@ -21,9 +21,10 @@ import torch
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
