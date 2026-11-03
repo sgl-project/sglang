@@ -5668,53 +5668,49 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        if not ignore_waiting:
-            idle &= len(self.waiting_queue) == 0
+        lists = self.request_lists()
+        if for_health_check:
+            busy_lists = {"chunked", "waiting"}
+            if not self._engine_paused:
+                busy_lists.add("decode_retracted")
         else:
+            busy_lists = lists.keys() - {
+                # Their steps are counted through the batches above.
+                "running",
+                "prefill_launched",
+                # Only its staging part is counted, above.
+                "dllm",
+                # Held across a weight update, whose cache flush needs idle.
+                "decode_held",
+                # Counted by uocr blocks_flush below.
+                "uocr_parked",
+                # Finished, and held only on the output rank; all ranks must agree.
+                "deferred",
+            }
+        if ignore_waiting:
+            busy_lists.discard("waiting")
             # A PD-decode request waiting with its transferred KV still owns
             # its request row; a flush would free it.
             idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
-
-        if (
-            for_health_check
-            and not self._engine_paused
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_prealloc_queue is not None
-        ):
-            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+        idle &= not any(lists.get(name) for name in busy_lists)
 
         if not for_health_check:
-            # Grammar queue and prefill transfer queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
             idle &= not self.request_receiver.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
                     ignore_waiting=ignore_waiting
                 )
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_transfer_queue) == 0
-                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-                if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.decode_offload_manager is not None
+            ):
+                idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -6135,20 +6131,21 @@ class Scheduler(
                     # an ack racing back is never dropped.
                     decode_req.kv_receiver.abort()
 
-            # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        discard_kv_cache_backup(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+            # Retracted requests hold a KV backup; held ones hold no KV.
+            retracted, held = self.disagg_decode_prealloc_queue.take_aborted(recv_req)
+            for req in retracted:
+                discard_kv_cache_backup(
+                    req,
+                    self.tree_cache,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+                self.send_abort_output(_make_abort_req(req), req)
+            for req in held:
+                req.finish_outside_step(FINISH_ABORT())
+                self._release_aborted_request(req)
+                self.send_abort_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
