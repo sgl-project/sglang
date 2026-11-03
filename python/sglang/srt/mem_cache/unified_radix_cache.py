@@ -85,9 +85,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
 )
-
-# UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
-# because other modules and tests import them from this module.
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -110,13 +107,8 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
-    UnifiedLRUList,
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    NodeId,
     uses_joint_lru,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -1477,7 +1469,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         if self.enable_session_radix_cache and is_finished:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+            from sglang.srt.managers.req_types import FINISH_ABORT
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
                 self.session_refs.register_session_ref(
@@ -3192,6 +3184,9 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
+        # The op is retired without an IO transfer, so retire its hicache root
+        # span now (idempotent with the zero-hit finish in prefetch_thread_func).
+        self.cache_controller._finish_op_trace(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -3884,7 +3879,7 @@ class UnifiedRadixCache(BasePrefixCache):
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
         if failed:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+            from sglang.srt.managers.req_types import FINISH_ABORT
 
             for req in failed:
                 req.skip_radix_cache_insert = True
