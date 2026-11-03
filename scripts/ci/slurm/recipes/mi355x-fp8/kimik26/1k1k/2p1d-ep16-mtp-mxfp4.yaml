@@ -105,7 +105,7 @@ mtp:
   num_steps: 3
   eagle_topk: 1
   num_draft_tokens: 4
-  draft_model_path: /it-share/model_coverage/models--lightseekorg--kimi-k2.6-eagle3.1-mla
+  draft_model: lightseekorg/kimi-k2.6-eagle3.1-mla
 
 bench:
   # bench_serving --max-concurrency sweep; one result JSON per concurrency.

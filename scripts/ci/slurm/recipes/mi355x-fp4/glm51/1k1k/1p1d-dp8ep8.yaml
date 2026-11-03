@@ -1,7 +1,7 @@
-# MI355X GLM-5.2 (MXFP4) 2-node 1P1D disaggregation recipe — DP8 + narrow EP8 + MTP.
+# MI355X GLM-5.1 (MXFP4) 2-node 1P1D disaggregation recipe — DP8 + narrow EP8.
 #
 # DSA attention is auto-selected (see 1p1d.yaml). DP-attention 8 + within-node
-# EP8 + built-in NextN MTP head (no external draft).
+# EP8, same topology as the DeepSeek-V4 dp8ep8 leg.
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
@@ -54,15 +54,6 @@ runtime:
   max_running_requests: 256
   chunked_prefill_size: 8192
   swa_full_tokens_ratio: 0.1
-
-# MTP / EAGLE speculative decoding (built-in NextN head from the base model).
-# Applied to both prefill and decode. No draft_model_path: the NextN head lives
-# in the base checkpoint.
-mtp:
-  enabled: true
-  num_steps: 3
-  eagle_topk: 1
-  num_draft_tokens: 4
 
 bench:
   # bench_serving --max-concurrency sweep; one result JSON per concurrency.

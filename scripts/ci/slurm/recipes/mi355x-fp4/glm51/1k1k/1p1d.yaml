@@ -1,14 +1,10 @@
-# MI355X GLM-5.2 (MXFP4) 2-node 1P1D disaggregation recipe.
+# MI355X GLM-5.1 (MXFP4) 2-node 1P1D disaggregation recipe.
 #
-# GLM-5.2 uses GlmMoeDsaForCausalLM (DeepSeek Sparse Attention). sglang
+# GLM-5.1 uses GlmMoeDsaForCausalLM (DeepSeek Sparse Attention). sglang
 # auto-selects the DSA attention backend for this architecture, so this recipe
 # leaves `attention_backend` unset (empty) and lets the server pick DSA. MXFP4
 # enables SGLANG_DSV4_FP4_EXPERTS in launch_mi355x.sh (driven by PRECISION),
 # same as the DeepSeek-V4 FP4 path.
-#
-# NOTE: the checkpoint on disk is amd/GLM-5.1-MXFP4 (only GLM MXFP4 build
-# currently mirrored on /it-share). model_path in nightly-configs.yaml points at
-# it; the recipe naming tracks the model line we are wiring CI for.
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and

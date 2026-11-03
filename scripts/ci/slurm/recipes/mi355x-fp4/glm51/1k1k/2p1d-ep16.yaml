@@ -1,4 +1,4 @@
-# MI355X GLM-5.2 (MXFP4) 4-node 2P1D disaggregation recipe -- narrow-prefill EP8
+# MI355X GLM-5.1 (MXFP4) 4-node 2P1D disaggregation recipe -- narrow-prefill EP8
 # + wide-decode EP16 (mirrors the DSV4-Pro / Kimi Oren config: wide EP only helps decode).
 #
 # Two prefill engines (EP8, one node each) + one decode engine (EP16) spanning 2

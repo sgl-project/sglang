@@ -149,6 +149,18 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJson(needs.setup.outputs.matrix-2n) }}
     env: &mi355x-env
+      # Cluster config for the pit2 amd-sglang nodes. The runner host sets none
+      # of these; this file is the only place they are defined.
+      CLUSTER: spur
+      SLURM_PARTITION: amd-sglang
+      SLURM_ACCOUNT: amd-sglang
+      SLURM_QOS: amd-sglang-qos
+      # Node-local HF hub cache on every compute node, read-only in containers.
+      # Loading from /share_nfs is too slow (16-24 min for a 1.5 TB checkpoint).
+      HF_CACHE: /var/tmp/sglang-ci/model_coverage
+      # The login-node python is externally managed; pip installs to ~/.local.
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
+      PIP_USER: "1"
       FRAMEWORK: sglang
       HW: mi355x
       MODEL: ${{ matrix.config.model }}
@@ -163,9 +175,6 @@ jobs:
       # launch + cleanup steps read it directly. Do NOT set it here from
       # ${{ runner.name }} -- the `runner` context is not available in job-level
       # env and makes the whole workflow file invalid.
-      # Shared-NFS HuggingFace cache dir; the launcher resolves the live snapshot
-      # via refs/main. Per-model value comes from nightly-configs.yaml model_path.
-      MODEL_PATH: ${{ matrix.config.model_path }}
       # launch_mi355x.sh's default TIME_LIMIT (02:30:00) is sized for the
       # heaviest EP16 4-node sweep. A 2-node 1P1D leg normally finishes in
       # 20-35 minutes, so give it a tighter cap: a stuck leg then frees its
