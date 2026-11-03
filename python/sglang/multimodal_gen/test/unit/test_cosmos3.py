@@ -1884,6 +1884,112 @@ class TestCosmos3Transfer(unittest.TestCase):
             )
 
 
+class TestCosmos3CfgParallelUndCache(unittest.TestCase):
+    """CFG ranks must miss the UND K/V cache in the same steps.
+
+    A miss runs the UND layers; with FSDP sharded across CFG ranks, a miss on
+    one rank only issues all-gathers the other ranks never match.
+    """
+
+    _MODULE = (
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.cosmos3"
+    )
+    # 6 steps; a [400, 1000] window (the T2I default) covers steps 0-3.
+    _TIMESTEPS = [999.0, 800.0, 600.0, 400.0, 200.0, 50.0]
+
+    def _und_cache_misses(self, cfg_rank, guidance_interval):
+        """Run the denoising loop as one of 2 CFG ranks; return the steps that miss."""
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        cache = set()
+        misses = []
+
+        def fake_run(*, latents, cache_key, current_timestep, **_):
+            if cache_key not in cache:
+                cache.add(cache_key)
+                misses.append(current_timestep)
+            return torch.zeros_like(latents)
+
+        stage.transformer = mock.Mock(reset_cache=mock.Mock(side_effect=cache.clear))
+        stage._run_transformer = fake_run
+        stage.scheduler = mock.Mock(step=lambda noise_pred, t, latents, **_: (latents,))
+        stage.progress_bar = lambda iterable, **_: iterable
+        stage.log_info = lambda *_: None
+        stage.check_cancelled = lambda _: None
+        stage._logged_parallel_config = True
+        stage._logged_cfg_split = True
+        stage._current_batch_is_warmup = False
+
+        text = torch.zeros(1, 4, dtype=torch.long)
+        batch = types.SimpleNamespace(
+            sampling_params=types.SimpleNamespace(
+                guidance_interval=guidance_interval, control_guidance=1.0
+            ),
+            extra={
+                "cond_text_ids": text,
+                "cond_text_mask": torch.ones_like(text),
+                "uncond_text_ids": text,
+                "uncond_text_mask": torch.ones_like(text),
+                "cond_text_seq_len": 4,
+                "uncond_text_seq_len": 4,
+                "video_shape": (1, 1, 1),
+            },
+            latents=torch.zeros(1, 1, 1, 1, 1),
+            audio_latents=None,
+            timesteps=torch.tensor(self._TIMESTEPS),
+            guidance_scale=4.0,
+            generator=None,
+            seed=None,
+            scheduler=None,
+            rollout=False,
+            profile=False,
+            is_warmup=False,
+        )
+        server_args = types.SimpleNamespace(
+            enable_cfg_parallel=True, pipeline_config=None
+        )
+        patches = {
+            "get_classifier_free_guidance_rank": cfg_rank,
+            "get_classifier_free_guidance_world_size": 2,
+            "get_sp_world_size": 1,
+            "rollout_step_kwargs": {},
+            "prepare_rollout_if_enabled": None,
+            "init_rollout_env_if_enabled": None,
+            "finalize_rollout_if_enabled": None,
+        }
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(
+                    mock.patch(f"{self._MODULE}.{name}", return_value=value)
+                )
+            # Identity: each rank keeps its own partial sum.
+            stack.enter_context(
+                mock.patch(
+                    f"{self._MODULE}.cfg_model_parallel_all_reduce",
+                    side_effect=lambda x: x,
+                )
+            )
+            stage._denoise_once(batch, server_args)
+        return misses
+
+    def test_ranks_miss_und_cache_in_same_steps(self):
+        cases = {
+            # CFG on throughout (T2V/I2V): one UND pass per rank, no resets.
+            "always_on": (None, [0]),
+            # T2I default: CFG split ends at step 4, where every rank runs "cond".
+            # Rank 1 has only cached "uncond".
+            "window_ends": ((400.0, 1000.0), [0, 4]),
+            # CFG split starts at step 3, where rank 1 first needs "uncond".
+            "window_starts": ((0.0, 500.0), [0, 3]),
+        }
+        for name, (interval, expected) in cases.items():
+            with self.subTest(name):
+                rank0 = self._und_cache_misses(0, interval)
+                rank1 = self._und_cache_misses(1, interval)
+                self.assertEqual(rank0, rank1)
+                self.assertEqual(rank0, expected)
+
+
 class TestCosmos3DomainAwareLinear(unittest.TestCase):
     """Per-domain action projection."""
 

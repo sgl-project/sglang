@@ -1771,6 +1771,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         # host copy for the per-step CFG window checks: a device read per step
         # would stall the host on every step's kernels
         timestep_values = timesteps.tolist()
+        # Which branch set the previous step split across CFG ranks: "control", "text", or None.
+        prev_step_cfg_split: str | None = None
 
         for i, t in progress_bar:
             # Precision is chosen once per step, before any transformer call,
@@ -1794,6 +1796,20 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and control_guidance != 1.0
                 and self._cfg_active_at(timestep_values[i], control_guidance_interval)
             )
+            if not enable_cfg_parallel:
+                step_cfg_split = None
+            elif control_cfg_active:
+                step_cfg_split = "control"
+            elif do_cfg and effective_scale != 1.0:
+                step_cfg_split = "text"
+            else:
+                step_cfg_split = None
+            if i > 0 and step_cfg_split != prev_step_cfg_split:
+                # Split steps leave each CFG rank with a different UND cache. A cache
+                # miss runs the UND layers, so with FSDP sharded across CFG ranks the
+                # ranks would issue different all-gathers; recompute on every rank.
+                self.transformer.reset_cache()
+            prev_step_cfg_split = step_cfg_split
 
             if control_cfg_active:
                 # Control-CFG owns the step: 2 branches (text guidance off) or 3
