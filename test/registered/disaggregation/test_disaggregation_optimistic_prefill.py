@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -43,7 +44,7 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
-register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=310, stage="extra-a", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
@@ -475,6 +476,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             processed_tokens_counter=0,
             _release_aborted_request=lambda req: None,
             clear_pending_chunk_send=lambda req: None,
+            prefill_launched_reqs=RequestList(),
         )
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
