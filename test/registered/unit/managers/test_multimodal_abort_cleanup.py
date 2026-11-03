@@ -16,8 +16,12 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
-from sglang.srt.managers.schedule_batch import MultimodalInputs, Req
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.modality import Modality
