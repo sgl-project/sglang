@@ -3,6 +3,7 @@ Usage:
 # From the test/srt directory:
 cd test/srt
 python3 -m unittest test_start_profile.TestStartProfile
+python3 -m unittest test_start_profile.TestStartProfileRustServer
 python3 -m unittest test_start_profile.TestStartProfileWithNsys
 
 # Run specific tests:
@@ -26,11 +27,12 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=57, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=115, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
 
 OUTPUT_DIR = "./profiler_dir"
 
@@ -45,6 +47,10 @@ def _is_nsys_available():
 
 
 class TestStartProfile(CustomTestCase):
+    # Extra server-launch env; subclasses override to run the same suite
+    # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
+    env = {}
+
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
@@ -61,6 +67,7 @@ class TestStartProfile(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            env=cls.env,
         )
 
     @classmethod
@@ -101,6 +108,30 @@ class TestStartProfile(CustomTestCase):
 
         self._check_non_empty_profile_dir()
 
+    def test_start_profile_4_refusals(self):
+        """A stop with nothing running, and a deferred (start_step) start while
+        a profile runs, are refused with the scheduler's error surfaced as a
+        bare 500; the running profile is unaffected and stops normally. Runs
+        after test_start_profile_3, whose num_steps profile stopped itself."""
+        self._assert_refused(requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"))
+
+        self._start_profile()
+        self._assert_refused(
+            requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/start_profile",
+                json={"start_step": "1", "num_steps": 1},
+            )
+        )
+        self._post_request()
+        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/stop_profile")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "Stop profiling. This will take some time.\n")
+        self._check_non_empty_profile_dir()
+
+    def _assert_refused(self, response):
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.text, "Internal Server Error")
+
     def _start_profile(self, **kwargs):
         """Start profiling with optional parameters."""
         response = requests.post(
@@ -108,6 +139,7 @@ class TestStartProfile(CustomTestCase):
             json=kwargs if kwargs else None,
         )
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "Start profiling.\n")
 
     def _post_request(self):
         response = requests.post(
@@ -138,6 +170,17 @@ class TestStartProfile(CustomTestCase):
             self.assertEqual(
                 len(os.listdir(OUTPUT_DIR)), 0, "Output directory is non-empty!"
             )
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built (e.g. AMD suite)",
+)
+class TestStartProfileRustServer(TestStartProfile):
+    """The same suite against the embedded Rust frontend, which relays the
+    profile requests to the scheduler itself."""
+
+    env = {"SGLANG_RUST_SERVER": "1"}
 
 
 class TestStartProfileWithNsys(CustomTestCase):

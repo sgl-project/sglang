@@ -126,6 +126,45 @@ def create_mla_kv_page_table_for_dcp(
 
 
 @triton.jit
+def compact_dcp_verify_token_table_to_ragged(
+    token_table_ptr,  # in: [bs * q_len, table_stride] from create_mla_kv_page_table_for_dcp
+    local_kv_lens_ptr,  # in: [bs] this rank's shard length per request, contiguous
+    kv_indptr_ptr,  # in: [bs + 1] cumsum of the lengths, each clamped to >= 1
+    kv_indices_ptr,  # out: ragged ids, one run per request
+    table_stride: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Rectangular token table -> ragged (kv_indices, kv_indptr).
+
+    Every row of a request repeats that request's shard, so this reads row 0.
+    """
+    # The grid is (bs,) and the token loop is inside the kernel, so a cuda
+    # graph can capture this launch.
+    req = tl.program_id(0)
+    out_offset = tl.load(kv_indptr_ptr + req)
+    local_len = tl.load(local_kv_lens_ptr + req).to(tl.int32)
+    # The table must be wide enough for the whole shard. A narrow table makes
+    # this kernel read the next query row and return the wrong ids.
+    tl.device_assert(local_len <= table_stride)
+
+    if local_len == 0:
+        # Give an empty shard one slot, because the attention kernel fails
+        # on a shard of length zero. The caller removes that row later.
+        tl.store(kv_indices_ptr + out_offset, 0)
+    else:
+        row = token_table_ptr + req * Q_LEN * table_stride
+        for i in range(tl.cdiv(local_len, BLOCK_SIZE)):
+            offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+            mask = offset < local_len
+            tl.store(
+                kv_indices_ptr + out_offset + offset,
+                tl.load(row + offset, mask=mask),
+                mask=mask,
+            )
+
+
+@triton.jit
 def create_dcp_kv_indices(
     kv_indptr,
     extend_lens_ptr,
@@ -492,6 +531,63 @@ def dcp_pack_a2a_send(
 
 
 @triton.jit
+def _dcp_pack_q_kernel(
+    q_nope_ptr,
+    q_pe_ptr,
+    out_ptr,
+    nope_stride_B,
+    nope_stride_H,
+    pe_stride_B,
+    pe_stride_H,
+    out_stride_H,
+    out_stride_B,
+    D_NOPE: tl.constexpr,
+    D_PE: tl.constexpr,
+):
+    """One (batch, head) row of ``[q_pe | q_nope]``, cast to the output dtype."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    out_ty = out_ptr.dtype.element_ty
+    dst = out_ptr + h * out_stride_H + b * out_stride_B
+    pe = tl.arange(0, D_PE)
+    q_pe = tl.load(q_pe_ptr + b * pe_stride_B + h * pe_stride_H + pe)
+    tl.store(dst + pe, q_pe.to(out_ty))
+    nope = tl.arange(0, D_NOPE)
+    q_nope = tl.load(q_nope_ptr + b * nope_stride_B + h * nope_stride_H + nope)
+    tl.store(dst + D_PE + nope, q_nope.to(out_ty))
+
+
+def dcp_pack_q(q_nope: torch.Tensor, q_pe: torch.Tensor, out: torch.Tensor) -> None:
+    """Pack ``[B, H, D_nope]`` and ``[B, H, D_pe]`` into ``out`` ``[H, B, D_pe + D_nope]``.
+
+    The cast is Triton's, the same one the sparse-MLA kernels apply when they
+    load a bf16 q against an FP8 KV cache, so an FP8 ``out`` matches their
+    in-kernel conversion bit for bit.
+    """
+    B, H, d_nope = q_nope.shape
+    d_pe = q_pe.shape[-1]
+    if q_nope.stride(-1) != 1 or q_pe.stride(-1) != 1:
+        raise ValueError("q_nope and q_pe need a unit-stride last dim")
+    if out.shape != (H, B, d_pe + d_nope) or out.stride(-1) != 1:
+        raise ValueError(f"out {tuple(out.shape)} does not match q {(B, H)}")
+    if B == 0:
+        return
+    _dcp_pack_q_kernel[(B, H)](
+        q_nope,
+        q_pe,
+        out,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        out.stride(0),
+        out.stride(1),
+        D_NOPE=d_nope,
+        D_PE=d_pe,
+    )
+
+
+@triton.jit
 def _dcp_lse_combine_kernel(
     recv_output_ptr,
     recv_lse_ptr,
@@ -566,7 +662,7 @@ def _dcp_lse_combine_kernel(
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
-    acc = acc / weight_sum
+    acc = acc / tl.maximum(weight_sum, 1.0)
 
     out_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
@@ -632,46 +728,3 @@ def dcp_lse_combine_triton(
         RETURN_LSE=return_lse,
     )
     return out, (out_lse if return_lse else None)
-
-
-def _lse_weighted_combine_cpu(
-    partial_outputs: torch.Tensor,
-    partial_lses: torch.Tensor,
-    is_lse_base_on_e: bool = True,
-) -> torch.Tensor:
-    """CPU reference: combine N partial attention outputs using LSE weights.
-
-    Args:
-        partial_outputs: [N, B, H_local, D]
-        partial_lses:    [N, B, H_local]
-        is_lse_base_on_e: base-e (True) or base-2 (False)
-
-    Returns:
-        [B, H_local, D] combined output
-    """
-    N, B, H_local, D = partial_outputs.shape
-    partial_outputs = partial_outputs.float()
-    partial_lses = partial_lses.float()
-
-    # Sanitize
-    partial_lses = torch.where(
-        torch.isnan(partial_lses) | torch.isinf(partial_lses),
-        torch.full_like(partial_lses, float("-inf")),
-        partial_lses,
-    )
-
-    # max LSE for numerical stability
-    lse_max, _ = partial_lses.max(dim=0)
-    lse_max = torch.where(lse_max == float("-inf"), torch.zeros_like(lse_max), lse_max)
-
-    centered = partial_lses - lse_max.unsqueeze(0)
-    if is_lse_base_on_e:
-        weights = torch.exp(centered)
-    else:
-        weights = torch.pow(2.0, centered)
-
-    weight_sum = weights.sum(dim=0, keepdim=True)
-    weights = weights / weight_sum
-
-    combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
-    return combined

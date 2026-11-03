@@ -15,10 +15,11 @@ logger = logging.getLogger(__name__)
 _compiled_kernels: Dict[Tuple, object] = {}
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
 TILE_K = 128
+# K-contiguous smem rows; the 8-float pad makes each warp's 8 K x 4 V reads
+# hit distinct banks and keeps rows 16B-aligned for cp.async.
+TILE_K_PADDED = 136
 TILE_V = 32
-TILE_V_PADDED = 36
 TILE_V_SMALL = 16
-TILE_V_SMALL_PADDED = 20
 NUM_STAGES = 2
 NUM_THREADS = 128
 NUM_BLOCKS_PER_STATE_SMALL = 8
@@ -262,12 +263,11 @@ def _define_kernels():
 
                 for k_iter in range(NUM_K_ITERS_SMALL):
                     flat_idx = tidx + k_iter * 128
-                    k_write = flat_idx // TILE_V_SMALL
-                    v_write = flat_idx % TILE_V_SMALL
-                    if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
-                        v_global_write = v_tile * TILE_V_SMALL + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    k_write = flat_idx % TILE_K
+                    v_write = flat_idx // TILE_K
+                    h_val = sData[(k_write, v_write, stage)]
+                    v_global_write = v_tile * TILE_V_SMALL + v_write
+                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
 
@@ -495,12 +495,11 @@ def _define_kernels():
 
                 for k_iter in range(NUM_K_ITERS_SMALL):
                     flat_idx = tidx + k_iter * 128
-                    k_write = flat_idx // TILE_V_SMALL
-                    v_write = flat_idx % TILE_V_SMALL
-                    if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
-                        v_global_write = v_tile * TILE_V_SMALL + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    k_write = flat_idx % TILE_K
+                    v_write = flat_idx // TILE_K
+                    h_val = sData[(k_write, v_write, stage)]
+                    v_global_write = v_tile * TILE_V_SMALL + v_write
+                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
 
@@ -713,12 +712,11 @@ def _define_kernels():
 
                 for k_iter in range(NUM_K_ITERS):
                     flat_idx = tidx + k_iter * 256
-                    k_write = flat_idx // TILE_V
-                    v_write = flat_idx % TILE_V
-                    if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
-                        v_global_write = v_tile * TILE_V + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    k_write = flat_idx % TILE_K
+                    v_write = flat_idx // TILE_K
+                    h_val = sData[(k_write, v_write, stage)]
+                    v_global_write = v_tile * TILE_V + v_write
+                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
 
@@ -931,12 +929,11 @@ def _define_kernels():
 
                 for k_iter in range(NUM_K_ITERS):
                     flat_idx = tidx + k_iter * 256
-                    k_write = flat_idx // TILE_V
-                    v_write = flat_idx % TILE_V
-                    if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
-                        v_global_write = v_tile * TILE_V + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    k_write = flat_idx % TILE_K
+                    v_write = flat_idx // TILE_K
+                    h_val = sData[(k_write, v_write, stage)]
+                    v_global_write = v_tile * TILE_V + v_write
+                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
 
@@ -991,15 +988,15 @@ def _create_jit_functions():
         num_v_tiles_small = cute.ceil_div(v_dim, TILE_V_SMALL)
         smem_layout_small = cute.make_layout(
             (TILE_K, TILE_V_SMALL, NUM_STAGES),
-            stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
+            stride=(1, TILE_K_PADDED, TILE_K_PADDED * TILE_V_SMALL),
         )
-        thread_layout_small = cute.make_layout((32, 4), stride=(4, 1))
-        val_layout_small = cute.make_layout((1, 4))
+        thread_layout_small = cute.make_layout((32, 4), stride=(1, 32))
+        val_layout_small = cute.make_layout((4, 1))
         tiled_copy_load_small = cute.make_tiled_copy_tv(
             copy_atom, thread_layout_small, val_layout_small
         )
         smem_bytes_small = (
-            4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES
+            4 * TILE_K_PADDED * TILE_V_SMALL * NUM_STAGES
             + 4 * TILE_V_SMALL
             + 4 * TILE_K * 2
             + 64
@@ -1070,15 +1067,15 @@ def _create_jit_functions():
         num_v_tiles_small = cute.ceil_div(v_dim, TILE_V_SMALL)
         smem_layout_small = cute.make_layout(
             (TILE_K, TILE_V_SMALL, NUM_STAGES),
-            stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
+            stride=(1, TILE_K_PADDED, TILE_K_PADDED * TILE_V_SMALL),
         )
-        thread_layout_small = cute.make_layout((32, 4), stride=(4, 1))
-        val_layout_small = cute.make_layout((1, 4))
+        thread_layout_small = cute.make_layout((32, 4), stride=(1, 32))
+        val_layout_small = cute.make_layout((4, 1))
         tiled_copy_load_small = cute.make_tiled_copy_tv(
             copy_atom, thread_layout_small, val_layout_small
         )
         smem_bytes_small = (
-            4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES
+            4 * TILE_K_PADDED * TILE_V_SMALL * NUM_STAGES
             + 4 * TILE_V_SMALL
             + 4 * TILE_K * 2
             + 64
@@ -1149,13 +1146,13 @@ def _create_jit_functions():
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
         base_smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
-            stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
+            stride=(1, TILE_K_PADDED, TILE_K_PADDED * TILE_V),
         )
-        thread_layout = cute.make_layout((32, 8), stride=(8, 1))
-        val_layout = cute.make_layout((1, 4))
+        thread_layout = cute.make_layout((32, 8), stride=(1, 32))
+        val_layout = cute.make_layout((4, 1))
         tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
         smem_bytes = (
-            4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
+            4 * TILE_K_PADDED * TILE_V * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
         )
 
         gdn_large(
@@ -1223,13 +1220,13 @@ def _create_jit_functions():
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
         base_smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
-            stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
+            stride=(1, TILE_K_PADDED, TILE_K_PADDED * TILE_V),
         )
-        thread_layout = cute.make_layout((32, 8), stride=(8, 1))
-        val_layout = cute.make_layout((1, 4))
+        thread_layout = cute.make_layout((32, 8), stride=(1, 32))
+        val_layout = cute.make_layout((4, 1))
         tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
         smem_bytes = (
-            4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
+            4 * TILE_K_PADDED * TILE_V * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
         )
 
         gdn_large_varlen(
@@ -1304,7 +1301,10 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
 
     A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
     dt_bias = torch.zeros(HV, dtype=torch.bfloat16, device="cuda")
-    h0_source = torch.zeros(pool_size, HV, K, V, dtype=torch.float32, device="cuda")
+    # from_dlpack bakes this layout into the kernel; it must match the runtime view.
+    h0_source = torch.zeros(
+        pool_size, HV, V, K, dtype=torch.float32, device="cuda"
+    ).transpose(-1, -2)
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
@@ -1386,7 +1386,10 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
 ) -> torch.Tensor:
-    """CuTe DSL implementation of fused sigmoid gating delta rule update."""
+    """CuTe DSL implementation of fused sigmoid gating delta rule update.
+
+    ``initial_state_source`` is the ``[pool_size, HV, V, K]`` state pool.
+    """
 
     B_q, T_q, H, K = q.shape
     HV = v.shape[2]
@@ -1401,7 +1404,7 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
 
     if initial_state_source.dim() == 1:
         pool_size = initial_state_source.numel() // (HV * K * V)
-        h0_source = initial_state_source.view(pool_size, HV, K, V)
+        h0_source = initial_state_source.view(pool_size, HV, V, K)
     elif initial_state_source.dim() == 4:
         pool_size = initial_state_source.shape[0]
         h0_source = initial_state_source
@@ -1409,6 +1412,8 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
         raise ValueError(
             f"Unexpected initial_state_source shape: {initial_state_source.shape}"
         )
+    # The kernels index (pool, HV, K, V).
+    h0_source = h0_source.transpose(-1, -2)
 
     if is_varlen_decode:
         if a.dim() == 3:
@@ -1462,7 +1467,7 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     ).mark_layout_dynamic(leading_dim=0)
     h0_source_tensor = from_dlpack(
         h0_source.detach(), assumed_align=16
-    ).mark_layout_dynamic(leading_dim=h0_source.ndim - 1)
+    ).mark_layout_dynamic(leading_dim=2)
     h0_indices_tensor = from_dlpack(
         initial_state_indices.detach(), assumed_align=16
     ).mark_layout_dynamic(leading_dim=0)

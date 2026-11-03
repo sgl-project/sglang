@@ -43,7 +43,7 @@ class TestKpoolTopkTransformFused(CustomTestCase):
     def _expected_tokens(
         self, score_row: torch.Tensor, group_topk: int
     ) -> torch.Tensor:
-        """The pooled top-k groups expanded to their ``pool_size`` token ids."""
+        """The pooled top-k groups expanded to their ``kpool`` token ids."""
         groups = torch.topk(score_row.float().cpu(), group_topk).indices
         offsets = torch.arange(self.POOL_SIZE, dtype=torch.int64)
         return (groups.unsqueeze(1) * self.POOL_SIZE + offsets).reshape(-1)
@@ -60,7 +60,7 @@ class TestKpoolTopkTransformFused(CustomTestCase):
         out = fast_kpool_topk_transform_fused(
             score=score,
             lengths=lengths,
-            pool_size=self.POOL_SIZE,
+            kpool=self.POOL_SIZE,
             topk=topk,
             seq_lens=seq_lens,
         )
@@ -81,6 +81,22 @@ class TestKpoolTopkTransformFused(CustomTestCase):
         # GLM-5.3-Flash: index_topk=2048 over index_kpool=4.
         score, out = self._run(rows=2, groups=1024, topk=2048)
         self._assert_pooled_columns(score, out, topk=2048)
+
+    def test_runtime_topk_matches_reference(self):
+        """Runtime dispatch must accept the same k-pool ratio as the fused kernel."""
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            topk_from_pooled_history_logits,
+        )
+
+        score = self._distinct_scores(rows=2, groups=1024)
+        lengths = torch.full((2,), 1024, dtype=torch.int32, device="cuda")
+        out = topk_from_pooled_history_logits(
+            logits=score,
+            group_lengths=lengths,
+            kpool=self.POOL_SIZE,
+            topk=2048,
+        )
+        self._assert_pooled_columns(score, out.cpu(), topk=2048)
 
     def test_group_topk_128_matches_reference(self):
         score, out = self._run(rows=2, groups=512, topk=512)
@@ -118,7 +134,7 @@ class TestKpoolTopkTransformFused(CustomTestCase):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
 def test_topk_membership_including_overfull_coarse_bins(distribution, start):
     torch.manual_seed(1234)
-    rows, width, length, group_topk, pool_size = 4, 50000, 32768, 512, 4
+    rows, width, length, group_topk, kpool = 4, 50000, 32768, 512, 4
     scores = torch.randn(rows, width, device="cuda")
     if distribution == "equal":
         scores.fill_(1)
@@ -130,18 +146,18 @@ def test_topk_membership_including_overfull_coarse_bins(distribution, start):
     result = fast_kpool_topk_transform_fused(
         scores,
         lengths,
-        pool_size,
-        group_topk * pool_size,
+        kpool,
+        group_topk * kpool,
         row_starts=starts,
-        seq_lens=lengths * pool_size + 3,
+        seq_lens=lengths * kpool + 3,
     )
-    groups = result[:, :2048:pool_size].long() // pool_size
+    groups = result[:, :2048:kpool].long() // kpool
     assert bool(((groups >= 0) & (groups < length)).all())
     for row in groups:
         assert torch.unique(row).numel() == group_topk
     torch.testing.assert_close(
-        result[:, :2048].reshape(rows, group_topk, pool_size).long(),
-        groups.unsqueeze(-1) * pool_size + torch.arange(pool_size, device="cuda"),
+        result[:, :2048].reshape(rows, group_topk, kpool).long(),
+        groups.unsqueeze(-1) * kpool + torch.arange(kpool, device="cuda"),
         atol=0,
         rtol=0,
     )
@@ -154,7 +170,7 @@ def test_topk_membership_including_overfull_coarse_bins(distribution, start):
     torch.testing.assert_close(
         result[:, -3:],
         torch.arange(
-            length * pool_size, length * pool_size + 3, dtype=torch.int32, device="cuda"
+            length * kpool, length * kpool + 3, dtype=torch.int32, device="cuda"
         ).expand(rows, -1),
         atol=0,
         rtol=0,
