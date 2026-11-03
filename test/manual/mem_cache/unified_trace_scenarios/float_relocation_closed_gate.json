@@ -1,0 +1,21 @@
+{"name": "float_relocation_closed_gate", "chain": "tri", "page_size": 16, "lazy": true, "ops": [
+  {"op": "extend", "req": 0, "n": 96},
+  {"op": "extend", "req": 1, "n": 96},
+  {"op": "extend", "req": 2, "n": 96},
+  {"op": "extend", "req": 3, "n": 96},
+  {"op": "extend", "req": 4, "n": 96},
+  {"op": "extend", "req": 5, "n": 96},
+  {"op": "extend", "req": 6, "n": 96},
+  {"op": "extend", "req": 7, "n": 96},
+  {"op": "retire", "req": 1, "upto": 96},
+  {"op": "retire", "req": 3, "upto": 96},
+  {"op": "retire", "req": 5, "upto": 96},
+  {"op": "free", "req": 0},
+  {"op": "free", "req": 2},
+  {"op": "gate", "open": false},
+  {"op": "extend", "req": 10, "n": 160},
+  {"op": "extend", "req": 11, "n": 160},
+  {"op": "gate", "open": true},
+  {"op": "extend", "req": 12, "n": 160},
+  {"op": "extend", "req": 13, "n": 160}
+]}
