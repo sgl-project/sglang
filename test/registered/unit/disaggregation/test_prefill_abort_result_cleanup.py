@@ -8,8 +8,12 @@ import torch
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
@@ -57,7 +61,7 @@ class _Req:
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self):
-        self.prefill_launched_reqs = RequestList()
+        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),
@@ -66,7 +70,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
-        self.disagg_prefill_transfer_queue = []
+        self.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
@@ -210,6 +214,7 @@ class TestPrefillCompleteResult(CustomTestCase):
             )
 
         req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
+        scheduler.prefill_launched_reqs.join([req])
         scheduler.process_batch_result_disagg_prefill(batch, result)
         self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
         self.assertTrue(req.pending_bootstrap)
@@ -222,7 +227,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
-        self.assertEqual(scheduler.disagg_prefill_transfer_queue, [])
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
         release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
@@ -232,11 +237,11 @@ class TestPrefillCompleteResult(CustomTestCase):
         req = _Req()
         req.to_finish = None
         retried = []
-        scheduler.optimistic_release_and_requeue = lambda r: retried.append(r)
+        scheduler.optimistic_release_and_requeue = lambda r, src: retried.append(r)
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])
-        self.assertEqual(scheduler.disagg_prefill_transfer_queue, [])
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
 
