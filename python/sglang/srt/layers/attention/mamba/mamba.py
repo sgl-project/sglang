@@ -494,7 +494,7 @@ class MambaMixer2(torch.nn.Module):
                 self.intermediate_size // self.tp_size,
                 self.conv_dim // self.tp_size,
                 self.num_heads // self.tp_size,
-                ],
+            ],
             dim=-1,
         )
         conv1d_weight = self.conv1d.weight
@@ -599,7 +599,8 @@ class MambaMixer2(torch.nn.Module):
                 if is_cpu() or not use_triton_causal_conv
                 else causal_conv1d_fn_triton
             )
-            self.conv1d.bias.data = self.conv1d.bias.data.to(dtype=x.dtype)
+            if is_cpu():
+                self.conv1d.bias.data = self.conv1d.bias.data.to(dtype=x.dtype)
             hidden_states_B_C_p = ccfn(
                 x,
                 conv_weights,
