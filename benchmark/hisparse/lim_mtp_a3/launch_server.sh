@@ -12,13 +12,10 @@ CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-2048}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.96}
 MTP=${MTP:-1}
 GRAPH=${GRAPH:-1}
-METADATA_FUSION=${METADATA_FUSION:-}
-PRE_METADATA_FUSION=${PRE_METADATA_FUSION:-0}
-NATIVE_MTP=${SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE:-}
 
 case "$CASE_ID" in
-  full_64k_b5) INPUT_TOKENS=64000; BATCH_SIZE=5; OFFLOAD=0; COPY_SFA=0; INDEXER_IMPL=legacy ;;
-  offload_64k_b16_copysfa) INPUT_TOKENS=64000; BATCH_SIZE=16; OFFLOAD=1; COPY_SFA=1; INDEXER_IMPL=lim ;;
+  full_64k_b5) INPUT_TOKENS=64000; BATCH_SIZE=5; OFFLOAD=0 ;;
+  offload_64k_b16_copysfa) INPUT_TOKENS=64000; BATCH_SIZE=16; OFFLOAD=1 ;;
   *) echo "Unknown CASE_ID: $CASE_ID" >&2; exit 2 ;;
 esac
 CACHE_DESCRIPTION=12288
@@ -26,11 +23,7 @@ if (( ! OFFLOAD )); then CACHE_DESCRIPTION=full_sequence; fi
 for name in PORT CONTEXT_LENGTH OUTPUT_TOKENS CHUNKED_PREFILL_SIZE MTP GRAPH; do
   [[ "${!name}" =~ ^[0-9]+$ ]] || { echo "Invalid integer: $name" >&2; exit 2; }
 done
-OPTIMIZED_MTP=0
-if [[ "$MTP" == 1 && "$OFFLOAD" == 1 ]]; then OPTIMIZED_MTP=1; fi
-METADATA_FUSION=${METADATA_FUSION:-$OPTIMIZED_MTP}
-NATIVE_MTP=${NATIVE_MTP:-$OPTIMIZED_MTP}
-for name in MTP GRAPH METADATA_FUSION PRE_METADATA_FUSION NATIVE_MTP; do
+for name in MTP GRAPH; do
   [[ "${!name}" =~ ^[01]$ ]] || { echo "Invalid boolean: $name" >&2; exit 2; }
 done
 if (( INPUT_TOKENS + OUTPUT_TOKENS + 16 > CONTEXT_LENGTH )); then
@@ -64,8 +57,8 @@ else
   args+=(--disable-cuda-graph)
 fi
 if [[ "${1:-}" == --dry-run ]]; then
-  printf 'case=%s global_bs=%s offload=%s copy_sfa=%s C=%s K=2048 mtp=%s graph=%s native_mtp=%s post_metadata=%s pre_metadata=%s\n' \
-    "$CASE_ID" "$BATCH_SIZE" "$OFFLOAD" "$COPY_SFA" "$CACHE_DESCRIPTION" "$MTP" "$GRAPH" "$NATIVE_MTP" "$METADATA_FUSION" "$PRE_METADATA_FUSION"
+  printf 'case=%s global_bs=%s offload=%s C=%s K=2048 mtp=%s graph=%s\n' \
+    "$CASE_ID" "$BATCH_SIZE" "$OFFLOAD" "$CACHE_DESCRIPTION" "$MTP" "$GRAPH"
   printf '%q ' "${args[@]}"
   printf '\n'
   exit 0
@@ -90,11 +83,9 @@ export DEEPEP_NORMAL_LONG_SEQ_ROUND=72 DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1 DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1 SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_NPU_PROFILING=0 TRANSFORMERS_VERBOSITY=error
-export SGLANG_NPU_SPARSE_KV_INDEXER="$INDEXER_IMPL" SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD="$OFFLOAD"
-export SGLANG_NPU_ENABLE_COPY_SFA="$COPY_SFA" SGLANG_NPU_SPARSE_KV_CACHE_SIZE=12288
-export SGLANG_NPU_FUSED_LIM_PRE_METADATA="$PRE_METADATA_FUSION"
-export SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA="$METADATA_FUSION"
-export SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE="$NATIVE_MTP"
+export SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD="$OFFLOAD"
+export SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA="$OFFLOAD"
+export SGLANG_NPU_SPARSE_KV_CACHE_SIZE=12288
 export TORCHINDUCTOR_CACHE_DIR="${TASK_ROOT:-${TMPDIR:-/tmp}/sglang-lim-mtp-a3}/cache/inductor"
 export TRITON_CACHE_DIR="${TASK_ROOT:-${TMPDIR:-/tmp}/sglang-lim-mtp-a3}/cache/triton"
 python3 - <<'PY'
@@ -121,8 +112,8 @@ if expected_hash and checksum != expected_hash:
     raise RuntimeError("Selected kernel library SHA256 differs from controller provenance")
 print(f"kernel_package={package} kernel_so={library} sha256={checksum}", flush=True)
 PY
-printf 'case=%s global_bs=%s offload=%s copy_sfa=%s C=%s K=2048 native_mtp=%s post_metadata=%s pre_metadata=%s visible_devices=%s\n' \
-  "$CASE_ID" "$BATCH_SIZE" "$OFFLOAD" "$COPY_SFA" "$CACHE_DESCRIPTION" "$NATIVE_MTP" "$METADATA_FUSION" "$PRE_METADATA_FUSION" "${ASCEND_RT_VISIBLE_DEVICES:-unset}"
+printf 'case=%s global_bs=%s offload=%s C=%s K=2048 visible_devices=%s\n' \
+  "$CASE_ID" "$BATCH_SIZE" "$OFFLOAD" "$CACHE_DESCRIPTION" "${ASCEND_RT_VISIBLE_DEVICES:-unset}"
 printf '%q ' "${args[@]}"
 printf '\n'
 exec "${args[@]}"

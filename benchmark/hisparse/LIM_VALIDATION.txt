@@ -1,3 +1,6 @@
+Historical validation: commands and results below belong to their recorded
+revisions. See README_native.md for the current fused path and dynamic MTP.
+
 Experimental Ascend LIM sparse KV offload
 ========================================
 
