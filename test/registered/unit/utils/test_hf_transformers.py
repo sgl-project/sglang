@@ -835,7 +835,7 @@ class TestAutoConfigRegistration(CustomTestCase):
             CONFIG_MAPPING_NAMES,
         )
 
-        import sglang.srt.configs  # noqa: F401  (populates the registrations)
+        import sglang.srt.configs.all_configs  # noqa: F401  (populates the registrations)
 
         # `_extra_content` is exactly the set of classes SGLang registered, so
         # this covers `_CONFIG_REGISTRY` and the standalone registrations alike.

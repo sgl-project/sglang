@@ -4,6 +4,7 @@
 //! and media prefetch. Deliberately knows nothing about Axum, SSE framing, or
 //! Tonic.
 
+mod drain;
 mod error;
 pub(crate) mod fanout;
 mod frame;
@@ -11,6 +12,7 @@ mod metrics;
 mod peer;
 pub(crate) mod prefetch;
 
+pub(crate) use drain::{DrainEnd, DrainState, InFlight};
 pub(crate) use error::{CoreError, CoreErrorKind};
 #[cfg(test)]
 pub(crate) use frame::frame_metadata_case;

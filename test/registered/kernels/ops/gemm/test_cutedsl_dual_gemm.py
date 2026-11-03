@@ -1,11 +1,12 @@
 """Correctness tests for the Blackwell CuTe DSL dual GEMM."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.activation import silu_and_mul
 from sglang.kernels.ops.gemm import fp8_scaled_mm
 from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
@@ -116,7 +117,7 @@ def _float_reference(x, gate_up_weight):
 class TestCuteDSLDualGemm(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+        if not current_arch().is_sm(10):
             raise unittest.SkipTest("NVIDIA SM10x required")
 
     def _check(
@@ -325,10 +326,10 @@ class TestCuteDSLDualGemm(CustomTestCase):
         self.assertFalse(can_use_dual_gemm(1, 4095, 14336, static_mode))
         self.assertFalse(can_use_dual_gemm(1, 4096, 14335, static_mode))
 
-        with patch.object(
-            torch.cuda,
-            "get_device_properties",
-            return_value=type("Properties", (), {"multi_processor_count": 132})(),
+        # A 132-SM part: dynamic mode needs every feature CTA resident.
+        with patch(
+            "sglang.kernels.ops.gemm.cutedsl_dual_gemm.current_arch",
+            return_value=SimpleNamespace(num_sms=132),
         ):
             self.assertFalse(can_use_dual_gemm(1, 3584, 18944, dynamic_mode))
             self.assertFalse(can_use_dual_gemm(16, 3584, 18944, dynamic_mode))

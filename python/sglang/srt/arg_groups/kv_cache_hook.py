@@ -416,10 +416,10 @@ def handle_cache_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "--enable-prefill-weight-versions is not supported with SGLANG_RUST_SERVER"
             )
-        if cfg.enable_pdmux or cfg.dllm_algorithm is not None:
+        if cfg.dllm_algorithm is not None:
             raise ValueError(
                 "--enable-prefill-weight-versions is not supported with "
-                "--enable-pdmux or --dllm-algorithm"
+                "--dllm-algorithm"
             )
         if cfg.speculative_algorithm not in {None, "EAGLE", "EAGLE3", "DFLASH"}:
             raise ValueError(

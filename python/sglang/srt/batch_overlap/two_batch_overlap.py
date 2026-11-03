@@ -35,12 +35,9 @@ from sglang.srt.layers.moe.token_dispatcher import (
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    compute_position,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, compute_position
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
@@ -780,7 +777,7 @@ class TboForwardBatchPreparer:
             "capture_hidden_mode",
             "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
             "full_prefill_cuda_graph_capture",  # forward-level flag, inherited by both child batches
-            "split_index",  # for split prefill
+            "input_ids_from_graph",
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
