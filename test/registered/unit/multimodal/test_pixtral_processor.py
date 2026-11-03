@@ -7,11 +7,8 @@ import torch
 from PIL import Image
 
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

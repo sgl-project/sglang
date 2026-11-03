@@ -16,11 +16,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.rust_server.multimodal import (  # noqa: E402
     RustMmProcessor,
     RustMmSpec,

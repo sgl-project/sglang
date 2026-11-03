@@ -29,7 +29,8 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
 from sglang.srt.models.unlimited_ocr_v2_support.window_params import KEY_KEEP
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import MultimodalDataItem, Req
+    from sglang.srt.managers.req_types import MultimodalDataItem
+    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 

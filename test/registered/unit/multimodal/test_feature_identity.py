@@ -4,6 +4,8 @@ import asyncio
 import itertools
 import pickle
 import runpy
+import subprocess
+import sys
 import unittest
 from array import array
 from dataclasses import dataclass, replace
@@ -17,14 +19,11 @@ import torch
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items, hash_feature_digest
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalInputs,
     MultimodalProcessorOutput,
-    Req,
 )
+from sglang.srt.managers.schedule_batch import MultimodalInputs, Req
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -35,6 +34,7 @@ from sglang.srt.multimodal.cache.identity import (
     media_preprocess_kwargs,
 )
 from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.llava import (
     LlavaImageProcessor,
     LlavaMultimodalProcessor,
@@ -70,6 +70,22 @@ def _item(value, **kwargs):
 
 
 class TestFeatureIdentity(CustomTestCase):
+    def test_request_types_do_not_eagerly_load_identity_or_scheduler(self):
+        # Hashing is lazy: wire-type imports must not undo the lightweight split.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; import sglang.srt.managers.req_types; "
+                "assert 'sglang.srt.multimodal.cache.identity' not in sys.modules; "
+                "assert 'sglang.srt.managers.schedule_batch' not in sys.modules",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_qwen_artifacts_keep_typed_identity_without_feature_storage(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
         processor._processor = SimpleNamespace(image_processor=Mock())
