@@ -26,16 +26,19 @@ an inserted prefix.
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional, Tuple
 
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.common import (
     HostTensorAllocator,
     _cuda_host_unregister,
     alloc_with_host_register,
 )
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,8 @@ class QSAKVOffloadLayout(msgspec.Struct, frozen=True):
     hot_blocks: int
     num_request_slots: int
     scratch_rows: int
+    token_topk: int
+    rows_per_request: int
 
     @property
     def region_rows(self) -> int:
@@ -112,6 +117,8 @@ def compute_offload_layout(
         hot_blocks=hot_blocks,
         num_request_slots=num_request_slots,
         scratch_rows=scratch,
+        token_topk=token_topk,
+        rows_per_request=rows_per_request,
     )
 
 
@@ -262,8 +269,10 @@ def _copy_rows(
 class QSAKVHostOffload:
     """Host K/V store and GPU hot cache of one QSA K/V pool.
 
-    The resolve here is the reference implementation: eager torch with host
-    synchronizations, so it requires ``--disable-cuda-graph``.
+    On CUDA the resolve is the fused, CUDA-graph-safe one
+    (``qsa_kv_offload_kernels``). The torch resolve here is the reference: eager,
+    with host synchronizations; ``SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE``
+    selects it on CUDA.
     """
 
     def __init__(
@@ -279,7 +288,8 @@ class QSAKVHostOffload:
         self.layout = layout
         # Debug: the full K/V pool stays on the GPU; see check().
         self.verify = verify
-        self.verified_calls = 0
+        self._forwards = 0
+        self._verify_logged = 0.0
         self.cr = layout.compress_ratio
         self.hot_blocks = layout.hot_blocks
         self.region = layout.region_rows
@@ -325,7 +335,21 @@ class QSAKVHostOffload:
             layout.scratch_rows,
         )
         self.req_to_token: Optional[torch.Tensor] = None
+        # The fused resolve reads the host store through raw UVA pointers,
+        # validated on CUDA only.
+        self.use_fused = (
+            self.device.type == "cuda"
+            and not is_hip()
+            and not envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
+        )
+        self.fused = None
+        self._resolve_errors_host = torch.zeros(
+            1, dtype=torch.int64, pin_memory=self.use_fused
+        )
         self._step = 0
+        if verify:
+            # [mismatching checks, checks]
+            self._verify_counts = torch.zeros(2, dtype=torch.int64, device=self.device)
         self._arange = torch.arange(
             max(layout.scratch_rows, self.cr), dtype=torch.int64, device=self.device
         )
@@ -339,32 +363,44 @@ class QSAKVHostOffload:
         pool_v: torch.Tensor,
     ) -> None:
         """Verify mode: the new K/V the full pool holds at ``loc`` -> device
-        rows ``rows`` and host rows ``loc``."""
-        loc = loc.long()
-        for k_dst, v_dst, dst in (
-            (self.dev_k[layer_idx], self.dev_v[layer_idx], rows.long()),
-            (self.host_k[layer_idx], self.host_v[layer_idx], loc),
-        ):
-            _copy_rows(
-                k_dst=k_dst, v_dst=v_dst, dst=dst, k_src=pool_k, v_src=pool_v, src=loc
-            )
+        rows ``rows`` and host rows ``loc`` (no host sync: graph-capturable)."""
+        loc, rows = loc.long(), rows.long()
+        self.dev_k[layer_idx][rows] = pool_k[loc]
+        self.dev_v[layer_idx][rows] = pool_v[loc]
+        self.write_through(layer_idx=layer_idx, rows=rows, loc=loc)
 
     def check(self, what: str, layer_idx: int, actual, expected) -> None:
-        """Verify mode: offloaded tensors must equal the full pool's bit for bit."""
+        """Verify mode: count offloaded tensors that differ from the full pool's,
+        bit for bit, on the device (graph-capturable); ``poll_verify`` raises."""
         for got, ref in zip(actual, expected):
-            if not torch.equal(got.view(torch.uint8), ref.view(torch.uint8)):
-                raise RuntimeError(
-                    f"QSA K/V offload verify: {what} of QSA layer {layer_idx} "
-                    "differs from the full pool"
-                )
-        self.verified_calls += 1
-        if self.verified_calls % 10000 == 0:
-            logger.info(
-                "QSA K/V offload verify: %d checks, 0 mismatches", self.verified_calls
+            self._verify_counts[0] += (
+                got.view(torch.uint8) != ref.view(torch.uint8)
+            ).any()
+        self._verify_counts[1] += 1
+
+    def poll_verify(self) -> None:
+        """Verify mode: raise if any check so far differed (host sync)."""
+        mismatches, checks = self._verify_counts.tolist()
+        if mismatches:
+            raise RuntimeError(
+                f"QSA K/V offload verify: {mismatches} of {checks} checks differ "
+                "from the full pool"
             )
+        now = time.monotonic()
+        if now - self._verify_logged >= 10:
+            self._verify_logged = now
+            logger.info("QSA K/V offload verify: %d checks, 0 mismatches", checks)
 
     def destroy(self) -> None:
         """Unpin the host K/V (see HostKVCache.destroy). Idempotent."""
+        if self.verify:
+            self._verify_logged = 0.0
+            self.poll_verify()
+        if self.fused is not None and int(self.fused.errors):
+            logger.error(
+                "QSA K/V offload: %d selected K/V columns had no device row",
+                int(self.fused.errors),
+            )
         if self.pin_memory:
             for buffer in (self.host_k, self.host_v):
                 _cuda_host_unregister(buffer)
@@ -383,6 +419,23 @@ class QSAKVHostOffload:
         self.req_to_token = req_to_token
         self.width = width
         self.max_blocks = width // self.cr + TAIL_BLOCKS
+        if self.use_fused:
+            from sglang.srt.mem_cache.qsa_kv_offload_kernels import QSAKVFusedResolve
+
+            self.fused = QSAKVFusedResolve(
+                num_request_slots=num_slots,
+                hot_blocks=self.hot_blocks,
+                compress_ratio=self.cr,
+                token_topk=self.layout.token_topk,
+                width=width,
+                region_rows=self.region,
+                dev_k=self.dev_k,
+                dev_v=self.dev_v,
+                host_k=self.host_k,
+                host_v=self.host_v,
+                max_rows_per_request=self.layout.rows_per_request,
+            )
+            return
         layers, hot, cr, dev = self.num_layers, self.hot_blocks, self.cr, self.device
 
         def table(*shape, dtype=torch.int64):
@@ -400,13 +453,23 @@ class QSAKVHostOffload:
         self.ring_src = table(layers, num_slots, TAIL_BLOCKS, cr, dtype=torch.int32)
         self.ring_end = table(layers, num_slots)
 
+    def set_num_real(self, num_requests: int) -> None:
+        """Requests of the next forward; CUDA-graph padding past them is skipped.
+        A single device fill: graph-replay metadata prep may be captured."""
+        if self.fused is not None:
+            self.fused.num_real.fill_(num_requests)
+
+    @property
+    def graph_safe(self) -> bool:
+        return self.use_fused
+
     def begin_forward(
         self,
         req_to_token: torch.Tensor,
         reset_req_pool_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Per-forward setup; an extend passes its requests to reset."""
-        if torch.cuda.is_current_stream_capturing():
+        if self.fused is None and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "The QSA K/V offload resolve runs eagerly; launch with "
                 "--disable-cuda-graph"
@@ -414,6 +477,22 @@ class QSAKVHostOffload:
         self.bind(req_to_token)
         if reset_req_pool_indices is not None:
             self.reset(reset_req_pool_indices)
+        self._forwards += 1
+        if self.fused is not None:
+            self._check_resolve_errors()
+        if self.verify:
+            self.poll_verify()
+
+    def _check_resolve_errors(self) -> None:
+        """Raise if the fused resolve left a selected column without a device row
+        (it would not be attended). Reads the copy started at the previous eager
+        forward, so it adds no host sync."""
+        if int(self._resolve_errors_host[0]):
+            raise RuntimeError(
+                f"QSA K/V offload: {int(self._resolve_errors_host[0])} selected K/V "
+                "columns had no device row"
+            )
+        self._resolve_errors_host.copy_(self.fused.errors, non_blocking=True)
 
     # ---- extend --------------------------------------------------------------
 
@@ -423,6 +502,9 @@ class QSAKVHostOffload:
         Every extend calls this for its requests (new request, radix hit or
         the next prefill chunk); exact because the host holds every token.
         """
+        if self.fused is not None:
+            self.fused.reset(req_pool_indices)
+            return
         idx = req_pool_indices.long()
         for table in (
             self.blk_slot,
@@ -448,6 +530,9 @@ class QSAKVHostOffload:
         self, layer_idx: int, rows: torch.Tensor, loc: torch.Tensor
     ) -> None:
         """Device rows ``rows`` -> host rows ``loc`` (their logical slots)."""
+        if self.fused is not None:
+            self.fused.write_through(layer_idx=layer_idx, rows=rows, loc=loc)
+            return
         _copy_rows(
             k_dst=self.host_k[layer_idx],
             v_dst=self.host_v[layer_idx],
@@ -506,6 +591,15 @@ class QSAKVHostOffload:
         attended (``< 0`` or ``>= row_seq_lens``). Call after ``bind``; the
         forward's new K/V may already be stored at ``new_token_rows``.
         """
+        if self.fused is not None:
+            return self.fused.resolve(
+                layer_idx=layer_idx,
+                positions=positions,
+                row_seq_lens=row_seq_lens.contiguous(),
+                row_req=row_req,
+                rows_per_request=rows_per_request,
+                req_to_token=self.req_to_token,
+            )
         cr, q = self.cr, rows_per_request
         num_rows, width = positions.shape
         if num_rows % q:

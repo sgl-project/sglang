@@ -819,6 +819,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices if is_extend else None
                 ),
             )
+            self._kv_offload.set_num_real(forward_batch.batch_size)
 
     def init_forward_metadata_out_graph(
         self,
@@ -955,11 +956,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.req_to_token_pool = req_pool
         if self._graph_seq_lens is None or self.token_to_kv_pool is None:
             raise RuntimeError("QSA CUDA graph state is not initialized")
-        if self._kv_offload is not None:
-            raise RuntimeError(
-                "The QSA K/V offload resolve runs eagerly; launch with "
-                "--disable-cuda-graph"
-            )
+        offload = self._kv_offload
+        if offload is not None:
+            if not offload.graph_safe:
+                raise RuntimeError(
+                    "The torch QSA K/V offload resolve runs eagerly; "
+                    "launch with --disable-cuda-graph"
+                )
+            offload.bind(self.req_to_token)
+            offload.set_num_real(bs)
         pool = self.token_to_kv_pool
         speculative_paged = self._is_speculative_paged_mode(forward_mode)
         metadata_rows = num_tokens if speculative_paged else bs
@@ -1040,6 +1045,8 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
         metadata = self._cuda_graph_metadata[(forward_mode, bs)]
+        if self._kv_offload is not None:
+            self._kv_offload.set_num_real(bs - num_padding)
         # Compressed addressing is arithmetic over req_to_token; pure reads below.
         if self._can_replay_with_gpu_kernels(metadata, seq_lens):
             self._replay_cuda_graph_metadata_gpu(

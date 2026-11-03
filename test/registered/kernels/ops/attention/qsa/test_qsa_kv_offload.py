@@ -13,6 +13,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
@@ -24,7 +25,7 @@ from sglang.srt.mem_cache.qsa_kv_offload import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 CR, BLOCK_TOPK, HEADS, DIM, STRIDE = 4, 512, 2, 256, 2112
 TOPK = BLOCK_TOPK * CR + CR - 1
@@ -43,6 +44,7 @@ def _packed(k, v, table, row_req, indices, lens, rows, packed_dtype):
     return counts, ok, ov
 
 
+@pytest.mark.parametrize("torch_resolve", [False, True])
 @pytest.mark.parametrize("rows_per_request", [1, 4])
 @pytest.mark.parametrize(
     "dtype,packed_dtype",
@@ -53,7 +55,7 @@ def _packed(k, v, table, row_req, indices, lens, rows, packed_dtype):
     ],
 )
 def test_offload_gather_matches_pool_gather(
-    rows_per_request, dtype, packed_dtype, request
+    rows_per_request, dtype, packed_dtype, torch_resolve, request
 ):
     torch.manual_seed(7)
     q, requests, width, pool_size = rows_per_request, 4, 12288, 65536
@@ -69,9 +71,13 @@ def test_offload_gather_matches_pool_gather(
     shape = (layout.device_rows + 64, HEADS, DIM)
     dev_k = torch.zeros(shape, device="cuda", dtype=dtype)
     dev_v = torch.zeros_like(dev_k)
-    offload = QSAKVHostOffload(
-        layout=layout, k_buffers=[dev_k], v_buffers=[dev_v], host_rows=pool_size + 64
-    )
+    with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
+        offload = QSAKVHostOffload(
+            layout=layout,
+            k_buffers=[dev_k],
+            v_buffers=[dev_v],
+            host_rows=pool_size + 64,
+        )
     request.addfinalizer(offload.destroy)
     pool_k = torch.randn(pool_size + 64, HEADS, DIM, device="cuda").to(dtype)
     pool_v = torch.randn_like(pool_k.float()).to(dtype)
@@ -125,6 +131,7 @@ def test_offload_gather_matches_pool_gather(
         positions = expand_qsa_block_indices(blocks, qpos, lens, CR, BLOCK_TOPK * CR)
 
         offload.begin_forward(req_to_token)
+        offload.set_num_real(requests)
         new_k = torch.randn(requests * q, HEADS, DIM, device="cuda").to(dtype)
         new_v = torch.randn_like(new_k.float()).to(dtype)
         pool_k[loc], pool_v[loc] = new_k, new_v
@@ -148,6 +155,131 @@ def test_offload_gather_matches_pool_gather(
             assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
         for req in range(1, requests + 1):  # accept between 1 and q tokens
             lengths[req] += int(torch.randint(1, q + 1, (1,)))
+    if offload.fused is not None:
+        assert int(offload.fused.errors) == 0
+
+
+def test_fused_resolve_in_cuda_graph_with_padding(request):
+    """The fused resolve captured once in a CUDA graph and replayed with new
+    positions, new req_to_token mappings and a smaller num_real: real rows gather
+    exactly the pool's K/V; padded rows are -1 and change no table."""
+    torch.manual_seed(11)
+    requests, width, pool_size = 4, 8192, 32768
+    layout = compute_offload_layout(
+        compress_ratio=CR,
+        token_topk=BLOCK_TOPK * CR,
+        hot_blocks=BLOCK_TOPK,
+        num_request_slots=requests + 1,
+        rows_per_request=1,
+        max_extend_tokens=4096,
+        page_size=64,
+    )
+    shape = (layout.device_rows + 64, HEADS, DIM)
+    dev_k = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    dev_v = torch.zeros_like(dev_k)
+    offload = QSAKVHostOffload(
+        layout=layout, k_buffers=[dev_k], v_buffers=[dev_v], host_rows=pool_size + 64
+    )
+    request.addfinalizer(offload.destroy)
+    assert offload.use_fused
+    pool_k = torch.randn(pool_size + 64, HEADS, DIM, device="cuda").bfloat16()
+    pool_v = torch.randn_like(pool_k)
+    req_to_token = torch.zeros((requests + 1, width), dtype=torch.int32, device="cuda")
+    free = (torch.randperm(pool_size, device="cuda") + 64).tolist()
+    lengths = [0] + [3000 + 700 * r for r in range(requests)]
+
+    def alloc(n):
+        nonlocal free
+        out, free = free[:n], free[n:]
+        return torch.tensor(out, dtype=torch.int64, device="cuda")
+
+    offload.begin_forward(req_to_token, torch.arange(1, requests + 1, device="cuda"))
+    for req in range(1, requests + 1):
+        slots = alloc(lengths[req])
+        req_to_token[req, : lengths[req]] = slots.int()
+        for start in range(0, lengths[req], 4096):
+            chunk = slots[start : start + 4096]
+            rows = offload.extend_rows(chunk.numel())
+            dev_k[rows], dev_v[rows] = pool_k[chunk], pool_v[chunk]
+            offload.write_through(layer_idx=0, rows=rows, loc=chunk)
+
+    positions = torch.full((requests, TOPK), -1, dtype=torch.int32, device="cuda")
+    lens = torch.ones(requests, dtype=torch.int32, device="cuda")
+    row_req = torch.arange(1, requests + 1, device="cuda")
+
+    def stage(real):
+        """New tokens of the real requests, their selection into the static inputs."""
+        qpos = torch.tensor(lengths[1 : real + 1], device="cuda")
+        loc = alloc(real)
+        req_to_token[row_req[:real], qpos] = loc.int()
+        pool_k[loc] = torch.randn(real, HEADS, DIM, device="cuda").bfloat16()
+        blocks = torch.full((real, BLOCK_TOPK), -1, device="cuda", dtype=torch.int32)
+        for row in range(real):
+            chosen = torch.randperm(int(qpos[row] + 1) // CR, device="cuda")
+            blocks[row, : min(BLOCK_TOPK, chosen.numel())] = chosen[:BLOCK_TOPK].int()
+        lens[:real] = (qpos + 1).int()
+        positions[:real] = expand_qsa_block_indices(
+            blocks, qpos, lens[:real], CR, BLOCK_TOPK * CR
+        )
+        new_rows = offload.new_token_rows(
+            row_seq_lens=lens[:real], row_req=row_req[:real]
+        )
+        dev_k[new_rows], dev_v[new_rows] = pool_k[loc], pool_v[loc]
+        offload.write_through(layer_idx=0, rows=new_rows, loc=loc)
+        for r in range(real):
+            lengths[r + 1] += 1
+
+    def resolve():
+        return offload.resolve_rows(
+            layer_idx=0,
+            positions=positions,
+            row_seq_lens=lens,
+            row_req=row_req,
+            rows_per_request=1,
+        )
+
+    stage(requests)
+    offload.set_num_real(requests)
+    resolve()  # warm up the Triton kernels outside capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rows = resolve()
+    fused = offload.fused
+    columns = torch.arange(TOPK, device="cuda", dtype=torch.int32)
+    for step in range(8):
+        real = requests if step % 2 == 0 else requests - 1
+        stage(real)
+        if step == 4:  # radix remap of a resident block of request 1
+            cols = torch.arange(CR, device="cuda") + CR * 100
+            slots = alloc(CR)
+            req_to_token[1, cols] = slots.int()
+            offload.host_k[0][slots.cpu()] = pool_k[slots].cpu()
+            offload.host_v[0][slots.cpu()] = pool_v[slots].cpu()
+        padded = requests
+        before = [
+            t[0, padded].clone()
+            for t in (fused.blk_slot, fused.slot_blk, fused.ring, fused.ring_src)
+        ]
+        offload.set_num_real(real)
+        graph.replay()
+        expected = _packed(
+            pool_k, pool_v, req_to_token, row_req[:real].int(), positions[:real],
+            lens[:real], real, torch.bfloat16,
+        )  # fmt: skip
+        actual = _packed(
+            dev_k, dev_v, rows[:real], torch.arange(real, device="cuda"),
+            torch.where(rows[:real] >= 0, columns, -1),
+            torch.full((real,), TOPK, device="cuda", dtype=torch.int32),
+            real, torch.bfloat16,
+        )  # fmt: skip
+        for got, ref in zip(actual, expected):
+            assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+        if real < requests:
+            assert bool((rows[real:] == -1).all())
+            after = (fused.blk_slot, fused.slot_blk, fused.ring, fused.ring_src)
+            for old, new in zip(before, after):
+                assert torch.equal(old, new[0, padded])
+    assert int(fused.errors) == 0
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ def validate_qsa_kv_offload(server_args: ServerArgs) -> None:
 def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
     """The offloaded pool keeps only device rows on the GPU, so every reader of
     the full-attention K/V that addresses logical slots directly is refused."""
+    from sglang.srt.environ import envs
     from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.mem_cache.qsa_kv_offload import compute_offload_layout
     from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -64,14 +65,16 @@ def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
             raise ValueError(f"--enable-qsa-kv-offload does not support {flag}.")
 
     graphs = cfg.cuda_graph_config
-    eager = (graphs.decode.backend, graphs.prefill.backend) == (
-        Backend.DISABLED,
-        Backend.DISABLED,
-    )
-    if not eager:
+    torch_resolve = envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
+    if torch_resolve and graphs.decode.backend != Backend.DISABLED:
         raise ValueError(
-            "--enable-qsa-kv-offload resolves the hot cache eagerly; add "
+            "The torch reference resolve of the QSA K/V offload runs eagerly; add "
             "--disable-cuda-graph."
+        )
+    if graphs.prefill.backend != Backend.DISABLED:
+        raise ValueError(
+            "--enable-qsa-kv-offload gathers the prefill context from the host "
+            "outside CUDA graphs; add --disable-prefill-cuda-graph."
         )
     # The same layout checks the pool runs, before the weights load.
     compute_offload_layout(

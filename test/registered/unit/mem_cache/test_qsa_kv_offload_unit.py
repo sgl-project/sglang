@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.arg_groups.qsa_kv_offload_hook import check_qsa_kv_offload_args
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.qsa_kv_offload import (
     QSAKVHostOffload,
     QSAKVOffloadBudget,
@@ -189,6 +190,18 @@ def _offload_args(**overrides):
 class TestOffloadArgs(CustomTestCase):
     def test_accepts_a_supported_config(self):
         check_qsa_kv_offload_args(_offload_args(), _QSA_HF_CONFIG)
+        decode_graphs = SimpleNamespace(
+            decode=SimpleNamespace(backend=Backend.FULL),
+            prefill=SimpleNamespace(backend=Backend.DISABLED),
+        )
+        check_qsa_kv_offload_args(
+            _offload_args(cuda_graph_config=decode_graphs), _QSA_HF_CONFIG
+        )
+        with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(True):
+            with self.assertRaisesRegex(ValueError, "disable-cuda-graph"):
+                check_qsa_kv_offload_args(
+                    _offload_args(cuda_graph_config=decode_graphs), _QSA_HF_CONFIG
+                )
         check_qsa_kv_offload_args(
             _offload_args(
                 speculative_algorithm="NEXTN",
@@ -223,11 +236,11 @@ class TestOffloadArgs(CustomTestCase):
                 dict(speculative_algorithm="EAGLE", speculative_eagle_topk=4),
                 _QSA_HF_CONFIG,
             ),
-            "disable-cuda-graph": (
+            "disable-prefill-cuda-graph": (
                 dict(
                     cuda_graph_config=SimpleNamespace(
                         decode=SimpleNamespace(backend=Backend.FULL),
-                        prefill=SimpleNamespace(backend=Backend.DISABLED),
+                        prefill=SimpleNamespace(backend=Backend.FULL),
                     )
                 ),
                 _QSA_HF_CONFIG,
@@ -276,6 +289,8 @@ class _OffloadSim:
                 hot_blocks=hot_blocks,
                 num_request_slots=self.slots,
                 scratch_rows=self.layout.scratch_rows,
+                token_topk=self.block_topk * CR,
+                rows_per_request=self.q,
             )
         shape = (self.layout.device_rows + 64, self.heads, self.dim)
         self.dev_k = [torch.zeros(shape, device=device) for _ in range(self.layers)]
@@ -412,11 +427,15 @@ class TestOffloadResolve(CustomTestCase):
     def test_verify_check(self):
         sim = _OffloadSim(rows_per_request=1, seed=5)
         ref = torch.zeros(4)
+        sim.offload.verify = True
+        sim.offload._verify_counts = torch.zeros(2, dtype=torch.int64)
         sim.offload.check("gather", 0, (ref.clone(),), (ref,))
+        sim.offload.poll_verify()
         bad = ref.clone()
         bad[1] = 1
-        with self.assertRaisesRegex(RuntimeError, "differs from the full pool"):
-            sim.offload.check("gather", 0, (bad,), (ref,))
+        sim.offload.check("gather", 0, (bad,), (ref,))
+        with self.assertRaisesRegex(RuntimeError, "1 of 2 checks differ"):
+            sim.offload.poll_verify()
 
     def test_selection_larger_than_hot_cache_raises(self):
         sim = _OffloadSim(rows_per_request=1, seed=3, hot_blocks=4)
