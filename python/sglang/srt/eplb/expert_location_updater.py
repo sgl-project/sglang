@@ -199,7 +199,11 @@ def _update_expert_weights_raw(
 
 def create_temp_buffers(sample_tensors):
     return [
-        torch.empty_like(t) if _is_dense(t[0]) else _empty_contiguous(t)
+        (
+            torch.empty_like(t)
+            if _is_dense(t[0])
+            else torch.empty_like(t, memory_format=torch.contiguous_format)
+        )
         for t in sample_tensors
     ]
 
@@ -214,19 +218,6 @@ def _is_dense(t: torch.Tensor) -> bool:
             return False
         expected *= size
     return True
-
-
-def _empty_contiguous(t: torch.Tensor) -> torch.Tensor:
-    return torch.empty(t.shape, dtype=t.dtype, device=t.device)
-
-
-def _copy_(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """`dst.copy_(src)` through int64 views when both allow it: a byte-sized copy
-    between different layouts otherwise runs one element per byte."""
-    d, s = _int64_view(dst), _int64_view(src)
-    if d is not None and s is not None:
-        dst, src = d, s
-    dst.copy_(src)
 
 
 def _int64_view(t: torch.Tensor) -> Optional[torch.Tensor]:
@@ -278,15 +269,19 @@ def update_expert_weights_single_layer(
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
     # Sends need each expert's slice dense; stage tensors whose slices are not
-    # (e.g. Mega MoE weights localized across locality domains).
-    staged = [not _is_dense(w[0]) for w in routed_experts_weights]
-    copies = [_copy_ if s else torch.Tensor.copy_ for s in staged]
-    send_weights = [
-        _empty_contiguous(w) if s else w for w, s in zip(routed_experts_weights, staged)
-    ]
-    for w, send, s in zip(routed_experts_weights, send_weights, staged):
-        if s:
-            _copy_(send, w)
+    # (e.g. Mega MoE weights localized across locality domains), moving them
+    # through int64 views when every layout allows it.
+    routed_experts_weights = list(routed_experts_weights)
+    temp_buffers = list(temp_buffers)
+    send_weights = list(routed_experts_weights)
+    for i, weight in enumerate(routed_experts_weights):
+        if _is_dense(weight[0]):
+            continue
+        send = torch.empty_like(weight, memory_format=torch.contiguous_format)
+        views = [_int64_view(t) for t in (weight, temp_buffers[i], send)]
+        if all(v is not None for v in views):
+            routed_experts_weights[i], temp_buffers[i], send = views
+        send_weights[i] = send.copy_(routed_experts_weights[i])
 
     self_node_id = rank // num_gpu_per_node
 
@@ -342,9 +337,8 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
-                    copies[i](
-                        _get_tensor(temp_buffers, i, dst_expert_location),
-                        _get_tensor(routed_experts_weights, i, src_expert_location),
+                    _get_tensor(temp_buffers, i, dst_expert_location).copy_(
+                        _get_tensor(routed_experts_weights, i, src_expert_location)
                     )
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
@@ -577,14 +571,9 @@ def update_expert_weights_single_layer(
             routed_experts_weights_expert_location,
         ) in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                copies[i](
-                    _get_tensor(
-                        routed_experts_weights,
-                        i,
-                        routed_experts_weights_expert_location,
-                    ),
-                    _get_tensor(temp_buffers, i, temp_buffers_expert_location),
-                )
+                _get_tensor(
+                    routed_experts_weights, i, routed_experts_weights_expert_location
+                ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
         return tensors[tensor_index][_get_local_expert_location(expert_location)]
