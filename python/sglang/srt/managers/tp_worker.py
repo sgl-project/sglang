@@ -551,9 +551,11 @@ class TpModelWorker(BaseTpWorker):
 
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
+        kv_shard_widening = page_interleave_shard_size(
+            self.model_runner.token_to_kv_pool_allocator
+        )
         kv_capacity = (
-            self.model_runner.effective_logical_max_total_num_tokens
-            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+            self.model_runner.effective_logical_max_total_num_tokens * kv_shard_widening
         )
         if is_cp_sharded_padded():
             kv_capacity = from_cp_sharded(kv_capacity)
@@ -574,7 +576,10 @@ class TpModelWorker(BaseTpWorker):
             kv_capacity - 1,
         )
         max_req_input_len = max_schedulable_input_len(
-            max_req_len, kv_capacity, max(get_schedule().page_size or 1, 1)
+            max_req_len=max_req_len,
+            kv_capacity=kv_capacity,
+            page_size=max(get_schedule().page_size or 1, 1),
+            kv_shard_widening=kv_shard_widening,
         )
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
