@@ -13,20 +13,22 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    FINISH_ABORT,
-    Req,
-    ReqKvInfo,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -34,6 +36,11 @@ from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    decode_queue,
+    empty_request_lists,
+)
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -68,6 +75,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -125,7 +133,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = self._new_req(priority=10)
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         ):
             scheduler._add_request_to_queue(req)
@@ -145,7 +153,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 req = self._new_req(priority=10)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(req)
@@ -173,7 +181,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 incoming = self._new_req(priority=priority)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(incoming)
@@ -233,7 +241,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             processed_tokens_counter=0,
         )
         queue.ensure_metadata_buffer = MagicMock(return_value=True)
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="req",
             disagg_kv_sender=object(),
             prefill_attempt_count=0,
@@ -242,7 +250,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             kv=SimpleNamespace(cache_protected_len=2),
             time_stats=MagicMock(),
         )
-        queue.queue = [req]
+        queue.queue = _RequestList(ListKind.PD_BOOTSTRAP)
+        queue.queue.join([req])
 
         with (
             patch(
@@ -262,7 +271,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue, req, result = self._pop_bootstrapping_swa_branch("write_through")
 
         self.assertEqual(result, [])
-        self.assertEqual(queue.queue, [req])
+        self.assertEqual(list(queue.queue), [req])
         self.assertEqual(req.prefill_attempt_count, 0)
         queue.ensure_metadata_buffer.assert_not_called()
 
@@ -272,7 +281,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 queue, req, result = self._pop_bootstrapping_swa_branch(write_policy)
 
                 self.assertEqual(result, [req])
-                self.assertEqual(queue.queue, [])
+                self.assertEqual(list(queue.queue), [])
                 self.assertEqual(req.prefill_attempt_count, 1)
                 queue.ensure_metadata_buffer.assert_called_once_with(req)
 
@@ -294,7 +303,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             "write_through", queue_cls=_Eager, is_retracted=True
         )
         self.assertEqual(result, [])
-        self.assertEqual(queue.queue, [req])
+        self.assertEqual(list(queue.queue), [req])
         queue.ensure_metadata_buffer.assert_not_called()
 
     def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
@@ -430,24 +439,21 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.chunked_req = None
+        empty_request_lists(scheduler)
         scheduler.mm_receiver = None
         scheduler.waiting_queue = [MagicMock(rid="req")]
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
-        scheduler.dllm_config = None
-        scheduler.grammar_manager = MagicMock()
-        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        scheduler.disagg_prefill_inflight_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
 
         with (
-            patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
+            patch("sglang.srt.managers.utils.get_serving") as get_serving,
             patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
         ):
             get_serving.return_value.weight_version = None
@@ -466,7 +472,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
-        req = SimpleNamespace(
+        req = FakeReq(
             rid=rid,
             priority=priority,
             origin_input_ids=[1, 2, 3],
@@ -489,7 +495,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
-        queue.queue = list(decode_reqs)
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
@@ -527,7 +533,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+        )
         queue.kv_manager = SimpleNamespace(
             kv_args=SimpleNamespace(state_types=[]),
         )
@@ -573,9 +581,13 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                 queue.token_to_kv_pool_allocator.page_size = 64
                 queue.token_to_kv_pool.page_size = 64
                 queue.draft_token_to_kv_pool = None
-                queue.transfer_queue.queue = [
-                    SimpleNamespace(host_staged=False) for _ in range(pending)
-                ]
+                queue.transfer_queue.queue = decode_queue(
+                    ListKind.PD_RECEIVING,
+                    [
+                        SimpleNamespace(req=FakeReq(), host_staged=False)
+                        for _ in range(pending)
+                    ],
+                )
                 queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
                 queue._uses_swa_reservation = MagicMock(return_value=False)
                 queue._send_kv_metadata = MagicMock()
@@ -584,7 +596,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
 
                 self.assertEqual(failed, [])
                 self.assertEqual(preallocated, reqs[:admitted])
-                self.assertEqual(queue.queue, reqs[admitted:])
+                self.assertEqual(list(queue.queue.items()), reqs[admitted:])
 
     def test_prealloc_lora_slots_cover_inflight_microbatches_and_queues(self):
         """In-flight requests retain their adapter slots."""
@@ -604,7 +616,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
 
         queue = self._new_queue(reqs)
         queue.pp_size = 2
-        queue.transfer_queue.queue = [transferring]
+        queue.transfer_queue.queue = decode_queue(ListKind.PD_RECEIVING, [transferring])
         scheduler = queue.scheduler
         scheduler.running_batch.reqs = [finished.req]
         scheduler.running_mbs = [
@@ -630,7 +642,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
 
         self.assertEqual(preallocated, [reqs[0], reqs[2]])
         self.assertEqual(failed, [])
-        self.assertEqual(queue.queue, [reqs[1]])
+        self.assertEqual(list(queue.queue.items()), [reqs[1]])
         self.assertEqual(
             [call.args[0] for call in queue._pre_alloc.call_args_list],
             [reqs[0].req, reqs[2].req],
@@ -690,7 +702,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             [decode_req.req.rid for decode_req in preallocated], ["healthy-high"]
         )
         self.assertEqual([decode_req.req.rid for decode_req in failed], ["failed-low"])
-        self.assertEqual(queue.queue, [])
+        self.assertEqual(list(queue.queue.items()), [])
         queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
@@ -716,7 +728,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                     fill_len=3, prefix_len=0
                 )
                 self.assertEqual(preallocated, [decode_req] if fits else [])
-                self.assertEqual(queue.queue, [] if fits else [decode_req])
+                self.assertEqual(
+                    list(queue.queue.items()), [] if fits else [decode_req]
+                )
                 self.assertEqual(failed, [])
 
 
@@ -769,19 +783,30 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         # namespace that carries the attributes it reads.
         payload = Req.build_rebootstrap_payload(req)
 
-        # origin_input_ids + output_ids, coerced to plain python ints.
-        self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
+        # origin_input_ids + output_ids[:-1], coerced to plain python ints.
+        self.assertEqual(payload["input_ids"], [1, 2, 3])
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["bootstrap_room"], 7)
         self.assertIsNone(payload["cache_salt"])
         # The prefill /generate URL is derived from bootstrap info on the decode
-        # side, not sent in the payload; and the boundary token is replayed via
-        # the decode-side override, so neither belongs in the payload.
+        # side, not sent in the payload.
         self.assertNotIn("pd_rebootstrap_prefill_url", payload)
-        self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
         json.dumps(payload)
+
+    def test_rebootstrap_lengths_match_prefill_input(self):
+        """The decode KV preallocation and admission length must equal the
+        token count the prefill recomputes, with or without emitted output."""
+        for output_ids in ([], [np.int32(3)], [np.int32(3), np.int32(4)]):
+            with self.subTest(num_output_ids=len(output_ids)):
+                req = self._new_req()
+                req.output_ids = list(output_ids)
+
+                prefill_len = len(Req.build_rebootstrap_payload(req)["input_ids"])
+
+                self.assertEqual(pre_alloc_fill_len(req), prefill_len)
+                self.assertEqual(req.output_ids, output_ids)
 
 
 class TestCommonKVManagerPrefillRecompute(unittest.TestCase):

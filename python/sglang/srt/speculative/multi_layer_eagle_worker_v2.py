@@ -23,17 +23,14 @@ import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
-    MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
-)
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -41,10 +38,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -452,8 +447,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
                 )
         else:
+            # NPU length updates live in the backend. Keep one graph per step;
+            # combined multi-step NPU capture is not enabled here.
             self.cuda_graph_runner_for_draft_extend = (
-                MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
+                MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
             )
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self._specialized_graph_memory_usage["draft_extend"] = (

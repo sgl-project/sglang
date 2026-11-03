@@ -56,7 +56,7 @@ correctness). Each test constructs a `HybridLinearAttnBackend` with two
   `ValueError`. Legal modes are `is_decode_or_idle`, plus
   `is_extend(include_draft_extend_v2=True)` (which subsumes `EXTEND` /
   `MIXED` / `DRAFT_EXTEND` / `DRAFT_EXTEND_V2` / `TARGET_VERIFY` /
-  `SPLIT_PREFILL` / `DLLM_EXTEND` per `forward_batch_info.py:106-115`).
+  `DLLM_EXTEND` per `forward_batch_info.py:106-115`).
 
 ## Caveats
 
