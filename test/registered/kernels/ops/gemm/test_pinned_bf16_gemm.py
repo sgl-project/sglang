@@ -3,8 +3,10 @@
 Turns red if the pinned GEMM stops matching torch.mm bit for bit (descriptor
 layout, transposes, workspace), if CUDA graph replay of it diverges from eager,
 if the table loader accepts a table recorded for another GPU or cuBLASLt
-version, keeps an entry that fails its self-check, or if
-UnquantizedLinearMethod stops routing table shapes through it.
+version, keeps an entry that fails its self-check, allocates device memory at
+load, self-checks on anything but the caller's weight, shares one cuBLASLt
+workspace between streams, or if UnquantizedLinearMethod stops routing table
+shapes through it.
 """
 
 import json
@@ -58,11 +60,17 @@ class TestPinnedBf16Gemm(CustomTestCase):
                     return m, algo, ws
         raise unittest.SkipTest("no split-K-free cuBLASLt algorithm matches torch.mm")
 
-    def setUp(self):
+    def _reset(self):
         self.lt._table = None
+        self.lt._unchecked.clear()
+        self.lt._max_workspace_bytes = 0
+        self.lt._workspaces.clear()
+
+    def setUp(self):
+        self._reset()
 
     def tearDown(self):
-        self.lt._table = None
+        self._reset()
 
     def _write_table(self, entries, **overrides):
         table = {
@@ -139,6 +147,88 @@ class TestPinnedBf16Gemm(CustomTestCase):
         ):
             x = torch.randn(self.m, K, device="cuda", dtype=torch.bfloat16)
             self.assertIsNone(self.lt.pinned_mm(x, self.w))
+
+    def test_load_allocates_nothing_and_checks_on_real_weight(self):
+        from sglang.srt.environ import envs
+
+        path = self._write_table([self._entry()])
+        x = torch.randn(self.m, K, device="cuda", dtype=torch.bfloat16)
+        self.lt.cublaslt_version()  # JIT build outside the measured window
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        self.lt._table = {}
+        self.lt._load_table(path)
+        self.assertEqual(torch.cuda.memory_allocated(), before)
+        self.assertIn((N, K), self.lt._unchecked)
+
+        self._reset()
+        with (
+            envs.SGLANG_OPT_BF16_GEMM_TABLE.override(path),
+            mock.patch.object(
+                self.lt, "_matches_torch", wraps=self.lt._matches_torch
+            ) as spy,
+        ):
+            y = self.lt.pinned_mm(x, self.w)
+            self.assertEqual(spy.call_count, 1)
+            self.assertIs(spy.call_args.args[0], self.w)
+            self.lt.pinned_mm(x, self.w)
+            self.assertEqual(spy.call_count, 1)
+        self.assertTrue(_same_bits(y, torch.mm(x, self.w.t())))
+
+    def test_unchecked_shape_is_skipped_during_capture(self):
+        from sglang.srt.environ import envs
+
+        path = self._write_table([self._entry()])
+        x = torch.randn(self.m, K, device="cuda", dtype=torch.bfloat16)
+        self.lt._table = {}
+        self.lt._load_table(path)
+        with (
+            envs.SGLANG_OPT_BF16_GEMM_TABLE.override(path),
+            mock.patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ),
+        ):
+            self.assertIsNone(self.lt.pinned_mm(x, self.w))
+        self.assertIn((N, K), self.lt._unchecked)
+
+    def test_workspace_per_stream_sized_once(self):
+        self.lt._max_workspace_bytes = 1 << 20
+        device = torch.device("cuda", torch.cuda.current_device())
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        bufs = []
+        for s in streams:
+            with torch.cuda.stream(s):
+                bufs.append(self.lt._workspace(device, 4096))
+                again = self.lt._workspace(device, 1 << 20)
+                self.assertEqual(again.data_ptr(), bufs[-1].data_ptr())
+        self.assertNotEqual(bufs[0].data_ptr(), bufs[1].data_ptr())
+        for s in streams:
+            key = (device.index, s.cuda_stream)
+            self.assertEqual(self.lt._workspaces[key].numel(), 1 << 20)
+
+    def test_concurrent_streams_match_torch(self):
+        from sglang.srt.environ import envs
+
+        path = self._write_table([self._entry()])
+        xs = [
+            torch.randn(self.m, K, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        refs = [torch.mm(x, self.w.t()) for x in xs]
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        outs = [torch.empty(self.m, N, device="cuda", dtype=torch.bfloat16) for _ in xs]
+        with envs.SGLANG_OPT_BF16_GEMM_TABLE.override(path):
+            self.assertIsNotNone(self.lt.pinned_mm(xs[0], self.w))  # load + check
+            torch.cuda.synchronize()
+            for s in streams:
+                s.wait_stream(torch.cuda.current_stream())
+            for _ in range(20):
+                for s, x, out in zip(streams, xs, outs):
+                    with torch.cuda.stream(s):
+                        self.lt.pinned_mm(x, self.w, out=out)
+            torch.cuda.synchronize()
+        for out, ref in zip(outs, refs):
+            self.assertTrue(_same_bits(out, ref))
 
     def test_unquantized_linear_uses_table(self):
         from sglang.srt.environ import envs

@@ -5,9 +5,13 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <cublasLt.h>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 namespace sglang {
@@ -64,6 +68,22 @@ struct CublasLtPinnedGemm {
     Problem& operator=(const Problem&) = delete;
   };
 
+  // Descriptors depend only on the shape and leading dimensions, not on the device or
+  // the data, so one set per (m, n, k, ldw, ldx, ldo) serves every call; the table
+  // has a few dozen shapes. Created once instead of 4 creates + 4 destroys per GEMM.
+  static const Problem& cached_problem(int64_t m, int64_t n, int64_t k, int64_t ldw, int64_t ldx, int64_t ldo) {
+    // Never destroyed: process exit may already have unloaded cuBLASLt.
+    static auto* mutex = new std::mutex();
+    static auto* cache = new std::map<std::array<int64_t, 6>, std::unique_ptr<Problem>>();
+    const std::array<int64_t, 6> key{m, n, k, ldw, ldx, ldo};
+    std::lock_guard<std::mutex> lock(*mutex);
+    auto& slot = (*cache)[key];
+    if (!slot) {
+      slot = std::make_unique<Problem>(m, n, k, ldw, ldx, ldo);
+    }
+    return *slot;
+  }
+
   static void
   run(const tvm::ffi::TensorView x,
       const tvm::ffi::TensorView w,
@@ -85,7 +105,8 @@ struct CublasLtPinnedGemm {
 
     cublasLtMatmulAlgo_t pinned;
     std::memcpy(&pinned, algo.data_ptr(), sizeof(pinned));
-    Problem problem(M.unwrap(), N.unwrap(), K.unwrap(), w.stride(0), x.stride(0), out.stride(0));
+    const Problem& problem =
+        cached_problem(M.unwrap(), N.unwrap(), K.unwrap(), w.stride(0), x.stride(0), out.stride(0));
     const float alpha = 1.0f, beta = 0.0f;
     const auto ws_bytes = static_cast<size_t>(workspace.size(0));
     check(
