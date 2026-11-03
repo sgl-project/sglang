@@ -5,14 +5,16 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.metadata import (
+    normal_decode_set_metadata,
+    prepare_swa_spec_page_table_triton,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
     merge_state_v2_wrapper,
-    normal_decode_set_metadata,
-    prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadata,
@@ -22,7 +24,8 @@ from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,

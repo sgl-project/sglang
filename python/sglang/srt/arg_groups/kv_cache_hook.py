@@ -6,15 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
