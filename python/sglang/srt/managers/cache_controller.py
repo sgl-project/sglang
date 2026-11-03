@@ -1015,7 +1015,7 @@ class HiCacheController:
             topk_rows_copy = topk_rows.copy_indices(
                 device_indices=op.device_indices,
                 host_indices=op.host_indices,
-                stream=self.l2_transfer_engine.device_to_host_stream,
+                stream=self.l2_transfer_engine.index_stream,
             )
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
@@ -1168,7 +1168,7 @@ class HiCacheController:
             topk_rows_copy = topk_rows.copy_indices(
                 device_indices=op.device_indices,
                 host_indices=op.host_indices,
-                stream=self.l2_transfer_engine.host_to_device_stream,
+                stream=self.l2_transfer_engine.index_stream,
             )
             topk_rows.add_load(topk_rows_copy)
         completion = self.l2_transfer_engine.submit_host_to_device(

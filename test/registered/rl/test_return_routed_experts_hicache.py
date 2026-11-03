@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=200, stage="extra-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
 _NUM_LAYERS = 48
 _TOPK = 8

@@ -8,8 +8,8 @@ be whatever those slots held before. Every HiCache write copies the rows of its
 device slots to its host slots, and every load-back copies them into the new
 device slots.
 
-The slot indices reach the CPU with a non-blocking copy on the transfer's own
-stream, issued before the KV copy. Each transfer's TopkRowCopy rides on its
+The slot indices reach the CPU with a non-blocking copy on the transfer
+engine's index stream, so they never wait behind earlier KV copies. Each transfer's TopkRowCopy rides on its
 HiCacheAck. A write's rows are copied when its ack is processed, before the
 device slots can be freed. A load's rows are copied when its ack is processed,
 or earlier when get_topk reads rows.
@@ -67,9 +67,9 @@ class HostTopkRows:
     def copy_indices(
         device_indices: torch.Tensor, host_indices: torch.Tensor, stream
     ) -> TopkRowCopy:
-        """Copy the slot indices of a transfer to the host on stream, after the
-        current stream that produced them. Call it before submitting the KV
-        copy, so the indices do not wait for the KV."""
+        """Copy the slot indices of a transfer to the host on stream (the
+        transfer engine's index stream), after the current stream that
+        produced them."""
         device_indices_cpu = torch.empty(
             device_indices.shape, dtype=device_indices.dtype, pin_memory=True
         )
