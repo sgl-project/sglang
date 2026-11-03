@@ -151,8 +151,7 @@ def dequantize_k_cache_paged_v41(
         else _dequantize_k_cache_paged_v41_fp4_kernel
     )
     data_stride, scale_base, scale_stride = layout.row_addressing(page_size)
-    on_hip = is_hip_runtime()
-    tokens_per_program = 1 if on_hip else 8
+    tokens_per_program = 8
     kernel[(triton.cdiv(num_tokens, tokens_per_program),)](
         out,
         buf_fp8,
@@ -168,9 +167,9 @@ def dequantize_k_cache_paged_v41(
         DATA_STRIDE=data_stride,
         SCALE_BASE=scale_base,
         SCALE_STRIDE=scale_stride,
-        IS_HIP=on_hip,
+        IS_HIP=is_hip_runtime(),
         TOKENS_PER_PROGRAM=tokens_per_program,
-        num_warps=4 if on_hip else 2,
+        num_warps=2,
     )
     return out
 
