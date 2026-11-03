@@ -66,7 +66,7 @@ python3 -m sglang.launch_server \
   --context-length 32768 --port 30000
 ```
 
-Each document can be a string or a list of text and image content parts:
+Queries must contain only text. Each document can be a string or a list of text and image content parts, with at most one image per document. Unsupported image inputs return HTTP 400.
 
 ```python
 import requests

@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+from sglang.test.vlm_utils import IMAGE_MAN_IRONING_URL
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
 
@@ -21,10 +22,7 @@ class TestNemotron35Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        response = requests.get(
-            "https://docs.nvidia.com/nemo-framework/user-guide/24.07/_images/nemo-llm-mm-stack.png",
-            timeout=30,
-        )
+        response = requests.get(IMAGE_MAN_IRONING_URL, timeout=30)
         response.raise_for_status()
         image = {
             "type": "image_url",
@@ -33,7 +31,9 @@ class TestNemotron35Rerank(CustomTestCase):
                 + base64.b64encode(response.content).decode()
             },
         }
-        text = "NeMo Framework offers comprehensive functionalities for developing both LLMs and Multimodal Models."
+        cls.query = "What is the man doing?"
+        cls.image = image
+        text = "A man is ironing clothes on the back of a car."
         cls.documents = [
             [{"type": "text", "text": text}, image],
             text,
@@ -41,7 +41,7 @@ class TestNemotron35Rerank(CustomTestCase):
             "A biological foundation model designed to analyze and generate DNA, RNA, and protein sequences.",
         ]
         # Same-checkpoint Transformers reference; scores may vary slightly by GPU.
-        cls.reference = [-1.801326, -2.107775, -1.818881, -2.956283]
+        cls.reference = [-1.954972, -2.034311, -2.185751, -3.345560]
         cls.process = popen_launch_server(
             os.environ.get(
                 "SGLANG_TEST_NEMOTRON_RERANK_MODEL",
@@ -69,7 +69,7 @@ class TestNemotron35Rerank(CustomTestCase):
         response = requests.post(
             self.base_url + "/v1/rerank",
             json={
-                "query": "What is NVIDIA NeMo Framework?",
+                "query": self.query,
                 "documents": documents,
                 **kwargs,
             },
@@ -104,6 +104,42 @@ class TestNemotron35Rerank(CustomTestCase):
             self.assertAlmostEqual(
                 by_index[after["index"]]["score"], after["score"], delta=0.02
             )
+
+    def test_literal_control_strings_match_reference(self):
+        for text, expected in [
+            ("see <s>old</s> price", -2.853922),
+            ("[IMG] figure", -2.661679),
+        ]:
+            with self.subTest(text=text):
+                response = requests.post(
+                    self.base_url + "/v1/rerank",
+                    json={
+                        "query": "What is shown?",
+                        "documents": [[{"type": "text", "text": text}, self.image]],
+                    },
+                    timeout=120,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                results = response.json()
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["index"], 0)
+                self.assertAlmostEqual(
+                    results[0]["score"], expected, delta=0.05 + 0.02 * abs(expected)
+                )
+
+    def test_unsupported_image_inputs_return_http_400(self):
+        for query, document, message in [
+            ([self.image], "plain text", "Queries must be text"),
+            (self.query, [self.image, self.image], "At most one image per document"),
+        ]:
+            with self.subTest(message=message):
+                response = requests.post(
+                    self.base_url + "/v1/rerank",
+                    json={"query": query, "documents": [document]},
+                    timeout=120,
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn(message, response.json()["message"])
 
     def test_distinct_concurrent_requests_match_batched_scores(self):
         batch = {x["index"]: x["score"] for x in self.request(self.documents)}

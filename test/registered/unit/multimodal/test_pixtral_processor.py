@@ -5,12 +5,21 @@ from unittest.mock import MagicMock
 
 import torch
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
+from transformers import PixtralImageProcessor
+from transformers import PixtralProcessor as HFPixtralProcessor
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputFormat,
+)
+from sglang.srt.multimodal.processors.nemotron35_reranker import (
+    Nemotron35RerankerProcessor,
 )
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +36,59 @@ class TestPixtralProcessor(CustomTestCase):
         processor._effective_patch_size = 28
         processor._precompute_hashes_before_cpu_transfer = MagicMock()
         return processor
+
+    def test_reranker_removes_padding_without_changing_other_pixtral_models(self):
+        """Masked tokens must not enter reranker attention or mean pooling."""
+        backend = Tokenizer(
+            WordLevel(
+                {
+                    "[UNK]": 0,
+                    "<pad>": 1,
+                    "[IMG]": 2,
+                    "[IMG_BREAK]": 3,
+                    "[IMG_END]": 4,
+                    "q": 5,
+                },
+                unk_token="[UNK]",
+            )
+        )
+        backend.pre_tokenizer = WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="<pad>",
+            additional_special_tokens=["[IMG]", "[IMG_BREAK]", "[IMG_END]"],
+            pad_to_multiple_of=8,
+        )
+        hf_processor = HFPixtralProcessor(
+            tokenizer=tokenizer,
+            image_processor=PixtralImageProcessor(size={"longest_edge": 28}),
+        )
+        image = Image.new("RGB", (28, 28))
+        expected = hf_processor(
+            text=["[IMG] q"], images=[image], padding=False, return_tensors="pt"
+        )
+        for processor_cls in (PixtralProcessor, Nemotron35RerankerProcessor):
+            with self.subTest(processor=processor_cls.__name__):
+                processor = object.__new__(processor_cls)
+                processor.mm_feature_transport = "cpu"
+                processor.FEATURE_NAMES = ["pixel_values"]
+                result = processor._call_processor(
+                    hf_processor, "[IMG] q", None, {"images": [image]}
+                )
+                if processor_cls is Nemotron35RerankerProcessor:
+                    torch.testing.assert_close(
+                        result["input_ids"], expected["input_ids"]
+                    )
+                    self.assertTrue(result["attention_mask"].bool().all())
+                else:
+                    self.assertGreater(
+                        result["input_ids"].numel(), expected["input_ids"].numel()
+                    )
+                    self.assertTrue((result["attention_mask"] == 0).any())
+                torch.testing.assert_close(
+                    result["pixel_values"][0], expected["pixel_values"][0]
+                )
 
     def test_multi_image_features_are_split_before_transport(self):
         """CUDA IPC dispatch must receive per-image tensors, not a bundled proxy."""

@@ -109,7 +109,10 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         ]
         request = V1RerankReqInput(query="q", documents=[document, "d"])
         adapted, _ = handler._convert_to_internal_request(request)
-        self.assertEqual(adapted.input_ids, [[0, 2, 1, 3, 4], [0, 2, 1, 3]])
+        self.assertEqual(
+            [tm.tokenizer.encode(prompt) for prompt in adapted.text],
+            [[0, 2, 1, 3, 4], [0, 2, 1, 3]],
+        )
         self.assertEqual(adapted.image_data, [["https://example.com/doc.png"], None])
         adapted.normalize_batch_and_arguments()
         self.assertEqual(adapted.batch_size, 2)

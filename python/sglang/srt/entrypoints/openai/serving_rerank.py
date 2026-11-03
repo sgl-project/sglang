@@ -3,6 +3,7 @@ import logging
 import math
 from typing import Any, Dict, List, Optional, Union
 
+import jinja2
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
@@ -262,7 +263,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         - For other cross-encoders: adapt into `EmbeddingReqInput` pairs.
         """
         if self._use_query_document_chat:
-            input_ids = []
+            prompts = []
             image_data = []
             for document in request.documents:
                 query, doc, images, videos = self._build_vl_reranker_content(
@@ -276,17 +277,18 @@ class OpenAIServingRerank(OpenAIServingBase):
                     {"role": "query", "content": query},
                     {"role": "document", "content": doc},
                 ]
-                input_ids.append(
-                    self.tokenizer_manager.tokenizer.apply_chat_template(
+                try:
+                    prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                         messages,
-                        tokenize=True,
+                        tokenize=False,
                         add_generation_prompt=False,
-                        return_dict=False,
                     )
-                )
+                except jinja2.TemplateError as e:
+                    raise ValueError(str(e)) from e
+                prompts.append(prompt)
                 image_data.append(images or None)
             return EmbeddingReqInput(
-                input_ids=input_ids,
+                text=prompts,
                 image_data=image_data if any(image_data) else None,
             ), request
 
