@@ -41,8 +41,8 @@ def _make_weights(num_experts, hidden, inter, gen):
     def alphas(scale):
         return (scale * (0.5 + torch.rand(num_experts, generator=gen))).cuda()
 
-    gs1 = torch.tensor([64.0], device="cuda")
-    gs2 = torch.tensor([32.0], device="cuda")
+    gs1 = torch.tensor(64.0, device="cuda")
+    gs2 = torch.tensor(32.0, device="cuda")
     return dict(
         w13=fp4(2 * inter, hidden),
         w13_sf=scales(2 * inter, hidden),

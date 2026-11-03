@@ -34,7 +34,7 @@ def _weights(num_experts, hidden, inter):
             ).to(torch.uint8)
 
         alpha = torch.full((num_experts,), 1e-4, device="cuda")
-        scale = torch.ones(1, device="cuda")
+        scale = torch.ones((), device="cuda")
         _WEIGHTS[key] = [
             fp4(2 * inter, hidden),
             sf(2 * inter, hidden),
