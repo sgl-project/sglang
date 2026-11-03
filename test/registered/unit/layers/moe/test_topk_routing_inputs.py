@@ -426,6 +426,31 @@ class TestTopKRoutingInputs(CustomTestCase):
             materialized.topk_ids.tolist(), [[0, 1], [0, 1], [-1, -1], [-1, -1]]
         )
 
+    def test_piecewise_lazy_routing_with_capture_keeps_the_full_config(self):
+        """The opaque op rebuilds a partial TopK config, so capture must bypass it."""
+        router = self._router(output_format=TopKOutputFormat.BYPASSED)
+        with get_exec().moe.override(ep_dispatch_algorithm=None):
+            output = router.forward_cuda(self.hidden, self.logits)
+        self.assertIsNone(output.num_token_non_padded)
+        self.assertIsNone(output.expert_location_dispatch_info)
+        layer = SimpleNamespace(
+            _use_ascend_fuseep=False,
+            forward_impl=lambda hidden, routes, **kwargs: routes,
+        )
+        get_resources().experts_capturer = object()
+        self.addCleanup(setattr, get_resources(), "experts_capturer", None)
+        with (
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.is_in_tc_piecewise_cuda_graph",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.fused_moe_bypassed_piecewise_cuda_graph_impl",
+                side_effect=AssertionError("opaque op drops the TopK config"),
+            ),
+        ):
+            self.assertIs(FusedMoE.forward(layer, self.hidden, output), output)
+
     def test_fp8_consumers_keep_lazy_padding_and_placement(self):
         """Both FP8 formats consume physical IDs and ignore poisoned inactive scores.
 
@@ -795,6 +820,123 @@ class TestTopKRoutingInputs(CustomTestCase):
                 torch.testing.assert_close(
                     result.expert_weights[:real].sum(-1), torch.full((real,), 2.5)
                 )
+
+    def test_fp8_padding_bound_still_runs_select_experts_hooks(self):
+        """With a padding bound and no placement remap, routed-expert capture,
+        distribution recording and routing simulation must still see the routes."""
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.utils import RoutingMethodType
+
+        provider = ModuleType("flashinfer.fused_moe")
+        provider.Fp8QuantizationType = IntEnum(
+            "Fp8QuantizationType", {"DeepSeekFp8": 0, "MxFp8": 1}
+        )
+        kernels = []
+
+        def routed_kernel(*, output, **kwargs):
+            kernels.append("routed")
+            output.zero_()
+
+        def logits_kernel(*, output, **kwargs):
+            kernels.append("logits")
+            output.zero_()
+
+        provider.trtllm_fp8_block_scale_routed_moe = routed_kernel
+        provider.trtllm_fp8_block_scale_moe = logits_kernel
+        quant_info = flashinfer_trtllm.FlashInferTrtllmFp8MoeQuantInfo(
+            w13_weight=torch.empty((4, 4, 2)),
+            w2_weight=torch.empty((4, 2, 2)),
+            global_num_experts=4,
+            local_expert_offset=0,
+            local_num_experts=4,
+            intermediate_size=2,
+            routing_method_type=RoutingMethodType.RenormalizeNaive,
+            block_quant=True,
+            weight_block_k=128,
+            w13_weight_scale_inv=torch.ones((4, 1, 1)),
+            w2_weight_scale_inv=torch.ones((4, 1, 1)),
+        )
+
+        class Hook:
+            ids = None
+
+            def capture(self, *, layer_id, topk_indices):
+                self.ids = topk_indices.clone()
+
+            def on_select_experts(self, topk_ids):
+                self.ids = topk_ids.clone()
+
+        def run_layer():
+            kernels.clear()
+            router = self._router(output_format=TopKOutputFormat.BYPASSED)
+            with get_exec().moe.override(ep_dispatch_algorithm=None):
+                lazy = router.forward_cuda(
+                    self.hidden, self.logits, num_token_non_padded=torch.tensor(2)
+                )
+            self.assertIsNone(lazy.expert_location_dispatch_info)
+            with (
+                get_parallel().override(tp_group=None),
+                patch.dict(sys.modules, {"flashinfer.fused_moe": provider}),
+                patch.object(
+                    flashinfer_trtllm,
+                    "trtllm_fp8_block_scale_moe_out_wrapper",
+                    inspect.unwrap(
+                        flashinfer_trtllm.trtllm_fp8_block_scale_moe_out_wrapper
+                    ),
+                ),
+                patch.object(
+                    flashinfer_trtllm,
+                    "trtllm_fp8_block_scale_routed_moe_out_wrapper",
+                    inspect.unwrap(
+                        flashinfer_trtllm.trtllm_fp8_block_scale_routed_moe_out_wrapper
+                    ),
+                ),
+                patch.object(
+                    flashinfer_trtllm,
+                    "per_token_group_quant_fp8",
+                    return_value=(self.hidden, torch.ones((1, 1))),
+                ),
+            ):
+                flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp8(
+                    StandardDispatchOutput(self.hidden, None, lazy),
+                    quant_info,
+                    MoeRunnerConfig(activation="silu"),
+                )
+
+        with self.subTest(hook="capture"):
+            hook = Hook()
+            get_resources().experts_capturer = hook
+            try:
+                run_layer()
+            finally:
+                get_resources().experts_capturer = None
+            self.assertEqual(kernels, ["routed"])
+            self.assertEqual(hook.ids[:2].tolist(), [[0, 1], [0, 1]])
+
+        with self.subTest(hook="recording"):
+            hook = Hook()
+            previous = get_resources().expert_distribution_recorder
+            get_resources().expert_distribution_recorder = hook
+            try:
+                with get_exec().moe.override(expert_distribution_recorder_mode="stat"):
+                    run_layer()
+            finally:
+                get_resources().expert_distribution_recorder = previous
+            self.assertEqual(kernels, ["routed"])
+            self.assertEqual(hook.ids[:2].tolist(), [[0, 1], [0, 1]])
+
+        with self.subTest(hook="simulation"):
+            with (
+                envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(True),
+                patch.object(topk_module, "apply_routing_simulation") as simulate,
+            ):
+                run_layer()
+            self.assertEqual(kernels, ["routed"])
+            simulate.assert_called_once()
 
     def test_in_range_draft_loads_experts_in_its_routing_order(self):
         """Draft expert weights stay in logical order despite a permuted target map."""
