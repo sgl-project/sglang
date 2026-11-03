@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import get_parallel
 def use_cp_decode_attn_dp(forward_batch) -> bool:
     parallel = get_parallel()
     mode = forward_batch.forward_mode
-    return getattr(parallel, "cp_decode_attn_mode", None) == "dp" and (
+    return parallel.cp_decode_attn_mode == "dp" and (
         mode.is_decode() or mode.is_target_verify()
     )
 

@@ -5,13 +5,14 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    flat_selection_slots,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -24,7 +25,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
-from .types import DecodeInputs, PrefillInputs
+from .types import DecodeInputs, PrefillInputs, RowShard
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -74,6 +75,27 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     def num_rows(self) -> int:
         return self.q_fp4.shape[0]
 
+    def narrow(self, rows: slice) -> DeepGEMMPrefillData:
+        """A contiguous query-row view, retaining the global flattened-K layout
+        and score width. Projection stays replicated so its GEMM shape is unchanged."""
+        start, stop, step = rows.indices(self.num_rows)
+        if step != 1:
+            raise ValueError("prefill index data requires contiguous query rows")
+        request_offsets = itertools.accumulate(self.rows_per_request, initial=0)
+        local_counts = [
+            max(0, min(offset + count, stop) - max(offset, start))
+            for offset, count in zip(request_offsets, self.rows_per_request)
+        ]
+        return msgspec.structs.replace(
+            self,
+            request_starts=self.request_starts[rows],
+            rows_per_request=local_counts,
+            compress_lens=self.compress_lens[rows],
+            q_fp4=self.q_fp4[rows],
+            q_sf=self.q_sf[rows],
+            weights=self.weights[rows],
+        )
+
     def empty_selection(self, topk: int) -> torch.Tensor:
         return self.request_starts.new_full(
             (self.num_rows, topk), -1, dtype=torch.int32
@@ -83,10 +105,11 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
         """The pool slots of the request-local ``inputs.out_raw_indices`` rows."""
         if inputs.out_page_indices is None:
             return
-        raw = inputs.out_raw_indices[: self.num_rows]
-        columns = (raw + self.request_starts[:, None]).clamp_min(0)
-        inputs.out_page_indices[: self.num_rows, : raw.shape[1]] = torch.where(
-            raw >= 0, self.k_slots[columns], -1
+        flat_selection_slots(
+            inputs.out_raw_indices[: self.num_rows],
+            self.request_starts,
+            self.k_slots,
+            inputs.out_page_indices,
         )
 
     def write_selection(self, selected: torch.Tensor, inputs: PrefillInputs) -> None:
@@ -265,7 +288,11 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
     )
 
 
-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+def score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+    """Score tiles whose row slices are relative to this data's query-row view."""
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -309,15 +336,30 @@ def dense_prefill_topk(
     *,
     out: torch.Tensor,
 ) -> None:
-    """Request-local compressed positions into ``out``, ``-1`` padded, unordered."""
+    """Request-local compressed positions of the data's query rows into
+    ``out``, one ``out`` row per scored row, ``-1`` padded, unordered."""
+    lens = data.compress_lens
     # Score columns are request-relative, so a zero offset emits request-local positions.
-    zero_offsets = torch.zeros_like(data.request_starts)
+    zero_offsets = torch.zeros_like(lens)
     for tile, logits in score_tiles(data, kv):
-        topk_ragged(
-            logits, data.compress_lens[tile], out=out[tile], offsets=zero_offsets[tile]
-        )
+        topk_ragged(logits, lens[tile], out=out[tile], offsets=zero_offsets[tile])
         # Free this tile's logits before the generator scores the next one.
         del logits
+
+
+def sharded_dense_prefill_topk(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    out: torch.Tensor,
+    shard: RowShard,
+) -> None:
+    """``dense_prefill_topk`` over this rank's share of the rows, all-gathered
+    into ``out`` for every row."""
+    num_rows = data.num_rows
+    local = out.new_full((shard.rows_per_rank(num_rows), out.shape[1]), -1)
+    dense_prefill_topk(data.narrow(shard.local_rows(num_rows)), kv, out=local)
+    out.copy_(shard.gather(local, num_rows))
 
 
 # ---------- torch ----------
@@ -362,13 +404,15 @@ def prefill_requests(
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
     if req is None:
-        # CP already provides this rank's row count for each request, including
-        # empty shards. Reconstruct ownership without using full-prefill lengths.
-        assert inputs.rows_per_request_device is not None
+        # CP query rows are rank-local and remain grouped by request.
+        assert inputs.rows_per_request is not None
+        repeats = inputs.rows_per_request_device
+        if repeats is None:
+            repeats = async_h2d(
+                inputs.rows_per_request, dtype=torch.int32, device=pos.device
+            )
         req = torch.repeat_interleave(
-            inputs.req_pool_indices,
-            inputs.rows_per_request_device.to(torch.int64),
-            output_size=pos.shape[0],
+            inputs.req_pool_indices, repeats, output_size=pos.numel()
         )
     assert inputs.seq_lens_cpu is not None
     # First flattened-K column of each request row, as inputs.k_slots lays them out.
@@ -394,6 +438,12 @@ def prefill_requests(
         slots = inputs.k_slots[k_starts[r] : k_starts[r] + lc]
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+        # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
+        # Pad K once per request; padded positions never enter selection.
+        if index_k.is_cuda and index_k.dtype == torch.bfloat16 and lc >= 1024:
+            score_width = (lc + 63) // 64 * 64
+            if score_width != lc:
+                index_k = torch.nn.functional.pad(index_k, (0, 0, 0, score_width - lc))
         request = RequestScores(
             lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
@@ -415,11 +465,13 @@ def _score_chunks(
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    rows_per_chunk = max(
+        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * index_k.shape[0] * 2)
+    )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+        s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
         s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
 
