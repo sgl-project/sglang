@@ -31,6 +31,10 @@ from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import is_unadmitted_reject
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -67,7 +71,7 @@ def _make_scheduler():
     sched = SimpleNamespace(
         output_streamer=MagicMock(),
         beam_coordinator=MagicMock(),
-        _release_aborted_request=MagicMock(),
+        release_aborted_request=MagicMock(),
     )
     sched.retire_unadmitted_request = MagicMock(
         side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
@@ -78,7 +82,7 @@ def _make_scheduler():
 def _prefill_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
-        queue=[],
+        queue=_RequestList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(return_value=True),
     )
     return q
@@ -88,7 +92,7 @@ def _decode_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
         token_to_kv_pool_allocator=MagicMock(),
-        retracted_queue=[],
+        retracted_queue=_RequestList(ListKind.PD_RETRACTED),
         pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
         _create_receiver_and_enqueue=MagicMock(
@@ -142,7 +146,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q = _prefill_queue(sched)
                     _admit_prefill(q, req)
                     q.create_sender.assert_not_called()
-                    self.assertEqual(q.queue, [])
+                    self.assertEqual(list(q.queue), [])
                 else:
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
@@ -174,7 +178,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 sched = _make_scheduler()
                 q = _prefill_queue(sched)
                 _admit_prefill(q, req)
-                self.assertEqual(q.queue, [req])
+                self.assertEqual(list(q.queue), [req])
                 sched.retire_unadmitted_request.assert_not_called()
                 self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
@@ -212,7 +216,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     sched.retire_unadmitted_request.assert_not_called()
                     self.assertIsInstance(req.to_finish, FINISH_ABORT)
                     if flag == "is_retracted":
-                        self.assertEqual(q.retracted_queue, [req])
+                        self.assertEqual(list(q.retracted_queue), [req])
                     else:
                         q._create_receiver_and_enqueue.assert_called_once()
                         receiver = (
@@ -245,7 +249,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 if door == "prefill":
                     q = _prefill_queue(sched)
                     _admit_prefill(q, req)
-                    self.assertEqual(q.queue, [req])
+                    self.assertEqual(list(q.queue), [req])
                 else:
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
@@ -262,7 +266,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 if door == "prefill":
                     q = _prefill_queue(sched)
                     _admit_prefill(q, req)
-                    self.assertEqual(q.queue, [req])
+                    self.assertEqual(list(q.queue), [req])
                 else:
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
@@ -311,7 +315,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
 
         # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
         # before the door, and only this call clears it again.
-        sched._release_aborted_request.assert_called_once_with(req)
+        sched.release_aborted_request.assert_called_once_with(req)
         session.abort_req.assert_called_once()
         self.assertIsNone(req.session)
         sched.beam_coordinator.retire_group.assert_called_once_with(req)
