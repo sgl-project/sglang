@@ -19,12 +19,14 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from unittest.mock import patch
 
 import aiohttp
 import msgspec
@@ -2990,3 +2992,48 @@ def _repo_relative_path(filepath: str) -> str:
 
     except Exception:
         return Path(filepath).name
+
+
+@contextmanager
+def mock_parallel_groups(**values):
+    """Bind small test process groups to production parallel-group getters."""
+    from sglang.srt.runtime_context import get_parallel
+
+    defaults = dict(
+        attn_cp_size=1,
+        attn_cp_rank=0,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        moe_tp_size=1,
+        attn_dp_size=1,
+    )
+    defaults.update(values)
+    defaults.setdefault(
+        "tp_size",
+        defaults["attn_cp_size"] * defaults["attn_tp_size"] * defaults["attn_dp_size"],
+    )
+    defaults.setdefault("moe_dp_size", 1)
+    defaults.setdefault("moe_ep_size", defaults["tp_size"] // defaults["moe_tp_size"])
+    parallel = SimpleNamespace(**defaults)
+    cp_fields = vars(parallel.attn_cp_group).copy()
+    cp_fields.update(
+        world_size=parallel.attn_cp_size, rank_in_group=parallel.attn_cp_rank
+    )
+    with ExitStack() as stack:
+        stack.enter_context(
+            get_parallel().override(
+                **{
+                    key: value
+                    for key, value in defaults.items()
+                    if key.endswith(("_size", "_rank"))
+                }
+            )
+        )
+        for getter, value in (
+            ("get_attn_cp_group", SimpleNamespace(**cp_fields)),
+            ("get_moe_tensor_parallel_world_size", parallel.moe_tp_size),
+        ):
+            stack.enter_context(
+                patch("sglang.srt.distributed." + getter, return_value=value)
+            )
+        yield parallel

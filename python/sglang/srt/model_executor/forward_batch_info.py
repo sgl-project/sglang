@@ -71,10 +71,12 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
+    from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -434,6 +436,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+    prefill_cp_metadata: Optional[ShardedContextParallelMetadata] = None
 
     # This iteration's KV ids, translated once per sub-pool (`IterationIds`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
@@ -461,6 +464,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
     mamba_track_seqlens_cpu: Optional[List[int]] = None
+    mamba_track_checkpoints: Optional[
+        Tuple[Tuple[Tuple[int, torch.Tensor], ...], ...]
+    ] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -889,6 +895,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
     @classmethod
+    @profile_method("sglang.batch.prepare_forward_inputs")
     def init_new(
         cls,
         batch: ScheduleBatch,
@@ -1009,6 +1016,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if batch.mamba_track_seqlens_cpu is not None
                 else None
             ),
+            mamba_track_checkpoints=batch.mamba_track_checkpoints,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
