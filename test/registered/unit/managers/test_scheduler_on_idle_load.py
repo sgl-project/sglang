@@ -104,6 +104,8 @@ class OnIdleIdlePublishTestCase(CustomTestCase):
         s.enable_hicache_storage = False
         s.disaggregation_mode = DisaggregationMode.NULL
         s.batch_result_processor = MagicMock()
+        s.running_reqs = MagicMock()
+        s.prefill_launched_reqs = MagicMock()
         s._record_step_counters = MagicMock()
         s._maybe_clear_mm_inputs = MagicMock()
         s.tree_cache = MagicMock()
