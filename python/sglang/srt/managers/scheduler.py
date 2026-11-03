@@ -2582,6 +2582,7 @@ class Scheduler(
             decode_graph_io=lambda: resolve_uocr_decode_graph_io(
                 runner.decode_cuda_graph_runner
             ),
+            abort_windows=self._abort_uocr_doc_windows,
         )
         self.resolve_forward_inputs = self.uocr_runtime.resolve_forward_inputs
 
@@ -5698,6 +5699,7 @@ class Scheduler(
                 ListKind.PD_HELD,
                 # Counted by uocr blocks_flush below.
                 ListKind.UOCR_PARKED,
+                ListKind.UOCR_RELEASED,
                 # Finished, and held only on the output rank; all ranks must agree.
                 ListKind.DEFERRED,
             }
@@ -5989,12 +5991,10 @@ class Scheduler(
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
             *([self.chunked_req] if self.chunked_req is not None else []),
-            *self.deferred_responses.held_reqs(),
+            *self.deferred_responses.held,
         }
         if self.hisparse_coordinator is not None:
-            live_reqs.update(
-                act.req for act in self.hisparse_coordinator.ack_staging_queue
-            )
+            live_reqs.update(self.hisparse_coordinator.ack_staging_queue)
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
@@ -6019,7 +6019,6 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
-        self.deferred_responses.abort(recv_req)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -6034,15 +6033,6 @@ class Scheduler(
         for i, req in enumerate(self.waiting_queue):
             if recv_req.matches(req.rid):
                 to_del.append(i)
-
-        if self.uocr_runtime is not None:
-            # Parked document windows are off the waiting queue; abort them alike.
-            self._abort_uocr_doc_windows(
-                self.uocr_runtime.drop_parked(
-                    "" if recv_req.abort_all else recv_req.rid
-                ),
-                finished_reason=recv_req.finished_reason,
-            )
 
         # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):
@@ -6081,29 +6071,6 @@ class Scheduler(
         for request_list in self.request_lists().values():
             if isinstance(request_list, RequestList):
                 request_list.abort(recv_req)
-
-        # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.matches(decode_req.req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.matches(decode_req.req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    if decode_req.host_staged:
-                        # Keep the host destination alive until prefill stops writing.
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-                        continue
-                    # The receiver arms drain-ack accounting before sending the
-                    # ABORT (see CommonKVReceiver._send_abort_notification), so
-                    # an ack racing back is never dropped.
-                    decode_req.kv_receiver.abort()
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

@@ -78,11 +78,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             waiting_queue=list(waiting),
             chunked_req=chunked,
             hisparse_coordinator=(
-                SimpleNamespace(
-                    ack_staging_queue=[SimpleNamespace(req=req) for req in staging]
-                )
-                if staging
-                else None
+                SimpleNamespace(ack_staging_queue=list(staging)) if staging else None
             ),
         )
 

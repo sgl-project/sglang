@@ -1449,7 +1449,7 @@ class SchedulerMetricsReporter:
             self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
         )
         host_reqs = (
-            [req for req in transfer_queue if req.host_staged]
+            [d.req for d in transfer_queue.items() if d.host_staged]
             if get_disagg().disaggregation_decode_host_receive_threshold < 1
             else []
         )
