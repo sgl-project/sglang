@@ -114,14 +114,21 @@ def block_key(page_key: str, namespace: str, pool: str) -> bytes:
 
 
 class StorageKeyAdapter:
-    def encode(self, framework_key: object) -> bytes:
+    def encode_to_framework(self, key: bytes) -> bytes:
+        return key
+
+    def decode_from_framework(self, framework_key: object) -> bytes:
         if not isinstance(framework_key, bytes):
             raise TypeError("KVCR storage keys must be bytes")
         return framework_key
 
-    def decode(self, key: bytes) -> int:
+    def encode_to_router(self, key: bytes) -> int:
         # Inverts SGLang's hash_str_to_int64, as the unsigned router hash.
         return int(key[:16], 16)
+
+    def decode_from_router(self, router_key: int | bytes) -> bytes:
+        # A router hash names a page across namespaces and pools: no single key.
+        raise NotImplementedError("no single KVCR key per router hash")
 
 
 def resume_boundaries(page_exists: list[bool], *, trailing: int | None) -> list[int]:
