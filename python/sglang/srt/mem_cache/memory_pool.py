@@ -46,6 +46,13 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_dcp_sharded_triton,
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
+    set_mla_kv_scale_buffer_triton,
+)
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -76,14 +83,7 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
-from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
-    maybe_init_custom_mem_pool,
-    set_mla_kv_buffer_dcp_sharded_triton,
-    set_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton_fp8_quant,
-    set_mla_kv_scale_buffer_triton,
-)
+from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
@@ -4291,6 +4291,10 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        # Pools owned beside full_kv_pool, which describes the full KV itself.
+        return ()
+
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
@@ -5682,6 +5686,32 @@ class MHATokenToKOnlyPool(KVCache):
     """K-only pool for MiniMax sparse layers whose index branch never reads V
     (``sparse_disable_index_value``); allocating V would waste memory."""
 
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            IndexKeyBufferInfo,
+            IndexKeyLayout,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=IndexKeyBufferInfo(
+                    page_size=self.page_size,
+                    compress_ratio=1,
+                    key_layout=IndexKeyLayout.KEY_ROWS,
+                    # NPU stores these rows with an explicit physical page axis.
+                    buffers=tuple(
+                        buffer.view(-1, self.head_num, self.head_dim)
+                        for buffer in self.k_buffer
+                    ),
+                ),
+            ),
+        )
+
     def __init__(
         self,
         size: int,
@@ -5704,6 +5734,9 @@ class MHATokenToKOnlyPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.head_num = head_num
         self.head_dim = head_dim
@@ -5963,6 +5996,7 @@ class MiniMaxSparseKVPool(KVCache):
         if self.index_kv_pool is not None:
             self.mem_usage += self.index_kv_pool.mem_usage
         if self.index_k_pool is not None:
+            self.index_k_pool.model_layer_ids = tuple(local_k_only_sparse_layer_ids)
             self.mem_usage += self.index_k_pool.mem_usage
 
         # HiCacheController reads these from the top-level KV pool wrapper.
