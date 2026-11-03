@@ -121,6 +121,12 @@ def _input(batch):
     )
 
 
+def _sending(reqs=()):
+    sending = _RequestList(ListKind.PD_SENDING)
+    sending.join(reqs)
+    return sending
+
+
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
@@ -229,7 +235,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self._record_step_counters = Mock()
         self._maybe_clear_mm_inputs = Mock()
         self.maybe_send_health_check_signal = Mock()
-        self.disagg_prefill_transfer_queue = []
+        self.disagg_prefill_transfer_queue = _sending()
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
@@ -320,6 +326,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         assert len(self.result_queue) < 2, "Overwrote a live forward's keep-alive slot"
         self.actions.append((self.iteration, "launch", batch.forward_iter))
         batch.add_inflight_step()
+        self.prefill_launched_reqs.join(
+            req for req in batch.reqs if req is not batch.chunked_req
+        )
         result = self.results[batch.forward_iter]
         if result.delay_sample_func is not None:
 
@@ -472,7 +481,7 @@ def _rank_consensus_worker(rank, rendezvous):
             )
             scheduler.polls = 0
             scheduler.tp_cpu_group = dist.group.WORLD
-            scheduler.disagg_prefill_transfer_queue = ["transferring"]
+            scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
             with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(True):
                 _run_loop(
                     scheduler,
@@ -713,7 +722,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 scheduler = TransferScheduler(
                     [_batch(1)] + [None] * 3, {1: _result()}, {1: 4}
                 )
-                scheduler.disagg_prefill_transfer_queue = list(inflight)
+                scheduler.disagg_prefill_transfer_queue = _sending(inflight)
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     poll_transfers
                 ):
@@ -763,7 +772,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     pause_mode=event if pause else "in_place",
                 )
                 scheduler.shutdown_at = None if pause else 2
-                scheduler.disagg_prefill_transfer_queue = ["transferring"]
+                scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     True
                 ):
@@ -829,7 +838,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     {1: _result(_Event(ready_after_queries=3))},
                     {1: 4},
                 )
-                scheduler.disagg_prefill_transfer_queue = ["transferring"]
+                scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
                 topology = {}
                 if mode == "independent_dp":
                     topology = {"dp_size": 2}
@@ -943,7 +952,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     ),
                     clear=Mock(),
                 )
-                scheduler.disagg_prefill_transfer_queue = [prior]
+                scheduler.disagg_prefill_transfer_queue = _sending([prior])
                 first.reqs[0].metadata_buffer_index = allocator.alloc()
                 for req in (first.reqs[0], second.reqs[0]):
                     req.pending_bootstrap = False
@@ -1042,7 +1051,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     {1: ready_at, 2: ready_at + 1},
                 )
                 scheduler.war_barrier_is_coarse = coarse
-                scheduler.disagg_prefill_transfer_queue = ["transferring"]
+                scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     polling == "transfers"
                 ):
@@ -1122,7 +1131,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 self.assertEqual(checkpoint_ends, [4, 8, 12])
                 self.assertEqual(req.inflight_steps, 0)
                 self.assertEqual(list(req.output_ids), [11])
-                self.assertEqual(scheduler.disagg_prefill_transfer_queue, [req])
+                self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [req])
                 self.assertEqual(scheduler.result_processes, {4: 1, 8: 1, 12: 1})
                 for end, event in scheduler.copy_events.items():
                     self.assertEqual(event.synchronizations, 1)

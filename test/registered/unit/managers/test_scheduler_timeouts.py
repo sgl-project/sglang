@@ -27,13 +27,11 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.deferred_responses import (
-    DeferredResponses,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.test.scheduler_request_lists import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -77,11 +75,7 @@ def _batch(reqs):
 
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
-    s.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
-    )
+    empty_request_lists(s)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
     s.waiting_queue = waiting_queue

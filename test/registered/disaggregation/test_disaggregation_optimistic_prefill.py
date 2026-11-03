@@ -486,7 +486,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req
+                scheduler, req, scheduler.prefill_launched_reqs
             )
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))

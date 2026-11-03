@@ -17,6 +17,10 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -371,7 +375,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             transfer_queue=SimpleNamespace(queue=[], enable_staging=False),
             queue=[],
             pending_reqs=[],
-            retracted_queue=[],
+            retracted_queue=_RequestList(ListKind.PD_RETRACTED),
             _prefill_dp_rank_queries={},
             _num_published_destinations=0,
             num_reserved_decode_tokens=0,
@@ -769,7 +773,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     (resumed.kv.req_pool_idx, slice(0, self.num_tokens)), reused
                 )
 
-            queue.retracted_queue = [req]
+            queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+            queue.retracted_queue.join([req])
             with (
                 patch.object(queue, "_uses_swa_reservation", return_value=False),
                 patch.object(queue, "_allocatable_token_budgets", return_value=1 << 20),

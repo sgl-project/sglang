@@ -301,6 +301,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 )
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    RequestList,
     _RequestList,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
@@ -1573,7 +1574,9 @@ class Scheduler(
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_transfer_queue = None
+        self.disagg_prefill_transfer_queue = _RequestList(
+            ListKind.PD_SENDING, abort=self.abort_disagg_prefill_transfer_reqs
+        )
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1702,7 +1705,6 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            self.disagg_prefill_transfer_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the transfer queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
@@ -4693,8 +4695,7 @@ class Scheduler(
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
-        if self.disagg_prefill_transfer_queue is not None:
-            lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
+        lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
             # Its staging queue is the part of this queue the current round runs.
             lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
@@ -6077,46 +6078,12 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-        if self.dllm_config is not None:
-            for req in self.dllm_manager.pop_aborted_reqs(
-                recv_req.abort_all, recv_req.rid
-            ):
-                # Finished in place, so a later abort in the same intake skips it.
-                if req.finished_reason is None:
-                    req.finish_outside_step(FINISH_ABORT())
-                self._release_aborted_request(req)
-                self.send_abort_output(make_abort_req(req), req)
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
-                logger.debug(f"Abort dLLM queued request. {req.rid=}")
-
-        # Delete the requests in the grammar queue
-        # Abort method 2: call `set_finish_with_abort`
-        # The request will still run one prefill forward pass.
-        # In this case, we change the input_ids to be only one token to make this prefill cheap.
-        self.grammar_manager.abort_requests(recv_req)
+        for request_list in self.request_lists().values():
+            if isinstance(request_list, RequestList):
+                request_list.abort(recv_req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # Abort requests that have not yet been bootstrapped
-            for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    self._release_aborted_request(req)
-
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
-
-            # Abort in-flight requests
-            for req in self.disagg_prefill_transfer_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
@@ -6137,22 +6104,6 @@ class Scheduler(
                     # ABORT (see CommonKVReceiver._send_abort_notification), so
                     # an ack racing back is never dropped.
                     decode_req.kv_receiver.abort()
-
-            # Retracted requests hold a KV backup; held ones hold no KV.
-            retracted, held = self.disagg_decode_prealloc_queue.take_aborted(recv_req)
-            for req in retracted:
-                discard_kv_cache_backup(
-                    req,
-                    self.tree_cache,
-                    get_disagg().disaggregation_decode_retraction_backup,
-                )
-                self.send_abort_output(make_abort_req(req), req)
-            for req in held:
-                req.finish_outside_step(FINISH_ABORT())
-                self._release_aborted_request(req)
-                self.send_abort_output(
-                    make_abort_req(req, finished_reason=recv_req.finished_reason), req
-                )
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

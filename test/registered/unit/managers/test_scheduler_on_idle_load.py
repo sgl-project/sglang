@@ -127,7 +127,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.running_reqs = []
         scheduler.dllm_config = None
         scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue = None
+        scheduler.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.hisparse_coordinator = None

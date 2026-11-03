@@ -25,9 +25,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.deferred_responses import (
-    DeferredResponses,
-)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -38,6 +35,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.scheduler_request_lists import empty_request_lists
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -94,34 +92,14 @@ def _invariant_checker(s):
     )
 
 
-def _empty_request_lists(s):
-    s.waiting_queue = []
-    s.grammar_manager = SimpleNamespace(grammar_queue=[])
-    s.chunked_req = None
-    s.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
-    s.disagg_prefill_transfer_queue = None
-    s.disagg_prefill_bootstrap_queue = None
-    s.disagg_decode_prealloc_queue = None
-    s.disagg_decode_transfer_queue = None
-    s.dllm_manager = SimpleNamespace(waiting_queue=[])
-    s.hisparse_coordinator = None
-    s.uocr_runtime = None
-    s.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
-    )
-
-
 def _scheduler():
     s = _Scheduler.__new__(_Scheduler)
+    empty_request_lists(s)
+    s.dllm_manager = SimpleNamespace(waiting_queue=[])
     s.running_batch = ScheduleBatch(reqs=[])
-    s.running_reqs = _RequestList(ListKind.DECODING)
     s.invariant_checker = _invariant_checker(s)
     s.disaggregation_mode = DisaggregationMode.NULL
-    s.dllm_config = None
     s.enable_hisparse = False
-    _empty_request_lists(s)
     # run_batch up to the forward
     s.scheduler_stage_metrics = None
     s.metrics_reporter = MagicMock()
@@ -320,14 +298,12 @@ class TestRunningReqsHooks(CustomTestCase):
         running.spec_algorithm = SpeculativeAlgorithm.NGRAM
         running.has_grammar = True
         s = Scheduler.__new__(Scheduler)
+        empty_request_lists(s)
         s.running_batch = running
         s.last_batch = None
-        s.running_reqs = _RequestList(ListKind.DECODING)
         s.running_reqs.join(running.reqs)
         s.disaggregation_mode = DisaggregationMode.NULL
-        s.dllm_config = None
         s.enable_hisparse = False
-        _empty_request_lists(s)
         s.invariant_checker = _invariant_checker(s)
         s._confidence_budget_prepare = None
         # Event loop
