@@ -2865,7 +2865,9 @@ def _make_guarded_metrics_app(
     def clear_scrape_task(done_task: asyncio.Task):
         nonlocal scrape_task
         try:
-            done_task.exception()
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error("Failed to generate Prometheus metrics", exc_info=exc)
         except asyncio.CancelledError:
             pass
         if scrape_task is done_task:
@@ -2914,7 +2916,6 @@ def _make_guarded_metrics_app(
             await response(scope, receive, send)
             return
         except Exception:
-            logger.exception("Failed to generate Prometheus metrics")
             response = PlainTextResponse(
                 "failed to generate metrics\n", status_code=500
             )

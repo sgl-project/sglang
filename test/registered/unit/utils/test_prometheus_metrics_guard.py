@@ -1,11 +1,13 @@
 import asyncio
 import gzip
+import logging
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from prometheus_client import CollectorRegistry, Counter, make_asgi_app
 
+import sglang.srt.utils.common as common_module
 from sglang.srt.utils.common import _make_guarded_metrics_app, add_prometheus_middleware
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -214,5 +216,39 @@ def test_metrics_guard_times_out_slow_scrape():
 
         assert _status(messages) == 504
         assert _body(messages) == b"metrics scrape timed out\n"
+
+    asyncio.run(run())
+
+
+def test_metrics_guard_logs_background_failure_after_timeout(caplog):
+    async def run():
+        started = threading.Event()
+        finish = threading.Event()
+        failed = threading.Event()
+
+        async def metrics_app(scope, receive, send):
+            started.set()
+            await asyncio.to_thread(finish.wait, 1)
+            failed.set()
+            raise RuntimeError("registry read failed")
+
+        app = _make_guarded_metrics_app(metrics_app, scrape_timeout_s=0.01)
+        caplog.set_level(logging.ERROR, logger=common_module.logger.name)
+        messages = await _call_asgi(app)
+        assert _status(messages) == 504
+        assert started.is_set()
+        finish.set()
+        assert await asyncio.to_thread(failed.wait, 1)
+
+        deadline = asyncio.get_running_loop().time() + 1
+        while not caplog.records and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+
+        assert any(
+            record.message == "Failed to generate Prometheus metrics"
+            and record.exc_info is not None
+            and record.exc_info[0] is RuntimeError
+            for record in caplog.records
+        )
 
     asyncio.run(run())
