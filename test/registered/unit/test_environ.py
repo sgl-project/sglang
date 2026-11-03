@@ -7,6 +7,7 @@ import sys
 import unittest
 import warnings
 from contextlib import ExitStack
+from unittest.mock import patch
 
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,17 +33,29 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH",
     "SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH",
     "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH",
-    "SGLANG_Q35MF_BK_VEC_COPY",
-    "SGLANG_Q35MF_MKH_N3B",
-    "SGLANG_Q35MF_MKH_N3C",
-    "SGLANG_Q35MF_EDGE_CHAIN_TREE",
-    "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
-    "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
-    "SGLANG_Q35MF_EDGE_SHM_SYNC",
-    "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
-    "SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
+    "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
+    "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
+    "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
+    "SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY",
+    "SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING",
+    "SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST",
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC",
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST",
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
+
+RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
+    "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED": "SGLANG_Q35MF_BK_VEC_COPY",
+    "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS": "SGLANG_Q35MF_MKH_N3B",
+    "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD": "SGLANG_Q35MF_MKH_N3C",
+    "SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY": "SGLANG_Q35MF_EDGE_CHAIN_TREE",
+    "SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING": "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
+    "SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST": "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC": "SGLANG_Q35MF_EDGE_SHM_SYNC",
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST": "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP": "SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
+}
 
 
 class TestEnvField(unittest.TestCase):
@@ -177,6 +190,38 @@ class TestEnvField(unittest.TestCase):
                     child = self.env_fields[name]
                     with child.override(None):
                         self.assertIsNone(child.get())
+
+
+class TestRenamedEnvAliases(unittest.TestCase):
+    def _read(self, new, env):
+        field = vars(type(envs))[new]
+        with (
+            patch.dict(os.environ, env),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            if new not in env:
+                os.environ.pop(new, None)
+            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
+                value = field.get()
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        return field, value, deprecations
+
+    def test_former_name_applies_with_a_deprecation_warning(self):
+        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
+            with self.subTest(new=new):
+                field, value, deprecations = self._read(new, {old: "1"})
+                self.assertEqual(field.deprecated_name, old)
+                self.assertIs(value, True)
+                self.assertEqual(len(deprecations), 1)
+                self.assertIn(new, str(deprecations[0].message))
+
+    def test_new_name_wins_over_former_name(self):
+        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
+            with self.subTest(new=new):
+                _, value, deprecations = self._read(new, {old: "1", new: "0"})
+                self.assertIs(value, False)
+                self.assertEqual(deprecations, [])
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):

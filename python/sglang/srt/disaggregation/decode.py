@@ -55,8 +55,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -158,6 +158,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -500,9 +501,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
-        # NOTE: requests held here are not reachable by ``/abort_request``; to
-        # support aborting them we would need an additional fix in the
-        # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
@@ -1056,6 +1054,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
+
+    def take_aborted(self, recv_req: AbortReq) -> Tuple[List[Req], List[Req]]:
+        def aborted(req: Req) -> bool:
+            return recv_req.abort_all or req.rid.startswith(recv_req.rid)
+
+        retracted = [req for req in self.retracted_queue if aborted(req)]
+        held = [req for req in self.held_rebootstrap_reqs if aborted(req)]
+        self.retracted_queue = [req for req in self.retracted_queue if not aborted(req)]
+        self.held_rebootstrap_reqs = [
+            req for req in self.held_rebootstrap_reqs if not aborted(req)
+        ]
+        return retracted, held
+
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_prealloc": [decode_req.req for decode_req in self.queue],
+            "decode_retracted": self.retracted_queue,
+            "decode_held": self.held_rebootstrap_reqs,
+        }
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
@@ -2834,6 +2851,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_transfer": [decode_req.req for decode_req in self.queue],
+            # Aborted, with KV held until the transfer drains.
+            "decode_releasing": [
+                decode_req.req for decode_req, *_ in self._deferred_releases
+            ],
+        }
+
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
@@ -3523,6 +3549,13 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            # overlap + spec + grammar is unsupported (would desync DP ranks).
+            process_last_batch_early = self.should_process_last_batch_early(
+                self.last_batch
+            )
+            if process_last_batch_early:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
@@ -3533,13 +3566,6 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
-            # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
-            )
-
-            if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -3552,7 +3578,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not process_last_batch_early:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
@@ -3596,7 +3622,6 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
-        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch=None)
 
         # Schedule decode batch
         if running_batch.is_empty():
