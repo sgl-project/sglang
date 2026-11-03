@@ -3,7 +3,11 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.layers.cp.utils import (
+    get_layer_owner,
+    get_layer_shard_range,
+    validate_layer_shard_chunk,
+)
 from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,6 +32,36 @@ class TestDSALayerShardUtils(CustomTestCase):
     def test_empty_tail_shards_have_empty_ranges(self):
         ranges = [get_layer_shard_range(rank, 4, 2) for rank in range(4)]
         self.assertEqual(ranges, [(0, 1), (1, 2), (2, 2), (2, 2)])
+
+    def test_chunked_ranges_start_on_the_grid(self):
+        # 78 layers over CP8: the even split starts a rank at layer 69, off any
+        # 10-layer L3 grid; whole chunks keep each rank at 10 layers, last short.
+        ranges = [get_layer_shard_range(rank, 8, 78, 10) for rank in range(8)]
+        self.assertEqual(
+            ranges,
+            [
+                (0, 10),
+                (10, 20),
+                (20, 30),
+                (30, 40),
+                (40, 50),
+                (50, 60),
+                (60, 70),
+                (70, 78),
+            ],
+        )
+        self.assertEqual(
+            [get_layer_owner(i, 8, 78, 10) for i in range(78)],
+            [i // 10 for i in range(78)],
+        )
+
+    def test_chunk_that_grows_a_rank_is_refused(self):
+        # Pools size every rank for ceil(78 / 8) = 10 layers; 3-layer chunks give
+        # rank 0 four chunks (12 layers), 5- and 10-layer chunks stay within 10.
+        with self.assertRaisesRegex(ValueError, "more than the 10 layers"):
+            validate_layer_shard_chunk(8, 78, 3)
+        for chunk in (1, 5, 10):
+            validate_layer_shard_chunk(8, 78, chunk)
 
     def test_prefetch_uses_sync_fallback_without_dedicated_communicator(self):
         broadcasts = []

@@ -13,7 +13,9 @@ from sglang.srt.arg_groups.hicache_hook import (
 )
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import get_layer_shard_range
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
 from sglang.srt.mem_cache.hicache_key_scheme import derive_namespace, namespace_digest
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -473,6 +475,163 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     controller.storage_host_pool.layer_num += 1
                 with self.assertRaises(NotImplementedError):
                     self._suffixes(controller)
+
+
+class TestLayerSplitUnifiedKeys(CustomTestCase):
+    """LayerSplit CP ranks own disjoint absolute layer ranges, keyed like PP stages."""
+
+    def _layer_split_controller(self, *, rank, shard_size, layer_num, chunk):
+        device_pool = object.__new__(LayerSplitDSATokenToKVPool)
+        device_pool.dtype = torch.float8_e4m3fn
+        device_pool.start_layer = 0
+        device_pool.end_layer = layer_num
+        device_pool.layer_num = layer_num
+        device_pool.layer_shard_size = shard_size
+        device_pool.layer_shard_chunk = chunk
+        start, end = get_layer_shard_range(rank, shard_size, layer_num, chunk)
+        device_pool.layer_shard_start = start
+        device_pool.layer_shard_end = end
+        capacity = -(-layer_num // shard_size)
+        return self._controller(device_pool, host_layer_num=capacity)
+
+    def _dp_controller(self, *, layer_num):
+        device_pool = object.__new__(MLATokenToKVPool)
+        device_pool.dtype = torch.float8_e4m3fn
+        return self._controller(device_pool, host_layer_num=layer_num)
+
+    def _controller(self, device_pool, *, host_layer_num):
+        host_pool = SimpleNamespace(
+            dtype=torch.uint8,
+            head_num=0,
+            head_group_num=1,
+            start_layer=0,
+            end_layer=device_pool.end_layer
+            if isinstance(device_pool, LayerSplitDSATokenToKVPool)
+            else host_layer_num,
+            layer_num=host_layer_num,
+            target_layer_num=host_layer_num,
+            page_unified_layout=object(),
+        )
+        controller = object.__new__(HiCacheController)
+        controller.page_size = 64
+        controller.storage_host_pool = host_pool
+        controller.mem_pool_host = host_pool
+        controller.mem_pool_device = device_pool
+        return controller
+
+    def _suffixes(self, controller, *, layer_partition):
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=None,
+            hicache_storage_layer_partition=layer_partition,
+        )
+        parallel = SimpleNamespace(attn_tp_rank=0, attn_tp_size=1, pp_rank=0, pp_size=1)
+        with (
+            patch(
+                "sglang.srt.managers.cache_controller.get_memory", return_value=memory
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            return controller._build_unified_plan("org/model", attn_cp_size=8).suffixes
+
+    def test_layer_split_ranks_tile_the_dp_reader_grid(self):
+        # Cross-topology reuse needs the CP8 ranks' chunks, together, to be
+        # exactly the chunks a DP reader on the same grid asks for.
+        layer_split = [
+            self._suffixes(
+                self._layer_split_controller(
+                    rank=rank, shard_size=8, layer_num=80, chunk=10
+                ),
+                layer_partition=10,
+            )
+            for rank in range(8)
+        ]
+        self.assertTrue(all(len(chunks) == 1 for chunks in layer_split))
+        self.assertEqual(
+            [chunk for chunks in layer_split for chunk in chunks],
+            self._suffixes(self._dp_controller(layer_num=80), layer_partition=10),
+        )
+
+    def test_padded_layer_split_is_refused_on_every_rank(self):
+        # 78 layers over CP8 leave the last rank 8 layers in a 10-layer host
+        # block. Refusing on only that rank would split the attach decision.
+        for rank in range(8):
+            with self.subTest(rank=rank), self.assertRaises(NotImplementedError):
+                self._suffixes(
+                    self._layer_split_controller(
+                        rank=rank, shard_size=8, layer_num=78, chunk=10
+                    ),
+                    layer_partition=10,
+                )
+
+    def test_every_layer_split_cp_rank_writes(self):
+        # Electing one CP writer, as for full-page CP, would drop 7/8 of the
+        # layers; attention-TP still replicates the MLA latent. Without DP
+        # attention tp_rank spans the whole CP x attention-TP grid, so the
+        # controller has to hand over the attention-TP rank.
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=None,
+            hicache_storage_layer_partition=4,
+        )
+        for attn_tp_rank, expected_writer in ((0, True), (1, False)):
+            for cp_rank in range(2):
+                with self.subTest(cp_rank=cp_rank, attn_tp_rank=attn_tp_rank):
+                    controller = self._layer_split_controller(
+                        rank=cp_rank, shard_size=2, layer_num=8, chunk=4
+                    )
+                    host_pool = controller.storage_host_pool
+                    host_pool.layout = "page_unified"
+                    host_pool.storage_format_tag = None
+                    host_pool.page_unified_layout = PageUnifiedLayout(
+                        page_size=64,
+                        layer_num=4,
+                        head_num=1,
+                        head_group_num=1,
+                        head_dim=16,
+                        itemsize=1,
+                        is_mla=True,
+                    )
+                    controller.enable_storage_metrics = False
+                    parallel = SimpleNamespace(
+                        tp_rank=cp_rank * 2 + attn_tp_rank,
+                        tp_size=4,
+                        attn_tp_rank=attn_tp_rank,
+                        attn_tp_size=2,
+                        attn_dcp_size=1,
+                        attn_dcp_rank=0,
+                        pp_rank=0,
+                        pp_size=1,
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.managers.cache_controller.get_memory",
+                            return_value=memory,
+                        ),
+                        patch(
+                            "sglang.srt.managers.cache_controller.get_parallel",
+                            return_value=parallel,
+                        ),
+                        patch(
+                            "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                            return_value=False,
+                        ),
+                        patch.object(
+                            controller,
+                            "get_attn_cp_rank_and_size",
+                            return_value=(cp_rank, 2),
+                        ),
+                    ):
+                        controller.storage_config = controller._generate_storage_config(
+                            "org/model"
+                        )
+                    self.assertEqual(
+                        controller.storage_config.is_storage_writer, expected_writer
+                    )
+                    self.assertEqual(controller.backup_skip, not expected_writer)
 
 
 class TestFileBackendUnifiedKeys(CustomTestCase):
