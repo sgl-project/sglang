@@ -291,7 +291,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_multi_layer_eagle",
     "speculative_adaptive",
     "speculative_adaptive_config",
-    "speculative_adaptive_memory_budget_gb",
     "decoupled_spec_bind_endpoint",
     "decoupled_spec_connect_endpoints",
     "decoupled_spec_rank",
@@ -560,5 +559,6 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "speculative_adaptive_memory_budget_gb",
 )
 # fmt: on
