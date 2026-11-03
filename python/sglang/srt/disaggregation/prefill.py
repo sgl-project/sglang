@@ -1020,7 +1020,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.inflight_middle_chunks <= 0:
+            if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
 
                 # Its KV never landed: abort instead of sending it to decode.
@@ -1128,16 +1128,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             else:
                 # being chunked reqs' prefill is not finished
-                req.inflight_middle_chunks -= 1
-
-                # Still chunking iff its next chunk was launched: either it is
-                # still self.chunked_req, or its final chunk (extend_end
-                # reaching the end of the input) is in flight. A yielded req
-                # is neither, so do its deferred release here.
-                still_chunking = self.chunked_req is req or (
-                    req.extend_end is not None
-                    and req.extend_end >= len(req.origin_input_ids)
-                )
+                # Still chunking while it holds the chunked slot or has another
+                # step in flight; otherwise it yielded, and this was its last step.
+                still_chunking = self.chunked_req is req or req.inflight_steps > 1
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
                 if is_aborted(req):
@@ -1498,11 +1491,10 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
-                    # Retract may drain every result, leaving no handler to requeue.
-                    if not self.enable_overlap or req.inflight_middle_chunks == 0:
+                    if req.inflight_steps == 0:
                         self.optimistic_release_and_requeue(req)
                     else:
-                        # Requeued once its chunks in flight are processed.
+                        # Requeued once its last step in flight is processed.
                         self.prefill_launched_reqs.join([req])
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
