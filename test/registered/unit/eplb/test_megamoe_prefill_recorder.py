@@ -14,7 +14,7 @@ from sglang.srt.eplb.expert_distribution import (
     should_advance_eplb_counter,
     should_record_forward_pass,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_resources, override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -9,14 +9,15 @@ from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.utils import GenerationBatchResult
 
 
 class SchedulerDllmMixin:
@@ -329,7 +330,6 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
-            self.dllm_manager.increment_inflight_middle_chunks()
 
     def _create_dllm_batch(
         self: Scheduler,
@@ -471,11 +471,6 @@ class DllmManager:
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
-
-    def increment_inflight_middle_chunks(self) -> None:
-        """Increment chunked count for all staging requests."""
-        for req in self.staging_queue:
-            req.inflight_middle_chunks += 1
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""

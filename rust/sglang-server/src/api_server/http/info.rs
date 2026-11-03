@@ -112,7 +112,8 @@ async fn model_info(State(state): State<Arc<AppState>>) -> Response {
 /// `launch_command`, scheduler init info, `kv_events`), as Python reports
 /// them, beneath the runtime's startup timings, typed allowlisted scheduler
 /// metrics and launch metadata. The raw scheduler state is never visible to
-/// this HTTP adapter.
+/// this HTTP adapter. Under DP, the listener of DP rank 0 adds every rank's
+/// listener as `dp_listeners` (see `CoreHandle::server_info`).
 async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let info = match await_server_info(&state).await {
         Ok(info) => info,
@@ -390,7 +391,12 @@ struct AbortRequestBody {
 /// matching every request, as `TokenizerManager.abort_request` does. Each
 /// aborted request ends as Python ends it, on the scheduler's terminal output
 /// with the abort as its finish reason and the partial generation, rather than
-/// on the cancelled error the gRPC `Abort` reports.
+/// on the cancelled error the gRPC `Abort` reports. Under DP, the listener
+/// of DP rank 0 then relays the abort to every other rank's listener through
+/// the control relay (`CoreHandle::abort_peers`), since each one feeds only
+/// its own DP group and tracks only its own generations; a peer's failure is
+/// logged, not answered, and a relayed abort is served locally and never
+/// relayed again.
 async fn abort_request(
     State(state): State<Arc<AppState>>,
     body: Result<Json<AbortRequestBody>, JsonRejection>,
@@ -410,6 +416,10 @@ async fn abort_request(
     } else {
         state.core.abort(Some(&rid), ending);
     }
+    // Detached: the reply does not wait on peers, and a client hanging up
+    // cannot cancel the relay.
+    let core = state.core.clone();
+    tokio::spawn(async move { core.abort_peers(rid, body.abort_all).await });
     StatusCode::OK.into_response()
 }
 
@@ -424,10 +434,14 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api_server::core::CoreEvent;
+    use crate::api_server::core::fanout::ControlTarget;
+    use crate::api_server::core::{CoreEvent, peer_endpoints};
     use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
-    use crate::message::config::{DisaggregationMode, ModelConfig, ServerArgs};
+    use crate::message::config::{
+        DeploymentInfo, DisaggregationMode, ModelConfig, RustServerEndpoint, ServerArgs,
+    };
     use crate::message::ids::Rid;
+    use crate::message::io_struct::AbortReq;
     use crate::message::request::Request;
     use crate::message::request::{GenerateRequest, RequestKind};
     use crate::message::response::{
@@ -438,6 +452,19 @@ mod tests {
 
     fn test_state(
         server_args: ServerArgs,
+    ) -> (
+        Arc<AppState>,
+        flume::Receiver<TmEvent>,
+        flume::Receiver<crate::tokenizer_manager::wiring::AbortSource>,
+    ) {
+        test_state_with_peers(server_args, Vec::new())
+    }
+
+    /// A state whose core answers for the DP ranks `peer_endpoints` reach as
+    /// well as its own.
+    fn test_state_with_peers(
+        server_args: ServerArgs,
+        peer_endpoints: Vec<Arc<dyn ControlTarget>>,
     ) -> (
         Arc<AppState>,
         flume::Receiver<TmEvent>,
@@ -456,7 +483,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 multimodal: false,
-                peer_endpoints: Vec::new(),
+                peer_endpoints,
                 metadata: CoreMetadata::from(server_args.as_ref()),
                 metrics: None,
             },
@@ -549,13 +576,28 @@ mod tests {
     async fn server_info_route_serializes_only_the_typed_public_subset() {
         // Native floats stay JSON numbers; NumPy scalars encoded by Python's
         // msgspec enc_hook=str must remain JSON strings, as before the refactor.
-        assert_server_info_response(rmpv::Value::from(23.616), serde_json::json!(23.616)).await;
-        assert_server_info_response(rmpv::Value::from("23.616"), serde_json::json!("23.616")).await;
+        // Under DP, the listener of DP rank 0 adds every rank's listener as
+        // `dp_listeners`, by rank; the other listeners do not.
+        assert_server_info_response(rmpv::Value::from(23.616), serde_json::json!(23.616), None)
+            .await;
+        assert_server_info_response(
+            rmpv::Value::from("23.616"),
+            serde_json::json!("23.616"),
+            Some(0),
+        )
+        .await;
+        assert_server_info_response(
+            rmpv::Value::from("23.616"),
+            serde_json::json!("23.616"),
+            Some(1),
+        )
+        .await;
     }
 
     async fn assert_server_info_response(
         kvcache: rmpv::Value,
         expected_kvcache: serde_json::Value,
+        dp_rank: Option<u32>,
     ) {
         let launch_fields = serde_json::json!({
             "model_path": "/model",
@@ -563,7 +605,18 @@ mod tests {
             "max_total_num_tokens": 1,
             "launch_command": "launch --tp-size 4",
         });
+        // Gathered in no particular order; published by rank.
+        let listeners = ["http://10.0.0.1:30000", "http://[fd00::2]:30000"];
+        let rust_server_endpoints = match dp_rank {
+            Some(_) => vec![endpoint(1, listeners[1]), endpoint(0, listeners[0])],
+            None => Vec::new(),
+        };
         let (state, intake_rx, abort_rx) = test_state(ServerArgs {
+            deployment_info: DeploymentInfo {
+                dp_rank,
+                rust_server_endpoints,
+                ..Default::default()
+            },
             model_path: "/model".into(),
             served_model_name: "served".into(),
             tokenizer_path: "/local-tokenizer-copy".into(),
@@ -717,7 +770,21 @@ mod tests {
                 .is_none(),
             "uncontracted scheduler fields must not silently become public API"
         );
+        let expected_dp_listeners = (dp_rank == Some(0)).then(|| {
+            serde_json::json!([
+                {"dp_rank": 0, "url": listeners[0]},
+                {"dp_rank": 1, "url": listeners[1]},
+            ])
+        });
+        assert_eq!(body.get("dp_listeners"), expected_dp_listeners.as_ref());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    fn endpoint(dp_rank: u32, endpoint: &str) -> RustServerEndpoint {
+        RustServerEndpoint {
+            dp_rank,
+            endpoint: endpoint.to_owned(),
+        }
     }
 
     /// `/flush_cache` relays one `FlushCacheReqInput` carrying the query
@@ -815,6 +882,186 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(intake_rx.try_recv().is_err());
+    }
+
+    /// The listener an abort reaches cancels the named generations locally,
+    /// answers at once, and relays the abort to every other rank's listener
+    /// as the scheduler's `AbortReq`; a dead peer is only logged. A relayed
+    /// abort is served on the receiving listener alone, and a no-op abort is
+    /// neither served nor relayed.
+    #[tokio::test]
+    async fn abort_request_reaches_every_dp_listener() {
+        // A live peer that reports each abort relayed to it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let (received_tx, received_rx) = flume::unbounded::<AbortReq>();
+        let peer_app = Router::new().route(
+            FORWARD_PEER_PATH,
+            post(move |body: Bytes| {
+                let received_tx = received_tx.clone();
+                async move {
+                    let abort = AbortReq::decode(&body).unwrap().expect("an AbortReq");
+                    received_tx.send(abort).unwrap();
+                    (StatusCode::OK, rmp_serde::to_vec(&true).unwrap())
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, peer_app).await.unwrap() });
+        // A dead peer: nothing listens on its port.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+
+        let info = DeploymentInfo {
+            dp_rank: Some(0),
+            rust_server_endpoints: vec![
+                endpoint(0, "http://127.0.0.1:1"),
+                endpoint(1, &dead),
+                endpoint(2, &live),
+            ],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0).unwrap();
+        let (state, intake_rx, abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: info,
+                ..Default::default()
+            },
+            peers,
+        );
+        let core = state.core.clone();
+        let app = routes().with_state(state);
+        let post_abort = |uri: &'static str, body: Bytes| {
+            app.clone().oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let relayed = AbortReq::new("client-rid".into(), false).encode().unwrap();
+        for (uri, body, local, forwarded) in [
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"rid": "client-rid"}"#),
+                true,
+                Some(("client-rid", false)),
+            ),
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"abort_all": true}"#),
+                true,
+                Some(("", true)),
+            ),
+            (FORWARD_PEER_PATH, relayed, true, None),
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"rid": ""}"#),
+                false,
+                None,
+            ),
+        ] {
+            let case = format!("{uri} {}", String::from_utf8_lossy(&body));
+            // A live generation each abort but the no-op one names.
+            let call = core
+                .generate(GenerateRequest {
+                    rid: Rid::from_client("client-rid"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{case}: generate must submit one request");
+            };
+            assert!(admission.try_accept(), "{case}");
+            let response = post_abort(uri, body).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            assert_eq!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid),
+                local,
+                "{case}: unexpected local abort"
+            );
+            // The aborted call still awaits the scheduler's terminal output;
+            // dropping it releases the request.
+            drop(call);
+            assert!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == request.rid),
+                "{case}: dropping the call must release the request"
+            );
+            let Some((rid, abort_all)) = forwarded else {
+                continue;
+            };
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(10), received_rx.recv_async())
+                    .await
+                    .expect("the live peer never received the abort")
+                    .unwrap();
+            assert_eq!(received.abort_all(), abort_all, "{case}");
+            if abort_all {
+                assert_eq!(received.get_rid().len(), 32, "{case}: a minted rid");
+            } else {
+                assert_eq!(received.get_rid(), rid, "{case}");
+            }
+        }
+        let late = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            received_rx.recv_async(),
+        );
+        assert!(late.await.is_err(), "a relayed or no-op abort was relayed");
+        assert!(
+            intake_rx.try_recv().is_err(),
+            "an abort never reaches the scheduler as control"
+        );
+    }
+
+    /// A table that points a listener back at itself (a peer published at
+    /// this listener's own address) cannot loop: its own relayed abort is
+    /// served on the local registry and never relayed again, so one client
+    /// abort is two requests served, the client's and its own.
+    #[tokio::test]
+    async fn a_self_dial_is_one_local_abort() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own = format!("http://{}", listener.local_addr().unwrap());
+        let info = DeploymentInfo {
+            dp_rank: Some(0),
+            rust_server_endpoints: vec![endpoint(0, &own), endpoint(1, &own)],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0).unwrap();
+        let (state, _intake_rx, _abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: info,
+                ..Default::default()
+            },
+            peers,
+        );
+        // Aborts are idempotent in the core, so count the requests served.
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        let app = routes()
+            .with_state(state)
+            .layer(axum::middleware::map_request(
+                move |request: HttpRequest<Body>| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move { request }
+                },
+            ));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let response = reqwest::Client::new()
+            .post(format!("{own}/abort_request"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"abort_all": true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     /// `/weights_checker` relays one `CheckWeightsReqInput` carrying the body's
