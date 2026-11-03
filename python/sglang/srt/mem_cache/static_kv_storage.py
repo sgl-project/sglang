@@ -914,8 +914,10 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # Both A3's SWA-page rings and A5's request-bank rings need row-sized
-        # items: P and D can have different ring sizes with decode-only MTP.
+        # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
+        # than SWA pages. A3 (EXPLICIT cache_mode) follows SWA pages, but its
+        # ring sizes can also differ between P and D with decode-only MTP.
+        # Register it separately so each peer maps positions to its local rows.
         c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
         if c4_ptrs:
             add(

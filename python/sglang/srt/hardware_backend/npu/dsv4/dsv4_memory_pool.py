@@ -427,11 +427,14 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """SWA KV pages only; C4 state ships separately as physical rows.
+        """GPU-compatible ``StateType.SWA`` component containing SWA KV only.
 
-        Even on A3, where C4 state follows SWA pages, the ring sizes can differ
-        between P and D. A whole-ring item would give them different byte
-        strides. :meth:`get_c4_state_buf_infos` exposes equal-sized row items.
+        On A5 (CYCLE cache_mode) the compressor addresses the C4 state
+        ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
+        here and registered separately via :meth:`get_c4_state_buf_infos`.
+        On A3 (EXPLICIT cache_mode), C4 state follows SWA pages, but P and D
+        can have different ring sizes. Register C4 separately as equal-sized
+        row items rather than whole rings with different byte strides.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
