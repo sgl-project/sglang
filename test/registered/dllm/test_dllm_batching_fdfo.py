@@ -92,7 +92,9 @@ class TestBatchingFDFO(CustomTestCase):
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
             else:
-                self.assertGreater(speed, 250)
+                # bs=1 dLLM decode is host-CPU bound (no overlap schedule, a sync
+                # per denoising step); relax for CI hosts with slower CPUs
+                self.assertGreater(speed, 200)
 
 
 if __name__ == "__main__":

@@ -274,14 +274,27 @@ class Qwen3Attention(nn.Module):
             and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
             and get_exec().deterministic.rl_on_policy_target is None
             and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
-            and type(self.rotary_emb) is RotaryEmbedding
+            and (
+                type(self.rotary_emb) is RotaryEmbedding
+                or (
+                    # At head_dim 256, triton_mrope_fused's BF16 rounding differs.
+                    type(self.rotary_emb) is MRotaryEmbedding
+                    and self.rotary_emb.mrope_section is not None
+                    and self.head_dim in (64, 128)
+                )
+            )
             and self.head_dim in (64, 128, 256)
         )
+        self.table_rope_positions_ndim = (
+            2 if type(self.rotary_emb) is MRotaryEmbedding else 1
+        )
+
         # Only the ordinary dense-Qwen3 caller opts in; inherited callers stay native.
         self.use_prefill_qk_norm_rope = (
             enable_prefill_qk_norm_rope
             and self.use_table_qk_norm_rope
             and type(self) is Qwen3Attention
+            and type(self.rotary_emb) is RotaryEmbedding
             and quant_config is None
             and attn_tp_size == 1
             and self.head_dim == 128
@@ -336,7 +349,12 @@ class Qwen3Attention(nn.Module):
             and qkv.dtype == torch.bfloat16
             and self.q_norm.weight.dtype == torch.bfloat16
             and self.k_norm.weight.dtype == torch.bfloat16
+            and positions.ndim == self.table_rope_positions_ndim
         ):
+            axis_map = None
+            if positions.ndim == 2:
+                axis_map = self.rotary_emb.axis_map
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv)
             table_qk_norm_rope_(
                 qkv,
                 positions,
@@ -348,6 +366,7 @@ class Qwen3Attention(nn.Module):
                 self.head_dim,
                 self.q_norm.variance_epsilon,
                 match_cuda=True,
+                axis_map=axis_map,
             )
         elif (
             self.use_prefill_qk_norm_rope

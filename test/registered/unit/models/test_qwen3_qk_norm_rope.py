@@ -10,7 +10,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import factory
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import qwen3
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -60,6 +60,23 @@ def make_layer(d=128, dtype=torch.bfloat16, enable_prefill_qk_norm_rope=True, **
     return layer
 
 
+MROPE = {
+    "rope_type": "default",
+    "mrope_section": [24, 20, 20],
+    "mrope_interleaved": True,
+}
+
+
+def decode_positions(layer, positions):
+    if layer.table_rope_positions_ndim == 2:
+        # Distinct axes also cover models with precomputed spatial decode positions;
+        # the decode graph runner passes a [:, :bs] slice of a [3, max_bs] buffer.
+        padded = torch.nn.functional.pad(positions, (0, 8))
+        axes = torch.stack([padded, padded + 5, padded * 3])
+        return (axes % len(layer.rotary_emb.cos_sin_cache))[:, : len(positions)]
+    return positions
+
+
 def separate(layer, positions, x, batch):
     with (
         patch.object(layer, "use_table_qk_norm_rope", False),
@@ -73,6 +90,7 @@ def assert_same_qkv(actual, expected):
         assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
 
 
+@pytest.mark.parametrize("rope_scaling", [None, MROPE])
 @pytest.mark.parametrize(
     "mode,dtype,should_fuse",
     [
@@ -84,16 +102,20 @@ def assert_same_qkv(actual, expected):
         (ForwardMode.DECODE, torch.float16, False),
     ],
 )
-def test_model_dispatch(mode, dtype, should_fuse):
-    layer = make_layer(dtype=dtype)
+def test_model_dispatch(rope_scaling, mode, dtype, should_fuse):
+    layer = make_layer(dtype=dtype, rope_scaling=rope_scaling)
     assert layer.use_table_qk_norm_rope
     should_prefill = (
-        mode == ForwardMode.EXTEND and torch.cuda.get_device_capability()[0] == 9
+        rope_scaling is None
+        and mode == ForwardMode.EXTEND
+        and torch.cuda.get_device_capability()[0] == 9
     )
+    if rope_scaling is not None:
+        assert not layer.use_prefill_qk_norm_rope
     if should_prefill:
         assert layer.use_prefill_qk_norm_rope
     x = torch.randn(4, layer.hidden_size, device="cuda", dtype=dtype)
-    positions = torch.arange(4, device="cuda") + 17
+    positions = decode_positions(layer, torch.arange(4, device="cuda") + 17)
     batch = SimpleNamespace(forward_mode=mode)
     expected = separate(layer, positions, x, batch)
     # Only attention itself is stubbed: construction, projections, norm and RoPE are real.
@@ -113,7 +135,7 @@ def test_model_dispatch(mode, dtype, should_fuse):
     if should_fuse:
         assert fused.call_args.kwargs["match_cuda"] is True
     assert_same_qkv(attn.call_args.args[:3], expected)
-    if mode == ForwardMode.EXTEND:
+    if should_prefill:
         assert attn.call_args.args[0].is_contiguous()
 
 
@@ -134,6 +156,11 @@ def test_model_dispatch(mode, dtype, should_fuse):
         ),
         ({}, {"d": 512}, False),
         ({}, {"rope_scaling": {"rope_type": "linear", "factor": 2.0}}, False),
+        (
+            {},
+            {"d": 256, "rope_scaling": {**MROPE, "mrope_section": [48, 40, 40]}},
+            False,
+        ),
         ({}, {}, True),
     ],
 )
@@ -175,19 +202,32 @@ def test_prefill_fallbacks(runtime, excluded):
     assert not actual[0].is_contiguous()
 
 
+def test_mrope_one_d_positions_stay_separate():
+    layer = make_layer(rope_scaling=MROPE)
+    x = torch.randn(4, layer.hidden_size, device="cuda", dtype=torch.bfloat16)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    with patch.object(qwen3, "table_qk_norm_rope_") as fused:
+        layer.forward_prepare_native(torch.arange(4, device="cuda"), x, batch)
+    fused.assert_not_called()
+
+
 @pytest.mark.parametrize(
-    "mode,dtype,batch_size",
+    "rope_scaling,mode,dtype,batch_size",
     [
-        (ForwardMode.DECODE, torch.bfloat16, 1),
-        (ForwardMode.DECODE, torch.bfloat16, 4),
-        (ForwardMode.EXTEND, torch.bfloat16, 17),
-        (ForwardMode.EXTEND, torch.float16, 17),
+        (None, ForwardMode.DECODE, torch.bfloat16, 1),
+        (None, ForwardMode.DECODE, torch.bfloat16, 4),
+        (None, ForwardMode.DECODE, torch.bfloat16, 128),
+        (MROPE, ForwardMode.DECODE, torch.bfloat16, 1),
+        (MROPE, ForwardMode.DECODE, torch.bfloat16, 4),
+        (MROPE, ForwardMode.DECODE, torch.bfloat16, 128),
+        (None, ForwardMode.EXTEND, torch.bfloat16, 17),
+        (None, ForwardMode.EXTEND, torch.float16, 17),
     ],
 )
-def test_changing_input_graph_replay(mode, dtype, batch_size):
-    layer = make_layer(dtype=dtype)
+def test_changing_input_graph_replay(rope_scaling, mode, dtype, batch_size):
+    layer = make_layer(dtype=dtype, rope_scaling=rope_scaling)
     x = torch.randn(batch_size, layer.hidden_size, device="cuda", dtype=dtype)
-    positions = torch.arange(batch_size, device="cuda")
+    positions = decode_positions(layer, torch.arange(batch_size, device="cuda"))
     batch = SimpleNamespace(forward_mode=mode)
     layer.forward_prepare_native(positions, x, batch)  # JIT warmup before capture.
     graph = torch.cuda.CUDAGraph()
@@ -201,7 +241,9 @@ def test_changing_input_graph_replay(mode, dtype, batch_size):
     assert fused.call_count == int(mode == ForwardMode.DECODE)
     for offset in (0, 17, 2048):
         x.normal_()
-        positions.copy_(torch.arange(batch_size, device="cuda") + offset)
+        positions.copy_(
+            decode_positions(layer, torch.arange(batch_size, device="cuda") + offset)
+        )
         graph.replay()
         assert_same_qkv(actual, separate(layer, positions, x, batch))
 

@@ -117,7 +117,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -213,7 +213,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -309,7 +309,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \

@@ -5,11 +5,13 @@ import torch
 
 import sglang.kernels.ops.moe.fill_padded_rows as fill_mod
 import sglang.srt.layers.moe.topk as topk_mod
+from sglang.kernels.ops.moe.fill_padded_rows import (
+    _can_fuse_padded_region,
+    _fill_padded_rows,
+)
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
-    _can_fuse_padded_region,
-    _fill_padded_rows,
     _mask_topk_ids_padded_region,
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
