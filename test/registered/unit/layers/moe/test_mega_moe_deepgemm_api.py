@@ -889,8 +889,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 layer_id=0,
                 quant_method=method,
             )
-        # create_weights is patched out, but the MMA type is read off the weight
-        # dtype: packed E2M1 (uint8) is the W4A8 kind.
+
         experts.w13_weight = torch.nn.Parameter(
             torch.zeros(0, dtype=torch.uint8), requires_grad=False
         )
