@@ -17,7 +17,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     TboForwardBatchPreparer,
     _verify_input_blocks_split,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_device
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.test.ci.ci_register import register_cpu_ci
