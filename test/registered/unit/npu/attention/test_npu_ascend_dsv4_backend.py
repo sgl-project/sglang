@@ -430,6 +430,7 @@ class TestC4StateTransferLayout(unittest.TestCase):
 
     @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
     def test_a3_transfer_rows_match_the_compressor_history(self, _):
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             _build_explicit_state_block_table,
         )
@@ -445,7 +446,9 @@ class TestC4StateTransferLayout(unittest.TestCase):
             state_pool.dummy_state_loc = 10 * ring_size
             for seq_len in (0, 1, 4, 7, 8, 9, 13, 127, 128, 129, 255, 256, 257):
                 with self.subTest(ring_size=ring_size, seq_len=seq_len):
-                    rows = req_pool.get_dsv4_c4_state_transfer_indices(2, seq_len)
+                    rows = dsv4_state_payloads(req_pool, 2, seq_len, page_size=128)[
+                        AscendStateType.DSV4_C4_STATE
+                    ]()
                     table = _build_explicit_state_block_table(
                         compress_ratio=4,
                         coff=2,

@@ -87,6 +87,10 @@ def dsv4_state_payloads(
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+        c4_state_transfer_indices,
+    )
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -108,9 +112,20 @@ def dsv4_state_payloads(
     payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
 
     def c4_state_indices():
-        return req_to_token_pool.get_dsv4_c4_state_transfer_indices(
-            req_pool_idx, seq_len
-        )
+        ring_size = req_to_token_pool.get_dsv4_c4_state_ring_size()
+        if is_npu_arch35():
+            return c4_state_transfer_indices(req_pool_idx, seq_len, ring_size=ring_size)
+
+        # A3's explicit compressor table follows full -> SWA -> state. Pair
+        # the last coff * ratio (2 * 4) positions in logical token order,
+        # including history spanning noncontiguous SWA pages.
+        full_locs = req_to_token_pool.req_to_token[
+            req_pool_idx, max(0, seq_len - 8) : seq_len
+        ]
+        kv_pool = req_to_token_pool._dsv4_allocator.get_kvcache()
+        swa_locs = kv_pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
+        rows = swa_locs // kv_pool.swa_page_size * ring_size + swa_locs % ring_size
+        return rows.to(torch.int32).cpu().numpy()
 
     payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
 
