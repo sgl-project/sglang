@@ -156,6 +156,7 @@ pub fn tool_constraint(
         .into_iter()
         .map(|tool| {
             serde_json::json!({
+                "type": "object",
                 "properties": {
                     "name": {"type": "string", "enum": [tool.name]},
                     "parameters": tool.parameters.clone().unwrap_or_else(|| {
@@ -356,6 +357,7 @@ mod tests {
 
         let named = ToolChoice::Named("get_time".into());
         let schema = json_schema(tool_constraint(Some("llama3"), &named, &tools, None).unwrap());
+        assert_eq!(schema["items"]["type"], "object");
         assert_eq!(schema["items"]["properties"]["name"]["enum"][0], "get_time");
         assert!(schema["items"].get("anyOf").is_none());
         assert!(schema.get("maxItems").is_none());

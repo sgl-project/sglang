@@ -15,6 +15,7 @@
 
 import json
 import logging
+import re
 from functools import cache
 from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
 
@@ -300,29 +301,53 @@ class GuidanceBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
 
+    def _lark_literal(self, text: str) -> str:
+        """Spell ``text`` in Lark, with its special tokens as token references.
+
+        llguidance tokenizes forced text into any special token it spells, then
+        rejects that token because special tokens never match text bytes.
+        """
+        tokenizer = self.llguidance_tokenizer
+        special_tokens = {
+            tokenizer.decode_str([token]): token
+            for token in tokenizer.tokenize_str(text)
+            if tokenizer.is_special_token(token)
+        }
+        pattern = "|".join(re.escape(spelling) for spelling in special_tokens)
+        pieces = re.split(f"({pattern})", text) if special_tokens else [text]
+        return " ".join(
+            f"<[{special_tokens[piece]}]>"
+            if piece in special_tokens
+            else json.dumps(piece)
+            for piece in pieces
+            if piece
+        )
+
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
             structural_tag = json.loads(key_string)
             assert is_legacy_structural_tag(structural_tag)
             # Pair each structure with a trigger that prefixes its own
-            # ``begin`` — StructTag asserts begin.startswith(trigger), and
-            # detectors with per-tool triggers (e.g. Inkling's
+            # ``begin``. Detectors with per-tool triggers (e.g. Inkling's
             # <|message_model|>{name}<|content_invoke_tool_json|>) emit a
             # distinct trigger per tool, so triggers[0] matches only one of
             # them and multi-tool grammars fail to compile.
             triggers = structural_tag["triggers"]
-            tags = [
-                StructTag(
-                    begin=structure["begin"],
-                    grammar=structure["schema"],
-                    end=structure["end"],
-                    trigger=next(
-                        (t for t in triggers if structure["begin"].startswith(t)),
-                        triggers[0],
-                    ),
+            tags = []
+            for structure in structural_tag["structures"]:
+                begin = structure["begin"]
+                trigger = next(
+                    (t for t in triggers if begin.startswith(t)), triggers[0]
                 )
-                for structure in structural_tag["structures"]
-            ]
+                assert begin.startswith(trigger), "begin must start with trigger"
+                grammar = (
+                    f"start: {self._lark_literal(begin[len(trigger) :])} "
+                    f"%json {json.dumps(structure['schema'])} "
+                    f"{self._lark_literal(structure['end'])}"
+                )
+                tags.append(
+                    StructTag(begin=trigger, grammar=grammar, end="", trigger=trigger)
+                )
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
         except Exception as e:

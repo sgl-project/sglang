@@ -331,9 +331,12 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
     def test_each_structure_pairs_with_its_own_trigger(self):
         import json
 
+        from llguidance import LLTokenizer
+
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 
         backend = object.__new__(GuidanceBackend)
+        backend.llguidance_tokenizer = LLTokenizer("byte")
         backend._from_serialized = lambda serialized: serialized
         begins = [
             '<|message_model|>alpha<|content_invoke_tool_json|>{"name":"alpha","args":',
@@ -358,6 +361,60 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
         )
         result = backend.dispatch_structural_tag(key)
         self.assertNotIsInstance(result, InvalidGrammarObject)
+
+
+class TestLlguidanceStructuralTagSpecialTokens(unittest.TestCase):
+    """Bug regression: a structure's forced text spelled a special token, which
+    llguidance offered as the only allowed token and then rejected, so finishing
+    a tool call aborted the request with 'Grammar accept_token failed'."""
+
+    def test_forced_text_accepts_the_special_token_it_spells(self):
+        from llguidance.torch import allocate_token_bitmask
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
+
+        alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+        tokenizer = Tokenizer(
+            models.BPE(vocab={c: i for i, c in enumerate(alphabet)}, merges=[])
+        )
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = decoders.ByteLevel()
+        tokenizer.add_special_tokens(["<call>", "</call>", "<sep>", "<eos>"])
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer, eos_token="<eos>"
+        )
+        backend = GuidanceBackend(tokenizer, n_vocab=len(tokenizer))
+
+        for begin, end in (
+            ('<call>\n{"args":', "}\n</call>"),
+            ("<call>f<sep>", "</call>"),
+        ):
+            with self.subTest(begin=begin, end=end):
+                grammar = backend.dispatch_structural_tag(
+                    json.dumps(
+                        {
+                            "type": "structural_tag",
+                            "structures": [
+                                {
+                                    "begin": begin,
+                                    "schema": {"type": "object"},
+                                    "end": end,
+                                }
+                            ],
+                            "triggers": ["<call>"],
+                        }
+                    )
+                )
+                self.assertNotIsInstance(grammar, InvalidGrammarObject)
+
+                mask = allocate_token_bitmask(1, len(tokenizer))
+                call = begin + "{}" + end
+                for token in tokenizer.encode(call, add_special_tokens=False):
+                    grammar.fill_vocab_mask(mask, 0)
+                    self.assertTrue((int(mask[0, token // 32]) >> (token % 32)) & 1)
+                    grammar.accept_token(token)
 
 
 class TestNulByteGrammarRejection(unittest.TestCase):
