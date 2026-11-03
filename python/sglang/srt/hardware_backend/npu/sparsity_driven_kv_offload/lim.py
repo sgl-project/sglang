@@ -216,7 +216,7 @@ class LIMDecodeAdapter:
                 cache_sizes=self._pre_cache_sizes[:batch],
                 capacity=self.capacity,
                 request_rows=self.rows,
-                full_visible=self.full_visible,
+                query_width=1,
             )
             slots = self._pre_safe_slots[:batch]
             lengths = self._pre_lengths[:batch]
