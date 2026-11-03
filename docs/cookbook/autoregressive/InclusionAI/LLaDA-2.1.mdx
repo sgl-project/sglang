@@ -444,7 +444,7 @@ python -m sglang.launch_server \
 - Latency Benchmark
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-mini \
   --dataset-name random \
@@ -500,7 +500,7 @@ Max ITL (ms):                            26.59
 - Throughput Benchmark
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-mini \
   --dataset-name random \
@@ -571,7 +571,7 @@ python -m sglang.launch_server \
 - Latency Benchmark
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-flash \
   --dataset-name random \
@@ -627,7 +627,7 @@ Max ITL (ms):                            29.27
 - Throughput Benchmark
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-flash \
   --dataset-name random \

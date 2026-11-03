@@ -97,7 +97,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
     def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any]:
         """Use the same independent-seed grouped path in serve and generate."""
 
-        from sglang.multimodal_gen.runtime.entrypoints.utils import (
+        from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
             expand_request_outputs,
         )
 
@@ -173,6 +173,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 server_args.warmup_num_frames / MINIMAX_H3_SUPPORTED_FPS
             )
         if server_args.warmup_resolutions is not None:
+            # Warm up at the canvas the flag names, short edge included.
+            target["short_edge"] = min(int(req.width), int(req.height))
             ratio = req.width / req.height
 
             def distance(name: str) -> float:
