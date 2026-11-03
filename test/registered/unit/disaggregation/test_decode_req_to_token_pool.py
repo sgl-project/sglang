@@ -1,10 +1,15 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+from sglang.srt.disaggregation.decode import (
+    DecodeReqToTokenPool,
+    HybridMambaDecodeReqToTokenPool,
+)
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,6 +70,45 @@ def test_request_pool_clear_keeps_row_generations_monotonic(pool_cls, pool_kwarg
 
     assert start_request() == row
     assert pool.req_generation[row].item() != stored_generation
+
+
+def _decode_mamba_spec_state_size(*, size, pre_alloc_size, replayssm_spec):
+    captured = {}
+
+    def capture(self, *, mamba_spec_state_size, **kwargs):
+        captured["rows"] = mamba_spec_state_size
+
+    with patch.object(HybridMambaDecodeReqToTokenPool, "_init_mamba_pool", capture):
+        HybridMambaDecodeReqToTokenPool(
+            size=size,
+            max_context_len=4,
+            device="cpu",
+            enable_memory_saver=False,
+            cache_params=None,
+            mamba_layer_ids=[0],
+            speculative_num_draft_tokens=6,
+            enable_mamba_extra_buffer=False,
+            pre_alloc_size=pre_alloc_size,
+            enable_overlap_schedule=True,
+            mamba_size=size + pre_alloc_size,
+            enable_linear_replayssm_spec=replayssm_spec,
+        )
+    return captured["rows"]
+
+
+@pytest.mark.parametrize(
+    "replayssm_spec, pp_spec_stable_rows, rows",
+    [(False, False, 8), (True, False, 8 + 16), (False, True, 8 + 16)],
+    ids=["batch_rows", "replayssm_spec_ring", "pp_spec_stable_rows"],
+)
+def test_decode_mamba_spec_scratch_rows(replayssm_spec, pp_spec_stable_rows, rows):
+    """In-transfer requests never verify, so the spec scratch skips the pre-allocated
+    slots unless verify indexes it by req_pool_idx (ReplaySSM-spec, PP-spec rows)."""
+    with envs.SGLANG_ENABLE_PP_SPEC.override(pp_spec_stable_rows):
+        spec_rows = _decode_mamba_spec_state_size(
+            size=8, pre_alloc_size=16, replayssm_spec=replayssm_spec
+        )
+    assert spec_rows == rows
 
 
 if __name__ == "__main__":
