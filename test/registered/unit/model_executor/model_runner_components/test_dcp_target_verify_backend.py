@@ -68,6 +68,9 @@ def _kimi_k3_mode(algorithm: str) -> str:
     """speculative_attention_mode after Kimi-K3's DCP override."""
     cfg = SimpleNamespace(
         dcp_size=2,
+        attention_backend=None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
         enable_symm_mem=False,
         speculative_algorithm=algorithm,
         dcp_replicate_q_proj=False,
@@ -75,10 +78,6 @@ def _kimi_k3_mode(algorithm: str) -> str:
         enable_prefill_cp=False,
     )
     with (
-        patch.object(kimi_k3, "resolving_view", return_value=cfg),
-        patch.object(
-            kimi_k3, "attention_backends_of", return_value=("trtllm_mla", "cutedsl_mla")
-        ),
         patch.object(kimi_k3, "_require_kimi_k3_cutedsl_dcp_support", lambda: None),
         patch.object(
             ragged_verify,
@@ -86,7 +85,7 @@ def _kimi_k3_mode(algorithm: str) -> str:
             return_value=ragged_verify.RaggedVerifyMode.STATIC,
         ),
     ):
-        overrides = kimi_k3._kimi_k3_overrides(object(), object())
+        overrides = kimi_k3._kimi_k3_overrides(cfg, None)
     return overrides.get("speculative_attention_mode", "prefill")
 
 
@@ -112,19 +111,16 @@ class TestDcpTargetVerifyBackend(CustomTestCase):
                     _hybrid(prefill_cls, CuteDslMLABackend, "decode"), mode="decode"
                 )
 
-    def test_kimi_k3_dspark_override_verifies_on_the_decode_backend(self):
-        self.assertEqual(_kimi_k3_mode("DSPARK"), "decode")
-        _require(
-            _hybrid(TRTLLMMLABackend, CuteDslMLABackend, _kimi_k3_mode("DSPARK")),
-            mode="decode",
-            algorithm="DSPARK",
-        )
-
-    def test_kimi_k3_dflash_keeps_prefill_mode_and_is_refused(self):
-        mode = _kimi_k3_mode("DFLASH")
-        self.assertEqual(mode, "prefill")
-        with self.assertRaisesRegex(ValueError, "TRTLLMMLABackend"):
-            _require(_hybrid(TRTLLMMLABackend, CuteDslMLABackend, mode), mode=mode)
+    def test_kimi_k3_override_verifies_on_the_decode_backend(self):
+        for algorithm in ("DSPARK", "DFLASH", "dflash"):
+            with self.subTest(algorithm=algorithm):
+                mode = _kimi_k3_mode(algorithm)
+                self.assertEqual(mode, "decode")
+                _require(
+                    _hybrid(TRTLLMMLABackend, CuteDslMLABackend, mode),
+                    mode=mode,
+                    algorithm=algorithm,
+                )
 
     def test_only_unified_dcp_speculative_runs_are_checked(self):
         hybrid = _hybrid(TRTLLMMLABackend, CuteDslMLABackend, "prefill")

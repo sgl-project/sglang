@@ -208,7 +208,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 
 **MoE runner.** Leave `--moe-runner-backend` unset on Blackwell: FlashInfer MXFP4 (W4A8, official trtllm-gen SiTU kernels) is selected; H100/H200 pin Marlin. The B200 Balanced and High-Throughput cells pin `flashinfer_mxfp4` explicitly because that is the shape they were brought up on.
 
-**Attention backend.** Leave all three attention knobs unset on Blackwell: K3 resolves prefill, decode, and — under DSPARK — verification as a set (`trtllm_mla` across the board; `cutedsl_mla` takes decode and verification under DCP). On the non-DCP recipes, setting any one of the three cancels the auto-resolution for the others. The B200 Balanced and High-Throughput cells pin `--decode-attention-backend cutedsl_mla`, which is what auto-resolution picks for those DCP recipes anyway — it is written out because it is the shape they were brought up on, not because it changes the resolution. H100/H200 pin `flashmla` for decode.
+**Attention backend.** On Blackwell, K3 selects `trtllm_mla` for prefill and decode by default. With DCP, it selects `cutedsl_mla` for decode and routes DSPARK and DFLASH target verification there automatically. The B200 Balanced and High-Throughput recipes pin `--decode-attention-backend cutedsl_mla` explicitly. On recipes without DCP, leave all three attention backend flags unset to use the defaults. H100/H200 pin `flashmla` for decode.
 
 **Context length.** `--context-length` bounds the longest accepted request plus some context-scaled buffers; it does not size the KV pool. For long context the lever that adds capacity is `fp8_e4m3` KV.
 
