@@ -56,10 +56,14 @@ class Schedule(msgspec.Struct):
     prefill_decode_interval: A[
         Optional[int],
         Arg(
-            help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+            help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. Without data-parallel attention, the interval is skipped while no request is decoding. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
             resolvable=True,
         ),
     ] = None
+    prefill_decode_interval_min_bs: A[
+        int,
+        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.",
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -168,7 +172,9 @@ class Schedule(msgspec.Struct):
                 "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
                 "family), how many radix-cached prefix tails it keeps room for. "
                 "Each tail is one sliding window plus one page. Default: 4 x "
-                "max_running_requests per attention-DP rank, 0 when the radix "
+                "max_running_requests per attention-DP rank, multiplied by "
+                "num_layers // draft_layers under encoder SWA bounded replay with "
+                "DSpark (only draft layers are paged there); 0 when the radix "
                 "cache is disabled."
             ),
         ),

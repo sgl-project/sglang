@@ -173,7 +173,7 @@ mod tests {
     fn temp_model_dir(label: &str) -> PathBuf {
         let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "sglang-renderer-{label}-{}-{sequence}",
+            "sglang-processor-{label}-{}-{sequence}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path).unwrap();

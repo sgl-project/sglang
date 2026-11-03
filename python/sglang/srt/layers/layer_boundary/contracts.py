@@ -21,7 +21,7 @@ import torch
 
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup, TokenAxis
-from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.output import OutputTransform, SumImplementation
 from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
 from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 
@@ -71,6 +71,9 @@ class InputContract(msgspec.Struct, frozen=True):
         gathered_by_compute: Token axes compute can gather internally; the boundary
             may hand it input still sharded over those axes.
         read: Operation that derives input from the updated residual.
+        in_token_order: Compute reads the whole sequence in the batch's token
+            order (a scan over it), so a gather over attention CP restores
+            that order instead of placing the shards side by side.
     """
 
     layout: Layout
@@ -79,6 +82,7 @@ class InputContract(msgspec.Struct, frozen=True):
     gathered_by_compute: FrozenSet[TokenAxis] = frozenset()
     # How the consumer reads its input from the residual.
     read: ResidualReadout = NORM_READOUT
+    in_token_order: bool = False
 
 
 class OutputContract(msgspec.Struct, frozen=True):
@@ -99,6 +103,10 @@ class OutputContract(msgspec.Struct, frozen=True):
         update: Producer residual operation; None on an arrival contract that
             declares capabilities and obtains the actual update from the stream.
         transform: Optional operation on the contribution before residual update.
+        in_token_order: The output covers the whole sequence in the batch's
+            token order; the consumer takes this rank's CP shard of it back.
+        sum_impl: Custom implementation of this declared sum, or None for
+            the ordinary boundary collective. It does not change token rows.
 
     These are permissions, not a record of a particular output. The exit
     decision and ResidualStream record what that output actually owes.
@@ -118,6 +126,8 @@ class OutputContract(msgspec.Struct, frozen=True):
     # description has no producer object; its edge declares capabilities only.
     update: Optional[ResidualUpdate] = PLAIN_ADD
     transform: Optional[OutputTransform] = None
+    in_token_order: bool = False
+    sum_impl: Optional[SumImplementation] = None
 
 
 class StageContract(msgspec.Struct, frozen=True):
@@ -179,13 +189,14 @@ class FfnInputFusion(msgspec.Struct, frozen=True):
 
 class ReadoutFusion(msgspec.Struct, frozen=True):
     """A kernel a stage's read supplies (its ``completing_fusions``) that
-    completes the sum its input owes together with the residual add, for a
-    read that is not the residual's plain norm and so takes no FfnInputFusion.
+    completes the input's sum and producer update before the consumer read.
 
+    With no ``accepts_update`` predicate the update must be plain addition.
+    Otherwise ``run`` also receives the actual producer's ``update`` keyword.
     ``run(hidden_states, residual, forward_batch)`` returns the written stream,
-    the completed sum plus the residual, which the read then reads; or None
-    when it does not take the batch, before touching its inputs or starting a
-    collective."""
+    or, with ``reads=True``, takes ``norm`` and returns (input, residual).
+    A carried candidate may receive UnreducedOutput or DeferredFinalize.
+    Returning None must precede any collective or mutation of input/state."""
 
     # The group whose sum it completes.
     completes: SumGroup
@@ -197,6 +208,12 @@ class ReadoutFusion(msgspec.Struct, frozen=True):
     # Whether it also does the read: run(hidden_states, residual,
     # forward_batch, norm) then returns the read's (input, residual).
     reads: bool = False
+    # None restricts the existing kernel to a plain addition. An explicit
+    # predicate validates the actual update before run receives it as a keyword.
+    accepts_update: Optional[Callable] = None
+    # Also accepts dynamically carried output; run must decline unsupported
+    # completion handles without starting communication or changing state.
+    carried: bool = False
 
 
 class CpMoves(msgspec.Struct, frozen=True):
@@ -297,6 +314,7 @@ class ExitFacts(msgspec.Struct, frozen=True):
             is not one all-reduce, may still be left to a fused consumer.
     """
 
+    writes_residual: bool = False
     may_defer_sum: bool = False
     defers_mixer_sum: bool = False
     sum_in_reduce_scatter: bool = False

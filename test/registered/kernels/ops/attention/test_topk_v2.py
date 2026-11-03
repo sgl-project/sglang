@@ -87,8 +87,14 @@ FIXED_CONFIGS = [
 ]
 
 
-def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
-    """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties."""
+def _assert_topk_close(
+    scores_cpu, ref_raw, our_raw, bs, seq_lens, k, max_permit_error=MAX_PERMIT_ERROR
+):
+    """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties.
+
+    ``max_permit_error`` covers the fp16 coarse histogram swapping near-equal
+    scores; tests that pin exactness pass 0.
+    """
     bad = 0
     for i in range(bs):
         L = int(seq_lens[i])
@@ -105,7 +111,7 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
         assert len(our) == min(k, L), (
             f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
         )
-    assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
+    assert bad <= max_permit_error, f"{bad=} > {max_permit_error}"
 
 
 def _make_page_table(batch, num_pages, mode, device, per_row=False):
@@ -309,6 +315,98 @@ def test_topk_v2_dual_output(batch: int, seq: int) -> None:
         assert sorted(transformed_raw[row]) == sorted(direct_raw[row])
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, direct_raw, batch, seq_lens.cpu(), k)
+
+
+# --- exactness when the coarse histogram cannot discriminate -----------------
+# The tests above draw from ``torch.randn``, which spreads scores over many
+# coarse bins and leaves the threshold bin far below the tie-staging capacity.
+# These distributions force the threshold bin to overflow the staging buffer.
+NARROW_DISTRIBUTIONS = [
+    "narrow",
+    "narrow_bin",
+    "tiny",
+    "two_values",
+    "signed_zero",
+    "all_equal",
+]
+
+
+def _single_bin_scores(kind, batch, width, device):
+    """Scores whose coarse bin carries no ordering information.
+
+    The bin comes from the top bits of the fp16 cast, so a band narrower than
+    one fp16 ulp -- or a magnitude that underflows fp16 -- gives one bin.
+    """
+    if kind == "narrow":
+        # Narrower than one fp32 ulp at 1.0 (1.19e-7): pins the tie count.
+        u = torch.rand(batch, width, dtype=torch.float32, device=device) * 2.0 - 1.0
+        return 1.0 + u * 1e-6
+    if kind == "narrow_bin":
+        # One coarse bin, ~1.7e5 distinct fp32 values: pins the ordering too.
+        return 1.0 + torch.rand(batch, width, dtype=torch.float32, device=device) * 0.02
+    if kind == "tiny":
+        # Below the fp16 subnormal floor: every score casts to zero.
+        return (
+            0.5 + torch.rand(batch, width, dtype=torch.float32, device=device)
+        ) * 1e-30
+    if kind == "two_values":
+        # Two adjacent fp32 values, ~half the row each: the refinement has to
+        # consume all 32 bits before the survivors are bit-identical, and more
+        # than kMaxNumTie of them still remain at that point.
+        hi = torch.tensor(1.0, dtype=torch.float32, device=device).nextafter(
+            torch.tensor(2.0, dtype=torch.float32, device=device)
+        )
+        pick = torch.rand(batch, width, device=device) < 0.5
+        return torch.where(pick, hi, torch.ones_like(hi))
+    if kind == "signed_zero":
+        # The threshold bin ends at +0.0. Its upper boundary must move to the
+        # smallest positive subnormal so -0.0 stays in the tie set instead of
+        # racing true positive values for output slots.
+        out = torch.full((batch, width), -1.0, dtype=torch.float32, device=device)
+        out[:, : width // 2] = -0.0
+        out[:, -1024:] = 1e-6
+        return out
+    # Control: the bin overflows too, but the candidates are bit-identical, so
+    # any subset is correct and this must keep passing.
+    return torch.full((batch, width), 0.5, dtype=torch.float32, device=device)
+
+
+def _narrow_seed(dist, *rest):
+    """Reproducible across processes -- ``hash(str)`` is salted per interpreter."""
+    seed = NARROW_DISTRIBUTIONS.index(dist)
+    for v in rest:
+        seed = seed * 100003 + int(v)
+    return seed
+
+
+# Longest row that never reaches the CUDA cluster path, which still truncates an
+# overflowing threshold bin (the smallest get_static_cluster_floor in topk_v2.cuh).
+CUDA_MAX_NON_CLUSTER_SEQ = 24576
+
+
+@pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
+@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 20480), (4, 32768), (4, 65536)])
+@torch.inference_mode()
+def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> None:
+    """No tolerance here: the threshold bin holds the whole row at k=2048, so a
+    dropped candidate is a wrong answer rather than a tie swap. Covers
+    register-path and streaming-path shapes, and a ROCm split-path shape (above
+    split_floor); tie staging is per-template.
+    """
+    if not is_hip() and seq > CUDA_MAX_NON_CLUSTER_SEQ:
+        pytest.skip("CUDA may route this shape to the unrefined cluster path")
+    torch.manual_seed(_narrow_seed(dist, batch, seq))
+    device = "cuda"
+    k = 2048
+    width = (seq + 3) & ~3
+    scores = _single_bin_scores(dist, batch, width, device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(
+        scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k, max_permit_error=0
+    )
 
 
 # --- ragged entry point ------------------------------------------------------
@@ -616,12 +714,12 @@ def test_topk_v2_split_duplicate_scores(batch: int, seq: int, nvals: int) -> Non
     """Duplicate-heavy rows: the cross-block tie merge must stay exact.
 
     The split path resolves the threshold bin in whichever block arrives last,
-    out of a tie list that every block appended to, so it is exact only while
-    that bin holds no more candidates than the list. Rows of ``nvals`` distinct
-    scores put ``seq / nvals`` exact duplicates at the cut, which is what fills
-    it; the shapes are long and narrow enough to reach the split gate. CUDA
-    runs its cluster path here, whose coarser histogram makes the same bin four
-    times as wide, so this is the ROCm path's test.
+    out of a tie list that every block appended to; a bin that overflows the
+    list is rescanned instead (test_topk_v2_single_coarse_bin_is_exact). Rows
+    of ``nvals`` distinct scores put ``seq / nvals`` exact duplicates at the
+    cut, which is what fills it; the shapes are long and narrow enough to reach
+    the split gate. CUDA runs its cluster path here, whose coarser histogram
+    makes the same bin four times as wide, so this is the ROCm path's test.
     """
     k = 2048
     g = torch.Generator(device="cuda").manual_seed(nvals * 7 + seq)
@@ -633,6 +731,89 @@ def test_topk_v2_split_duplicate_scores(batch: int, seq: int, nvals: int) -> Non
 
     for row in range(batch):
         _assert_topk_values(scores[row], out[row], k)
+
+
+@pytest.mark.skipif(not is_hip(), reason="ROCm zero-candidate overflow shortcut")
+@pytest.mark.parametrize("k", [1024, 2048])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (8, 8192),  # Register2
+        (8, 16384),  # Register4
+        (68, 65536),  # Streaming: below this batch's split floor
+        (56, 262400),  # Split: late values land in the last long chunk
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_zero_candidates_graph_replay(batch: int, seq: int, k: int) -> None:
+    """Only a proven all-+0 candidate bucket may bypass overflow refinement.
+
+    The row itself is not constant: k-1 positive scores are above the bucket,
+    and negative scores are below it. More than 2048 +0 candidates precede
+    the final positions, where a small positive value must win the last slot.
+    These positions are also late within the last split chunk; atomic staging
+    order is deliberately not assumed. Reuse one graph across +0, nonzero,
+    and +0 inputs to exercise the persistent split counters as well.
+    """
+    device = "cuda"
+    scores_cpu = torch.zeros((batch, seq), dtype=torch.float32)
+    scores_cpu[:, : k - 1] = 2.0
+    scores_cpu[:, k + 128 : k + 640] = -1.0
+    assert (scores_cpu[0] == 0).sum() > 2048
+    scores = scores_cpu.to(device)
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    page_table = (
+        torch.arange((seq + PAGE_SIZE - 1) // PAGE_SIZE, device=device)
+        .to(torch.int32)
+        .expand(batch, -1)
+        .contiguous()
+    )
+    metadata = _plan(lengths)
+    out = torch.full((batch, k), -2, dtype=torch.int32, device=device)
+
+    def transform():
+        topk_transform_paged_v2(scores, lengths, page_table, out, PAGE_SIZE, metadata)
+
+    # Compile and initialize persistent scratch outside graph capture.
+    for _ in range(3):
+        transform()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        transform()
+
+    # Both positives round to binary16 +0 but must survive exact fp32 ranking.
+    # Write bits directly so CPU DAZ/FTZ cannot erase the subnormal test input.
+    scores_cpu_bits = scores_cpu.view(torch.int32)
+    for late_bits, negative_zero in [
+        (0, False),
+        (0x31800000, False),  # 2**-28
+        (0, False),
+        (1, False),  # smallest positive fp32 subnormal
+        (0, False),
+        (0, True),
+        (0, False),
+        (0x31800000, True),
+        (0, False),
+    ]:
+        scores_cpu_bits[:, -2] = -2147483648 if negative_zero else 0
+        scores_cpu_bits[:, -1] = late_bits
+        scores.copy_(scores_cpu)
+        assert torch.equal(
+            scores[:, -2:].view(torch.int32).cpu(),
+            scores_cpu[:, -2:].view(torch.int32),
+        )
+        out.fill_(-2)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        # Identity page mapping makes outputs raw indices. The CPU oracle
+        # preserves subnormals and permits any legal, unique equal-score set.
+        out_cpu = out.cpu()
+        if late_bits != 0:
+            assert (out_cpu == seq - 1).any(dim=1).all()
+        for row in range(batch):
+            _assert_topk_values(scores_cpu[row], out_cpu[row], k)
 
 
 if __name__ == "__main__":
