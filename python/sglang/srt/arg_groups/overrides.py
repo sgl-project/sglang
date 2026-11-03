@@ -613,8 +613,10 @@ def _check_dsa_kpool_backend_support(
     index_kpool = get_dsa_index_kpool(hf_config)
     if index_kpool <= 1:
         return
-    # A PD node runs only its own role, and calculate_mla_kv_cache_dim reads only
-    # that role. A literal trtllm there keeps FP8 rows raw.
+    # A PD node serves only its own role, and calculate_mla_kv_cache_dim reads only
+    # that role. A literal trtllm there keeps FP8 rows raw. FlashInfer autotune on a
+    # prefill node also runs a decode dummy, so an unsupported decode backend still
+    # fails after load in _check_kpool_tail_backend.
     roles = {"prefill": prefill_backend, "decode": decode_backend}
     if disaggregation_mode in roles:
         roles = {disaggregation_mode: roles[disaggregation_mode]}
