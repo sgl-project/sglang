@@ -9,6 +9,8 @@ pub mod stream;
 
 use serde_json::{json, Value};
 
+use crate::protocol::scrub_message;
+
 pub use request::{to_chat, Converted, EchoContext};
 
 /// `input_tokens` excludes cache reads, as Anthropic defines it.
@@ -100,32 +102,6 @@ pub fn wrap_error_body(body: &[u8], status: u16) -> Vec<u8> {
     .expect("serialize error")
 }
 
-/// 5xx text can carry stack frames, paths or prompt fragments, so it never
-/// reaches the client; 4xx keeps the validation message.
-pub(crate) fn scrub_message(message: &str, status: u16) -> String {
-    const MAX_CHARS: usize = 500;
-    if status >= 500 {
-        return "Internal server error".into();
-    }
-    let kept: Vec<&str> = message
-        .lines()
-        .filter(|l| !l.starts_with("Traceback") && !l.contains("File \"/"))
-        .collect();
-    let cleaned = kept.join("\n");
-    let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
-        return "Request failed".into();
-    }
-    match cleaned.char_indices().nth(MAX_CHARS) {
-        Some((at, _)) => format!("{}\u{2026}", &cleaned[..at]),
-        None => cleaned.to_owned(),
-    }
-}
-
-pub(crate) fn new_id(prefix: &str) -> String {
-    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
-}
-
 pub(crate) fn tool_input(arguments: &str) -> Value {
     match serde_json::from_str::<Value>(arguments) {
         Ok(v @ Value::Object(_)) => v,
@@ -213,12 +189,5 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["error"]["message"], "Internal server error");
-
-        let traced = "bad input\nTraceback (most recent call last):\n  File \"/a.py\", line 1";
-        assert_eq!(scrub_message(traced, 400), "bad input");
-        let long = scrub_message(&"x".repeat(600), 400);
-        assert_eq!(long.chars().count(), 501);
-        assert!(long.ends_with('\u{2026}'));
-        assert_eq!(scrub_message("", 400), "Request failed");
     }
 }
