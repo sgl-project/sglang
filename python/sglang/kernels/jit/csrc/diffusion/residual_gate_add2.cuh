@@ -107,7 +107,7 @@ struct ResidualGateAdd2Kernel {
     auto N = SymbolicSize{"numel"};
     auto G = SymbolicSize{"gate_numel"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({N}).with_dtype<T>().with_device(device).verify(out).verify(residual).verify(update_a).verify(
         update_b);
     TensorMatcher({G}).with_dtype<T>().with_device(device).verify(gate);
