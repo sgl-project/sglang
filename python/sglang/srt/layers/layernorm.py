@@ -107,6 +107,11 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
+
+    if _is_xpu:
+        from sglang.kernels.ops.layernorm.rmsnorm_cast_before_mul import (
+            rmsnorm_cast_before_mul,
+        )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
@@ -973,8 +978,21 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # XPU rmsnorm kernels apply the weight before rounding; HF rounding needs native.
-        if self.variance_size_override is not None or self.cast_x_before_out_mul:
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual, post_residual_addition)
+        if self.cast_x_before_out_mul:
+            # XPU rmsnorm kernels apply the weight before rounding; HF rounding has its own kernel.
+            if (
+                x.is_xpu
+                and residual is None
+                and not is_batch_invariant_mode_enabled()
+                and x.dtype in (torch.bfloat16, torch.float16)
+                and self.weight.dtype == x.dtype
+                and x.stride(-1) == 1
+            ):
+                return rmsnorm_cast_before_mul(
+                    x, self.weight.data, self.variance_epsilon
+                )
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if residual is not None:
