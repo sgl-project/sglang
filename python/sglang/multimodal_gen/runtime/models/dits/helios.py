@@ -508,9 +508,10 @@ class HeliosTransformerBlock(nn.Module):
         original_context_length=None,
         cross_attn_key_value=None,
     ):
+        # Cast the compact table before broadcasting it across tokens.
         if temb.ndim == 4:
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0) + temb.float()
+                self.scale_shift_table.unsqueeze(0).float() + temb.float()
             ).chunk(6, dim=2)
             shift_msa = shift_msa.squeeze(2)
             scale_msa = scale_msa.squeeze(2)
@@ -520,7 +521,7 @@ class HeliosTransformerBlock(nn.Module):
             c_gate_msa = c_gate_msa.squeeze(2)
         else:
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table + temb.float()
+                self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
         # 1. Self-attention
