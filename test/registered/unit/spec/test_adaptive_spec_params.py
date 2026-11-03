@@ -395,6 +395,35 @@ class TestBatchSizeRouting(CustomTestCase):
         self.assertEqual(params.get_steps_for_batch(32), 1)
 
 
+class TestCandidateRestriction(CustomTestCase):
+    """Memory-budget pruning: what the controller may skip, and what it may not."""
+
+    def _params(self):
+        # Slots: bs=1 -> [1,3,5,7], bs=8 -> [0,1,3], bs=32 -> [0,1], bs=64 -> [0].
+        return AdaptiveSpeculativeParams(initial_steps=3)
+
+    def test_required_steps_are_the_slot_start_steps(self):
+        # initial_steps=3 is not a candidate of the bs=32 and bs=64 slots, so
+        # they start on their middle candidate; a batch of that size activates
+        # it before any feedback.
+        self.assertEqual(self._params().required_steps, [0, 1, 3])
+
+    def test_prebuild_order_puts_required_first_then_nearest_hops(self):
+        self.assertEqual(self._params().prebuild_order(), [0, 1, 3, 5, 7])
+
+    def test_restricted_policy_never_selects_a_dropped_step(self):
+        params = self._params()
+        self.assertEqual(params.restrict_candidates({0, 1, 3}), [5, 7])
+        self.assertEqual(params.candidate_steps, [0, 1, 3])
+        for _ in range(40):
+            params.on_verify_complete([7, 7, 7], batch_size=1)
+        self.assertEqual(params.get_steps_for_batch(1), 3)
+
+    def test_restrict_rejects_dropping_a_slot_start_step(self):
+        with self.assertRaisesRegex(ValueError, "BS slot 64 starts on steps=0"):
+            self._params().restrict_candidates({1, 3, 5, 7})
+
+
 class TestResolveCandidateSteps(CustomTestCase):
     def test_default_config(self):
         steps = resolve_candidate_steps_from_config()
