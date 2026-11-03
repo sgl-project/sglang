@@ -1,0 +1,110 @@
+"""WeightBridge receiver for one TP rank of an SGLang engine.
+
+WeightBridge (meta-pytorch/monarch, examples/weightbridge) owns the weight-update control
+plane: a coordinator process per engine relays the trainer's one-time connect, and every
+later update is signalled by the trainer's own RDMA data flags. The scheduler therefore
+never receives an HTTP or tokenizer request for an update; it calls :meth:`poll` once per
+loop iteration on every TP rank, and rank 0's hub broadcast keeps the ranks in lockstep.
+"""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+import time
+from collections.abc import Callable
+from typing import Optional
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+class WeightBridgeReceiver:
+    """Builds the coordinator (engine rank 0) and this rank's ``ReceiverAdapter`` at startup.
+
+    ``rank`` numbers every TP x PP worker of the engine from 0; rank 0 alone sees the trainer's
+    signal and relays each decision to the others over the hub, an IPC socket on a single node or
+    ``hub_addr`` (a TCP endpoint on rank 0's host) when the engine spans nodes.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: torch.nn.Module,
+        hf_checkpoint: str,
+        engine_port: int,
+        rank: int,
+        num_workers: int,
+        hub_addr: Optional[str],
+    ) -> None:
+        from wbridge.backend import coordinator
+        from wbridge.backend.control_channel import (
+            coordinator_ipc,
+            coordinator_tcp_port,
+        )
+        from wbridge.frontend.adapters import AdapterContext, ReceiverAdapter
+        from wbridge.utils.specgen import hf_weights_from_checkpoint
+
+        self._rank = rank
+        ipc = coordinator_ipc(engine_port)
+        self._coordinator: Optional[subprocess.Popen] = (
+            coordinator.spawn(ipc, coordinator_tcp_port(engine_port))
+            if rank == 0
+            else None
+        )
+
+        hf_weights, hf_shapes = hf_weights_from_checkpoint(hf_checkpoint)
+        ctx = AdapterContext(
+            hf_weights=hf_weights,
+            hf_shapes=hf_shapes,
+            wksd_factory=lambda: dict(model.named_parameters()),
+            load_weights=lambda fetcher: model.load_weights(
+                (name, factory()) for name, factory in fetcher.items()
+            ),
+            rank=rank,
+        )
+        # Probing load_weights overwrites every parameter, then restores it from the checkpoint,
+        # which is what a freshly started engine holds.
+        with torch.no_grad():
+            self._adapter = ReceiverAdapter(
+                ctx, ipc, num_workers=num_workers, control_hub_name=hub_addr
+            )
+        logger.info(
+            f"[wbridge] receiver ready: {rank=} {num_workers=} {engine_port=} "
+            f"coordinator={ipc} hub={hub_addr or 'ipc'}"
+        )
+
+    def poll(self, *, quiesce: Callable[[], None]) -> Optional[str]:
+        """Service one control round; return the update's weight version once its weights are loaded.
+
+        ``quiesce`` runs on every rank after WeightBridge's GO and before any weight is written.
+        """
+        epoch: list[Optional[int]] = [None]
+
+        def before_receive(update_epoch: int) -> None:
+            epoch[0] = update_epoch
+            quiesce()
+
+        with torch.no_grad():
+            loaded = self._adapter.poll_requests(before_receive=before_receive)
+        if not loaded:
+            return None
+        # EWTT endpoint: wall clock right after the update is loaded, before generation resumes.
+        logger.info(
+            f"[wbridge] consume_end epoch={epoch[0]} rank={self._rank} "
+            f"t_ns={time.time_ns()}"
+        )
+        return _weight_version_of(self._adapter.update_metadata, epoch=epoch[0])
+
+    def flush_profile_outputs(self) -> None:
+        """Release WeightBridge profiling output once the scheduler has resumed (rollout block_end)."""
+        self._adapter.flush_profile_outputs()
+
+
+def _weight_version_of(metadata: object, *, epoch: int) -> str:
+    # Trainers tag each update with send_weights(metadata={"weight_version": v}); an untagged update
+    # falls back to the count of updates received, which starts at 1.
+    if isinstance(metadata, dict) and metadata.get("weight_version") is not None:
+        return str(metadata["weight_version"])
+    return str(epoch + 1)

@@ -105,13 +105,14 @@ Enable memory saver support when launching the server:
 
 ## Open-To-Use Refit Functionality
 
-After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. For a deeper dive into SGLang's weight update utilities, see [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md).
+After training completes each step, rollout engines must be refit with new weights. SGLang supports four refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. For a deeper dive into SGLang's weight update utilities, see [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md).
 
 **How to choose:**
 
 - **From disk** is simplest and best for elastic rollout scaling and checkpointing.
 - **From tensor** is best for co-located training/rollout when you can pass in-memory tensors.
 - **From distributed** is best for disaggregated training/rollout with dedicated communication groups (NCCL/IB).
+- **Through WeightBridge** is best for disaggregated training/rollout over an RDMA fabric, especially with many rollout replicas: the trainer drives every update and the engine needs no per-update API call.
 
 ### Update Weights from Disk
 
@@ -594,6 +595,25 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 - `engine.update_weights_from_distributed(names, dtypes, shapes, ...)`
 - `engine.end_weight_update()`
 - `engine.destroy_weights_update_group(group_name)`
+
+### Receive Weights through WeightBridge
+
+**When to use:**
+
+- Disaggregated training/rollout over RDMA (Mooncake on InfiniBand/RoCE or EFA), especially at high rollout data parallelism
+- Trainers that send sharded weights directly, without gathering them first
+
+[WeightBridge](https://github.com/harvard-cns/weightbridge) (`pip install wbridge`) moves each trainer rank's own shards directly to the rollout ranks that need them with one-sided RDMA writes. Each replicated tensor crosses the network once: rollout replicas each receive a share and reconstruct the rest among themselves. WeightBridge learns the layout by probing the model's own `load_weights`, so no per-model mapping is needed.
+
+With `--enable-weightbridge-receiver`, every engine worker builds a WeightBridge receiver at startup, and engine rank 0 spawns the engine's coordinator at the HTTP port + 1717, where trainers connect. Each scheduler then polls its receiver once per loop pass. When an update arrives, rank 0 relays the decision to all TP and PP ranks over WeightBridge's own control hub, and every rank applies the same session as an HTTP refit, without any request to the engine: finish the batch in flight, retract or abort every request, load the weights, flush the cache, set the weight version (the trainer's `weight_version` metadata when present), and resume. Under pipeline parallelism the engine first finishes the micro-batches already in flight.
+
+**Server flags:**
+
+- `--enable-weightbridge-receiver`: build the receiver and poll it from the scheduler loop.
+- `--weightbridge-pause-mode {retract,abort}` (default `retract`): requeue in-flight requests to recompute under the new weights, or abort them.
+- `--weightbridge-hub-addr tcp://host:port`: the control hub on the engine's rank-0 host; required when the engine spans several nodes.
+
+Supported: TP, PP, attention DP, multi-node engines. Not supported: data-parallel replicas (`--dp-size > 1`), PD disaggregation, and speculative decoding with PP. The trainer side uses WeightBridge's `SenderAdapter`; [miles](https://github.com/radixark/miles) drives it with `--update-weight-transfer-mode weightbridge`.
 
 ### Per-Token Weight Version Attribution
 

@@ -565,5 +565,8 @@ POSITIONAL_FIELD_ORDER = (
     "output_store_backend_extra_config",
     "remote_instance_weight_loader_start_seed_via_nixl",
     "enable_token_space_processor",
+    "enable_weightbridge_receiver",
+    "weightbridge_pause_mode",
+    "weightbridge_hub_addr",
 )
 # fmt: on
