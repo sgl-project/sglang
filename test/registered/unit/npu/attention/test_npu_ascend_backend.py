@@ -598,7 +598,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         with patch(f"{module}.get_parallel", return_value=parallel):
             backend.init_forward_metadata(batch)
         metadata = backend.forward_metadata
-        self.assertEqual(metadata.prefix_cu_lens_cpu, prefix_lens.cumsum(0).tolist())
+        self.assertEqual(metadata.prefix_lens.tolist(), lengths)
 
         full, local = [], []
         for request, length in enumerate(lengths):
@@ -759,7 +759,6 @@ class TestMlaPrefixFia(unittest.TestCase):
         backend.forward_metadata = ForwardMetadata(
             extend_seq_lens_cpu_int=torch.tensor(query_lens, dtype=torch.int32),
             prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
-            prefix_cu_lens_cpu=torch.tensor(prefix_lens).cumsum(0).tolist(),
             prefix_token_indices=torch.arange(prefix_tokens),
             flatten_prefix_block_tables=indices,
         )

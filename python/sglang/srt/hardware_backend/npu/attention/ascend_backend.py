@@ -133,7 +133,6 @@ class ForwardMetadata:
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
-    prefix_cu_lens_cpu: Optional[List[int]] = None
     prefix_token_indices: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
@@ -780,9 +779,6 @@ class AscendAttnBackend(AttentionBackend):
         ):
             self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
                 "cpu"
-            )
-            self.forward_metadata.prefix_cu_lens_cpu = (
-                self.forward_metadata.prefix_lens.cumsum(0).tolist()
             )
             if self.dense_mla_dcp_target:
                 local_lens, block_tables = self._get_kv_lens_and_block_tables(
@@ -2398,7 +2394,7 @@ class AscendAttnBackend(AttentionBackend):
                         num_key_value_heads=layer.tp_k_head_num,
                         input_layout="TND",
                         actual_seq_qlen=cu_query_lens,
-                        actual_seq_kvlen=self.forward_metadata.prefix_cu_lens_cpu,
+                        actual_seq_kvlen=prefix_lens.cumsum(0).tolist(),
                         sparse_mode=0,
                         softmax_scale=layer.scaling,
                         return_softmax_lse=True,
