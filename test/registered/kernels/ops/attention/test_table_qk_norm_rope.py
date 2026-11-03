@@ -1,11 +1,14 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.kernels.ops.attention.rope import apply_rope_inplace
+from sglang.kernels.ops.attention.rotary_triton import triton_mrope_fused
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -52,6 +55,7 @@ def inputs(d, batch, hq, hk, seed, padded=False, position_dtype=torch.int64):
         (1, 32, 8, False, torch.int64),
         (4, 8, 2, True, torch.int32),
         (32, 32, 8, False, torch.int64),
+        (129, 8, 2, True, torch.int64),
         (257, 7, 1, True, torch.int64),
     ],
 )
@@ -69,6 +73,59 @@ def test_cuda_sequence_is_bit_exact(d, batch, hq, hk, padded, pos_dtype):
     if padded:
         assert_same_bits(storage[:, :8], before[:, :8])
         assert_same_bits(storage[:, -8:], before[:, -8:])
+
+
+@pytest.mark.parametrize("d,section", [(64, [16, 8, 8]), (128, [24, 20, 20])])
+@pytest.mark.parametrize("layout", ["sections", "interleaved", "interleaved_glm"])
+@pytest.mark.parametrize(
+    "batch,hq,hk", [(1, 32, 8), (32, 8, 1), (129, 12, 2), (257, 64, 8)]
+)
+def test_bf16_mrope_matches_triton_mrope(d, section, batch, hq, hk, layout):
+    """A BF16 table with per-axis positions must reproduce the split MRoPE path."""
+    _, x, pos, qw, kw, cache = inputs(d, batch, hq, hk, 29)
+    cache = cache.bfloat16()
+    # Distinct axes, as in prefill or precomputed spatial decode positions.
+    positions = torch.stack([pos, (pos + 7) % len(cache), (pos * 3) % len(cache)])
+    interleaved, glm = layout != "sections", layout == "interleaved_glm"
+    axis_map = MRotaryEmbedding._build_axis_map(
+        SimpleNamespace(
+            mrope_section=section,
+            rotary_dim=d,
+            mrope_interleaved=interleaved,
+            mrope_interleaved_glm=glm,
+            cos_sin_cache=cache,
+        )
+    )
+    expected = x.clone()
+    q, k, _ = expected.split([hq * d, hk * d, hk * d], dim=-1)
+    fused_inplace_qknorm(q.view(batch, hq, d), k.view(batch, hk, d), qw, kw, 1e-6)
+    triton_mrope_fused(
+        q,
+        k,
+        cache,
+        positions,
+        section,
+        d,
+        d,
+        interleaved,
+        glm,
+        True,
+        axis_map if glm else None,
+    )
+    table_qk_norm_rope_(
+        x,
+        positions,
+        qw,
+        kw,
+        cache,
+        hq,
+        hk,
+        d,
+        1e-6,
+        match_cuda=True,
+        axis_map=axis_map,
+    )
+    assert_same_bits(x, expected)
 
 
 @pytest.mark.parametrize("d", [64, 128, 256])
@@ -115,7 +172,7 @@ def test_cuda_mode_rejects_invalid_inputs(invalid):
     elif invalid == "qkv_stride":
         x = x[:, ::2]
     elif invalid == "table":
-        cache = cache.bfloat16()
+        cache = cache.half()
     else:
         pos = pos.float()
     with pytest.raises(AssertionError):

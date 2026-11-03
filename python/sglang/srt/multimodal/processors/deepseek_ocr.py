@@ -1,7 +1,7 @@
 from typing import List, Union
 
 from sglang.srt.configs.deepseek_ocr import is_ocr2_config, local_crop_size
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
