@@ -194,7 +194,14 @@ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "join
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native", "intel_xpu"]
+LORA_BACKEND_CHOICES = [
+    "triton",
+    "csgmv",
+    "ascend",
+    "torch_native",
+    "triton_v2",
+    "intel_xpu",
+]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
