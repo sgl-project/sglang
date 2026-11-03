@@ -68,6 +68,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.is_hybrid_swa = False
         s.waiting_queue = WaitingQueue()
         s.waiting_queue.join(waiting)
+        s.chunked_reqs = _RequestList(ListKind.CHUNKED)
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
         s.policy = Mock()

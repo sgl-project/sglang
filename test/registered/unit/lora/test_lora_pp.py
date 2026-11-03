@@ -138,7 +138,7 @@ class TestAllPPLoras(CustomTestCase):
             enable_lora_overlap_loading=False,
             enable_priority_preemption=False,
             is_hybrid_swa=False,
-            chunked_req=None,
+            chunked_reqs=_RequestList(ListKind.CHUNKED),
             min_free_slots_delayer=None,
             is_mixed_chunk=False,
             dllm_config=None,

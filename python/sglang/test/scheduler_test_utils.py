@@ -42,7 +42,9 @@ def empty_request_lists(scheduler: Scheduler) -> None:
     scheduler.grammar_manager = SimpleNamespace(
         grammar_queue=_RequestList(ListKind.GRAMMAR)
     )
-    scheduler.chunked_req = None
+    scheduler.chunked_reqs = _RequestList(
+        ListKind.CHUNKED, abort=scheduler._defer_chunked_abort
+    )
     scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
     scheduler.running_reqs = _RequestList(ListKind.DECODING)
     scheduler.disagg_prefill_bootstrap_queue = None

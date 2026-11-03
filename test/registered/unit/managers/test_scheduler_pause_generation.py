@@ -102,7 +102,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = _RequestList(ListKind.CHUNKED)
         scheduler.running_reqs = _RequestList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_batch = MagicMock()
@@ -902,7 +902,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler
-        prealloc_queue.queue = []
+        prealloc_queue.queue = _RequestList(ListKind.PD_PREALLOC)
         prealloc_queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
         prealloc_queue.held_rebootstrap_reqs = _RequestList(
             ListKind.PD_HELD, abort=prealloc_queue._abort_held
@@ -910,8 +910,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         prealloc_queue.add = MagicMock()
         scheduler.disagg_decode_prealloc_queue = prealloc_queue
         transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        transfer_queue.queue = []
-        transfer_queue._deferred_releases = []
+        transfer_queue.queue = _RequestList(ListKind.PD_RECEIVING)
+        transfer_queue._deferred_releases = _RequestList(ListKind.PD_RELEASING)
         scheduler.disagg_decode_transfer_queue = transfer_queue
         scheduler.deferred_responses = MagicMock()
         scheduler.mm_receiver = None

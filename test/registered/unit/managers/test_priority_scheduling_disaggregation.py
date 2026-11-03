@@ -985,7 +985,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.schedule_stream = MagicMock()
         scheduler.forward_stream = MagicMock()
         scheduler.ngram_embedding_manager = MagicMock()
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = _RequestList(ListKind.CHUNKED)
         return scheduler
 
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):

@@ -30,7 +30,6 @@ from typing import (
     Any,
     Deque,
     Dict,
-    Iterable,
     List,
     Optional,
     Set,
@@ -1437,7 +1436,9 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_req = None
+        self.chunked_reqs = _RequestList(
+            ListKind.CHUNKED, abort=self._defer_chunked_abort
+        )
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -3964,6 +3965,17 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    @property
+    def chunked_req(self) -> Optional[Req]:
+        """The request between two chunks of its prefill, or None."""
+        return next(iter(self.chunked_reqs), None)
+
+    @chunked_req.setter
+    def chunked_req(self, req: Optional[Req]) -> None:
+        self.chunked_reqs.clear()
+        if req is not None:
+            self.chunked_reqs.join([req])
+
     def stash_chunked_request(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
@@ -4680,13 +4692,13 @@ class Scheduler(
             if not req.finished()
         ]
 
-    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
+    def request_lists(self) -> Dict[ListKind, RequestList]:
         """The lists that hold the live requests, by kind. A request is in at
         most one."""
         lists = {
             ListKind.WAITING: self.waiting_queue,
             ListKind.GRAMMAR: self.grammar_manager.grammar_queue,
-            ListKind.CHUNKED: [] if self.chunked_req is None else [self.chunked_req],
+            ListKind.CHUNKED: self.chunked_reqs,
             ListKind.PREFILL_LAUNCHED: self.prefill_launched_reqs,
             ListKind.DECODING: self.running_reqs,
         }
@@ -6042,19 +6054,20 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-    def abort_request(self, recv_req: AbortReq):
+    def _defer_chunked_abort(self, recv_req: AbortReq) -> None:
+        """Mark the chunked request for `process_pending_chunked_abort`."""
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
+    def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
         if self.mm_receiver is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)
 
         for request_list in self.request_lists().values():
-            if isinstance(request_list, RequestList):
-                request_list.abort(recv_req)
+            request_list.abort(recv_req)
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

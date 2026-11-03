@@ -579,7 +579,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = _RequestList(ListKind.CHUNKED)
         scheduler.waiting_queue = WaitingQueue()
         scheduler.disagg_prefill_transfer_queue = []
         scheduler.enable_staging = False
