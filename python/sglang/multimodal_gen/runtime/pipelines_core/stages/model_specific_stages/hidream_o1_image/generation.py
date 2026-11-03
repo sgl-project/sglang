@@ -24,9 +24,23 @@ from sglang.multimodal_gen.configs.pipeline_configs.hidream_o1_image import (
 )
 from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
     HIDREAM_O1_SUPPORTED_RESOLUTIONS,
+    _VARIANT_DEFAULTS,
     _resolve_variant,
 )
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_transformer,
+    refresh_context_on_transformer,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_group,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.models.dits.hidream_o1_image import (
+    HiO1CacheBlockAdapter,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -217,6 +231,33 @@ def build_scheduler(
     else:
         sched.set_timesteps(num_inference_steps, device)
     return sched
+
+
+def resolve_scheduler_name(
+    editing: bool,
+    model_type: str,
+    scheduler_name: str | None = None,
+) -> str:
+    """Determine which scheduler a request runs on.
+
+    The base recipe is the served variant's default — "default" (UniPC) for the
+    full checkpoint, "flash" for the two Dev checkpoints — taken from
+    ``_VARIANT_DEFAULTS``. Dev TI2I editing swaps the Dev flash scheduler for
+    the flow_match scheduler, which runs the fixed 28-step DEFAULT_TIMESTEPS
+    schedule.
+
+    ``scheduler_name`` is the per-request value from the sampling params
+    (already filled with the variant default by ``_adjust``, or an explicit
+    override). Only the name travels between the stages: the denoising stage
+    builds the scheduler itself for every request, so no scheduler object (and
+    no step counter) is ever shared between requests.
+    """
+    if scheduler_name is None:
+        scheduler_name = _VARIANT_DEFAULTS[model_type]["scheduler_name"]
+    if editing and model_type != "full" and scheduler_name != "flow_match":
+        logger.info("Editing: scheduler %s -> flow_match", scheduler_name)
+        return "flow_match"
+    return scheduler_name
 
 
 def find_closest_resolution(width: int, height: int) -> tuple[int, int]:
@@ -660,7 +701,7 @@ def build_ti2i_text_sample(
     model_config,
 ):
     """Build the TI2I sample (reference-image conditioning, official I2I branch)."""
-    image_token_id = model_config.build_scheduler
+    image_token_id = model_config.image_token_id
     video_token_id = model_config.video_token_id
     vision_start_token_id = model_config.vision_start_token_id
     spatial_merge_size = model_config.vision_spatial_merge_size
@@ -904,17 +945,13 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
         self,
         tokenizer,
         processor,
-        scheduler,
         *,
-        editing_scheduler,
         vision_start_token_id: int,
         tms_token_id: int,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.processor = processor
-        self.scheduler = scheduler
-        self.editing_scheduler = editing_scheduler
         self.vision_start_token_id = vision_start_token_id
         self.tms_token_id = tms_token_id
 
@@ -939,7 +976,6 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
             "num_steps": batch.sampling_params.num_inference_steps,
             "model_type": _resolve_variant(server_args.model_path),
             "guidance_scale": float(batch.guidance_scale),
-            "scheduler_name": batch.scheduler_name,
             "noise_scale_start": float(batch.noise_scale_start),
             "noise_scale_end": float(batch.noise_scale_end),
             "noise_clip_std": float(batch.noise_clip_std),
@@ -1072,6 +1108,31 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
                 ctx["model_config"],
             )
 
+        # The unconditional CFG branch shares the refs/geometry but not the
+        # prompt. Build it here, where the tokenizer lives, so the denoising
+        # stage only expands it to the chunk rows (it has no tokenizer).
+        if ref_paths:
+            uncond_sample = build_ti2i_text_sample(
+                " ",
+                ref_pils_vlm,
+                ref_pils_resized,
+                height,
+                width,
+                ref_image_lens,
+                self.tokenizer,
+                self.processor,
+                ctx["model_config"],
+            )
+        else:
+            uncond_sample = build_t2i_text_sample(
+                " ",
+                height,
+                width,
+                self.tokenizer,
+                self.processor,
+                ctx["model_config"],
+            )
+
         item.update(
             {
                 "height": height,
@@ -1084,6 +1145,7 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
                 "ref_pils_vlm": ref_pils_vlm,
                 "ref_pils_resized": ref_pils_resized,
                 "cond_sample": cond_sample,
+                "uncond_sample": uncond_sample,
                 "group_key": (
                     height,
                     width,
@@ -1207,6 +1269,14 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
         )
         editing = ctx["is_editing"]
 
+        # Determine the scheduler *name* only. The denoising stage builds the
+        # scheduler itself per request, so no scheduler object (or step counter)
+        # is ever shared between requests.
+        ctx["scheduler_name"] = resolve_scheduler_name(
+            editing=editing,
+            model_type=ctx["model_type"],
+        )
+
         # The framework denoising loop (NVTX, CFG gating, cfg-parallel, BCG,
         # trajectory) serves the full model's plain T2I path: single prompt,
         # UniPC recipe, no cache-dit/torch-compile. Everything else — Dev
@@ -1217,38 +1287,39 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
             ctx["model_type"] == "full"
             and ctx["scheduler_name"] in ("default", "unipc", "flow_unipc")
         )
-        framework_path = single_prompt and not editing and uni_pc
+        # cache-dit runs on the hand-rolled flash trajectory, never the framework
+        # dense path, so a cache-dit request must stay off ``framework_path``.
+        cache_dit_requested = (
+            envs.SGLANG_CACHE_DIT_ENABLED
+            if batch.sampling_params.enable_cache_dit is None
+            else batch.sampling_params.enable_cache_dit
+        )
+        framework_path = single_prompt and not editing and uni_pc and not cache_dit_requested
         ctx["framework_path"] = framework_path
+        ctx["cache_dit_requested"] = cache_dit_requested
         ctx["device"] = str(device)
 
         first = items[0]
         height, width = first["height"], first["width"]
         h_patches, w_patches = first["h_patches"], first["w_patches"]
 
-        # Scheduler templates are built at load; the Dev editing recipe just
-        # selects the flow_match one (official editing default).
-        scheduler = self.scheduler
-        if (
-            editing
-            and ctx["model_type"] != "full"
-            and ctx["scheduler_name"] != "flow_match"
-        ):
-            logger.info("Editing: scheduler %s -> flow_match", ctx["scheduler_name"])
-            ctx["scheduler_name"] = "flow_match"
-            scheduler = self.editing_scheduler
-        if isinstance(scheduler, FlashFlowMatchScheduler):
-            # reset the per-request step counter on the shared template
-            scheduler.set_timesteps_list(DEFAULT_TIMESTEPS, device)
-        else:
-            scheduler.set_timesteps(ctx["num_steps"], device=device)
-        ctx["scheduler"] = scheduler
+        latents = self._prepare_latents(
+            seeds=[it["seed"] for it in items],
+            height=height,
+            width=width,
+            patch_size=PATCH_SIZE,
+            channels=3,
+            dtype=dit_dtype,
+            device=device,
+            noise_scale=ctx["noise_scale_start"],
+        )
 
         if framework_path:
             # Main's contract: conditioning stashed for the framework CFG
             # branches; the backbone embeds the prompt itself, so
             # prompt_embeds only satisfy the denoising stage's contract.
             cond = self._build_conditioning(
-                _resolve_single_prompt(batch.prompt, field_name="prompt"),
+                _resolve_single_prompt(prompts, field_name="prompt"),
                 batch_size=len(items),
                 h_patches=h_patches,
                 w_patches=w_patches,
@@ -1266,17 +1337,6 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
                 mask_dtype=dit_dtype,
                 device=device,
             )
-
-            latents = self._prepare_latents(
-                seeds=[it["seed"] for it in items],
-                height=height,
-                width=width,
-                patch_size=PATCH_SIZE,
-                channels=3,
-                dtype=dit_dtype,
-                device=device,
-                noise_scale=ctx["noise_scale_start"],
-            )
             batch.extra[HIDREAM_O1_COND_KEY] = cond
             batch.extra[HIDREAM_O1_NEG_COND_KEY] = neg_cond
             batch.prompt_embeds = [cond["input_ids"]]
@@ -1285,9 +1345,6 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
         batch.extra["hidream_o1_ctx"] = ctx
         batch.extra["hidream_o1_items"] = items
         batch.latents = latents
-        batch.timesteps = scheduler.timesteps
-        batch.scheduler = scheduler
-        batch.sigmas = scheduler.sigmas.tolist()
         batch.raw_latent_shape = latents.shape
         batch.height = height
         batch.width = width
@@ -1297,8 +1354,23 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs):
         result = VerificationResult()
         result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(3)])
-        result.add_check("timesteps", batch.timesteps, V.is_tensor)
         return result
+
+
+def _register_hidream_o1_cache_dit_spec() -> None:
+    from cache_dit import ForwardPattern
+
+    from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+        _CUSTOM_BLOCK_ADAPTER_SPECS,
+        CustomBlockAdapterSpec,
+    )
+
+    _CUSTOM_BLOCK_ADAPTER_SPECS.setdefault(
+        HiO1CacheBlockAdapter.__name__,
+        CustomBlockAdapterSpec(
+            blocks_attr="blocks", forward_pattern=ForwardPattern.Pattern_3
+        ),
+    )
 
 
 class HiDreamO1ImageDenoisingStage(DenoisingStage):
@@ -1315,22 +1387,109 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
     reroll and cache-dit — none of which the shared loop can express.
     """
 
-    def __init__(self, model: torch.nn.Module, scheduler, processor: Any) -> None:
+    def __init__(self, model: torch.nn.Module) -> None:
         # Route the model through the base init so the framework's compile/
         # offload and attention-backend wiring see the transformer.
-        super().__init__(transformer=model, scheduler=scheduler)
+        #
+        # No scheduler is held here: the before-denoising stage only resolves
+        # the scheduler *name* into ``ctx["scheduler_name"]``, and this stage
+        # builds a fresh scheduler per request in ``forward`` (the Dev editing
+        # recipe swaps flash for flow_match, and the step counter must not be
+        # shared between requests). Text samples (cond + uncond) are built in
+        # the before-denoising stage, which owns the tokenizer/processor.
+        super().__init__(transformer=model, scheduler=None)
         self.model = model
-        self.processor = processor
+        self._cache_dit_adapter: HiO1CacheBlockAdapter | None = None
+        self._cache_dit_num_steps: int | None = None
 
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        # ``batch.timesteps`` is created per request inside ``forward`` (the
+        # scheduler is built there), so it cannot be validated before the stage
+        # runs; the latents shape is all this stage needs at its boundary.
+        result = VerificationResult()
+        result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(3)])
+        return result
+
+    def _build_cache_dit_config(self, num_inference_steps: int) -> CacheDitConfig:
+        return CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
+            Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
+            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
+            residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
+            max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
+            enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
+            taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
+            num_inference_steps=num_inference_steps,
+        )
+
+    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
+        """Mount cache-dit on the flash decoder loop (env/per-request gated, idempotent).
+
+        The O1 backbone is not a diffusers DiT, so it is exposed via
+        HiO1CacheBlockAdapter (see that adapter's docstring for the naming
+        constraint); SGLANG_CACHE_DIT_* then apply as for GLM-Image/Wan.
+        """
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            return
+        if self._cache_dit_adapter is None:
+            _register_hidream_o1_cache_dit_spec()
+            self._cache_dit_adapter = HiO1CacheBlockAdapter(self.model.model)
+            tp_group = None
+            if model_parallel_is_initialized():
+                group = get_tp_group()
+                tp_group = group.device_group if group.world_size > 1 else None
+            enable_cache_on_transformer(
+                self._cache_dit_adapter,
+                self._build_cache_dit_config(num_inference_steps),
+                model_name="hidream_o1_image",
+                tp_group=tp_group,
+                has_separate_cfg=True,
+            )
+            self.log_info(
+                "cache-dit enabled on HiDream-O1-Image (Fn=%d Bn=%d W=%d R=%.2f "
+                "MC=%d TaylorSeer=%s)",
+                envs.SGLANG_CACHE_DIT_FN,
+                envs.SGLANG_CACHE_DIT_BN,
+                envs.SGLANG_CACHE_DIT_WARMUP,
+                envs.SGLANG_CACHE_DIT_RDT,
+                envs.SGLANG_CACHE_DIT_MC,
+                envs.SGLANG_CACHE_DIT_TAYLORSEER,
+            )
+        # Refresh every request: a new generation resets cache-dit's step counter.
+        refresh_context_on_transformer(self._cache_dit_adapter, num_inference_steps)
+        self._cache_dit_num_steps = num_inference_steps
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         ctx = batch.extra["hidream_o1_ctx"]
+        # Build the request's scheduler from the recipe the before-denoising
+        # stage resolved, and publish it for the framework loop
+        # (``batch.scheduler`` / ``batch.timesteps``) and the hand-rolled
+        # trajectory (``ctx["scheduler"]``).
+        scheduler = build_scheduler(
+            num_inference_steps=ctx["num_steps"],
+            timesteps_list=(
+                DEFAULT_TIMESTEPS
+                if ctx["scheduler_name"] in ("flash", "flow_match")
+                else None
+            ),
+            shift=ctx["shift"],
+            device=self.device,
+            scheduler_name=ctx["scheduler_name"],
+        )
+        ctx["scheduler"] = scheduler
+        batch.scheduler = scheduler
+        batch.timesteps = scheduler.timesteps
+        batch.sigmas = scheduler.sigmas.tolist()
         if ctx.get("framework_path"):
             return super().forward(batch, server_args)
+        if ctx.get("cache_dit_requested"):
+            self._maybe_enable_cache_dit(ctx["num_steps"])
         items = batch.extra["hidream_o1_items"]
         chunks = _chunk_items(items, ctx["max_forward_rows"])
         z_rows: list = [None] * len(items)
@@ -1420,7 +1579,9 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
             uncond = self._build_uncond_sample(first, ctx, len(chunk))
 
         sched = ctx["scheduler"]
-        inject_noise = ctx["scheduler_name"] == "flash"
+        # The flash scheduler is the one that injects per-step noise; key off
+        # the scheduler in use so the name cannot desync the trajectory.
+        inject_noise = isinstance(sched, FlashFlowMatchScheduler)
         num_steps = len(sched.timesteps)
         if inject_noise and num_steps > 1:
             noise_scale_schedule = [
@@ -1549,15 +1710,23 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                     s_noise=noise_scale_schedule[step_idx],
                     noise=noise,
                 ).to(dit_dtype)
+            elif isinstance(sched, FlowMatchScheduler):
+                # FlowMatch's Euler step takes no ``return_dict`` and returns
+                # the sample tensor directly.
+                z = sched.step(
+                    model_output.float(),
+                    step_t.to(dtype=torch.float32),
+                    z.float(),
+                ).to(dit_dtype)
             else:
+                # UniPC (full-model TI2I) is diffusers-style: it accepts
+                # ``return_dict`` and returns a ``(prev_sample,)`` tuple.
                 step_out = sched.step(
                     model_output.float(),
                     step_t.to(dtype=torch.float32),
                     z.float(),
                     return_dict=False,
                 )
-                # the framework UniPC returns (sample,); the Dev schedulers
-                # return the sample tensor directly
                 z = (
                     step_out[0] if isinstance(step_out, tuple) else step_out
                 ).to(dit_dtype)
@@ -1676,28 +1845,14 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
         return torch.cat(rows, dim=0)
 
     def _build_uncond_sample(self, first: dict, ctx: dict, batch_rows: int) -> dict:
-        """One uncond sample for the chunk's refs/size, expanded to all rows."""
-        if first["ref_paths"]:
-            sample = build_ti2i_text_sample(
-                " ",
-                first["ref_pils_vlm"],
-                first["ref_pils_resized"],
-                first["height"],
-                first["width"],
-                first["ref_image_lens"],
-                self.tokenizer,
-                self.processor,
-                ctx["model_config"],
-            )
-        else:
-            sample = build_t2i_text_sample(
-                " ",
-                first["height"],
-                first["width"],
-                self.tokenizer,
-                self.processor,
-                ctx["model_config"],
-            )
+        """Expand the before-denoising stage's uncond sample to all chunk rows.
+
+        The unconditional base sample (empty prompt) is built in the
+        before-denoising stage, which owns the tokenizer; this stage only
+        broadcasts it to the chunk's rows.
+        """
+        del ctx
+        sample = first["uncond_sample"]
         b = batch_rows
         expanded = {
             "input_ids": sample["input_ids"].expand(b, -1),
@@ -1738,6 +1893,31 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
             "timestep": t_pixeldit.reshape(-1).to(device),
             "token_types": sample["token_types"].to(device),
         }
+
+        if (
+            self._cache_dit_adapter is not None
+            and pixel_values is None
+            and not getattr(self.model, "_fsdp_wrapped", False)
+        ):
+            # cache-dit drives the flash decoder loop itself: embed once, run the
+            # wrapped block chain, then project with the final RMSNorm applied.
+            inputs_embeds, conds, _ = self.model.forward_pre(
+                input_ids=common_kwargs["input_ids"],
+                position_ids=common_kwargs["position_ids"],
+                vinputs=common_kwargs["vinputs"],
+                timestep=common_kwargs["timestep"],
+                token_types=common_kwargs["token_types"],
+            )
+            hidden_states = self._cache_dit_adapter(
+                inputs_embeds,
+                conds["cos"],
+                conds["sin"],
+                conds["idx_ar"],
+            )
+            return (
+                self.model.forward_post(hidden_states, apply_norm=True)["x_pred"],
+                None,
+            )
 
         outputs = self.model(
             **common_kwargs,

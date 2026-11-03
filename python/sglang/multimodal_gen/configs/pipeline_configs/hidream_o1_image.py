@@ -109,6 +109,15 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
         del batch
         return latents
 
+    def calculate_condition_image_size(self, image, width, height):
+        # HiDream has no VAE, so there is no latent-aligned multiple to resize
+        # the reference to. The before-denoising stage sizes the reference
+        # itself (aspect-preserving), so returning None skips the VAE-based
+        # size adjustment in InputValidationStage, which would otherwise hit a
+        # VAE-less scale factor.
+        del image, width, height
+        return None
+
 
 def register():
     from sglang.multimodal_gen.configs.sample.hidream_o1_image import (

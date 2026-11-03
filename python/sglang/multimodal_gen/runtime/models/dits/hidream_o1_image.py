@@ -547,6 +547,105 @@ def _flash_decoder_layer(
     return hidden_states
 
 
+class _HiO1CacheBlock(nn.Module):
+    """Pattern_3 view of one decoder layer for cache-dit.
+
+    cache-dit drives blocks as ``(hidden_states, *conds) -> hidden_states``
+    (ForwardPattern.Pattern_3); the flash two-pass path is a pure
+    ``hidden -> hidden`` map per layer. Held by plain reference
+    (object.__setattr__) so parameters stay registered only under
+    ``HiDreamO1TextModel.layers``.
+    """
+
+    def __init__(
+        self,
+        layer: nn.Module,
+        deepstack_process: Callable[..., torch.Tensor],
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        deepstack_embed: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        object.__setattr__(self, "_layer", layer)
+        object.__setattr__(self, "_deepstack_process", deepstack_process)
+        object.__setattr__(self, "_visual_pos_masks", visual_pos_masks)
+        object.__setattr__(self, "_deepstack_embed", deepstack_embed)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        idx_ar: torch.Tensor,
+    ) -> torch.Tensor:
+        # Drops the residual (the flash path keeps the pure hidden->hidden map).
+        # TI2I reference features are baked in per block; T2I blocks carry None.
+        return _flash_decoder_layer(
+            self._layer,
+            hidden_states,
+            cos,
+            sin,
+            idx_ar,
+            None,
+            self._visual_pos_masks,
+            self._deepstack_embed,
+            self._deepstack_process,
+        )
+
+
+class HiO1CacheBlockAdapter(nn.Module):
+    """cache-dit-wrappable view of the flash decoder block loop (Pattern_3).
+
+    Threads ``cos`` / ``sin`` / ``idx_ar`` through every block unchanged, then
+    leaves the final RMSNorm to ``forward_post(apply_norm=True)``. ``pad_mask`` is
+    omitted because the flash path never pads, so every cond is a tensor. For TI2I
+    the constant reference features (``visual_pos_masks`` / per-layer
+    ``deepstack_visual_embeds``) are baked into each block so the per-layer
+    injection stays inside the cached block body.
+    The name must NOT start with ``HiDream``: cache-dit's
+    ``BlockAdapterRegister.is_supported`` prefix-matches class names and would
+    mis-resolve this to its built-in (dual-stream) HiDream adapter instead of the
+    custom Pattern_3 spec.
+    """
+
+    def __init__(
+        self,
+        model: "HiDreamO1ImageModel",
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+    ) -> None:
+        super().__init__()
+        text_model = model.language_model
+        n_deepstack = (
+            len(deepstack_visual_embeds) if deepstack_visual_embeds is not None else 0
+        )
+        self.blocks = nn.ModuleList(
+            [
+                _HiO1CacheBlock(
+                    layer,
+                    text_model._deepstack_process,
+                    visual_pos_masks,
+                    (
+                        deepstack_visual_embeds[layer_idx]
+                        if layer_idx < n_deepstack
+                        else None
+                    ),
+                )
+                for layer_idx, layer in enumerate(text_model.layers)
+            ]
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        idx_ar: torch.Tensor,
+    ) -> torch.Tensor:
+        for block in self.blocks:
+            hidden_states = block(hidden_states, cos, sin, idx_ar)
+        return hidden_states.contiguous()
+
+
 class HiDreamO1ImageModel(nn.Module):
     def __init__(
         self,
@@ -676,6 +775,52 @@ class HiDreamO1ImageTransformer(BaseDiT):
     @property
     def visual(self):
         return self.model.visual
+
+    def post_load_weights(self) -> None:
+        """Rebuild the vision tower's RoPE cache, which the checkpoint does not carry.
+
+        The Qwen3-VL vision tower creates its rotary embedding while the model is
+        being built on the meta device. ``cos_sin_cache`` is a non-persistent
+        buffer, so the weight loader never materializes it and it stays on meta.
+        Recompute it here on the real device, mirroring
+        ``RotaryEmbedding._compute_cos_sin_cache``.
+        """
+        visual = self.model.visual
+        if visual is None:
+            return
+        rotary_emb = getattr(visual, "rotary_pos_emb", None)
+        if rotary_emb is None:
+            return
+        cache = getattr(rotary_emb, "cos_sin_cache", None)
+        if cache is None or not cache.is_meta:
+            return
+
+        device = next(visual.parameters()).device
+        # Recompute exactly what RotaryEmbedding._compute_cos_sin_cache would
+        # have produced had the model not been built on the meta device.
+        inv_freq = 1.0 / (
+            rotary_emb.base
+            ** (
+                torch.arange(
+                    0, rotary_emb.rotary_dim, 2, dtype=torch.float, device=device
+                )
+                / rotary_emb.rotary_dim
+            )
+        )
+        t = torch.arange(
+            rotary_emb.position_start,
+            rotary_emb.position_start + rotary_emb.max_position_embeddings,
+            dtype=torch.float,
+            device=device,
+        )
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        new_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+        # Match RotaryEmbedding.__init__: the cache stays in FP32 on CUDA-like
+        # devices for numerical stability, and is cast to the model dtype
+        # elsewhere.
+        if device.type not in ("cuda", "hip", "xpu"):
+            new_cache = new_cache.to(rotary_emb.dtype)
+        rotary_emb.register_buffer("cos_sin_cache", new_cache, persistent=False)
 
     # ------------------------------------------------------------------
     # TI2I / two-pass SDPA interface (Dev variants)

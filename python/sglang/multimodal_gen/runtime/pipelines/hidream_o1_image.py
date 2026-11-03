@@ -44,15 +44,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     HiDreamO1ImageDecodingStage,
     HiDreamO1ImageDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream_o1_image.generation import (
-    DEFAULT_TIMESTEPS,
-    FlowMatchScheduler,
-    build_scheduler,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from transformers import AutoProcessor
+from transformers import PreTrainedTokenizerBase
 
 logger = init_logger(__name__)
 
@@ -93,7 +90,7 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         model_path = maybe_download_model(
             self.model_path, revision=server_args.revision
         )
-        with open(os.path.join(model_dir, "config.json")) as config_file:
+        with open(os.path.join(model_path, "config.json")) as config_file:
             hf_config = json.load(config_file)
 
         if loaded_modules is not None and _HIDREAM_O1_MODULES <= set(loaded_modules):
@@ -102,7 +99,7 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
 
         dit_config = server_args.pipeline_config.dit_config
         variant = _resolve_variant(model_path)
-        w_dtype = getattr(torch, _VARIANT_DEFAULTS[variant]["torch_dtype"])
+        w_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
         # The vision tower is built for every variant: the stage serves TI2I
         # editing for all of them, and the checkpoint ships model.visual.*.
@@ -125,32 +122,14 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         )
         self._validate_tms_token(tokenizer, dit_config)
 
-        # The variant-default scheduler is built once at pipeline creation,
-        # like the official pipeline builds its scheduler before denoising:
-        # full -> FlowUniPCMultistepScheduler via the diffusion defaults
-        # (recipe shift 3.0), Dev -> flash. The Dev editing override is also a
-        # deployment constant (the variant recipe decides it, not the
-        # request), so its flow_match template is built here too; the stage
-        # only selects a template and re-arms its per-request step counter.
-        variant_defaults = _VARIANT_DEFAULTS[variant] # TODO: check need to change
-        scheduler = build_scheduler(
-            num_inference_steps=server_args.pipeline_config.num_inference_steps,
-            timesteps_list=None if variant == "full" else DEFAULT_TIMESTEPS,
-            shift=variant_defaults["shift"],
-            device=get_local_torch_device(),
-            scheduler_name=variant_defaults["scheduler_name"],
-        )
-        editing_scheduler = FlowMatchScheduler(shift=variant_defaults["shift"])
-        editing_scheduler.set_timesteps_list(
-            DEFAULT_TIMESTEPS, get_local_torch_device()
-        )
-
+        # No scheduler is built here: the scheduler depends on the request
+        # (task type, number of reference images), so the before-denoising
+        # stage only resolves the scheduler *name* and the denoising stage
+        # builds the scheduler per request.
         return {
             "model": model,
             "processor": processor,
             "tokenizer": tokenizer,
-            "scheduler": scheduler,
-            "editing_scheduler": editing_scheduler,
         }
 
     @staticmethod
@@ -224,8 +203,6 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
             HiDreamO1ImageBeforeDenoisingStage(
                 tokenizer=self.get_module("tokenizer"),
                 processor=processor,
-                scheduler=self.get_module("scheduler"),
-                editing_scheduler=self.get_module("editing_scheduler"),
                 vision_start_token_id=arch_config.vision_start_token_id,
                 tms_token_id=arch_config.tms_token_id,
             ),
@@ -234,8 +211,6 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         self.add_stage(
             HiDreamO1ImageDenoisingStage(
                 model=self.get_module("model"),
-                scheduler=self.get_module("scheduler"),
-                processor=processor,
             ),
             "hidream_o1_image_denoising_stage",
         )
