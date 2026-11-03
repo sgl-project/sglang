@@ -1,0 +1,284 @@
+"""End-to-end test of --cuda-graph-persistence (Foundry CUDA graph save/restore).
+
+Three engines run in sequence on one GPU with the same CUDA graph
+sets: native capture, Foundry SAVE (captures and writes the archive) and
+Foundry LOAD (rebuilds the graphs from the archive instead of capturing). LOAD
+must produce the same greedy tokens as native, restore every archived graph
+quickly, and actually run Foundry.
+
+Qwen3.5-2B (hybrid gated DeltaNet) runs decode graphs only: its full-backend
+prefill capture fails in SGLang (the GDN out-of-graph metadata is decode-only).
+test_cuda_graph_persistence_prefill.py covers full-backend prefill plus decode
+graphs with Qwen3-1.7B; test_cuda_graph_persistence_spec.py the EAGLE3
+decode-type graph kinds with Qwen3-30B-A3B-FP8.
+
+Needs the optional dependency sglang[foundry] (the CUDA CI installs it).
+
+Run:  python3 test/registered/e2e/cuda_graph/persistence/test_cuda_graph_persistence.py
+"""
+
+import glob
+import os
+import re
+import shutil
+import tempfile
+import unittest
+
+import requests
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+    terminate_and_kill_process_tree,
+)
+
+register_cuda_ci(est_time=215, stage="base-b", runner_config="1-gpu-large")
+
+# Seconds for LOAD's graph restore (decode + prefill lines summed). H200 restores 12
+# graphs in ~0.03 s; arbitrary headroom for shared CI hosts.
+_RESTORE_BOUND_S = 2.0
+
+_PROMPTS = [
+    "The capital of France is",
+    "1, 2, 3, 4, 5,",
+    "def fibonacci(n):",
+    "Explain why the sky is blue in one sentence.",
+    "Translate to German: The weather is nice today.",
+    "The three primary colors are",
+    "Write a haiku about the ocean.",
+    "In 1969, the first person to walk on the moon was",
+]
+_SAMPLING = {"temperature": 0, "max_new_tokens": 64, "ignore_eos": True}
+
+_ACTIVE = re.compile(r"\[Foundry\] cuda graph persistence active: pid=(\d+) mode=(\w+)")
+# "Loaded N SGLang graphs" (target decode) or "Loaded N SGLang <kind> graphs" (the
+# speculative-decoding kinds target_verify / draft_decode / draft_extend).
+_DECODE_LOADED = re.compile(
+    r"\[Foundry\] Loaded (\d+) SGLang (?!prefill )(?:(\w+) )?graphs in ([0-9.]+)s"
+)
+_PREFILL_LOADED = re.compile(
+    r"\[Foundry\] Loaded (\d+) SGLang prefill graphs in ([0-9.]+)s"
+)
+_PREFILL_PASSES = re.compile(
+    r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+    r"\s+([0-9.eE+-]+)$",
+    re.MULTILINE,
+)
+
+
+def _write_toml(path: str, workspace: str) -> str:
+    # The region is virtual address space for everything allocated after setup,
+    # the KV pool included; 256GB covers an 80-192 GB GPU at this memory fraction.
+    # No mode key: --cuda-graph-persistence gives it.
+    with open(path, "w") as f:
+        f.write(
+            'base_addr = 0x600000000000\nregion_size = "256GB"\n'
+            f'workspace_root = "{workspace}"\nscratch_space_size = "1024MB"\n'
+        )
+    return path
+
+
+def _prefill_graph_passes(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    return sum(map(float, _PREFILL_PASSES.findall(metrics)), 0.0)
+
+
+def _generate(base_url: str, text):
+    response = requests.post(
+        base_url + "/generate",
+        json={"text": text, "sampling_params": _SAMPLING},
+        timeout=300,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+class TestFoundryGraphPersistence(CustomTestCase):
+    model = "Qwen/Qwen3.5-2B"
+    decode_bs = [1, 2, 3, 4, 5, 6, 7, 8]
+    # Empty = prefill graphs disabled; the prefill assertions then expect none.
+    prefill_bs = []
+    # None = SGLang's default (fa3 on Hopper).
+    attention_backend = None
+    # Decode-type graph kinds SAVE archives and LOAD restores: [None] = the target
+    # decode graphs (archive files graph_*_FULL_t*); speculative decoding replaces
+    # them by target_verify / draft_decode / draft_extend (graph_*_DECODE-<kind>_t*).
+    decode_kinds = [None]
+    # Appended to the server args of every engine (subclasses: speculative decoding).
+    extra_server_args = []
+    process = None
+    tmp = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.tmp = tempfile.mkdtemp(prefix="foundry_e2e_")
+        cls.workspace = os.path.join(cls.tmp, "archive")
+        cls.toml = _write_toml(os.path.join(cls.tmp, "foundry.toml"), cls.workspace)
+        if cls.prefill_bs:
+            prefill_args = [
+                "full",
+                "--cuda-graph-bs-prefill",
+                *map(str, cls.prefill_bs),
+            ]
+        else:
+            prefill_args = ["disabled"]
+        cls.server_args = [
+            "--cuda-graph-backend-prefill",
+            *prefill_args,
+            "--cuda-graph-bs-decode",
+            *map(str, cls.decode_bs),
+            "--disable-cuda-graph-padding",
+            "--mem-fraction-static",
+            "0.6",
+            "--max-running-requests",
+            str(max(cls.decode_bs)),
+            "--random-seed",
+            "0",
+            "--enable-metrics",
+            # The batched request reaches the scheduler as one batch, so every
+            # engine prefills the same batch composition.
+            "--enable-tokenizer-batch-encode",
+        ]
+        if cls.attention_backend is not None:
+            cls.server_args += ["--attention-backend", cls.attention_backend]
+        cls.server_args += cls.extra_server_args
+        # Native first: it also fills the JIT caches, which SAVE must not compile
+        # inside its capture window.
+        cls.runs = {"native": cls._run_engine("native", mode=None)}
+        cls.runs["save"] = cls._run_engine("save", mode="save")
+        cls.runs["load"] = cls._run_engine("load", mode="load")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+            cls.process = None
+        if cls.tmp is not None:
+            shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _run_engine(cls, name, mode):
+        out_path = os.path.join(cls.tmp, f"{name}.out")
+        err_path = os.path.join(cls.tmp, f"{name}.err")
+        result = {}
+        with open(out_path, "w") as out, open(err_path, "w") as err:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=cls.server_args + cls._persistence_args(mode),
+                return_stdout_stderr=(out, err),
+            )
+            try:
+                passes_before = _prefill_graph_passes(cls.base_url)
+                # One request at a time, then all prompts as one batch (batch encode).
+                result["sequential"] = []
+                for prompt in _PROMPTS:
+                    # A radix hit would shrink the prefill below the smallest bucket.
+                    # timeout: wait for the scheduler to drain the previous
+                    # request; without it /flush_cache answers 400 while busy.
+                    requests.post(
+                        cls.base_url + "/flush_cache",
+                        params={"timeout": 30},
+                        timeout=60,
+                    ).raise_for_status()
+                    result["sequential"].append(
+                        _generate(cls.base_url, prompt)["output_ids"]
+                    )
+                result["prefill_passes"] = (
+                    _prefill_graph_passes(cls.base_url) - passes_before
+                )
+                result["batched"] = [
+                    r["output_ids"] for r in _generate(cls.base_url, _PROMPTS)
+                ]
+            finally:
+                terminate_and_kill_process_tree(cls.process)
+                cls.process = None
+        with open(err_path) as f_err, open(out_path) as f_out:
+            result["log"] = f_err.read() + f_out.read()
+        return result
+
+    @classmethod
+    def _persistence_args(cls, mode):
+        if mode is None:
+            return []
+        return [
+            "--cuda-graph-persistence",
+            mode,
+            "--cuda-graph-persistence-config",
+            cls.toml,
+        ]
+
+    def _archived_decode_graphs(self, kind):
+        pattern = (
+            "graph_*_FULL_t*.json" if kind is None else f"graph_*_DECODE-{kind}_t*.json"
+        )
+        return glob.glob(os.path.join(self.workspace, "rank_0", pattern))
+
+    def test_save_writes_archive(self):
+        rank_dir = os.path.join(self.workspace, "rank_0")
+        prefill = glob.glob(os.path.join(rank_dir, "graph_*_PREFILL_t*.json"))
+        for kind in self.decode_kinds:
+            with self.subTest(kind=kind):
+                decode = self._archived_decode_graphs(kind)
+                self.assertEqual(len(decode), len(self.decode_bs), sorted(decode))
+        if self.prefill_bs:
+            self.assertGreaterEqual(len(prefill), len(self.prefill_bs), sorted(prefill))
+        else:
+            self.assertEqual(prefill, [])
+
+    def test_greedy_output_matches_native(self):
+        for engine in ("save", "load"):
+            for kind in ("sequential", "batched"):
+                with self.subTest(engine=engine, kind=kind):
+                    self.assertEqual(self.runs[engine][kind], self.runs["native"][kind])
+
+    def test_load_restores_and_replays_every_graph(self):
+        log = self.runs["load"]["log"]
+        decode = {kind or None: int(n) for n, kind, _ in _DECODE_LOADED.findall(log)}
+        prefill = [int(n) for n, _ in _PREFILL_LOADED.findall(log)]
+        archived_prefill = len(
+            glob.glob(os.path.join(self.workspace, "rank_0", "graph_*_PREFILL_t*.json"))
+        )
+        # One Loaded line per decode-type kind, each with every archived graph.
+        self.assertEqual(
+            decode, {kind: len(self.decode_bs) for kind in self.decode_kinds}
+        )
+        if not self.prefill_bs:
+            self.assertEqual(prefill, [])
+            return
+        self.assertEqual(prefill, [archived_prefill])
+        # A restored prefill graph that the runner never selects would pass the
+        # count checks and silently run eager prefills.
+        self.assertGreaterEqual(self.runs["native"]["prefill_passes"], len(_PROMPTS))
+        self.assertGreaterEqual(self.runs["load"]["prefill_passes"], len(_PROMPTS))
+
+    def test_load_restore_time(self):
+        log = self.runs["load"]["log"]
+        times = [float(t) for _, _, t in _DECODE_LOADED.findall(log)]
+        times += [float(t) for _, t in _PREFILL_LOADED.findall(log)]
+        self.assertTrue(times, "no [Foundry] Loaded line in the LOAD log")
+        self.assertLess(sum(times), _RESTORE_BOUND_S, times)
+
+    def test_foundry_active_without_hook_errors(self):
+        self.assertIsNone(
+            _ACTIVE.search(self.runs["native"]["log"]),
+            "Foundry active without --cuda-graph-persistence",
+        )
+        for engine in ("save", "load"):
+            log = self.runs[engine]["log"]
+            with self.subTest(engine=engine):
+                active = _ACTIVE.findall(log)
+                # Launcher (resolution) and scheduler each activate it, in the flag's mode.
+                self.assertGreaterEqual(len({pid for pid, _ in active}), 2)
+                self.assertEqual({mode for _, mode in active}, {engine})
+                # An allocation outside the region is only logged by the hook.
+                self.assertNotIn("[HOOK] ERROR", log)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=3)
