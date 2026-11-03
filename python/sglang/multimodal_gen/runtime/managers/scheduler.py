@@ -507,6 +507,14 @@ class Scheduler(
                     reqs=reqs, error_msg=output_batch.error, cancelled=True
                 )
             if output_batch.error:
+                if output_batch.error_code == "invalid_request":
+                    # Validation finishes before prefix/action work or any output.
+                    logger.warning(
+                        "Invalid grouped observation; isolating %d requests: %s",
+                        len(reqs),
+                        output_batch.error,
+                    )
+                    return self._execute_generation_sequential(reqs)
                 logger.error(
                     "Native grouped execution returned error. Returning per-request errors: %s",
                     output_batch.error,

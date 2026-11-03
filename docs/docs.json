@@ -1689,6 +1689,13 @@
                     ]
                   },
                   {
+                    "group": "OpenDM",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/OpenDM/DM05"
+                    ]
+                  },
+                  {
                     "group": "Black Forest Labs",
                     "tag": "NEW",
                     "pages": [

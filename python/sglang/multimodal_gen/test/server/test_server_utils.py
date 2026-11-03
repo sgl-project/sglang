@@ -1743,6 +1743,7 @@ def get_generate_fn(
         extra = dict(sampling_params.extras)
         action_horizon = int(extra.get("action_horizon", 50))
         action_dim = int(extra.get("action_dim", 32))
+        output_action_dim = int(extra.get("output_action_dim", action_dim))
         state_dim = int(extra.get("state_dim", action_dim))
         image_size = int(extra.get("image_size", 64))
         # Policies with a fixed camera resolution (e.g. DROID 360x640) set both.
@@ -1823,10 +1824,10 @@ def get_generate_fn(
 
         body = response.json()
         action = body["data"][0]["action"]
-        if action["shape"] != [action_horizon, action_dim]:
+        if action["shape"] != [action_horizon, output_action_dim]:
             pytest.fail(
                 f"{case_id}: action shape mismatch: {action['shape']} "
-                f"!= {[action_horizon, action_dim]}"
+                f"!= {[action_horizon, output_action_dim]}"
             )
         values = action["values"]
         if not all(

@@ -20,6 +20,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
+    DM05_LIBERO_ACTION_CI_sampling_params,
     FLUX3_ACTION_CI_sampling_params,
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
@@ -122,6 +123,20 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         PI05_ACTION_CI_sampling_params,
         run_perf_check=False,
         perf_warmup_requests=1,
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "dm05_action_http",
+        DiffusionServerArgs(
+            model_path="Dexmal/DM05-libero",
+            extras=["--revision", "25a8e0d38a8eaeaae41a44d7b4a2378fd8ce1088"],
+        ),
+        DM05_LIBERO_ACTION_CI_sampling_params,
+        run_perf_check=False,
+        perf_warmup_requests=1,
+        # No action fixture is published in the pinned CI data revision yet.
+        run_consistency_check=False,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),

@@ -1059,7 +1059,8 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
     ) -> None:
         payload = json.loads(content.decode("utf-8"))
         expected_horizon = int(case.sampling_params.extras.get("action_horizon", 50))
-        expected_dim = int(case.sampling_params.extras.get("action_dim", 32))
+        extra = case.sampling_params.extras
+        expected_dim = int(extra.get("output_action_dim", extra.get("action_dim", 32)))
         output = self._extract_action_array(payload, expected_horizon, expected_dim)
 
         num_gpus = case.server_args.num_gpus

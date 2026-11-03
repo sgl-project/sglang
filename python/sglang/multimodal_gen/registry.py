@@ -28,6 +28,11 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.dm05 import (
+    DM05_MODEL_IDS,
+    dm05_model_id,
+    is_dm05_model,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
     FLUX3_ACTION_HF_PATHS,
     is_flux3_action_package,
@@ -385,6 +390,8 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id in DM05_MODEL_IDS and not is_dm05_model(model_path):
+            continue
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
             continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
@@ -404,6 +411,8 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
     # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id in DM05_MODEL_IDS and not is_dm05_model(model_path):
+            continue
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
             continue
         cache_repo_fragment = (
@@ -451,6 +460,9 @@ def _get_config_info(
             f"--model-id '{model_id}' did not match any registered model; "
             "falling back to automatic detection."
         )
+
+    if is_dm05_model(model_path):
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[dm05_model_id(model_path)])
 
     # SenseNova Hub IDs require an exact match, while local checkpoints are
     # identified from their config metadata rather than their directory name.
@@ -724,6 +736,8 @@ def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
+    if is_dm05_model(model_path):
+        return "DM05Pipeline"
     if is_sensenova_u1_model(model_path):
         return "SenseNovaU1Pipeline"
     if is_flux3_action_package(model_path):

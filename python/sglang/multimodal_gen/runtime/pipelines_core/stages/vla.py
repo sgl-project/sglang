@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -170,10 +171,25 @@ class VLAPrefixEncodingStage(PipelineStage):
         self,
         policy_model: Any,
         prefix_cache: VLAPrefixCacheManager,
+        *,
+        observation_collator: Callable | None = None,
+        observation_signature: Callable | None = None,
     ):
         super().__init__()
         self.policy_model = policy_model
         self.prefix_cache = prefix_cache
+        self.observation_collator = (
+            observation_collator or collate_vla_observation_batches
+        )
+        self.observation_signature = observation_signature
+
+    def _observation_fingerprint(self, batch: Req, server_args: ServerArgs):
+        fingerprint = _grouped_fingerprint(batch, server_args)
+        if fingerprint[0] == "single" or self.observation_signature is None:
+            return fingerprint
+        return fingerprint + (
+            self.observation_signature(vla_state(batch)["observation_batch"]),
+        )
 
     def run_grouped_requests(
         self,
@@ -183,7 +199,7 @@ class VLAPrefixEncodingStage(PipelineStage):
         results: list[Req | None] = [None] * len(batches)
         for fingerprint, group in self._group_requests_by_fingerprint(
             batches,
-            lambda batch: _grouped_fingerprint(batch, server_args),
+            lambda batch: self._observation_fingerprint(batch, server_args),
         ):
             group_batches = [batch for _, batch in group]
             if len(group_batches) == 1 or fingerprint[0] == "single":
@@ -195,7 +211,7 @@ class VLAPrefixEncodingStage(PipelineStage):
             observations = [
                 vla_state(batch)["observation_batch"] for batch in group_batches
             ]
-            grouped_observation = collate_vla_observation_batches(observations)
+            grouped_observation = self.observation_collator(observations)
             prefix_context = self.policy_model.encode_prefix(
                 grouped_observation,
                 use_cuda_graph=_cuda_graph_enabled(group_batches[0]),
@@ -358,9 +374,10 @@ class VLAPrefixEncodingStage(PipelineStage):
 
 
 class VLAActionDenoisingStage(PipelineStage):
-    def __init__(self, policy_model: Any):
+    def __init__(self, policy_model: Any, *, output_transform: Callable | None = None):
         super().__init__()
         self.policy_model = policy_model
+        self.output_transform = output_transform
 
     @property
     def role_affinity(self) -> RoleType:
@@ -409,6 +426,10 @@ class VLAActionDenoisingStage(PipelineStage):
                 generator=None,
             )
             synchronize_vla_action_tensor(actions)
+            if self.output_transform is not None:
+                actions = self.output_transform(
+                    actions, observation, server_args.pipeline_config
+                )
             actions_out = materialize_vla_action_batch(
                 actions,
                 server_args.pipeline_config.output_action_dim,

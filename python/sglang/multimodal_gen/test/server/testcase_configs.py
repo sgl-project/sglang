@@ -537,6 +537,23 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
 )
 
 
+DM05_LIBERO_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="pick up the blue block",
+    extras={
+        "action_horizon": 10,
+        "action_dim": 32,
+        "output_action_dim": 7,
+        "state_dim": 8,
+        "camera_order": ("head", "left_wrist"),
+        "image_size": 64,
+        "num_inference_steps": 2,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        "enable_cuda_graph": True,
+    },
+)
+
+
 # DROID policy: three fixed-name 360x640 cameras, 8-dim state and actions,
 # the package recipe (4 steps, CFG on video). Noise comes from the seed.
 FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(

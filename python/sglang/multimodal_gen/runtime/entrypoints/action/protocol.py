@@ -153,6 +153,13 @@ def _normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         normalized["images"] = {
             name: _normalize_image_value(value) for name, value in images.items()
         }
+    history = normalized.get("history_images")
+    if isinstance(history, (list, tuple)):
+        normalized["history_images"] = [
+            _normalize_image_value(value) for value in history
+        ]
+    if isinstance(normalized.get("action_mask"), dict):
+        normalized["action_mask"] = _decode_tensor_payload(normalized["action_mask"])
     for name, value in observation.items():
         if name.startswith("observation.images."):
             normalized[name] = _normalize_image_value(value)
@@ -300,6 +307,18 @@ def _action_request_to_observation(payload: dict[str, Any]) -> dict[str, Any]:
         observation["state"] = input_payload["state"]
     if "noise" in input_payload:
         observation["noise"] = input_payload["noise"]
+    for name in (
+        "history_images",
+        "robot_type",
+        "control_mode",
+        "speed",
+        "state_desc",
+        "action_mask",
+        "image_masks",
+        "camera_order",
+    ):
+        if name in input_payload:
+            observation[name] = input_payload[name]
     for name in ("image", "image_path", "input_reference", "video", "video_path"):
         if name in input_payload:
             observation[name] = input_payload[name]
@@ -397,6 +416,19 @@ def _build_action_model_sampling_params(
     if output_format not in ("list", "numpy"):
         raise ValueError("output_format must be 'list' or 'numpy'")
 
+    # Preserve DM05 values so strict deployment validation can reject coercions.
+    from sglang.multimodal_gen.configs.sample.dm05 import DM05SamplingParams
+
+    def strict_integer(value):
+        if type(value) is not int or value <= 0:
+            raise ValueError(
+                "DM05 action geometry and inference steps must be positive integers"
+            )
+        return value
+
+    parse_integer = (
+        strict_integer if issubclass(sampling_params_cls, DM05SamplingParams) else int
+    )
     sampling_kwargs = {
         "request_id": payload.get("request_id") or payload.get("id"),
         "prompt": prompt,
@@ -406,19 +438,19 @@ def _build_action_model_sampling_params(
         "state": state,
         "noise": noise,
         "observation": observation,
-        "action_horizon": int(
+        "action_horizon": parse_integer(
             parameters.get(
                 "action_horizon",
                 observation.get("action_horizon", pipeline_config.action_horizon),
             )
         ),
-        "action_dim": int(
+        "action_dim": parse_integer(
             parameters.get(
                 "action_dim",
                 observation.get("action_dim", pipeline_config.action_dim),
             )
         ),
-        "num_inference_steps": int(
+        "num_inference_steps": parse_integer(
             parameters.get(
                 "num_inference_steps",
                 observation.get(
@@ -435,7 +467,12 @@ def _build_action_model_sampling_params(
     # Optional per-request overrides; absent keys keep the model defaults.
     for name in ("seed", "guidance_scale", "guidance_scale_action"):
         value = parameters.get(name, observation.get(name))
-        if value is not None:
+        explicit_dm05_seed = (
+            name == "seed"
+            and issubclass(sampling_params_cls, DM05SamplingParams)
+            and (name in parameters or name in observation)
+        )
+        if value is not None or explicit_dm05_seed:
             sampling_kwargs[name] = value
     supported_fields = _sampling_params_field_names(sampling_params_cls)
     sp = sampling_params_cls(
@@ -480,6 +517,8 @@ async def infer_action(
     req = prepare_request(server_args, sp)
     response = await async_scheduler_client.forward(req)
     if getattr(response, "error", None):
+        if getattr(response, "error_code", None) == "invalid_request":
+            raise ValueError(response.error)
         raise RuntimeError(response.error)
     if response.output is None:
         raise RuntimeError("action policy returned no output")

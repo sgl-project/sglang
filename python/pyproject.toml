@@ -112,6 +112,7 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 instanttensor = ["instanttensor>=0.1.9"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
+  "accelerate",
   "addict==2.4.0",
   "av==16.1.0",
   "cache-dit==1.5.1",
