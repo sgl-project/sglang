@@ -12,7 +12,6 @@ import torch.nn.functional as F
 import torch_npu
 from sgl_kernel_npu.operators import attention as npu_attention_ops
 from sgl_kernel_npu.operators import kvcacheio as npu_cache_ops
-from sgl_kernel_npu.operators.kvcacheio import NPU_KV_QUANT_PATH
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
@@ -54,7 +53,7 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
     """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout."""
     if is_npu_arch35():
         return {
-            "quant_mode": NPU_KV_QUANT_PATH.reader_quant_mode,
+            "quant_mode": 1,
             "rope_head_dim": _NPU_ARCH35_KV_ROPE_HEAD_DIM,
         }
     return {}
@@ -2026,6 +2025,10 @@ class DeepseekV4AscendAttnBackend(
             "head_dim": self._dsv4_head_dim,
             "has_ori_kv": True,
             "has_cmp_kv": False,
+            # Supply existing host mirrors for kernel backends that require
+            # CPU metadata; the kernel selects the ABI before graph capture.
+            "cu_seqlens_q_cpu": getattr(fm, "actual_seq_lengths_q_pa_cpu", None),
+            "seqused_ori_kv_cpu": getattr(fm, "seq_lens_cpu_int", None),
         }
         shared_kwargs = base_kwargs | common
         c1a_kwargs = shared_kwargs

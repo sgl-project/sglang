@@ -59,8 +59,6 @@ _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
-# Pin the kernel layout descriptor so the tests stay hermetic.
-from sglang.srt.hardware_backend.npu.attention import ascend_dsv4_backend as _backend
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
@@ -78,16 +76,51 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
+    NPUDeepSeekV4SingleKVPool,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
 
-_backend.NPU_KV_QUANT_PATH.reader_quant_mode = 1
-
 _BACKEND_NPU_OPS = (
     "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_attention_ops"
 )
+
+
+class TestKernelSelectedKVLayout(unittest.TestCase):
+    _POOL = "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool"
+
+    def test_allocation_uses_the_kernel_format_descriptor(self):
+        pool = NPUDeepSeekV4SingleKVPool.__new__(NPUDeepSeekV4SingleKVPool)
+        pool.qk_nope_head_dim = 448
+        pool.qk_rope_head_dim = 64
+        for width in (608, 640):
+            descriptor = SimpleNamespace(packed_dim=MagicMock(return_value=width))
+            with (
+                self.subTest(width=width),
+                patch(self._POOL + ".get_npu_kv_quant_path", return_value=descriptor),
+            ):
+                self.assertEqual(pool.a5_packed_kv_dim, width)
+                descriptor.packed_dim.assert_called_once_with(448, 64)
+
+    def test_writer_passes_canonical_buffers_without_vendor_attributes(self):
+        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        pool.qk_nope_head_dim = 448
+        pool.qk_rope_head_dim = 64
+        for width in (608, 640):
+            buffer = torch.empty(1, 2, 1, width, dtype=torch.float8_e4m3fn)
+            with (
+                self.subTest(width=width),
+                patch(self._POOL + ".kv_compress_epilog") as writer,
+            ):
+                pool._write_a5_packed_kv(
+                    buf=buffer, loc=torch.tensor([-1, 0]), cache=torch.ones(2, 512)
+                )
+                args = writer.call_args.args
+                self.assertIs(args[0], buffer)
+                self.assertEqual(args[1].dtype, torch.bfloat16)
+                self.assertEqual(args[2].tolist(), [-1, 0])
+                self.assertEqual(writer.call_args.kwargs, {})
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
