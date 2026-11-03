@@ -245,6 +245,42 @@ class FullComponent(TreeComponent):
         self._evict_device_heap = []
         self._evict_device_last_node = None
 
+    def trim_eviction_leaf(
+        self, node_id: NodeId, remaining: int, *, chunk: int
+    ) -> None:
+        """Keep a reusable prefix. The selected node ID still denotes the suffix."""
+        core = self.tree_core
+        if (
+            core.enable_hicache
+            or core.enable_storage
+            or core.enable_external_cache_linker
+            or core.is_host_memory_buffer_only
+        ):
+            return
+        node = core.node_by_id(node_id)
+        data = node.component_data[self.component_type]
+        if (
+            remaining <= 0
+            or node.children
+            or node.backuped
+            or data.value is None
+            or data.lock_ref
+            or data.host_lock_ref
+            or data.session_ref
+            or node.write_through_pending_id is not None
+            or node.load_back_pending_id is not None
+        ):
+            return
+        release = (remaining + chunk - 1) // chunk * chunk
+        keep = len(node.key) - release
+        if keep < chunk:
+            return
+        last_access = node.last_access_time
+        parent, action = core._split_node(node.key, node, keep)
+        assert action is None
+        # Splitting for eviction does not constitute an access to the prefix.
+        parent.last_access_time = node.last_access_time = last_access
+
     def drive_host_eviction(
         self,
         num_tokens: int,

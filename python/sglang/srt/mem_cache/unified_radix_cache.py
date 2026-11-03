@@ -7,6 +7,7 @@ import time
 from array import array
 from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from http import HTTPStatus
 from queue import Queue
 from typing import (
@@ -205,6 +206,7 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    _trim_full_eviction_leaf: Optional[Callable[[NodeId, int], None]] = None
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
 
@@ -294,6 +296,24 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+
+        chunk = envs.SGLANG_PYTHON_RADIX_EVICT_TAIL_CHUNK_SIZE.get()
+        if chunk < 0 or chunk % params.page_size:
+            raise ValueError(
+                "eviction tail chunk size must be a nonnegative page multiple"
+            )
+        if (
+            chunk
+            and self._tree_core_backend == "python"
+            and self.tree_components == (BASE_COMPONENT_TYPE,)
+            and type(self.components[BASE_COMPONENT_TYPE]) is FullComponent
+            and not params.enable_session_radix_cache
+            and params.attn_cp_size == 1
+            and page_interleave_shard_size(params.token_to_kv_pool_allocator) == 1
+        ):
+            self._trim_full_eviction_leaf = partial(
+                self.components[BASE_COMPONENT_TYPE].trim_eviction_leaf, chunk=chunk
+            )
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
@@ -1103,6 +1123,17 @@ class UnifiedRadixCache(BasePrefixCache):
                         if not made_progress:
                             break
                     else:
+                        if (
+                            self._trim_full_eviction_leaf
+                            and allocation_reclaim_satisfied is None
+                        ):
+                            remaining = request_cnt - tracker[ct]
+                            if to_target:
+                                # walk_quota can cover the whole tree. Trim to the
+                                # current allocator shortfall, even after a clamp.
+                                _, target = available_size_targets[ct]
+                                remaining = target - self._component_available_size(ct)
+                            self._trim_full_eviction_leaf(node_id, remaining)
                         self._evict_leaf_with_backup(node_id, tracker)
                     if target_reached(ct):
                         break

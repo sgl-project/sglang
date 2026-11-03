@@ -787,6 +787,9 @@ class Envs:
     # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
+    # Minimum tail to free when splitting an oversized device-only FULL leaf.
+    # Python TreeCore only. Zero keeps whole-leaf eviction.
+    SGLANG_PYTHON_RADIX_EVICT_TAIL_CHUNK_SIZE = EnvInt(0)
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
