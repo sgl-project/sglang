@@ -4,12 +4,13 @@
 //! and `rmp_serde`'s default struct-as-array encoding reproduces it.
 
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;
 use super::types::{Tagged, control_messages, wire_struct};
 use crate::utils::error::Error;
+use crate::utils::serialize::parse_int_opt;
 
 wire_struct! {
     /// The scheduler's `TokenizedGenerateReqInput`. Keep in lockstep with the
@@ -99,6 +100,7 @@ control_messages! {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+        names: Option<Vec<String>>,
     }
 
     /// Clear the HiCache storage backend.
@@ -114,6 +116,50 @@ control_messages! {
         hicache_storage_prefetch_policy: Option<String>,
         hicache_write_policy: Option<String>,
     }
+
+    /// `/start_profile` and `/stop_profile`'s control request, built only by
+    /// [`ProfileReq::start`] / [`ProfileReq::stop`]. The frontend fans it out
+    /// to every DP rank's scheduler, and each broadcasts it from its TP rank
+    /// 0, so every rank starts (or stops) its profiler.
+    ProfileReq {
+        /// Python's `ProfileReqType` value: 1 starts, 2 stops.
+        req_type: u8,
+        output_dir: Option<String>,
+        start_step: Option<i64>,
+        num_steps: Option<i64>,
+        activities: Option<Vec<String>>,
+        profile_by_stage: bool,
+        with_stack: Option<bool>,
+        record_shapes: Option<bool>,
+        profile_id: Option<String>,
+        merge_profiles: bool,
+        profile_prefix: Option<String>,
+        profile_stages: Option<Vec<String>>,
+        detailed_annotations: bool,
+    }
+}
+
+/// The client-settable fields of a profiling start: Python's `ProfileReq`
+/// body for `/start_profile`, every field optional and defaulted as Python
+/// defaults it. `start_step`/`num_steps` also accept a numeric string, as
+/// Python's request validation does.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProfileOptions {
+    pub(crate) output_dir: Option<String>,
+    #[serde(deserialize_with = "parse_int_opt")]
+    pub(crate) start_step: Option<i64>,
+    #[serde(deserialize_with = "parse_int_opt")]
+    pub(crate) num_steps: Option<i64>,
+    pub(crate) activities: Option<Vec<String>>,
+    pub(crate) profile_by_stage: bool,
+    pub(crate) with_stack: Option<bool>,
+    pub(crate) record_shapes: Option<bool>,
+    pub(crate) profile_id: Option<String>,
+    pub(crate) merge_profiles: bool,
+    pub(crate) profile_prefix: Option<String>,
+    pub(crate) profile_stages: Option<Vec<String>>,
+    pub(crate) detailed_annotations: bool,
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -225,6 +271,7 @@ impl CheckWeightsReqInput {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+        names: Option<Vec<String>>,
     ) -> Self {
         Self {
             rid,
@@ -232,6 +279,52 @@ impl CheckWeightsReqInput {
             allow_quant_error,
             skip_tensor_list,
             selector,
+            names,
+        }
+    }
+}
+
+impl ProfileReq {
+    /// Start profiling with `options` (Python's `ProfileReqType.START_PROFILE`).
+    pub fn start(rid: String, options: ProfileOptions) -> Self {
+        let ProfileOptions {
+            output_dir,
+            start_step,
+            num_steps,
+            activities,
+            profile_by_stage,
+            with_stack,
+            record_shapes,
+            profile_id,
+            merge_profiles,
+            profile_prefix,
+            profile_stages,
+            detailed_annotations,
+        } = options;
+        Self {
+            rid,
+            req_type: 1,
+            output_dir,
+            start_step,
+            num_steps,
+            activities,
+            profile_by_stage,
+            with_stack,
+            record_shapes,
+            profile_id,
+            merge_profiles,
+            profile_prefix,
+            profile_stages,
+            detailed_annotations,
+        }
+    }
+
+    /// Stop profiling: Python's `ProfileReq(req_type=STOP_PROFILE)`, every
+    /// other field at its default.
+    pub fn stop(rid: String) -> Self {
+        Self {
+            req_type: 2,
+            ..Self::start(rid, ProfileOptions::default())
         }
     }
 }
@@ -243,6 +336,35 @@ impl AbortReq {
             abort_all,
             finished_reason: (),
             abort_message: (),
+        }
+    }
+
+    /// Whether this aborts every live request rather than the one `rid` names.
+    pub fn abort_all(&self) -> bool {
+        self.abort_all
+    }
+
+    /// The `AbortReq` a control message's wire bytes carry, or `None` when
+    /// they carry another message: how a listener tells an abort another
+    /// listener relayed to it from a request for its scheduler. The
+    /// positions are the ones `abort_req_msgpack_shape` pins; the two fields
+    /// after `abort_all` are always `()` from this server, so they are not read.
+    pub fn decode(header: &[u8]) -> Result<Option<Self>, Error> {
+        let value = rmpv::decode::read_value(&mut &header[..])
+            .map_err(|e| Error::Codec(format!("abort request: {e}")))?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| Error::Codec("abort request: not an array".into()))?;
+        if items.first().and_then(rmpv::Value::as_str) != Some(<Self as Tagged>::TAG) {
+            return Ok(None);
+        }
+        let rid = items.get(1).and_then(rmpv::Value::as_str);
+        let abort_all = items.get(3).and_then(rmpv::Value::as_bool);
+        match (rid, abort_all) {
+            (Some(rid), Some(abort_all)) => Ok(Some(Self::new(rid.to_owned(), abort_all))),
+            _ => Err(Error::Codec(
+                "abort request: expected [tag, rid, http_worker_ipc, abort_all, ..]".into(),
+            )),
         }
     }
 }
@@ -267,6 +389,21 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+    }
+
+    /// `decode` reads an `AbortReq` back from its own wire bytes, tells
+    /// another message apart by its tag, and refuses bytes of neither shape.
+    #[test]
+    fn abort_req_decodes_from_its_own_wire_bytes_only() {
+        let header = AbortReq::new("12345".into(), true).encode().unwrap();
+        let decoded = AbortReq::decode(&header).unwrap().expect("an AbortReq");
+        assert_eq!(decoded.get_rid(), "12345");
+        assert!(decoded.abort_all());
+        let other = FlushCacheReqInput::new("7".into(), None).encode().unwrap();
+        assert!(AbortReq::decode(&other).unwrap().is_none());
+        assert!(AbortReq::decode(b"\xc0").is_err());
+        let short = rmp_serde::to_vec(&("AbortReq", "12345")).unwrap();
+        assert!(AbortReq::decode(&short).is_err());
     }
 
     #[test]
@@ -295,6 +432,7 @@ mod tests {
             true,
             Some(vec!["lm_head".into()]),
             "target".into(),
+            Some(vec!["model.weight".into()]),
         )
         .encode()
         .unwrap();
@@ -302,9 +440,9 @@ mod tests {
         let arr = val.as_array().expect("array");
         assert_eq!(
             arr.len(),
-            7,
+            8,
             "CheckWeightsReqInput = [tag, rid, http_ipc, action, \
-             allow_quant_error, skip_tensor_list, selector]"
+             allow_quant_error, skip_tensor_list, selector, names]"
         );
         assert_eq!(arr[0].as_str(), Some("CheckWeightsReqInput"));
         assert_eq!(arr[1].as_str(), Some("7"));
@@ -313,6 +451,62 @@ mod tests {
         assert_eq!(arr[4].as_bool(), Some(true));
         assert_eq!(arr[5][0].as_str(), Some("lm_head"));
         assert_eq!(arr[6].as_str(), Some("target"));
+        assert_eq!(arr[7][0].as_str(), Some("model.weight"));
+    }
+
+    /// `ProfileReq` decodes positionally into Python's 15-field struct: a
+    /// shift would hand the scheduler e.g. `num_steps` as `start_step`.
+    #[test]
+    fn profile_req_msgpack_shape() {
+        let start = ProfileReq::start(
+            "7".into(),
+            ProfileOptions {
+                output_dir: Some("/traces".into()),
+                start_step: Some(3),
+                num_steps: Some(5),
+                activities: Some(vec!["CPU".into(), "GPU".into()]),
+                profile_by_stage: true,
+                with_stack: Some(false),
+                record_shapes: Some(true),
+                profile_id: Some("id".into()),
+                merge_profiles: true,
+                profile_prefix: Some("pre".into()),
+                profile_stages: Some(vec!["decode".into()]),
+                detailed_annotations: true,
+            },
+        );
+        let val = rmpv::decode::read_value(&mut &start.encode().unwrap()[..]).unwrap();
+        let expected = rmpv::Value::Array(vec![
+            "ProfileReq".into(),
+            "7".into(),
+            rmpv::Value::Nil,
+            1.into(),
+            "/traces".into(),
+            3.into(),
+            5.into(),
+            rmpv::Value::Array(vec!["CPU".into(), "GPU".into()]),
+            true.into(),
+            false.into(),
+            true.into(),
+            "id".into(),
+            true.into(),
+            "pre".into(),
+            rmpv::Value::Array(vec!["decode".into()]),
+            true.into(),
+        ]);
+        assert_eq!(val, expected);
+
+        let stop = ProfileReq::stop("8".into());
+        let val = rmpv::decode::read_value(&mut &stop.encode().unwrap()[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(arr.len(), 16);
+        assert_eq!(arr[3].as_u64(), Some(2), "req_type STOP_PROFILE");
+        for i in [4, 5, 6, 7, 9, 10, 11, 13, 14] {
+            assert!(arr[i].is_nil(), "idx {i} must be a nil default");
+        }
+        for i in [8, 12, 15] {
+            assert_eq!(arr[i].as_bool(), Some(false), "idx {i} must be false");
+        }
     }
 
     /// The header must be positionally aligned: `input_embeds` (idx 5) /

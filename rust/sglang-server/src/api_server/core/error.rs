@@ -5,6 +5,7 @@ use http::StatusCode;
 use sglang_api_types::api::v1 as api;
 
 use super::CoreOutput;
+use crate::multi_modality::worker::MediaError;
 
 /// Protocol-independent error category used by transport adapters.
 ///
@@ -42,6 +43,11 @@ pub(crate) enum CoreError {
     #[error("{0}")]
     Cancelled(String),
 
+    /// A DP rank did not answer a control request within the fan-out's
+    /// deadline (see [`super::fanout`]).
+    #[error("{0}")]
+    DeadlineExceeded(String),
+
     /// The internal producer disappeared before returning a terminal result.
     ///
     /// This is a server-side failure, not evidence that the caller cancelled.
@@ -75,6 +81,17 @@ pub(crate) enum CoreError {
     Internal(String),
 }
 
+/// A media failure keeps Python's class and message, whether admission or the
+/// MM processor raised it: `ValueError` is a 400, anything else a 500.
+impl From<MediaError> for CoreError {
+    fn from(error: MediaError) -> Self {
+        match error {
+            MediaError::Client(message) => Self::InvalidArgument(message),
+            MediaError::Server(message) => Self::Internal(message),
+        }
+    }
+}
+
 impl CoreError {
     /// Semantic status for adapters that do not use the scheduler's legacy
     /// HTTP code space (notably the future gRPC adapter).
@@ -84,6 +101,7 @@ impl CoreError {
             Self::Unavailable => CoreErrorKind::Unavailable,
             Self::Overloaded(_) => CoreErrorKind::ResourceExhausted,
             Self::Cancelled(_) => CoreErrorKind::Cancelled,
+            Self::DeadlineExceeded(_) => CoreErrorKind::DeadlineExceeded,
             Self::ResponseTruncated => CoreErrorKind::Internal,
             Self::RuntimeRejected { kind, .. } => *kind,
             Self::InvalidResponse(_) | Self::Internal(_) => CoreErrorKind::Internal,
@@ -93,7 +111,7 @@ impl CoreError {
     /// Translate the scheduler's inherited HTTP-coded failure into a semantic
     /// category once, at the runtime boundary. HTTP can retain the exact legacy
     /// status while other adapters consume [`Self::kind`].
-    pub(super) fn from_runtime_rejection(
+    pub(crate) fn from_runtime_rejection(
         message: String,
         legacy_http_status: u16,
         output: CoreOutput,
@@ -187,6 +205,10 @@ mod tests {
         assert_eq!(
             CoreError::Cancelled("gone".into()).http_status().as_u16(),
             499
+        );
+        assert_eq!(
+            CoreError::DeadlineExceeded("late".into()).http_status(),
+            StatusCode::GATEWAY_TIMEOUT
         );
         assert_eq!(
             CoreError::RuntimeRejected {

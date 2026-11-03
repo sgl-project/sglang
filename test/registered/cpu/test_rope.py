@@ -9,9 +9,11 @@ from sglang.srt.layers.rotary_embedding import (
 )
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
-    apply_rotary_pos_emb_native,
 )
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
+from sglang.srt.layers.rotary_embedding.utils import (
+    apply_rotary_pos_emb_native,
+    apply_rotary_pos_emb_native_eager,
+)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision

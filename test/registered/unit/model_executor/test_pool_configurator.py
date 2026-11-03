@@ -96,6 +96,7 @@ def _make_model_runner(
     mr = MagicMock()
 
     mr.use_mla_backend = use_mla_backend
+    mr.modelslim_cache_layout = None
     mr.is_draft_worker = False
     mr.dflash_draft_cell_size_per_token = None
     mr.num_effective_layers = num_layers
@@ -180,7 +181,7 @@ def _make_model_runner(
         num_effective_layers=num_layers,
         swa_attention_layer_ids=list(mc.swa_attention_layer_ids),
         full_attention_layer_ids=list(mc.full_attention_layer_ids),
-        is_hybrid_swa_mtp_draft=False,
+        draft_owns_its_depth=False,
     )
     mr.attn_dp_size = 1
     mr.pp_size = 1
