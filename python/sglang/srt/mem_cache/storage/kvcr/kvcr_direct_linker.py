@@ -167,33 +167,44 @@ class _SplitLayerGather:
         return prepared
 
     def gather_layer(self, layer_id, prepared):
+        # One all-gather per layer: pack every buffer's owned rows back to back.
+        parts = []
         for name, (padded, counts, width) in prepared.items():
             layer = self.pools[name].layer_mapping.get(layer_id)
             if layer is None:
                 continue
             for buffers in self.buffers[name]:
                 for index in (layer,) if isinstance(layer, int) else layer:
-                    self._gather(buffers[index], padded, counts, width)
+                    parts.append((buffers[index], padded, counts, width))
+        if parts:
+            self._gather(parts)
 
-    def _gather(self, buf, padded, counts, width):
-        row_bytes = buf.shape[1]
-        need = width * row_bytes
+    def _gather(self, parts):
+        sizes = [width * buf.shape[1] for buf, _, _, width in parts]
+        need = sum(sizes)
         if self.staging.numel() < need:
             self.staging = torch.empty(need, dtype=torch.uint8, device=self.device)
         if self.gathered.numel() < need * self.size:
             self.gathered = torch.empty(
                 need * self.size, dtype=torch.uint8, device=self.device
             )
-        mine = self.staging[:need].view(width, row_bytes)
-        torch.index_select(buf, 0, padded[self.rank], out=mine)
+        offset = 0
+        for (buf, padded, _, width), size in zip(parts, sizes):
+            mine = self.staging[offset : offset + size].view(width, buf.shape[1])
+            torch.index_select(buf, 0, padded[self.rank], out=mine)
+            offset += size
         out = self.gathered[: need * self.size]
         torch.distributed.all_gather_into_tensor(
             out, self.staging[:need], group=self.group
         )
-        out = out.view(self.size, width, row_bytes)
-        for r in range(self.size):
-            if r != self.rank and counts[r]:
-                buf.index_copy_(0, padded[r, : counts[r]], out[r, : counts[r]])
+        out = out.view(self.size, need)
+        offset = 0
+        for (buf, padded, counts, width), size in zip(parts, sizes):
+            rows = out[:, offset : offset + size].view(self.size, width, buf.shape[1])
+            for r in range(self.size):
+                if r != self.rank and counts[r]:
+                    buf.index_copy_(0, padded[r, : counts[r]], rows[r, : counts[r]])
+            offset += size
 
 
 def _offset_source_ports(hints, offset):
