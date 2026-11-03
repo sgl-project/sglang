@@ -82,7 +82,13 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    log_info_on_rank0,
+)
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -1085,6 +1091,22 @@ class EngramEmbedding(nn.Module):
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
+        # Needs whole hash columns per rank: the hash puts each column's ids in its
+        # own subtable, so a rank's share of every token's rows is its k columns.
+        self._all_gather_columns = (
+            _is_hip
+            and envs.SGLANG_OPT_HIP_ENGRAM_ALL_GATHER.get()
+            and self.tp_size > 1
+            and self._cols_per_rank is not None
+            and self.peer is None
+            and self.host_table is None
+        )
+        if self._all_gather_columns:
+            log_info_on_rank0(
+                logger,
+                f"Engram layer {layer_id}: eager prefill all-gathers the fp8 rows of "
+                f"{self._cols_per_rank} hash columns per rank",
+            )
 
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
@@ -1186,6 +1208,14 @@ class EngramEmbedding(nn.Module):
             return self._lookup(all_indices)[start : start + local_rows]
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
+        if (
+            self._all_gather_columns
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_breakable_cuda_graph()
+        ):
+            return self._all_gather_lookup(indices)
         return self._lookup(indices)
 
     def dequant_staged(
@@ -1235,6 +1265,43 @@ class EngramEmbedding(nn.Module):
             )
             return values
         return tensor_model_parallel_all_reduce(values)
+
+    def _all_gather_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """Lookup when every TP rank holds the same indices and owns whole hash
+        columns: each rank all-gathers its columns' rows as stored (fp8 rows, e8m0
+        scales), and every rank dequantizes all of them with the kernel of the
+        zero-fill + all-reduce lookup, so the rows are bitwise the same."""
+        if indices.shape[0] == 0:
+            return self.new_rows(indices)
+        parallel = get_parallel()
+        k, world, num_tokens = self._cols_per_rank, self.tp_size, indices.shape[0]
+        start = parallel.tp_rank * k
+        local = indices.flatten(1)[:, start : start + k].reshape(-1) - self.row_start
+        rows = self.weight.view(torch.uint8).index_select(0, local)
+        scales = self.scale.view(torch.uint8).index_select(0, local)
+        all_rows = rows.new_empty((world * rows.shape[0], rows.shape[1]))
+        all_scales = scales.new_empty((world * scales.shape[0], scales.shape[1]))
+        parallel.tp_group.all_gather_into_tensor(all_rows, rows)
+        parallel.tp_group.all_gather_into_tensor(all_scales, scales)
+        # [source rank, token, its columns] -> [token, columns in rank order]
+        arange = functools.partial(
+            torch.arange, dtype=torch.int32, device=indices.device
+        )
+        ids = (
+            arange(world).view(1, -1, 1) * (num_tokens * k)
+            + arange(num_tokens).view(-1, 1, 1) * k
+            + arange(k)
+        ).flatten()
+        out = self.new_rows(indices)
+        engram_gather(
+            all_rows.data_ptr(),
+            all_scales.data_ptr(),
+            ids,
+            out.view(-1, self.dim),
+            self.dim,
+            FP8_BLOCK_SIZE,
+        )
+        return out
 
     def new_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """An uninitialized output for the rows of ``indices``."""
