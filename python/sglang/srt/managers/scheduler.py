@@ -25,7 +25,18 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -90,13 +101,13 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -216,10 +227,12 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     MultimodalInputs,
     MultimodalProcessorOutput,
+)
+from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
@@ -288,10 +301,14 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    RequestList,
+    _RequestList,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -303,6 +320,7 @@ from sglang.srt.managers.utils import (
     allocate_distinct_stream,
     is_health_check_generate_req,
     is_war_barrier_enabled,
+    make_abort_req,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -386,7 +404,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_confidential_compute, is_npu
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
@@ -394,10 +412,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.weight_versions import (
-    compute_weight_version_spans,
-    record_weight_version_events,
-)
+from sglang.srt.utils.weight_versions import record_weight_version_events
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -1369,7 +1384,13 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        self.running_reqs = RunningReqs()
+        # Requests merged into a running batch, until they finish or a retract,
+        # preemption or pause takes them out.
+        self.running_reqs = _RequestList(ListKind.DECODING)
+        # Prefill requests out of the chunked slot whose launched steps their next
+        # holder has not taken yet: the running batch at the merge, the PD
+        # transfer queue, HiSparse staging, or a requeue.
+        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1447,7 +1468,13 @@ class Scheduler(
 
         # A small running batch admits prefill every round so it can grow;
         # the interval only protects decode once the batch is large enough.
-        if running_batch.batch_size() < self.prefill_decode_interval_min_bs:
+        # With nothing decoding there is no decode to protect, and waiting only
+        # idles the GPU between chunks. DP attention keeps the synchronized
+        # cadence because peer ranks may still be decoding.
+        nothing_decodes = running_batch.is_empty() or running_batch.is_prefill_only
+        if running_batch.batch_size() < self.prefill_decode_interval_min_bs or (
+            nothing_decodes and not self.require_mlp_sync
+        ):
             self._prefill_decode_interval_remaining = 0
             return False
 
@@ -1549,7 +1576,9 @@ class Scheduler(
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_transfer_queue = None
+        self.disagg_prefill_transfer_queue = _RequestList(
+            ListKind.PD_SENDING, abort=self._abort_prefill_transfer
+        )
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1678,7 +1707,6 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            self.disagg_prefill_transfer_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the transfer queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
@@ -2636,15 +2664,13 @@ class Scheduler(
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
             get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
-            get_running_reqs=lambda: self.running_reqs,
-            get_pp_running_mbs=lambda: (
-                self.running_mbs if get_parallel().pp_size > 1 else ()
+            get_running_batches=lambda: (
+                self.running_batch,
+                *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
-            prefill_launch_starts_running=self._prefill_launch_starts_running,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -2774,7 +2800,7 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             output_streamer=self.output_streamer,
             send_abort=lambda req, finished_reason: self.send_abort_output(
-                _make_abort_req(req, finished_reason=finished_reason), req
+                make_abort_req(req, finished_reason=finished_reason), req
             ),
         )
 
@@ -2819,6 +2845,7 @@ class Scheduler(
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
+            leave_prefill_launched=self.prefill_launched_reqs.leave,
         )
 
     def init_internal_state(self) -> None:
@@ -3276,7 +3303,7 @@ class Scheduler(
             return
 
         if error_msg := self.validate_dllm_request(req):
-            abort_req = _make_abort_req(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3631,7 +3658,7 @@ class Scheduler(
         # `prefetch_from_storage` arms the paced-retry set for this attempt's
         # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
         # that, and a retired request reaches neither.
-        self._release_aborted_request(req)
+        self.release_aborted_request(req)
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
@@ -3641,7 +3668,7 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
-            self._release_aborted_request(req)
+            self.release_aborted_request(req)
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
@@ -3649,7 +3676,7 @@ class Scheduler(
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
-                self._release_aborted_request(req)
+                self.release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
             if self.uocr_runtime is None:
@@ -3696,7 +3723,7 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            abort_req = _make_abort_req(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3709,7 +3736,7 @@ class Scheduler(
             return False
         return True
 
-    def _release_aborted_request(self, req: Req) -> None:
+    def release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
@@ -3726,9 +3753,9 @@ class Scheduler(
     ) -> None:
         """Abort document windows held off the waiting queue."""
         for req in reqs:
-            self._release_aborted_request(req)
+            self.release_aborted_request(req)
             self.ipc_channels.send_to_tokenizer.send_output(
-                _make_abort_req(req, finished_reason=finished_reason), req
+                make_abort_req(req, finished_reason=finished_reason), req
             )
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -3757,7 +3784,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req)
+                self.release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -3768,7 +3795,7 @@ class Scheduler(
                 )
 
         self.send_abort_output(
-            _make_abort_req(
+            make_abort_req(
                 req_to_abort,
                 finished_reason={
                     "type": "abort",
@@ -3969,8 +3996,8 @@ class Scheduler(
         (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
         the top of the scheduling step stops the next chunk from launching; the
         chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later, so the batch-result processors keep
-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+        the result lands a step later; its batch still names the request as its
+        ``chunked_req``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
         ``process_batch_result_prefill`` via its chunked branch (the finished req
         is excluded from streaming and its logprob offset is still accounted).
@@ -4002,7 +4029,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self._release_aborted_request(req)
+        self.release_aborted_request(req)
         # No member rows exist before the leader's prefill ends.
         self.beam_coordinator.retire_group(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -4012,7 +4039,7 @@ class Scheduler(
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
+            make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4144,6 +4171,9 @@ class Scheduler(
             # DP attention converted to extend is last_batch itself: filtered
             # in place above, nothing to merge.
             if not last_batch.is_empty() and last_batch is not running_batch:
+                # Its launched prefills start running at the merge.
+                self.prefill_launched_reqs.leave(last_batch.reqs)
+                self.running_reqs.join(last_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
@@ -4156,7 +4186,6 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
-        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -4546,9 +4575,6 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
-
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
@@ -4563,8 +4589,9 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+        # A parked chunked request runs no chunk in this batch.
+        new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
+            self.chunked_req in can_run_set
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
@@ -4670,24 +4697,23 @@ class Scheduler(
             if not req.finished()
         ]
 
-    def request_lists(self) -> Dict[str, List[Req]]:
-        """The lists that hold the live requests, by name. A request is in at
-        most one; one that PD prefill or HiSparse launched is in none until its
-        result is processed."""
+    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
+        """The lists that hold the live requests, by kind. A request is in at
+        most one."""
         lists = {
-            "waiting": self.waiting_queue,
-            "grammar": self.grammar_manager.grammar_queue,
-            "chunked": [] if self.chunked_req is None else [self.chunked_req],
-            "running": list(self.running_reqs),
+            ListKind.WAITING: self.waiting_queue,
+            ListKind.GRAMMAR: self.grammar_manager.grammar_queue,
+            ListKind.CHUNKED: [] if self.chunked_req is None else [self.chunked_req],
+            ListKind.PREFILL_LAUNCHED: self.prefill_launched_reqs,
+            ListKind.DECODING: self.running_reqs,
         }
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
-            lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
-        if self.disagg_prefill_transfer_queue is not None:
-            lists["prefill_transfer"] = self.disagg_prefill_transfer_queue
+            lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
+        lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
             # Its staging queue is the part of this queue the current round runs.
-            lists["dllm"] = self.dllm_manager.waiting_queue
+            lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
         components = (
             self.disagg_decode_prealloc_queue,
             self.disagg_decode_transfer_queue,
@@ -4705,21 +4731,16 @@ class Scheduler(
             lists.update(component_lists)
         return lists
 
-    def _prefill_launch_starts_running(self) -> bool:
-        """Whether launching a request's last prefill chunk starts it running: not
-        under PD (KV transfer, or the prebuilt merge), HiSparse (after staging) or
-        dLLM (never)."""
-        return (
-            self.disaggregation_mode == DisaggregationMode.NULL
-            and self.dllm_config is None
-            and not self.enable_hisparse
-        )
-
-    def _join_launched_reqs(self, batch: ScheduleBatch) -> None:
-        """Launching a request's last prefill chunk starts it running. A row of a
-        mixed or DP-converted step that is running already stays."""
-        if self._prefill_launch_starts_running() and batch.forward_mode.is_extend():
-            self.running_reqs.join(r for r in batch.reqs if r is not batch.chunked_req)
+    def _join_prefill_launched(self, batch: ScheduleBatch) -> None:
+        """Launching a request's last prefill chunk moves it out of the chunked slot
+        into prefill_launched_reqs. A row that is running already stays; dLLM keeps
+        its requests in its own queue."""
+        if self.dllm_config is None and batch.forward_mode.is_extend():
+            self.prefill_launched_reqs.join(
+                r
+                for r in batch.reqs
+                if r is not batch.chunked_req and r not in self.running_reqs
+            )
 
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
@@ -4740,27 +4761,25 @@ class Scheduler(
         # Whether to run the profiler; a capture it starts here covers this step.
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
-        self._join_launched_reqs(batch)
-        self.invariant_checker.maybe_check_request_lists()
+        self._join_prefill_launched(batch)
+        self.invariant_checker.maybe_check_request_lists(batch)
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step once its result is processed."""
         self.invariant_checker.maybe_check_batch_consistency(batch)
         batch.drop_inflight_step()
-        # Running requests finish only in a step's processing.
+        # Requests finish only in a step's processing.
         self.running_reqs.leave_finished()
+        self.prefill_launched_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests whose queued result commits their last output by length."""
-        if not self.enable_skip_finishing_decode or not self.result_queue:
+        """Requests whose step in flight commits their last output by length."""
+        if not self.enable_skip_finishing_decode:
             return []
-        # At scheduling time the overlap loop has processed every result but the last.
-        assert len(self.result_queue) == 1
-        queued_reqs = set(self.result_queue[0][0].reqs)
         return [
             req
             for req in batch.reqs
-            if req in queued_reqs
+            if req.inflight_steps > 0
             and req.beam_group is None
             and req.next_output_finishes_by_length()
         ]
@@ -4825,7 +4844,7 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_abort_output(
-                    _make_abort_req(req, finished_reason=abort_reason.to_json()),
+                    make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
             for req in reqs_to_abort:
@@ -5672,53 +5691,49 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        if not ignore_waiting:
-            idle &= len(self.waiting_queue) == 0
+        lists = self.request_lists()
+        if for_health_check:
+            busy_lists = {ListKind.CHUNKED, ListKind.WAITING}
+            if not self._engine_paused:
+                busy_lists.add(ListKind.PD_RETRACTED)
         else:
+            busy_lists = lists.keys() - {
+                # Their steps are counted through the batches above.
+                ListKind.DECODING,
+                ListKind.PREFILL_LAUNCHED,
+                # Only its staging part is counted, above.
+                ListKind.DLLM,
+                # Held across a weight update, whose cache flush needs idle.
+                ListKind.PD_HELD,
+                # Counted by uocr blocks_flush below.
+                ListKind.UOCR_PARKED,
+                # Finished, and held only on the output rank; all ranks must agree.
+                ListKind.DEFERRED,
+            }
+        if ignore_waiting:
+            busy_lists.discard(ListKind.WAITING)
             # A PD-decode request waiting with its transferred KV still owns
             # its request row; a flush would free it.
             idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
-
-        if (
-            for_health_check
-            and not self._engine_paused
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_prealloc_queue is not None
-        ):
-            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+        idle &= not any(lists.get(name) for name in busy_lists)
 
         if not for_health_check:
-            # Grammar queue and prefill transfer queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
             idle &= not self.request_receiver.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
                     ignore_waiting=ignore_waiting
                 )
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_transfer_queue) == 0
-                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-                if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.decode_offload_manager is not None
+            ):
+                idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -6021,7 +6036,7 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         self.deferred_responses.abort(recv_req)
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -6032,7 +6047,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
                 to_del.append(i)
 
         if self.uocr_runtime is not None:
@@ -6053,12 +6068,12 @@ class Scheduler(
             # Finished in place, so a later abort in the same intake skips it.
             if req.finished_reason is None:
                 req.finish_outside_step(FINISH_ABORT())
-            self._release_aborted_request(req)
+            self.release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.send_abort_output(
-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -6078,49 +6093,15 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-        if self.dllm_config is not None:
-            for req in self.dllm_manager.pop_aborted_reqs(
-                recv_req.abort_all, recv_req.rid
-            ):
-                # Finished in place, so a later abort in the same intake skips it.
-                if req.finished_reason is None:
-                    req.finish_outside_step(FINISH_ABORT())
-                self._release_aborted_request(req)
-                self.send_abort_output(_make_abort_req(req), req)
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
-                logger.debug(f"Abort dLLM queued request. {req.rid=}")
-
-        # Delete the requests in the grammar queue
-        # Abort method 2: call `set_finish_with_abort`
-        # The request will still run one prefill forward pass.
-        # In this case, we change the input_ids to be only one token to make this prefill cheap.
-        self.grammar_manager.abort_requests(recv_req)
+        for request_list in self.request_lists().values():
+            if isinstance(request_list, RequestList):
+                request_list.abort(recv_req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # Abort requests that have not yet been bootstrapped
-            for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    self._release_aborted_request(req)
-
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
-
-            # Abort in-flight requests
-            for req in self.disagg_prefill_transfer_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if get_parallel().pp_size > 1:
@@ -6128,7 +6109,7 @@ class Scheduler(
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     if decode_req.host_staged:
                         # Keep the host destination alive until prefill stops writing.
@@ -6139,27 +6120,10 @@ class Scheduler(
                     # an ack racing back is never dropped.
                     decode_req.kv_receiver.abort()
 
-            # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        discard_kv_cache_backup(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
-
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
-                # Abort method 3: `request_finish`
+            if not req.finished() and recv_req.matches(req.rid):
+                # Abort method 2: `request_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
@@ -6262,6 +6226,7 @@ class Scheduler(
         self.running_batch.reqs = []
         # Under PP the other micro-batches keep running.
         self.running_reqs.leave(retract_reqs)
+        self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
             if req in unresumable:
                 abort_reason = FINISH_ABORT(
@@ -6269,7 +6234,7 @@ class Scheduler(
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
                 self.send_abort_output(
-                    _make_abort_req(req, finished_reason=abort_reason.to_json()), req
+                    make_abort_req(req, finished_reason=abort_reason.to_json()), req
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
@@ -6767,18 +6732,3 @@ def run_scheduler_process(
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
-
-
-def _make_abort_req(
-    req: Req, finished_reason: Optional[FinishReasonDict] = None
-) -> AbortReq:
-    return AbortReq(
-        rid=req.rid,
-        finished_reason=finished_reason,
-        weight_versions=compute_weight_version_spans(
-            req.weight_version_events,
-            current_version=get_serving().weight_version,
-            num_output_tokens=len(req.output_ids),
-        ),
-        prefill_weight_versions=req.prefill_weight_versions,
-    )
