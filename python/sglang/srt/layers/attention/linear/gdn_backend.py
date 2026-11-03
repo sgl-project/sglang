@@ -1461,9 +1461,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ),
                 # Rows past the batch's real tokens (e.g. DP-attention padding)
                 # belong to no sequence and must stay zero.
-                no_padding_rows=(
-                    forward_metadata.logical_num_tokens == actual_seq_len
-                ),
+                no_padding_rows=(forward_metadata.logical_num_tokens == actual_seq_len),
             )
 
             if is_npu() and last_recurrent_state is not None:
