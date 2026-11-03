@@ -461,6 +461,8 @@ mod tests {
     fn test_server_args(disaggregation_mode: DisaggregationMode) -> ServerArgs {
         ServerArgs {
             skip_tokenizer_init: true,
+            // These registry-only fixtures have no scheduler to answer warmup.
+            skip_server_warmup: true,
             disaggregation_mode,
             ..Default::default()
         }
