@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from typing import Callable, List, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -119,6 +119,11 @@ class TopkCaptureOutput:
 
 
 class BaseTopkCapturer:
+    # Class defaults also cover capturers built without __init__ (test doubles).
+    _pre_read_hooks: Tuple[Callable[[], None], ...] = ()
+    # Rows of host-tier KV slots (hierarchical cache); see alloc_host_tier_cache.
+    host_tier_cache: Optional[BaseHostCache] = None
+
     def __init__(
         self,
         num_tokens: int,
@@ -135,9 +140,6 @@ class BaseTopkCapturer:
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
-        self._pre_read_hooks: List[Callable[[], None]] = []
-        # Rows of host-tier KV slots (hierarchical cache); see alloc_host_tier_cache.
-        self.host_tier_cache: Optional[BaseHostCache] = None
 
         self.host_cache = BaseHostCache(
             num_tokens, num_layers, topk_size, name=name, device=device
@@ -155,7 +157,7 @@ class BaseTopkCapturer:
 
     def add_pre_read_hook(self, hook: Callable[[], None]) -> None:
         """Run hook before every get_topk, to land pending row copies."""
-        self._pre_read_hooks.append(hook)
+        self._pre_read_hooks = (*self._pre_read_hooks, hook)
 
     def alloc_host_tier_cache(self, num_tokens: int, device: str) -> BaseHostCache:
         """Allocate rows for num_tokens host-tier KV slots, freed with the capturer."""

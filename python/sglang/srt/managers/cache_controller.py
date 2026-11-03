@@ -924,8 +924,9 @@ class HiCacheController:
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
-        if self.topk_rows is not None:
-            self.topk_rows.reset()
+        # getattr: test doubles build controllers without __init__.
+        if (topk_rows := getattr(self, "topk_rows", None)) is not None:
+            topk_rows.reset()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -1010,8 +1011,8 @@ class HiCacheController:
             )
 
         topk_rows_copy = None
-        if self.topk_rows is not None:
-            topk_rows_copy = self.topk_rows.copy_indices(
+        if (topk_rows := getattr(self, "topk_rows", None)) is not None:
+            topk_rows_copy = topk_rows.copy_indices(
                 device_indices=op.device_indices,
                 host_indices=op.host_indices,
                 stream=self.l2_transfer_engine.device_to_host_stream,
@@ -1163,13 +1164,13 @@ class HiCacheController:
             )
 
         topk_rows_copy = None
-        if self.topk_rows is not None:
-            topk_rows_copy = self.topk_rows.copy_indices(
+        if (topk_rows := getattr(self, "topk_rows", None)) is not None:
+            topk_rows_copy = topk_rows.copy_indices(
                 device_indices=op.device_indices,
                 host_indices=op.host_indices,
                 stream=self.l2_transfer_engine.host_to_device_stream,
             )
-            self.topk_rows.add_load(topk_rows_copy)
+            topk_rows.add_load(topk_rows_copy)
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
