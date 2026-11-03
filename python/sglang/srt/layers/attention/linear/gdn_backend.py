@@ -1,14 +1,8 @@
-from itertools import accumulate
 from typing import Optional, Tuple, Union
 
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.kernels.ops.attention.fla.index import (
-    prepare_chunk_indices,
-    prepare_chunk_offsets,
-)
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
@@ -63,6 +57,10 @@ _is_hip = is_hip()
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+    from sglang.kernels.ops.attention.fla.index import (
+        prepare_chunk_indices,
+        prepare_chunk_offsets,
     )
 
 if is_cuda() or is_hip() or is_xpu():
@@ -278,6 +276,12 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
+
+
+def _uses_host_chunk_tables(extend_kernel) -> bool:
+    """Whether eager extends hand FLA host-built chunk tables (the CUDA Triton
+    kernel; the CPU and NPU chunk kernels take no tables)."""
+    return not is_cpu() and not is_npu() and isinstance(extend_kernel, TritonGDNKernel)
 
 
 class GDNKernelDispatcher:
@@ -573,6 +577,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        self._host_chunk_tables = _uses_host_chunk_tables(
+            self.kernel_dispatcher.extend_kernel
+        )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -1199,28 +1206,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return core_attn_out
 
-    def _get_extend_chunk_tables(self, forward_batch, forward_metadata):
+    def _get_extend_chunk_tables(self, forward_batch, forward_metadata, num_tokens):
         """FLA chunk tables of an eager Triton extend, built once per forward from
         the host lengths; otherwise the first GDN layer reads them back from the
         device. Below one 64-token chunk the output kernel picks a smaller chunk,
         so those batches keep deriving their own tables."""
-        tables = getattr(forward_metadata, "extend_chunk_tables", None)
-        if tables is not None:
-            return tables
+        if not self._host_chunk_tables:
+            return None, None
+        if forward_metadata.extend_chunk_tables is not None:
+            return forward_metadata.extend_chunk_tables
         tables = (None, None)
-        lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        query_start_loc = forward_metadata.query_start_loc
         if (
-            isinstance(
-                getattr(self.kernel_dispatcher, "extend_kernel", None), TritonGDNKernel
-            )
-            and lens is not None
-            and len(lens) + 1 == query_start_loc.numel()
-            and sum(lens) >= FLA_CHUNK_SIZE
+            forward_metadata.host_extend_lens_trusted
+            and forward_metadata.logical_num_tokens == num_tokens
+            and num_tokens >= FLA_CHUNK_SIZE
         ):
-            cu_seqlens = torch.tensor(
-                [0, *accumulate(lens)], dtype=query_start_loc.dtype
+            query_start_loc = forward_metadata.query_start_loc
+            lens = torch.tensor(
+                forward_batch.extend_seq_lens_cpu, dtype=query_start_loc.dtype
             )
+            cu_seqlens = torch.cat([lens.new_zeros(1), lens.cumsum(0).to(lens.dtype)])
             pin = is_pin_memory_available(query_start_loc.device)
             tables = tuple(
                 (t.pin_memory() if pin else t).to(
@@ -1471,7 +1476,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     device=ssm_states.device,
                 )
             chunk_indices, chunk_offsets = self._get_extend_chunk_tables(
-                forward_batch, forward_metadata
+                forward_batch=forward_batch,
+                forward_metadata=forward_metadata,
+                num_tokens=seq_len,
             )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,

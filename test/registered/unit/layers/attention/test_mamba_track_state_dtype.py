@@ -214,6 +214,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                 with self.subTest(snapshot=snapshot, contiguous=contiguous):
                     backend = object.__new__(GDNAttnBackend)
                     backend.forward_metadata = metadata
+                    backend._host_chunk_tables = False
                     backend.mis_metadata = None
                     backend.requires_contiguous_prefill_state = contiguous
                     conv_states = torch.zeros(16, 6, 2)[::2]
