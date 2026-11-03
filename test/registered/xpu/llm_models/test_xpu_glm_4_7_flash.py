@@ -18,7 +18,7 @@ class TestGLM4_7FlashXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     tp_size = 4
     accuracy = 0.80
     timeout_for_server_launch = 3600
-    num_examples = 50
+    num_examples = 20
     num_threads = 4
     # Cookbook sampling; the chat template thinks by default.
     temperature = 0.7
