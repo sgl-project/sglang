@@ -86,7 +86,12 @@ class RemoteEngramValidationTest(CustomTestCase):
         with (
             mock.patch("torch.cuda.is_current_stream_capturing", return_value=True),
             mock.patch.dict(
-                "sys.modules", {"row264_kernels": SimpleNamespace(gather_row264=gather)}
+                "sys.modules",
+                {
+                    "sglang.srt.engram_remote.row264_kernels": SimpleNamespace(
+                        gather_row264=gather
+                    )
+                },
             ),
         ):
             result = table.lookup(

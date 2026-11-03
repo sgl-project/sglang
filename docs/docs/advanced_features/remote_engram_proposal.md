@@ -1,7 +1,7 @@
 # Proposal: remote shared Engram tables
 
 > Discussion draft. This branch contains an experimental adapter for an
-> external research runtime; it is not a standalone or production feature.
+> legacy GPU-GET library; it is not a production feature.
 > The provider interface below is illustrative, not the implemented API.
 
 ## Motivation
@@ -46,14 +46,14 @@ readers that omit local weights cannot automatically fall back to a local table.
 Setting `SGLANG_EXPERIMENTAL_REMOTE_ENGRAM=1` and selecting
 `--engram-config '{"placement":"cpu","replication":"none"}'` routes
 TP-owned rows through the research adapter. The option is off by default.
-The adapter requires the external `shared_model_adapter`, `row264_kernels`,
-owner service, and experimental NIXL/GPUNETIO library used in the prior
-research runtime. It currently only supports 256-wide Engram layers 1 and 14.
-`ENGRAM_SHARED_PREFETCH=1` enables the external reader's experimental CP hash
+The SGLang package contains the reader, owner service, and READ-plan code. It
+requires the separately built experimental NIXL/GPUNETIO GPU-GET library from
+the prior research runtime. It currently only supports 256-wide Engram layers 1 and 14.
+`ENGRAM_SHARED_PREFETCH=1` enables the reader's experimental CP hash
 prefetch; `ENGRAM_SHARED_READ_PLAN=1` uses its prepared multi-QP READ plan.
-These options require the matching external runtime and have not been qualified
-for all graph, cancellation, or model configurations. It is not a self-contained installation,
-nor does this draft provide the owner, NIXL GET implementation or setup script.
+These options require the matching native library and have not been qualified
+for all graph, cancellation, or model configurations. The native NIXL GET
+implementation remains a separate dependency.
 The experimental runtime validates checkpoint identity and registered table
 metadata. The following smoke and C8 measurements used this draft at commit
 `a4edaf95a27657069ac32f417e0857e926a1cf62`, before its later main-branch
@@ -64,14 +64,14 @@ reference output exactly. The P used TP8/CP8, bounded replay disabled and the
 remote reader; D used DP8, a native per-node host table and DSpark. Mooncake
 handled P/D KV transfer. P recorded one KV transfer, and both P/D requests
 returned successfully. This is a single functional smoke, not a performance,
-concurrency or production qualification. The reader runtime and owner remain
-external dependencies.
+concurrency or production qualification. That historical test used separately
+provisioned reader and owner files; this draft now includes their Python code.
 
 A subsequent paired C8 test used three rounds of 32 measured requests per arm
 with 16K input and 64 output tokens on the same two H20 nodes. The Shared P
 used 16 QPs and the experimental READ plan/prefetch; Native P used the
-per-node local CPU table available at that tested revision. Both used the same D process, Mooncake KV, model
-version, prompt sets, and bounded replay disabled. Median-of-round TTFT p50 was
+per-node local CPU table available at that tested revision. Both used the same D
+process, Mooncake KV, model version, prompt sets, and bounded replay disabled. Median-of-round TTFT p50 was
 5159.83 ms Native and 5204.95 ms Shared (+0.87%); output throughput was 94.33
 and 93.52 tokens/s (-0.85%). All 96 paired input and output hashes matched,
 with zero measured cache hits, retractions or client errors. P was restarted
@@ -80,6 +80,63 @@ the sample is not a production or p99 qualification. The 1-QP path had a
 5928.08 ms TTFT p50 in one earlier 32-request round; the combined READ plan and
 prefetch changes improved that matching-input round by 12.44%, but individual
 contributions and multi-run 1-QP variance were not isolated.
+
+### Starting the research owner and reader
+
+The Python owner and reader are included in this PR. The native library is
+separate: build the legacy DOCA 3.1 research snapshot following the [NIXL
+reproducer](https://github.com/foraxe/nixl/tree/b5322e46f6e686ff16bdb3afb8a1a940a64e1163/research/vllm_engram_repro).
+Use the matching NIXL core and GPUNETIO plugin on both nodes. This is not a
+supported current-DOCA installation. Configure the local RDMA device, GID and
+OOB interface as required by that reproducer.
+
+On the owner node, set `MODEL`, `SHIM`, `OWNER_HOST` and an empty private
+`WORK` directory for your deployment, then run:
+
+```bash
+python -m sglang.srt.engram_remote.owner \
+  --checkpoint "$MODEL" --library "$SHIM" --owner-gpu 0 \
+  --rdma-port 56001 --control-host 0.0.0.0 --advertise-host "$OWNER_HOST" \
+  --control-port 56002 --ready-file "$WORK/owner.json" \
+  --stop-file "$WORK/owner.stop" --max-pinned-gib 190 --storage-layout row264
+```
+
+The ready file contains registration metadata and remote memory keys. Transfer
+it securely to the reader node and restrict the owner control network to
+trusted peers; the research control channel is not authenticated or encrypted.
+Choose unused ports and adjust the pinned-memory budget for the checkpoint.
+Do not stop the owner while readers or their GPU work are active.
+
+On the prefill node, set `MODEL`, `SHIM` and `OWNER_READY` to the matching
+checkpoint, local native library, and securely copied ready file. In addition
+to the usual SGLang P/D configuration, set:
+
+```bash
+export SGLANG_EXPERIMENTAL_REMOTE_ENGRAM=1
+export ENGRAM_SHARED_MODEL="$MODEL" ENGRAM_SHARED_LIBRARY="$SHIM"
+export ENGRAM_SHARED_READY="$OWNER_READY" ENGRAM_SHARED_READER_PORT_BASE=56100
+export ENGRAM_SHARED_PREFETCH=1 ENGRAM_SHARED_READ_PLAN=1
+export ENGRAM_SHARED_READ_LANES=16 ENGRAM_SHARED_MAX_QUERIES=393216
+export ENGRAM_SHARED_READ_GRAPH_SIZES=393216 ENGRAM_SHARED_DEFER_LAYER14=1
+# Optional: one RDMA device name per visible GPU, comma separated.
+export ENGRAM_SHARED_READER_DEVICES="<gpu0-device>,<gpu1-device>,..."
+```
+
+Use `--engram-config '{"placement":"cpu","replication":"none"}'` for
+this experimental path. Keep the decode node on its native Engram path. These
+legacy `ENGRAM_SHARED_*` keys configure the research reader and native ABI;
+their final configuration surface is part of the design discussion. To check
+both checkpoint layers with one reader GPU, set `ENGRAM_SHARED_MAX_QUERIES=8192`
+and `ENGRAM_SHARED_READ_GRAPH_SIZES=4096`, then run:
+
+```bash
+python test/manual/engram_remote_smoke.py
+```
+
+After readers have stopped and drained, create the owner stop file and wait for
+it to exit. Failed readers can leave orphan leases; this prototype intentionally
+does not reclaim them on a timer. The older native backend can retain per-peer
+QP resources until owner exit, so repeated restarts require special care.
 
 ## Research evidence and limits
 

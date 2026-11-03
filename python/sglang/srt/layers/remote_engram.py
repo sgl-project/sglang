@@ -1,8 +1,8 @@
 """Experimental adapter for the external shared-Engram research runtime.
 
-This adapter is opt-in and is not a supported NIXL integration. It expects the
-legacy research runtime on PYTHONPATH. The reader owns registered scratch
-until GPU work retires.
+This adapter is opt-in and is not a supported NIXL integration. Its reader and
+owner live in SGLang; the native GPU-GET library is a separate research build.
+The reader owns registered scratch until GPU work retires.
 """
 
 import os
@@ -48,7 +48,7 @@ class RemoteEngramTable:
         if self.loaded != {"weight", "scale"}:
             raise RuntimeError("remote Engram checkpoint parameters not loaded")
         if _runtime is None:
-            from shared_model_adapter import ReaderRuntime
+            from sglang.srt.engram_remote.runtime import ReaderRuntime
 
             _runtime = ReaderRuntime()
         self.runtime = _runtime
@@ -89,7 +89,7 @@ class RemoteEngramTable:
             indices, self.layer_id, row_start, row_start + rows
         )
         if self.runtime.storage_layout == "row264":
-            from row264_kernels import gather_row264
+            from sglang.srt.engram_remote.row264_kernels import gather_row264
 
             representatives = (
                 self.runtime.context.representatives((1, 14).index(self.layer_id))
