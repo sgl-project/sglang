@@ -78,10 +78,10 @@ class TestReqFinishMethods(CustomTestCase):
 
     def test_abort_resets_start_lens_for_the_one_token_prompt(self):
         req = Req(
-            "r",
-            "",
-            [1, 2, 3],
-            SamplingParams(),
+            rid="r",
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3],
+            sampling_params=SamplingParams(),
             return_logprob=True,
             return_routed_experts=True,
             routed_experts_start_len=-1,
