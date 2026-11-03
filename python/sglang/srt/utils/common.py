@@ -431,7 +431,7 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
 
 def get_numa_node_available_bytes(node: int) -> int:
     """
-    Estimate the available memory on a NUMA node, in bytes.
+    Estimate the available memory on a NUMA node in bytes.
 
     Node meminfo has no MemAvailable field, so this adds MemFree, file-backed
     page cache and reclaimable slab. The result can be slightly optimistic,
