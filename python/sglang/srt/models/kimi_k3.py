@@ -92,6 +92,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -1927,13 +1928,21 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+        # Not do_fuse_qkvbfg: it requires quant_config is None, which quantized
+        # checkpoints never meet even though their attention linears stay bf16.
+        if not (self.use_full_rank_gate and self.attn_tp_size == self.tp_size):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
         if self._bfa_uses_block_fp8:
             return False
-        ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
+        mods = (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)
+        # The merged buffer is applied through fused_qkvg_proj's quant method and
+        # carries only .weight, and online quantization replaces .weight after
+        # this runs, so every projection must stay unquantized.
+        if not all(isinstance(m.quant_method, UnquantizedLinearMethod) for m in mods):
+            return False
+        ws = [m.weight for m in mods]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
         # Whitelist the dtype rather than only require the three to agree: the
