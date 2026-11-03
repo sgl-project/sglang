@@ -40,7 +40,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 
 
 class C128SidecarComponent(TreeComponent):
