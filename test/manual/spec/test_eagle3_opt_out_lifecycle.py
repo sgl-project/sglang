@@ -201,6 +201,14 @@ def run():
         "--port",
         "30000",
     ]
+    if os.environ.get("LIFECYCLE_GRAPH") == "1":
+        args.remove("--disable-decode-cuda-graph")
+        args += [
+            "--cuda-graph-backend-decode",
+            "full",
+            "--cuda-graph-max-bs-decode",
+            "4",
+        ]
     (root / "args.json").write_text(json.dumps(args))
     url = "http://127.0.0.1:30000"
     summary = {}
@@ -391,7 +399,15 @@ def run():
                     for x in later
                 )
                 assert reuse[rid], f"no observed row+KV slot reuse after {rid}"
+            graph_rounds = sum(
+                x.get("verify_cuda_graph", False)
+                for x in rows
+                if x["kind"] == "draft_extend"
+            )
+            if os.environ.get("LIFECYCLE_GRAPH") == "1":
+                assert graph_rounds > 0, "no actual target verify graph execution"
             summary.update(
+                graph_rounds=graph_rounds,
                 mixed_rounds=sum(any(x["flags"]) and not all(x["flags"]) for x in ver),
                 draft_checks=len(states),
                 reuse=reuse,
