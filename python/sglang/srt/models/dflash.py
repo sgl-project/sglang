@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -1186,6 +1187,12 @@ class DFlashDraftModel(nn.Module):
         for layer in self.layers:
             if isinstance(layer.self_attn, DFlashMLAAttention):
                 layer.self_attn.absorb_kv_b_proj()
+
+        # DSpark drafts load their backbone through here as well.
+        if envs.SGLANG_SPEC_DRAFT_INT8_WEIGHTS.get():
+            from sglang.srt.speculative.draft_int8 import apply_draft_int8_weights
+
+            apply_draft_int8_weights(self)
 
 
 class DFlashLagunaAttention(DFlashAttention):
