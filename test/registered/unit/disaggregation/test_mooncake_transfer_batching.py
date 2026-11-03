@@ -839,6 +839,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         manager = SimpleNamespace(
             enable_trace=False,
             enable_staging=False,
+            enable_failed_session_repair=False,
             enable_deferred_decode_kv_release=True,
             _staging_outstanding=defaultdict(int),
             request_status={1: KVPoll.WaitingForInput},
@@ -861,6 +862,15 @@ class TestMooncakeEarlySend(CustomTestCase):
             note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
+        manager._session_transfer_allowed = lambda session, room: (
+            MooncakeKVManager._session_transfer_allowed(manager, session, room)
+        )
+        manager._release_session_repair_room = lambda room: (
+            MooncakeKVManager._release_session_repair_room(manager, room)
+        )
+        manager._finish_session_repair = lambda session, room: (
+            MooncakeKVManager._finish_session_repair(manager, session, room)
+        )
         return manager, queue
 
     def test_worker_waits_before_reading_kv(self):
