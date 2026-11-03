@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -149,6 +150,8 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    import torch
+
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
     if use_mla:
@@ -173,7 +176,7 @@ def build_kv_host_pool(
     geometry = resolve_kv_host_geometry(
         kv_pool,
         page_size=page_size // parallel.attn_dcp_size
-        if use_mla and parallel.dcp_enabled
+        if parallel.dcp_enabled
         else page_size,
         layout=get_memory().hicache_mem_layout,
         use_mla=use_mla,
@@ -205,10 +208,23 @@ def build_kv_host_pool(
     else:
         kwargs.update(mha_kwargs)
     if parallel.dcp_enabled:
-        assert use_mla, (
-            "HiCache + DCP is only wired for the MLA host pool; the MHA host "
-            "pool has no DCP index translation."
-        )
+        # Per-tensor FP8 stores raw bytes; its static scales belong to the model.
+        if not use_mla and (
+            kv_host_pool_cls is not MHATokenToKVPoolHost
+            or kv_pool.dtype
+            not in (
+                torch.bfloat16,
+                torch.float16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
+            or host_input.scales is not None
+            or mtp_draft_device_pools
+        ):
+            raise ValueError(
+                "MHA HiCache + DCP requires a standard FP16/BF16 or per-tensor FP8 "
+                "host pool without drafts or pool-resident scales."
+            )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
     host_pool = kv_host_pool_cls(
