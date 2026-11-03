@@ -1,5 +1,6 @@
 //! OpenAI Chat Completions endpoint and chat-template preparation.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -83,9 +84,36 @@ pub(super) struct ChatBody {
 impl<'de> Deserialize<'de> for ChatBody {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = Value::deserialize(deserializer)?;
-        let request = ChatRequest::deserialize(&raw).map_err(serde::de::Error::custom)?;
+        let request =
+            ChatRequest::deserialize(&*fold_reasoning(&raw)).map_err(serde::de::Error::custom)?;
         Ok(Self { request, raw })
     }
+}
+
+/// `raw` as Dynamo's typed request can read it. Dynamo aliases a message's
+/// `reasoning` to `reasoning_content`, so it rejects both keys together and a
+/// `reasoning` that is not text, which Python accepts. A string `reasoning` fills
+/// a missing or null `reasoning_content`, and any other `reasoning` is dropped.
+fn fold_reasoning(raw: &Value) -> Cow<'_, Value> {
+    let carries_reasoning = raw["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| message.get("reasoning").is_some())
+    });
+    if !carries_reasoning {
+        return Cow::Borrowed(raw);
+    }
+    let mut body = raw.clone();
+    let messages = body["messages"].as_array_mut().into_iter().flatten();
+    for message in messages.filter_map(Value::as_object_mut) {
+        let Some(reasoning) = message.remove("reasoning") else {
+            continue;
+        };
+        if reasoning.is_string() && message.get("reasoning_content").is_none_or(Value::is_null) {
+            message.insert("reasoning_content".into(), reasoning);
+        }
+    }
+    Cow::Owned(body)
 }
 
 async fn chat_completions(
@@ -1101,12 +1129,12 @@ mod tests {
 
     use super::super::ChatFormatter;
     use super::super::test_utils::{
-        answering_app_state_with, answering_app_state_with_item, body_json, chat_submitted, chunk,
-        post_json,
+        answering_app_state_with, answering_app_state_with_item, body_json, chat_submitted,
+        checkpoint_formatter, chunk, post_json,
     };
     use super::{
-        OutputParsing, SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        ChatBody, OutputParsing, SamplingDefaults, chat_event_stream, chat_logprobs,
+        chat_sampling_params, merge_template_stops, render_chat, unary_chat,
     };
     use crate::message::config::{DefaultSamplingParams, ServerArgs};
     use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
@@ -1332,6 +1360,59 @@ mod tests {
         let app = super::routes().with_state(state);
         let response = post_json(app, "/v1/chat/completions", body).await;
         body_json(response).await["choices"][0]["message"].clone()
+    }
+
+    /// Every replayed assistant shape parses, and the template reads a string
+    /// `reasoning` only when `reasoning_content` is missing or null.
+    #[test]
+    fn replayed_assistant_reasoning_parses_and_renders() {
+        use serde::Deserialize;
+        use serde_json::json;
+
+        let formatter = checkpoint_formatter(
+            &json!({}),
+            "{{ messages[0].reasoning_content or 'absent' }}",
+        );
+        let object = json!({"effort": "high"});
+        for (fields, expected) in [
+            (json!({"reasoning": "alias"}), "alias"),
+            (
+                json!({"reasoning": "alias", "reasoning_content": null}),
+                "alias",
+            ),
+            (
+                json!({"reasoning": "alias", "reasoning_content": "native"}),
+                "native",
+            ),
+            (
+                json!({"reasoning": "alias", "reasoning_content": ""}),
+                "absent",
+            ),
+            (
+                json!({"reasoning": null, "reasoning_content": "native"}),
+                "native",
+            ),
+            (
+                json!({"reasoning": null, "reasoning_content": null}),
+                "absent",
+            ),
+            (json!({"reasoning": object}), "absent"),
+            (
+                json!({"reasoning": object, "reasoning_content": "native"}),
+                "native",
+            ),
+        ] {
+            let mut assistant = json!({"role": "assistant", "content": "A"});
+            let added = fields.as_object().unwrap().clone();
+            assistant.as_object_mut().unwrap().extend(added);
+            let messages = json!([assistant, {"role": "user", "content": "Q"}]);
+            let body = json!({"model": "model", "messages": messages});
+            let ChatBody { request, raw } =
+                ChatBody::deserialize(body).unwrap_or_else(|error| panic!("{fields}: {error}"));
+            let rendered =
+                render_chat(&formatter, raw, &request.request, &Default::default()).unwrap();
+            assert_eq!(rendered.prompt.as_str(), expected, "{fields}");
+        }
     }
 
     /// The DeepSeek-V4.1 checkpoint the processor's `openai_parity` fixture
