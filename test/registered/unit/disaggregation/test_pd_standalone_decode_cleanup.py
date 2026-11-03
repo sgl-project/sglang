@@ -110,11 +110,13 @@ class TestPdStandaloneDecodeCleanup(unittest.TestCase):
 
     def enqueue(self, queue, rid, room, *, probability=0.75, token=3, max_new=8):
         def req():
+            sampling_params = SamplingParams(max_new_tokens=max_new)
+            sampling_params.normalize(tokenizer=None)
             return Req(
                 rid,
                 "",
                 array("q", [1, 2]),
-                SamplingParams(max_new_tokens=max_new),
+                sampling_params,
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=room,
                 vocab_size=11,
