@@ -89,7 +89,9 @@ def should_use_zmq() -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+_LOAD_AWARE_METHODS = frozenset(
+    {"total_requests", "total_tokens", "prefill_session_tokens"}
+)
 
 
 def _tokenizer_load_snapshot_owner_caller() -> str:
