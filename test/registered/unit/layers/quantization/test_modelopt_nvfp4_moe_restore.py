@@ -65,7 +65,9 @@ def _raw_tensors(seed):
 
 def _layer(raw):
     config = MoeRunnerConfig(is_gated=True)
-    method = ModelOptNvFp4FusedMoEMethod(SimpleNamespace(use_per_token_activation=False))
+    method = ModelOptNvFp4FusedMoEMethod(
+        SimpleNamespace(use_per_token_activation=False)
+    )
     layer = FusedMoE.__new__(FusedMoE)
     torch.nn.Module.__init__(layer)
     layer.quant_method = method

@@ -2976,8 +2976,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
-            # Rescaled E4M3 block scales cannot be recovered exactly.
-            if not w13_scales_rescaled and not layer.trtllm_fp4_layout_padded:
+            # Exact restore needs unrescaled E4M3 scales and the standard
+            # aligner without padding (it records whether it padded).
+            if not w13_scales_rescaled and not getattr(
+                layer, "trtllm_fp4_layout_padded", True
+            ):
                 layer._fp4_moe_repack = "trtllm"
 
         else:
