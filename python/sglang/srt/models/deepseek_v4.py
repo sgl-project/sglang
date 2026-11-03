@@ -4780,6 +4780,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 # Deterministic execution keeps its pinned tactic.
                 method.mxfp8_prefill_autotune_min_tokens = 1
             weight = layer.weight
+            if weight.numel() == 0:
+                continue
             scale = layer.weight_scale_inv_swizzled
             key = (
                 weight.shape,
