@@ -1,0 +1,253 @@
+---
+title: "Cohere-compatible embedding API"
+description: "Create embeddings with /v2/embed. Configure input formats, token limits, output dimensions, and vector encodings."
+---
+
+Use `POST /v2/embed` to create one embedding per input sample. The endpoint returns all results in one JSON response, in input order. It uses the served model's existing embedding and pooling implementation.
+
+The request and response format targets vLLM v0.32.0's Cohere-style embedding API. For the OpenAI request format, use [`/v1/embeddings`](/docs/basic_usage/openai_api_embeddings).
+
+## Start an embedding server
+
+The commands below target Linux with one NVIDIA CUDA GPU and a SGLang build that includes `/v2/embed`. Install SGLang using the [installation guide](/docs/get-started/install). The client example requires the Python `requests` package.
+
+Start `Qwen/Qwen3-Embedding-0.6B`:
+
+```bash
+sglang serve \
+  --model-path Qwen/Qwen3-Embedding-0.6B \
+  --is-embedding \
+  --tp 1 \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --context-length 256 \
+  --json-model-override-args '{"is_matryoshka":true,"matryoshka_dimensions":[128]}'
+```
+
+This example uses a short context for testing. The model override declares support for 128-dimensional output so you can run the dimension example below. It does not change the model weights. Do not use this override to claim dimension-reduction support for a model that lacks it.
+
+The commands use a public Hugging Face model and do not set an API key. If you configure server authentication, include `Authorization: Bearer YOUR_API_KEY` in each request. Keep the tokenizer enabled; `/v2/embed` requires it.
+
+## Embed text
+
+After the server is ready, send a JSON request:
+
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v2/embed",
+    json={"texts": ["A red apple on the table.", "A spaceship approaches Mars."]},
+    timeout=120,
+)
+response.raise_for_status()
+result = response.json()
+
+vectors = result["embeddings"]["float"]
+assert len(vectors) == 2
+print("First vector dimension:", len(vectors[0]))
+print("First five values:", vectors[0][:5])
+print("Token counts:", result["meta"]["billed_units"])
+```
+
+The first vector represents the apple sentence. The second represents the spaceship sentence. Omitting `model` selects the model already served by this process; the request does not load another model.
+
+## Request fields
+
+Send `Content-Type: application/json`. Provide exactly one non-null field among `texts`, `images`, and `inputs`, and give it a nonempty list. For example, sending both `texts` and `images` returns HTTP 400. Use `inputs` to combine text and images in one sample.
+
+| Field | Type | Default | Behavior |
+| --- | --- | --- | --- |
+| `model` | String | Served model name | Select the served model by its name or model path. An unknown model returns HTTP 404. |
+| `texts` | Array of strings | Not set | Create one embedding per string. |
+| `images` | Array of image strings | Not set | Create one embedding per image. Each string must be nonempty. See [image inputs](#image-and-mixed-inputs). |
+| `inputs` | Array of objects | Not set | Create one embedding per object's `content` list, combining all blocks in that list. |
+| `input_type` | String | No task instruction | Select a task instruction defined by the model. See [task instructions](#task-instructions). |
+| `output_dimension` | Positive integer | Model's default dimension | Request a dimension supported by the model's Matryoshka configuration. |
+| `embedding_types` | Array of strings | `["float"]` | Select any combination of `float`, `base64`, `binary`, and `ubinary`. An omitted value, `null`, or `[]` selects `float`. |
+| `truncate` | String | `"END"` | Choose `END`, `START`, or `NONE`. See [token limits](#token-limits-and-truncation). |
+| `max_tokens` | Integer, at least `-1` | Server input limit | Set the token budget for each sample after preprocessing. It limits input tokens, not generated output. |
+| `priority` | Signed 64-bit integer | `0` | Forward the priority to the server's scheduler. Scheduling order follows the server's priority configuration. |
+
+All samples in a request share the task, dimension, encoding, and truncation settings. Unknown JSON fields are ignored. In particular, `stream: true` does not enable streaming.
+
+### Task instructions
+
+`input_type` is a model-defined key. The server reads string-valued entries from the model's `task_instructions` configuration. If that mapping is empty, it reads `prompts` from `config_sentence_transformers.json`.
+
+For example, a model with this instruction mapping accepts `"input_type": "query"`:
+
+```json
+{"task_instructions": {"query": "Represent this query: "}}
+```
+
+An unknown key returns HTTP 400 and lists the available keys. There is no automatic `search_document` instruction.
+
+For `texts`, a nonempty instruction becomes the system message when a chat template is available. Without a chat template, the server concatenates the instruction and the text exactly; it inserts no separator. In the example above, the instruction's trailing space separates it from the text.
+
+When `input_type` is omitted, `texts` are tokenized without adding a task instruction or rendering a chat template. `images` and `inputs` always use a chat template, including `inputs` containing only text.
+
+### Image and mixed inputs
+
+<Note>
+Image request conversion is implemented. Real image-model GPU inference and Nemotron 3.5 Embed HF-reference validation have not been completed for this endpoint. The examples below specify the request format; they do not provide a validated multimodal model deployment recipe.
+</Note>
+
+Image requests require a multimodal embedding model and an embedding-compatible chat template that represents images. The text-only Qwen3 server above rejects image requests with HTTP 400. An unavailable template also returns HTTP 400.
+
+Image strings can be HTTP(S) URLs or base64 data URLs such as `data:image/png;base64,...`. The server must be able to fetch or decode the image. A content block uses one of these forms:
+
+| Block | Fields |
+| --- | --- |
+| Text | `{"type": "text", "text": "Describe the image."}` |
+| Image | `{"type": "image_url", "image_url": {"url": "IMAGE_URL"}}` |
+
+The `image_url` field is an object containing `url`, not a string. Audio and video content blocks are not accepted.
+
+The following example constructs two request bodies from a local PNG. Place an existing PNG at `image.png` before running it:
+
+```python
+import base64
+from pathlib import Path
+
+image_url = "data:image/png;base64," + base64.b64encode(
+    Path("image.png").read_bytes()
+).decode("ascii")
+
+# One sample: returns one image embedding.
+image_request = {"images": [image_url]}
+
+# Two samples: returns two embeddings, not three.
+mixed_request = {
+    "inputs": [
+        {
+            "content": [
+                {"type": "text", "text": "A red apple."},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
+        },
+        {"content": [{"type": "text", "text": "A spaceship approaches Mars."}]},
+    ]
+}
+```
+
+Send one of these bodies as the JSON body of `POST /v2/embed` to a multimodal embedding server. In `mixed_request`, vector 0 represents the text and image together; vector 1 represents the text-only sample. Each `content` list must be nonempty and can contain multiple images.
+
+## Token limits and truncation
+
+The budget applies separately to each sample after task instructions, templates, special tokens, and multimodal preprocessing have been applied. The server input limit accounts for context length, reserved tokens, and scheduling limits; it is not necessarily equal to `--context-length`.
+
+Let `B` be the server's available input-token limit and `N` a positive `max_tokens` value.
+
+| `max_tokens` | `truncate="END"` or `"START"` | `truncate="NONE"` |
+| --- | --- | --- |
+| Omitted or `null` | Use `B`; truncate a longer input. | Reject an input longer than `B`. |
+| `-1` | Use `B`; truncate a longer input. | Compare against literal `-1`; reject every nonempty input. |
+| `0` | Text input becomes empty and is rejected. Image input cannot be removed to meet a zero-token budget. | Reject every nonempty input. |
+| `N` at most `B` | Keep at most `N` tokens. | Reject an input longer than `N`. |
+| `N` greater than `B` | Reject the request, even if the input is short. | Accept an input that fits within `B`; reject a longer input. |
+
+For a text token sequence `[A, B, C, D, E]` with `max_tokens: 3`:
+
+- `END` removes tokens from the end and retains `[A, B, C]`.
+- `START` removes tokens from the start and retains `[C, D, E]`.
+- `NONE` returns HTTP 400 instead of truncating.
+
+A final empty token sequence returns HTTP 400. An empty string is not rejected solely for being empty: the result depends on the tokens added during preprocessing.
+
+For multimodal inputs, truncation has additional restrictions:
+
+- `START` returns HTTP 400 when shortening is required.
+- `END` can remove only a trailing text region while keeping every image token span and boundary token.
+- Image inputs with MRoPE or separate vision-position metadata cannot be shortened by this endpoint. Missing or invalid image span boundaries also cause HTTP 400 when shortening is required.
+- Image inputs without a complete, consistent expanded token sequence return HTTP 400 in all three modes, even if the input fits the token budget.
+
+## Output dimensions and encodings
+
+Set `output_dimension` to request a shorter vector. The server checks that the model supports Matryoshka embeddings, that the dimension is in its configured allowed list when one exists, and that it does not exceed the model's maximum dimension. A failed check returns HTTP 400.
+
+The server command above explicitly enables 128-dimensional output. Request that dimension and two encodings:
+
+```python
+import base64
+import struct
+
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v2/embed",
+    json={
+        "texts": ["A red apple."],
+        "output_dimension": 128,
+        "embedding_types": ["float", "base64"],
+    },
+    timeout=120,
+)
+response.raise_for_status()
+embeddings = response.json()["embeddings"]
+
+assert len(embeddings["float"][0]) == 128
+decoded = struct.unpack("<128f", base64.b64decode(embeddings["base64"][0]))
+print("Decoded dimension:", len(decoded))
+```
+
+For `N` samples with dimension `D`, the response contains:
+
+| Encoding | JSON value | Representation |
+| --- | --- | --- |
+| `float` | `N` arrays of `D` numbers | Floating-point vectors. |
+| `base64` | `N` strings | Each string encodes `D` little-endian float32 values. |
+| `ubinary` | `N` arrays of `D / 8` integers | Packed sign bits, with values from 0 to 255. |
+| `binary` | `N` arrays of `D / 8` integers | Each packed unsigned byte minus 128, with values from -128 to 127. |
+
+Binary encodings require `D` to be divisible by 8; otherwise the request returns HTTP 400. Each component greater than or equal to zero maps to bit 1, and each negative component maps to bit 0. The first component occupies the most significant bit.
+
+For example, `[1, -1, 1, -1, 1, -1, 1, -1]` becomes `10101010`, so `ubinary` is `[170]` and `binary` is `[42]`. Requesting several encodings converts the same inference result into each format.
+
+## Response fields
+
+A successful request returns HTTP 200 with these fields:
+
+| Field | Value |
+| --- | --- |
+| `id` | Generated string beginning with `embd-`. |
+| `embeddings` | Object containing only the requested encoding names. Every encoding preserves sample order. |
+| `texts` | Original `texts` array, before task formatting or truncation. Omitted for `images` and `inputs` requests. |
+| `meta.api_version.version` | String `"2"`. |
+| `meta.billed_units.input_tokens` | Sum of processed input tokens when the request contains no images; otherwise 0. |
+| `meta.billed_units.image_tokens` | Sum of all processed input tokens when the request contains any image; otherwise 0. |
+| `response_type` | String `"embeddings_by_type"`. |
+
+Token counts include preprocessing and reflect truncation. For a mixed batch containing an image, `image_tokens` includes text tokens and tokens from text-only samples as well. It is request-level accounting, not a count of visual tokens alone or a monetary charge.
+
+## Errors
+
+The endpoint uses an `error` object containing `message`, `type`, `param`, and `code`. `param` is `null` when no parameter name is supplied.
+
+For example, requesting an unknown task key on a model with no configured instructions returns HTTP 400 with this structure:
+
+```json
+{
+  "error": {
+    "message": "Unsupported input_type 'query'; supported input types: none",
+    "type": "BadRequestError",
+    "param": null,
+    "code": 400
+  }
+}
+```
+
+| HTTP status | Error type | Cause |
+| --- | --- | --- |
+| 400 | `BadRequestError` | Invalid request fields, unsupported task or model capability, invalid output dimension, missing template, or token-limit violation. |
+| 404 | `NotFoundError` | The requested model is not served by this process. |
+| 500 | `InternalServerError` | Internal execution or response-serialization failure. |
+
+Server authentication and scheduling also apply their existing checks.
+
+## Current scope
+
+- Text requests have GPU integration coverage with `Alibaba-NLP/gte-Qwen2-1.5B-instruct` and `Qwen/Qwen3-Embedding-0.6B`. These tests compare results with `/v1/embeddings`.
+- The endpoint adapts requests to installed model implementations. It does not add Nemotron model implementations.
+- Encoder/language disaggregation is not supported for these embedding requests. Use a server that runs the model and its encoder together for image requests.
+- The endpoint returns embeddings only. It does not implement Cohere chat, text generation, reranking, audio/video inputs, or streaming.
