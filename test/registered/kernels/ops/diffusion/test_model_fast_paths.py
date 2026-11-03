@@ -152,11 +152,13 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
 from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
     fold_upsample2x_conv2d_weight,
 )
-from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    use_vae_fast_path,
+)
 from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     FusedWanRMSNormSiLU,
     GatedChannelsLastUpsample,
-    VaeFastPathGate,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
