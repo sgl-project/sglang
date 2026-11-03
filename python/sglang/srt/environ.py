@@ -1385,7 +1385,7 @@ class Envs:
     # decode. Exposed as a knob (e.g. set 2.0) for grid A/B tuning without a rebuild.
     SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
     # Tri-state tensor-descriptor path in the Triton extend-attention kernel.
-    # Unset -> auto, on only where descriptor loads reach a hardware fast path;
+    # Unset -> auto, currently off on every platform;
     # True/False force it, which is how the two paths are A/B-ed on one device.
     SGLANG_USE_TRITON_ATTN_TENSOR_DESC = EnvBool(None)
 

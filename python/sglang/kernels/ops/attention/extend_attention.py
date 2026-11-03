@@ -41,7 +41,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
-    is_xpu,
 )
 
 _is_cuda = is_cuda()
@@ -49,7 +48,6 @@ if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
-_is_xpu = is_xpu()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
@@ -1226,11 +1224,8 @@ def extend_attention_fwd(
     # Tiles are gated one at a time: the preconditions vary legitimately between
     # models, so a tile that fails one silently keeps the pointer path.
     q_desc = qpe_desc = k_desc = kpe_desc = v_desc = None
-    # Descriptors only beat the pointer path where they lower to a hardware fast
-    # path, so every other backend stays on pointers unless the env var forces them.
+    # Unset (auto) is off on every platform for now; only the env var enables it.
     use_tensor_desc = envs.SGLANG_USE_TRITON_ATTN_TENSOR_DESC.get()
-    if use_tensor_desc is None:
-        use_tensor_desc = _is_xpu
     if use_tensor_desc and _support_tensor_descriptor:
         # Q / K carry the rope sub-tile in the same head, so the pair of tiles is
         # what has to cover the head dim.
