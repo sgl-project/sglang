@@ -29,7 +29,16 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+)
 
 import msgspec
 import numpy as np
@@ -410,14 +419,6 @@ class DecodeRequest:
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
-    @property
-    def seqlen(self) -> int:
-        return self.req.seqlen
-
-    @property
-    def priority(self) -> Optional[int]:
-        return self.req.priority
-
 
 class _PendingPublish(msgspec.Struct, frozen=True):
     allocated: torch.cuda.Event
@@ -495,7 +496,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
-        self.queue: List[DecodeRequest] = []
+        self.queue = _RequestList(
+            ListKind.PD_PREALLOC,
+            abort=self._abort_prealloc,
+            req_of=lambda decode_req: decode_req.req,
+        )
         self.retracted_queue = _RequestList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
         )
@@ -1006,7 +1011,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
-        self.queue.append(decode_req)
+        self.queue.join([decode_req])
         return decode_req
 
     def hold_rebootstrap(self, req: Req) -> None:
@@ -1066,6 +1071,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return True
         return False
 
+    def _abort_prealloc(self, recv_req: AbortReq) -> None:
+        for decode_req in self.queue.items():
+            if recv_req.matches(decode_req.req.rid):
+                logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                decode_req.kv_receiver.abort()
+                if get_parallel().pp_size > 1:
+                    prepare_abort(decode_req.req, "Aborted by AbortReq.")
+
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
@@ -1087,9 +1100,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
 
-    def request_lists(self) -> Dict[ListKind, List[Req]]:
+    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
         return {
-            ListKind.PD_PREALLOC: [decode_req.req for decode_req in self.queue],
+            ListKind.PD_PREALLOC: self.queue,
             ListKind.PD_RETRACTED: self.retracted_queue,
             ListKind.PD_HELD: self.held_rebootstrap_reqs,
         }
@@ -1230,17 +1243,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # is blocked.
         if self.pp_size > 1:
             polls = poll_and_all_reduce_pp(
-                (decode_req.req.rid for decode_req in self.queue),
+                (req.rid for req in self.queue),
                 KVPoll.WaitingForInput,
                 pp_good_rids,
                 pp_bad_rids,
             )
         else:
             polls = poll_and_all_reduce(
-                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+                [decode_req.kv_receiver for decode_req in self.queue.items()],
+                self.gloo_group,
             )
 
-        for decode_req, poll in zip(self.queue, polls):
+        for decode_req, poll in zip(self.queue.items(), polls):
             if poll is None:
                 continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1478,14 +1492,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
+        queue = list(self.queue.items())
         if self.scheduler.enable_priority_scheduling:
             priority_sign = (
                 1 if self.scheduler.schedule_low_priority_values_first else -1
             )
-            self.queue.sort(key=lambda r: r.req.priority * priority_sign)
+            queue.sort(key=lambda r: r.req.priority * priority_sign)
+            self.queue.clear()
+            self.queue.join(queue)
 
         # First, remove all failed requests from the queue
-        for i, decode_req in enumerate(self.queue):
+        for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -1536,11 +1553,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras = {
                 req.lora_id for batch in running_batches for req in batch.reqs
             }
-            running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
+            running_loras.update(req.lora_id for req in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
         # Then, preallocate the remaining requests if possible
-        for i, decode_req in enumerate(self.queue):
+        for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -1784,9 +1801,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
                     release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
 
-        self.queue = [
-            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
-        ]
+        self.queue.leave([queue[i].req for i in indices_to_remove])
 
         return preallocated_reqs, failed_reqs
 
@@ -2243,7 +2258,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         queue, and no failed transfer awaiting its drain."""
         return not (
             self.has_published_destinations
-            or any(decode_req.host_staged for decode_req in self.transfer_queue.queue)
+            or any(
+                decode_req.host_staged
+                for decode_req in self.transfer_queue.queue.items()
+            )
             or self.transfer_queue.has_pending_deferred_releases()
         )
 
@@ -2261,7 +2279,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def num_tokens_pre_allocated(self):
         return sum(
             decode_req.req.extend_end
-            for decode_req in self.transfer_queue.queue
+            for decode_req in self.transfer_queue.queue.items()
             if not decode_req.host_staged
         )
 
@@ -2271,7 +2289,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         charged the way the pool stats charge a request's private KV."""
         page_size = self.token_to_kv_pool_allocator.page_size
         full_tokens = swa_tokens = 0
-        for decode_req in self.transfer_queue.queue:
+        for decode_req in self.transfer_queue.queue.items():
             if decode_req.host_staged:
                 continue
             full_tokens += kv_private_tokens(decode_req.req.kv, page_size)
@@ -2299,7 +2317,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
         return (
             len(self.scheduler.running_batch.reqs)
-            + sum(not r.host_staged for r in self.transfer_queue.queue)
+            + sum(not r.host_staged for r in self.transfer_queue.queue.items())
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
@@ -2839,7 +2857,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
-        self.queue: List[DecodeRequest] = []
+        self.queue = _RequestList(
+            ListKind.PD_RECEIVING,
+            abort=self._abort_receiving,
+            req_of=lambda decode_req: decode_req.req,
+        )
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
@@ -2865,20 +2887,33 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
 
-    def request_lists(self) -> Dict[ListKind, List[Req]]:
+    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
         return {
-            ListKind.PD_RECEIVING: [decode_req.req for decode_req in self.queue],
+            ListKind.PD_RECEIVING: self.queue,
             # Aborted, with KV held until the transfer drains.
             ListKind.PD_RELEASING: [
                 decode_req.req for decode_req, *_ in self._deferred_releases
             ],
         }
 
+    def _abort_receiving(self, recv_req: AbortReq) -> None:
+        for decode_req in self.queue.items():
+            if recv_req.matches(decode_req.req.rid):
+                logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                if decode_req.host_staged:
+                    # Keep the host destination alive until prefill stops writing.
+                    prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                    continue
+                # The receiver arms drain-ack accounting before sending the
+                # ABORT (see CommonKVReceiver._send_abort_notification), so
+                # an ack racing back is never dropped.
+                decode_req.kv_receiver.abort()
+
     def add(self, decode_req: DecodeRequest) -> None:
-        self.queue.append(decode_req)
+        self.queue.join([decode_req])
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
-        self.queue.extend(decode_reqs)
+        self.queue.join(decode_reqs)
         # This queue now covers them.
         prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
         if prealloc_queue is not None:
@@ -3069,20 +3104,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _pollers(self) -> list:
         if self.scheduler.enable_decode_hicache:
-            return [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
-        return [dr.kv_receiver for dr in self.queue]
+            return [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue.items()]
+        return [dr.kv_receiver for dr in self.queue.items()]
 
     def _poll_with_metadata_gate(self) -> List[int]:
         return poll_and_all_reduce(
             self._pollers(),
             self.gloo_group,
-            decode_reqs=self.queue,
+            decode_reqs=list(self.queue.items()),
             metadata_buffers=self.metadata_buffers,
         )
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
-            self.queue,
+            list(self.queue.items()),
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
@@ -3130,7 +3165,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def publish_pending_metadata(self, polls: Optional[List[int]] = None) -> None:
         pending = []
         ready = []
-        for i, decode_req in enumerate(self.queue):
+        for i, decode_req in enumerate(self.queue.items()):
             metadata = decode_req.pending_metadata
             if metadata is None:
                 continue
@@ -3169,7 +3204,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self._process_hicache_local_restores(
                 [
                     decode_req
-                    for decode_req in self.queue
+                    for decode_req in self.queue.items()
                     if rids_to_check is None or decode_req.req.rid in rids_to_check
                 ]
             )
@@ -3187,7 +3222,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         failed: List[Tuple[int, DecodeRequest, bool]] = []
         outcomes: Dict[str, bool] = {}
         device_admission_refused = False
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+        queue = list(self.queue.items())
+        for i, (decode_req, poll) in enumerate(zip(queue, polls)):
             if rids_to_check is not None:
                 if decode_req.req.rid not in rids_to_check:
                     continue
@@ -3339,21 +3375,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 # Held for deferred release; metadata buffer freed at resolve time.
                 continue
             if self.enable_staging and self.staging_handler.is_staging_room(
-                self.queue[i].req.bootstrap_room
+                queue[i].req.bootstrap_room
             ):
-                self.staging_handler.unregister_decode_req(
-                    self.queue[i].req.bootstrap_room
-                )
-            idx = self.queue[i].metadata_buffer_index
+                self.staging_handler.unregister_decode_req(queue[i].req.bootstrap_room)
+            idx = queue[i].metadata_buffer_index
             assert idx != -1
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
             self.metadata_buffers.clear_slot(idx)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
-        self.queue = [
-            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
-        ]
+        self.queue.leave([queue[i].req for i in indices_to_remove])
         polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
         self.publish_pending_metadata(polls)

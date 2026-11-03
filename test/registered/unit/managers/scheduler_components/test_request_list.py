@@ -41,10 +41,8 @@ _OWNERS = (
 # shrinks: a list that migrates leaves it.
 _NOT_YET_LISTS = {
     "Scheduler.waiting_queue",
-    "DecodePreallocQueue.queue",
     # Shares its entries with `queue`.
     "DecodePreallocQueue.pending_reqs",
-    "DecodeTransferQueue.queue",
     "DecodeTransferQueue._deferred_releases",
     # A subset of `waiting_queue`.
     "DllmManager.staging_queue",

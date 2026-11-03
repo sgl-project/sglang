@@ -182,7 +182,7 @@ def disagg_transfers_in_flight(scheduler):
             return bool(
                 any(
                     not decode_req.host_staged
-                    for decode_req in scheduler.disagg_decode_transfer_queue.queue
+                    for decode_req in scheduler.disagg_decode_transfer_queue.queue.items()
                 )
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (

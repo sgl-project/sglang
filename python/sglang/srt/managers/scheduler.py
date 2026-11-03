@@ -6080,29 +6080,6 @@ class Scheduler(
             if isinstance(request_list, RequestList):
                 request_list.abort(recv_req)
 
-        # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.matches(decode_req.req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.matches(decode_req.req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    if decode_req.host_staged:
-                        # Keep the host destination alive until prefill stops writing.
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-                        continue
-                    # The receiver arms drain-ack accounting before sending the
-                    # ABORT (see CommonKVReceiver._send_abort_notification), so
-                    # an ack racing back is never dropped.
-                    decode_req.kv_receiver.abort()
-
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
             if not req.finished() and recv_req.matches(req.rid):
