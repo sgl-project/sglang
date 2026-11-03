@@ -81,6 +81,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -355,9 +356,16 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         else:
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
+        # In-transfer reqs never verify, and verify indexes the spec scratch by
+        # batch row (build_verify_intermediate_state_indices). ReplaySSM-spec rings
+        # (GDN, KDA's request ring) and PP-spec stable rows index by req_pool_idx,
+        # so they keep the in-transfer slots.
+        mamba_spec_state_size = size
+        if enable_linear_replayssm_spec or pp_spec_stable_rows_enabled():
+            mamba_spec_state_size = size + pre_alloc_size
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
