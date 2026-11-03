@@ -235,7 +235,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             envs.SGLANG_ENABLE_QSA_SPARSE_DECODE_CUDA.get()
             and self._fused_kv_pool_eligible
             and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
-            and (is_sm100_supported() or is_sm120())
+            and is_sm120()
         )
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)

@@ -21,7 +21,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 pytestmark = pytest.mark.skipif(
     not (is_sm100_supported() or is_sm120()),
-    reason="qsa_sparse_decode is enabled on SM100 and SM120",
+    reason="qsa_sparse_decode is tested on SM100 and SM120",
 )
 
 Q_HEADS, KV_HEADS, HEAD_DIM, PAGE, RATIO = 24, 2, 256, 64, 4
@@ -178,13 +178,14 @@ def _fp8_backend(enabled):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_backend_routes_fp8_decode_to_kernel(monkeypatch, enabled):
-    """With the env var set, decode / verify skip the fused pack-for-trtllm
-    path and run qsa_sparse_decode on the expanded top-k; without it nothing
-    changes."""
+    """With the env var set on SM120, decode / verify skip the fused
+    pack-for-trtllm path and run qsa_sparse_decode on the expanded top-k;
+    without it, or on SM100, nothing changes."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.test.mem_cache_utils import routed
 
     module, backend = _fp8_backend(enabled)
+    enabled = enabled and is_sm120()
     assert backend._use_sparse_decode_cuda is enabled
     x = _make_inputs(2, 1, 6000, seed=1)
     backend.qsa_profile = None
