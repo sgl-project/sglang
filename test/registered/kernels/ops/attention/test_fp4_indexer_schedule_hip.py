@@ -29,16 +29,20 @@ class TestPrefillScheduleCompilesBeforeServing(CustomTestCase):
     def test_no_new_variant_after_warm_up(self):
         from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
             CTA_INFO_WIDTH,
+            _prefill_cta_info_kernel,
         )
 
         from sglang.kernels.ops.attention.dsv4 import fp4_indexer_schedule_hip as sched
 
-        kernel = sched._prefill_schedule_prep_kernel
-        if not hasattr(kernel, "device_caches"):
+        kernels = (sched._prefill_schedule_prep_kernel, _prefill_cta_info_kernel)
+        if not all(hasattr(kernel, "device_caches") for kernel in kernels):
             self.skipTest("this Triton keeps no per-device kernel cache")
 
         def variants():
-            return sum(len(entry[0]) for entry in kernel.device_caches.values())
+            return [
+                sum(len(entry[0]) for entry in kernel.device_caches.values())
+                for kernel in kernels
+            ]
 
         device = torch.device("cuda", torch.cuda.current_device())
         sched.warm_prefill_schedule(device)
@@ -47,12 +51,13 @@ class TestPrefillScheduleCompilesBeforeServing(CustomTestCase):
         # as a row share or a request group produces them
         for rows, width, start in (
             (17, 5, 0),
-            (100, 37, 3),
+            (102, 37, 3),
             (333, 1440, 1),
             (1000, 23, 2),
             (2047, 64, 0),
             (2049, 9, 5),
             (3001, 730, 7),
+            (3002, 12, 4),
             (4095, 4, 1),
             (4096, 1441, 0),
         ):

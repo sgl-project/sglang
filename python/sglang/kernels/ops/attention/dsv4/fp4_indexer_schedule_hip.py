@@ -38,6 +38,9 @@ MAX_FUSED_ROWS = 4096
 # up to a multiple of 4, plus 4 more for the scheduler's one-chunk lookahead.
 _PT_BLOCK = 256
 
+# int32s per 16 bytes, the granularity of Triton's pointer-alignment specialization.
+_I32_PER_16B = 4
+
 
 @triton.jit
 def _pad_page_table_tile(
@@ -276,25 +279,31 @@ class PrefillScheduleBuffers:
 
     def __init__(self, rows: int, device: torch.device):
         self.fused = rows <= MAX_FUSED_ROWS
+        # Every row region and the [safe, total_splits] pair (the prep kernel writes
+        # it as one) start on a 16-byte boundary: AITER's cta_info kernel specializes
+        # on pointer alignment, so a stride of exactly rows would compile a new
+        # variant per rows % 4 while serving.
+        stride = triton.cdiv(rows, _I32_PER_16B) * _I32_PER_16B
         if not self.fused:
-            self.storage = torch.empty(2 * rows, dtype=torch.int32, device=device)
+            self.storage = torch.empty(2 * stride, dtype=torch.int32, device=device)
             # Identity rows over their whole window; constant across refreshes,
             # so these two dispatches happen once per buffer, not per build.
             self.row_to_batch = self.storage[0:rows]
-            self.local_starts = self.storage[rows : 2 * rows]
+            self.local_starts = self.storage[stride : stride + rows]
             torch.arange(rows, dtype=torch.int32, device=device, out=self.row_to_batch)
             self.local_starts.zero_()
             self.chunks = self.incl = self.excl = None
             self.safe = self.total_splits = None
             return
-        self.storage = torch.empty(5 * rows + 2, dtype=torch.int32, device=device)
+        tail = 5 * stride
+        self.storage = torch.empty(tail + 2, dtype=torch.int32, device=device)
         self.chunks = self.storage[0:rows]
-        self.incl = self.storage[rows : 2 * rows]
-        self.excl = self.storage[2 * rows : 3 * rows]
-        self.row_to_batch = self.storage[3 * rows : 4 * rows]
-        self.local_starts = self.storage[4 * rows : 5 * rows]
-        self.safe = self.storage[5 * rows : 5 * rows + 1]
-        self.total_splits = self.storage[5 * rows + 1 : 5 * rows + 2]
+        self.incl = self.storage[stride : stride + rows]
+        self.excl = self.storage[2 * stride : 2 * stride + rows]
+        self.row_to_batch = self.storage[3 * stride : 3 * stride + rows]
+        self.local_starts = self.storage[4 * stride : 4 * stride + rows]
+        self.safe = self.storage[tail : tail + 1]
+        self.total_splits = self.storage[tail + 1 : tail + 2]
 
 
 def build_prefill_schedule(
@@ -411,28 +420,36 @@ _warm_prefill_devices: set = set()
 
 def warm_prefill_schedule(device: torch.device) -> None:
     """Compile every BLOCK_T variant of the fused prefill schedule (one per power of two
-    up to MAX_FUSED_ROWS) once per device, so no prefill call compiles one while
-    serving; prefill calls of any row count then reuse these. Skipped inside CUDA-graph
-    capture, which must not record the warm-up launches."""
+    up to MAX_FUSED_ROWS) and both alignments of its local_ends once per device, so no
+    prefill call compiles one while serving; prefill calls of any row count then reuse
+    these. Skipped inside CUDA-graph capture, which must not record the warm-up
+    launches."""
     if device in _warm_prefill_devices or torch.cuda.is_current_stream_capturing():
         return
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         CTA_INFO_WIDTH,
     )
 
-    rows = 16
-    while rows <= MAX_FUSED_ROWS:
+    def build(rows: int, ends_offset: int) -> None:
         page_table = torch.zeros((rows, 4), dtype=torch.int32, device=device)
+        ends = torch.ones(ends_offset + rows, dtype=torch.int32, device=device)
         build_prefill_schedule(
             page_table=page_table,
-            local_ends=torch.ones(rows, dtype=torch.int32, device=device),
+            local_ends=ends[ends_offset:],
             cta_info_out=torch.empty(
                 (rows, CTA_INFO_WIDTH), dtype=torch.int32, device=device
             ),
             parallel_unit_num=rows,
             max_seq_len=page_table.shape[1] * _KV_BLOCK_SIZE,
         )
+
+    rows = 16
+    while rows <= MAX_FUSED_ROWS:
+        build(rows, 0)
         rows *= 2
+    # A request group or a row share starts at any row, and AITER's cta_info kernel
+    # keys on whether local_ends is 16-byte aligned.
+    build(16, 1)
     _warm_prefill_devices.add(device)
 
 
