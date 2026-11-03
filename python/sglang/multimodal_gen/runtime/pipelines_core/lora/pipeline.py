@@ -741,7 +741,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 return False
             if has_unmergeable_weights:
                 logger.info(
-                    "Using dynamic LoRA for %s because its quantized weights cannot be merged in place.",
+                    "Using dynamic LoRA for %s because its quantized or AMX-packed weights cannot be merged in place.",
                     module_name,
                 )
                 return False
@@ -749,7 +749,7 @@ class LoRAPipeline(ComposedPipelineBase):
         if has_unmergeable_weights:
             raise ValueError(
                 f"LoRA merge mode is unavailable for {module_name} because its "
-                "quantized weights cannot be updated in place; use merge mode 'dynamic'"
+                "quantized or AMX-packed weights cannot be updated in place; use merge mode 'dynamic'"
             )
         if uses_dtensor_weights:
             logger.warning(
