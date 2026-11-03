@@ -1436,9 +1436,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_reqs = _RequestList(
-            ListKind.CHUNKED, abort=self._defer_chunked_abort
-        )
+        self.chunked_reqs = _RequestList(ListKind.CHUNKED, abort=self._abort_chunked)
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -6023,9 +6021,8 @@ class Scheduler(
     def _abort_waiting(self, recv_req: AbortReq) -> None:
         """Abort the waiting requests `recv_req` names."""
         for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
-            # Abort method 1: directly pop from the queue
-            # This only works for requests that have not started anything.
-            # We still need to send something back to TokenizerManager to clean up the state.
+            # A waiting request has started nothing, so it is aborted here; the
+            # tokenizer still needs the abort output to clean up its state.
             # Finished in place, so a later abort in the same intake skips it.
             if req.finished_reason is None:
                 req.finish_outside_step(FINISH_ABORT())
@@ -6054,8 +6051,9 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-    def _defer_chunked_abort(self, recv_req: AbortReq) -> None:
-        """Mark the chunked request for `process_pending_chunked_abort`."""
+    def _abort_chunked(self, recv_req: AbortReq) -> None:
+        """Mark the chunked request; `process_pending_chunked_abort` aborts it at
+        the next schedule."""
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -6072,8 +6070,8 @@ class Scheduler(
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
             if not req.finished() and recv_req.matches(req.rid):
-                # Abort method 2: `request_finish`
-                # The request will still run one decode forward pass.
+                # A running request is finished through `request_finish` and
+                # still runs one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:

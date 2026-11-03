@@ -125,10 +125,9 @@ class _RequestList(RequestList):
 
 
 class WaitingQueue(RequestList):
-    """The requests waiting for prefill admission, in queue order. Held in a list,
-    which joining appends to in place: requests join one at a time and the policy
-    reorders the queue every pass, which a rebound dict would make linear per
-    request."""
+    """The requests waiting for prefill admission, in queue order. Held in a list:
+    the queue is read by index and slice, joined at the front, and reordered by
+    the scheduling policy through `replace`."""
 
     kind = ListKind.WAITING
 
