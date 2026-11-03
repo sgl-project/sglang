@@ -141,6 +141,9 @@ def test_matches_reference(steps, vocab, block):
 
 @pytest.mark.parametrize("vocab,token", [(129, 126), (65569, 32766)])
 def test_final_draw_when_cutoff_rounds_to_residual_total(vocab, token):
+    """The final token must be the last positive-weight token when FP32 rounding
+    lifts the cutoff to the residual total. The scan used to match no token here
+    and return VOCAB_SIZE - 1, which has zero weight."""
     target = torch.zeros(1, 2, vocab, device=DEVICE)
     # The common prefix sums to 1 - 2**-126; the two rows differ only in the tail.
     target[:, :, :126] = target.new_tensor([2.0**-k for k in range(1, 127)])
@@ -162,6 +165,9 @@ def test_final_draw_when_cutoff_rounds_to_residual_total(vocab, token):
 
 @pytest.mark.parametrize("vocab", [17, 129])
 def test_final_draw_stays_in_residual_support_for_coins_near_one(vocab):
+    """The final token must have positive residual weight for coins just below 1.
+    FP32 rounding used to let the scan return a zero-weight or out-of-vocabulary
+    token for these coins."""
     torch.manual_seed(42)
     batch = 102400
     target = torch.randn(batch, 2, vocab, device=DEVICE).softmax(-1)
