@@ -49,7 +49,7 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
 
 def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
     manager = backend.sparse_kv_manager
-    if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get() or manager is None:
+    if not envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get() or manager is None:
         return False
     if (
         not forward_batch.forward_mode.is_decode()

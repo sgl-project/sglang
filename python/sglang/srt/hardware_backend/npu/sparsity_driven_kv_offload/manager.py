@@ -121,8 +121,8 @@ class SparseKVCacheManager:
         )
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
-        self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
-        if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get():
+        self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+        if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
             from sglang.srt.runtime_context import get_spec
 
             spec = get_spec()
@@ -134,8 +134,8 @@ class SparseKVCacheManager:
                     "Experimental native MTP requires a Q4 chain with topk=1."
                 )
         if (
-            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
-            and envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get()
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
         ):
             raise ValueError("Experimental Q4 LIM does not support fused pre-metadata.")
         self.max_context_len = copy_sfa_host_row_stride(
@@ -365,7 +365,7 @@ class SparseKVCacheManager:
                         dtype=torch.int32,
                         device=self.device,
                     )
-                    if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get():
+                    if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
                         self.mtp_attn_out = torch.empty(
                             (
                                 self.batch_capacity * 4,

@@ -314,7 +314,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         * num_sparse_pools
                     )
                 self._fixed_overhead_bytes += reservation
-                if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
+                if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
                     # One FP32 dequant-scale workspace shared across indexer
                     # layers, with a row for every physical indexer token.
                     self._cell_size += 4
@@ -375,7 +375,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         # reserved above; native LIM also needs one FP32 scale
                         # workspace per physical draft index token.
                         self._cell_size += draft_indexer_size
-                        if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
+                        if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
                             self._cell_size += 4
                             self._fixed_overhead_bytes += 4 * get_schedule().page_size
                     else:

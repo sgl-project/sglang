@@ -106,7 +106,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         if (
             forward_batch.forward_mode.is_decode()
             or (
-                envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
                 and forward_batch.forward_mode.is_target_verify()
             )
         ) and not is_copy_sfa_decode_graph_eligible(forward_batch.seq_lens_cpu):

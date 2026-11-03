@@ -32,13 +32,17 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
+def use_fused_sparse_kv_offload() -> bool:
+    return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+
+
 def is_copy_sfa_decode_graph_eligible(seq_lens_cpu) -> bool:
     """Require every live row to have enough tokens to populate its cache.
 
     C defaults to K=2048. Larger native LIM caches use host gather until C
     visible tokens exist, so those batches must also stay outside this graph.
     """
-    if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
+    if not envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get():
         return True
     capacity = envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() or 2048
     return seq_lens_cpu is not None and not any(
@@ -53,11 +57,11 @@ def is_sparsity_driven_kv_offload_enabled(
 ) -> bool:
     indexer_impl = get_offload_sparse_kv_indexer_impl()
     if (
-        envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+        envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
         and not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
     ):
         raise ValueError(
-            "SGLANG_NPU_ENABLE_COPY_SFA requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD."
+            "SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD."
         )
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
         if indexer_impl != "legacy":
@@ -109,12 +113,7 @@ def is_sparsity_driven_kv_offload_enabled(
 
 
 def get_offload_sparse_kv_indexer_impl() -> str:
-    value = envs.SGLANG_NPU_SPARSE_KV_INDEXER.get()
-    if value not in ("legacy", "lim"):
-        raise ValueError(
-            f"SGLANG_NPU_SPARSE_KV_INDEXER must be legacy or lim; got {value!r}."
-        )
-    return value
+    return "lim" if use_fused_sparse_kv_offload() else "legacy"
 
 
 def get_sparsity_driven_kv_offload_sparse_context_len(
@@ -196,11 +195,11 @@ def get_sparse_kv_budget(
         cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
         hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
         indexer_impl=get_offload_sparse_kv_indexer_impl(),
-        copy_sfa=envs.SGLANG_NPU_ENABLE_COPY_SFA.get(),
+        copy_sfa=envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get(),
         copy_sfa_query_heads=copy_sfa_query_heads,
-        mtp_full_visible=envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get(),
-        fused_copy_sfa_metadata=envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get(),
-        fused_pre_metadata=envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get(),
+        mtp_full_visible=envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get(),
+        fused_copy_sfa_metadata=envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get(),
+        fused_pre_metadata=envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get(),
         graph_batch_capacity=sparse_batch_capacity(
             request_rows,
             max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),

@@ -408,7 +408,7 @@ class AscendAttnBackend(AttentionBackend):
                         ),
                         None,
                     )
-                    if envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+                    if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
                     else None
                 ),
                 graph_batch_capacity=graph_batch_capacity,

@@ -143,7 +143,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         if forward_batch.forward_mode.is_decode() or (
-            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
             and forward_batch.forward_mode.is_target_verify()
         ):
             # Copy-SFA v1 uses a fixed 2048-token cache window. Decide from

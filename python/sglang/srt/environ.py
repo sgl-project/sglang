@@ -1055,19 +1055,12 @@ class Envs:
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     # Per-request resident token capacity; 0 defaults to model TopK or auto-sizes
-    # from the manager HBM budget. Legacy/reference use LRU when C > K;
+    # from the manager HBM budget. Legacy uses LRU when C > K;
     # native LIM maintains its own resident mapping.
     SGLANG_NPU_SPARSE_KV_CACHE_SIZE = EnvInt(0)
     # Per-rank persistent manager allocations, in MiB; 0 leaves the cap unset.
     SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB = EnvInt(0)
-    # Sparse KV offload indexer/cache implementation: legacy or native LIM.
-    SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
-    SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA = EnvBool(False)
-    SGLANG_NPU_FUSED_LIM_PRE_METADATA = EnvBool(False)
-    # Experimental MTP path; requires a matching full-visible LIM kernel.
-    SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE = EnvBool(False)
-    # Optional operator-enabled library; loaded once before graph capture.
-    SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
+    SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)

@@ -60,12 +60,12 @@ class LIMDecodeAdapter:
         self.top_k = manager.sparse_context_len
         self.full_visible = manager.copy_sfa_enabled
         self.fused_copy_metadata = (
-            self.full_visible and envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get()
+            self.full_visible and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
         )
         self.fused_pre_metadata = (
             self.full_visible
             and self.top_k == 2048
-            and envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get()
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
         )
         self.source_capacity = (manager.max_context_len + 127) // 128 * 128
         self.width = self.top_k if self.full_visible else self.top_k + 128
@@ -129,7 +129,7 @@ class LIMDecodeAdapter:
             self._metadata_next_scratch = torch.full(
                 (self.batch_capacity,), -1, dtype=torch.int32, device=device
             )
-        self.mtp_full_visible = envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+        self.mtp_full_visible = envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
         if self.mtp_full_visible:
             # The diagnostic integration supports the target-verify Q4 shape.
             rows = self.batch_capacity * 4
