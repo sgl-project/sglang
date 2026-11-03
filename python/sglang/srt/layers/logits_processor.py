@@ -542,6 +542,8 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        # Logits columns of --sampling-banned-token-ids (set_banned_token_ids).
+        self.banned_token_cols: Optional[torch.Tensor] = None
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1068,8 +1070,8 @@ class LogitsProcessor(nn.Module):
                 and logits_metadata.forward_mode.is_target_verify()
             ):
                 return logits
-            return self._gather_softcap_fused(
-                logits, logits_metadata, use_logits_buffer
+            return self._mask_banned_tokens(
+                self._gather_softcap_fused(logits, logits_metadata, use_logits_buffer)
             )
 
         used_tp_lm_head_all_to_all = False
@@ -1121,6 +1123,44 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        return self._mask_banned_tokens(logits)
+
+    def set_banned_token_ids(
+        self,
+        token_ids: List[int],
+        device: torch.device,
+        column_token_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Set the logits of token_ids to the lowest finite value in every row
+        from now on, so their probability is 0 and every logprob stays finite.
+
+        column_token_ids maps each logits column to its token id, for a head
+        over a reduced vocabulary (a draft hot-token map); None means column c
+        is token c.
+        """
+        ids = torch.tensor(sorted(set(token_ids)), dtype=torch.int64)
+        if column_token_ids is None:
+            if int(ids[-1]) >= self.vocab_size:
+                logger.warning(
+                    "Banned token ids >= the vocabulary size %d are ignored.",
+                    self.vocab_size,
+                )
+            cols = ids[ids < self.vocab_size]
+        else:
+            cols = torch.isin(column_token_ids.cpu().long(), ids).nonzero().flatten()
+        self.banned_token_cols = cols.to(device) if cols.numel() > 0 else None
+        logger.info(
+            "Banned token ids: %d of %d logits columns masked.",
+            cols.numel(),
+            self.vocab_size if column_token_ids is None else len(column_token_ids),
+        )
+
+    def _mask_banned_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+        # A static index, so CUDA-graph capture keeps it.
+        if self.banned_token_cols is not None:
+            logits.index_fill_(
+                -1, self.banned_token_cols, torch.finfo(logits.dtype).min
+            )
         return logits
 
     def _can_gather_softcap_fused(

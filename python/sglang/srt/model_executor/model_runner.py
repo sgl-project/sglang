@@ -92,7 +92,10 @@ from sglang.srt.layers.cp.utils import (
     is_mla_cp_enabled,
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
@@ -768,6 +771,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
+        self.maybe_set_banned_token_ids()
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -866,6 +870,16 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if get_parallel().tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+
+    def maybe_set_banned_token_ids(self):
+        token_ids = get_exec().features.sampling_banned_token_ids
+        # A draft head can span a reduced vocabulary; its speculative worker
+        # masks the draft after setting up the head.
+        if not token_ids or self.is_draft_worker:
+            return
+        for module in self.model.modules():
+            if isinstance(module, LogitsProcessor):
+                module.set_banned_token_ids(token_ids=token_ids, device=self.device)
 
     def maybe_init_lora_manager(self):
         if self.spec_algorithm.is_uno():
