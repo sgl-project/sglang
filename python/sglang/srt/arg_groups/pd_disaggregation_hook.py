@@ -5,12 +5,12 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
 
@@ -208,8 +208,8 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
     attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
     if cfg.tp_size != attn_dp_size:
         unsupported.append("attention tensor parallelism greater than one")
-    if cfg.enable_pdmux or cfg.decoupled_spec_role != "null":
-        unsupported.append("PD multiplexing or decoupled speculation")
+    if cfg.decoupled_spec_role != "null":
+        unsupported.append("decoupled speculation")
     if cfg.enable_pd_role_switch:
         unsupported.append("runtime PD role switching")
     if cfg.encoder_only or cfg.language_only:
