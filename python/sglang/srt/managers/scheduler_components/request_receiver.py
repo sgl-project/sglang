@@ -50,9 +50,6 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
-        AsyncShmMaterializer,
-    )
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -78,22 +75,20 @@ class SchedulerRequestReceiver:
     # SGLANG_RUST_SERVER: requests are drained from the embedded Rust
     # listener's ring rather than received over zmq.
     rust_server_mode: bool
-    # Unlimited-OCR only: off-thread SHM materialization and crop prefetch.
-    async_shm_materializer: Optional[AsyncShmMaterializer] = None
-    submit_crop_prefetch: Optional[Callable[[list], None]] = None
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        # The async SHM materializer reserves queue room for one bounded poll.
-        limit = (
-            self.max_recv_per_poll
-            if self.async_shm_materializer is None
-            else self.async_shm_materializer.max_recv_per_poll
-        )
-        if limit < 0:
-            return False
-        return num_recv_reqs >= limit
+        return self.max_recv_per_poll >= 0 and num_recv_reqs >= self.max_recv_per_poll
+
+    def has_pending(self) -> bool:
+        return False
+
+    def wait_for_progress(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
@@ -104,9 +99,9 @@ class SchedulerRequestReceiver:
         local_reqs are aborts the caller decided on this rank; they ride the
         same broadcast as the pulled requests.
         """
-        if self.async_shm_materializer is not None:
-            return self._recv_requests_async(local_reqs)
+        return self._recv_requests(local_reqs)
 
+    def _recv_requests(self, local_reqs: Optional[List[AbortReq]]) -> List:
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
 
@@ -118,7 +113,6 @@ class SchedulerRequestReceiver:
 
         self._finalize_shm_features(recv_reqs)
 
-        self._submit_crop_prefetch(recv_reqs)
         return recv_reqs
 
     def _recv_and_broadcast(self, local_reqs: Optional[List[AbortReq]]) -> List:
@@ -133,40 +127,6 @@ class SchedulerRequestReceiver:
             self.unwrap_pickle_wrapper(recv_reqs)
 
         return self._apply_mm_receiver(recv_reqs)
-
-    def _recv_requests_async(self, local_reqs: Optional[List[AbortReq]]) -> List:
-        """Return materialized values in arrival order; new ones materialize off-thread."""
-        materializer = self.async_shm_materializer
-        ready = materializer.pop_ready()
-
-        if self.scripted_scheduler_hook is not None:
-            self.scripted_scheduler_hook.step()
-
-        if (
-            self.recv_skipper is not None
-            and not self.recv_skipper.handle(self.get_last_batch())
-        ) or not materializer.reserve_receive(extra_items=len(local_reqs or ())):
-            self._submit_crop_prefetch(ready)
-            return ready
-
-        try:
-            recv_reqs = self._recv_and_broadcast(local_reqs)
-            materializer.submit(
-                recv_reqs,
-                finalize=self._finalize_shm_features,
-                has_shm=has_shm_features,
-            )
-            ready = ready + materializer.pop_ready()
-        except BaseException:
-            materializer.cancel_receive()
-            raise
-
-        self._submit_crop_prefetch(ready)
-        return ready
-
-    def _submit_crop_prefetch(self, values: List) -> None:
-        if self.submit_crop_prefetch is not None and values:
-            self.submit_crop_prefetch(values)
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if get_parallel().pp_rank == 0:

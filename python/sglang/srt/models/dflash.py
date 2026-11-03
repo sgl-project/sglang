@@ -57,7 +57,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:

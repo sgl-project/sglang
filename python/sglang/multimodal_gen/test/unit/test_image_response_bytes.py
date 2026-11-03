@@ -18,10 +18,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import unpack_tensors
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils

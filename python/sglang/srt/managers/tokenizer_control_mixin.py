@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -94,7 +95,6 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
-from sglang.srt.server_args import LoRARef
 from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
