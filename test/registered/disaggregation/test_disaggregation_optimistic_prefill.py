@@ -24,7 +24,10 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -474,16 +477,16 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-            _release_aborted_request=lambda req: None,
+            release_aborted_request=lambda req: None,
             clear_pending_chunk_send=lambda req: None,
-            prefill_launched_reqs=RequestList(),
+            prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
         )
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req
+                scheduler, req, scheduler.prefill_launched_reqs
             )
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
