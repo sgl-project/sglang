@@ -28,6 +28,19 @@ class NPUSwiglu(BaseActivation):
         return torch.ops.npu.npu_swiglu(hidden_states), None
 
 
+class NPUSwigluWithLimit(BaseActivation):
+    """Clip gate/up before SiLU, keeping the floating output dtype."""
+
+    def __init__(self, limit: float):
+        self.limit = float(limit)
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        gate, up = hidden_states.float().chunk(2, dim=-1)
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        return (F.silu(gate) * up).to(hidden_states.dtype), None
+
+
 class NPUSwigluQuant(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(

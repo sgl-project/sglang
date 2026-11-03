@@ -24,13 +24,17 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -43,7 +47,7 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
-register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=310, stage="extra-a", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
@@ -473,15 +477,16 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-            _release_aborted_request=lambda req: None,
+            release_aborted_request=lambda req: None,
             clear_pending_chunk_send=lambda req: None,
+            prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
         )
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req
+                scheduler, req, scheduler.prefill_launched_reqs
             )
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
