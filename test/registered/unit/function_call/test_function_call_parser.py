@@ -5,6 +5,7 @@ import warnings
 from unittest.mock import patch
 
 import xgrammar as xgr
+from llguidance import LLMatcher, LLTokenizer, grammar_from
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -3363,6 +3364,35 @@ class TestGlm4MoeDetector(CustomTestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def test_python_only_literals_keep_the_tool_call(self):
+        """ast.literal_eval accepts these values, but json.dumps does not."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="inspect",
+                    parameters={"properties": {"value": {"type": "array"}}},
+                ),
+            )
+        ]
+        for raw in ('{"env:prod", "service:web"}', "[{1, 2}]", "b'abc'", "1j"):
+            with self.subTest(raw=raw):
+                text = (
+                    "<tool_call>inspect\n<arg_key>value</arg_key>\n"
+                    f"<arg_value>{raw}</arg_value>\n</tool_call>"
+                )
+                result = Glm4MoeDetector().detect_and_parse(text, tools)
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(json.loads(result.calls[0].parameters), {"value": raw})
+
+                detector = Glm4MoeDetector()
+                detector.parse_streaming_increment(text, tools)
+                # The chat endpoint serializes these arguments when a stream finishes.
+                self.assertEqual(
+                    json.loads(json.dumps(detector.prev_tool_call_arr[0]["arguments"])),
+                    {"value": raw},
+                )
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -3778,7 +3808,7 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
             max_threads=1,
         )
 
-    def _compile(self, parameters=None, choice="auto", parallel=True, thinking=False):
+    def _ebnf(self, parameters=None, choice="auto", parallel=True, thinking=False):
         tools = [
             Tool(type="function", function=Function(name=name, parameters=parameters))
             for name in ("alpha", "beta")
@@ -3788,11 +3818,21 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
             choice, parallel_tool_calls=parallel, thinking_mode=thinking
         )
         self.assertIsNotNone(constraint)
-        return self.compiler.compile_grammar(xgr.Grammar.from_ebnf(constraint[1]))
+        return constraint[1]
+
+    def _compile(self, *args, **kwargs):
+        ebnf = self._ebnf(*args, **kwargs)
+        return self.compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
 
     def _accepts(self, grammar, text):
         matcher = xgr.GrammarMatcher(grammar)
         return matcher.accept_string(text) and matcher.is_completed()
+
+    def _llguidance_accepts(self, ebnf, text):
+        tokenizer = LLTokenizer("byte")
+        matcher = LLMatcher(tokenizer, grammar_from("ebnf", ebnf), log_level=0)
+        consumed = matcher.consume_tokens(tokenizer.tokenize_bytes(text.encode()))
+        return consumed and matcher.is_accepting() and not matcher.is_error()
 
     def test_tool_choice_and_parallel_calls(self):
         alpha = "<tool_call>alpha</tool_call>"
@@ -3873,8 +3913,11 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                 self.assertTrue(
                     self._accepts(grammar, f"<tool_call>alpha{arg}</tool_call>")
                 )
-                self.assertTrue(
-                    self._accepts(grammar, f"<tool_call>alpha{arg}{arg}</tool_call>")
+                # Resolved keys bound the pairs. $ref and properties mixed
+                # with allOf fall back to free-form arguments.
+                self.assertEqual(
+                    self._accepts(grammar, f"<tool_call>alpha{arg}{arg}</tool_call>"),
+                    "$ref" in schema or "properties" in schema,
                 )
                 self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
 
@@ -3941,6 +3984,42 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                 grammar = self._compile({"properties": {key: {"type": "string"}}})
                 text = f"<tool_call>alpha<arg_key>{key}</arg_key><arg_value>v</arg_value></tool_call>"
                 self.assertTrue(self._accepts(grammar, text))
+
+    def test_argument_pairs_are_bounded_by_schema_keys(self):
+        # A repeated key must not let one call grow until max_tokens.
+        for keys in (["query"], ["query", "from", "to"]):
+            ebnf = self._ebnf({"properties": {k: {"type": "string"} for k in keys}})
+            grammar = self.compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+            pairs = [f"<arg_key>{k}</arg_key><arg_value>v</arg_value>" for k in keys]
+            cases = {
+                "".join(pairs): True,
+                "".join(reversed(pairs)): True,
+                "": True,
+                "".join(pairs) + pairs[0]: False,
+                pairs[0] * (len(keys) + 1): False,
+            }
+            for backend, accepts in (
+                ("xgrammar", lambda text: self._accepts(grammar, text)),
+                ("llguidance", lambda text: self._llguidance_accepts(ebnf, text)),
+            ):
+                for arguments, expected in cases.items():
+                    text = f"<tool_call>alpha{arguments}</tool_call>"
+                    with self.subTest(backend=backend, text=text):
+                        self.assertEqual(accepts(text), expected)
+
+    def test_closed_zero_key_schemas_reject_argument_pairs(self):
+        """A closed no-argument tool must not accept argument pairs."""
+        pair = "<arg_key>unknown</arg_key><arg_value>v</arg_value>"
+        for schema in (
+            {"properties": {}, "additionalProperties": False},
+            {"additionalProperties": False},
+        ):
+            with self.subTest(schema=schema):
+                grammar = self._compile(schema)
+                self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
+                self.assertFalse(
+                    self._accepts(grammar, f"<tool_call>alpha{pair}</tool_call>")
+                )
 
 
 class TestLing3Detector(unittest.TestCase):
