@@ -2733,17 +2733,20 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
-def _granian_http1_settings():
+def _granian_http1_settings(max_payload_size: int):
     from granian.http import HTTP1Settings
 
     if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
-        return HTTP1Settings()
+        return HTTP1Settings(max_buffer_size=max_payload_size)
     timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
     if timeout_s <= 0:
         raise ValueError(
             f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
         )
-    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+    return HTTP1Settings(
+        max_buffer_size=max_payload_size,
+        header_read_timeout=timeout_s * 1000,
+    )
 
 
 def _run_granian_server(
@@ -2752,6 +2755,7 @@ def _run_granian_server(
     log_level,
     http2_max_concurrent_streams,
     http2_initial_connection_window_size,
+    max_payload_size,
     tokenizer_manager=None,
     tokenizer_worker_num=1,
     ssl_certfile=None,
@@ -2789,7 +2793,7 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
-        http1_settings=_granian_http1_settings(),
+        http1_settings=_granian_http1_settings(max_payload_size),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
             max_concurrent_streams=http2_max_concurrent_streams,
@@ -2931,6 +2935,7 @@ def _setup_and_run_http_server(
                     http2_initial_connection_window_size=(
                         get_serving().http2_initial_connection_window_size
                     ),
+                    max_payload_size=get_serving().max_payload_size,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -2949,6 +2954,7 @@ def _setup_and_run_http_server(
                     or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
+                    h11_max_incomplete_event_size=get_serving().max_payload_size,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -2992,6 +2998,7 @@ def _setup_and_run_http_server(
                         or get_observability().log_level,
                         timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                         loop="uvloop",
+                        h11_max_incomplete_event_size=get_serving().max_payload_size,
                         ssl_keyfile=get_serving().ssl_keyfile,
                         ssl_certfile=get_serving().ssl_certfile,
                         ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -3036,6 +3043,7 @@ def _setup_and_run_http_server(
                     http2_initial_connection_window_size=(
                         get_serving().http2_initial_connection_window_size
                     ),
+                    max_payload_size=get_serving().max_payload_size,
                     tokenizer_worker_num=get_serving().tokenizer_worker_num,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_keyfile=get_serving().ssl_keyfile,
@@ -3052,6 +3060,7 @@ def _setup_and_run_http_server(
                     or get_observability().log_level,
                     "timeout_keep_alive": envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     "timeout_worker_healthcheck": envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
+                    "h11_max_incomplete_event_size": get_serving().max_payload_size,
                     "loop": "uvloop",
                     "workers": get_serving().tokenizer_worker_num,
                     "ssl_keyfile": get_serving().ssl_keyfile,

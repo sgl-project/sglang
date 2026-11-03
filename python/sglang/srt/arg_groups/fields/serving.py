@@ -132,6 +132,14 @@ class Serving(msgspec.Struct):
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
     ] = 1024 * 1024
+    max_payload_size: A[
+        int,
+        "Maximum request payload size in bytes accepted by the HTTP server. "
+        "With --enable-http2 it raises Granian's HTTP/1.1 read buffer "
+        "(408 KB by default); with Uvicorn it raises the h11 "
+        "incomplete-event ceiling. Large base64 image payloads are otherwise "
+        "rejected with 'payload reached size limit'.",
+    ] = 10 * 1024 * 1024
 
     # -------------------------------------------------------------------------
     # SSL/TLS

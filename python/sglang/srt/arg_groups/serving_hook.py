@@ -90,6 +90,9 @@ def handle_ssl_validation(server_args: Any):
             "and has no effect with --enable-http2."
         )
 
+    if cfg.max_payload_size <= 0:
+        raise ValueError("--max-payload-size must be a positive number of bytes.")
+
     if cfg.enable_http2:
         if not 0 < cfg.http2_max_concurrent_streams < 2**32:
             raise ValueError(
@@ -99,6 +102,12 @@ def handle_ssl_validation(server_args: Any):
             raise ValueError(
                 "--http2-initial-connection-window-size must be between "
                 "1024 and 2147483647."
+            )
+        if cfg.max_payload_size < 8192:
+            raise ValueError(
+                "--max-payload-size must be at least 8192 with --enable-http2 "
+                "(Granian requires an HTTP/1.1 buffer size of at least 8192 "
+                "bytes)."
             )
 
         try:
