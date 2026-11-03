@@ -568,6 +568,8 @@ class MoeFlags(_FlagGroupBase):
     speculative_runner_backend: Any = None
     speculative_a2a_backend: Any = None
     deepep_mode: Any = None
+    mscclpp_mode: Any = None
+    mscclpp_ep_layout: Any = None
     deepep_config: str | None = None
     moe_ascend_ops_config: Any = None
     tbo_enabled: bool | None = None
