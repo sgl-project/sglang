@@ -797,6 +797,21 @@ class ChatCompletionMessageGenericParam(BaseModel):
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
 
+    @model_validator(mode="after")
+    def validate_assistant_tool_call_names(self):
+        # FunctionResponse.name is optional because streaming continuation
+        # chunks carry no name, but a tool call replayed in the conversation
+        # history must name its function: chat encoders look the name up, so a
+        # nameless call otherwise fails while rendering the prompt (HTTP 500)
+        # instead of being rejected as a bad request.
+        if self.role != "assistant" or not self.tool_calls:
+            return self
+        for index, tool_call in enumerate(self.tool_calls):
+            name = tool_call.function.name
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"tool_calls[{index}]: 'function.name' is required")
+        return self
+
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
