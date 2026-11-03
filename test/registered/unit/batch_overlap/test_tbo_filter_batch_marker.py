@@ -15,7 +15,8 @@ import unittest
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -117,6 +118,14 @@ class TestTboFilterBatchMarker(CustomTestCase):
                 parent.defer_logits_to_eager = deferred
                 child = _filter(parent, lo=0, hi=4)
                 self.assertEqual(child.defer_logits_to_eager, deferred)
+
+    def test_filter_batch_drops_attention_kv_len_lower_bound(self):
+        """init_new sets the bound on every one-request batch, so a TBO split
+        of one would trip the completeness guard unless children drop it."""
+        parent = _make_target_verify_batch(8)
+        parent.attention_kv_len_lower_bound = 7
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child.attention_kv_len_lower_bound)
 
     def test_filter_batch_drops_aux_hidden_states_buffer(self):
         """Decode graph capture sets the shared aux output on the parent before

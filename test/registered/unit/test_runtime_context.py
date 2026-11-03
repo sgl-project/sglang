@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+register_cpu_ci(est_time=196, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -240,7 +240,7 @@ class TestParallelDelegation(_IsolatedOverrides):
     def test_wrapper_holds_no_resolved_state(self):
         # __slots__: no __dict__; the only instance state is the override hook.
         self.assertFalse(hasattr(get_parallel(), "__dict__"))
-        # tp_group IS exposed: live delegation handles PD-multiplexing / the tp patch.
+        # tp_group IS exposed: live delegation handles the tp patch.
         self.assertTrue(hasattr(ParallelContext, "tp_group"))
         # local_attn_dp is intentionally not part of the wrapper surface.
         self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))

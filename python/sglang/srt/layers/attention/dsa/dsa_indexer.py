@@ -21,6 +21,10 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import (
+    dcp_all_gather_rows_,
+    dcp_split_rows,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
@@ -202,13 +206,14 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     # PyNCCL is the faster path under capture, but it is not a precondition:
     # a split attn-TP group is built without one (parallel_state.py), and the
     # process-group broadcast captures and replays correctly.
+    pynccl_comm = group.get_available_pynccl_comm()
     if (
         topk_indices.device.type == "cuda"
         and torch.cuda.is_current_stream_capturing()
-        and group.pynccl_comm is not None
+        and pynccl_comm is not None
     ):
-        with group.pynccl_comm.change_state(enable=True):
-            group.pynccl_comm.broadcast(topk_indices, src=0)
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.broadcast(topk_indices, src=0)
     else:
         group.broadcast(topk_indices, src=0)
 
@@ -1565,14 +1570,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        # Every DCP rank holds the whole index K: score 1/W of the rows each, then
+        # all-gather the top-k.
+        split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
+        topk_dst = topk_result
+        if split:
+            row_per, row_slot, row_lo, row_hi = dcp_split_rows(q_offset)
+            # Gather in place unless the strides would spill past the real rows.
+            if (
+                row_per * metadata.dcp_size != q_offset
+                or not topk_result.is_contiguous()
+            ):
+                topk_dst = topk_result.new_empty(
+                    (row_per * metadata.dcp_size, topk_result.shape[1])
+                )
+        else:
+            row_lo, row_hi = 0, q_offset
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
-            num_rows=q_offset,
+            num_rows=row_hi - row_lo,
             num_cols=k_offset,
             get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
             rocm=_is_hip,
         )
 
-        if not need_chunk:
+        if not need_chunk and not split:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
@@ -1621,9 +1642,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
-        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
-        max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
-        max_rows = min(max_rows, q_offset)
+        max_rows = max(1, row_hi - row_lo)
+        if need_chunk:
+            bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+            max_rows = min(max_rows, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
         cu_seqlens_q_full = None
@@ -1638,9 +1661,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
             )
 
-        start = 0
-        while start < q_offset:
-            end = min(start + max_rows, q_offset)
+        start = row_lo
+        while start < row_hi:
+            end = min(start + max_rows, row_hi)
 
             with self._with_real_sm_count():
                 if _is_hip:
@@ -1703,9 +1726,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
             )
-            topk_result[start:end] = raw_topk_chunk
+            topk_dst[start:end] = raw_topk_chunk
             start = end
 
+        if split:
+            dcp_all_gather_rows_(topk_dst, row_per, row_slot)
+            if topk_dst is not topk_result:
+                topk_result[:q_offset] = topk_dst[:q_offset]
         return topk_result
 
     def _forward_cuda_k_only(
@@ -1903,6 +1930,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
+    @property
+    def topk_output_width(self):
+        return self.index_topk
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1911,6 +1942,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
         # A padded eager IDLE rank has no real requests and therefore no valid
         # DSA page-table rows to index. Return invalid rows with the physical DP
@@ -1936,7 +1968,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         in_piecewise_or_breakable_cuda_graph = (
-            _is_in_piecewise_or_breakable_cuda_graph()
+            use_cuda_graph and _is_in_piecewise_or_breakable_cuda_graph()
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside

@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{
     Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, TokenizerBackend,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -443,11 +443,23 @@ mod kimi_fixture;
 
 #[tokio::test]
 async fn generate_kimi_ids_preserve_engine_chunk_boundaries() {
+    for backend in [TokenizerBackend::Hf, TokenizerBackend::Fast] {
+        generate_kimi_ids_preserve_engine_chunk_boundaries_on(backend).await;
+    }
+}
+
+/// Raw `/generate` text takes Kimi's chunked encoding on either tiktoken engine.
+async fn generate_kimi_ids_preserve_engine_chunk_boundaries_on(backend: TokenizerBackend) {
     let mock = MockWorker::start(vec![]).await;
     let fixture = kimi_fixture::tokenizer();
     let mut cfg = config();
     cfg.model.tokenizer_path = Some(fixture.path().join("tiktoken.model").display().to_string());
+    cfg.model.tokenizer.backend = backend;
     let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    assert!(
+        ctx.tokenizers.stats().backend().is_tiktoken(),
+        "{backend:?}"
+    );
     // Kimi's engine tokenizer splits a non-whitespace run after 25,000 chars,
     // cutting through a BPE merge here. Encoding the whole prompt changes its IDs.
     let text = "message".repeat(4_000);
