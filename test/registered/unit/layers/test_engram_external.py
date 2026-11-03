@@ -13,6 +13,9 @@ from safetensors.torch import save_file
 from sglang.srt.arg_groups.engram_config import EngramConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.layers import engram_external, engram_shared_vmm
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _unsupported_derived_weight_cache_error,
+)
 from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context
@@ -23,6 +26,21 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 class TestExternalEngram(CustomTestCase):
+    def test_online_weight_update_requires_new_owner_generation(self):
+        config = EngramConfig.from_dict(
+            {
+                "placement": "external",
+                "shared_host_endpoint": "127.0.0.1:56000",
+                "shared_host_token_file": "/tmp/token",
+                "shared_host_generation": "generation",
+            }
+        )
+        with get_context().override_server_args(engram_config=config):
+            self.assertEqual(
+                _unsupported_derived_weight_cache_error(torch.nn.Linear(1, 1)),
+                "Online weight updates require a new external Engram owner generation.",
+            )
+
     def test_external_requires_complete_identity_and_direct_lookup(self):
         valid = {
             "placement": "external",

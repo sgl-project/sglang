@@ -63,6 +63,8 @@ before safetensors materialization but still loads the smaller weights in
 their shards. External placement currently needs CUDA, attention DP=1 and
 CP=1, ordinary mmap-backed safetensors loading and a reachable trusted TCP
 control network. The control channel is not encrypted.
+Online weight updates are rejected while an external generation is attached;
+start a new owner and new workers for an updated checkpoint.
 
 During graceful shutdown SGLang synchronizes GPU work, unmaps its views and
 releases owner leases. The owner retains backing if a client loses control

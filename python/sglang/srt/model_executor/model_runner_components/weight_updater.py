@@ -19,7 +19,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_pp_stage_load_group,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -52,6 +52,9 @@ def _unsupported_derived_weight_cache_error(
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
     """
+    engram_config = get_exec().offload.engram_config
+    if engram_config is not None and engram_config.placement == "external":
+        return "Online weight updates require a new external Engram owner generation."
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
