@@ -37,7 +37,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_gfx95_supported, is_hip, retry
 from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
@@ -2101,6 +2101,8 @@ class ModelConfig:
             "quark_int4fp8_moe",
             "quark_mxfp4",
         ]
+        if is_gfx95_supported():
+            rocm_supported_quantization.append("modelopt_fp8")
         optimized_quantization_methods = [
             "fp8",
             "marlin",
