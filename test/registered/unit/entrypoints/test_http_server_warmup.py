@@ -3,13 +3,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):

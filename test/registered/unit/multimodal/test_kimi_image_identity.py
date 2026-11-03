@@ -20,14 +20,13 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     get_new_expanded_mm_items,
 )
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     MM_PAD_SHIFT_VALUE,
-    Modality,
     MultimodalDataItem,
-    MultimodalInputFormat,
     MultimodalInputs,
 )
 from sglang.srt.multimodal.cache import snapshot_media
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
@@ -37,7 +36,7 @@ from sglang.srt.multimodal.processors.kimi_common import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Two single-element features whose legacy 30-bit pad sentinels collide.
 _LEGACY_COLLIDING_FEATURES = (23990, 59582)
