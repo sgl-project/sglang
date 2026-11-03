@@ -41,6 +41,7 @@ import torch
 
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    HybridMambaDecodeReqToTokenPool,
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -61,6 +62,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TreeSlot
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.scheduler_test_utils import decode_queue
@@ -609,8 +611,12 @@ class TestPDRequestLocalMambaState(CustomTestCase):
         self.comp = object.__new__(MambaComponent)
         self.comp.state_from_prefill = True
         self.comp.host_only_checkpoint = False
-        self.pool = MagicMock()
-        self.comp.cache = SimpleNamespace(req_to_token_pool=self.pool)
+        self.pool = MagicMock(spec_set=HybridMambaDecodeReqToTokenPool)
+        self.storage = MagicMock(spec_set=StaticKVStorage)
+        self.storage.tree_sub_pool.return_value = "mamba"
+        self.comp.cache = SimpleNamespace(
+            req_to_token_pool=self.pool, kv_storage=lambda: self.storage
+        )
 
     def test_kv_hit_does_not_restore_or_publish_recurrent_state(self):
         node = SimpleNamespace(
@@ -641,13 +647,13 @@ class TestPDRequestLocalMambaState(CustomTestCase):
     def test_request_state_retained_until_finish_or_abort(self):
         for inserted in (False, True):
             with self.subTest(inserted=inserted):
-                self.pool.reset_mock()
+                self.storage.reset_mock()
                 req = SimpleNamespace()
                 params = SimpleNamespace(mamba_value=None) if inserted else None
                 self.comp.cleanup_after_caching_req(req, False, insert_params=params)
-                self.pool.free_mamba_cache.assert_not_called()
+                self.storage.release_state.assert_not_called()
                 self.comp.cleanup_after_caching_req(req, True, insert_params=params)
-                self.pool.free_mamba_cache.assert_called_once_with(req)
+                self.storage.release_state.assert_called_once_with("mamba", req)
 
     def test_mtp_key_excludes_shifted_draft_boundary(self):
         for kv_only, expected in ((True, True), (False, False)):

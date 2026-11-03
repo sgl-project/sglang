@@ -885,7 +885,8 @@ class MambaComponent(TreeComponent):
     ) -> None:
         if self.state_from_prefill:
             if is_finished:
-                self.cache.req_to_token_pool.free_mamba_cache(req)
+                storage, sub_pool = self._state()
+                storage.release_state(sub_pool, req)
             return
         if self._mamba_host_only_checkpoint():
             self._release_unused_host_checkpoint(insert_result, insert_params)
