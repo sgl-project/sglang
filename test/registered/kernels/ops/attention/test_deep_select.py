@@ -222,5 +222,25 @@ def test_page_transform_denser_tier():
     _check_topk(input, k, logical, idx_fill=-1)
 
 
+def test_denser_tier_with_end_and_offset():
+    """The same 3-CTA config without a page table: ragged ends and per-row offsets."""
+    rows = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 1
+    k, width = 512, 33000
+    input = _make_input(rows, width, torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(2)
+    end = torch.randint(
+        k, width + 1, (rows,), dtype=torch.int32, device="cuda", generator=g
+    )
+    offset = torch.randint(
+        0, 1 << 20, (rows,), dtype=torch.int32, device="cuda", generator=g
+    )
+
+    _, indices = topk(
+        input, k, end=end, output_idx_offset=offset, idx_oob_fill_value=-1
+    )
+
+    _check_topk(input, k, indices, end=end, idx_fill=-1, offset=offset)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
