@@ -410,6 +410,7 @@ class BuiltMegakernel(Protocol):
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
+    prefill_widths: tuple[int, ...]  # the prefill buckets it built; () for a decode-only spec
     draft_sampler: Optional[Callable[..., Callable[[int], Optional[Callable]]]]
     draft_loop: Optional[Callable]
     draft_extend: Optional[Callable]

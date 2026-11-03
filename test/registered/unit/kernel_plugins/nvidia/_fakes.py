@@ -34,8 +34,9 @@ class FakeBuilt:
     begin_draft_round = None
     graph_variants = None
 
-    def __init__(self, widths):
+    def __init__(self, widths, prefill_widths=()):
         self.widths = tuple(w for w in widths if w <= 4)
+        self.prefill_widths = tuple(prefill_widths)
         self.steps, self.views = [], []
 
     def summary(self):
@@ -53,7 +54,7 @@ class FakeBuilt:
 
 def _build(model, hf_config, context):
     model.context = context
-    return FakeBuilt(context.widths)
+    return FakeBuilt(context.widths, prefill_widths=context.prefill_widths)
 
 
 SPEC = MegakernelSpec(
@@ -78,6 +79,7 @@ DRAFT = replace(
     max_rows=0,
     build=lambda model, hf, ctx: SimpleNamespace(
         widths=(),
+        prefill_widths=(),
         summary=lambda: "draft sampler",
         draft_sampler=print,
         draft_loop=None,
@@ -91,6 +93,7 @@ EAGLE_DRAFT = replace(
     DRAFT,
     build=lambda model, hf, ctx: SimpleNamespace(
         widths=(),
+        prefill_widths=(),
         draft_sampler=None,
         draft_loop=print,
         draft_extend=None,

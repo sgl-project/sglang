@@ -47,6 +47,7 @@ from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 from sglang.srt.runtime_context import (
     get_context,
@@ -1093,28 +1094,19 @@ def megakernel_disable_reasons(
         f"{f.value} is in use and {spec.name} does not accept it"
         for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)
     ]
-    one_of = (
-        [
-            ("tp_size", cfg.tp_size, req.tp_sizes),
+    one_of = [
+        ("tp_size", cfg.tp_size, req.tp_sizes),
+        ("decode CUDA graphs", cfg.cuda_graph_config.decode.backend, req.decode_graph_backends),
+    ]
+    if req.prefill_graph_backends:
+        one_of.append(
             (
-                "decode CUDA graphs",
-                cfg.cuda_graph_config.decode.backend,
-                req.decode_graph_backends,
-            ),
-        ]
-        + (
-            [
-                (
-                    "prefill CUDA graphs",
-                    cfg.cuda_graph_config.prefill.backend,
-                    req.prefill_graph_backends,
-                )
-            ]
-            if req.prefill_graph_backends
-            else []
+                "prefill CUDA graphs",
+                cfg.cuda_graph_config.prefill.backend,
+                req.prefill_graph_backends,
+            )
         )
-        + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
-    )
+    one_of += [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
     exactly = [
         # another model's config may not have the field at all
         (f"config.{key}", getattr(hf_config, key, None), want)
@@ -1232,6 +1224,10 @@ def install_megakernel(
     # Different widths would leave ranks waiting in different collectives, and
     # different entries would run different code around them.
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
+    if spec.requires.prefill_graph_backends:
+        megakernel_agree(
+            tuple(built.prefill_widths), what=f"prefill widths {spec.name} built"
+        )
     entries = _offered_entries(built)
     megakernel_agree(entries, what=f"entries {spec.name} offers")
     variants = _offered_graph_variants(built)
@@ -1489,6 +1485,13 @@ def _requirement_reasons(
             f"decode CUDA graphs {backend!r} are not one of "
             f"{sorted(req.decode_graph_backends)}"
         )
+    if req.prefill_graph_backends:
+        prefill_backend = Backend.DISABLED if graph is None else graph.prefill.backend
+        if prefill_backend not in req.prefill_graph_backends:
+            reasons.append(
+                f"prefill CUDA graphs {prefill_backend!r} are not one of "
+                f"{sorted(req.prefill_graph_backends)}"
+            )
     exactly = [
         (f"config.{key}", getattr(hf_config, key, None), want)
         for key, want in req.hf_config.items()
@@ -1525,12 +1528,9 @@ class _Dispatch:
     def __init__(self, *, built: BuiltMegakernel, original: Callable, binding: Any):
         # MegakernelBinding, or the model-specific binding in _BINDINGS.
         self.built, self.original, self.binding = built, original, binding
-        # batch size -> the step planned while capturing its decode graphs; plan reads
-        # only the mode and rows, so every graph variant of a batch size plans alike
+        # batch_size -> step planned during decode graph capture
         self.captured: dict[int, Optional[Step]] = {}
-        # token count -> the step planned while capturing the prefill graphs. A
-        # prefill graph is keyed by its token bucket, not by a batch size, so the
-        # two cannot share one dict.
+        # token_count -> step planned during prefill graph capture (keyed differently)
         self.captured_tokens: dict[int, Optional[Step]] = {}
 
     def wrapped(self) -> Callable:
@@ -1540,8 +1540,10 @@ class _Dispatch:
             step = self.built.plan(input_ids, forward_batch, *args, **kwargs)
             capturing = torch.cuda.is_current_stream_capturing()
             if capturing:
-                self.captured[int(forward_batch.batch_size)] = step
-                self.captured_tokens[int(input_ids.shape[0])] = step
+                if forward_batch.forward_mode == ForwardMode.EXTEND:
+                    self.captured_tokens[int(input_ids.shape[0])] = step
+                else:
+                    self.captured[int(forward_batch.batch_size)] = step
             if step is None:
                 return self.original(
                     input_ids, positions, forward_batch, *args, **kwargs
@@ -1570,24 +1572,16 @@ class _Dispatch:
 
 
 class _CaptureCheck:
-    """Once every graph of one phase is captured, log the ones that run the
-    megakernel and refuse a runner none of whose graphs do.
-
-    One instance per phase. The decode phase is keyed by batch size and the
-    prefill phase by token bucket, because that is what each runner captures;
-    a prefill instance is installed only for a spec that declares
-    ``prefill_graph_backends``, so a decode-only spec is refused on its decode
-    graphs alone and is not asked to run a prefill graph it never claimed.
-    """
+    """Refuse a runner none of whose captured graphs run the megakernel."""
 
     def __init__(self, *, spec: MegakernelSpec, dispatch: _Dispatch, phase: str = "decode"):
         self.spec, self.dispatch, self.phase = spec, dispatch, phase
         self.is_done = False
 
-    def _expected(self, runner: Any) -> Optional[Collection[int]]:
+    def _expected(self, runner: Any) -> Collection[int]:
         if self.phase == "decode":
-            return getattr(runner, "capture_bs", None)
-        return getattr(runner, "capture_num_tokens", None)
+            return runner.capture_bs
+        return runner.capture_num_tokens
 
     def __call__(
         self,
@@ -1602,7 +1596,7 @@ class _CaptureCheck:
             else self.dispatch.captured_tokens
         )
         expected = self._expected(runner)
-        if self.is_done or expected is None or not set(expected) <= set(captured):
+        if self.is_done or not set(expected) <= set(captured):
             return
         self.is_done = True
         if self.phase == "decode" and isinstance(self.dispatch.binding, MegakernelBinding):
