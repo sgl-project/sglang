@@ -5,18 +5,21 @@ idle. When a GEMM runs without split-K, every output element is one fp32
 accumulator over K in ascending order followed by one rounding to BF16, so other
 split-K-free cuBLASLt algorithms of the same build often give the same bits while
 using the GPU better. ``benchmark/kernels/pinned_bf16_gemm/tune_pinned_bf16_gemm.py``
-searches them per (N, K, M), keeps only algorithms that accumulate K in the same
-order as torch.mm (``order_check_operands``: equal bits on inputs where any other
-order changes the BF16 result), and writes the fastest into a JSON table for one
-GPU model and cuBLASLt version.
+searches them per (N, K, M) and keeps only algorithms that give torch.mm's bits on
+``order_check_operands``, inputs on which an algorithm that accumulates K in
+another order differs from torch.mm with overwhelming probability. It writes the
+fastest into a JSON table for one GPU model and cuBLASLt version, marked
+``"order_checked": true``.
 
 ``SGLANG_OPT_BF16_GEMM_TABLE=<table.json>`` enables the table. On the first eager
-call, a table recorded for another GPU or cuBLASLt version is ignored. The first
-eager call for each weight shape (N, K) re-checks all of that shape's entries
-bitwise against torch.mm on the real weight with plain inputs, as a guard against
-a table from another build; an entry that differs is dropped with a warning.
-Shapes outside the table, and shapes not checked yet while a CUDA graph is being
-captured, return ``None`` and the caller keeps its own call.
+call, a table without that marker, or recorded for another GPU or cuBLASLt
+version, is ignored with a warning. The first eager call for each weight shape
+(N, K) re-checks that shape's entries bitwise against torch.mm on the real weight
+with plain inputs and drops any that differ; this catches gross mismatches, not
+another accumulation order, so exactness rests on the tuner's check, and a
+hand-edited table is not protected. Shapes outside the table, and shapes not
+checked yet while a CUDA graph is being captured, return ``None`` and the caller
+keeps its own call.
 """
 
 from __future__ import annotations
@@ -44,6 +47,8 @@ _SELF_CHECK_SEEDS = (1, 2, 3)
 # Magnitude of the cancelling product pair in `order_check_operands`: fp32 has a
 # 24-bit significand, so while a partial sum holds 2^24 it rounds every O(1) term.
 _ORDER_CHECK_PLANT = float(2**24)
+# Set by the tuner on tables whose entries passed the order check.
+ORDER_CHECKED_KEY = "order_checked"
 
 # A table entry as a callable (x, w, out) -> out.
 _Runner = Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
@@ -135,7 +140,7 @@ def gives_torch_bits(runner: _Runner, x: torch.Tensor, w: torch.Tensor) -> bool:
     return torch.equal(ref.view(torch.int16), runner(x, w, None).view(torch.int16))
 
 
-def matches_torch(w: torch.Tensor, m: int, runner: _Runner) -> bool:
+def _matches_torch(w: torch.Tensor, m: int, runner: _Runner) -> bool:
     """In-process re-check of a table entry against weight ``w`` on plain inputs."""
     for seed in _SELF_CHECK_SEEDS:
         g = torch.Generator(device=w.device)
@@ -159,8 +164,8 @@ def order_check_operands(
     (at two random k of w's row, for every row where x has equal signs there) that
     cancel exactly, so the result is O(sqrt(K)) while each O(1) term added between
     the two is rounded to 2^24's fp32 ulp. Which terms fall between them depends on
-    the order, so another order changes many outputs, and the same order changes
-    none.
+    the order, so another order changes some outputs with overwhelming
+    probability, and the same order changes none.
     """
     g = torch.Generator(device=device)
     g.manual_seed(seed)
@@ -207,6 +212,15 @@ def _load_table(path: str) -> None:
             version,
         )
         return
+    if data.get(ORDER_CHECKED_KEY) is not True:
+        logger.warning(
+            "BF16 GEMM table %s has no %r marker (written by "
+            "tune_pinned_bf16_gemm.py after its accumulation-order check); "
+            "the table is ignored",
+            path,
+            ORDER_CHECKED_KEY,
+        )
+        return
     for entry in data["entries"]:
         n, k, m = int(entry["n"]), int(entry["k"]), int(entry["m"])
         runner = _runner_for(entry)
@@ -233,7 +247,7 @@ def _check_shape(w: torch.Tensor, entries: List[Tuple[int, _Runner]]) -> None:
     n, k = w.shape
     active = 0
     for m, runner in entries:
-        if matches_torch(w, m, runner):
+        if _matches_torch(w, m, runner):
             _table[(n, k, m)] = runner
             active += 1
         else:

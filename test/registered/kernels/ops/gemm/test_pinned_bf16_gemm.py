@@ -79,6 +79,7 @@ class TestPinnedBf16Gemm(CustomTestCase):
         table = {
             "device_name": self.lt.table_device_name(),
             "cublaslt_version": self.lt.cublaslt_version(),
+            self.lt.ORDER_CHECKED_KEY: True,
             "entries": entries,
         }
         table.update(overrides)
@@ -192,13 +193,24 @@ class TestPinnedBf16Gemm(CustomTestCase):
             x = torch.randn(self.m, K, device="cuda", dtype=torch.bfloat16)
             self.assertIsNone(self.lt.pinned_mm(x, self.w))
 
+    def test_table_without_order_check_marker_is_ignored(self):
+        from sglang.srt.environ import envs
+
+        for marker in (None, False):
+            path = self._write_table([self._entry()], order_checked=marker)
+            self._reset()
+            with envs.SGLANG_OPT_BF16_GEMM_TABLE.override(path):
+                x = torch.randn(self.m, K, device="cuda", dtype=torch.bfloat16)
+                self.assertIsNone(self.lt.pinned_mm(x, self.w))
+                self.assertEqual(self.lt._unchecked, {})
+
     def test_entry_failing_self_check_is_dropped(self):
         from sglang.srt.environ import envs
 
         path = self._write_table([self._entry()])
         with (
             envs.SGLANG_OPT_BF16_GEMM_TABLE.override(path),
-            mock.patch.object(self.lt, "matches_torch", return_value=False),
+            mock.patch.object(self.lt, "_matches_torch", return_value=False),
         ):
             x = torch.randn(self.m, K, device="cuda", dtype=torch.bfloat16)
             self.assertIsNone(self.lt.pinned_mm(x, self.w))
@@ -220,7 +232,7 @@ class TestPinnedBf16Gemm(CustomTestCase):
         with (
             envs.SGLANG_OPT_BF16_GEMM_TABLE.override(path),
             mock.patch.object(
-                self.lt, "matches_torch", wraps=self.lt.matches_torch
+                self.lt, "_matches_torch", wraps=self.lt._matches_torch
             ) as spy,
         ):
             y = self.lt.pinned_mm(x, self.w)

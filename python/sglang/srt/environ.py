@@ -1435,8 +1435,11 @@ class Envs:
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
     # JSON table of pinned cuBLASLt algorithms per (N, K, M) for unquantized BF16
-    # linears and the BF16 lm_head, each bitwise equal to torch.mm; written by
-    # benchmark/kernels/pinned_bf16_gemm/tune_pinned_bf16_gemm.py.
+    # linears and the BF16 lm_head, written by
+    # benchmark/kernels/pinned_bf16_gemm/tune_pinned_bf16_gemm.py, which keeps only
+    # algorithms with torch.mm's accumulation order and marks the table
+    # "order_checked"; unmarked tables are ignored. The serving re-check uses plain
+    # inputs only, so a hand-edited table is not protected.
     SGLANG_OPT_BF16_GEMM_TABLE = EnvStr(None)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)

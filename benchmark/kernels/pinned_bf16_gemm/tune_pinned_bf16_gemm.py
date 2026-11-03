@@ -3,10 +3,11 @@
 For every (N, K) weight shape and every M, the tuner times all split-K-free
 cuBLASLt algorithms (and the heuristic's own top choices) on the packed
 problem, takes the fastest few, keeps those that accumulate K in the same order
-as torch.mm (bitwise equal on ``order_check_operands``, where any other order
-changes the BF16 result), and times them against torch.mm with a cold L2
-under CUDA graph replay. An (N, K, M) entry is written when the best exact
-algorithm beats torch.mm by at least --min-speedup.
+as torch.mm (bitwise equal on ``order_check_operands``, where another order
+differs with overwhelming probability), and times them against torch.mm with a
+cold L2 under CUDA graph replay. An (N, K, M) entry is written when the best
+exact algorithm beats torch.mm by at least --min-speedup. The table is marked
+``"order_checked": true``; the server ignores tables without the marker.
 
 Shapes are the unquantized linears of the served model after tensor-parallel
 sharding (N = output features per rank, K = input features per rank). M is the
@@ -28,6 +29,7 @@ import torch
 
 from sglang.kernels.jit.benchmark.marker import do_bench
 from sglang.kernels.ops.gemm.pinned_bf16_gemm import (
+    ORDER_CHECKED_KEY,
     cublaslt_version,
     enumerate_algos,
     gives_torch_bits,
@@ -140,6 +142,7 @@ def main():
     table = {
         "device_name": table_device_name(),
         "cublaslt_version": cublaslt_version(),
+        ORDER_CHECKED_KEY: True,
         "entries": entries,
     }
     with open(args.output, "w") as f:
