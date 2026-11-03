@@ -14,12 +14,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
@@ -267,7 +267,8 @@ class TestCudaIpcTransport(CustomTestCase):
         self.assertIsNone(proxy._pool_storage)
 
     def test_failed_item_batch_releases_undispatched_pool_slice(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
