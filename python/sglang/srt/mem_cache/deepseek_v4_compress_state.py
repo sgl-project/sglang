@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -188,6 +189,24 @@ class CompressStatePool:
                 self.kv_score_buffer.clear()
             else:
                 self.kv_score_buffer[-1].clear()
+
+    def checkpoint_buffer_info(self) -> DSV4StateBufferInfo:
+        """Expose whole page-owned rings without copying their backing storage."""
+        if self.request_scoped:
+            raise ValueError("Request-scoped compressor state is not checkpointed")
+        state = self.kv_score_buffer.kv_score
+        if not state.is_contiguous():
+            raise ValueError("Compressor checkpoint state must be contiguous")
+        page_bytes = self.ring_size * state[0].nbytes
+        usable_slots = state.shape[0] // self.ring_size * self.ring_size
+        pages = (
+            state.view(torch.uint8)
+            .reshape(state.shape[0], -1)[:usable_slots]
+            .reshape(-1, page_bytes)
+        )
+        return DSV4StateBufferInfo(
+            pages=pages, ring_size=self.ring_size, dtype=state.dtype
+        )
 
     def transfer_indices(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
         """PD transfer indices of this pool's state for one request."""

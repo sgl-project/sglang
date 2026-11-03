@@ -26,8 +26,9 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode, is_unadmitted_reject
+from sglang.srt.disaggregation.utils import is_unadmitted_reject
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import publish, reset_context
@@ -36,7 +37,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ERROR_MSG = (
     "Input length (1500 tokens) exceeds the maximum allowed length (1018 tokens)."
@@ -281,6 +282,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req = _make_req()
         req.set_finish_with_abort(ERROR_MSG)
         sched = SimpleNamespace(
+            uocr_runtime=None,
             disaggregation_mode=DisaggregationMode.NULL,
             waiting_queue=[],
             processed_tokens_counter=0,

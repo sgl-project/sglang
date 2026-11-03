@@ -443,8 +443,9 @@ in-process twins report.
 
 ### Adding a model-specific config adjustment
 
-Never assign `server_args` fields from model code. Declare instead
-(`sglang/srt/arg_groups/overrides.py`):
+Never assign `server_args` fields from model code. Declare instead, in a module
+under `sglang/srt/arg_groups/model_overrides/`, with the helpers from
+`sglang/srt/arg_groups/model_override_base.py`:
 
 - Constant per-arch values → `MODEL_OVERRIDES["MyArchForCausalLM"] = {...}`.
 - Derived values → `@register_model_override("MyArchForCausalLM")` returning a dict; the
@@ -509,8 +510,8 @@ Named slots + two keyed-lazy registries:
   side stream is `"lora_side"`. Two call sites may share a name only if their work belongs
   on one stream — sharing across roles serializes intended overlap.
 - `get_buffer(name, factory)` — get-or-create a named persistent buffer. Grow-only or
-  per-device semantics manage their `resources.buffers` entries directly (see tokenspeed /
-  SM120 split / Marlin workspace). Buffer names are per-backend today; do not silently
+  per-device semantics manage their `resources.buffers` entries directly (see SM120
+  split / Marlin workspace). Buffer names are per-backend today; do not silently
   share.
 - Singletons with manager semantics (EP dispatcher buffers, EPLB recorder/metadata, graph
   memory pool) keep their owning accessors/classes as facades; only the *state* lives in a

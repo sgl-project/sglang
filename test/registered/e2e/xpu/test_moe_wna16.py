@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.arg_groups.overrides import _moe_runner_backend_quant_constraints
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -19,7 +20,6 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, resolve_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
     CompressedTensorsW8A8Fp8MoE,
-    QuantizationStrategy,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
