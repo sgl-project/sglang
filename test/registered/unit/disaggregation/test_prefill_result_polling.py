@@ -1184,8 +1184,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 release_steps = []
 
                 def release(req, tree_cache, checkpoint):
-                    # No step carrying the request is in flight beyond the one
-                    # being processed.
+                    # Only the step being processed still carries it.
                     self.assertLessEqual(req.inflight_steps, 1)
                     release_steps.append(scheduler.iteration)
                     req.kv.req_pool_idx = None
