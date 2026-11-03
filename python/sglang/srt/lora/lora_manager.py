@@ -811,7 +811,12 @@ class LoRAManager:
 
         if target_modules and target_modules == {"all"}:
             self.target_modules = auto_detect_lora_target_modules(self.base_model)
-            self.target_modules.update(EMBEDDING_NAMES)
+            # Auto-detection only finds the parallel embedding classes LoRA can
+            # wrap, and misses a tied lm_head. Add both names when either was
+            # found; a model with its own embedding class (e.g. Gemma's scaled
+            # nn.Embedding) gets neither.
+            if self.target_modules & set(EMBEDDING_NAMES):
+                self.target_modules.update(EMBEDDING_NAMES)
             logger.info(
                 "CLI --lora-target-modules='all' resolved to %s "
                 "by inspecting the base model.",
