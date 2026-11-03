@@ -1,9 +1,11 @@
 import asyncio
 import functools
+import itertools
 import logging
 
 import torch
 
+from sglang.srt.multimodal.cache.identity import build_cache_key
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.multimodal_processor_mixin import (
     MultimodalProcessorMixin,
@@ -17,6 +19,8 @@ from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
+
+_MODALITIES = (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
 
 
 class TokenSpaceProcessor(MultimodalProcessorMixin):
@@ -48,9 +52,12 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         *,
         processor_config=None,
         worker_thread_device=None,
+        item_feature_cache=None,
     ):
         strategy_class = self.strategy_class
         self._worker_thread_device = worker_thread_device
+        # Any map with get and __setitem__, e.g. a dict, an LRU or a disk cache.
+        self._item_feature_cache = item_feature_cache
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
@@ -122,15 +129,9 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         # As legacy: a video request preprocesses all its media on the video device.
         if video_data and self._video_preprocessing_device is not None:
             image_device = video_device = self._video_preprocessing_device
-        loaded = await self._load_media_lists(
-            *sources,
-            audio_sample_rate=self.strategy.audio_sample_rate,
-            discard_alpha_channel=self.strategy.discard_alpha_channel,
-            video_decode_device=video_device,
-        )
         request_options = dict(image_device=image_device, video_device=video_device)
-        media_items = self._list_media_items(sources, loaded, video_metadata)
-        item_features = await self._process_items(media_items, request_options)
+        media_items = self._list_media_items(sources, video_metadata)
+        item_features = await self._get_item_features(media_items, request_options)
         return await self._run_mm_processor(
             self._build_output,
             media_items=media_items,
@@ -157,12 +158,11 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                 )
 
     @staticmethod
-    def _list_media_items(sources, loaded, video_metadata):
-        """(modality, loaded item, preprocess_kwargs, per-item kwargs), in modality order."""
+    def _list_media_items(sources, video_metadata):
+        """(modality, source, preprocess_kwargs, per-item kwargs), in modality order."""
         media_items = []
-        modalities = (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
-        for modality, data_list, items in zip(modalities, sources, loaded):
-            for index, (source, item) in enumerate(zip(data_list or (), items)):
+        for modality, data_list in zip(_MODALITIES, sources):
+            for index, source in enumerate(data_list or ()):
                 if isinstance(source, (ImageData, VideoData)):
                     preprocess_kwargs = source.preprocess_kwargs or {}
                 elif isinstance(source, dict):
@@ -172,8 +172,65 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                 item_kwargs = {}
                 if modality == Modality.VIDEO and video_metadata is not None:
                     item_kwargs["video_metadata"] = video_metadata[index]
-                media_items.append((modality, item, preprocess_kwargs, item_kwargs))
+                media_items.append((modality, source, preprocess_kwargs, item_kwargs))
         return media_items
+
+    async def _get_item_features(self, media_items, request_options):
+        """Each item's features, from the item feature cache or by loading and processing it.
+
+        A key is the item's source before loading with everything else its features
+        depend on, so a hit skips both loading and processing. The checkpoint,
+        mm_process_config and image processor backend let a trainer and serving
+        share one map.
+        """
+        item_features = [None] * len(media_items)
+        if self._item_feature_cache is not None:
+            item_keys = [
+                build_cache_key(
+                    (
+                        self.hf_config.name_or_path,
+                        self.mm_process_config,
+                        self.image_processor_backend,
+                        modality,
+                        source,
+                        item_kwargs,
+                        request_options,
+                    )
+                )
+                for modality, source, _, item_kwargs in media_items
+            ]
+            item_features = [self._item_feature_cache.get(key) for key in item_keys]
+        missed = [
+            index for index, features in enumerate(item_features) if features is None
+        ]
+        missed_items = [media_items[index] for index in missed]
+        loaded = await self._load_media_lists(
+            *(
+                [
+                    source
+                    for item_modality, source, *_ in missed_items
+                    if item_modality == modality
+                ]
+                or None
+                for modality in _MODALITIES
+            ),
+            audio_sample_rate=self.strategy.audio_sample_rate,
+            discard_alpha_channel=self.strategy.discard_alpha_channel,
+            video_decode_device=request_options["video_device"],
+        )
+        # Missed items are in modality order, as the loaded lists are.
+        loaded_items = [
+            (modality, item, preprocess_kwargs, item_kwargs)
+            for (modality, _, preprocess_kwargs, item_kwargs), item in zip(
+                missed_items, itertools.chain.from_iterable(loaded)
+            )
+        ]
+        missed_features = await self._process_items(loaded_items, request_options)
+        for index, features in zip(missed, missed_features):
+            item_features[index] = features
+            if self._item_feature_cache is not None:
+                self._item_feature_cache[item_keys[index]] = features
+        return item_features
 
     async def _process_items(self, media_items, request_options):
         """One worker task per item; decoders are closed once every task has finished."""

@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.cache import (
     CONTENT_HASH_PREFIX,
+    MultimodalPreprocessCache,
     resolve_multimodal_item_hash,
 )
 from sglang.srt.multimodal.modality import Modality
@@ -32,7 +33,7 @@ from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
     TokenSpaceServingSpec,
 )
 from sglang.srt.multimodal.transport.feature_transport import MultimodalFeatureTransport
-from sglang.srt.runtime_context import get_exec, get_mm
+from sglang.srt.runtime_context import get_exec, get_mm, get_serving
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import is_cuda_alike
 
@@ -125,12 +126,25 @@ class TokenSpaceSGLangProcessor:
             media_url_max_file_size_mb=mm.media_url_max_file_size_mb,
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
         )
+        # As legacy: each tokenizer worker takes its share of the budget; zero disables it.
+        self._mm_preprocess_cache = MultimodalPreprocessCache(
+            max_size_bytes=(mm.mm_preprocess_cache_size_mb or 0)
+            * 1024
+            * 1024
+            // get_serving().tokenizer_worker_num
+        )
         self._core = TokenSpaceProcessor.for_strategy(strategy_class)(
             hf_config,
             _processor,
             processor_config=processor_config,
             # nvJPEG and GPU video decode use bare "cuda", cuda:0 on a pool thread.
             worker_thread_device=server_args.base_gpu_id if is_cuda_alike() else None,
+            # Its keys are media URLs, so it is used only when they are trusted.
+            item_feature_cache=(
+                self._mm_preprocess_cache
+                if mm.token_space_preprocess_cache_trust_url
+                else None
+            ),
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
@@ -318,7 +332,7 @@ class TokenSpaceSGLangProcessor:
         return resolve_hf_image_token_counts(self._core._processor, images)
 
     def clear_preprocess_cache(self) -> None:
-        """No preprocess cache to clear; token-space output is never cached."""
+        self._mm_preprocess_cache.clear()
 
     def shutdown(self) -> None:
         self.hash_executor.shutdown()

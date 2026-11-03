@@ -277,6 +277,8 @@ def _canonicalize(value: Any) -> Any:
             "shape": list(snapshot.shape),
             "digest": _digest_bytes(snapshot.view(np.uint8).tobytes()),
         }
+    if isinstance(value, Image.Image):
+        return {"type": "pil_image", "digest": _snapshot_pil(value).content_digest}
     if isinstance(value, Mapping):
         items = [
             [_canonicalize(key), _canonicalize(item)] for key, item in value.items()
@@ -308,6 +310,11 @@ def _canonical_json(value: Any) -> bytes:
     ).encode()
 
 
+def build_cache_key(value: Any) -> str:
+    """SHA-256 identity of a cache-key value, e.g. a tuple of media sources and options."""
+    return _digest_bytes(_canonical_json(value))
+
+
 def build_artifact_key(
     content_digest: str,
     *,
@@ -317,13 +324,14 @@ def build_artifact_key(
 ) -> str:
     """Build the cache key for a processor artifact."""
     content_digest = parse_content_hash(content_digest)
-    payload = {
-        "content_digest": content_digest,
-        "modality": modality,
-        "processor_fingerprint": processor_fingerprint,
-        "preprocess_kwargs": preprocess_kwargs or {},
-    }
-    return _digest_bytes(_canonical_json(payload))
+    return build_cache_key(
+        {
+            "content_digest": content_digest,
+            "modality": modality,
+            "processor_fingerprint": processor_fingerprint,
+            "preprocess_kwargs": preprocess_kwargs or {},
+        }
+    )
 
 
 def resolve_multimodal_item_hash(
