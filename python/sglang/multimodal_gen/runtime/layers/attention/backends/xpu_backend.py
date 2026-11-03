@@ -1,11 +1,15 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import math
+import re
 from functools import lru_cache
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -23,6 +27,75 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
+
+try:
+    from deepklox.sageattn_interface import sageattn_v3, sageattn_v3_hybrid
+except ImportError:
+    sageattn_v3 = sageattn_v3_hybrid = None
+
+logger = init_logger(__name__)
+
+_SAGE_V3_KINDS = ("pure", "hybrid")
+_BLOCK_INDEX_RE = re.compile(r"(?:^|\.)blocks\.(\d+)\.")
+
+
+@torch.library.custom_op("sglang::xpu_sage_v3_attn", mutates_args=())
+def _xpu_sage_v3_attn(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, kind: str
+) -> torch.Tensor:
+    attn = sageattn_v3 if kind == "pure" else sageattn_v3_hybrid
+    return attn(query, key, value, tensor_layout="NHD")
+
+
+@_xpu_sage_v3_attn.register_fake
+def _(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, kind: str
+) -> torch.Tensor:
+    return torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
+
+
+def _resolve_sage_v3_kind(
+    *,
+    prefix: str,
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int | None,
+    softmax_scale: float,
+    causal: bool,
+    is_cross_attention: bool,
+) -> str | None:
+    kind = envs.SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3.strip().lower()
+    if not kind:
+        return None
+    if kind not in _SAGE_V3_KINDS:
+        raise ValueError(
+            f"SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3 must be one of {_SAGE_V3_KINDS}, got {kind!r}"
+        )
+    if sageattn_v3 is None:
+        raise ImportError(
+            "SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3 needs deepklox built with SageAttention V3 (CRI)"
+        )
+    if (
+        causal
+        or is_cross_attention
+        or head_size != 128
+        or (num_kv_heads is not None and num_kv_heads != num_heads)
+        or not math.isclose(softmax_scale, head_size**-0.5, rel_tol=1e-6)
+    ):
+        return None
+    bf16_blocks = {
+        int(b)
+        for b in envs.SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3_BF16_BLOCKS.split(",")
+        if b.strip()
+    }
+    block = _BLOCK_INDEX_RE.search(prefix)
+    if block is not None and int(block.group(1)) in bf16_blocks:
+        return None
+    logger.info_once(
+        f"Using deepklox SageAttention V3 ({kind}) for XPU self-attention; "
+        f"BF16 flash attention for blocks {sorted(bf16_blocks)} and cross-attention."
+    )
+    return kind
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -95,6 +168,7 @@ class XPUAttentionImpl(AttentionImpl):
         softmax_scale: float,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
@@ -102,6 +176,15 @@ class XPUAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.sage_v3_kind = _resolve_sage_v3_kind(
+            prefix=prefix,
+            head_size=head_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            is_cross_attention=is_cross_attention,
+        )
 
     def forward(
         self,
@@ -112,6 +195,16 @@ class XPUAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
+        if (
+            self.sage_v3_kind is not None
+            and not return_softmax_lse
+            and query.dtype == torch.bfloat16
+            and query.shape[0] == 1
+            and query.shape[1] == key.shape[1]
+        ):
+            return torch.ops.sglang.xpu_sage_v3_attn(
+                query, key, value, self.sage_v3_kind
+            )
         bsz, seqlen_q, nheads_q, d = tuple(query.shape)
         _, seqlen_k, nheads_k, _ = tuple(key.shape)
 

@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
+    SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3: str = ""
+    SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3_BF16_BLOCKS: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK: bool = False
@@ -217,6 +219,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Both kernels compute the same attention.
     "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
+    ),
+    "SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3": _lazy_str(
+        "SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3", ""
+    ),
+    "SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3_BF16_BLOCKS": _lazy_str(
+        "SGLANG_DIFFUSION_XPU_SAGE_ATTN_V3_BF16_BLOCKS", ""
     ),
     # Debug: under Ulysses, recompute each layer's attention on the gathered
     # full sequence and log the difference to the sharded result (exactness
