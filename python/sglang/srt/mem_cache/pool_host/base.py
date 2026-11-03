@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional, TypeGuard, Union
+from typing import NamedTuple, Optional, TypeGuard, Union
 
 import torch
 
@@ -81,7 +81,7 @@ def prepare_page_unified_write_back_staging(
     return staging
 
 
-_host_memory_budget: ContextVar[Optional[int]] = ContextVar(
+_host_memory_budget: ContextVar[Optional[tuple[int, int]]] = ContextVar(
     "hicache_host_memory_budget", default=None
 )
 
@@ -107,9 +107,15 @@ def shared_host_layout_domains(host_pools: Iterable[object]) -> list:
 
 
 @contextmanager
-def host_memory_budget_scope(budget_bytes: int):
-    """Book every pool built inside against one snapshot, not re-sampled psutil."""
-    token = _host_memory_budget.set(budget_bytes)
+def host_memory_budget_scope(budget: Union[int, tuple[int, int]]):
+    """Book every pool built inside against one snapshot, not re-sampled psutil.
+
+    The snapshot is a (plain RAM, hugetlb pool) pair, so each booking stays in
+    the memory type its mappings will actually use; a bare int is plain RAM.
+    """
+    token = _host_memory_budget.set(
+        budget if isinstance(budget, tuple) else (budget, 0)
+    )
     try:
         yield
     finally:
@@ -133,7 +139,7 @@ def ranks_per_host() -> int:
 
 
 def _hugetlb_supported(
-    allocator: Optional[HostTensorAllocator],
+    allocator: Optional[Union[HostTensorAllocator, type[HostTensorAllocator]]],
     device: Optional[Union[str, torch.device]],
 ) -> bool:
     return (
@@ -144,86 +150,205 @@ def _hugetlb_supported(
     )
 
 
-def host_memory_allocation_bytes(
+def _hugetlb_page_size_and_mode(
+    allocator: Optional[Union[HostTensorAllocator, type[HostTensorAllocator]]],
+    device: Optional[Union[str, torch.device]],
+) -> tuple[int, str]:
+    if not _hugetlb_supported(allocator, device):
+        return 0, HUGEPAGE_MODE_OFF
+    page_size = hugepage_size_requested()
+    mode = hugepage_mode(page_size)
+    if mode == HUGEPAGE_MODE_REQUIRED and page_size == 0:
+        raise ValueError(
+            "SGLANG_HUGEPAGE_MODE=required requires SGLANG_HUGEPAGE_SIZE=2MB or 1GB."
+        )
+    if page_size == 0:
+        return 0, HUGEPAGE_MODE_OFF
+    return page_size, mode
+
+
+def _host_memory_allocation_bytes(
     mapping_lengths: Iterable[int],
-    allocator: Optional[HostTensorAllocator] = None,
-    device: Optional[Union[str, torch.device]] = None,
-) -> int:
-    """Return the host-memory allocation size for the given mapping lengths.
+    allocator: Optional[Union[HostTensorAllocator, type[HostTensorAllocator]]],
+    device: Optional[Union[str, torch.device]],
+    *,
+    hugetlb_bookable_bytes: int,
+    page_size_and_mode: Optional[tuple[int, str]] = None,
+) -> tuple[int, int]:
+    """The (plain, hugetlb) bytes the given mapping lengths will occupy.
 
     With normal pages this is the plain sum. With hugepages each mapping
-    rounds up to a whole page on its own (alloc_mmap).
+    rounds up to a whole page on its own (alloc_mmap). ``prefer`` charges the
+    rounded total while the whole batch still fits the hugetlb pool, and
+    falls back to the plain sum beyond that.
     """
-    if _hugetlb_supported(allocator, device):
-        page_size = hugepage_size_requested()
-        if page_size and hugepage_mode(page_size) != HUGEPAGE_MODE_OFF:
-            return sum(
-                -(-length // page_size) * page_size for length in mapping_lengths
-            )
-    return sum(mapping_lengths)
+    lengths = list(mapping_lengths)
+    plain = sum(lengths)
+    page_size, mode = page_size_and_mode or _hugetlb_page_size_and_mode(
+        allocator, device
+    )
+    if page_size == 0 or mode == HUGEPAGE_MODE_OFF:
+        return plain, 0
+    rounded = [-(-length // page_size) * page_size for length in lengths]
+    if mode == HUGEPAGE_MODE_REQUIRED:
+        return 0, sum(rounded)
+    if sum(rounded) <= hugetlb_bookable_bytes:
+        return 0, sum(rounded)
+    return plain, 0
 
 
-def host_memory_budget_bytes(
-    allocation_bytes: int = 0,
-    allocator: Optional[HostTensorAllocator] = None,
+def host_memory_budget_plain_hugetlb(
+    allocator: Optional[Union[HostTensorAllocator, type[HostTensorAllocator]]] = None,
     device: Optional[Union[str, torch.device]] = None,
     *,
     auto_size: bool = False,
-) -> int:
-    """Host RAM this rank may claim for a HiCache pool.
+    free_hugetlb_bytes: Optional[int] = None,
+    page_size_and_mode: Optional[tuple[int, str]] = None,
+) -> tuple[int, int]:
+    """The (plain RAM, hugetlb pool) bytes this rank may claim for HiCache.
 
     Bound machine availability by the visible cgroup limits before splitting
     among local ranks. Independent engines with separate container budgets
     therefore size against their own remaining allowance.
     Auto-sizing requires successful cgroup discovery; explicit pool sizing
     can fall back to checking host availability when discovery fails.
-
-    Inside host_memory_budget_scope, allocation_bytes is booked against the
-    snapshot when it fits; the allowance before booking is returned.
-
-    When ``allocator`` maps MAP_HUGETLB (SGLANG_HUGEPAGE_SIZE) the pool may
-    come from the kernel's hugetlb pool instead, which MemAvailable excludes.
-    The two are alternatives, not a sum: one mapping is served entirely by one
-    or the other, so the larger of them is the budget, and the reserve stays
-    on plain RAM. The credit needs ``device`` to dispatch to the allocator
-    (npu/musa pin through torch). Unsupported allocator/device paths ignore the
-    hugepage policy and retain the plain-RAM budget. On supported paths,
-    ``required`` uses only hugetlb; in ``prefer`` mode an unexpected hugetlb
-    allocation failure may fall back to plain RAM that was not budgeted for.
-    When the hugepage policy applies the budget is handed out in whole pages,
-    matching the per-mapping round-up every allocation pays.
+    The pool is credited only when ``allocator`` (an instance, or its class
+    before the pools are built) maps MAP_HUGETLB for ``device``; the reserve
+    stays on plain RAM.
     """
-    available = _host_memory_budget.get()
-    if available is not None:
-        if allocation_bytes <= available:
-            _host_memory_budget.set(available - allocation_bytes)
-        return available
-
-    free = (
+    plain = (
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
-    alignment = 0
-    if _hugetlb_supported(allocator, device):
-        size = hugepage_size_requested()
-        mode = hugepage_mode(size)
-        if mode == HUGEPAGE_MODE_REQUIRED:
-            if size == 0:
-                raise ValueError(
-                    "SGLANG_HUGEPAGE_MODE=required requires "
-                    "SGLANG_HUGEPAGE_SIZE=2MB or 1GB."
+    pool = 0
+    page_size, mode = page_size_and_mode or _hugetlb_page_size_and_mode(
+        allocator, device
+    )
+    if mode != HUGEPAGE_MODE_OFF:
+        pool = (
+            allocator.free_hugetlb_bytes()
+            if free_hugetlb_bytes is None
+            else free_hugetlb_bytes
+        )
+    ranks = ranks_per_host()
+    return plain // ranks, pool // ranks
+
+
+def host_memory_budget_from_plain_hugetlb(
+    plain: int,
+    hugetlb: int,
+    allocator: Optional[Union[HostTensorAllocator, type[HostTensorAllocator]]] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    *,
+    page_size_and_mode: Optional[tuple[int, str]] = None,
+) -> int:
+    """The zero-charge available bytes for an already-sampled (plain, hugetlb) budget.
+
+    Deriving sizing and scope from one snapshot keeps them consistent;
+    re-sampling in between could hand each a different budget.
+    """
+    page_size, mode = page_size_and_mode or _hugetlb_page_size_and_mode(
+        allocator, device
+    )
+    if mode == HUGEPAGE_MODE_PREFER:
+        if hugetlb == 0:
+            return plain
+        return max(plain, hugetlb // page_size * page_size)
+    if mode == HUGEPAGE_MODE_REQUIRED:
+        return hugetlb // page_size * page_size
+    return plain
+
+
+class HostMemoryPreflight(NamedTuple):
+    """allocation_bytes for a batch and the available_bytes before booking it."""
+
+    allocation_bytes: int
+    available_bytes: int
+
+
+def host_memory_preflight(
+    mapping_lengths: Iterable[int] = (),
+    allocator: Optional[Union[HostTensorAllocator, type[HostTensorAllocator]]] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    *,
+    auto_size: bool = False,
+) -> HostMemoryPreflight:
+    """Charge mapping_lengths against this rank's HiCache host-memory budget.
+
+    Returns the batch's allocation size -- each MAP_HUGETLB mapping rounds
+    up to a whole hugepage -- and the available bytes before booking.
+
+    Plain RAM and the hugetlb pool are alternatives, not a sum. The pool is
+    credited only when ``allocator`` maps MAP_HUGETLB for ``device``. The
+    split is a snapshot, not a reservation: a mapping that loses the hugetlb
+    race at mmap time still lands on plain RAM.
+    """
+    available = _host_memory_budget.get()
+    if available is not None:
+        plain_rem, pool_rem = available
+        page_size_and_mode = _hugetlb_page_size_and_mode(allocator, device)
+        plain_part, pool_part = _host_memory_allocation_bytes(
+            mapping_lengths,
+            allocator,
+            device,
+            hugetlb_bookable_bytes=pool_rem,
+            page_size_and_mode=page_size_and_mode,
+        )
+        total = plain_part + pool_part
+        if plain_part <= plain_rem and pool_part <= pool_rem:
+            _, mode = page_size_and_mode
+            plain_fallback = (
+                mode == HUGEPAGE_MODE_PREFER and plain_part > 0 and pool_part == 0
+            )
+            if plain_fallback:
+                pool_rem = 0  # a plain fallback drains the live pool's rest
+            _host_memory_budget.set((plain_rem - plain_part, pool_rem - pool_part))
+            # available_bytes predates the booking (and the pool-bucket close).
+            if plain_fallback:
+                # An all-plain charge is measured unaligned, as outside a scope.
+                free = max(*available) if available[1] > 0 else available[0]
+            else:
+                free = host_memory_budget_from_plain_hugetlb(
+                    *available, allocator, device, page_size_and_mode=page_size_and_mode
                 )
-            free = allocator.free_hugetlb_bytes()
-        elif mode == HUGEPAGE_MODE_PREFER:
-            hugetlb_free = allocator.free_hugetlb_bytes()
-            if hugetlb_free > 0:
-                free = max(free, hugetlb_free)
-        if mode != HUGEPAGE_MODE_OFF:
-            alignment = size
-    free //= ranks_per_host()
-    if alignment:
-        free = free // alignment * alignment
-    return free
+            return HostMemoryPreflight(total, free)
+        # The binding bucket reports what this split could have booked against.
+        return HostMemoryPreflight(
+            total, min(plain_rem + pool_part, plain_part + pool_rem)
+        )
+
+    # One snapshot per call: page size and mode derived and the pool read
+    # once. The split bills against this rank's pool share, not the
+    # host-wide pool.
+    page_size_and_mode = _hugetlb_page_size_and_mode(allocator, device)
+    _, mode = page_size_and_mode
+    free_hugetlb = allocator.free_hugetlb_bytes() if mode != HUGEPAGE_MODE_OFF else 0
+    plain, pool = host_memory_budget_plain_hugetlb(
+        allocator,
+        device,
+        auto_size=auto_size,
+        free_hugetlb_bytes=free_hugetlb,
+        page_size_and_mode=page_size_and_mode,
+    )
+    plain_part, pool_part = _host_memory_allocation_bytes(
+        mapping_lengths,
+        allocator,
+        device,
+        hugetlb_bookable_bytes=pool,
+        page_size_and_mode=page_size_and_mode,
+    )
+    total = plain_part + pool_part
+    if mode == HUGEPAGE_MODE_PREFER:
+        if plain_part > plain or pool_part > pool:
+            return HostMemoryPreflight(total, min(plain + pool_part, plain_part + pool))
+        if pool_part == 0 and plain_part > 0:
+            return HostMemoryPreflight(total, max(plain, pool) if pool > 0 else plain)
+    return HostMemoryPreflight(
+        total,
+        host_memory_budget_from_plain_hugetlb(
+            plain, pool, allocator, device, page_size_and_mode=page_size_and_mode
+        ),
+    )
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -352,18 +477,6 @@ class HostKVCache(abc.ABC):
         self.lock = threading.RLock()
         self.clear()
 
-    def _budget_device(self) -> Optional[Union[str, torch.device]]:
-        """Device the host-memory budget/hugetlb accounting dispatches on.
-
-        Buffer-info pools set ``_transfer_device`` before super().__init__();
-        older pools still register their device pool with the base class.
-        """
-        device = getattr(self, "_transfer_device", None)
-        if device is not None:
-            return device
-        pool = getattr(self, "device_pool", None)
-        return pool.device if pool is not None else None
-
     def _allocate_host_buffer(self) -> None:
         if self.size <= self.device_capacity_tokens:
             logger.warning(
@@ -376,12 +489,9 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        budget_device = self._budget_device()
-        allocation_bytes = host_memory_allocation_bytes(
+        budget_device = self._transfer_device
+        allocation_bytes, available_bytes = host_memory_preflight(
             self.get_mapping_lengths(), self.allocator, budget_device
-        )
-        available_bytes = host_memory_budget_bytes(
-            allocation_bytes, self.allocator, budget_device
         )
         if allocation_bytes > available_bytes:
             raise ValueError(

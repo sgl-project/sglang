@@ -8,7 +8,10 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.mem_cache.device_pool_info import MHABufferInfo, PageEnvelopeBufferInfo
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    HostKVCache,
+    host_memory_preflight,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -126,9 +129,9 @@ class _SharedPageEnvelopeHostBacking:
         self.allocator = get_allocator_from_storage(allocator_type)
 
         if host_size == 0 and host_to_device_ratio == 0:
-            total_bytes = host_memory_budget_bytes(
+            total_bytes = host_memory_preflight(
                 allocator=self.allocator, device=device_buffers[0].device
-            )
+            ).available_bytes
         elif host_size > 0:
             total_bytes = max(nominal_view_bytes)
         else:
@@ -149,13 +152,13 @@ class _SharedPageEnvelopeHostBacking:
                 f"Unified host backing size must be positive: {total_bytes}"
             )
 
-        available_bytes = host_memory_budget_bytes(
-            total_bytes, allocator=self.allocator, device=device_buffers[0].device
+        allocation_bytes, available_bytes = host_memory_preflight(
+            [total_bytes], self.allocator, device_buffers[0].device
         )
-        if total_bytes > available_bytes:
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 "Not enough host memory for unified page-envelope backing. "
-                f"Requesting {total_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 

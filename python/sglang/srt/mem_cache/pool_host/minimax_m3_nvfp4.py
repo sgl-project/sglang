@@ -17,8 +17,7 @@ import torch
 from sglang.srt.mem_cache.device_pool_info import PageRowBufferInfo
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
-    host_memory_allocation_bytes,
-    host_memory_budget_bytes,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -87,11 +86,8 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        allocation_bytes = host_memory_allocation_bytes(
+        allocation_bytes, available_bytes = host_memory_preflight(
             self.get_mapping_lengths(), self.allocator, self._transfer_device
-        )
-        available_bytes = host_memory_budget_bytes(
-            allocation_bytes, self.allocator, self._transfer_device
         )
         if allocation_bytes > available_bytes:
             raise ValueError(
@@ -136,9 +132,6 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
-
-    def get_mapping_lengths(self) -> list[int]:
-        return [self.page_num * self.layer_num * self.row_bytes]
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":

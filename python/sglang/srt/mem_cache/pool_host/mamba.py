@@ -11,8 +11,7 @@ import torch
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
-    host_memory_allocation_bytes,
-    host_memory_budget_bytes,
+    host_memory_preflight,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -183,13 +182,10 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
-        allocation_bytes = host_memory_allocation_bytes(
+        allocation_bytes, available_bytes = host_memory_preflight(
             self.get_mapping_lengths(),
             self.allocator,
             self._buffer_device,
-        )
-        available_bytes = host_memory_budget_bytes(
-            allocation_bytes, self.allocator, self._buffer_device
         )
         if allocation_bytes > available_bytes:
             raise ValueError(

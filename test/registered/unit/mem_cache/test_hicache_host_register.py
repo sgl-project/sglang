@@ -277,8 +277,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with (
                     mock.patch.object(
                         memory_pool_host,
-                        "host_memory_budget_bytes",
-                        return_value=1024**3,
+                        "host_memory_preflight",
+                        return_value=(0, 1024**3),
                     ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
@@ -293,7 +293,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
                 # 4 pages x 11 B x 3 layers, booked against the budget scope.
                 budget.assert_called_once_with(
-                    132, allocator=pool.allocator, device=torch.device("cpu")
+                    [44, 44, 44], allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
@@ -313,8 +313,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with (
                     mock.patch.object(
                         memory_pool_host,
-                        "host_memory_budget_bytes",
-                        return_value=1024**3,
+                        "host_memory_preflight",
+                        return_value=(0, 1024**3),
                     ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
@@ -328,7 +328,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
                 # 4 pages x (ring 2 x 3 B slots) x 2 layers, scope-booked.
                 budget.assert_called_once_with(
-                    48, allocator=pool.allocator, device=torch.device("cpu")
+                    [24, 24], allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
@@ -342,8 +342,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
             envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
             envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
             mock.patch.object(
-                memory_pool_host,
-                "host_memory_budget_bytes",
+                base, "host_memory_budget_plain_hugetlb", return_value=(0, 2 * 1024**3)
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.common.hugetlb_pool_free_bytes",
                 return_value=2 * 1024**3,
             ),
             mock.patch.object(base, "device_uses_allocator", return_value=True),

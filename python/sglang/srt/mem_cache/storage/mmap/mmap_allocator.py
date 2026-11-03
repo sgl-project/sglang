@@ -51,9 +51,6 @@ _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 _MADV_DONTFORK = getattr(mmap, "MADV_DONTFORK", 10)
 _MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
 _PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
-# Prefault chunks are THP-aligned so no huge page straddles two threads.
-_THP_SIZE = 2 * 1024 * 1024
-
 HUGEPAGE_BYTES_2MB = 2 * 1024 * 1024
 HUGEPAGE_BYTES_1GB = 1024 * 1024 * 1024
 
@@ -149,21 +146,11 @@ def hugetlb_pool_free_bytes() -> int:
     return free_bytes
 
 
-def _tensor_storage_key(tensor: torch.Tensor) -> int:
-    return tensor.untyped_storage().data_ptr()
-
-
 def _track_hugepage_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    key = _tensor_storage_key(tensor)
+    key = tensor.untyped_storage().data_ptr()
     _hugepage_storage_keys.add(key)
     weakref.finalize(tensor, _hugepage_storage_keys.discard, key)
     return tensor
-
-
-def _mmap_page_size_and_flags(mode: str, hugepage_size: int) -> tuple[int, int]:
-    if mode == HUGEPAGE_MODE_OFF or hugepage_size == 0:
-        return mmap.PAGESIZE, 0
-    return hugepage_size, _HUGEPAGE_MMAP_FLAGS[hugepage_size]
 
 
 @functools.cache
@@ -230,8 +217,9 @@ def _mmap_private_parallel_prefaulted(alloc_bytes: int, num_threads: int) -> mma
     # Best effort: still correct on 4 KB pages if THP is disabled.
     _libc.madvise(base, alloc_bytes, _MADV_HUGEPAGE)
 
-    chunk = max(_THP_SIZE, -(-alloc_bytes // max(num_threads, 1)))
-    chunk = -(-chunk // _THP_SIZE) * _THP_SIZE
+    # Keep prefault chunks 2 MiB-aligned so no huge page straddles two threads.
+    chunk = max(HUGEPAGE_BYTES_2MB, -(-alloc_bytes // max(num_threads, 1)))
+    chunk = -(-chunk // HUGEPAGE_BYTES_2MB) * HUGEPAGE_BYTES_2MB
     ranges = [
         (off, min(chunk, alloc_bytes - off)) for off in range(0, alloc_bytes, chunk)
     ]
@@ -299,7 +287,10 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """
     hugepage_size = hugepage_size_requested()
     mode = hugepage_mode(hugepage_size)
-    page_size, extra_flags = _mmap_page_size_and_flags(mode, hugepage_size)
+    if mode == HUGEPAGE_MODE_OFF or hugepage_size == 0:
+        page_size, extra_flags = mmap.PAGESIZE, 0
+    else:
+        page_size, extra_flags = hugepage_size, _HUGEPAGE_MMAP_FLAGS[hugepage_size]
     if mode == HUGEPAGE_MODE_REQUIRED and not extra_flags:
         raise ValueError(
             "SGLANG_HUGEPAGE_MODE=required requires SGLANG_HUGEPAGE_SIZE=2MB or 1GB."
@@ -367,7 +358,7 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
 
     # Note: hugepages are not directly supported with /dev/shm mmap files
     # without mounting hugetlbfs there, so we fall back to plain page size.
-    if hugepage_size:
+    if hugepage_size != "":
         logger.warning(
             "Hugepages are not supported with SHM allocator. "
             "Falling back to plain page-size mmap."
