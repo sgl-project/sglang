@@ -192,7 +192,7 @@ class TestCakeSoftmaxCapability(CustomTestCase):
             device=SimpleNamespace(index=0),
         )
 
-    def test_sampling_softmax_uses_cake_for_qualified_sm100_inputs(self):
+    def test_sampling_softmax_falls_back_to_cake_for_qualified_sm100_inputs(self):
         import torch
 
         from sglang.kernels.ops import sampling as sampling_ops

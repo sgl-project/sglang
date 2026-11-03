@@ -10,13 +10,19 @@ and numerical contract. In particular, Cake top-k-then-top-p sampling is not a
 drop-in replacement for joint top-k/top-p filtering. Prepared plans must remain
 valid when input contents and buffers change across calls and CUDA Graph replay.
 
-The sampler's softmax fast path accepts FP32 contiguous logits on SM100 and
-SM103, small batches and large vocabularies. The sampler retains its existing
-filtering and random-number generation, and deterministic inference retains
-torch.softmax.
+In `sampling.softmax`, SM100-family GPUs run the JIT softmax first. The Cake
+softmax runs only when the JIT softmax rejects the input and the logits are FP32
+and contiguous on SM100 or SM103, with a small batch and a large vocabulary. The
+sampler retains its existing filtering and random-number generation, and
+deterministic inference retains torch.softmax.
 Other operators require their own numerical and real-model performance evidence
 before being added here.
 
-The fast path also requires FlashInfer's `cake_blackwell_softmax` module. Older
-FlashInfer installations retain Torch softmax; this adapter does not change
-SGLang's dependency pins.
+The Cake softmax in `sampling.softmax` also requires FlashInfer's
+`cake_blackwell_softmax` module. With an older FlashInfer, that path uses Torch
+softmax. This adapter does not change SGLang's dependency pins.
+
+DSpark's draft softmax (`SoftmaxTemp` in
+`ops/speculative/dspark/dspark_accept.py`) calls FlashInfer's softmax directly
+and does not use this adapter. FlashInfer routes that call to its Cake softmax
+on SM100 and SM103.
