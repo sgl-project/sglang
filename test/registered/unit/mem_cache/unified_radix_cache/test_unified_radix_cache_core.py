@@ -1800,6 +1800,37 @@ class TestMambaFinishedOvershootCheckpoint(
         max_context_len=64,
     )
 
+    def test_cp_snapshots_publish_prefixes_without_double_freeing_kv(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        retained = None
+        for duplicate in (False, True):
+            req, tokens = self._build_req(allocator, pool, None)
+            req.last_node = cache.root_node_handle()
+            cache.prepare_mamba_checkpoints(req, [4, 8], reserve_slots=3)
+            checkpoints = list(req.kv.mamba_pending_checkpoints)
+            self.assertEqual([position for position, _ in checkpoints], [4, 8])
+            finish_req(cache, req, 12)
+            self.assertEqual(req.kv.mamba_pending_checkpoints, [])
+            for position, slot in checkpoints:
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens[:position])))
+                )
+                self.assertEqual(match.device_prefix_len, position)
+                actual = cache.tree_core.get_component_device_value(
+                    match.last_device_node, ComponentType.MAMBA
+                )
+                if not duplicate:
+                    self.assertTrue(torch.equal(actual.reshape(-1), slot.reshape(-1)))
+            available = (
+                allocator.available_size(),
+                pool.mamba_allocator.available_size(),
+            )
+            if duplicate:
+                self.assertEqual(available, retained)
+            else:
+                retained = available
+            cache.sanity_check()
+
     def test_previous_checkpoint_or_no_donation(self):
         for previous_len, expected_len in ((8, 8), (None, 0), (12, 0)):
             with self.subTest(previous_len=previous_len):

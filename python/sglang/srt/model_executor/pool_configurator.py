@@ -572,6 +572,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
 
+        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+
+        if is_sharded_cp_enabled():
+            cell_size //= get_parallel().attn_cp_size
+
         cell_size += self._compute_qsa_cell_size(
             hf_config=model_config.hf_config, num_layers=num_layers
         )
