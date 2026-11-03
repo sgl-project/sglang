@@ -57,7 +57,7 @@ def _init_communicator() -> None:
 
 @lazy_register_class("sgl.distributed.PushPlane", _init_communicator)
 class PushPlane(tvm_ffi.Object):
-    """Lamport push plane: a zero-filled symmetric workspace + a local counter.
+    """Lamport push plane: a zero-filled symmetric workspace + a local phase word.
 
     All buffers are owned by the caller; this object only validates and
     records them.
@@ -67,6 +67,8 @@ class PushPlane(tvm_ffi.Object):
     if TYPE_CHECKING:
         rank: int
         world_size: int
+        default_blocks: int
+        slot_bytes: int
 
     def __init__(
         self,
@@ -75,6 +77,7 @@ class PushPlane(tvm_ffi.Object):
         *,
         workspaces: List[torch.Tensor],
         counter: torch.Tensor,
+        default_blocks: int,
         mc_workspace: int | None = None,
     ) -> None:
         """
@@ -82,10 +85,13 @@ class PushPlane(tvm_ffi.Object):
                            views of symmetric memory. The local rank's view
                            MUST be zero-filled before first use -- the
                            kernels poll for a pos-zero marker.
-        :param counter: local ``[num_blocks, 4]`` uint8 tensor, zero-filled.
+        :param counter: local ``[8]`` uint8 tensor (one u64 phase word), zero-filled.
+        :param default_blocks: launch width for kernels that do not pick their own.
         :param mc_workspace: multicast VA of the local workspace, or None.
         """
-        self.__ffi_init__(rank, world_size, workspaces, counter, mc_workspace or 0)
+        self.__ffi_init__(
+            rank, world_size, workspaces, counter, mc_workspace or 0, default_blocks
+        )
 
 
 @lazy_register_class("sgl.distributed.PullPlane", _init_communicator)
@@ -103,6 +109,9 @@ class PullPlane(tvm_ffi.Object):
     if TYPE_CHECKING:
         rank: int
         world_size: int
+        capacity: int
+        default_blocks: int
+        num_bytes: int
 
     def __init__(
         self,
@@ -113,13 +122,16 @@ class PullPlane(tvm_ffi.Object):
         semaphores: List[torch.Tensor] | None = None,
         mc_workspace: int | None = None,
         mc_semaphore: int | None = None,
+        default_blocks: int | None = None,
     ) -> None:
         """
         :param workspaces: per-rank ``[num_bytes]`` uint8 views of symmetric
                            memory, or None when the caller brings its own.
-        :param semaphores: per-rank ``[num_blocks, 128]`` uint8 views of
+        :param semaphores: per-rank ``[capacity, 128]`` uint8 views of
                            symmetric memory, zero-filled before first use, or
                            None when the caller never barriers on this plane.
+        :param default_blocks: launch width for kernels that do not pick their
+                               own; None means the semaphore capacity.
         :param mc_workspace: multicast VA of the local workspace, or None.
         :param mc_semaphore: multicast VA of the local semaphores, or None.
         """
@@ -134,8 +146,16 @@ class PullPlane(tvm_ffi.Object):
 
         mc_workspace = mc_workspace or 0
         mc_semaphore = mc_semaphore or 0
+        capacity = semaphores[0].shape[0]
+        default_blocks = capacity if default_blocks is None else default_blocks
         self.__ffi_init__(
-            rank, world_size, workspaces, semaphores, mc_workspace, mc_semaphore
+            rank,
+            world_size,
+            workspaces,
+            semaphores,
+            mc_workspace,
+            mc_semaphore,
+            default_blocks,
         )
 
 
