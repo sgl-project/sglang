@@ -55,8 +55,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1056,6 +1056,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
+
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_prealloc": [decode_req.req for decode_req in self.queue],
+            "decode_retracted": self.retracted_queue,
+            "decode_held": self.held_rebootstrap_reqs,
+        }
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
@@ -2834,6 +2841,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_transfer": [decode_req.req for decode_req in self.queue],
+            # Aborted, with KV held until the transfer drains.
+            "decode_releasing": [
+                decode_req.req for decode_req, *_ in self._deferred_releases
+            ],
+        }
+
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
@@ -3596,7 +3612,6 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
-        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch=None)
 
         # Schedule decode batch
         if running_batch.is_empty():
