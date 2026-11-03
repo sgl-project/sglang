@@ -519,7 +519,6 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         to_finish=None,
         finished_reason=None,
         discard_output_reason=None,
-        inflight_middle_chunks=0,
         pending_bootstrap=False,
         return_logprob=False,
         return_sampling_mask=False,
@@ -531,6 +530,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     batch = SimpleNamespace(
         reqs=[req],
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
@@ -549,6 +549,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
         disagg_prefill_transfer_queue=[],
+        prefill_launched_reqs=Mock(),
         checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
