@@ -12,6 +12,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
+    scatter_conv_windows_after_mtp_verify,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -20,6 +21,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
+)
+from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+    commit_gdn_ucache_cursors,
 )
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
@@ -1617,14 +1621,32 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
-        )
+        if mamba_pool.gdn_ucache is not None:
+            # The u-cache ring owns the SSM rollback: no intermediate_ssm to scatter.
+            assert mamba_track_indices is None, "u-cache verify runs with radix off"
+            commit_gdn_ucache_cursors(
+                buffers=mamba_pool.gdn_ucache,
+                slots=state_indices_tensor,
+                # Linear chain only, so the last accepted step + 1 counts the bonus.
+                num_accept_tokens=last_correct_step_indices + 1,
+            )
+            scatter_conv_windows_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                src_indices_raw=src_indices_raw,
+            )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+            )
 
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,

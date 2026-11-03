@@ -661,6 +661,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_gdn_replayssm_ucache: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -888,7 +889,8 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                # The u-cache verify rolls back through its ring cursors as well.
+                if enable_linear_replayssm_spec or enable_gdn_replayssm_ucache:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -1062,7 +1064,25 @@ class MambaPool:
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
+            self.gdn_ucache = (
+                self._allocate_gdn_ucache(
+                    cache_params=cache_params,
+                    num_mamba_layers=num_mamba_layers,
+                    num_slots=size + 1,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+                if enable_gdn_replayssm_ucache
+                else None
+            )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
+            if self.gdn_ucache is not None:
+                mem_usage_bytes += get_tensor_size_bytes(
+                    [
+                        self.gdn_ucache.k_ring,
+                        self.gdn_ucache.u_ring,
+                        self.gdn_ucache.g_ring,
+                    ]
+                )
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical
                 # shape over-reports its real footprint; charge the physical buffers
@@ -1081,6 +1101,42 @@ class MambaPool:
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
         self._warmup_fused_copy_slot_kernel()
+
+    def _allocate_gdn_ucache(
+        self,
+        *,
+        cache_params: BaseLinearStateParams,
+        num_mamba_layers: int,
+        num_slots: int,
+        speculative_num_draft_tokens: Optional[int],
+    ):
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            allocate_gdn_ucache,
+        )
+
+        if cache_params.is_kda or speculative_num_draft_tokens is None:
+            raise ValueError(
+                "--enable-gdn-replayssm-ucache needs a GDN model with spec verify."
+            )
+        num_v_heads, head_v_dim, head_k_dim = cache_params.shape.temporal
+        gdn_ucache = allocate_gdn_ucache(
+            num_layers=num_mamba_layers,
+            num_slots=num_slots,
+            num_k_heads=cache_params.shape.num_k_heads_per_tp,
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            max_num_draft_tokens=speculative_num_draft_tokens,
+            device=self.device,
+        )
+        logger.info(
+            "GDN u-cache rings allocated: "
+            f"k={get_tensor_size_bytes(gdn_ucache.k_ring) / GB:.3f}GB, "
+            f"u={get_tensor_size_bytes(gdn_ucache.u_ring) / GB:.3f}GB, "
+            f"g={get_tensor_size_bytes(gdn_ucache.g_ring) / GB:.3f}GB, "
+            f"flush_min={gdn_ucache.flush_min}"
+        )
+        return gdn_ucache
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         """Checkpoint buffers for host transfer, excluding speculative work space."""
@@ -1393,6 +1449,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_gdn_replayssm_ucache: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1431,6 +1488,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_gdn_replayssm_ucache=enable_gdn_replayssm_ucache,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1451,6 +1509,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_gdn_replayssm_ucache: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1470,6 +1529,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_gdn_replayssm_ucache=enable_gdn_replayssm_ucache,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
