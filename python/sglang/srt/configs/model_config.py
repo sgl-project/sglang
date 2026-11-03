@@ -563,9 +563,12 @@ def get_num_indexer_layers(config) -> int:
     if is_deepseek_dsa(config):
         return config.num_hidden_layers
     if is_deepseek_v4(config):
-        compress_ratios = getattr(config, "compress_ratios", None) or []
-        return sum(1 for r in compress_ratios if r == 4)
+        return _num_c4_layers(getattr(config, "compress_ratios", None) or [])
     return getattr(config, "num_indexer_layers", 0)
+
+
+def _num_c4_layers(compress_ratios: List[int]) -> int:
+    return sum(1 for ratio in compress_ratios if ratio == 4)
 
 
 def indexer_slots_at(config, layer_ids: List[int]) -> List[int]:
@@ -577,8 +580,7 @@ def indexer_slots_at(config, layer_ids: List[int]) -> List[int]:
         # Slots are the C4 layers' compress_layer_id: the C4 layers before them
         # (DeepSeekV4TokenToKVPool._init_compressed_layer_mapping).
         return [
-            sum(1 for ratio in config.compress_ratios[:layer_id] if ratio == 4)
-            for layer_id in layer_ids
+            _num_c4_layers(config.compress_ratios[:layer_id]) for layer_id in layer_ids
         ]
     raise ValueError(
         f"The indexer top-k of {_hf_arch(config)} cannot be split by layer: "

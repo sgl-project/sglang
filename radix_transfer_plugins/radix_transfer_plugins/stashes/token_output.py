@@ -22,7 +22,8 @@ class TokenOutputStash(msgspec.Struct, frozen=True, kw_only=True):
 
     # Blocks of layer ids
     routed_experts: Optional[LayerBlocks] = None
-    # Blocks of indexer capturer slots, which are layer ids only on some models
+    # Blocks of indexer capturer slots, which are layer ids only on some models;
+    # a split range that holds no slot has no block.
     indexer_topk: Optional[LayerBlocks] = None
     # [num_tokens]: how many allowed token ids each output token's sampling mask holds
     output_token_sampling_mask_lengths: Optional[np.ndarray] = None

@@ -3037,8 +3037,9 @@ class TestPipelineParallelCompat(CustomTestCase):
                 check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
 
     def test_capture_is_rejected(self):
-        """Each stage captures only its layers into a zeroed buffer and only the last
-        stage returns it, so a PP engine would return zeros for the other layers."""
+        """Each stage captures only its layers into a zeroed buffer,
+        and only the first stage's capture reaches the response,
+        so the other stages' layers would be returned as zeros."""
         for flag in ("enable_return_routed_experts", "enable_return_indexer_topk"):
             with self.subTest(flag=flag):
                 with self.assertRaisesRegex(AssertionError, "pipeline parallelism"):

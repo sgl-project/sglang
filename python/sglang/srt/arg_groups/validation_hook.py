@@ -170,8 +170,8 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     assert not (cfg.enable_return_routed_experts or cfg.enable_return_indexer_topk), (
         "--enable-return-routed-experts and --enable-return-indexer-topk are not "
         "supported with pipeline parallelism: each stage captures only its own "
-        "layers and only the last stage returns its capture, so the other stages' "
-        "layers would be returned as zeros"
+        "layers and only the first stage's capture reaches the response, so the "
+        "other stages' layers would be returned as zeros"
     )
 
 
