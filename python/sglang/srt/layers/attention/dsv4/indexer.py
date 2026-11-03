@@ -52,6 +52,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_token_parallel import (
+    token_parallel_state,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -582,11 +585,20 @@ class C4IndexerBackendMixin:
         forward_batch: ForwardBatch,
         skip_compressor: bool = False,
         q_lora_quant=None,
+        query_rows: Optional[Tuple[int, int]] = None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
-        weights = c4_indexer.compute_weights(x, skip_scale=True)
+        # Token-parallel prefill computed weights_proj on each rank's rows and gathered it.
+        tp_state = token_parallel_state(forward_batch)
+        weights = tp_state.take(c4_indexer) if tp_state is not None else None
+        if weights is None:
+            weights = c4_indexer.compute_weights(x, skip_scale=True)
+        if query_rows is not None:
+            # Queries are sharded; the keys (compressor below) cover all tokens.
+            lo, hi = query_rows
+            q_lora, positions, weights = q_lora[lo:hi], positions[lo:hi], weights[lo:hi]
         q, weights = c4_indexer.compute_q(q_lora, positions, weights, q_lora_quant)
         if not skip_compressor:
             self.forward_indexer_compressor(
@@ -812,6 +824,20 @@ class C4IndexerBackendMixin:
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
+        # Token-parallel prefill: the scoring is O(T * L), so each rank scores only
+        # its own query rows and the selected indices are all-gathered below.
+        tp_state = token_parallel_state(forward_batch)
+        tp_rows = None
+        if (
+            tp_state is not None
+            and not c4_indexer.use_fp4_indexer
+            and self.hisparse_coordinator is None
+            and get_global_indexer_capturer() is None
+            and not self.debug_use_external_c4_sparse_indices
+            and num_queries == tp_state.num_tokens
+        ):
+            tp_rows = (tp_state.lo, tp_state.hi)
+
         if enable_multi_stream:
             q_indexer, weights = self._forward_prepare_multi_stream(
                 x=x,
@@ -832,6 +858,7 @@ class C4IndexerBackendMixin:
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
                 q_lora_quant=q_lora_quant,
+                query_rows=tp_rows,
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
@@ -889,14 +916,31 @@ class C4IndexerBackendMixin:
             pad = (0, 0) * (tensor.dim() - 1) + (0, query_rows - tensor.shape[0])
             return F.pad(tensor, pad, value=value)
 
-        c4_seq_lens = match_num_queries(
-            indexer_metadata.compressed_seq_lens, value=0 if use_aiter_fp4 else 1
-        )
+        tp_local_buffers = None
+        if tp_rows is not None:
+            lo, hi = tp_rows
+            c4_seq_lens = indexer_metadata.compressed_seq_lens[lo:hi]
+            page_table = indexer_metadata.page_table[lo:hi]
+            # Every rank contributes tp_state.local rows to the gather; the last
+            # rank's tail rows stay -1 like the unused rows of the full buffer.
+            full_idx = core_metadata.c4_sparse_page_indices
+            full_raw = core_metadata.c4_sparse_raw_indices
+            tp_local_buffers = (
+                full_idx.new_full((tp_state.local, full_idx.shape[1]), -1),
+                None
+                if full_raw is None
+                else full_raw.new_full((tp_state.local, full_raw.shape[1]), -1),
+            )
+            c4_sparse_page_indices = tp_local_buffers[0][:query_rows]
+        else:
+            c4_seq_lens = match_num_queries(
+                indexer_metadata.compressed_seq_lens, value=0 if use_aiter_fp4 else 1
+            )
+            page_table = match_num_queries(indexer_metadata.page_table, value=0)
+            c4_sparse_page_indices = match_num_queries(
+                core_metadata.c4_sparse_page_indices, value=-1
+            )
         _c4sl = c4_seq_lens
-        page_table = match_num_queries(indexer_metadata.page_table, value=0)
-        c4_sparse_page_indices = match_num_queries(
-            core_metadata.c4_sparse_page_indices, value=-1
-        )
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
@@ -934,7 +978,10 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if core_metadata.c4_sparse_raw_indices is not None:
+        if tp_local_buffers is not None:
+            if tp_local_buffers[1] is not None:
+                raw_indices = tp_local_buffers[1][:query_rows]
+        elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
         elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
@@ -972,10 +1019,11 @@ class C4IndexerBackendMixin:
             elif self.dsa_topk_backend.should_use_topk_v2():
                 if topk_plan is None:
                     # The cached plan routes rows by their index in the full
-                    # range, so a chunk needs one built over its own rows.
+                    # range, so a chunk (or this rank's token-parallel rows)
+                    # needs one built over its own rows.
                     topk_plan = (
                         indexer_metadata.topk_metadata
-                        if rows == all_rows
+                        if rows == all_rows and tp_rows is None
                         else plan_topk_v2(c4_seq_lens[rows])
                     )
                 topk_transform_paged_v2(
@@ -1122,6 +1170,16 @@ class C4IndexerBackendMixin:
                     )
             else:
                 run_paged_indexer(all_rows, deep_gemm_metadata)
+
+        if tp_local_buffers is not None:
+            full_buffers = (
+                core_metadata.c4_sparse_page_indices,
+                core_metadata.c4_sparse_raw_indices,
+            )
+            for local, full in zip(tp_local_buffers, full_buffers):
+                if local is not None:
+                    gathered = tp_state.all_gather(local)
+                    full[: gathered.shape[0]].copy_(gathered)
 
         if hisparse_coordinator is not None:
             if hisparse_decode:

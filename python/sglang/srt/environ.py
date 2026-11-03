@@ -1918,6 +1918,15 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # ROCm (not gfx95 / gfx1250), pure TP: each rank keeps 1/tp of a prefill's
+    # tokens through the replicated per-token work (mHC, input projections,
+    # indexer scoring, router); attention heads and experts stay TP-sharded.
+    SGLANG_DSV4_TOKEN_PARALLEL_PREFILL = EnvBool(False)
+    # ... only for extend batches of at least this many tokens.
+    SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS = EnvInt(2048)
+    # ... also while DSpark captures the target's aux hidden states; the captured
+    # layers are all-gathered for the draft.
+    SGLANG_DSV4_TOKEN_PARALLEL_DSPARK = EnvBool(False)
     # Decoder SWA bounded replay: eager prefill steps with up to this many tail rows
     # run the tail layers from CUDA graphs (buckets of 128 rows); 0 keeps them eager.
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = EnvInt(2048)

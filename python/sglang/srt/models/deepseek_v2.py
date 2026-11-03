@@ -127,6 +127,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import (
     TopK,
+    TopKOutput,
     TopKOutputFormat,
     fused_shared_expert_weight,
     is_expert_remapping_enabled,
@@ -1369,6 +1370,7 @@ class DeepseekV2MoE(nn.Module):
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
+        topk_output: Optional[TopKOutput] = None,
     ) -> Union[torch.Tensor, MoEOutput]:
         if self.shared_experts is not None and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1397,35 +1399,12 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
-            # router_logits: (num_tokens, n_experts)
-            if _is_hip:
-                router_logits, router_logits_partials = _hip_moe.forward_gate(
-                    self,
+            if topk_output is None:
+                topk_output = self._route(
                     hidden_states,
                     gemm_output_zero_allocator,
-                    fused_gate=not use_vision_topk,
-                )
-            else:
-                router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-                router_logits_partials = None
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            if router_logits_partials is not None:
-                topk_kwargs["router_logits_partials"] = router_logits_partials
-            if use_vision_topk:
-                topk_output = vision_topk(
-                    self,
-                    router_logits,
                     input_ids_global,
-                )
-            else:
-                topk_output = self.topk(
-                    hidden_states,
-                    router_logits,
-                    **topk_kwargs,
+                    use_vision_topk=use_vision_topk,
                 )
         else:
             pre_quant_input = None
@@ -1511,6 +1490,34 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
         return self._finalize_normal_output(final_hidden_states, shared_output)
+
+    def _route(
+        self,
+        hidden_states: torch.Tensor,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        input_ids_global: Optional[torch.Tensor] = None,
+        *,
+        use_vision_topk: bool = False,
+    ) -> TopKOutput:
+        # router_logits: (num_tokens, n_experts)
+        if _is_hip:
+            router_logits, router_logits_partials = _hip_moe.forward_gate(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator,
+                fused_gate=not use_vision_topk,
+            )
+        else:
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            router_logits_partials = None
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(self, "is_hash", False) else {}
+        )
+        if router_logits_partials is not None:
+            topk_kwargs["router_logits_partials"] = router_logits_partials
+        if use_vision_topk:
+            return vision_topk(self, router_logits, input_ids_global)
+        return self.topk(hidden_states, router_logits, **topk_kwargs)
 
     def _adds_replicated_output(self) -> bool:
         """Whether this rank adds the replicated TP1 shared-expert output."""

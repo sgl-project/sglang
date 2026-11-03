@@ -17,6 +17,9 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_token_parallel import (
+    token_parallel_state,
+)
 from sglang.srt.models.deepseek_v2 import _is_hip, _use_aiter
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
@@ -146,7 +149,11 @@ class Compressor(BaseFusedOp):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = self._compute_wkv_gate(x)
+        # Token-parallel prefill computed wkv_gate on each rank's rows and gathered it.
+        tp_state = token_parallel_state(forward_batch)
+        kv_score = tp_state.take(self) if tp_state is not None else None
+        if kv_score is None:
+            kv_score = self._compute_wkv_gate(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
