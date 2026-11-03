@@ -272,12 +272,18 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
+    if cfg.schedule_policy == "uniboost":
+        assert cfg.uniboost_gamma is None or cfg.uniboost_gamma > 0, (
+            "--uniboost-gamma must be > 0"
+        )
+        assert cfg.uniboost_bin_size >= 1, "--uniboost-bin-size must be >= 1"
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",
             "lof",
+            "uniboost",
         ], (
-            f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
+            f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof' or 'uniboost'. '{cfg.schedule_policy}' is not supported."
         )
         if cfg.default_priority_value is None:
             logger.warning(
