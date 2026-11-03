@@ -482,6 +482,15 @@ class UnifiedTreeCoreInterface(ABC):
         """Protected token count for one component (0 if absent)."""
         raise NotImplementedError("This tree core does not expose per-component sizes")
 
+    def component_evictable_device_indices(
+        self, component_type: ComponentType
+    ) -> torch.Tensor:
+        """Device KV indices of one component's unlocked values, i.e. the slots
+        counted by `component_evictable_size`. Walks the whole tree."""
+        raise NotImplementedError(
+            "This tree core does not expose per-component evictable indices"
+        )
+
     @abstractmethod
     def adjust_component_size(
         self, node_id: NodeId, component_type: ComponentType, delta: int

@@ -92,6 +92,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_cache_compatibility",
         "handle_page_major_kv_layout",
         "handle_unified_memory_pool",
+        "handle_elastic_mem_pool",
         "handle_dllm_inference",
         "handle_crash_dump_env",
         "handle_debug_utils",

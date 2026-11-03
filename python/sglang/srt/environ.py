@@ -644,6 +644,17 @@ class Envs:
     # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
     # The engine defaults NCCL cuMem on for eligible single-node deployments.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
+    # Elastic memory (kvcached VMM): hybrid-SWA full/SWA KV pools trade physical
+    # pages at runtime (mem_cache/elastic). Requires the `kvcached` package.
+    SGLANG_ENABLE_ELASTIC_MEM_POOL = EnvBool(False)
+    # Physical page granularity for map/unmap, in bytes (default 2 MB).
+    SGLANG_ELASTIC_MEM_CU_PAGE_SIZE = EnvInt(2 << 20)
+    # A pool whose token usage exceeds this may grow ...
+    SGLANG_ELASTIC_MEM_MAP_THRESHOLD = EnvFloat(0.9)
+    # ... by taking pages from a pool whose token usage is below this.
+    SGLANG_ELASTIC_MEM_UNMAP_THRESHOLD = EnvFloat(0.8)
+    # Minimum token-usage gap between the two pools before a resize starts.
+    SGLANG_ELASTIC_MEM_RESIZE_TRIGGER_DIFF_RATIO = EnvFloat(0.2)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

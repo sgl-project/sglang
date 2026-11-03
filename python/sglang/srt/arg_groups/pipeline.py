@@ -150,6 +150,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
+        handle_elastic_mem_pool,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
@@ -344,6 +345,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_page_major_kv_layout, server_args)
 
     run_hook(handle_unified_memory_pool, server_args)
+
+    run_hook(handle_elastic_mem_pool, server_args)
 
     from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
 

@@ -1881,6 +1881,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False
+    # Elastic pools size themselves via kvcached map/unmap, not post-capture resize.
+    if envs.SGLANG_ENABLE_ELASTIC_MEM_POOL.get():
+        return False
     if cfg.device != "cuda":
         return False
     if cfg.dcp_size != 1:
