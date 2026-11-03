@@ -43,7 +43,8 @@ register_cuda_ci(
 )
 register_amd_ci(
     est_time=380,
-    suite="extra-a-test-1-gpu-large-amd",
+    suite="nightly-amd-1-gpu",
+    nightly=True,
 )
 
 PROMPTS = [
