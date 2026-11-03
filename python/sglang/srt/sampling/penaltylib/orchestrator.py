@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import abc
 import weakref
-from typing import TYPE_CHECKING, Optional, Set, Type
+from typing import TYPE_CHECKING, Optional, Sequence, Type
 
 import torch
 
@@ -15,7 +15,7 @@ class BatchedPenalizerOrchestrator:
         self,
         vocab_size: int,
         batch: ScheduleBatch,
-        penalizers: Set[Type[_BatchedPenalizer]],
+        penalizers: Sequence[Type[_BatchedPenalizer]],
     ):
         self.vocab_size = vocab_size
         self._batch_ref = weakref.ref(batch)
