@@ -518,10 +518,19 @@ class OpenAIServingChat(OpenAIServingBase):
         # to avoid double BOS; otherwise the kwarg is a no-op and dropping it
         # lets slow tokenizers (e.g. Kimi's TikTokenTokenizer) stay on the
         # fast internal path.
+        self._auto_added_bos_id = None
         try:
-            self._tokenizer_auto_adds_specials = (
-                len(self.tokenizer_manager.tokenizer.encode("")) > 0
-            )
+            tokenizer = self.tokenizer_manager.tokenizer
+            added_ids = tokenizer.encode("")
+            self._tokenizer_auto_adds_specials = len(added_ids) > 0
+            # A nonempty input distinguishes a BOS prefix from an EOS suffix,
+            # even when the tokenizer uses the same ID for both.
+            if (
+                self._tokenizer_auto_adds_specials
+                and added_ids[0] == getattr(tokenizer, "bos_token_id", None)
+                and tokenizer.encode("x")[:1] == added_ids[:1]
+            ):
+                self._auto_added_bos_id = added_ids[0]
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
@@ -1303,13 +1312,17 @@ class OpenAIServingChat(OpenAIServingBase):
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
         """
-        # A lossy text round-trip makes the rendered prompt unusable, so send the
-        # ids instead. Only when nothing needs placeholder expansion: with media
-        # attached the MM processor still has to tokenize the text itself.
+        # The MM processor needs text to expand media placeholders. Without
+        # media, use the template IDs if re-encoding would lose control tokens
+        # or prepend a second BOS.
+        prompt_ids = processed_messages.prompt_ids
         prefers_prompt_ids = (
-            self._prompt_text_round_trip_is_lossy
-            and isinstance(processed_messages.prompt_ids, list)
-            and processed_messages.prompt_ids
+            isinstance(prompt_ids, list)
+            and prompt_ids
+            and (
+                self._prompt_text_round_trip_is_lossy
+                or prompt_ids[0] == self._auto_added_bos_id
+            )
             and not (
                 processed_messages.image_data
                 or processed_messages.video_data
@@ -1322,9 +1335,9 @@ class OpenAIServingChat(OpenAIServingBase):
             and not prefers_prompt_ids
         ):
             return "text", processed_messages.prompt
-        if isinstance(processed_messages.prompt_ids, str):
-            return "text", processed_messages.prompt_ids
-        return "input_ids", processed_messages.prompt_ids
+        if isinstance(prompt_ids, str):
+            return "text", prompt_ids
+        return "input_ids", prompt_ids
 
     def _can_reuse_text_only_prompt_ids(
         self, processed_messages: MessageProcessingResult, is_multimodal: bool

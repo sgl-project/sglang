@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 from fastapi import Request
 from tokenizers import Tokenizer as BackendTokenizer
 from tokenizers import models as tokenizer_models
-from tokenizers import pre_tokenizers
+from tokenizers import pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
 from xgrammar import Grammar
@@ -1694,6 +1694,35 @@ class ServingChatTestCase(CustomTestCase):
                     ("get_weather", {"city": "Paris"}),
                 )
                 self.assertEqual(choice.finish_reason, "tool_calls")
+
+    def test_text_only_multimodal_prompt_distinguishes_bos_prefix_from_eos_suffix(self):
+        """A tokenizer can use the same ID for a BOS prefix or an EOS suffix."""
+        self.tm.model_config.is_multimodal = True
+        self.template_manager.chat_template_name = None
+        backend = BackendTokenizer(
+            tokenizer_models.WordLevel({"<s>": 0, "hi": 1, "[UNK]": 2}, "[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+        for pattern, expected in [("<s> $A", [0, 1]), ("$A <s>", [0, 1, 0])]:
+            with self.subTest(post_processor=pattern):
+                backend.post_processor = processors.TemplateProcessing(
+                    single=pattern, special_tokens=[("<s>", 0)]
+                )
+                tokenizer = PreTrainedTokenizerFast(
+                    tokenizer_object=backend,
+                    bos_token="<s>",
+                    eos_token="<s>",
+                    unk_token="[UNK]",
+                    chat_template="{{ bos_token }} {{ messages[0].content }}",
+                )
+                self.tm.tokenizer = tokenizer
+                chat = OpenAIServingChat(self.tm, self.template_manager)
+                request = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "hi"}]
+                )
+                adapted, _ = chat._convert_to_internal_request(request)
+                ids = adapted.input_ids or tokenizer.encode(adapted.text)
+                self.assertEqual(ids, expected)
 
     def test_prompt_reuse_only_for_text_on_a_processor_free_model(self):
         self.tm.model_config.is_multimodal = True

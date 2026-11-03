@@ -11,6 +11,7 @@ import unittest
 
 import openai
 from PIL import Image, ImageDraw
+from transformers import AutoTokenizer
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -69,6 +70,29 @@ class TestLlavaServer(ImageOpenAITestMixin):
 
 class TestLfm2VlServer(ImageOpenAITestMixin):
     model = "LiquidAI/LFM2.5-VL-1.6B"
+
+    def test_text_only_prompt_keeps_a_single_bos(self):
+        """The chat template writes the BOS and the tokenizer auto-adds one, so a
+        text-only prompt that is encoded a second time starts with two BOS tokens.
+        """
+        messages = [{"role": "user", "content": "What is 2+2?"}]
+        expected = AutoTokenizer.from_pretrained(self.model).apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=False
+        )
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        chat = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=1,
+            extra_body={"return_prompt_token_ids": True},
+        )
+        self.assertEqual(chat.choices[0].prompt_token_ids, expected)
+
+        response = client.responses.create(
+            model=self.model, input=messages, max_output_tokens=16
+        )
+        self.assertEqual(response.usage.input_tokens, len(expected))
 
 
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
