@@ -13,7 +13,7 @@ That makes three ways to be silently wrong rather than loud:
   * shipping the SWA side's KERNEL-FACING ids, which the read path uses, in
     place of its physical ones;
   * letting compaction relocate a page mid-transfer, which the SWA allocator
-    had no `set_disagg_move_gate` to prevent.
+    nothing kept the SWA allocator's pages in place against.
 
 Logprob parity against a non-PD unified reference catches all three; GSM8K on
 gpt-oss is too noisy to (single-server unified and static both score 0.570 at

@@ -131,6 +131,69 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.3.jsx";
 
 <AgentX data={agentx} />
 
+### MI355X deployment measured with SemiAnalysis InferenceX
+
+MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4593](https://github.com/SemiAnalysisAI/InferenceX/pull/4593)): TP4·EP4 with HiCache at concurrency 4–16, and TP8·EP1 with GPU-resident KV at concurrency 1–4.
+
+- **Container image.** `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261025` (`sha256:bb3370918fb7fc4adce40d4192e61ad7dbccbc8159e2f6063318120d0bc0e949`, the image tested in InferenceX). This dated nightly is built from `main` on 2026-10-25 and includes [#40776](https://github.com/sgl-project/sglang/pull/40776), which the checkpoint needs to load; the `v0.5.22` release does not.
+- **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency. The commands below use concurrency 10 for TP4·EP4 and 4 for TP8·EP1.
+- **HiCache.** `--hicache-size` is the host tier in GB per rank, so 180 GB needs about 720 GB of host memory across the four ranks.
+
+```bash TP4·EP4 (concurrency 4–16)
+SGLANG_OPT_USE_TOPK_V2=true \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+python -m sglang.launch_server \
+  --model-path amd/GLM-5.3-Quark-MXFP4-AttnFP8 \
+  --tp-size 4 \
+  --ep-size 4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 32768 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 20 \
+  --cuda-graph-max-bs-decode 20 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --enable-hierarchical-cache \
+  --hicache-size 180 \
+  --hicache-write-policy write_through \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash TP8·EP1 (concurrency 1–4)
+SGLANG_OPT_USE_TOPK_V2=true \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+python -m sglang.launch_server \
+  --model-path amd/GLM-5.3-Quark-MXFP4-AttnFP8 \
+  --tp-size 8 \
+  --ep-size 1 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 32768 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs-decode 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 ## 1. Model Introduction
 
 **GLM-5.3** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It keeps the same base architecture while updating post-training for complex coding and long-horizon tasks. It ships in two precisions — **FP8** (`zai-org/GLM-5.3`) and full **BF16** (`zai-org/GLM-5.3-BF16`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, RadixArk publishes an **experimental NVFP4** build (`RadixArk/GLM-5.3-NVFP4`, Model Optimizer) that quantizes only the routed experts' linear weights and activations to 4-bit (attention, shared experts, dense layers, MTP, embeddings, and the LM head stay unquantized), cutting the weight footprint to ~0.45 TB so a 4-GPU GB300 node can serve it with TP4. **The NVFP4 cells are experimental** — benchmark data (accuracy / throughput) is still pending; treat them as provisional until the benchmark cards fill in.
@@ -178,7 +241,7 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.3.jsx";
 - **Chunked-prefill size is regime-dependent.** For long-input balanced workloads, start with `--chunked-prefill-size 32768` and tune it together with `--max-running-requests` for your input length and KV capacity. Keep the default chunked-prefill size for the high-throughput recipe unless profiling shows that prefill is the bottleneck.
 
 - **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.3`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.3-BF16`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there. Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). GLM-5.3 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
-- **MTP / EAGLE speculative decoding** is disabled for AMD in the Deploy panel because the gfx950 spec-decode draft kernel is not yet validated on this hardware (and at `--speculative-num-steps > 3` hits a separate build issue). Until MTP is validated on gfx950, omit the `--speculative-*` flags and serve without MTP.
+- **MTP / EAGLE speculative decoding** is disabled for AMD in the Deploy panel because the gfx950 spec-decode draft kernel is not yet validated on this hardware (and at `--speculative-num-steps > 3` hits a separate build issue). Until MTP is validated on gfx950, omit the `--speculative-*` flags and serve without MTP. This applies to the Deploy panel's FP8 and BF16 commands; the [MI355X AgentX commands](#mi355x-deployment-measured-with-semianalysis-inferencex) run EAGLE MTP with `--speculative-num-steps 5` on the MXFP4 checkpoint and `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261025`.
 
 ## 3. Advanced Usage
 

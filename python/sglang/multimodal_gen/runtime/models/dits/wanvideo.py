@@ -80,22 +80,16 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix, is_device_stream_capturing
 
-if current_platform.is_xpu() or current_platform.is_hip():
-    # CuTe DSL (cutlass) is unavailable on XPU and ROCm; use the unfused q/k norm path.
-    can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
-    fused_rmsnorm_interleaved_rope_ = None
-    fused_rmsnorm_interleaved_rope_into_blocks = None
-    rmsnorm_interleaved_rope_block_cols = None
-else:
+logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
+
+if _is_cuda:
     from sglang.kernels.ops.diffusion import (
         can_use_fused_rmsnorm_interleaved_rope,
         fused_rmsnorm_interleaved_rope_,
         fused_rmsnorm_interleaved_rope_into_blocks,
         rmsnorm_interleaved_rope_block_cols,
     )
-
-logger = init_logger(__name__)
-_is_cuda = current_platform.is_cuda()
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -745,7 +739,8 @@ class WanTransformerBlock(nn.Module):
         rope_cos_sin_cache: torch.Tensor | None,
     ) -> bool:
         return (
-            rope_cos_sin_cache is not None
+            _is_cuda
+            and rope_cos_sin_cache is not None
             and self.fuse_qk_norm_rope
             and not torch.compiler.is_compiling()
             and all(
