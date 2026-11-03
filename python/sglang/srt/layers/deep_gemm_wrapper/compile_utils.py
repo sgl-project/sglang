@@ -103,11 +103,9 @@ def update_deep_gemm_config(gpu_id: int):
 
     _IS_FIRST_RANK_ON_NODE = get_device().base_gpu_id == gpu_id
 
-    # Check if is the first rank on node.
-    # Default each rank will try compile all Ms to
-    # load all symbols at the launch stages.
-    # Avoid loading symbols at the serving stages.
-    _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
+    # CP peers have independent CUDA contexts. Warm every rank so a new
+    # prefill shape cannot load a module after serving fills the memory pool.
+    _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE or get_parallel().attn_cp_size > 1
 
 
 class DeepGemmKernelType(IntEnum):
@@ -201,7 +199,7 @@ def _compile_deep_gemm_one_type_all(
     m_list: List[int],
 ) -> None:
     # Symmetric memory allocation performs a collective operation across all the GPUs.
-    # Temporary disable symmetric memory during compilation since it only runs on the first rank.
+    # Disable symmetric memory while ranks independently load their kernel variants.
     saved_context = disable_symmetric_memory_context()
     try:
         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
@@ -211,7 +209,6 @@ def _compile_deep_gemm_one_type_all(
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
-        # Here the precompilation is only run on the first rank, so gpu_id should be 0
         memory_budget = get_available_gpu_memory(
             device="cuda", gpu_id=torch.cuda.current_device()
         )

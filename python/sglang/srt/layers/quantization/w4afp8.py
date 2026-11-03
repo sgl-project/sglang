@@ -49,7 +49,13 @@ class W4AFp8Config(QuantizationConfig):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_checkpoint_w4afp8_serialized = is_checkpoint_w4afp8_serialized
         if is_checkpoint_w4afp8_serialized:
-            logger.warning("Detected w4afp8 checkpoint. Please note that")
+            logger.info(
+                "W4AFp8 checkpoint: expert weights=INT4, group_size=%d, "
+                "FP8 expert activation scheme=%s, FP8 linear activation scheme=%s",
+                group_size,
+                moe_activation_scheme,
+                linear_activation_scheme,
+            )
         if moe_activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {moe_activation_scheme}")
         self.linear_activation_scheme = linear_activation_scheme
@@ -101,6 +107,17 @@ class W4AFp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            from sglang.srt.layers.moe.sm90_mxfp4_mega import enabled
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+            if enabled():
+                # This method converts the original checkpoint before the
+                # standard W4A8 post-load path applies any backend packing.
+                return W4AFp8Mxfp4MegaMoEMethod(self)
+            if get_moe_a2a_backend().is_megamoe():
+                raise ValueError(
+                    "MegaMoE requires the explicit W4AFP8-to-MXFP4 conversion"
+                )
             return W4AFp8MoEMethod(self)
         return None
 
@@ -432,3 +449,60 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             return hidden_states
+
+
+class W4AFp8Mxfp4MegaMoEMethod(W4AFp8MoEMethod):
+    def create_moe_runner(self, layer, moe_runner_config):
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_megamoe():
+            raise ValueError("SM90 MXFP4 experiment requires --moe-a2a-backend megamoe")
+
+    def process_weights_after_loading(self, layer):
+        if getattr(self, "processed", False):
+            return
+        from flashinfer.moe_ep._sm90_mxfp4.conversion import (
+            requantize_int4_expert,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl.weights import (
+            preprocess_mega_weights,
+        )
+        from flashinfer.moe_ep.weights import PrequantizedMoEWeights
+
+        converted = {}
+        for name in ("w13", "w2"):
+            old = getattr(layer, name + "_weight")
+            scale = getattr(layer, name + "_weight_scale_inv")
+            q = torch.empty_like(old, dtype=torch.uint8)
+            sf = torch.empty(
+                (*old.shape[:-1], old.shape[-1] * 2 // 32),
+                dtype=torch.uint8,
+                device=old.device,
+            )
+            for expert in range(old.shape[0]):
+                qe, se = requantize_int4_expert(
+                    old[expert], scale[expert], self.quant_config.group_size
+                )
+                q[expert].copy_(qe)
+                sf[expert].copy_(se)
+            converted[name] = q
+            converted[name + "_scale"] = sf
+        packed = PrequantizedMoEWeights(**converted)
+        layer.mega_l1_weights, layer.mega_l2_weights = preprocess_mega_weights(
+            packed,
+            intermediate_size=layer.intermediate_size_per_partition,
+            hidden_size=layer.hidden_size,
+            expert_chunk_size=1,
+        )
+        for name in ("w13", "w2"):
+            for suffix in ("_weight", "_weight_scale_inv", "_input_scale"):
+                delattr(layer, name + suffix)
+        self.processed = True
+        layer._mega_moe_weights_built = True
+        logger.info(
+            "Experimental SM90 MXFP4 Mega weights: layer=%s source=INT4 target=E2M1/E8M0/group32",
+            layer.layer_id,
+        )
+
+    def apply(self, layer, dispatch_output):
+        raise RuntimeError("SM90 MXFP4 Mega must run through FusedMoE.forward")

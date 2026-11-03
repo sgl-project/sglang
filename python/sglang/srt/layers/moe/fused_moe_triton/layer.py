@@ -607,6 +607,17 @@ class FusedMoE(torch.nn.Module):
         )
         self.supports_deferred_finalize = False
 
+        if get_exec().moe.enable_mxfp4_mega:
+            from sglang.srt.layers.quantization.w4afp8 import W4AFp8Mxfp4MegaMoEMethod
+
+            if not isinstance(self.quant_method, W4AFp8Mxfp4MegaMoEMethod):
+                raise ValueError(
+                    "This MegaMoE implementation supports only MXFP4 expert weights; "
+                    "enable the explicit W4AFP8-to-MXFP4 conversion when loading."
+                )
+            if self.moe_tp_size != 1:
+                raise ValueError("MXFP4 MegaMoE requires pure EP")
+
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -1749,6 +1760,18 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        if get_exec().moe.enable_mxfp4_mega:
+            from sglang.srt.layers.moe.sm90_mxfp4_mega import (
+                prepare_workspace,
+                run_experts,
+            )
+
+            workspace = prepare_workspace(
+                self, hidden_states, num_experts=self.num_experts, top_k=self.top_k
+            )
+            # The symmetric workspace is shared by layers. Return owned storage
+            # before the model adds shared experts or the next layer reuses it.
+            return run_experts(self, hidden_states, topk_output, workspace).clone()
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_bypassed(topk_output) and (
                 topk_output.expert_location_dispatch_info is not None

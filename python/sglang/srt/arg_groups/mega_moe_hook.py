@@ -159,6 +159,11 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
         return
+    if cfg.enable_mxfp4_mega:
+        # This implementation sizes its own workspace from CP shard padding,
+        # chunk/context limits and request capacity. The DeepGEMM buffer budget
+        # below belongs to the other MegaMoE implementation.
+        return
     if get_platform().is_hip:
         return
 

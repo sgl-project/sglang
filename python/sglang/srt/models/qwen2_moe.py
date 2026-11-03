@@ -54,6 +54,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.row_transport import launch_cp_residual_exchange
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     LinearParallelGroup,
@@ -437,7 +438,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
-        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._use_mega_moe = (
+            get_moe_a2a_backend().is_megamoe() and not get_exec().moe.enable_mxfp4_mega
+        )
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
@@ -647,6 +650,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         trace_sync("pre_experts")
+        if forward_batch.prefill_cp_metadata is not None:
+            launch_cp_residual_exchange(forward_batch.prefill_cp_metadata)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -703,6 +708,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_ids = topk_output.topk_ids
             topk_weights = topk_output.topk_weights
 
+        if forward_batch is not None and forward_batch.prefill_cp_metadata is not None:
+            launch_cp_residual_exchange(forward_batch.prefill_cp_metadata)
         final_hidden_states = run_mega_routed_experts(
             self.experts,
             hidden_states,
@@ -726,6 +733,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         *,
         defer_finalize: bool = False,
     ):
@@ -736,6 +744,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if forward_batch is not None and forward_batch.prefill_cp_metadata is not None:
+            launch_cp_residual_exchange(forward_batch.prefill_cp_metadata)
         if defer_finalize:
             if not self.supports_deferred_finalize:
                 raise RuntimeError(
@@ -771,6 +781,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -818,7 +829,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(hidden_states, forward_batch)
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -862,6 +873,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # self.experts() to participate in alltoall collective.
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+            # Empty CP shards also owe the next layer's residual exchange.
+            if (
+                forward_batch is not None
+                and forward_batch.prefill_cp_metadata is not None
+            ):
+                launch_cp_residual_exchange(forward_batch.prefill_cp_metadata)
             final_hidden_states = self.experts(hidden_states, topk_output)
         elif (
             self.alt_stream is not None
@@ -877,6 +894,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
+                forward_batch=forward_batch,
             )
         else:
             shared_output = self._forward_shared_experts(
@@ -887,7 +905,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states, shared_output
                 )
             final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
+                hidden_states, forward_batch, defer_finalize=defer_finalize
             )
 
         if defer_finalize:
