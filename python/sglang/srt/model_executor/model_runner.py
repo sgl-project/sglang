@@ -269,19 +269,22 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
+# Select the EPLB guard independently of backend initialization below.
 if _is_npu:
     from sglang.srt.hardware_backend.npu.eplb import isolate_draft_expert_recording
-    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
-
-    init_npu_backend()
 else:
 
     def isolate_draft_expert_recording(forward):
         # Preserve the original callable on non-NPU devices, without a wrapper.
         return forward
 
-    if current_platform.is_out_of_tree():
-        current_platform.init_backend()
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+    init_npu_backend()
+elif current_platform.is_out_of_tree():
+    current_platform.init_backend()
 
 # Detect stragger ranks in model loading
 
