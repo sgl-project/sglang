@@ -86,6 +86,8 @@ def store_offloaded_kv(*, backend, layer, forward_batch, k, v) -> None:
     pool = backend.token_to_kv_pool
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
     if offload.verify:
+        if layer_idx == 0:
+            offload.snapshot_mapping()
         backend.kv_layers.layer(layer.layer_id).store(
             layer, forward_batch.out_cache_loc, k, v
         )
@@ -122,11 +124,11 @@ def gather_offloaded_context(
         output_size=total_k,
     )
     positions = torch.arange(total_k, device=device) - cu_seqlens_k[:-1].long()[owner]
-    slots = backend.req_to_token[
+    offload = backend._kv_offload
+    slots = offload.req_to_token[
         forward_batch.req_pool_indices.long()[owner], positions
     ]
     pool = backend.token_to_kv_pool
-    offload = backend._kv_offload
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
     k, v = offload.gather_context(layer_idx=layer_idx, slots=slots)
     pool_k = pool.layer_router.read(layer.layer_id).key()
@@ -139,7 +141,7 @@ def gather_offloaded_context(
         expected = pack_qsa_prefill_kv(
             k=pool_k,
             v=pool_v,
-            req_to_token=backend.req_to_token,
+            req_to_token=offload.req_to_token,
             req_indices=forward_batch.req_pool_indices,
             cu_k=cu_seqlens_k,
             total_k=total_k,
@@ -198,7 +200,7 @@ def forward_offloaded_attention(
         reference = QSAKVGatherSource(
             k_buffer=pool_k,
             v_buffer=pool_v,
-            slot_table=backend.req_to_token_pool.req_to_token,
+            slot_table=offload.req_to_token,
             row_requests=row_requests,
             sequence_lengths=metadata.sequence_lengths,
         )

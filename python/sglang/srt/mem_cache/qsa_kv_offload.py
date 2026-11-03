@@ -415,7 +415,10 @@ class QSAKVHostOffload:
                 f"req_to_token has {num_slots} request slots, the QSA K/V offload "
                 f"was built for {self.layout.num_request_slots}"
             )
-        self.req_to_token = req_to_token
+        # Verify mode reads one snapshot of the mapping per forward
+        # (snapshot_mapping); serving reads the live table, as upstream does.
+        self._live_req_to_token = req_to_token
+        self.req_to_token = req_to_token.clone() if self.verify else req_to_token
         self.width = width
         self.max_blocks = width // self.cr + TAIL_BLOCKS
         if self.use_fused:
@@ -451,6 +454,15 @@ class QSAKVHostOffload:
         self.ring_blk = table(layers, num_slots, TAIL_BLOCKS)
         self.ring_src = table(layers, num_slots, TAIL_BLOCKS, cr, dtype=torch.int32)
         self.ring_end = table(layers, num_slots)
+
+    def snapshot_mapping(self) -> None:
+        """Verify mode: copy the live ``req_to_token`` once per forward. The
+        scheduler rewrites a running request's mapping (radix dedup in
+        ``checkpoint``) on its own stream while a forward may run, so the
+        resolve and the full-pool reference must read the same copy
+        (graph-capturable)."""
+        if self.verify:
+            self.req_to_token.copy_(self._live_req_to_token)
 
     def set_num_real(self, num_requests: int) -> None:
         """Requests of the next forward; CUDA-graph padding past them is skipped.

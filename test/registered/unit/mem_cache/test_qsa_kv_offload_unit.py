@@ -437,6 +437,24 @@ class TestOffloadResolve(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "1 of 2 checks differ"):
             sim.offload.poll_verify()
 
+    def test_verify_reads_one_mapping_snapshot_per_forward(self):
+        sim = _OffloadSim(rows_per_request=1, seed=6)
+        layout, live = sim.layout, torch.arange(sim.slots * 8).reshape(sim.slots, 8)
+        offload = QSAKVHostOffload(
+            layout=layout,
+            k_buffers=sim.dev_k,
+            v_buffers=sim.dev_v,
+            host_rows=64,
+            pin_memory=False,
+            verify=True,
+        )
+        offload.bind(live)
+        offload.snapshot_mapping()
+        live[1, 2] = -5  # the scheduler rewrites a mapping mid-forward
+        self.assertEqual(int(offload.req_to_token[1, 2]), 10)
+        offload.snapshot_mapping()  # the next forward sees it
+        self.assertEqual(int(offload.req_to_token[1, 2]), -5)
+
     def test_selection_larger_than_hot_cache_raises(self):
         sim = _OffloadSim(rows_per_request=1, seed=3, hot_blocks=4)
         sim.extend(1, 300)
