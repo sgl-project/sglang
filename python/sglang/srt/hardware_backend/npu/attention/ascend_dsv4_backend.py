@@ -114,22 +114,51 @@ def _ensure_dsv41_static_verify_mode() -> None:
 
 @functools.cache
 def _ds41_ops():
-    """The `cann_ops_transformer.ops.ds41` module with the V4.1 Python operators.
+    """The V4.1 operator entry points, called directly.
 
-    Only `compressor`, `indexer_prologue_k`, `quant_lightning_indexer` and
-    `quant_sparse_lightning_indexer` are exposed as Python ops (they need
-    Python-side argument marshalling); the remaining V4.1 operators go through
-    `torch.ops.*` and are called inline.
+    Seven operators are plain functions of the ``cannbot-arena-net`` wheel
+    (import name ``ops``) and are invoked directly, skipping the
+    ``cann_ops_transformer`` torch.library wrapper: ``compressor``,
+    ``indexer_prologue_k``, ``quant_lightning_indexer(_metadata)``,
+    ``quant_sparse_lightning_indexer(_metadata)`` and
+    ``mixed_quant_sparse_flash_mla(_metadata)``. Their keyword names are the
+    ``samples`` sources' parameters, which differ from the torch-op schemas.
 
-    `ds41` is NOT in `cann_ops_transformer.ops`'s static registration table, so
-    importing this module is also what registers the
-    `torch.ops.cann_ops_transformer.ds41.*` namespace (SMLA, mhc_post, the
-    `_metadata` variants). Call this once during backend init, before any
-    `torch.ops.cann_ops_transformer.ds41.*` use.
+    ``mixed_quant_sparse_flash_mla`` is the caller-allocated ABI: the caller
+    passes ``out``/``lse`` tensors. ``compressor`` is the one exception that is
+    NOT a DSL sample (it is an AOT AscendC extension inside ops-transformer), so
+    it goes through the registered ``torch.ops.cann_ops_transformer.ds41``
+    namespace -- importing this module is also what registers it. Call this
+    once during backend init, before any ``torch.ops`` use.
     """
-    from cann_ops_transformer.ops import ds41
+    from types import SimpleNamespace
 
-    return ds41
+    import cann_ops_transformer.ops.ds41  # noqa: F401 - registers torch.ops ds41
+    import ops
+    from ops.indexer_prologue_k import indexer_prologue_k
+    from ops.mixed_quant_sparse_flash_mla import (
+        mixed_quant_sparse_flash_mla,
+        mixed_quant_sparse_flash_mla_metadata,
+    )
+    from ops.quant_lightning_indexer_dsl import quant_lightning_indexer
+    from ops.quant_lightning_indexer_metadata_dsl import (
+        quant_lightning_indexer_metadata,
+    )
+    from ops.quant_sparse_lightning_indexer_dsl import quant_sparse_lightning_indexer
+    from ops.quant_sparse_lightning_indexer_metadata_dsl import (
+        quant_sparse_lightning_indexer_metadata,
+    )
+
+    return SimpleNamespace(
+        compressor=torch.ops.cann_ops_transformer.ds41.compressor,
+        indexer_prologue_k=indexer_prologue_k,
+        mixed_quant_sparse_flash_mla=mixed_quant_sparse_flash_mla,
+        mixed_quant_sparse_flash_mla_metadata=mixed_quant_sparse_flash_mla_metadata,
+        quant_lightning_indexer=quant_lightning_indexer,
+        quant_lightning_indexer_metadata=quant_lightning_indexer_metadata,
+        quant_sparse_lightning_indexer=quant_sparse_lightning_indexer,
+        quant_sparse_lightning_indexer_metadata=quant_sparse_lightning_indexer_metadata,
+    )
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -1319,20 +1348,22 @@ class LowRatioCompressAscendBackendMixin:
             w=w,
             descale_q=descale_q,
             descale_k=descale_k,
-            topk=topk,
-            quant_mode=1,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            cu_seqlens_k=None,
             seqused_q=None,
             seqused_k=(kv_lens // ratio).to(torch.int32),
             cmp_residual_k=(None if ratio == 1 else (kv_lens % ratio).to(torch.int32)),
             block_table=page_table.to(torch.int32),
+            output_idx_offset=None,
+            metadata=metadata,
+            topk=topk,
+            quant_mode=1,
             max_seqlen_q=-1,
             mask_mode=3,
             cmp_ratio=ratio,
             layout_q="TND",
             layout_k="PA_BBND",
             return_value=False,
-            metadata=metadata,
             # -1 leaves the operator's third and fourth returns empty.
             candidate_topk_blocks=indexer.candidate_topk_blocks if candidate else -1,
             candidate_block_size=indexer.candidate_block_size if candidate else -1,
@@ -1419,18 +1450,15 @@ class LowRatioCompressAscendBackendMixin:
         topk = self._dsv4_index_topk
         qsli_k = self._dsv41_qsli_cache(layer)
         indices, _ = _ds41_ops().quant_sparse_lightning_indexer(
-            q_packed,
+            q=q_packed,
             # QSLI takes the record rows without the singleton head axis.
-            qsli_k.squeeze(-2),
-            w,
-            descale_q,
-            candidate_indices,
-            candidate_lengths,
-            topk,
-            1,
-            indexer.candidate_block_size,
-            descale_k=None,
+            k=qsli_k.squeeze(-2),
+            w=w,
+            descale_q=descale_q,
+            candidate_block_indices=candidate_indices,
+            candidate_block_length=candidate_lengths,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            cu_seqlens_k=None,
             seqused_q=None,
             seqused_k=(self._dsv41_qli_kv_lens(forward_batch) // ratio).to(torch.int32),
             # Only mask_mode=3 with cmp_ratio != 1 needs it; consumers are
@@ -1439,6 +1467,9 @@ class LowRatioCompressAscendBackendMixin:
             block_table=page_table.to(torch.int32),
             output_idx_offset=None,
             metadata=metadata,
+            topk=topk,
+            candidate_block_size=indexer.candidate_block_size,
+            quant_mode=1,
             max_seqlen_q=-1,
             mask_mode=3,
             cmp_ratio=ratio,
@@ -1570,7 +1601,7 @@ class LowRatioCompressAscendBackendMixin:
             keep(
                 f"c{candidate_ratio}a_qsli_metadata",
                 ds41.quant_sparse_lightning_indexer_metadata(
-                    visible_blocks.to(torch.int32).view(-1, 1),
+                    candidate_block_length=visible_blocks.to(torch.int32).view(-1, 1),
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_q=None,
                     seqused_k=(kv_lens // candidate_ratio).to(torch.int32),
@@ -1721,8 +1752,8 @@ class LowRatioCompressAscendBackendMixin:
                 cmp_lengths = self._dsv41_cmp_topk_length(forward_batch, ratio)
             key = f"{attention_type}_metadata"
             metadata = ds41.mixed_quant_sparse_flash_mla_metadata(
-                win_lengths,
-                cmp_lengths,
+                ori_topk_length=win_lengths,
+                cmp_topk_length=cmp_lengths,
                 cu_seqlens_q=cu_seqlens_q,
                 num_heads_q=head_num,
                 num_heads_kv=1,
@@ -1820,7 +1851,11 @@ class LowRatioCompressAscendBackendMixin:
                     forward_batch, compress_ratio
                 ),
             )
-        attn_out, _lse = _ds41_ops().mixed_quant_sparse_flash_mla(q, **attn_kwargs)
+        # The DSL attention is caller-allocated: pass the output and the
+        # (unused, empty) softmax-lse tensors explicitly.
+        attn_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+        lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+        _ds41_ops().mixed_quant_sparse_flash_mla(q, out=attn_out, lse=lse, **attn_kwargs)
         return attn_out
 
     # ---- V4.1 metadata assembly ------------------------------------------------
@@ -2061,8 +2096,8 @@ class LowRatioCompressAscendBackendMixin:
         for ratio in (0, *self._dsv41_low_ratios()):
             attention_type = "win" if ratio == 0 else f"c{ratio}a"
             probe = ds41.mixed_quant_sparse_flash_mla_metadata(
-                metadata.dsv41_win_topk_length,
-                probe_cmp_lengths,
+                ori_topk_length=metadata.dsv41_win_topk_length,
+                cmp_topk_length=probe_cmp_lengths,
                 cu_seqlens_q=cu_seqlens_q,
                 num_heads_q=int(self._dsv4_q_head_num),
                 num_heads_kv=1,
@@ -2152,7 +2187,7 @@ class LowRatioCompressAscendBackendMixin:
             # Only the record count matters for the probe; replay rewrites it.
             visible_blocks = torch.ones((bs, 1), dtype=torch.int32, device=device)
             probe = ds41.quant_sparse_lightning_indexer_metadata(
-                visible_blocks,
+                candidate_block_length=visible_blocks,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_q=None,
                 seqused_k=local_cmp_lens,

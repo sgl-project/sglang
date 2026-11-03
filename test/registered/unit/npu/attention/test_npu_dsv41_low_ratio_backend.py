@@ -7,6 +7,7 @@ Everything here is pure device-agnostic torch arithmetic plus a stub for the
 ``ds41`` operator module, so the suite runs on CPU without an Ascend device.
 """
 
+import importlib.util
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -64,7 +65,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
 
 class _Ds41Stub(ModuleType):
-    """Stand-in for ``cann_ops_transformer.ops.ds41``.
+    """Stand-in for the entry points ``_ds41_ops`` returns.
 
     Only the two metadata entry points are exercised by these tests; both return
     a real int32 tensor so the graph-buffer ``torch.zeros_like`` probe works.
@@ -74,6 +75,7 @@ class _Ds41Stub(ModuleType):
         super().__init__("ds41_stub")
         self.mixed_quant_sparse_flash_mla = MagicMock(return_value=(None, None))
         self.quant_lightning_indexer = MagicMock(return_value=(None, None, None, None))
+        self.quant_sparse_lightning_indexer = MagicMock(return_value=(None, None))
         self.compressor = MagicMock()
         self.indexer_prologue_k = MagicMock()
 
@@ -85,6 +87,11 @@ class _Ds41Stub(ModuleType):
     @staticmethod
     def quant_lightning_indexer_metadata(*args, **kwargs):
         # QLI metadata is a fixed 1024 int32.
+        return torch.zeros(1024, dtype=torch.int32)
+
+    @staticmethod
+    def quant_sparse_lightning_indexer_metadata(*args, **kwargs):
+        # QSLI metadata is a fixed 1024 int32.
         return torch.zeros(1024, dtype=torch.int32)
 
 
@@ -2201,6 +2208,95 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         self.assertEqual(metadata.dsv41_win_topk_length.tolist(), [[0]] * 6)
         self.assertEqual(metadata.start_pos.tolist(), [0, 0])
         self.assertEqual(metadata.seqused.tolist(), [0, 0])
+
+
+class TestDs41DirectAbi(unittest.TestCase):
+    """The direct-call ABI of every entry point ``_ds41_ops`` exposes.
+
+    sglang calls the ``cannbot-arena-net`` (``ops``) functions directly, not
+    through the ``cann_ops_transformer`` torch.library wrapper, so a keyword
+    drift between the two would surface only on the A5 box. Guard each call
+    site's keyword set against the real signature when the wheel is available.
+    """
+
+    # keyword names each sglang call site passes, keyed by entry point
+    _CALL_SITES = {
+        "compressor": (
+            {"x", "wkv", "wgate", "seqused", "start_pos", "cmp_ratio",
+             "cu_seqlens", "state_cache", "state_block_table"},
+            "compressor is a torch.ops entry; kwargs match its schema",
+        ),
+        "indexer_prologue_k": (
+            {"latent", "wk", "norm_weight", "rope_sin", "rope_cos",
+             "k_cache", "k_scale_cache", "cache_index", "storage_mode",
+             "norm_eps", "combined_block_size"},
+            "DSL: samples/indexer_prologue_k/indexer_prologue_k.py",
+        ),
+        "quant_lightning_indexer": (
+            {"q", "k", "w", "descale_q", "descale_k", "cu_seqlens_q",
+             "cu_seqlens_k", "seqused_q", "seqused_k", "cmp_residual_k",
+             "block_table", "output_idx_offset", "metadata", "topk",
+             "quant_mode", "max_seqlen_q", "mask_mode", "cmp_ratio",
+             "layout_q", "layout_k", "return_value", "candidate_topk_blocks",
+             "candidate_block_size"},
+            "DSL: samples/quant_lightning_indexer_dsl",
+        ),
+        "quant_sparse_lightning_indexer": (
+            {"q", "k", "w", "descale_q", "candidate_block_indices",
+             "candidate_block_length", "cu_seqlens_q", "cu_seqlens_k",
+             "seqused_q", "seqused_k", "cmp_residual_k", "block_table",
+             "output_idx_offset", "metadata", "topk", "candidate_block_size",
+             "quant_mode", "max_seqlen_q", "mask_mode", "cmp_ratio",
+             "layout_q", "layout_k", "return_value"},
+            "DSL: samples/quant_sparse_lightning_indexer_dsl",
+        ),
+        "quant_lightning_indexer_metadata": (
+            {"cu_seqlens_q", "seqused_q", "seqused_k", "cmp_residual_k",
+             "batch_size", "num_heads_q", "num_heads_k", "head_dim", "topk",
+             "mask_mode", "cmp_ratio", "layout_q", "layout_k",
+             "candidate_topk_blocks", "candidate_block_size"},
+            "DSL: samples/quant_lightning_indexer_metadata_dsl",
+        ),
+        "quant_sparse_lightning_indexer_metadata": (
+            {"candidate_block_length", "cu_seqlens_q", "seqused_q",
+             "seqused_k", "cmp_residual_k", "batch_size", "num_heads_q",
+             "num_heads_k", "head_dim", "topk", "quant_mode",
+             "candidate_block_size", "mask_mode", "cmp_ratio", "layout_q",
+             "layout_k"},
+            "DSL: samples/quant_sparse_lightning_indexer_metadata_dsl",
+        ),
+        "mixed_quant_sparse_flash_mla": (
+            {"ori_kv", "cmp_kv", "ori_sparse_indices", "cmp_sparse_indices",
+             "ori_block_table", "cmp_block_table", "cu_seqlens_q",
+             "seqused_q", "seqused_ori_kv", "seqused_cmp_kv",
+             "ori_topk_length", "cmp_topk_length", "sinks", "metadata",
+             "quant_mode", "softmax_scale", "layout_q", "layout_kv",
+             "return_softmax_lse", "out", "lse"},
+            "DSL: samples/mixed_quant_sparse_flash_mla (caller-allocated out/lse)",
+        ),
+        "mixed_quant_sparse_flash_mla_metadata": (
+            {"ori_topk_length", "cmp_topk_length", "cu_seqlens_q",
+             "num_heads_q", "num_heads_kv", "head_dim", "quant_mode",
+             "layout_q", "layout_kv", "has_ori_kv", "has_cmp_kv"},
+            "DSL: samples/mixed_quant_sparse_flash_mla_metadata",
+        ),
+    }
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("ops") is not None
+        and importlib.util.find_spec("cann_ops_transformer") is not None,
+        "ds41 op wheels are unavailable on this host",
+    )
+    def test_call_site_keywords_exist_in_real_signatures(self):
+        import inspect
+
+        ds41_ops = dsv4_backend._ds41_ops()
+        for name, (kwargs, why) in self._CALL_SITES.items():
+            with self.subTest(operator=name):
+                fn = getattr(ds41_ops, name)
+                params = inspect.signature(fn).parameters
+                for kw in kwargs:
+                    self.assertIn(kw, params, f"{name}: {kw} ({why})")
 
 
 if __name__ == "__main__":
