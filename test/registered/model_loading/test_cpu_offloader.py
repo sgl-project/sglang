@@ -118,8 +118,9 @@ class TestCpuOffloader(CustomTestCase):
                 inputs = torch.randn((2, 4), dtype=torch.bfloat16, device=self.device)
                 expected = model(inputs)
                 offloader = OffloaderV1(cpu_offload_max_bytes=1024**2)
-                for name in offloaded:
-                    offloader.maybe_offload_to_cpu(getattr(model, name))
+                projections = [model.get_submodule(name) for name in offloaded]
+                for projection in projections:
+                    offloader.maybe_offload_to_cpu(projection)
 
                 with patch(
                     "sglang.srt.models.qwen3_5.get_lora",
@@ -129,8 +130,8 @@ class TestCpuOffloader(CustomTestCase):
 
                 self.assertIsNone(model._fused_in_proj_weight)
                 torch.testing.assert_close(model(inputs), expected)
-                for name in offloaded:
-                    self.assertEqual(getattr(model, name).weight.device.type, "cpu")
+                for projection in projections:
+                    self.assertEqual(projection.weight.device.type, "cpu")
 
     def test_cpu_offloaded_gemma_weight_fills_device_buffer(self) -> None:
         norm = GemmaRMSNorm(16).to(self.device)
