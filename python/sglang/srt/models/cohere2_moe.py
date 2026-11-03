@@ -183,7 +183,9 @@ class Cohere2MoeAttention(nn.Module):
         )
         sliding_window = getattr(config, "sliding_window", None)
         self.sliding_window_size = (
-            sliding_window if (self.is_sliding and sliding_window is not None) else -1
+            sliding_window - 1
+            if (self.is_sliding and sliding_window is not None)
+            else -1
         )
 
         self.rotary_emb = get_rope(

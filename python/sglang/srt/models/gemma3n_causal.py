@@ -406,7 +406,9 @@ class Gemma3nAttention(nn.Module):
                 ),
             )
 
-        self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.sliding_window = (
+            get_attention_sliding_window_size(config) if self.is_sliding else None
+        )
 
         self.attn = RadixAttention(
             self.num_heads,

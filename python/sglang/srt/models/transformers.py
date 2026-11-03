@@ -939,7 +939,7 @@ class TransformersBase(nn.Module):
                 and layer_types[idx] == "sliding_attention"
                 and global_sliding_window is not None
             ):
-                per_layer_sliding_window = global_sliding_window
+                per_layer_sliding_window = global_sliding_window - 1
 
             instances[idx] = RadixAttention(
                 num_heads=divide(num_heads, tp_size),

@@ -388,7 +388,7 @@ class ExaoneMoEAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
             sliding_window_size=(
-                config.sliding_window if self.sliding_window else None
+                config.sliding_window - 1 if self.sliding_window else None
             ),
         )
         self.layer_id = layer_id
