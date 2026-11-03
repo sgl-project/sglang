@@ -1380,6 +1380,19 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _extend_query(self, q: torch.Tensor, layer: RadixAttention) -> torch.Tensor:
+        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        # FA4 compiles Q with a dynamic row stride, 16-byte-aligned base and rows
+        # (to_cute_tensor), so a fused-QKV slice needs no copy; FA3 takes a dense Q.
+        if (
+            self.fa_impl_ver == 4
+            and q.stride(-1) == 1
+            and q.data_ptr() % 16 == 0
+            and q.stride(0) * q.element_size() % 16 == 0
+        ):
+            return q
+        return q.contiguous()
+
     def get_paged_mha_kv_cache(
         self,
         layer: RadixAttention,
@@ -1796,7 +1809,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 result = self.flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=self._extend_query(q, layer),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
