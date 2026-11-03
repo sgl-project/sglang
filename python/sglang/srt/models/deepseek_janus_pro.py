@@ -49,10 +49,11 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -2001,9 +2002,9 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         im_end_id = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]
 
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-
-        return helper.pad_input_tokens(input_ids, image_inputs)
+        return pad_mm_token_pairs(
+            input_ids, image_inputs, data_token_pairs=media_token_pairs
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

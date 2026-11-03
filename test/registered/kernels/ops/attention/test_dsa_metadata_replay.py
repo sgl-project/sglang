@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import build_pooled_page_table_64
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.dsa_metadata_kit import (
     BS,
@@ -56,7 +56,7 @@ class TestDSAMetadataReplay(CustomTestCase):
                     self.assertEqual(pointers, addresses(fused.forward_metadata))
                     if mode.is_target_verify():
                         metadata = fused.forward_metadata
-                        _, _, table, _ = IndexerKPool._get_kpool_decode_metadata(
+                        _, _, table, _, _ = IndexerKPool._get_kpool_decode_metadata(
                             SimpleNamespace(index_kpool=POOL),
                             SimpleNamespace(attn_metadata=metadata),
                             metadata.real_page_table,

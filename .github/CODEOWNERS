@@ -1,15 +1,18 @@
-.github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @HaiShaw @bingxche
+.github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @HaiShaw
+.github/workflows @bingxche @michaelzhang-ai
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211 @sogalin
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname @whybeyoung
+/docker/sgl-router.Dockerfile @sherlockwu @Kangyan-Zhou @ShangmingCai
 /docs @wisclmy0611 @zijiexia @sogalin
 /docs @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/kernels @DarkSharpness @HaiShaw @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/kernels/ops/diffusion @yingluosanqian @BBuf @mickqian @triple-mu @niehen6174
 /python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
+/python/sglang/kernels/ops/attention/linear @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/kernels/ops/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/kernels/jit/csrc/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
-/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174
+/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174 @JackZeng0208
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers/quantization/ @HaiShaw @BowenBao @OrangeRedeng @TallMessiWu
 /python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
@@ -21,7 +24,7 @@
 /python/sglang/srt/disaggregation/encoder @ShangmingCai @liusy58 @ZhengWG @gty111
 /python/sglang/srt/disaggregation/mori @Duyi-Wang @kkHuang-amd @HaiShaw @Lzy17 @billishyahao
 /python/sglang/srt/disaggregation/nixl @iyastreb @ovidiusm @lluki
-/python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
+/python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan @hubertlu-tw
 /python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py @ShangmingCai @stmatengss
 /python/sglang/srt/dllm @ClawSeven @btw616 @rwang5203
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
@@ -66,6 +69,7 @@
 /python/sglang/srt/models/deepseek_common @Fridge003 @ispobock @fzyzcjy @ch-wan
 /python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
 /python/sglang/srt/models/transformers.py @adarshxs
+/python/sglang/srt/monokernels @kevin-mii @HaiShaw @kkHuang-amd
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo @HaiShaw @yctseng0211
 /python/sglang/srt/observability @merrymercy @fzyzcjy @sufeng-buaa
 /python/sglang/srt/parser @JustinTong0323
@@ -80,8 +84,12 @@
 /rust/sglang-mm @sherlockwu @merrymercy
 /rust/sglang-processor @sagearc @sherlockwu
 /rust/sglang-radix-tree @Jialin @alphabetc1
-/rust/sglang-renderer @sagearc @rainj-me
 /rust/sglang-server @rainj-me @merrymercy
+/sgl-router @sherlockwu @Kangyan-Zhou @ShangmingCai @hzh0425
+/sgl-router/sgl-kv-indexer @sherlockwu @lixiufei-leo @ShangmingCai @wuyl1 @hzh0425
+/sgl-router/src/policies @sherlockwu @ShangmingCai @Bo-Vincent
+/sgl-router/src/workers @sherlockwu @AMD-yanfeiwang
+/sgl-router/src/protocol @sherlockwu @whybeyoung
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
@@ -108,7 +116,10 @@
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl @pyc96
 /python/sglang/kernels/ops/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/kernels/ops/embeddings/ngram_embedding.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator
 /tools/sglang-simulator @littlefatfat @hzh0425 @zhuzi-z @LinSiyuan814
+/python/sglang/kernels/**/paged_experts.* @N3mezis @BBuf
+/python/sglang/srt/layers/moe/paged_experts/ @N3mezis @BBuf

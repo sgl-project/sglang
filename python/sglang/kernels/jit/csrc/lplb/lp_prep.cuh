@@ -147,13 +147,13 @@ void lp_prep(
   using namespace host;
 
   SymbolicDevice device_;
-  TensorMatcher({NC, NV}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(A_full);
-  TensorMatcher({NC}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(b);
-  TensorMatcher({NUM_SINGLE}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(t1);
-  TensorMatcher({NUM_SINGLE}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(log_single);
-  TensorMatcher({NUM_RED_LOG}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(log_replicated);
-  TensorMatcher({NUM_GPUS, NUM_SINGLE}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(B1);
-  TensorMatcher({NC}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(A_base_row_sum);
+  TensorMatcher({NC, NV}).with_dtype<float>().with_device<kDLGPU>(device_).verify(A_full);
+  TensorMatcher({NC}).with_dtype<float>().with_device<kDLGPU>(device_).verify(b);
+  TensorMatcher({NUM_SINGLE}).with_dtype<float>().with_device<kDLGPU>(device_).verify(t1);
+  TensorMatcher({NUM_SINGLE}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(log_single);
+  TensorMatcher({NUM_RED_LOG}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(log_replicated);
+  TensorMatcher({NUM_GPUS, NUM_SINGLE}).with_dtype<float>().with_device<kDLGPU>(device_).verify(B1);
+  TensorMatcher({NC}).with_dtype<float>().with_device<kDLGPU>(device_).verify(A_base_row_sum);
 
   constexpr int WARPS_PER_BLOCK = BLOCK_DIM / 32;
   const size_t smem_bytes = (NUM_SINGLE + NUM_RED_LOG + WARPS_PER_BLOCK + 1) * sizeof(float);

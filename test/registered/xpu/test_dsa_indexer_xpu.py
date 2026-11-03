@@ -39,7 +39,8 @@ from sglang.srt.layers.attention.dsa_backend import (
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
@@ -388,7 +389,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — extend mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_extend_mode(self, mock_act_quant):
         """Indexer forward in EXTEND mode calls sgl_kernel.fp8_mqa_logits on XPU."""
 
@@ -444,7 +445,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — decode mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_decode_mode(self, mock_act_quant):
         """Indexer forward in DECODE mode calls sgl_kernel.fp8_paged_mqa_logits on XPU."""
 

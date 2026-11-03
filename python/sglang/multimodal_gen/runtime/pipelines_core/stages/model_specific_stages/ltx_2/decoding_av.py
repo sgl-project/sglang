@@ -109,6 +109,44 @@ class LTX2AVDecodingStage(DecodingStage):
             latents, server_args, vae=module
         )
 
+    def _postprocess_video(self, video: torch.Tensor):
+        if not video.is_cuda:
+            return self.video_processor.postprocess_video(video, output_type="np")
+        batch_size, channels, num_frames, height, width = video.shape
+        try:
+            host = torch.empty(
+                (batch_size, num_frames, height, width, channels),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+        except RuntimeError:
+            return self.video_processor.postprocess_video(video.cpu(), output_type="np")
+
+        # Bound each FP32 conversion to 64 MiB (or one frame), independently
+        # of clip length and batch size. Normalize in the source dtype first.
+        chunk_frames = max(1, (64 * 1024 * 1024) // (channels * height * width * 4))
+        stream = torch.cuda.current_stream(video.device)
+        try:
+            for batch_idx in range(batch_size):
+                for start in range(0, num_frames, chunk_frames):
+                    end = min(start + chunk_frames, num_frames)
+                    frames = self.video_processor.postprocess_video(
+                        video[batch_idx : batch_idx + 1, :, start:end], output_type="pt"
+                    )
+                    frames = (
+                        frames[0]
+                        .permute(0, 2, 3, 1)
+                        .to(dtype=torch.float32, memory_format=torch.contiguous_format)
+                    )
+                    host[batch_idx, start:end].copy_(frames, non_blocking=True)
+        except torch.cuda.OutOfMemoryError:
+            stream.synchronize()
+            host = None
+            return self.video_processor.postprocess_video(video.cpu(), output_type="np")
+        stream.synchronize()
+        return host.numpy()
+
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
         output_batch = OutputBatch(
@@ -161,9 +199,7 @@ class LTX2AVDecodingStage(DecodingStage):
             or not model_parallel_is_initialized()
             or get_replica_group().rank_in_group == 0
         ):
-            output_batch.output = self.video_processor.postprocess_video(
-                video, output_type="np"
-            )
+            output_batch.output = self._postprocess_video(video)
         if not audio_first:
             self._decode_audio(batch, server_args, output_batch)
         return output_batch
