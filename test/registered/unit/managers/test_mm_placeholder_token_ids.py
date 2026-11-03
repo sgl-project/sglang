@@ -1,0 +1,250 @@
+"""Unit tests for the token ids embed_mm_inputs leaves at multimodal positions.
+
+The scheduler fills the multimodal positions of input_ids with per-item pad values
+(MM_PAD_SHIFT_VALUE + hash sentinels, above any vocab) so the radix cache can key
+images. embed_mm_inputs works in place on that tensor, which is
+forward_batch.input_ids, and models can read it again after the embedding: Qwen4-Exp's
+per-layer N-gram embedding hashes token N-grams of it. Each modality's placeholder
+token id (im_token_id / video_token_id) must replace its pad values there, as in the
+HF reference, on both the plain and the adaptive-dispatch split path. Embeddings and
+the host-side key ids keep their values.
+
+CPU-only: no engine, GPU or weights.
+"""
+
+import sys
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from sglang.srt.managers import mm_schedule, mm_utils
+from sglang.srt.managers.req_types import (
+    MM_PAD_SHIFT_VALUE,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+VOCAB = 64
+HIDDEN = 8
+IMAGE_TOKEN_ID = 41
+VIDEO_TOKEN_ID = 42
+# Two items per request; (start, end) offsets are inclusive, as processors emit them.
+OFFSETS = [(3, 6), (10, 12)]
+SEQ_LEN = 16
+
+
+@pytest.fixture(autouse=True)
+def single_process_runtime_context():
+    # The embedding path reads the config namespaces and the attention-TP rank.
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    try:
+        with get_parallel().override(attn_tp_rank=0, attn_tp_size=1, tp_size=1):
+            yield
+    finally:
+        override.restore()
+
+
+@pytest.fixture(autouse=True)
+def cpu_embedding_cache():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+
+
+def _feature(item: MultimodalDataItem) -> torch.Tensor:
+    start, end = item.offsets[0]
+    gen = torch.Generator().manual_seed(item.hash)
+    return torch.randn(end - start + 1, HIDDEN, generator=gen)
+
+
+class _FakeVLM:
+    def get_image_feature(self, items):
+        return torch.cat([_feature(item) for item in items], dim=0)
+
+    def get_video_feature(self, items):
+        return torch.cat([_feature(item) for item in items], dim=0)
+
+
+def _request(
+    req_seed,
+    im_token_id,
+    modalities=(Modality.IMAGE, Modality.IMAGE),
+    video_token_id=None,
+    precomputed=False,
+):
+    """One request: text ids < VOCAB, item runs filled with their items' pad values.
+
+    Returns (mm_inputs, host key ids, multimodal positions per modality).
+    """
+    items = []
+    for i, (offset, modality) in enumerate(zip(OFFSETS, modalities)):
+        item = MultimodalDataItem(
+            modality=modality, feature=torch.zeros(1), offsets=[offset]
+        )
+        item.set_hash(1_000 * req_seed + 7 * i + 1)
+        if precomputed:
+            item.precomputed_embeddings = _feature(item)
+        items.append(item)
+    gen = torch.Generator().manual_seed(req_seed)
+    ids = torch.randint(0, VOCAB, (SEQ_LEN,), generator=gen)
+    positions = {m: torch.zeros(SEQ_LEN, dtype=torch.bool) for m in Modality.all()}
+    for item in items:
+        start, end = item.offsets[0]
+        ids[start : end + 1] = torch.tensor(item.padding_sequence(end - start + 1))
+        positions[item.modality][start : end + 1] = True
+    mm_inputs = MultimodalInputs(
+        mm_items=items, im_token_id=im_token_id, video_token_id=video_token_id
+    )
+    return mm_inputs, ids, positions
+
+
+def _embedding():
+    torch.manual_seed(0)
+    return nn.Embedding(VOCAB, HIDDEN)
+
+
+def _embed(mm_inputs_list, input_ids, prefix_lens, seq_lens):
+    embedding = _embedding()
+    embeds, _ = mm_utils.embed_mm_inputs(
+        mm_inputs_list=mm_inputs_list,
+        extend_prefix_lens=prefix_lens,
+        extend_seq_lens=seq_lens,
+        input_ids=input_ids,
+        input_embedding=embedding,
+        multimodal_model=_FakeVLM(),
+    )
+    return embeds, embedding
+
+
+def _expected_embeds(mm_inputs_list, host_ids, embedding):
+    """Token embeddings, with each item's feature over its run."""
+    expected = embedding(host_ids.clamp(0, VOCAB - 1)).clone()
+    for r, mm in enumerate(mm_inputs_list):
+        for item in mm.mm_items:
+            start, end = item.offsets[0]
+            expected[r * SEQ_LEN + start : r * SEQ_LEN + end + 1] = _feature(item)
+    return expected
+
+
+def test_pad_values_are_out_of_vocab():
+    _, ids, positions = _request(1, IMAGE_TOKEN_ID)
+    assert bool((ids[positions[Modality.IMAGE]] >= MM_PAD_SHIFT_VALUE).all())
+
+
+@pytest.mark.parametrize("num_requests", [1, 2])
+def test_placeholder_token_id_written_in_place(num_requests):
+    reqs = [_request(seed, IMAGE_TOKEN_ID) for seed in range(1, num_requests + 1)]
+    mm_inputs_list = [mm for mm, _, _ in reqs]
+    host_ids = torch.cat([ids for _, ids, _ in reqs])
+    image_positions = torch.cat([pos[Modality.IMAGE] for _, _, pos in reqs])
+    input_ids = host_ids.clone()  # forward_batch.input_ids, copied from the host ids
+
+    embeds, embedding = _embed(
+        mm_inputs_list, input_ids, [0] * num_requests, [SEQ_LEN] * num_requests
+    )
+
+    assert bool((input_ids[image_positions] == IMAGE_TOKEN_ID).all())
+    assert torch.equal(input_ids[~image_positions], host_ids[~image_positions])
+    # The host key ids (radix / prefix keys) keep their pad values.
+    assert bool((host_ids[image_positions] >= MM_PAD_SHIFT_VALUE).all())
+    torch.testing.assert_close(
+        embeds, _expected_embeds(mm_inputs_list, host_ids, embedding), rtol=0, atol=0
+    )
+
+
+def test_image_and_video_get_their_own_placeholder():
+    mm, host_ids, positions = _request(
+        5,
+        IMAGE_TOKEN_ID,
+        modalities=(Modality.IMAGE, Modality.VIDEO),
+        video_token_id=VIDEO_TOKEN_ID,
+    )
+    input_ids = host_ids.clone()
+
+    embeds, embedding = _embed([mm], input_ids, [0], [SEQ_LEN])
+
+    assert bool((input_ids[positions[Modality.IMAGE]] == IMAGE_TOKEN_ID).all())
+    assert bool((input_ids[positions[Modality.VIDEO]] == VIDEO_TOKEN_ID).all())
+    mm_positions = positions[Modality.IMAGE] | positions[Modality.VIDEO]
+    assert torch.equal(input_ids[~mm_positions], host_ids[~mm_positions])
+    torch.testing.assert_close(
+        embeds, _expected_embeds([mm], host_ids, embedding), rtol=0, atol=0
+    )
+
+
+def test_chunk_boundary_inside_an_image():
+    # Second chunk of a chunked prefill: it starts inside the first image.
+    mm, ids, positions = _request(3, IMAGE_TOKEN_ID)
+    prefix = 5
+    chunk = ids[prefix:].clone()
+    chunk_positions = positions[Modality.IMAGE][prefix:]
+
+    embeds, _ = _embed([mm], chunk, [prefix], [SEQ_LEN - prefix])
+
+    assert bool((chunk[chunk_positions] == IMAGE_TOKEN_ID).all())
+    assert torch.equal(chunk[~chunk_positions], ids[prefix:][~chunk_positions])
+    full = _FakeVLM().get_image_feature(mm.mm_items)
+    torch.testing.assert_close(
+        embeds[chunk_positions], full[prefix - OFFSETS[0][0] :], rtol=0, atol=0
+    )
+
+
+def test_without_placeholder_token_id_falls_back_to_clamp():
+    mm, ids, positions = _request(4, None)
+    image_positions = positions[Modality.IMAGE]
+    input_ids = ids.clone()
+
+    embeds, _ = _embed([mm], input_ids, [0], [SEQ_LEN])
+
+    assert bool((input_ids[image_positions] == VOCAB - 1).all())
+    assert torch.equal(input_ids[~image_positions], ids[~image_positions])
+    torch.testing.assert_close(
+        embeds[image_positions],
+        _FakeVLM().get_image_feature(mm.mm_items),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_split_path_mixed_precomputed():
+    # Adaptive encoder dispatch embeds a torch.cat copy per group; input_ids must
+    # still end up with the placeholder ids.
+    reqs = [
+        _request(6, IMAGE_TOKEN_ID, precomputed=True),
+        _request(7, IMAGE_TOKEN_ID, precomputed=False),
+    ]
+    mm_inputs_list = [mm for mm, _, _ in reqs]
+    host_ids = torch.cat([ids for _, ids, _ in reqs])
+    image_positions = torch.cat([pos[Modality.IMAGE] for _, _, pos in reqs])
+    input_ids = host_ids.clone()
+    forward_batch = SimpleNamespace(
+        extend_seq_lens_cpu=[SEQ_LEN, SEQ_LEN], mm_inputs=mm_inputs_list
+    )
+    embedding = _embedding()
+
+    embeds, _ = mm_utils._embed_mm_inputs_with_split(
+        mm_inputs_list=mm_inputs_list,
+        extend_prefix_lens=[0, 0],
+        extend_seq_lens=[SEQ_LEN, SEQ_LEN],
+        input_ids=input_ids,
+        forward_batch=forward_batch,
+        input_embedding=embedding,
+        multimodal_model=_FakeVLM(),
+    )
+
+    assert bool((input_ids[image_positions] == IMAGE_TOKEN_ID).all())
+    assert torch.equal(input_ids[~image_positions], host_ids[~image_positions])
+    assert bool((host_ids[image_positions] >= MM_PAD_SHIFT_VALUE).all())
+    torch.testing.assert_close(
+        embeds, _expected_embeds(mm_inputs_list, host_ids, embedding), rtol=0, atol=0
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

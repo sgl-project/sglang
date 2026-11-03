@@ -438,6 +438,29 @@ def _scatter_mm_embedding(
     dest.index_copy_(0, rows[:num_src_rows], src)
 
 
+def _fill_mm_placeholder_token_ids(
+    input_ids: torch.Tensor,
+    mm_inputs_list: List[MultimodalInputs],
+    modalities: List[Modality],
+    masks: List[Optional[torch.Tensor]],
+) -> None:
+    """Write each modality's placeholder token id over its pad values, in place."""
+    for modality, mask in zip(modalities, masks):
+        if mask is None:
+            continue
+        token_ids = (
+            {
+                Modality.IMAGE: mm_inputs.im_token_id,
+                Modality.VIDEO: mm_inputs.video_token_id,
+                Modality.AUDIO: mm_inputs.audio_token_id,
+            }[modality]
+            for mm_inputs in mm_inputs_list
+        )
+        token_id = next((t for t in token_ids if t is not None), None)
+        if token_id is not None:
+            input_ids.masked_fill_(mask.view(input_ids.shape), token_id)
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -546,6 +569,10 @@ def embed_mm_inputs(
             masks += [mask]
 
     # 3. Get input embeddings
+    # Models can read input_ids again after this routine (e.g. Qwen4-Exp's per-layer
+    # N-gram embedding hashes it), so multimodal positions get their placeholder token
+    # id, as in the HF reference, rather than the clamped pad value.
+    _fill_mm_placeholder_token_ids(input_ids, mm_inputs_list, modalities, masks)
     vocab_size = input_embedding.num_embeddings
     # Important: clamp after getting original multimodal regions
     # Clamp input ids. This is because the input_ids for the multimodal tokens are
@@ -675,6 +702,10 @@ def _embed_mm_inputs_with_split(
             req_len = all_seq_lens[bi]
             start = token_starts[bi]
             input_embeds[start : start + req_len] = sub_embeds[
+                offset : offset + req_len
+            ]
+            # embed_mm_inputs rewrote the torch.cat copy; mirror it into input_ids.
+            input_ids[start : start + req_len] = sub_input_ids[
                 offset : offset + req_len
             ]
             if (
