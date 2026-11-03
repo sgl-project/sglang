@@ -2506,56 +2506,6 @@ def attach_hybrid_pool_to_unified_cache(
         raise
 
 
-def _nvfp4_main_host_size(
-    *, params: CacheInitParams, main_pool: Any, index_pool: Any
-) -> float:
-    """The --hicache-size share of NVFP4 main KV once index and drafts are paid."""
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
-
-    memory = get_memory()
-    if memory.hicache_io_backend not in ("kernel", "direct"):
-        raise ValueError("M3.1 NVFP4 HiCache requires kernel or direct IO")
-    if memory.hicache_mem_layout not in (
-        "layer_first",
-        "page_first",
-        "page_first_direct",
-    ):
-        raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
-    main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
-    index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
-    draft_bytes = 0
-    for draft_pool in params.sidecar_draft_device_pools:
-        if (
-            type(draft_pool) is not MHATokenToKVPool
-            or draft_pool.size != main_pool.size
-            or draft_pool.page_size != params.page_size
-            or draft_pool.start_layer != 0
-            or draft_pool.layer_num > main_pool.layer_num
-        ):
-            raise ValueError(
-                "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
-                "token capacity/page size and at most as many layers as the target"
-            )
-        draft_bytes += sum(draft_pool.get_kv_size_bytes()) / (
-            draft_pool.size + draft_pool.page_size
-        )
-    total_bytes = main_bytes + index_bytes + draft_bytes
-    # --hicache-size covers main KV, index payload/scales and draft sidecars.
-    host_size = memory.hicache_size * main_bytes / total_bytes
-    slots = (
-        int(host_size * 1e9 // main_bytes)
-        if host_size > 0
-        else int(main_pool.size * memory.hicache_ratio)
-    )
-    slots = (slots // params.page_size + 1) * params.page_size
-    if slots * total_bytes > host_memory_budget_bytes():
-        raise ValueError(
-            "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
-        )
-    return host_size
-
-
 def build_minimax_sparse_hicache_stack(
     *,
     params: CacheInitParams,
@@ -2571,6 +2521,7 @@ def build_minimax_sparse_hicache_stack(
     from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
         MiniMaxM3Nvfp4IndexKPoolHost,
         MiniMaxM3Nvfp4MainKVPoolHost,
+        nvfp4_main_host_size,
     )
 
     # PP>1 stays gated pending end-to-end validation of the sparse host path.
@@ -2600,8 +2551,12 @@ def build_minimax_sparse_hicache_stack(
         kv_host_pool = MiniMaxM3Nvfp4MainKVPoolHost(
             main_info.buffer_info,
             memory.hicache_ratio,
-            _nvfp4_main_host_size(
-                params=params, main_pool=main_pool, index_pool=index_k_pool
+            nvfp4_main_host_size(
+                memory=memory,
+                main_pool=main_pool,
+                index_pool=index_k_pool,
+                draft_pools=params.sidecar_draft_device_pools,
+                page_size=params.page_size,
             ),
             params.page_size,
             memory.hicache_mem_layout,
