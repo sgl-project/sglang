@@ -34,7 +34,12 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    _RequestList,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -482,8 +487,10 @@ class _FakeIdxAllocator:
 
 def _make_queue(timeout=30.0, enable_metrics=False):
     q = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    q._deferred_releases = []
-    q.queue = []
+    q._deferred_releases = _RequestList(
+        ListKind.PD_RELEASING, req_of=lambda x: x[0].req
+    )
+    q.queue = _RequestList(ListKind.PD_RECEIVING, req_of=lambda x: x.req)
     q.gloo_group = dist.group.WORLD
     q.tp_rank = 0
     q.enable_deferred_kv_release = True
@@ -523,7 +530,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         clear=lambda: None,
     )
     return SimpleNamespace(
-        req=SimpleNamespace(bootstrap_room=room, rid=str(room), return_logprob=False),
+        req=FakeReq(bootstrap_room=room, rid=str(room), return_logprob=False),
         host_staged=False,
         hicache_restore_status=HiCacheRestoreResult.READY,
         prefix_match=None,
@@ -556,11 +563,11 @@ class TestResolveDeferredReleases(CustomTestCase):
         # ABORT was sent before metadata, so this rank has no ack generation.
         # A peer that already published still makes every rank retain capacity.
         queue._defer_release(entry)
-        self.assertEqual(queue._deferred_releases[0][-1], 0)
+        self.assertEqual(list(queue._deferred_releases.items())[0][-1], 0)
         with patch.object(decode_mod, "release_kv_cache") as release:
             queue.resolve_deferred_releases()
         release.assert_called_once_with(entry.req, queue.tree_cache, checkpoint=False)
-        self.assertEqual(queue._deferred_releases, [])
+        self.assertEqual(list(queue._deferred_releases.items()), [])
         self.assertEqual(queue.req_to_metadata_buffer_idx_allocator.freed, [7])
 
     def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
@@ -594,7 +601,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             mgr.note_abort_ack(1, 0, generations[1])
             q.resolve_deferred_releases()
             self.assertEqual(discard.call_count, 2)
-            self.assertEqual(q._deferred_releases, [])
+            self.assertEqual(list(q._deferred_releases.items()), [])
             device_release.assert_not_called()
 
     def test_holds_until_drained_then_releases(self):
@@ -629,7 +636,7 @@ class TestResolveDeferredReleases(CustomTestCase):
                 rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
         # Held state fully cleaned up.
-        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(q.num_pending_deferred_releases(), 0)
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertEqual(q.metadata_buffers.bootstrap_room[idx], 0)
@@ -646,7 +653,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         q = _make_queue(timeout=30.0, enable_metrics=True)
         dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=1)
         # Force an already-expired deadline (no ack will ever arrive).
-        q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
+        q._deferred_releases.join([(dreq, 10.0, float("-inf"), idx, 1)])
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=42.0),
@@ -655,7 +662,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             q.resolve_deferred_releases()
             rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
-        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertIsNone(dreq.kv_receiver)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
@@ -671,8 +678,8 @@ class TestResolveDeferredReleases(CustomTestCase):
         good = _make_decode_req(700, 1, mgr)
         bad = _make_decode_req(701, 2, mgr)
         # Both already past deadline -> both selected for release.
-        q._deferred_releases.append((bad, 10.0, float("-inf"), 2, 1))
-        q._deferred_releases.append((good, 10.0, float("-inf"), 1, 1))
+        q._deferred_releases.join([(bad, 10.0, float("-inf"), 2, 1)])
+        q._deferred_releases.join([(good, 10.0, float("-inf"), 1, 1)])
 
         calls = []
 
@@ -689,7 +696,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             # The good one still released despite the bad one throwing.
             self.assertIn(good.req, calls)
             # Nothing left held, and a second call is a clean no-op (no retry).
-            self.assertEqual(q._deferred_releases, [])
+            self.assertEqual(list(q._deferred_releases.items()), [])
             q.resolve_deferred_releases()
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_has_calls(
             [
@@ -705,7 +712,9 @@ class TestResolveDeferredReleases(CustomTestCase):
         with patch.object(decode_mod.time, "monotonic", return_value=5.0):
             q._defer_release(dreq)
         self.assertEqual(len(q._deferred_releases), 1)
-        held_req, start_time, deadline, held_idx, required = q._deferred_releases[0]
+        held_req, start_time, deadline, held_idx, required = list(
+            q._deferred_releases.items()
+        )[0]
         self.assertIs(held_req, dreq)
         self.assertEqual(start_time, 5.0)
         self.assertEqual(deadline, 17.5)
@@ -798,7 +807,7 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
             if not receiver.abort_notified:
                 receiver.bootstrap_infos = None
             generation = mgr.register_deferred_abort_room(43)
-            q.queue = [dreq]
+            q.queue.join([dreq])
             with (
                 patch.object(decode_mod, "prepare_abort"),
                 patch.object(decode_mod, "release_kv_cache"),
@@ -866,7 +875,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
     receiver.force_arm_calls = []
     receiver.ensure_abort_notified = ensure
     return SimpleNamespace(
-        req=SimpleNamespace(bootstrap_room=room, rid=f"r{room}", return_logprob=False),
+        req=FakeReq(bootstrap_room=room, rid=f"r{room}", return_logprob=False),
         kv_receiver=receiver,
         metadata_buffer_index=idx,
         hicache_restore_status=None,
@@ -900,7 +909,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         mgr.enable_deferred_decode_kv_release = True
         q = _make_pop_queue(mgr)
         entry = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
-        q.queue = [entry]
+        q.queue.join([entry])
 
         released = self._pop(q)
 
@@ -912,7 +921,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(len(q._deferred_releases), 1)
         # Metadata slot stays owned by the hold until resolve time.
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
-        self.assertEqual(q.queue, [])
+        self.assertEqual(list(q.queue.items()), [])
 
     def test_unnotifiable_failure_releases_immediately(self):
         # Metadata never published: no prefill holds this destination, so no
@@ -923,12 +932,12 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         entry = _make_failed_req(
             mgr, room=8, idx=4, abort_notified=False, notifiable=False
         )
-        q.queue = [entry]
+        q.queue.join([entry])
 
         released = self._pop(q)
 
         self.assertEqual(released, [entry])
-        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [4])
 
     def test_failure_before_deferred_publish_releases_immediately(self):
@@ -939,7 +948,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         q = _make_pop_queue(mgr)
         entry = _make_failed_req(mgr, room=10, idx=6, abort_notified=False)
         entry.awaiting_publish = True
-        q.queue = [entry]
+        q.queue.join([entry])
         # Under prefill_complete, clear() of a failed receiver that decode did not
         # abort notifies prefill and arms drain tracking no ACK will resolve.
         entry.kv_receiver.clear = lambda: mgr.register_deferred_abort_room(10)
@@ -947,7 +956,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         released = self._pop(q)
 
         self.assertEqual(released, [entry])
-        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [6])
         self.assertNotIn(10, mgr._deferred_abort_ack_tracker)
 
@@ -968,7 +977,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         for entry in (held, sent, queued):
             entry.kv_receiver.send_metadata = MagicMock()
         held_receiver = held.kv_receiver  # the release path nulls entry.kv_receiver
-        q.queue = [held, sent, queued]
+        q.queue.join([held, sent, queued])
         q._poll_with_metadata_gate = lambda: [
             KVPoll.Failed,
             KVPoll.Failed,
@@ -980,12 +989,12 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         held_receiver.send_metadata.assert_not_called()
         queued.kv_receiver.send_metadata.assert_called_once_with("queued")
         self.assertIsNone(queued.pending_metadata)
-        self.assertEqual(q.queue, [queued])
+        self.assertEqual(list(q.queue.items()), [queued])
         self.assertEqual(released, [held])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3])
         required_acks = {
             entry.req.bootstrap_room: acks
-            for entry, _, _, _, acks in q._deferred_releases
+            for entry, _, _, _, acks in q._deferred_releases.items()
         }
         self.assertEqual(required_acks, {8: 2})
 
@@ -1008,7 +1017,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
             entry.kv_receiver.send_metadata = MagicMock()
         aborted_receiver = aborted.kv_receiver
         pending = aborted.pending_metadata
-        q.queue = [concluded, aborted, queued]
+        q.queue.join([concluded, aborted, queued])
         q._poll_with_metadata_gate = lambda: [
             KVPoll.Failed,
             KVPoll.Failed,
@@ -1018,7 +1027,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         with patch.object(decode_mod, "prepare_abort"):
             q.pop_transferred_with_outcomes({concluded.req.rid: True})
 
-        self.assertEqual(q.queue, [aborted, queued])
+        self.assertEqual(list(q.queue.items()), [aborted, queued])
         self.assertEqual(released, [concluded])
         aborted_receiver.send_metadata.assert_not_called()
         self.assertIs(aborted.pending_metadata, pending)
@@ -1032,9 +1041,9 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
             q.pop_transferred_with_outcomes({aborted.req.rid: True})
 
         self.assertEqual(released, [concluded, aborted])
-        self.assertEqual(q.queue, [queued])
+        self.assertEqual(list(q.queue.items()), [queued])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3, 4])
-        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(mgr._deferred_abort_ack_tracker, {})
         aborted_receiver.send_metadata.assert_not_called()
         queued.kv_receiver.send_metadata.assert_called_once_with("queued")
@@ -1045,13 +1054,13 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         q = _make_pop_queue(mgr)
         entry = _make_failed_req(mgr, room=9, idx=5, abort_notified=False)
         receiver = entry.kv_receiver  # the release path nulls entry.kv_receiver
-        q.queue = [entry]
+        q.queue.join([entry])
 
         released = self._pop(q)
 
         self.assertFalse(receiver.abort_notified)
         self.assertEqual(released, [entry])
-        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(list(q._deferred_releases.items()), [])
 
 
 class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
@@ -1089,7 +1098,7 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
         mgr = _make_manager()
         log = []
         q = self._queue(mgr, log)
-        q.queue = [_make_failed_req(mgr, room=12, idx=6, abort_notified=False)]
+        q.queue.join([_make_failed_req(mgr, room=12, idx=6, abort_notified=False)])
 
         at_failure = self._pop_and_resolve(q, mgr, 12, log)
 
@@ -1100,11 +1109,13 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
         mgr = _make_manager()
         log = []
         q = self._queue(mgr, log)
-        q.queue = [
-            _make_failed_req(
-                mgr, room=13, idx=7, abort_notified=False, notifiable=False
-            )
-        ]
+        q.queue.join(
+            [
+                _make_failed_req(
+                    mgr, room=13, idx=7, abort_notified=False, notifiable=False
+                )
+            ]
+        )
 
         at_failure = self._pop_and_resolve(q, mgr, 13, log)
 

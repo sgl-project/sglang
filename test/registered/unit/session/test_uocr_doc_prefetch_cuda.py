@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers import mm_schedule
 from sglang.srt.models.unlimited_ocr_v2_support import document_prefetch as p
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -28,9 +29,10 @@ class TestEarlyEncode(CustomTestCase):
             device=device,
             forward_stream=torch.cuda.Stream(device),
             tp_size=1,
+            abort_windows=None,
         )
         item = SimpleNamespace(hash=7, feature=torch.ones(3, 4), offsets=[(2, 4)])
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="w1",
             sampling_params=SimpleNamespace(
                 custom_params={p.KEY_AFTER: "w0", p.KEY_BUDGET: 10},
