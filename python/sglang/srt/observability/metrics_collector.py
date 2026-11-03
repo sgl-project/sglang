@@ -2183,9 +2183,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_frontend_request_timing(self, durations: Dict[str, float]):
         for stage in ("total", "text", "multimodal"):
-            self.histogram_frontend_request.labels(**self.labels, stage=stage).observe(
-                durations.get(stage, 0.0)
-            )
+            if stage in durations:
+                self.histogram_frontend_request.labels(**self.labels, stage=stage).observe(
+                    durations[stage]
+                )
 
     def observe_time_to_first_token(
         self, labels: Dict[str, str], value: float, *, stream: bool

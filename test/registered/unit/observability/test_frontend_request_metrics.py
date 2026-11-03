@@ -10,7 +10,7 @@ import unittest
 from collections import OrderedDict
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, multiprocess
 from sglang.test.test_utils import (
@@ -29,6 +29,7 @@ from sglang.srt.observability.frontend_request_timing import (
     FrontendRequestTiming,
     bind_frontend_timing,
     current_frontend_timing,
+    measure_frontend_stage,
 )
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -158,6 +159,99 @@ class TestFrontendRequestMetrics(CustomTestCase):
             "sglang:tokenizer_encode_seconds", {m.name for m in self.registry.collect()}
         )
 
+    def test_unused_stages_do_not_dilute_participating_request_histograms(self):
+        manager = self.manager()
+        manager.enable_metrics = True
+        manager.rid_to_state = {}
+        for i in range(10):
+            timing = FrontendRequestTiming(started_at=10.0)
+            if i >= 8:
+                timing.add_span("text", 10.1, 10.5)
+                timing.add_span("multimodal", 10.1, 10.5)
+            manager.rid_to_state[str(i)] = SimpleNamespace(
+                obj=SimpleNamespace(_frontend_request_timing=timing)
+            )
+            manager._observe_frontend_request(str(i), 11.0)
+        for stage, count, duration in [
+            ("total", 10, 10.0),
+            ("text", 2, 0.8),
+            ("multimodal", 2, 0.8),
+        ]:
+            labels = {**self.collector.labels, "stage": stage}
+            self.assertEqual(
+                self.registry.get_sample_value(_METRIC + "_count", labels), count
+            )
+            self.assertAlmostEqual(
+                self.registry.get_sample_value(_METRIC + "_sum", labels), duration
+            )
+            self.assertEqual(
+                self.registry.get_sample_value(
+                    _METRIC + "_bucket", {**labels, "le": "0.001"}
+                ),
+                0,
+            )
+
+    def test_executed_zero_duration_stages_are_observed(self):
+        timing = FrontendRequestTiming(started_at=0.0)
+        with patch(_CLOCK, return_value=0.0):
+            for stage in ("text", "multimodal"):
+                with measure_frontend_stage(timing, stage):
+                    pass
+        self.collector.observe_frontend_request_timing(timing.finish(0.0))
+        for stage in ("total", "text", "multimodal"):
+            labels = {**self.collector.labels, "stage": stage}
+            self.assertEqual(
+                self.registry.get_sample_value(_METRIC + "_count", labels), 1
+            )
+            self.assertEqual(
+                self.registry.get_sample_value(_METRIC + "_sum", labels), 0.0
+            )
+
+    def test_failed_or_cancelled_dispatch_does_not_export_stage_spans(self):
+        for error_type in (RuntimeError, asyncio.CancelledError):
+            with self.subTest(error_type=error_type):
+                timing = FrontendRequestTiming(started_at=10.0)
+                with patch(_CLOCK, side_effect=[10.1, 10.2]):
+                    with self.assertRaises(error_type):
+                        with measure_frontend_stage(timing, "multimodal"):
+                            raise error_type()
+                self.assertAlmostEqual(timing.snapshot(11.0)["multimodal"], 0.1)
+                manager = self.manager()
+                manager.enable_metrics = True
+                manager.rid_to_state = {
+                    "request": SimpleNamespace(
+                        obj=SimpleNamespace(_frontend_request_timing=timing),
+                        abort_sent=False,
+                    )
+                }
+                manager.cuda_vmm_feature_transport = SimpleNamespace(
+                    prepare_for_dispatch_async=AsyncMock(return_value=[]),
+                    cancel_for_dispatch=Mock(),
+                )
+                manager.positional_embeds_transport = SimpleNamespace(
+                    prepare_for_dispatch=Mock(return_value=[]), cancel_for_dispatch=Mock()
+                )
+                manager._dispatch_to_scheduler = Mock(side_effect=error_type())
+                request = SimpleNamespace(
+                    rid="request",
+                    mm_inputs=None,
+                    time_stats=Mock(),
+                    wrap_pickle_fields=Mock(),
+                )
+                with patch(
+                    "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+                    side_effect=lambda obj: obj,
+                ):
+                    with self.assertRaises(error_type):
+                        asyncio.run(manager._send_one_request(request))
+                self.assertIsNone(timing._finished_at)
+                for stage in ("total", "text", "multimodal"):
+                    self.assertIsNone(
+                        self.registry.get_sample_value(
+                            _METRIC + "_count", {**self.collector.labels, "stage": stage}
+                        )
+                    )
+
     def test_chat_encoding_excludes_separate_render_decode_and_cache_hits(self):
         server = SimpleNamespace(
             tokenizer_manager=self.manager(),
@@ -261,7 +355,6 @@ with published_topology():
             for stage, expected in [
                 ("total", 0.05),
                 ("text", 0.02),
-                ("multimodal", 0.0),
             ]:
                 labels = {
                     "model_name": "test",
@@ -274,6 +367,12 @@ with published_topology():
                 self.assertAlmostEqual(
                     registry.get_sample_value(_METRIC + "_sum", labels), expected
                 )
+            self.assertIsNone(
+                registry.get_sample_value(
+                    _METRIC + "_count",
+                    {"model_name": "test", "engine_type": "unified", "stage": "multimodal"},
+                )
+            )
 
 
 if __name__ == "__main__":
