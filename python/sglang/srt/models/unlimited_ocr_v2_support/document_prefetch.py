@@ -218,8 +218,6 @@ class DocPrefetch:
             return False
         if not envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get():
             return False
-        # A later follow-up of the same predecessor replaces the earlier one.
-        self._parked.leave([r for r in self._parked if _after(r) == after])
         self._parked.join([req])
         mm = req.multimodal_inputs
         if self._encode_ahead and mm is not None and mm.mm_items:
@@ -246,13 +244,14 @@ class DocPrefetch:
         self.release_early(req.rid)
         out = len(req.output_ids) if req.finished_len is None else req.finished_len
         used = max(0, out - forced_len(req))
-        follow = next((r for r in self._parked if _after(r) == req.rid), None)
-        if follow is None:
+        follows = [r for r in self._parked if _after(r) == req.rid]
+        if not follows:
             if _is_predecessor(req):
                 self._finished[req.rid] = used
             return
-        _apply_budget(follow, used)
-        move([follow], self._parked, self._released)
+        for follow in follows:
+            _apply_budget(follow, used)
+        move(follows, self._parked, self._released)
 
     def take_released(self) -> List[Req]:
         """Follow-ups released since the last call, in release order."""

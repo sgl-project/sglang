@@ -107,6 +107,20 @@ class TestNextWindowPrefetch(CustomTestCase):
         # Spliced text is not generation; it does not spend the budget.
         self.assertEqual(w1.sampling_params.max_new_tokens, 479)
 
+    def test_every_follow_up_of_a_window_is_released(self):
+        """Two follow-ups waiting on one window are both queued when it finishes."""
+        prefetch = _prefetch()
+        sched = _Sched(prefetch)
+        w0 = _req("w0", keep=True)
+        w1a = _req("w1a", after="w0", budget=1000)
+        w1b = _req("w1b", after="w0", budget=1000)
+        sched.add(w1a)
+        sched.add(w1b)
+        _finish(w0, 300)
+        prefetch.on_window_finished(w0)
+        sched.ingest()
+        self.assertEqual(sched.queue, [w1a, w1b])
+
     def test_a_retracted_window_releases_nothing(self):
         """Retraction passes the same cache hook unfinished; releasing there
         would start the follow-up before the window's KV is retained."""
