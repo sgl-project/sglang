@@ -2334,7 +2334,6 @@ class DeepseekV2AttentionMLA(
 
         self.init_mha_forward()
         self.init_mla_forward()
-        self.init_mla_rocm_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
