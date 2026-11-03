@@ -288,7 +288,6 @@ class QSAKVHostOffload:
         self.layout = layout
         # Debug: the full K/V pool stays on the GPU; see check().
         self.verify = verify
-        self._forwards = 0
         self._verify_logged = 0.0
         self.cr = layout.compress_ratio
         self.hot_blocks = layout.hot_blocks
@@ -477,7 +476,6 @@ class QSAKVHostOffload:
         self.bind(req_to_token)
         if reset_req_pool_indices is not None:
             self.reset(reset_req_pool_indices)
-        self._forwards += 1
         if self.fused is not None:
             self._check_resolve_errors()
         if self.verify:

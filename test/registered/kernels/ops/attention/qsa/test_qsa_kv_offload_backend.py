@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.mem_cache.qsa_kv_offload import compute_offload_layout
@@ -25,7 +26,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 CR, PAGE, Q_HEADS, KV_HEADS, DIM = 4, 64, 24, 2, 256
 TOKEN_TOPK = 2048
@@ -116,7 +117,8 @@ def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, what: st
     ), f"{what}: offloaded attention differs from the full pool"
 
 
-def test_backend_offload_matches_full_pool(server_context):
+@pytest.mark.parametrize("torch_resolve", [False, True])
+def test_backend_offload_matches_full_pool(server_context, torch_resolve):
     torch.manual_seed(11)
     req_to_token = torch.zeros(
         (REQUESTS + 1, CONTEXT), dtype=torch.int32, device="cuda"
@@ -131,8 +133,10 @@ def test_backend_offload_matches_full_pool(server_context):
         page_size=PAGE,
     )
     full = _backend(req_to_token, kv_offload_layout=None)
-    offloaded = _backend(req_to_token, kv_offload_layout=layout)
-    assert full._kv_offload is None and offloaded._kv_offload is not None
+    with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
+        offloaded = _backend(req_to_token, kv_offload_layout=layout)
+    assert full._kv_offload is None
+    assert offloaded._kv_offload.use_fused is not torch_resolve
     try:
         layer = SimpleNamespace(
             layer_id=0,
@@ -214,6 +218,8 @@ def test_backend_offload_matches_full_pool(server_context):
                 _select(positions),
                 f"decode step {step}",
             )
+        if offloaded._kv_offload.fused is not None:
+            assert int(offloaded._kv_offload.fused.errors) == 0
     finally:
         offloaded._kv_offload.destroy()
 
