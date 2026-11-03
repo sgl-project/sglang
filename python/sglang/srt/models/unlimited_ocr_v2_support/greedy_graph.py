@@ -70,7 +70,7 @@ class UocrGreedyGraph:
     ) -> None:
         """Track graph replays; load relayed inputs for a deferred eager decode."""
         self._replayed_batch = forward_batch if replays_graph else None
-        if not replays_graph and forward_batch.uocr_graph_io_deferred:
+        if not replays_graph and forward_batch.input_ids_from_graph:
             decode_graph_runner.uocr_graph_io.materialize_eager(forward_batch)
 
     def recorded_ids(

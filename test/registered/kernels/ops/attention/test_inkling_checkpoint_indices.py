@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec, StateView
 from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -748,7 +748,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 "require_mlp_tp_gather": False,
                 "require_mlp_sync": False,
                 "require_attn_tp_gather": False,
-                "resolve_decode_backend": Mock(),
+                "resolve_decode_backend": Mock(cache_loc_dtype=torch.int64),
             }
             for name, result in replacements.items():
                 stack.enter_context(patch.object(eagle, name, return_value=result))
