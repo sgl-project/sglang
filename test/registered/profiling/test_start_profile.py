@@ -11,11 +11,14 @@ python3 -m unittest test_start_profile.TestStartProfile.test_start_profile_1
 python3 -m unittest test_start_profile.TestStartProfileWithNsys.test_start_profile_cuda_profiler
 """
 
+import gzip
+import json
 import os
 import shutil
 import subprocess
 import time
 import unittest
+from pathlib import Path
 
 import requests
 
@@ -164,6 +167,22 @@ class TestStartProfile(CustomTestCase):
         self.assertNotEqual(
             len(os.listdir(OUTPUT_DIR)), 0, "Output directory is empty!"
         )
+
+        traces = list(Path(OUTPUT_DIR).glob("*.trace.json*"))
+        self.assertTrue(traces, "No Chrome trace was exported")
+        for path in traces:
+            open_trace = gzip.open if path.suffix == ".gz" else open
+            with open_trace(path, "rt") as stream:
+                events = json.load(stream)["traceEvents"]
+            scopes = {event["name"] for event in events if event.get("ph") == "X"}
+            self.assertTrue(
+                {
+                    "sglang.scheduler.run_batch",
+                    "sglang.worker.forward_batch",
+                    "sglang.batch.prepare_forward_inputs",
+                }.issubset(scopes),
+                f"Missing scheduler/worker scopes in {path}",
+            )
 
     def _check_empty_profile_dir(self):
         if os.path.isdir(OUTPUT_DIR):
