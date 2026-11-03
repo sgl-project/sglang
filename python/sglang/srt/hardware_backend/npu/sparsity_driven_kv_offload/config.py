@@ -54,20 +54,13 @@ def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,
     use_mla_backend: bool,
+    is_draft_worker: bool = False,
 ) -> bool:
-    indexer_impl = get_offload_sparse_kv_indexer_impl()
-    if (
-        envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-        and not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
-    ):
-        raise ValueError(
-            "SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD."
-        )
+    # Offload is a target-model policy. Draft attention keeps its native KV
+    # pool even though the process inherits the target's environment flags.
+    if is_draft_worker:
+        return False
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
-        if indexer_impl != "legacy":
-            raise ValueError(
-                "LIM indexer requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1."
-            )
         return False
 
     prefill_attention_backend, decode_attention_backend = attention_backends()
@@ -89,15 +82,16 @@ def is_sparsity_driven_kv_offload_enabled(
             "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires max_running_requests "
             "to be set to bound the per-process host KV allocation."
         )
-    if indexer_impl != "legacy":
-        if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
-            raise ValueError("LIM integration requires model index_topk=2048.")
-        if get_schedule().page_size != 128:
-            raise ValueError("LIM integration requires --page-size 128.")
-        if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
-            raise ValueError(
-                "LIM integration currently requires PP=1 and DCP disabled."
-            )
+    if not use_fused_sparse_kv_offload():
+        return True
+    if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
+        raise ValueError("Native LIM integration requires model index_topk=2048.")
+    if get_schedule().page_size != 128:
+        raise ValueError("Native LIM integration requires --page-size 128.")
+    if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
+        raise ValueError(
+            "Native LIM integration currently requires PP=1 and DCP disabled."
+        )
     algorithm = (get_spec().speculative_algorithm or "NONE").upper()
     if algorithm != "NONE" and (
         algorithm not in ("EAGLE", "NEXTN")
@@ -152,10 +146,12 @@ def get_sparsity_driven_kv_offload_cell_size(
     use_mla_backend: bool,
     num_layers: int,
     element_size: int,
+    is_draft_worker: bool = False,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
         use_mla_backend=use_mla_backend,
+        is_draft_worker=is_draft_worker,
     ):
         return None
 

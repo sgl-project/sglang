@@ -482,8 +482,6 @@ class TestDefaultConfigurator(CustomTestCase):
                 speculative_eagle_topk=1,
             ),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
-            envs.SGLANG_NPU_ENABLE_COPY_SFA.override(False),
-            envs.SGLANG_NPU_SPARSE_KV_INDEXER.override("legacy"),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(12288),
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             mock_cpu_env(kv_size=2),
@@ -527,14 +525,12 @@ class TestDefaultConfigurator(CustomTestCase):
         ):
             cfg = DefaultPoolConfigurator(mr)
 
-        # Target index-only charge is 21 owners * 128 values * 2-byte BF16.
-        # The final cell adds one separately priced one-layer draft indexer.
-        # Since the target cell is exactly the target indexer charge, the
-        # MTP target_kv_size remainder is zero rather than phantom MLA KV.
+        # One compact target indexer, one FP32 scale workspace, and the
+        # draft's full native CKV/KPE plus indexer remain in HBM.
         self.assertEqual(len(owner_ids), 21)
-        self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2)
-        self.assertEqual(cfg._fixed_overhead_bytes, 2 * 123)
-        self.assertEqual(mock_sparse_budget.call_count, 2)
+        self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2 + 576 * 2 + 4)
+        self.assertEqual(cfg._fixed_overhead_bytes, 123 + 128 * 4)
+        self.assertEqual(mock_sparse_budget.call_count, 1)
 
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
@@ -1085,8 +1081,8 @@ class TestAllSWAConfigurator(CustomTestCase):
 class TestEagleConfigurator(CustomTestCase):
     """EAGLE: draft KV cache must be accounted for so total allocation fits in budget."""
 
-    def test_sparse_mtp_reserves_both_managers_and_only_index_tokens(self):
-        """Target admission must leave room for the separate draft host-KV manager."""
+    def test_sparse_mtp_reserves_target_manager_and_native_draft_kv(self):
+        """Target admission reserves native draft KV without a draft offload manager."""
         import torch
 
         from sglang.srt.environ import envs
@@ -1125,9 +1121,7 @@ class TestEagleConfigurator(CustomTestCase):
                 speculative_eagle_topk=1,
             ),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
-            envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True),
-            envs.SGLANG_NPU_SPARSE_KV_INDEXER.override("lim"),
-            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(2048),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             # Isolate the hardware predicate; all config decisions are real.
             patch(
@@ -1148,21 +1142,33 @@ class TestEagleConfigurator(CustomTestCase):
                 top_k=2048,
                 kv_bytes_per_token=576 * 2,
             )
-            managers = sum(
-                get_sparse_kv_budget(num_layers=layers, **options).managed_hbm_bytes
-                for layers in (4, 1)
-            )
-            # Five BF16 index-K layers and one FP32 scale workspace per pool;
-            # no CKV/KPE payload is priced as a device token in either model.
-            self.assertEqual(cfg._cell_size, 5 * 128 * 2 + 2 * 4)
-            self.assertEqual(cfg._fixed_overhead_bytes, managers + 2 * 128 * 4)
-            available = managers + 2 * 128 * 4 + 10_000_000
+            unpadded = get_sparse_kv_budget(num_layers=4, **options)
+            manager_bytes = unpadded.managed_hbm_bytes
+            # Five BF16 index-K layers, the draft's full KV, and one target
+            # FP32 scale workspace. Only the target owns bounded residency.
+            cell_size = 5 * 128 * 2 + 576 * 2 + 4
+            fixed = manager_bytes + 128 * 4
+            self.assertEqual(cfg._cell_size, cell_size)
+            self.assertEqual(cfg._fixed_overhead_bytes, fixed)
+            available = fixed + 10_000_000
             sizes = cfg.calculate_pool_sizes(available, 128)
-            used = sizes.max_total_num_tokens * (5 * 128 * 2 + 2 * 4)
-            used += managers + 2 * 128 * 4
+            used = sizes.max_total_num_tokens * cell_size + fixed
             self.assertLessEqual(used, available)
 
-            # Eager MLP-sync can pad a one-row draft to attention TP=8 even
+            # The HBM limit caps actual allocations; it must not reserve the
+            # complete limit when automatic C is determined by query width.
+            with (
+                envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
+                envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(128),
+            ):
+                capped = DefaultPoolConfigurator(mr)
+                actual = get_sparse_kv_budget(num_layers=4, **options)
+                self.assertEqual(
+                    capped._fixed_overhead_bytes,
+                    actual.managed_hbm_bytes + 128 * 4,
+                )
+
+            # Eager MLP-sync can pad a one-row target to attention TP=8 even
             # when graphs are disabled. Admission must price that scratch too.
             with get_parallel().override(
                 tp_size=16,
@@ -1177,10 +1183,12 @@ class TestEagleConfigurator(CustomTestCase):
                 padded = get_sparse_kv_budget(
                     num_layers=4, graph_batch_capacity=0, **options
                 )
-                self.assertEqual(padded.selected_kv_bytes, 8 * 2048 * 1152)
+                self.assertEqual(padded.selected_kv_bytes, 0)
+                self.assertEqual(padded.device_kv_bytes, 3 * 4 * 8192 * 1152)
+                self.assertGreater(padded.copy_sfa_bytes, unpadded.copy_sfa_bytes)
 
     def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):
-        """Budget both MTP managers per attention-DP worker, then add PD rows."""
+        """Budget the target manager per attention-DP worker, including PD slots."""
         from sglang.srt.environ import envs
         from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
@@ -1211,9 +1219,7 @@ class TestEagleConfigurator(CustomTestCase):
         )
         with (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
-            envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True),
-            envs.SGLANG_NPU_SPARSE_KV_INDEXER.override("lim"),
-            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(2048),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
@@ -1278,16 +1284,14 @@ class TestEagleConfigurator(CustomTestCase):
                         DefaultPoolConfigurator(mr)
 
                     calls = mock_sparse_budget.call_args_list
-                    self.assertEqual(len(calls), 2)
-                    self.assertEqual(
-                        [call.kwargs["num_layers"] for call in calls], [4, 1]
-                    )
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual([call.kwargs["num_layers"] for call in calls], [4])
                     self.assertEqual(
                         [call.kwargs["request_rows"] for call in calls],
-                        [expected_rows, expected_rows],
+                        [expected_rows],
                         msg=(
                             f"{requested=}, {attn_dp=}, {dp=}, {extra=}: "
-                            "target and draft budgets should use the same local row count"
+                            "target residency must use the attention-DP local row count"
                         ),
                     )
 
