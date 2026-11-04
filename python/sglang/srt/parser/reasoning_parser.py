@@ -117,6 +117,8 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = False
 
         self.continuation_target = continuation_target
+        self._continuation_close_prefix = ""
+        self._continuation_close_buffer = ""
         if continuation_target is not None:
             # The prompt already opened the selected field. Generated openers
             # are literal text; only an explicit close can end reasoning.
@@ -124,6 +126,11 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = self.force_reasoning
             self.stripped_think_start = True
             self.tool_start_token = None
+            if self._in_reasoning:
+                prefix_len = self._ends_with_partial_token(
+                    previous_content, self.think_end_token
+                )
+                self._continuation_close_prefix = self.think_end_token[:prefix_len]
 
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
@@ -172,6 +179,7 @@ class BaseReasoningFormatDetector:
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         if self.continuation_target is not None:
+            text = self._consume_continuation_close(text, final=True)
             if not self._in_reasoning:
                 return StreamingParseResult(normal_text=text)
             reasoning_text, _, normal_text = text.partition(self.think_end_token)
@@ -221,6 +229,26 @@ class BaseReasoningFormatDetector:
             # think_end_token is in self.previous_content for continue_final_message=True case
             return StreamingParseResult(normal_text=processed_text)
 
+    def _consume_continuation_close(self, text: str, final: bool = False) -> str:
+        """Complete a close marker split across the supplied prefix and new text.
+
+        Only new characters are buffered or returned. A mismatch or truncated
+        completion remains literal reasoning; supplied characters are never echoed.
+        """
+        if not self._continuation_close_prefix:
+            return text
+        self._continuation_close_buffer += text
+        text = self._continuation_close_buffer
+        completion = self.think_end_token[len(self._continuation_close_prefix) :]
+        if text.startswith(completion):
+            self._in_reasoning = False
+            text = text[len(completion) :]
+        elif completion.startswith(text) and not final:
+            return ""
+        self._continuation_close_prefix = ""
+        self._continuation_close_buffer = ""
+        return text
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
         Streaming incremental parsing for reasoning content.
@@ -240,6 +268,7 @@ class BaseReasoningFormatDetector:
         return ret
 
     def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        new_text = self._consume_continuation_close(new_text)
         self._buffer += new_text
         current_text = self._buffer
 
@@ -360,6 +389,7 @@ class BaseReasoningFormatDetector:
         (e.g. max_tokens cut it short), instead of dropping it: the whole block under
         stream_reasoning=False, the held-back token suffix under stream_reasoning=True.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
+        self._buffer += self._consume_continuation_close("", final=True)
         if not self._in_reasoning:
             # Same as the reasoning-side flush below: a held-back slice that never
             # became a token is content.
@@ -2459,6 +2489,10 @@ class ReasoningParser:
 
         if isinstance(continuation_target, str):
             kwargs["continuation_target"] = continuation_target
+            if continuation_target == "reasoning_content" and isinstance(
+                request, ChatCompletionRequest
+            ):
+                kwargs["previous_content"] = request.messages[-1].reasoning_content
         self.detector = detector_class(**kwargs)
 
     def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:

@@ -749,6 +749,28 @@ class TestFieldContinuationParser(CustomTestCase):
                     "".join(content or "" for _, content in chunks), "answer"
                 )
 
+    def test_reasoning_continuation_close_split_from_supplied_prefix(self):
+        cases = (
+            ("old reasoning</thi", "nk>Answer.", ("", "Answer.")),
+            ("old reasoning</thi", "nk", ("nk", "")),
+            ("old reasoning</thi", "nkXliteral", ("nkXliteral", "")),
+            ("old reasoning</think>", "nk>literal", ("nk>literal", "")),
+        )
+        for model_type in ("qwen3", "deepseek-r1"):
+            for prefix, suffix, expected in cases:
+                with self.subTest(model_type=model_type, prefix=prefix, suffix=suffix):
+                    request = ChatCompletionRequest(
+                        messages=[
+                            {
+                                "role": "assistant",
+                                "reasoning_content": prefix,
+                                "content": "",
+                            }
+                        ],
+                        continue_final_message="reasoning_content",
+                    )
+                    self._assert_suffix(model_type, request, suffix, expected)
+
 
 class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------
