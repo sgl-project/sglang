@@ -1,6 +1,6 @@
 # SGLang Session-Aware KV Cache Orchestrator 实现方案与实施计划
 
-日期：2026-11-04。状态：当前基线 `f6ec094123` 已整合 P0–P3、P4a/P4b/P4c 和 P5；P4 的 Router/L3 owner 接入仍由 P6 完成。当前修改为 P8 实测问题驱动的 native/demand PREFETCH 合并优化，CPU、GPU/file/Mooncake 正确性及 Rust 验证通过，未提交。模型级 TTFT before/after 由 parent 审查后重启快照测量；P6/P7 和完整 P8 验收未完成，P9 为后续扩展。
+日期：2026-11-04。状态：首轮 P0–P8 已实现并完成 TP=1 FULL/Mooncake 验收；执行快照为 `f65f0393c4`。P9 配置扩展保留为后续工作。测试通过后按功能提交。最终性能与限制见 `benchmark/session_kv_control/results/2026-11-04/FINAL_ACCEPTANCE.md`，阶段证据见 `PLAN-REVIEW-LOG.md`。
 
 目标是在保留 `rfc-kvc` 引擎控制实现的基础上，接入 Router 侧的 session 编排，完成 `PREFETCH`、`DEMOTE`、`PIN`、Mooncake 执行适配及结果反馈。主要验证场景是：应用等待工具期间，将已存在于 Mooncake 的上下文准备到另一个 Engine 的 L2，并在恢复推理时实际复用。
 
@@ -448,19 +448,19 @@ Router wire 与外部 bridge 当前忽略 session 信息，需要分别接入。
 
 ## 11. 实施阶段与依赖
 
-本任务针对 P2 模型矩阵发现的晚到 PREFETCH 回归，合并匹配的普通请求与正在执行的 native L3→L2 读取。首轮仅支持相同完整 page-aligned token scope、兼容 salt/extra-key、wait_complete；预算受既有 max_prepared_prefixes 和 max_scope_tokens 约束。受控实际存储调用从两次 query/GET 降到一次，CPU 与 live GPU/Mooncake 正确性已验证。原矩阵和 ready-window 结果保持不变；本次没有模型级性能收益结论，parent 将运行一致负载的 before/after。
+P0–P8 首轮范围已完成。实测推动两处修复：匹配的普通请求共享在途 native L3→L2 读取，以及 host 满容量时按缺口调用原生未保护缓存驱逐。相同完整 page-aligned scope、兼容 salt/extra-key、wait_complete、既有准备/传输预算仍有效。P7 增加实际缓存水位和有界反馈，恢复遵守 owner/epoch/gap 围栏。原始退化结果保留；最终快照的短窗口、host 压力、两套路由和共享保护结果另存。
 
 | 阶段 | 主要产物 | 依赖 | 退出条件 |
 | --- | --- | --- | --- |
-| P0 基线整合 | 固定 merge 基线、冲突记录、D1–D7 决策记录 | C1/C2 | 原有控制/搬运回归通过，Router/indexer 可构建 |
+| P0 基线整合（已完成） | 固定 merge 基线、冲突记录、D1–D7 决策记录 | C1/C2 | 原有控制/搬运回归通过，Router/indexer 可构建 |
 | P1 协议与模型（已提交） | 三动作 schema、PrefixTarget、capabilities、结果、跨语言 fixtures、Rust 纯模型 | P0 | Python 72 tests + 66 subtests；Rust 4 tests；locked Router/indexer check 通过 |
 | P2 后端与 PREFETCH（已提交） | 注册 file/Mooncake adapters、独立 L3→L2、完成结果、物理 key 描述 | P1 | CPU 74 tests + 66 subtests；GPU/file 通过；真实 Mooncake 跨 owner 无本地前缀恢复及 GPU load-back 通过 |
 | P3 DEMOTE（已提交） | native 回收、保存/回收结果、证据化阻塞原因、取消副作用 | P2 | parent CPU/GPU/Mooncake 验证通过，证据见 review log |
-| P4 PIN（L2 runtime/L3 owner 已实现，Router 接入待 P6） | L2 registry、L3 protection owner、对象聚合、TTL/renew/release | P1/P2 | 共享保护、未知结果与过期处理通过专项测试 |
-| P5 Router 关联与观察（纯模型已提交） | session/branch index、confirmed-only 接口、关联输入、位置查询 adapter | P1 | 多分支和纯命中能正确建关联，位置失效不删除关联 |
-| P6 编排与路由 | intent/job 管理、Engine client、独立信号、参考策略、两套路由接入 | P2/P3/P4/P5 | 完成跨 Engine 准备并保留最终路由决策权 |
-| P7 反馈与恢复 | 完整事件、query 对账、epoch/gap、bridge 分片顺序、保护恢复 | P2/P4/P5/P6 | 故障注入后无错误 ready、无共享误释放 |
-| P8 联合验收与评测 | 两 Engine Mooncake 场景、功能矩阵、对照实验、运行说明 | P3/P4/P6/P7 | 三动作及主场景均有可重复证据 |
+| P4 PIN（含 Router 接入，已完成） | L2 registry、L3 protection owner、对象聚合、TTL/renew/release | P1/P2 | 共享保护、未知结果与过期处理通过专项测试 |
+| P5 Router 关联与观察（已完成） | session/branch index、confirmed-only 接口、关联输入、位置查询 adapter | P1 | 多分支和纯命中能正确建关联，位置失效不删除关联 |
+| P6 编排与路由（已完成） | intent/job 管理、Engine client、独立信号、参考策略、两套路由接入 | P2/P3/P4/P5 | 完成跨 Engine 准备并保留最终路由决策权 |
+| P7 反馈与恢复（首轮范围已完成） | 完整事件、query 对账、epoch/gap、bridge 分片顺序、保护恢复 | P2/P4/P5/P6 | 故障注入后无错误 ready、无共享误释放 |
+| P8 联合验收与评测（已完成） | 两 Engine Mooncake 场景、功能矩阵、对照实验、运行说明 | P3/P4/P6/P7 | 三动作及主场景均有可重复证据 |
 | P9 配置扩展 | 多 rank、Hybrid、PD、其他 cache mode/backend、多 Router | 对应 P8 能力 | 每个新增路径独立通过正确性与恢复验收 |
 
 ### P0 的合并重点
@@ -520,7 +520,7 @@ P0 已记录 HEAD、MERGE_HEAD 和测试环境，执行固定上游快照的合�
 
 测试分四层：纯协议/状态模型测试，带真实 cache 结构和可控完成时序的 CPU 测试，GPU/host/file 回归，以及真实 Mooncake 双 Engine 测试。mock 成功不能替代 Mooncake 完成确认；file 测试不能证明跨 Engine 共享已正确。
 
-已有回归测试入口在第 13 节列出。实施时按项目测试环境运行，并记录依赖版本、模型、GPU、cache mode、page size、存储协议和测试命令。本文编写阶段仅核对代码与文档，没有运行上述功能测试。
+已有回归测试入口在第 13 节列出。实施时按项目测试环境运行，并记录依赖版本、模型、GPU、cache mode、page size、存储协议和测试命令。本轮已运行协议/状态、真实 cache CPU、GPU/file 和真实 Mooncake 双 Engine 验证；具体命令、结果及不支持范围见最终验收报告和 review log。
 
 ### 对照实验与指标
 
@@ -543,14 +543,14 @@ Agentic RL 扩展记录 batch collection time、有效样本吞吐、trainer wai
 
 ### 首轮完成标准
 
-- [ ] D1–D7 的最终选择已记录，并反映到 capabilities 和测试范围。
-- [ ] 合并后旧控制、引用生命周期和 namespace 回归通过。
-- [ ] 三动作均有实际执行路径、query 结果及反馈，不以 transport 接收代替完成。
-- [ ] 真实 Mooncake 双 Engine 场景通过，并证明 B 的 L2 被后续推理使用。
-- [ ] 共享 PIN、取消、部分失败、idle progress、gap 和重启测试通过。
-- [ ] 发布能力与已验证模型、布局、rank 和 cache mode 一致。
-- [ ] B0–B3 配置和原始结果可重复，区分功能成功与性能收益。
-- [ ] README/运行示例按最终代码更新，本文中采用和变更的设计决定有记录。
+- [x] D1–D7 的最终选择已记录，并反映到 capabilities 和测试范围。
+- [x] 合并后旧控制、引用生命周期和 namespace 回归通过。
+- [x] 三动作均有实际执行路径、query 结果及反馈，不以 transport 接收代替完成。
+- [x] 真实 Mooncake 双 Engine 场景通过，并证明 B 的 L2 被后续推理使用。
+- [x] 共享 PIN、取消、部分失败、idle progress、gap 和重启测试通过。
+- [x] 发布能力与已验证模型、布局、rank 和 cache mode 一致。
+- [x] B0–B3 配置和原始结果可重复，区分功能成功与性能收益。
+- [x] README/运行示例按最终代码更新，本文中采用和变更的设计决定有记录。
 
 ## 13. 代码改动地图
 
@@ -622,4 +622,4 @@ request metadata 的变更还涉及 [io_struct.py](/home/youwei/bzh/project/Toke
 | 能力限制 | 仍返回 unsupported 的路径、unknown 恢复边界 |
 | 后续依赖 | 未完成前不能宣布支持的能力 |
 
-当前进度：`f6ec094123` 基线保持 P1–P5 能力与约束。本次合并 native/demand PREFETCH 的修改未提交，证据见 `PLAN-REVIEW-LOG.md` 和 `/tmp/sglang-rfc-build/prefetch-report.txt`。两台 Qwen 服务仍使用不可变 P2 快照；没有重启、配置修改或源码快照改写。GPU 1 小型正确性测试在查询确认两台服务 running/waiting queues 均为零后执行。P6/P7、模型级 before/after 及完整 P8 验收仍待后续工作。
+当前进度：首轮 P0–P8 完成，功能提交至 `f65f0393c4`，后续提交记录最终文档与证据。CPU 154 tests/96 subtests、GPU 2 tests/2 subtests、Router unit 1114、proxy 241、Indexer 156、orchestrator 44、benchmark 16 均通过；可选或既有长耗时用例按报告说明跳过。共归档 238 条有效场景及独立保护验收。最终 8K host 压力配对的 TTFT 下降约 84%、完整前台周期下降约 16%，每组 N=3；短窗口 2K 周期未见正收益，并发场景存在后台吞吐代价。结果不推广到未测配置。运行入口、能力边界、失败记录和重算方式见 `benchmark/session_kv_control/results/2026-11-04/FINAL_ACCEPTANCE.md` 与 `sgl-router/KV_ORCHESTRATION.md`。

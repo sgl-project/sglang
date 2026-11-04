@@ -8,6 +8,8 @@ control endpoints require `Authorization: Bearer <control_bearer>`; caller IDs
 in request bodies cannot select another caller. Worker HTTP credentials continue
 to use `--worker-api-key`.
 
+The checked build used task-local Rust 1.99.1; the installed system Rust 1.75 cannot build the locked upstream dependencies. Replace the local toolchain/cache paths below when using another environment.
+
 Start against the local Qwen Engine pair (legacy or `--chat-routing reorg`):
 
 ```sh
@@ -19,7 +21,7 @@ export CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
 export CARGO_BUILD_JOBS=8
 cargo build --locked --manifest-path sgl-router/Cargo.toml -p sgl-router
 "$CARGO_TARGET_DIR/debug/sgl-router" \
-  --host 127.0.0.1 --port 51900 \
+  --host 127.0.0.1 --port 12910 \
   --model-id /home/youwei/bzh/model/Qwen/Qwen3-8B \
   --tokenizer-path /home/youwei/bzh/model/Qwen/Qwen3-8B/tokenizer.json \
   --worker-urls http://127.0.0.1:51801 http://127.0.0.1:51803 \
@@ -39,7 +41,7 @@ preparation/control owner; normal Router policy still makes the formal pick.
 ```python
 import json, time, uuid, requests
 from transformers import AutoTokenizer
-base = "http://127.0.0.1:51900"
+base = "http://127.0.0.1:12910"
 a, b = "http://127.0.0.1:51801", "http://127.0.0.1:51803"
 headers = {"Authorization": "Bearer local-p6-control"}
 task = {"session_id": "trial-" + uuid.uuid4().hex, "incarnation": "task-1"}

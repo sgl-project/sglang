@@ -160,3 +160,5 @@ summary 同时提供全部已完成恢复、验证通过、`prefetch_ready_befor
 - 父任务已在 feature A/B 运行 `/tmp/sglang-rfc-build/bench-p2-matrix-v1` 的 36 条真实对照，36 条通过路径与输出校验；分析见 `p2-matrix-analysis.md`。2K 提前准备降低 TTFT，8K 效果不稳定，16K 在 0.5s 提前量下平均变慢。扩展的 trace/EMA/背景负载与 host 压力仅在 mock HTTP 中验证，本次未发起新的 GPU 实验。
 
 交付文件：`manifest.json` 保存配置与版本，`schedule.json` 保存完整顺序，`raw.jsonl` 保存 HTTP/生成/warmup/trial 原始记录，`summary.json` 和 `summary.md` 提供可重新计算的统计。退出码 0 表示全部 trial 通过校验；2 表示存在无效/失败 trial；1 表示启动、能力或配置检查失败。
+
+最终执行快照、238 条场景、性能与限制见 [整合验收](results/2026-11-04/FINAL_ACCEPTANCE.md)。初始退化结果保留，容量修复后的实测单独列出。
