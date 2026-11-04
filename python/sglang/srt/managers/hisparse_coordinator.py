@@ -1603,15 +1603,23 @@ class HiSparseCoordinator:
         req_pool_idx = req.kv.req_pool_idx
         assert req_pool_idx is not None
 
+        # The sidecars cover COMMITTED tokens only: kv_committed_len equals
+        # the resume's fill length by construction (commit_prealloc), so the
+        # restore's page-count invariant holds even when speculative decoding
+        # leaves kv_allocated_len past the committed length (its high-water
+        # mark never shrinks -- see allocate_spec_decode -- and those verify
+        # slots have no data written yet).
+        committed_len = req.kv.kv_committed_len
+
         # Preserve the indexer K (DSA top-k selection data). Unlike the C4 KV,
         # it lives in the device logical-slot space (prefill transfers it over
         # RDMA straight into device buffers; HiSparse does not offload it), so
         # the fresh logical slots a resume allocates would read garbage and
         # corrupt the top-k selection. Back up the request's page rows here
         # in position order; resume writes them into the new slots' pages.
-        self._backup_indexer_rows(req, allocated_len, req_pool_idx)
+        self._backup_indexer_rows(req, committed_len, req_pool_idx)
         # Same for the SWA window rows (device logical-slot space as well).
-        self._backup_swa_rows(req, allocated_len, req_pool_idx)
+        self._backup_swa_rows(req, committed_len, req_pool_idx)
 
         # release device buffer indices (same ownership union request_finished
         # computes; over-allocation slots carry stale -1/0 entries that are
