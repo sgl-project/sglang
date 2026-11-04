@@ -617,15 +617,22 @@ def test_nemotron_mamba_chunk_scan_combined_cpu_varlen_track_model_shape():
     C = torch.randn_like(B)
     D = torch.randn(nheads, dtype=torch.float32)
     dt_bias = torch.randn(nheads, dtype=torch.float32) - 3.0
-    initial_states = torch.randn(len(seqlens), nheads, headdim, dstate, dtype=dtype) * 0.1
+    initial_states = (
+        torch.randn(len(seqlens), nheads, headdim, dstate, dtype=dtype) * 0.1
+    )
     cu_seqlens = torch.tensor([0, seqlens[0], total_tokens], dtype=torch.int32)
     seq_idx = torch.cat(
-        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(seqlens)]
+        [
+            torch.full((length,), i, dtype=torch.int32)
+            for i, length in enumerate(seqlens)
+        ]
     )[None]
     chunk_indices = torch.tensor([[0, 0], [1, 0], [1, 1]], dtype=torch.int32)
     chunk_offsets = torch.tensor([0, 0, NEMOTRON_CHUNK_SIZE], dtype=torch.int32)
     track_seq_idx = torch.tensor([0, 1], dtype=torch.int32)
-    track_end_locs = torch.tensor([1, seqlens[0] + NEMOTRON_CHUNK_SIZE], dtype=torch.int32)
+    track_end_locs = torch.tensor(
+        [1, seqlens[0] + NEMOTRON_CHUNK_SIZE], dtype=torch.int32
+    )
     out = torch.empty_like(x)
 
     intermediate_states, varlen_states, track_states = mamba_chunk_scan_combined(
@@ -710,7 +717,9 @@ def test_nemotron_mamba_chunk_scan_combined_cpu_varlen_track_model_shape():
 
     _assert_close_scaled(out, expected_out, dtype)
     assert intermediate_states.shape == (1, 2, nheads, headdim, dstate)
-    _assert_close_scaled(intermediate_states[0], torch.stack(expected_intermediate), dtype)
+    _assert_close_scaled(
+        intermediate_states[0], torch.stack(expected_intermediate), dtype
+    )
     _assert_close_scaled(varlen_states, torch.stack(expected_final), dtype)
     _assert_close_scaled(track_states, torch.stack(expected_track), dtype)
 
