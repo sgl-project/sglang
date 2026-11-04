@@ -482,7 +482,7 @@ class FlashinferDispatcher(BaseDispatcher):
                 topk_ids,
                 topk_weights,
                 hidden_states_scale=x_sf,
-                max_tokens_per_rank=runtime_max_tokens_per_rank,
+                runtime_max_tokens_per_rank=runtime_max_tokens_per_rank,
             )
             x = received.hidden_states
             x_sf = received.hidden_states_scale
