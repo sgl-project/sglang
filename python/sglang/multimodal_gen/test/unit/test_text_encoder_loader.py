@@ -895,6 +895,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
         inputs = torch.zeros(1, 64)
         inputs[:, 0::2] = 1
 
+        method.process_weights_after_loading(layer)
         output = method.apply(layer, inputs)
 
         torch.testing.assert_close(output, torch.full((1, 128), 32.0))
