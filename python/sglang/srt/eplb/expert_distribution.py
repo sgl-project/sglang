@@ -40,7 +40,8 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     ExpertDispatchCollector,
@@ -85,10 +86,7 @@ def should_record_forward_pass(forward_batch: ForwardBatch) -> bool:
         return True
     if _is_model_capture_mode():
         return False
-    if forward_batch.forward_mode not in (
-        ForwardMode.EXTEND,
-        ForwardMode.SPLIT_PREFILL,
-    ):
+    if forward_batch.forward_mode != ForwardMode.EXTEND:
         return False
     return int(forward_batch.extend_num_tokens or 0) > 0
 
@@ -414,7 +412,10 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
-            if get_exec().moe.deepep_mode == "normal":
+            # NPU dispatch retains expert IDs for graph-padding rows, so receive
+            # counts include padding. Use the separately masked TopK IDs to count
+            # valid routes in normal, low-latency, and auto modes.
+            if get_platform().is_npu or get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif get_exec().moe.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
@@ -1033,10 +1034,14 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=get_device_namespace().device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+            avg_rate_tensor = torch.empty(
+                1,
+                dtype=torch.float32,
+                device=get_device_namespace().device,
+            )
         torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 

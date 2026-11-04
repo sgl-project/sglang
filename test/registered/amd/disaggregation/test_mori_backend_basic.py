@@ -6,8 +6,8 @@ from unittest.mock import Mock, call, patch
 
 import numpy as np
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori import conn as mori_conn
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
