@@ -15,7 +15,7 @@ from unittest import mock
 import pytest
 import torch
 
-PLUGIN_DIR = Path(__file__).resolve().parents[1]
+PLUGIN_DIR = Path(__file__).resolve().parents[2] / "apps/ComfyUI_SGLDiffusion"
 PKG = "sgld_comfy_under_test"
 
 
@@ -44,6 +44,10 @@ def _install_comfy_stubs() -> None:
     comfy = types.ModuleType("comfy")
     comfy.model_detection = types.ModuleType("comfy.model_detection")
     comfy.model_management = types.ModuleType("comfy.model_management")
+    comfy.model_management.InterruptProcessingException = type(
+        "InterruptProcessingException", (Exception,), {}
+    )
+    comfy.model_management.throw_exception_if_processing_interrupted = lambda: None
 
     comfy_utils = types.ModuleType("comfy.utils")
     for name in (
@@ -53,6 +57,15 @@ def _install_comfy_stubs() -> None:
         "unet_to_diffusers",
     ):
         setattr(comfy_utils, name, lambda *a, **k: None)
+
+    class ProgressBar:
+        def __init__(self, total):
+            pass
+
+        def update_absolute(self, value, total=None, preview=None):
+            pass
+
+    comfy_utils.ProgressBar = ProgressBar
     comfy.utils = comfy_utils
 
     comfy_model_patcher = types.ModuleType("comfy.model_patcher")

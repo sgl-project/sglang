@@ -1,8 +1,8 @@
 """Regression tests for ComfyUI_SGLDiffusion server-mode bugs found in audit.
 
 Each bug gets a test that fails against the pre-fix code and passes after.
-These stub ComfyUI/ torch-adjacent modules the same way test_h3_request.py
-does, so they run without a ComfyUI install or a GPU.
+These stub ComfyUI/ torch-adjacent modules the same way
+test_comfyui_h3_request.py does, so they run without a ComfyUI install or a GPU.
 """
 
 import base64
@@ -19,7 +19,7 @@ import pytest
 import torch
 from PIL import Image
 
-PLUGIN_DIR = Path(__file__).resolve().parents[1]
+PLUGIN_DIR = Path(__file__).resolve().parents[2] / "apps/ComfyUI_SGLDiffusion"
 PKG = "sgld_server_mode_under_test"
 
 
