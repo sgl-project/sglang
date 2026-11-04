@@ -44,6 +44,18 @@ def _select_recurrent_launch_config(
     ):
         return (8, 4) if n == 1 else (16, 2)
     if (
+        _is_hip
+        and _is_gfx95
+        and is_kda
+        and 0 < n <= 4
+        and h == hv == 12
+        and k == 128
+        and v == 128
+    ):
+        # Kimi-K3 TP8 (12 heads) gets 48 CTAs at BV=32; tuned on MI355X at n=1 and n=4,
+        # where BV=8 is 15.2 vs 19.9 us at n=1, T=8. One warp matches BV=32 bit for bit.
+        return 8, 1
+    if (
         target_verify
         and not _is_hip
         and not is_kda
@@ -263,6 +275,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
+
+    if IS_VARLEN:
+        num_seqs = tl.num_programs(1) if SPLIT_N_HV_GRID else tl.num_programs(2) // HV
+        if i_n == num_seqs - 1:
+            # Graph padding has no tokens in cu_seqlens, so the recurrent loop
+            # never writes its output. Clear the unused tail in the last
+            # sequence's programs, without touching real tokens or state slots.
+            for pad_token in range(eos, all):
+                p_pad = o + ((i_k * all + pad_token) * HV + i_hv) * V + o_v
+                tl.store(p_pad, 0.0, mask=mask_v)
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:

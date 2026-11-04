@@ -4,8 +4,8 @@ import unittest
 
 from transformers.models.qwen2 import Qwen2Config
 
-from sglang.srt.configs import LocateAnythingConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.configs.locate_anything import LocateAnythingConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
