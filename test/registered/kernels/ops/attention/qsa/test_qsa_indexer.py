@@ -245,6 +245,295 @@ def _selected_score_multisets(logits, block_indices):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("rows", [0, 65])
+def test_fused_q_prep_without_cache_store(dtype, rows):
+    device = torch.device("cuda")
+    indexer = _make_indexer(_make_rotary([24, 20, 20], True, device), device)
+    pool = FakePool(128, 32, device, compressed_dtype=dtype)
+    hidden = torch.randn(rows, HIDDEN, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(rows, device=device).expand(3, -1).contiguous()
+    q, k, stored = indexer.project_qk(
+        hidden, positions, pool=pool, rope_max_position=64
+    )
+    q_ref, k_ref, _ = indexer.project_qk(hidden, positions, rope_max_position=64)
+    assert not stored
+    torch.testing.assert_close(k, k_ref)
+    assert torch.count_nonzero(pool.key_state) == 0
+    assert torch.count_nonzero(pool.qsa_rope_position_buffer) == 0
+    assert q.shape == (rows, NUM_Q_HEADS, HEAD_DIM)
+    assert q.dtype == dtype
+    if not rows:
+        return
+    if dtype == torch.float8_e4m3fn:
+        assert_fp8_within_one_ulp(q, q_ref.to(dtype))
+    else:
+        assert_bit_comparable(q, q_ref)
+
+
+def _cp_mqa_ring_case(rank, world, dtype, prefixes, extend, exchange):
+    """Real CP entrypoint oracle; isolate projection with precomputed Q and K."""
+    from sglang.srt.layers.attention.qsa.metadata import (
+        build_pending_ring_slots,
+        build_qsa_prefill_mqa_plan,
+    )
+
+    device = torch.device("cuda", rank)
+    torch.manual_seed(72)
+    lengths = [p + n for p, n in zip(prefixes, extend)]
+    indexer = _make_indexer(_make_rotary([24, 20, 20], True, device), device)
+    indexer.rotary_emb._ensure_cos_sin_cache_length(max(lengths) - 1)
+    width = (max(lengths) + 63) // 64 * 64
+    pages = torch.arange(1, len(lengths) * width // 64 + 1, device=device).flip(0)
+    table = (pages[:, None] * 64 + torch.arange(64, device=device)).reshape(
+        len(lengths), width
+    )
+    pool = FakePool(
+        (len(lengths) + 1) * 4,
+        (len(lengths) * width + 64) // 4,
+        device,
+        compressed_dtype=dtype,
+    )
+    full_keys = torch.randn(
+        sum(lengths), 1, HEAD_DIM, device=device, dtype=torch.bfloat16
+    )
+    full_positions = torch.cat([torch.arange(n, device=device) for n in lengths])
+    full_rope = full_positions[:, None].expand(-1, 3).contiguous()
+    source_start = 0
+    for seq, length in enumerate(lengths):
+        groups = (
+            source_start
+            + torch.arange(length // 4, device=device)[:, None] * 4
+            + torch.arange(4, device=device)
+        )
+        if groups.numel():
+            indexer._fused_compress_store(
+                pool,
+                groups.int(),
+                (table[seq, : length // 4 * 4 : 4] // 4).int(),
+                source_keys=full_keys,
+                source_rope=full_rope,
+            )
+        source_start += length
+    expected_cache = pool.compressed.clone()
+    full_query = torch.randn(sum(extend), NUM_Q_HEADS, HEAD_DIM, device=device).to(
+        dtype
+    )
+    global_positions = torch.cat(
+        [torch.arange(p, n, device=device) for p, n in zip(prefixes, lengths)]
+    )
+    seq_ids = torch.repeat_interleave(
+        torch.arange(len(lengths), device=device), torch.tensor(extend, device=device)
+    )
+    local_positions, q = (
+        global_positions[rank::world],
+        full_query[rank::world].contiguous(),
+    )
+    lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    plan = build_qsa_prefill_mqa_plan(
+        sequence_lengths=lens,
+        sequence_lengths_cpu=lengths,
+        token_slot_table=table,
+        query_positions=local_positions,
+        query_sequence_ids=seq_ids[rank::world],
+        compress_ratio=4,
+    )
+    expected = indexer.select_prefill_tokens(
+        q,
+        pool.compressed[plan.compressed_locs],
+        plan.row_starts,
+        plan.row_ends,
+        local_positions,
+        plan.row_sequence_lengths,
+    )
+    raw_parts, start = [], 0
+    for prefix, length in zip(prefixes, lengths):
+        raw_parts.append(full_keys[start + prefix : start + length])
+        start += length
+    raw = torch.cat(raw_parts)
+    members, writes, ends, start = [], [], [], 0
+    for seq, (prefix, length, added) in enumerate(zip(prefixes, lengths, extend)):
+        groups = torch.arange(added // RATIO, device=device)
+        members.append(start + groups * RATIO)
+        writes.append((table[seq, prefix + groups * RATIO] // RATIO).long())
+        ends.append(prefix + groups * RATIO + RATIO - 1)
+        start += added
+    members, writes, ends = map(torch.cat, (members, writes, ends))
+    pool.compressed[writes] = 0
+    pending_slots = build_pending_ring_slots(
+        token_to_batch_idx=seq_ids,
+        req_pool_indices=torch.arange(1, len(lengths) + 1, device=device),
+        sequence_lengths=lens,
+        logical_positions=global_positions,
+        compress_ratio=4,
+        is_extend=True,
+    )
+    metadata = SimpleNamespace(
+        cp_key_exchange=exchange,
+        token_to_kv_pool=pool,
+        pending_ring_slots=pending_slots,
+        extend_rope_matrix=global_positions[:, None].expand(-1, 3).contiguous(),
+        prefill_mqa_plan=plan,
+        rope_max_position=max(lengths) - 1,
+        is_cuda_graph=False,
+        write_locs=writes,
+        compress_member_rows=members,
+        compress_group_positions=ends,
+        get_token_to_batch_idx=lambda: seq_ids,
+        get_prefill_mqa_inputs=lambda *args, **kwargs: (
+            pool.compressed.index_select(0, plan.compressed_locs),
+            plan.row_starts,
+            plan.row_ends,
+            plan.row_sequence_lengths,
+        ),
+    )
+    from unittest.mock import patch
+
+    from sglang.srt.layers.attention.qsa import qsa_indexer
+    from sglang.srt.layers.cp import ContextParallelStrategyKind
+
+    strategy = SimpleNamespace(
+        kind=ContextParallelStrategyKind.INTERLEAVE, cp_rank=rank, cp_size=world
+    )
+    batch = SimpleNamespace(positions=global_positions, attn_cp_metadata=None)
+    local_keys = raw[rank::world].contiguous()
+
+    def run():
+        with (
+            patch.object(qsa_indexer, "get_cp_strategy", return_value=strategy),
+            patch.object(
+                qsa_indexer,
+                "cp_shard_position_ids",
+                side_effect=lambda value, batch: value[rank::world],
+            ),
+            patch.object(
+                qsa_indexer,
+                "cp_shard_hidden_states",
+                side_effect=lambda value, batch: value[rank::world],
+            ),
+            patch.object(indexer, "project_qk", return_value=(q, local_keys, False)),
+        ):
+            return indexer.forward_cuda_cp(
+                q[:, 0],
+                local_positions,
+                batch,
+                metadata,
+                metadata.extend_rope_matrix.T.contiguous(),
+            )
+
+    def verify(actual):
+        torch.testing.assert_close(
+            pool.compressed.float(), expected_cache.float(), rtol=0, atol=0
+        )
+        # Candidate order is unspecified; identical ties may select different
+        # block IDs. Compare selected scores, and validate tail/causal indices.
+        from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_prefill
+
+        for seq, length in enumerate(lengths):
+            mask = seq_ids[rank::world] == seq
+            if not mask.any():
+                continue
+            keys = pool.compressed[(table[seq, : length // 4 * 4 : 4] // 4).long()]
+            ends = ((local_positions[mask] + 1) // 4).int()
+            logits = torch_qsa_mqa_prefill(q[mask], keys, torch.zeros_like(ends), ends)
+            actual_rows, expected_rows = actual[mask], expected[mask]
+            for i, (a, e) in enumerate(zip(actual_rows, expected_rows)):
+                visible = int(local_positions[mask][i]) + 1
+                n = min(visible // 4, 512) * 4
+                torch.testing.assert_close(a[n:], e[n:], rtol=0, atol=0)
+                assert (a[a >= 0] < visible).all()
+                if n:
+                    aa, ee = a[:n:4].long() // 4, e[:n:4].long() // 4
+                    torch.testing.assert_close(
+                        logits[i, aa].sort().values,
+                        logits[i, ee].sort().values,
+                        rtol=2e-3,
+                        atol=2e-3,
+                    )
+        start = 0
+        for seq, length in enumerate(lengths):
+            tail = length % 4
+            if tail:
+                torch.testing.assert_close(
+                    pool.key_state[(seq + 1) * 4 : (seq + 1) * 4 + tail],
+                    raw[start + extend[seq] - tail : start + extend[seq]],
+                    rtol=0,
+                    atol=0,
+                )
+            start += extend[seq]
+
+    return SimpleNamespace(
+        run=run,
+        verify=verify,
+        indexer=indexer,
+        q=q,
+        raw_keys=raw,
+        positions=local_positions,
+        metadata=metadata,
+        strategy=strategy,
+    )
+
+
+def _cp_mqa_ring_worker(rank, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from sglang.srt.layers.cp.utils import RingKVExchange
+
+    torch.cuda.set_device(rank)
+    publish(ServerArgs(model_path="dummy"), role="test")
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        with torch.inference_mode():
+            exchange = RingKVExchange(
+                group=dist.group.WORLD,
+                capacity=8192,
+                kv_heads=1,
+                head_dim=HEAD_DIM,
+                device=torch.device("cuda", rank),
+                dtype=torch.bfloat16,
+                overlap=True,
+                transport="symm_rma",
+                planes=1,
+            )
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                for prefixes, extend in (
+                    ([0], [8192]),
+                    ([4096, 2048], [2053, 4099]),
+                    ([0], [1]),
+                    ([0, 0], [3, 5]),
+                ):
+                    case = _cp_mqa_ring_case(rank, 2, dtype, prefixes, extend, exchange)
+                    case.verify(case.run())
+                    case.verify(
+                        case.run()
+                    )  # workspace reuse must preserve prior consumers
+                    torch.cuda.synchronize()
+                    dist.barrier()
+    finally:
+        dist.destroy_process_group()
+        reset_context()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_cp_mqa_ring_matches_full_scoring(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _cp_mqa_ring_worker,
+        args=((tmp_path / "rendezvous").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_tilelang_mqa_matches_torch_reference(dtype):
     """TileLang scoring vs the fp32 torch reference on the same operands. The
     selected blocks are compared as score multisets because fp8 ties at the

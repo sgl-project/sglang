@@ -51,7 +51,7 @@ from sglang.srt.layers.cp.zigzag import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel, get_schedule, uses_mla_backend
 from sglang.srt.utils.common import is_pin_memory_available
-from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method, profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -602,6 +602,7 @@ class ShardedContextParallelMetadata(BaseContextParallelMetadata):
     queued_residual: tuple | None = None
     pending_residual: tuple | None = None
     mlp_destination: str | None = None
+    mapped_moe_output: bool = False
     original_non_padded: torch.Tensor | None = None
     total_non_padded: torch.Tensor | None = None
     query_indices: torch.Tensor | None = None
@@ -1295,6 +1296,8 @@ class TokenExchange(msgspec.Struct, frozen=True):
     source_rows: int = -1
     send_identity: bool = False
     restore_identity: bool = False
+    output_destinations: torch.Tensor | None = None
+    peer_copy_ranges: tuple[tuple[int, int, int, int, int, int], ...] = ()
 
     def apply(
         self, value: torch.Tensor, *, group=None, restore_order: bool = True
@@ -1369,9 +1372,41 @@ def make_token_exchange(
     owners[included] = target_owner[target_order[positions[included]]]
     offsets = np.cumsum([0, *map(len, source)])
     local_owners = owners[offsets[rank] : offsets[rank + 1]]
+    target_offsets = np.cumsum([0, *map(len, target)])
+    destination_rows = np.zeros(len(source_flat), dtype=np.int64)
+    destination_rows[included] = (
+        target_order[positions[included]] - target_offsets[owners[included]]
+    )
+    destinations = np.stack(
+        (local_owners, destination_rows[offsets[rank] : offsets[rank + 1]]), axis=1
+    )
     send_indices, send_counts, recv_counts, received = [], [], [], []
+    peer_copy_ranges = []
     for peer in range(world):
         selected = np.flatnonzero(local_owners == peer)
+        target_rows = destinations[selected, 1]
+        source_steps, target_steps = np.diff(selected), np.diff(target_rows)
+        begin = 0
+        while begin < len(selected):
+            end, source_step, target_step = begin + 1, 1, 1
+            if end < len(selected) and target_steps[begin] > 0:
+                source_step, target_step = source_steps[begin], target_steps[begin]
+                changes = np.flatnonzero(
+                    (source_steps[begin:] != source_step)
+                    | (target_steps[begin:] != target_step)
+                )
+                end = begin + int(changes[0]) + 1 if len(changes) else len(selected)
+            peer_copy_ranges.append(
+                (
+                    peer,
+                    int(selected[begin]),
+                    int(target_rows[begin]),
+                    end - begin,
+                    int(source_step),
+                    int(target_step),
+                )
+            )
+            begin = end
         send_indices.append(selected)
         send_counts.append(len(selected))
         peer_slice = slice(offsets[peer], offsets[peer + 1])
@@ -1395,6 +1430,10 @@ def make_token_exchange(
         source_rows=len(source[rank]),
         send_identity=np.array_equal(send_indices, np.arange(len(source[rank]))),
         restore_identity=np.array_equal(restore_indices, np.arange(len(received))),
+        output_destinations=_cp_metadata_tensor(
+            destinations, dtype=torch.long, device=device
+        ),
+        peer_copy_ranges=tuple(peer_copy_ranges),
     )
 
 
@@ -1416,22 +1455,66 @@ class PendingTokenExchange:
 
 
 class TokenExchangeStream:
-    """Overlap residual layout work with expert computation.
+    """Overlap residual layout work with independent FFN computation.
 
-    Submit after the MoE input gather. Reuse its NCCL group so collectives on
-    that group's communication stream run in order: gather, residual exchange,
-    output reduce-scatter. Pure EP has no input gather; its next hidden exchange
-    follows the residual exchange on the same group. A separate CUDA stream keeps
-    residual packing independent of expert compute. The group is borrowed;
-    its lifetime remains owned by the caller.
+    Symmetric copies write precomputed row ranges into persistent target-order
+    buffers. Producer events and peer credits protect their alternating slots.
+    The NCCL path keeps the MoE group's input/output collective order.
     """
 
-    def __init__(self, *, group, device):
+    def __init__(
+        self, *, group, device, capacity=0, features=0, dtype=None, transport="nccl"
+    ):
         self.group = group
         self.stream = torch.cuda.Stream(device=device)
+        self.workspace = None
+        self.slot = 0
+        if transport == "symm_rma":
+            from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
+            from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+                TorchSymmMemCommunicator,
+            )
+
+            if capacity <= 0 or features <= 0 or dtype is None:
+                raise ValueError("Symmetric token exchange requires bounded storage")
+            load_ipc_a2a_sync()
+            communicator = TorchSymmMemCommunicator.get(group, device)
+            with torch.cuda.stream(self.stream):
+                self.workspace = communicator.allocate_peer_workspace(
+                    (2, capacity, features),
+                    dtype,
+                    signal_shape=(2, dist.get_world_size(group), 2),
+                )
+        elif transport != "nccl":
+            raise ValueError(f"Unsupported token transport: {transport}")
+
+    def _copy_peers(self, plan, value):
+        workspace = self.workspace
+        _, capacity, features = workspace.buffers.shape
+        received = sum(plan.recv_counts)
+        if (
+            value.shape[0] != plan.source_rows
+            or sum(row_range[3] for row_range in plan.peer_copy_ranges)
+            != sum(plan.send_counts)
+            or received > capacity
+            or math.prod(value.shape[1:]) != features
+            or value.dtype != workspace.buffers.dtype
+            or value.device != workspace.buffers.device
+            or not value.is_contiguous()
+        ):
+            raise ValueError("Token exchange does not match its reserved workspace")
+        workspace.communicator.exchange_peer_rows(
+            workspace, value, plan.peer_copy_ranges, slot=self.slot
+        )
+        output = workspace.buffers[self.slot, :received].view(
+            received, *value.shape[1:]
+        )
+        self.slot ^= 1
+        return output
 
     @profile_method("sglang.cp.residual_exchange")
     def submit(self, plan, value, *, ready=None, restore_order=True):
+        """Submit device work; the returned handle waits only on its consumer stream."""
         if ready is None:
             self.stream.wait_stream(torch.cuda.current_stream(value.device))
         else:
@@ -1440,14 +1523,21 @@ class TokenExchangeStream:
         plan.send_indices.record_stream(self.stream)
         plan.restore_indices.record_stream(self.stream)
         with torch.cuda.stream(self.stream):
-            output = plan.apply(value, group=self.group, restore_order=restore_order)
+            if self.workspace is not None:
+                output = self._copy_peers(plan, value)
+            else:
+                output = plan.apply(
+                    value, group=self.group, restore_order=restore_order
+                )
             ready = self.stream.record_event()
         return PendingTokenExchange(
             output,
             ready,
             (
                 plan.restore_indices
-                if not restore_order and not plan.restore_identity
+                if self.workspace is None
+                and not restore_order
+                and not plan.restore_identity
                 else None
             ),
         )
@@ -1810,6 +1900,7 @@ class RingKVExchange:
         dtype: torch.dtype,
         overlap: bool,
         transport: str | None = None,
+        planes: int = 2,
     ):
         self.group = group
         self.rank = dist.get_rank(group)
@@ -1818,7 +1909,10 @@ class RingKVExchange:
         self.comm_stream = torch.cuda.Stream(device=device) if overlap else self.stream
         self.overlap = overlap
         self.initialization_ready = None
-        shape = (2, 2, max(capacity, 1), kv_heads, head_dim)
+        if planes not in (1, 2):
+            raise ValueError("Ring transport supports K or K/V payloads")
+        self.planes = planes
+        shape = (2, planes, max(capacity, 1), kv_heads, head_dim)
         self.transport = transport or "nccl"
         self.rma = None
         if self.transport == "symm_rma":
@@ -1850,7 +1944,10 @@ class RingKVExchange:
         reusable: torch.cuda.Event | None,
         active_tokens: int,
     ):
-        with torch.cuda.stream(self.comm_stream):
+        with (
+            torch.cuda.stream(self.comm_stream),
+            profile_range("sglang.cp.ring.transfer"),
+        ):
             self.comm_stream.wait_event(ready)
             if reusable is not None:
                 self.comm_stream.wait_event(reusable)
@@ -1865,9 +1962,9 @@ class RingKVExchange:
                     send_slot=current,
                     recv_slot=1 - current,
                     signal_slot=1 - current,
-                    byte_ranges=(
-                        (0, plane_bytes),
-                        (self.capacity * token_bytes, plane_bytes),
+                    byte_ranges=tuple(
+                        (plane * self.capacity * token_bytes, plane_bytes)
+                        for plane in range(self.planes)
                     ),
                 )
             else:
@@ -1884,7 +1981,7 @@ class RingKVExchange:
         # Each plane prefix is contiguous; the K/V pair has a capacity-sized
         # gap and cannot be sent as one shortened contiguous tensor.
         operations = []
-        for plane in range(2):
+        for plane in range(self.planes):
             operations.extend(
                 [
                     dist.P2POp(
@@ -1922,7 +2019,8 @@ class RingKVExchange:
         active_tokens = self.capacity if active_tokens is None else active_tokens
         if (
             not 0 <= local_kv.shape[1] <= active_tokens <= self.capacity
-            or local_kv.shape != (2, local_kv.shape[1], self.kv_heads, self.head_dim)
+            or local_kv.shape
+            != (self.planes, local_kv.shape[1], self.kv_heads, self.head_dim)
             or local_kv.dtype != self.buffers.dtype
             or local_kv.device != self.buffers.device
         ):

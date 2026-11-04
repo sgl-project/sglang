@@ -557,6 +557,62 @@ class TorchSymmMemCommunicator:
             )
         )
 
+    def exchange_peer_rows(self, workspace, value, ranges, *, slot):
+        """Copy preplanned strided rows directly into each peer's target layout.
+
+        Ranges specify peer, source row, target row, count and both row strides.
+        All ranks grant overwrite credit and publish arrival even for empty data.
+        The caller orders readiness and previous consumers on this stream.
+        """
+        if (
+            workspace.communicator is not self
+            or workspace.buffers is None
+            or workspace.signals is None
+            or tuple(workspace.signals.shape) != (2, self.world_size, 2)
+            or slot not in (0, 1)
+            or torch.cuda.current_stream(self.device) != workspace.stream
+        ):
+            raise ValueError("Peer row exchange requires its own workspace and stream")
+        from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
+
+        _, capacity, features = workspace.buffers.shape
+        row_bytes = features * value.element_size()
+        copies = []
+        for peer, source, target, count, source_step, target_step in ranges:
+            if not (
+                0 <= peer < self.world_size
+                and min(source, target) >= 0
+                and min(count, source_step, target_step) > 0
+                and source + (count - 1) * source_step < value.shape[0]
+                and target + (count - 1) * target_step < capacity
+            ):
+                raise ValueError("Peer row range exceeds its reserved storage")
+            copies.extend(
+                (
+                    value.data_ptr() + source * row_bytes,
+                    workspace.peers[peer].data_ptr()
+                    + (slot * capacity + target) * row_bytes,
+                    row_bytes,
+                    count,
+                    source_step * row_bytes,
+                    target_step * row_bytes,
+                )
+            )
+        generation = (workspace.generations[slot] + 1) & 0xFFFFFFFF
+        workspace.generations[slot] = generation
+        base = slot * self.world_size * 2
+        signals = []
+        for peer in range(self.world_size):
+            if peer != self.rank:
+                credit_write = workspace.signal_ptrs[peer] + 4 * (base + 2 * self.rank)
+                credit_wait = workspace.signal_ptrs[self.rank] + 4 * (base + 2 * peer)
+                signals.extend(
+                    (credit_write, credit_wait, credit_write + 4, credit_wait + 4)
+                )
+        load_ipc_a2a_sync().copy_peer_strided(
+            signals, copies, workspace.stream.cuda_stream, generation
+        )
+
     def broadcast(self, workspace, value, owner):
         if workspace.communicator is not self or workspace.buffers is None:
             raise ValueError(

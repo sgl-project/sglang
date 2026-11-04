@@ -173,9 +173,9 @@ def launch_cp_residual_exchange(metadata):
     metadata.queued_residual = None
 
 
-def finish_sharded_cp_ffn(hidden_states, residual, *, forward_batch):
+def finish_sharded_cp_ffn(hidden_states, residual, *, forward_batch, update=None):
     """Complete the TP sum while returning rows for the next hybrid layer."""
-    metadata = forward_batch.prefill_cp_metadata
+    metadata = forward_batch.layer_cp_metadata
     if metadata.queued_residual is not None:
         raise RuntimeError("Deferred residual exchange missed its MoE compute window")
     if metadata.moe_tp:
@@ -192,6 +192,30 @@ def finish_sharded_cp_ffn(hidden_states, residual, *, forward_batch):
         forward_batch.num_token_non_padded = metadata.local_token_count(
             hidden_states.shape[0]
         )
+    if metadata.mapped_moe_output:
+        destination = metadata.mlp_destination
+        if (
+            metadata.pending_residual is None
+            or metadata.pending_residual[0] != destination
+        ):
+            raise RuntimeError("Mapped MoE output has no matching residual transfer")
+        pending = metadata.pending_residual[1]
+        if update is not None and not update.is_plain_add:
+            residual = update.rearrange_residual(residual, lambda _: pending.wait())
+        else:
+            residual = pending.wait()
+        metadata.pending_residual = None
+        metadata.current = destination
+        metadata.mapped_moe_output = False
+    if update is not None and update.applied_at_exit:
+        hidden_states = update.update(hidden_states, residual)
+        residual = None
+        if metadata.current == metadata.layout_names["attention"]:
+            from sglang.srt.layers.cp.padding import pad_local_rows
+
+            hidden_states = pad_local_rows(
+                hidden_states, forward_batch.attn_cp_metadata, dim=0
+            )
     metadata.mlp_destination = None
     return hidden_states, residual
 

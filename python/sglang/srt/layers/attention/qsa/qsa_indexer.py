@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -163,6 +164,7 @@ class QSAIndexer(MultiPlatformOp):
         self._rope_axis_map_cache = axis_map.to(device)
         return self._rope_axis_map_cache
 
+    @profile_method("sglang.attention.qsa.prepare_qk")
     def project_qk(
         self,
         hidden_states: torch.Tensor,
@@ -172,16 +174,22 @@ class QSAIndexer(MultiPlatformOp):
         q_heads_padded: int | None = None,
         ensure_cos_sin_cache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        if hidden_states.shape[0] == 0:
+            q_dtype = (
+                pool.qsa_compressed_dtype if pool is not None else hidden_states.dtype
+            )
+            return (
+                hidden_states.new_empty(
+                    (0, self.index_n_heads, self.index_head_dim), dtype=q_dtype
+                ),
+                hidden_states.new_empty((0, self.index_kv_heads, self.index_head_dim)),
+                False,
+            )
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
         )
-        if (
-            pool is not None
-            and cache_loc is not None
-            and qk.shape[0] > 0
-            and self._use_fused_prep(qk)
-        ):
+        if pool is not None and qk.shape[0] > 0 and self._use_fused_prep(qk):
             from sglang.kernels.ops.attention.qsa_indexer import (
                 qsa_index_q_norm_rope_store,
             )
@@ -201,7 +209,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.rotary_emb.cos_sin_cache,
                 self._rope_axis_map(qk.device),
                 self.q_layernorm.weight.data,
-                cache_loc[: qk.shape[0]].long(),
+                cache_loc[: qk.shape[0]].long() if cache_loc is not None else None,
                 key_state_buffer.view(key_state_buffer.shape[0], -1),
                 pool.qsa_rope_position_buffer,
                 self.index_n_heads,
@@ -211,7 +219,7 @@ class QSAIndexer(MultiPlatformOp):
                 q_heads_padded=q_heads_padded,
                 out_dtype=pool.qsa_compressed_dtype,
             )
-            return q, token_k, True
+            return q, token_k, cache_loc is not None
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
@@ -655,20 +663,21 @@ class QSAIndexer(MultiPlatformOp):
         # Raw keys of all new tokens in global packed order: the ring store
         # and compression use the global write plan unchanged. Cached prefix
         # groups already reside in the compressed-K pool on every rank.
-        token_k_local = token_k.reshape(num_local, -1).contiguous()
+        token_k_local = token_k.reshape(
+            num_local, self.index_kv_heads * self.index_head_dim
+        ).contiguous()
         if interleave:
             exchange = indexer_metadata.cp_key_exchange
             if exchange is None:
                 raise RuntimeError("QSA indexer ring workspace was not prepared")
             local = token_k_local.reshape(-1, self.index_kv_heads, self.index_head_dim)
-            # Reuse the two-plane ring transport; indexer compression consumes
-            # global raw keys while attention consumes KV shards incrementally.
+            # Indexer exchanges only raw K; it has no V plane.
             token_k_full = local.new_empty(
                 (num_global, self.index_kv_heads, self.index_head_dim)
             )
             active = (num_global + strategy.cp_size - 1) // strategy.cp_size
             for owner, payload in exchange.shards(
-                torch.stack((local, local)), active_tokens=active
+                local.unsqueeze(0), active_tokens=active
             ):
                 count = len(range(owner, num_global, strategy.cp_size))
                 token_k_full[owner :: strategy.cp_size].copy_(payload[0, :count])

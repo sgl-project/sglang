@@ -1762,7 +1762,13 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        *,
+        output_layout=None,
+        shared_output=None,
+        shared_gate=None,
     ):
+        if output_layout is not None and not get_exec().moe.enable_mxfp4_mega:
+            raise ValueError("Mapped MoE output requires an MXFP4 Mega workspace")
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1778,7 +1784,15 @@ class FusedMoE(torch.nn.Module):
             )
             # The symmetric workspace is shared by layers. Return owned storage
             # before the model adds shared experts or the next layer reuses it.
-            return run_experts(self, hidden_states, topk_output, workspace).clone()
+            return run_experts(
+                self,
+                hidden_states,
+                topk_output,
+                workspace,
+                output_layout=output_layout,
+                shared_output=shared_output,
+                shared_gate=shared_gate,
+            ).clone()
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_bypassed(topk_output) and (
                 topk_output.expert_location_dispatch_info is not None

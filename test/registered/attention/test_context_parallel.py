@@ -66,6 +66,7 @@ def make_cp_attention_layout(**kwargs):
 def _prepare_attention_layout(frame, hidden, residual, batch, layout, norm=None):
     """Exercise the production residual boundary while isolating token movement."""
     batch.prefill_cp_metadata = frame
+    batch.layer_cp_metadata = frame
     stream = ResidualStream(residual)
     if residual is not None:
         hidden = stream.record(hidden, PLAIN_ADD)
@@ -1673,6 +1674,40 @@ class TestContextParallelMetadata(unittest.TestCase):
                         allow_subset=subset,
                     )
 
+    def test_combine_destinations_preserve_token_identity(self):
+        for lengths in ((0,), (1,), (129, 1, 0), (513, 65), (16384,)):
+            contiguous = contiguous_chunk_indices(lengths, 2)
+            interleaved = tuple(tuple(range(r, sum(lengths), 2)) for r in range(2))
+            for source, target in (
+                (contiguous, interleaved),
+                (interleaved, contiguous),
+                (contiguous, tuple(rows[::2] for rows in interleaved)),
+            ):
+                expected = {
+                    token: (rank, row)
+                    for rank, rows in enumerate(target)
+                    for row, token in enumerate(rows)
+                }
+                for rank in range(2):
+                    with (
+                        self.subTest(lengths=lengths, rank=rank),
+                        patch("torch.distributed.get_rank", return_value=rank),
+                    ):
+                        plan = make_token_exchange(
+                            source=source,
+                            target=target,
+                            group=self.parallel.attn_cp_group.device_group,
+                            device=torch.device("cpu"),
+                            allow_subset=True,
+                        )
+                        destinations = plan.output_destinations.tolist()
+                        self.assertEqual(len(destinations), len(source[rank]))
+                        for token, (peer, row) in zip(source[rank], destinations):
+                            if token in expected:
+                                self.assertEqual((peer, row), expected[token])
+                            else:
+                                self.assertEqual(peer, -1)
+
 
 def _collective_cases(rank, world):
     device = torch.device("cuda", rank)
@@ -1725,6 +1760,8 @@ def _collective_cases(rank, world):
                         count = torch.tensor(len(target[rank]), device=device)
                         frame = SimpleNamespace(
                             layout_names={"source": "source", "target": "target"},
+                            token_layouts={"source": source, "target": target},
+                            rank=rank,
                             current="source",
                             pending_residual=None,
                             exchange_plan=lambda source, target: exchange,
@@ -1789,9 +1826,61 @@ def _token_worker(rank, world, port):
     )
     try:
         _collective_cases(rank, world)
+        _symmetric_residual_cases(rank, world)
         torch.cuda.synchronize()
     finally:
         dist.destroy_process_group()
+
+
+def _symmetric_residual_cases(rank, world):
+    device = torch.device("cuda", rank)
+    for dtype in (torch.bfloat16, torch.float32):
+        exchange = TokenExchangeStream(
+            group=dist.group.WORLD,
+            device=device,
+            capacity=16384,
+            features=4 * 17,
+            dtype=dtype,
+            transport="symm_rma",
+        )
+        storage = exchange.workspace.buffers.data_ptr()
+        for lengths in ((0,), (1,), (3, 5), (129, 1, 0), (8192,), (16384,)):
+            tokens = sum(lengths)
+            reference = (torch.arange(tokens * 68, device=device) % 79).to(dtype)
+            reference = reference.view(tokens, 4, 17)
+            layouts = (
+                contiguous_chunk_indices(lengths, world),
+                tuple(tuple(range(peer, tokens, world)) for peer in range(world)),
+            )
+            if tokens <= 130:
+                layouts += (tuple(tuple(reversed(rows)) for rows in layouts[1]),)
+            local = reference[list(layouts[0][rank])]
+            # Consume a workspace view as the next sender, reusing both slots.
+            # This catches premature reuse and missing producer/consumer events.
+            with torch.inference_mode():
+                for step in range(6):
+                    source = layouts[step % len(layouts)]
+                    target = layouts[(step + 1) % len(layouts)]
+                    plan = make_token_exchange(
+                        source=source,
+                        target=target,
+                        group=dist.group.WORLD,
+                        device=device,
+                    )
+                    ready = torch.cuda.current_stream().record_event()
+                    with patch.object(
+                        type(plan), "apply", side_effect=AssertionError("NCCL fallback")
+                    ):
+                        pending = exchange.submit(
+                            plan, local, ready=ready, restore_order=False
+                        )
+                    local = pending.wait()
+                    torch.testing.assert_close(
+                        local, reference[list(target[rank])], rtol=0, atol=0
+                    )
+                    assert exchange.workspace.buffers.data_ptr() == storage
+        exchange.stream.synchronize()
+        exchange.workspace.close()
 
 
 class TestCPTokenLayout(unittest.TestCase):
@@ -1871,8 +1960,8 @@ class TestCPDecoderParticipation(unittest.TestCase):
         from sglang.srt.models import qwen2_moe
 
         for rows in (0, 1, 17):
-            for cp in (False, True):
-                with self.subTest(rows=rows, cp=cp):
+            for cp, mapped in ((False, False), (True, False), (True, True)):
+                with self.subTest(rows=rows, cp=cp, mapped=mapped):
                     calls = []
                     hidden = torch.ones((rows, 4))
                     pending = object()
@@ -1890,9 +1979,14 @@ class TestCPDecoderParticipation(unittest.TestCase):
                         pending_residual=None,
                         residual_exchange=SimpleNamespace(submit=submit),
                         moe_tp=False,
+                        current="contiguous",
+                        mlp_destination="attention" if mapped else "contiguous",
                     )
 
-                    def experts(value, topk):
+                    def experts(value, topk, **kwargs):
+                        self.assertIs(
+                            kwargs.get("output_layout"), metadata if mapped else None
+                        )
                         self.assertEqual(calls, ["residual"] if cp else [])
                         if cp:
                             self.assertIsNone(metadata.queued_residual)
@@ -1900,7 +1994,18 @@ class TestCPDecoderParticipation(unittest.TestCase):
                                 metadata.pending_residual, ("attention", pending)
                             )
                         calls.append("experts")
-                        return value
+                        return value.new_ones((rows + int(mapped), 4))
+
+                    def shared_experts(value, **kwargs):
+                        if mapped:
+                            self.assertEqual(calls, ["residual"])
+                            self.assertIsNone(metadata.queued_residual)
+                        return None
+
+                    def router(value):
+                        if mapped:
+                            self.assertEqual(calls, ["residual"])
+                        return value, None
 
                     layer = SimpleNamespace(
                         _use_mega_moe=False,
@@ -1908,10 +2013,10 @@ class TestCPDecoderParticipation(unittest.TestCase):
                         alt_stream=None,
                         reduce_results=False,
                         enable_shared_expert_fusion=False,
-                        gate=lambda value: (value, None),
+                        gate=router,
                         topk=Mock(return_value=object()),
                         experts=experts,
-                        _forward_shared_experts=lambda value, **kwargs: None,
+                        _forward_shared_experts=shared_experts,
                     )
                     layer._forward_router_experts = MethodType(
                         qwen2_moe.Qwen2MoeSparseMoeBlock._forward_router_experts, layer
@@ -1922,17 +2027,30 @@ class TestCPDecoderParticipation(unittest.TestCase):
                             for name in ("deepep", "deepep_v2", "mori", "ascend_fuseep")
                         }
                     )
-                    with patch.object(
-                        qwen2_moe, "get_moe_a2a_backend", return_value=backend
+                    with (
+                        patch.object(
+                            qwen2_moe, "get_moe_a2a_backend", return_value=backend
+                        ),
+                        patch.object(
+                            qwen2_moe,
+                            "get_exec",
+                            return_value=SimpleNamespace(
+                                moe=SimpleNamespace(enable_mxfp4_mega=mapped)
+                            ),
+                        ),
                     ):
                         output = qwen2_moe.Qwen2MoeSparseMoeBlock.forward(
                             layer,
                             hidden,
                             SimpleNamespace(
-                                prefill_cp_metadata=metadata if cp else None
+                                prefill_cp_metadata=metadata if cp else None,
+                                layer_cp_metadata=metadata if cp else None,
+                                moe_num_token_non_padded=lambda: torch.tensor(rows),
                             ),
                         )
-                    torch.testing.assert_close(output, hidden)
+                    torch.testing.assert_close(
+                        output, hidden.new_ones((rows + int(mapped), 4))
+                    )
                     self.assertEqual(
                         calls, ["residual", "experts"] if cp else ["experts"]
                     )

@@ -18,6 +18,7 @@ _BUFFERS = {}
 _BUFFER_STREAMS = {}
 _REPORTED_WORKSPACES = set()
 _BUFFER_READY = {}
+_OUTPUT_WORKSPACES = {}
 
 
 def enabled():
@@ -174,6 +175,25 @@ def warmup_experts(experts, *, device, dtype, context_len):
                 buf,
                 process_group=group.device_group,
             )
+        if args.attn_cp_size > 1 and args.attn_cp_size == world:
+            from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+                TorchSymmMemCommunicator,
+            )
+
+            communicator = TorchSymmMemCommunicator.get(group.cpu_group, device)
+            output = communicator.allocate_peer_workspace((capacity, hidden), dtype)
+            destinations = torch.full(
+                (capacity, 2), -1, device=device, dtype=torch.int64
+            )
+            shared = torch.zeros((capacity, hidden), device=device, dtype=dtype)
+            peers = output.peer_ptrs.view(torch.int64)
+            _OUTPUT_WORKSPACES[key] = (
+                output,
+                destinations,
+                peers,
+                shared,
+                torch.ones(capacity, device=device, dtype=torch.float32),
+            )
         _BUFFERS[key] = buf
         _BUFFER_STREAMS[key] = torch.cuda.current_stream(device)
         logger.info(
@@ -188,6 +208,17 @@ def warmup_experts(experts, *, device, dtype, context_len):
     sm90.hopper_mxfp4_mega_launch_thunk(
         experts.mega_l1_weights, experts.mega_l2_weights, buf
     )
+    if key in _OUTPUT_WORKSPACES:
+        _, destinations, peers, shared, gates = _OUTPUT_WORKSPACES[key]
+        sm90.hopper_mxfp4_mega_launch_thunk(
+            experts.mega_l1_weights,
+            experts.mega_l2_weights,
+            buf,
+            output_destinations=destinations,
+            output_peer_ptrs=peers,
+            shared_output=shared,
+            shared_gate=gates,
+        )
     _BUFFER_READY[key] = torch.cuda.current_stream(device).record_event()
     experts._sm90_mega_workspace = (buf, key)
 
@@ -216,7 +247,16 @@ def prepare_workspace(experts, hidden_states, *, num_experts, top_k):
     return workspace
 
 
-def run_experts(experts, hidden_states, routing, workspace):
+def run_experts(
+    experts,
+    hidden_states,
+    routing,
+    workspace,
+    *,
+    output_layout=None,
+    shared_output=None,
+    shared_gate=None,
+):
     """Execute already-routed tokens and return a borrowed view of the workspace.
 
     The caller must copy/add into owned storage before another layer reuses it.
@@ -239,11 +279,41 @@ def run_experts(experts, hidden_states, routing, workspace):
         quantize_input=True,
         safe_quantization=True,
     )
-    if getattr(experts, "_sm90_mega_thunk_key", None) != key:
-        experts._sm90_mega_thunk = hopper_mxfp4_mega_launch_thunk(
-            experts.mega_l1_weights, experts.mega_l2_weights, buf
+    mapped = output_layout is not None
+    thunk_key = (key, mapped)
+    extra = {}
+    if mapped:
+        if key not in _OUTPUT_WORKSPACES:
+            raise ValueError("Mapped combine requires a shared pure CP/EP group")
+        output, destinations, peers, shared, gates = _OUTPUT_WORKSPACES[key]
+        plan = output_layout.exchange_plan(
+            output_layout.current, output_layout.mlp_destination
         )
-        experts._sm90_mega_thunk_key = key
+        count = plan.output_destinations.shape[0]
+        if count > hidden_states.shape[0]:
+            raise ValueError("MoE output map exceeds the local input rows")
+        destinations.fill_(-1)
+        destinations[:count].copy_(plan.output_destinations)
+        if shared_output is None:
+            shared.zero_()
+        else:
+            shared[:count].copy_(shared_output[:count])
+        if shared_gate is None:
+            gates.fill_(1)
+        else:
+            gates[:count].copy_(shared_gate[:count])
+        extra = dict(
+            output_destinations=destinations,
+            output_peer_ptrs=peers,
+            shared_output=shared,
+            shared_gate=gates,
+        )
+        output.data_handle.barrier(channel=0)
+    if getattr(experts, "_sm90_mega_thunk_key", None) != thunk_key:
+        experts._sm90_mega_thunk = hopper_mxfp4_mega_launch_thunk(
+            experts.mega_l1_weights, experts.mega_l2_weights, buf, **extra
+        )
+        experts._sm90_mega_thunk_key = thunk_key
     if key not in _REPORTED_WORKSPACES:
         workspace = buf._frontend._mega
         logger.info(
@@ -257,4 +327,13 @@ def run_experts(experts, hidden_states, routing, workspace):
         )
         _REPORTED_WORKSPACES.add(key)
     experts._sm90_mega_thunk()
+    if mapped:
+        output.data_handle.barrier(channel=1)
+        output_layout.mapped_moe_output = True
+        rows = len(
+            output_layout.token_layouts[output_layout.mlp_destination][
+                output_layout.rank
+            ]
+        )
+        return output.buffers[:rows]
     return buf.output_activation[: hidden_states.shape[0]]

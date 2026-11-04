@@ -312,6 +312,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         strategy = get_cp_strategy()
         if strategy is None or strategy.kind != ContextParallelStrategyKind.INTERLEAVE:
             return
+        from sglang.srt.layers.attention.qsa.mqa import warmup_qsa_mqa_prefill
         from sglang.srt.layers.attention.qsa.sparse_attn import (
             warmup_cp_sparse_attention,
         )
@@ -330,6 +331,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             topk=config.indexer_budget + config.indexer_compress_ratio - 1,
             cp_size=strategy.cp_size,
             max_local_tokens=(tokens + strategy.cp_size - 1) // strategy.cp_size,
+        )
+        warmup_qsa_mqa_prefill(
+            device=self.device,
+            dtype=self.token_to_kv_pool.qsa_compressed_dtype,
+            heads=config.indexer_n_heads,
+            head_dim=config.indexer_head_dim,
         )
 
     @staticmethod
@@ -891,6 +898,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             **common,
             kv_heads=config.indexer_kv_heads,
             head_dim=config.indexer_head_dim,
+            planes=1,
         )
 
     @staticmethod

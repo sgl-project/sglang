@@ -738,6 +738,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.linear_attn_backends = backends
         self._gdn_cp_plan = None
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        self._cp_residual_exchange = None
+        if self.kernel_dispatcher.use_context_parallel:
+            from sglang.srt.distributed import get_attn_cp_group
+            from sglang.srt.layers.cp.utils import TokenExchangeStream
+
+            self._cp_residual_exchange = (
+                model_runner.cp_residual_exchange
+                or TokenExchangeStream(
+                    group=get_attn_cp_group().device_group, device=self.device
+                )
+            )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -920,6 +931,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cp_mode="round-robin-split",
             attention_indices=attention_indices,
             previous=self._gdn_cp_plan,
+            residual_exchange=self._cp_residual_exchange,
         )
         metadata.gdn_conv_metadata = tuple(
             make_gdn_cp_conv_metadata(metadata, device="cpu")

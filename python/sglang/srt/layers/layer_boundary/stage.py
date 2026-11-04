@@ -184,7 +184,7 @@ class StageBoundary:
             Updates forward_batch.residual_stream with the resulting residual.
         """
         if (
-            forward_batch.prefill_cp_metadata is not None
+            getattr(forward_batch, "layer_cp_metadata", None) is not None
             and self.declaration.cp_layout is not None
         ):
             from sglang.srt.layers.layer_boundary.prepare import (
@@ -206,6 +206,7 @@ class StageBoundary:
                     stream,
                     forward_batch,
                     self.norm,
+                    read=self.declaration.read,
                     layout=self.declaration.cp_layout,
                     quant_format=call.get("quant_format", ""),
                     post_residual_addition=call.get("post_residual_addition"),
@@ -215,6 +216,7 @@ class StageBoundary:
                 stream,
                 forward_batch,
                 self.norm,
+                read=self.declaration.read,
                 next_layout=self.declaration.cp_next_layout,
                 defer_cp_residual=self.declaration.sparse,
             )
@@ -235,7 +237,10 @@ class StageBoundary:
         actual contribution, or an FFN's or a mixer's output with its sum
         completed or carried on. An FFN whose boundary has fusions (which may
         take a MoE finalize handoff) finishes through exit() instead."""
-        if self.declaration.row_transport is not None:
+        if self.declaration.row_transport is not None and (
+            self.declaration.cp_layout is None
+            or getattr(forward_batch, "layer_cp_metadata", None) is None
+        ):
             with self.exit(forward_batch, update_context=update_context) as output:
                 return output.finish(hidden_states)
         if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
@@ -285,7 +290,10 @@ class StageBoundary:
             when compute is skipped for an empty input. It completes or carries work
             using the same decision rather than selecting a second path.
         """
-        if self.declaration.row_transport is not None:
+        if self.declaration.row_transport is not None and (
+            self.declaration.cp_layout is None
+            or getattr(forward_batch, "layer_cp_metadata", None) is None
+        ):
             return TransportExit(self, forward_batch, update_context=update_context)
         result = (
             self.plan.output.ffn_exit(

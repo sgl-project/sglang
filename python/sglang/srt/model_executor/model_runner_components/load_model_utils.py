@@ -471,7 +471,7 @@ def warmup_context_parallel(self):
     from sglang.srt.layers.attention.linear.gdn_backend import (
         warmup_gdn_prefill,
     )
-    from sglang.srt.layers.cp.utils import warmup_copy_token_rows
+    from sglang.srt.layers.cp.utils import TokenExchangeStream, warmup_copy_token_rows
     from sglang.srt.layers.layernorm import warmup_indexed_add_rmsnorm
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
     from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -505,6 +505,22 @@ def warmup_context_parallel(self):
         )
     chunk_size = get_schedule().chunked_prefill_size
     tokens = chunk_size if (chunk_size or 0) > 0 else get_schedule().max_prefill_tokens
+    if (
+        get_exec().moe.enable_mxfp4_mega
+        and get_parallel().moe_tp_size == 1
+        and self.server_args.attn_cp_transport == "symm_rma"
+    ):
+        # Reserve before KV budgeting, shared by the hybrid attention backends.
+        # A ragged batch can put every short request on rank zero.
+        features = config.hidden_size * getattr(config, "hc_count", 1)
+        self.cp_residual_exchange = TokenExchangeStream(
+            group=cp_group.device_group,
+            device=device,
+            capacity=tokens,
+            features=features,
+            dtype=self.dtype,
+            transport="symm_rma",
+        )
     alignment = 64 * cp_group.world_size
     warmup_gdn_prefill(
         device=device,

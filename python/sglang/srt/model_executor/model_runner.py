@@ -1022,6 +1022,7 @@ class ModelRunner:
         from sglang.srt.layers.cp.utils import is_gdn_cp_enabled, is_sharded_cp_enabled
 
         self.cp_kv_exchange = None
+        self.cp_residual_exchange = None
         if is_gdn_cp_enabled():
             from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
             from sglang.srt.model_executor.model_runner_components.load_model_utils import (

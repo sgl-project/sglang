@@ -226,6 +226,18 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
 
 
 @contextmanager
+def _qwen_cp_planning():
+    with (
+        patch("sglang.srt.layers.cp.utils.is_gdn_cp_enabled", return_value=False),
+        patch(
+            "sglang.srt.models.qwen4_exp.get_exec",
+            lambda: SimpleNamespace(moe=SimpleNamespace(enable_mxfp4_mega=False)),
+        ),
+    ):
+        yield
+
+
+@contextmanager
 def planning(
     parallel,
     *,
@@ -245,6 +257,7 @@ def planning(
 
     with (
         patch_communicator("get_parallel", get_parallel),
+        _qwen_cp_planning(),
         patch_communicator("is_dsa_enable_prefill_cp", lambda: dsa_cp),
         patch_communicator("is_mla_cp_enabled", lambda: False),
         patch_communicator(

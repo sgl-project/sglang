@@ -45,6 +45,8 @@ class GatedResidualState:
         ffn_mix: The FFN stage's read.
         attn_combine: Writes the attention output back into the streams.
         ffn_combine: Writes the FFN output back into the streams.
+        ffn_norm: Recomputes the row-local normalized residual after CP moves
+            the streams, without transferring a second copy of the wide tensor.
         attn_reads_every_row: Whether attn_mix needs every row of the
             attention's, as a contribution computed for all of them does.
     """
@@ -55,6 +57,7 @@ class GatedResidualState:
     attn_combine: Callable
     ffn_combine: Callable
     attn_reads_every_row: bool = False
+    ffn_norm: Optional[Callable] = None
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
     gate_partials: Optional[torch.Tensor] = None
@@ -72,8 +75,12 @@ class GatedResidualState:
     def read_attn_input(self, residual, out_norm=None):
         return self._read(self.attn_mix, residual, out_norm)
 
-    def update_and_read_ffn_input(self, hidden_states, residual, out_norm=None):
+    def update_and_read_ffn_input(
+        self, hidden_states, residual, out_norm=None, *, on_residual_ready=None
+    ):
         residual = self.apply_attn_combine(hidden_states, residual)
+        if on_residual_ready is not None:
+            on_residual_ready(residual)
         return self._read(self.ffn_mix, residual, out_norm)
 
     def apply_attn_combine(self, hidden_states, residual):
@@ -201,6 +208,7 @@ class _FfnReadout:
     gathering_reads = ()
     reads_before_dp_gather = False
     reads_after_attn_tp_gather = False
+    publishes_residual_before_read = True
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -213,13 +221,18 @@ class _FfnReadout:
             "a gated hyper-connection FFN input read without its attention"
         )
 
-    def update_and_read(self, update, hidden_states, residual, norm, **kwargs):
+    def update_and_read(
+        self, update, hidden_states, residual, norm, *, on_residual_ready=None, **kwargs
+    ):
         if not isinstance(update, _AttnUpdate) or update.state is not self.state:
             raise NotImplementedError(
                 f"a gated hyper-connection FFN input after {update=}"
             )
         return self.state.update_and_read_ffn_input(
-            hidden_states, residual, out_norm=norm
+            hidden_states,
+            residual,
+            out_norm=norm,
+            on_residual_ready=on_residual_ready,
         )
 
 
@@ -243,6 +256,18 @@ class _FfnUpdate:
         hidden_states = self.state.apply_ffn_combine(hidden_states, residual)
         self.state.clear_coefficients()
         return hidden_states
+
+    def rearrange_residual(self, residual, move):
+        residual = move(residual)
+        if self.state.ffn_norm is None:
+            raise ValueError(
+                "Gated residual layout exchange requires its normalization"
+            )
+        # Recompute a row-local norm instead of transferring a second wide HC
+        # tensor. Injection coefficients must describe the destination rows.
+        self.state.normed = self.state.ffn_norm(residual)
+        self.state.gate_partials = None
+        return residual
 
     def slice_residual_attn_tp(self, residual):
         return self.state.slice_residual_attn_tp(residual)

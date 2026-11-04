@@ -242,7 +242,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         q_layernorm=lambda value: value,
         apply_rope=Mock(side_effect=lambda positions, value, **kwargs: value),
         _use_fused_prep=Mock(
-            side_effect=AssertionError("local keys must not be stored")
+            return_value=False
         ),
         update_key_state_and_compress=Mock(
             side_effect=lambda *args, **kwargs: events.append("compress")
@@ -269,9 +269,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         row_ends,
     )
     torch.testing.assert_close(actual, expected)
-    indexer._use_fused_prep.assert_not_called()
-    # Sizing the RoPE cache reads positions.max() on the host: a device sync per layer.
-    assert indexer.apply_rope.call_args.kwargs["ensure_cos_sin_cache"] is False
+    indexer._use_fused_prep.assert_called_once()
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False

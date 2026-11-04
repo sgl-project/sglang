@@ -251,6 +251,16 @@ class GatedResidual(HyperConnectionBase):
             )
         return self._mix_flydsl_ok
 
+    def normalize_residual(self, hyper_input):
+        """Normalize independent residual rows, including after a token exchange."""
+        if hyper_input.shape[0] == 0:
+            return hyper_input
+        if self.config.hc_per_branch_norm:
+            return self.hc_norm(hyper_input)
+        return self.hc_norm(
+            hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+        ).flatten(-2)
+
     def mix(
         self,
         hyper_input: torch.Tensor,
@@ -267,12 +277,8 @@ class GatedResidual(HyperConnectionBase):
             assert self.config.hc_per_branch_norm
             assert normalized_input.shape == hyper_input.shape
             hyper_input_normed = normalized_input
-        elif self.config.hc_per_branch_norm:
-            hyper_input_normed = self.hc_norm(hyper_input)
         else:
-            hyper_input_normed = self.hc_norm(
-                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
-            ).flatten(-2)
+            hyper_input_normed = self.normalize_residual(hyper_input)
         if (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda

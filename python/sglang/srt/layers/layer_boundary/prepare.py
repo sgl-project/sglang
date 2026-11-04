@@ -630,6 +630,7 @@ def prepare_sharded_cp_attention(
     norm,
     *,
     layout,
+    read=None,
     quant_format="",
     post_residual_addition=None,
 ):
@@ -638,9 +639,12 @@ def prepare_sharded_cp_attention(
 
     hidden_states = stream.complete(hidden_states)
     hidden_states, residual = stream.input(hidden_states)
-    metadata = forward_batch.prefill_cp_metadata
+    metadata = forward_batch.layer_cp_metadata
     destination = metadata.layout_names[layout]
     row_indices = None
+    gated = read is not None and not read.is_plain_norm
+    if gated and stream.pending is not None:
+        raise ValueError("Gated CP attention requires an already-written residual")
     fuse_reorder_norm = (
         hidden_states.is_cuda
         and hidden_states.ndim == 2
@@ -674,7 +678,15 @@ def prepare_sharded_cp_attention(
     elif metadata.current != destination:
         plan = metadata.exchange_plan(metadata.current, destination)
         fuse_reorder_norm = fuse_reorder_norm and not plan.restore_identity
-        hidden_states = plan.apply(hidden_states, restore_order=not fuse_reorder_norm)
+        # Symmetric stores already use destination order. Both operands must
+        # use the same rows when the following norm fuses their restoration.
+        fuse_reorder_norm = fuse_reorder_norm and (
+            pending is None or pending.restore_indices is not None
+        )
+        local_rows = len(metadata.token_layouts[metadata.current][metadata.rank])
+        hidden_states = plan.apply(
+            hidden_states[:local_rows], restore_order=not fuse_reorder_norm
+        )
         if pending is not None:
             residual = pending.wait(restore_order=not fuse_reorder_norm)
         elif residual is not None:
@@ -685,9 +697,26 @@ def prepare_sharded_cp_attention(
         residual = pending.wait()
     metadata.pending_residual = None
     metadata.current = destination
-    forward_batch.num_token_non_padded = metadata.local_token_count(
-        row_indices.numel() if row_indices is not None else hidden_states.shape[0]
-    )
+    local_rows = len(metadata.token_layouts[destination][metadata.rank])
+    forward_batch.num_token_non_padded = metadata.local_token_count(local_rows)
+    if gated:
+        # Equivalent layouts can still have different physical padding: QSA
+        # keeps equal row counts, while GDN consumes only this rank's tokens.
+        hidden_states = hidden_states[:local_rows]
+        if layout == "attention":
+            from sglang.srt.layers.cp.padding import pad_local_rows
+
+            hidden_states = pad_local_rows(
+                hidden_states, forward_batch.attn_cp_metadata, dim=0
+            )
+        hidden_states, residual = read.read(
+            read.init_residual(hidden_states),
+            norm,
+            quant_format=quant_format,
+            post_residual_addition=post_residual_addition,
+        )
+        stream.write(residual)
+        return hidden_states
     if post_residual_addition is not None or quant_format:
         raise ValueError("Ring CP does not support fused residual/quant additions")
     if row_indices is not None:
@@ -709,6 +738,7 @@ def prepare_sharded_cp_ffn(
     norm,
     *,
     next_layout=None,
+    read=None,
     defer_cp_residual=False,
 ):
     """Normalize local rows and gather only the operand required by TP experts."""
@@ -716,11 +746,10 @@ def prepare_sharded_cp_ffn(
         launch_cp_residual_exchange,
     )
 
+    update = stream.pending.update if stream.pending is not None else None
     hidden_states = stream.complete(hidden_states)
     hidden_states, residual = stream.input(hidden_states)
-    if hidden_states.shape[0]:
-        hidden_states, residual = norm(hidden_states, residual)
-    metadata = forward_batch.prefill_cp_metadata
+    metadata = forward_batch.layer_cp_metadata
     metadata.mlp_destination = metadata.current
     residual_plan = None
     if metadata.residual_exchange is not None and next_layout is not None:
@@ -734,19 +763,42 @@ def prepare_sharded_cp_ffn(
             metadata.mlp_destination = destination
             if residual is not None:
                 residual_plan = metadata.exchange_plan(metadata.current, destination)
+
+    def publish_residual(value):
+        ready = torch.cuda.current_stream(value.device).record_event()
+        metadata.queued_residual = (
+            metadata.mlp_destination,
+            residual_plan,
+            value[: len(metadata.token_layouts[metadata.current][metadata.rank])],
+            ready,
+        )
+
+    early_residual = (
+        residual_plan is not None
+        and not metadata.moe_tp
+        and getattr(read, "publishes_residual_before_read", False)
+    )
+    if read is not None and not read.is_plain_norm:
+        kwargs = {}
+        if early_residual:
+
+            def submit_residual(value):
+                publish_residual(value)
+                launch_cp_residual_exchange(metadata)
+
+            kwargs["on_residual_ready"] = submit_residual
+        hidden_states, residual = read.update_and_read(
+            update, hidden_states, residual, norm, **kwargs
+        )
+    elif hidden_states.shape[0]:
+        hidden_states, residual = norm(hidden_states, residual)
     if metadata.moe_tp:
         hidden_states = metadata.token_collectives().gather(
             hidden_states, rank_ordered=True
         )
         forward_batch.num_token_non_padded = metadata.total_non_padded
-    if residual_plan is not None:
-        ready = torch.cuda.current_stream(residual.device).record_event()
-        metadata.queued_residual = (
-            metadata.mlp_destination,
-            residual_plan,
-            residual,
-            ready,
-        )
+    if residual_plan is not None and not early_residual:
+        publish_residual(residual)
         if not defer_cp_residual:
             launch_cp_residual_exchange(metadata)
     stream.write(residual)
