@@ -530,7 +530,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from sglang.srt.layers.attention.dsv4.metadata import (
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
@@ -577,7 +577,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
     def test_prefill_snapshot_skips_layers_reading_live_tables(self):
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from sglang.srt.layers.attention.dsv4.metadata import (
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
