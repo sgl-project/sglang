@@ -411,6 +411,8 @@ class FusedMoE(torch.nn.Module):
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
+        activation_type: Optional[str] = None,
+        activation_impl: Optional[str] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -514,6 +516,8 @@ class FusedMoE(torch.nn.Module):
             num_fused_shared_experts=num_fused_shared_experts,
             params_dtype=params_dtype,
             activation=activation,
+            activation_type=activation_type,
+            activation_impl=activation_impl,
             apply_router_weight_on_input=apply_router_weight_on_input,
             inplace=inplace,
             no_combine=no_combine,
@@ -623,6 +627,12 @@ class FusedMoE(torch.nn.Module):
         _validate_gluon_quant_method(self, self.quant_method)
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.runner_backend = self.quant_method.get_moe_runner_backend(self)
+        if (activation_type is not None or activation_impl is not None) and (
+            self.runner_backend is None or not self.runner_backend.is_humming()
+        ):
+            raise ValueError(
+                "Custom CUDA activation expressions require the Humming runner"
+            )
         self.moe_runner_config.runner_backend = self.runner_backend
         self._set_runner_flags()
         self.supports_deferred_finalize = (

@@ -16,6 +16,7 @@ pytest.importorskip("humming")
 
 from sglang.srt.layers.moe import fused_moe_triton  # noqa: E402
 from sglang.srt.layers.moe.moe_runner import humming  # noqa: E402
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -48,6 +49,22 @@ def make_runner(module):
             check_device=Mock(),
         )
     return runner
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"activation_impl": "a * b"},
+        {"activation_type": "binary_split"},
+        {"activation_type": "unary", "activation_impl": "a"},
+        {"is_gated": False},
+    ],
+)
+def test_custom_activation_rejects_incompatible_layout(overrides):
+    # The MoE weights and workspaces hold two input halves; unary would corrupt
+    # the down projection shape even though the library itself supports it.
+    with pytest.raises(ValueError):
+        humming.get_humming_activation(MoeRunnerConfig(**overrides), torch.bfloat16)
 
 
 @pytest.mark.parametrize("down_block_m", [40, 16])
@@ -149,8 +166,11 @@ def test_deepep_input_is_not_requantized(runner_module):
         ("float4e0m3", "float8e4m3", (128, torch.uint8), (128, torch.float8_e4m3fn)),
     ],
 )
+@pytest.mark.parametrize(
+    "gemm_type", ["INDEXED", "GROUPED_CONTIGUOUS", "GROUPED_MASKED"]
+)
 def test_workspace_uses_each_sublayers_dtype(
-    runner_module, gate_up_dtype, down_dtype, gate_up_buffer, down_buffer
+    runner_module, gate_up_dtype, down_dtype, gate_up_buffer, down_buffer, gemm_type
 ):
     runner = make_runner(runner_module)
     for sublayer, dtype in (("w13", gate_up_dtype), ("w2", down_dtype)):
@@ -161,7 +181,7 @@ def test_workspace_uses_each_sublayers_dtype(
     inputs = torch.ones(3, 256, dtype=torch.bfloat16)
     routes = torch.zeros(3, 2, dtype=torch.int32)
     buffers = runner.prepare_buffers(
-        inputs, routes, runner_module.HummingGemmType.INDEXED
+        inputs, routes, getattr(runner_module.HummingGemmType, gemm_type)
     )
     for name, expected in (
         ("quanted_gate_up_input", gate_up_buffer),
@@ -173,14 +193,21 @@ def test_workspace_uses_each_sublayers_dtype(
         width, dtype = expected
         assert buffers[name].shape[-1] == width
         assert buffers[name].dtype == dtype
-    assert (
-        buffers["activation_output"].data_ptr() != buffers["gate_up_output"].data_ptr()
-    )
     if "quanted_down_input" in buffers:
+        assert "activation_output" not in buffers
         assert (
-            buffers["activation_output"].data_ptr()
+            buffers["gate_up_output"].data_ptr()
             != buffers["quanted_down_input"].data_ptr()
         )
+        down_input = buffers["quanted_down_input"]
+    else:
+        down_input = buffers["activation_output"]
+        assert down_input.data_ptr() != buffers["gate_up_output"].data_ptr()
+    assert down_input.data_ptr() != buffers["down_output"].data_ptr()
+    if gemm_type == "GROUPED_MASKED":
+        assert buffers["output"].data_ptr() == buffers["down_output"].data_ptr()
+    else:
+        assert buffers["output"].data_ptr() != buffers["down_output"].data_ptr()
 
 
 def test_hadamard_matches_each_sublayers_weight_transform(runner_module):
