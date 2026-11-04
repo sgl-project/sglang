@@ -4970,3 +4970,9 @@ parent 审阅完整差异并独立执行 transfers/service/cache/prefetch lifecy
 实际 GPU/file/Mooncake 原有 2 项测试及 2 子测试通过。新增非恒定、分层 K/V 数据的 host DEMOTE→L3→GPU 回读测试，实际 host slots 释放及逐元素 K/V 一致检查通过，18.79s；测试采用原生 JSON action 封装及实际 tensor dtype，未使用模型输出代替搬运字节证明。
 
 真实 Qwen3 2K 控制观察保留于 lifecycle-opt/live-host-demote-proof.json：首次完整 prefill 与恢复生成的一位数字不同。对照 v2 证明不执行 DEMOTE 的 GPU 暖缓存也出现同样差异；GPU 暖缓存、仅 host 恢复、L3 回收后恢复的输出完全一致，实际释放/恢复 2048 tokens，后续请求 host 命中 2048。该观察用于区分计算形状数值变化与 KV 数据错误，不删除首次观察。日志：gpu-mooncake-tests.log、gpu-host-demote-exact-tests-v4.log、live-host-demote-v2-proof.log。
+
+### O5 — 重复生命周期的 wire 身份
+
+发现并修复持续恢复中的历史结果重放：Router ack 忘记本地 Job 后，新任务的相同目标会重建相同 Engine message ID；在 Engine 历史 COMPLETED 尚未过期且实际副本已驱逐时，只重放旧结果。现按 Router actor incarnation 与单调序号生成新 episode 的 wire ID，存活的逻辑 job 仍共享，单次提交丢响应仍重试同一 wire ID。
+
+parent 完整审阅 17 行 runtime 改动与回归，独立运行 HTTP orchestration 20 项通过，1.31s。测试保留旧 Engine COMPLETED、清除实际 residency，在任务切换和 Router 重启后核验三个独立 wire ID 与真实重新准备。日志：lifecycle-opt/o5-wire-parent-tests.log。

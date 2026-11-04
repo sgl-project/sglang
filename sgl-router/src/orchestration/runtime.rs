@@ -393,6 +393,8 @@ struct Actor {
     caps: BTreeMap<String, Capabilities>,
     last_route: BTreeMap<SessionIdentity, String>,
     tick_cursor: usize,
+    wire_incarnation: String,
+    next_wire_message: u64,
     events: BTreeMap<DemandId, (String, Value)>,
     cost_ms_per_token: f64,
     preparation_costs: Option<PreparationCosts>,
@@ -424,6 +426,8 @@ impl Actor {
             caps: BTreeMap::new(),
             last_route: BTreeMap::new(),
             tick_cursor: 0,
+            wire_incarnation: uuid::Uuid::new_v4().to_string(),
+            next_wire_message: 0,
             events: BTreeMap::new(),
             cost_ms_per_token: config.initial_prefetch_ms_per_token,
             preparation_costs: config
@@ -1324,6 +1328,17 @@ impl Actor {
             );
             ids.insert(id.clone());
             if !self.jobs.contains_key(&id) {
+                // Concurrent interests share the logical job. A new lifecycle
+                // episode needs a fresh Engine envelope, while lost replies
+                // must retry the same envelope within this episode.
+                self.next_wire_message = self
+                    .next_wire_message
+                    .checked_add(1)
+                    .ok_or("wire message sequence exhausted")?;
+                let message_id = format!(
+                    "op-{}",
+                    digest(&(&self.wire_incarnation, &id, self.next_wire_message))
+                );
                 planned.insert(
                     id.clone(),
                     Job {
@@ -1339,7 +1354,7 @@ impl Actor {
                         claim_view: Value::Null,
                         submitted: false,
                         attempted: false,
-                        message_id: id.clone(),
+                        message_id,
                         releasing_pin: false,
                         cancel_sent: false,
                         quiescent: false,

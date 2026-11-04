@@ -208,8 +208,9 @@ fn command_now(
             s.claims.insert(payload["claim_id"].as_str().unwrap().into(),json!({"owner_epoch":epoch,"revision":payload["revision"],
                 "state":if payload["mode"]=="release"{"released"}else{"active"},"effective_protection":"eviction_exclusion","actual_scope":[{"start_token":0,"end_token":count}]}));
         }
+        let fresh = !s.operations.contains_key(&id);
         s.operations.entry(id).or_insert(result);
-        if !s.running && action["action_type"] == "sglang.prefetch" {
+        if fresh && !s.running && action["action_type"] == "sglang.prefetch" {
             s.resident = s.partial.unwrap_or(count);
         }
         if s.lose_submit_once {
@@ -1282,4 +1283,49 @@ async fn feedback_cache_generation_and_current_delayed_query_use_native_order_on
     );
     let state = feedback_view(&router).await;
     assert_eq!(state["global_snapshot_complete"], false);
+}
+
+#[tokio::test]
+async fn new_lifecycle_and_actor_episodes_use_fresh_wire_ids_after_cached_completion() {
+    let engine = Engine::start().await;
+    let mut logical = None;
+    let mut wire_ids = std::collections::BTreeSet::new();
+    for tasks in [vec!["a", "b"], vec!["c"]] {
+        let router = router(&[&engine], false, true).await;
+        for id in tasks {
+            start(&router, id).await;
+            let view = submit(&router, id, "prepare", prefix(vec![1, 2, 3, 4]), &engine).await;
+            if let Some(expected) = &logical {
+                assert_eq!(&view["operations"][0]["child_id"], expected);
+            } else {
+                logical = Some(view["operations"][0]["child_id"].clone());
+            }
+            ready(&router, id, "prepare").await;
+            event(&router, id, "task_finished", 1, "finish").await;
+            query(&router, id, "prepare").await;
+            api(
+                &router,
+                json!({"kind":"ack","task":task(id),"message_id":"prepare"}),
+            )
+            .await;
+            let mut state = engine.state.lock().unwrap();
+            let command = state
+                .commands
+                .iter()
+                .rev()
+                .find(|c| c["kind"] == "submit")
+                .unwrap();
+            assert!(wire_ids.insert(
+                command["envelope"]["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            ));
+            // Engine retains its COMPLETED record while the physical copy is
+            // gone. The next episode must perform a new preparation.
+            state.resident = 0;
+        }
+    }
+    assert_eq!(wire_ids.len(), 3);
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 3);
 }
