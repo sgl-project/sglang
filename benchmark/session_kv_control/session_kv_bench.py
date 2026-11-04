@@ -10,7 +10,6 @@ import itertools
 import json
 import math
 import os
-from pathlib import Path
 import random
 import sys
 import threading
@@ -19,11 +18,12 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 
 from bench_inputs import estimate_kv_bytes_per_token, load_trace, tokenizer_identity
 from bench_load import BackgroundLoad
-from bench_statistics import PrefetchCostEMA
 from bench_report import distribution, percentile, summarize, write_summary
+from bench_statistics import PrefetchCostEMA
 
 ACTIVE = {"received", "queued", "accepted", "running", "cancelling"}
 GOOD = {"completed"}
@@ -45,6 +45,15 @@ CAPACITY_KEYS = (
 
 class BenchError(RuntimeError):
     pass
+
+
+class HTTPBenchError(BenchError):
+    """Structured HTTP failure; the original response stays in the journal."""
+
+    def __init__(self, message, status_code, error):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error = error if isinstance(error, dict) else {}
 
 
 def digest(value):
@@ -174,7 +183,14 @@ class HTTP:
             payload = exc.read().decode(errors="replace")
             if optional and code in (404, 405, 503):
                 return None
-            raise BenchError(f"HTTP {self.url}{path}: {code}: {payload[:2048]}") from exc
+            try:
+                failure = json.loads(payload)
+            except ValueError:
+                failure = None
+            error = failure.get("error") if isinstance(failure, dict) else None
+            raise HTTPBenchError(
+                f"HTTP {self.url}{path}: {code}: {payload[:2048]}", code, error
+            ) from exc
         except (OSError, TimeoutError) as exc:
             if optional:
                 return None

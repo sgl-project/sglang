@@ -5090,3 +5090,9 @@ parent 阅读完整两文件差异，并独立复测成本工具 15 项通过，
 parent 阅读完整两文件差异，并独立复测 51 项 HTTP 回归通过，5.74s；精确 Rust 1.92.0 release lib Clippy（-D warnings）通过，16.57s；全 workspace fmt 和 diff 检查通过。日志：lifecycle-opt/cancelled-interest-parent-http-tests.log、cancelled-interest-parent-clippy.log。新增回归覆盖未排空/已排空未 ACK、重放、无 intent 的 task_finished、ACK 后 fresh wire、显式伪 event 与旧策略拒绝，以及多目标退回的原子性。
 
 记录更正：上一节入口窗口诊断中的“新版 C8”应为批量观察版本 C32；原始 cell 为 batch-screen-c32。两版筛选的跨版本绝对速度不作为单因素因果结论。
+
+### O7 — 共享 job 重新推进时的 ACK 重试
+
+poll250 六轮筛选中 1,152 次生成全部一致，但一条收尾在 query 观察 quiescent 后，ACK 重新检查返回 operation/claim not quiescent。该 job 仍有其他共享兴趣，两个调用不构成原子快照。原始控制失败和未通过验收状态保留；采样结束后独立 cancel/query/ACK 三次调用完成清理，另存 post-poll250-ack-recovery.json，不改写原结果。
+
+HTTPBenchError 在保持 BenchError 兼容的同时携带 HTTP 状态及解析错误。工具仅对 400/rejected/精确 non-quiescent reason 在原 deadline 内继续查询；cancel 一次，其他错误和非法 ACK 保持失败，每次拒绝仍完整记录 journal。parent 阅读完整三文件差异并独立复测 41 项通过，28.738s，开启 ResourceWarning 作为错误；覆盖暂拒后重新查询、持续拒绝超时、其他九类错误/非法响应及原始失败记录。selected Ruff、格式及 diff 检查通过；共享旧文件仅修正两处 import 排序，未整体重排。日志：lifecycle-opt/router-ack-race-parent-tests.log。

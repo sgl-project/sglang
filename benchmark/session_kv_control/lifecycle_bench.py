@@ -29,6 +29,7 @@ from session_kv_bench import (
     HTTP,
     BenchError,
     Control,
+    HTTPBenchError,
     Journal,
     build_tokens,
     cache_details,
@@ -367,20 +368,31 @@ def drain_router(router, task, message_id, trial, timeout):
     """A lost submit response still owns its stable message ID until drained."""
     router.command({"kind": "cancel", "task": task, "message_id": message_id}, trial)
     deadline = time.monotonic() + timeout
-    while True:
+    while time.monotonic() < deadline:
         view = router.query(task, message_id, trial)
+        if time.monotonic() >= deadline:
+            break
         if view.get("quiescent") is True and all(
             op.get("quiescent") is True for op in view.get("operations", [])
         ):
-            ack = router.command(
-                {"kind": "ack", "task": task, "message_id": message_id}, trial
-            )
-            if ack.get("acknowledged") is not True:
-                raise BenchError("Router drain acknowledgement failed")
-            return view
-        if time.monotonic() >= deadline:
-            raise BenchError("Router intent did not become quiescent")
-        time.sleep(router.poll_ms / 1000)
+            # ACK revalidates shared jobs; a query does not reserve quiescence.
+            try:
+                ack = router.command(
+                    {"kind": "ack", "task": task, "message_id": message_id}, trial
+                )
+            except HTTPBenchError as error:
+                if (
+                    error.status_code != 400
+                    or error.error.get("code") != "rejected"
+                    or error.error.get("reason") != "operation/claim not quiescent"
+                ):
+                    raise
+            else:
+                if not isinstance(ack, dict) or ack.get("acknowledged") is not True:
+                    raise BenchError("Router drain acknowledgement failed")
+                return view
+        time.sleep(min(router.poll_ms / 1000, max(0, deadline - time.monotonic())))
+    raise BenchError("Router intent did not become quiescent")
 
 
 class Preparation:
