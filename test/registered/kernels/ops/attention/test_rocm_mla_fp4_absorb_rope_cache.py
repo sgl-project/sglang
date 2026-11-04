@@ -2,7 +2,7 @@
 
 On gfx950 graph decode, ``forward_absorb_rocm_core`` replaces the MXFP4 branch
 of ``rocm_absorb_q_bmm`` followed by ``_fused_rope_cat_and_cache`` with one
-``_fused_fp4_bmm_rope_cat_and_cache`` launch. Both paths must hand attention
+``_fused_bmm_rope_cat_and_cache`` launch. Both paths must hand attention
 the same q and leave the same KV-cache bytes, at the out_cache_loc slots only.
 """
 
@@ -186,7 +186,7 @@ class TestFusedFp4AbsorbRopeCache(CustomTestCase):
             )[0]
 
         def fused():
-            return self.mla._fused_fp4_bmm_rope_cat_and_cache(
+            return self.mla._fused_bmm_rope_cat_and_cache(
                 q_nope=q_nope, **rope_cache_args
             )[0]
 

@@ -1934,7 +1934,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the MXFP4 absorbed MLA key projection, RoPE, and KV-cache write into one AITER launch during ROCm gfx95/AITER graph decode. Applies to every MLA model with MXFP4 <code>w_kc</code> and kernel-supported head dims (Kimi-K2.5, DeepSeek-V3/R1 MXFP4). Unsupported configurations and eager decode use the existing split path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the absorbed MLA key projection, RoPE, and KV-cache write into one AITER launch on ROCm gfx95. FP8 <code>w_kc</code> fuses on the TileLang/Triton DSA path at decode-sized batches; MXFP4 <code>w_kc</code> (Kimi-K2.5, DeepSeek-V3/R1 MXFP4) fuses during AITER-backend graph decode at kernel-supported head dims. Set to <code>false</code> to keep the split path everywhere.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>

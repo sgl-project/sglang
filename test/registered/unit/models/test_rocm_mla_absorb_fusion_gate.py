@@ -1,12 +1,12 @@
-"""The gates that pick the fused q-absorb + RoPE + KV-write kernels.
+"""The gate that picks the fused q-absorb + RoPE + KV-write kernels.
 
 Every term names a branch that one of the two kernels it replaces would
 otherwise have taken, so the fused path is only equivalent where all of them
 hold. A term quietly dropped here would route a shape the kernel does not
 implement, and the wrong answer would look like a plausible one.
 
-The FP8 gate's caller carries one further term, ``not q_replicate_active``,
-which needs a ForwardBatch to evaluate and so is not part of that predicate.
+The gate's caller carries one further term, ``not q_replicate_active``,
+which is computed in prepare and so is not part of that predicate.
 """
 
 import contextlib
@@ -27,8 +27,13 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-_CAN_FUSE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
+_CAN_FUSE_GATE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
 _ABSORB_CONFIG = forward_mla_rocm._absorb_bmm_config
+
+
+def _CAN_FUSE(attn):
+    # FP8 terms ignore the forward mode and capture state; the caller gates those.
+    return _CAN_FUSE_GATE(attn, forward_mode=ForwardMode.EXTEND, is_capture_mode=False)
 
 
 def _attn(**overrides):
@@ -84,6 +89,8 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+        with envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(False):
+            self.assertFalse(_CAN_FUSE(_attn()))
 
 
 class TestAbsorbBmmConfig(CustomTestCase):
@@ -121,7 +128,7 @@ class TestAbsorbBmmConfig(CustomTestCase):
 
 
 class TestMxfp4ProjectionFusionGate(CustomTestCase):
-    """The MXFP4 w_kc gate, ``_can_fuse_rocm_mla_projection_rope_cache``."""
+    """The MXFP4 w_kc branch of ``_can_fuse_bmm_rope_cat_and_cache``."""
 
     def _make_attn(self):
         # Deliberately no q_lora_rank or v_head_dim: the kernel is key-side only,
@@ -129,7 +136,10 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
         return SimpleNamespace(
             current_attention_backend="aiter",
             use_dsa=False,
+            use_deep_gemm_bmm=False,
+            dcp_size=1,
             kv_b_proj=SimpleNamespace(set_lora=False),
+            _skip_rope_for_dsa_tilelang_fused=lambda: False,
             w_kc=torch.empty(1, dtype=torch.uint8),
             w_scale_k=torch.empty(1),
             rotary_emb=object(),
@@ -151,8 +161,10 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
             yield
 
     def _can_fuse(self, attn, forward_batch, is_capture_mode=True):
-        return forward_mla_rocm._can_fuse_rocm_mla_projection_rope_cache(
-            attn, forward_batch=forward_batch, is_capture_mode=is_capture_mode
+        return _CAN_FUSE_GATE(
+            attn,
+            forward_mode=forward_batch.forward_mode,
+            is_capture_mode=is_capture_mode,
         )
 
     def test_each_term_alone_turns_it_off(self):
@@ -173,6 +185,7 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
                 ("use_dsa", True),
                 ("kv_b_proj", SimpleNamespace(set_lora=True)),
                 ("w_kc", torch.empty(1, dtype=torch.float8_e4m3fn)),
+                ("w_kc", torch.empty(1, dtype=torch.bfloat16)),
                 ("w_scale_k", None),
                 ("rotary_emb", None),
             ):
@@ -218,34 +231,44 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
                     self.assertFalse(self._can_fuse(attn, forward_batch))
 
 
-class TestMxfp4ProjectionQDtype(CustomTestCase):
+class TestFusedAbsorbQDtype(CustomTestCase):
     """Gluon MLA decode (bh16bn128) reads bf16 Q at 12 local heads, so with an FP8
-    cache the MXFP4 fused kernel must emit bf16 Q there, as the split path does."""
+    cache the MXFP4 fused kernel must emit bf16 Q there, as the split path does.
+    The FP8 w_kc kernel feeds DSA, which keeps FP8 Q at any head count."""
 
-    def _q_out_dtype(self, num_heads, kv_cache_dtype):
+    def _q_out_dtype(self, num_heads, kv_cache_dtype, w_kc_dtype=torch.uint8):
+        is_mxfp4 = w_kc_dtype == torch.uint8
         attn = SimpleNamespace(
             kv_cache_dtype=kv_cache_dtype,
-            current_attention_backend="aiter",
-            w_kc=torch.empty(num_heads, 4, 2, dtype=torch.uint8),
+            current_attention_backend="aiter" if is_mxfp4 else "dsa",
+            w_kc=torch.empty(num_heads, 4, 2, dtype=w_kc_dtype),
             w_scale_k=torch.empty(num_heads, 4, 1, dtype=torch.uint8),
+            w_scale=torch.empty(1),
             rotary_emb=SimpleNamespace(
                 cos_cache=None, sin_cache=None, is_neox_style=False
             ),
             attn_mqa=SimpleNamespace(layer_id=0, k_scale=None),
         )
         q_nope = torch.empty(3, num_heads, 4, dtype=torch.bfloat16)
-        kernel = mock.Mock()
+        fp4_kernel = mock.Mock()
+        fp8_kernel = mock.Mock()
         layers = mock.Mock()
         with (
             mock.patch.object(
                 forward_mla_rocm,
                 "fused_fp4_bmm_rope_cat_and_cache_mla",
-                kernel,
+                fp4_kernel,
+                create=True,
+            ),
+            mock.patch.object(
+                forward_mla_rocm,
+                "fused_fp8_bmm_rope_cat_and_cache_mla",
+                fp8_kernel,
                 create=True,
             ),
             mock.patch.object(forward_mla_rocm, "get_kv_layers", return_value=layers),
         ):
-            forward_mla_rocm._fused_fp4_bmm_rope_cat_and_cache(
+            forward_mla_rocm._fused_bmm_rope_cat_and_cache(
                 attn,
                 q_nope=q_nope,
                 q_pe=None,
@@ -254,12 +277,22 @@ class TestMxfp4ProjectionQDtype(CustomTestCase):
                 positions=None,
                 out_cache_loc=torch.zeros(3, dtype=torch.int64),
             )
+        kernel, unused = (
+            (fp4_kernel, fp8_kernel) if is_mxfp4 else (fp8_kernel, fp4_kernel)
+        )
+        unused.assert_not_called()
         return kernel.call_args.kwargs["q_out_dtype"]
 
     def test_fp8_cache_with_12_heads_keeps_bf16_q(self):
         self.assertEqual(self._q_out_dtype(12, "fp8_e4m3"), torch.bfloat16)
         self.assertEqual(self._q_out_dtype(8, "fp8_e4m3"), forward_mla_rocm.fp8_dtype)
         self.assertEqual(self._q_out_dtype(12, "auto"), torch.bfloat16)
+
+    def test_fp8_w_kc_keeps_fp8_q_at_12_heads(self):
+        self.assertEqual(
+            self._q_out_dtype(12, "fp8_e4m3", w_kc_dtype=torch.float8_e4m3fn),
+            forward_mla_rocm.fp8_dtype,
+        )
 
 
 if __name__ == "__main__":
