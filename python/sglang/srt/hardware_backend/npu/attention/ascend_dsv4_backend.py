@@ -3,7 +3,6 @@ from __future__ import annotations
 import functools
 import logging
 import math
-import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
@@ -1155,18 +1154,14 @@ class LowRatioCompressAscendBackendMixin:
         fm = self.forward_metadata
         if indexer.owns_k:
             self._dsv41_index_k_store(layer, latent)
-        if indexer.is_candidate_source and not os.environ.get(
-            "SGLANG_DSV41_DISABLE_QSLI"
-        ):
+        if indexer.is_candidate_source:
             # Level one: the plain top-k this layer attends with, plus the
             # block candidates later indexer layers rescore inside.
             topk, blocks = self._dsv41_index_full_topk(
                 layer, x, q_lora, pos, forward_batch, candidate=True
             )
             fm.dsv41_candidate_blocks = blocks
-        elif indexer.uses_candidates and not os.environ.get(
-            "SGLANG_DSV41_DISABLE_QSLI"
-        ):
+        elif indexer.uses_candidates:
             topk = self._dsv41_index_qsli_topk(layer, x, q_lora, pos, forward_batch)
         else:
             topk, _ = self._dsv41_index_full_topk(layer, x, q_lora, pos, forward_batch)
@@ -1237,9 +1232,7 @@ class LowRatioCompressAscendBackendMixin:
             k_scale_cache=pool.get_index_scale(layer.layer_id),
             storage_mode=0,
         )
-        if indexer.is_candidate_source and not os.environ.get(
-            "SGLANG_DSV41_DISABLE_QSLI_CACHE"
-        ):
+        if indexer.is_candidate_source:
             # Level-two K for QSLI: the same rows again, eight to a record,
             # fused with their scales.
             ds41.indexer_prologue_k(
@@ -2247,10 +2240,8 @@ class LowRatioCompressAscendBackendMixin:
         live = ctx.live_seq_lens[:n].to(torch.int64)
         raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
         # The replay view's out_cache_loc is UNPADDED (raw rows) while live/n
-        # span the padded bucket. Only a truly empty vector is DP-idle: a
-        # short-but-nonempty one is a padded live replay, so scatter it into a
-        # padded vector and let the mask below skip the tail rows.
-        short_out_loc = raw_out_loc.numel() < n
+        # span the padded bucket, so scatter it into a padded vector and let the
+        # slot filter below skip the tail rows.
         out_loc = torch.zeros_like(live)
         if raw_out_loc.numel() > 0:
             m = min(int(raw_out_loc.numel()), n)
