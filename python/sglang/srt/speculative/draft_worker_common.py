@@ -13,6 +13,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_exec,
     get_memory,
     get_platform,
     get_spec,
@@ -74,6 +75,7 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
 def _aiter_serves_draft() -> bool:
     # A DSpark draft verifies its block bidirectionally: only AITER unified_attention
     # with causal=False serves that, and it takes no MLA, sliding window, 5D or unified-memory pool.
+    # Deterministic mode rejects unified_attention, so the draft stays on the fallback there.
     from sglang.srt.environ import envs
     from sglang.srt.speculative.dspark_components.dspark_config import (
         draft_has_sliding_window,
@@ -89,6 +91,7 @@ def _aiter_serves_draft() -> bool:
         and envs.SGLANG_AITER_UNIFIED_VERIFY.get()
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "nhd"
         and not get_memory().enable_unified_memory
+        and not get_exec().deterministic.enable_deterministic_inference
         and aiter_unified_attention_supports_non_causal()
         and not draft_is_mla()
         and not draft_has_sliding_window()

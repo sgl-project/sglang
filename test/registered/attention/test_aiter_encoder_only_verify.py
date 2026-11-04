@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase

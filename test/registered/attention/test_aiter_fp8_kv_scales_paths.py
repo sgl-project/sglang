@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -152,6 +153,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             scaling=scaling,
             logit_cap=0.0,
             is_cross_attention=False,
+            attn_type=AttentionType.DECODER,
         )
 
     def _assert_close(self, actual, expected):

@@ -23,14 +23,19 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
         layout="nhd",
         unified_attn=None,
         unified_verify=True,
+        deterministic=False,
     ):
         spec = SimpleNamespace(
             speculative_algorithm=algorithm, speculative_draft_attention_backend=None
         )
         memory = SimpleNamespace(enable_unified_memory=False)
+        exec_bag = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=deterministic)
+        )
         with (
             patch.object(draft_worker_common, "get_spec", return_value=spec),
             patch.object(draft_worker_common, "get_memory", return_value=memory),
+            patch.object(draft_worker_common, "get_exec", return_value=exec_bag),
             patch.object(
                 draft_worker_common,
                 "attention_backends",
@@ -58,8 +63,8 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
     def test_aiter_serves_only_a_dspark_mha_draft_on_a_non_causal_aiter(self):
         """A DSpark draft verifies its block bidirectionally. An AITER without
         causal=False, the causal-only aiter MLA verify, a sliding-window draft, a
-        SHUFFLE 5D pool, unified attention or verify switched off, and DFLASH
-        must all leave the draft on the fallback."""
+        SHUFFLE 5D pool, unified attention or verify switched off, deterministic
+        inference, and DFLASH must all leave the draft on the fallback."""
         self.assertEqual(self._resolve(algorithm="DSPARK"), "aiter")
         self.assertEqual(self._resolve(algorithm="DSPARK", unified_attn=True), "aiter")
         for case in (
@@ -69,6 +74,7 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
             dict(algorithm="DSPARK", layout="shuffle"),
             dict(algorithm="DSPARK", unified_attn=False),
             dict(algorithm="DSPARK", unified_verify=False),
+            dict(algorithm="DSPARK", deterministic=True),
             dict(algorithm="DFLASH"),
         ):
             with self.subTest(**case):
