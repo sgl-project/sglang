@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
+# Load Transformers before mocking torch_npu so package discovery sees a real spec.
+import sglang.srt.utils.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -713,3 +715,7 @@ def test_verify_mask_broadcasts_across_query_block(backend):
     torch.testing.assert_close(
         output[2 * width :], torch.ones_like(output[2 * width :])
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

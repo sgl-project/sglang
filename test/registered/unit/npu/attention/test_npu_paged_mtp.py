@@ -359,3 +359,7 @@ def test_target_verify_preserves_cpu_path_unless_backend_opts_out(needs_cpu, mir
         expected = mirror + 8 if mirror is not None else 256
         assert fb.seq_lens_cpu.tolist() == [expected]
         assert fb.seq_lens_sum == expected
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
