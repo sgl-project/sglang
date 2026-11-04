@@ -550,6 +550,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 backend = self._make_prefill_backend()
                 backend.dsv4_prefill_backend = backend_choice
                 build = backend._build_sparse_prefill_chunk_cache
+                backend.forward_metadata.sparse_prefill_direct = True
 
                 with (
                     envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
@@ -686,7 +687,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             return replay_metadata
 
         backend._build_forward_metadata = fake_build_forward_metadata
-        forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
+        forward_batch = SimpleNamespace(
+            name="live", max_seq_len_override=None, extend_prefix_lens_cpu=None
+        )
         static_forward_batch = SimpleNamespace(
             name="static",
             max_seq_len_override=None,
