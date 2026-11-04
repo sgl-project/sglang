@@ -10,8 +10,8 @@ from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -66,7 +66,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
-        self.policy.calc_priority(self.waiting_queue)
+        self.waiting_queue.replace(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
@@ -249,7 +249,7 @@ class SchedulerDllmMixin:
         if num_requests_to_add > 0:
             requests_to_add = self.waiting_queue[:num_requests_to_add]
             self.dllm_manager.add_waiting_reqs(requests_to_add)
-            self.waiting_queue = self.waiting_queue[num_requests_to_add:]
+            self.waiting_queue.replace(self.waiting_queue[num_requests_to_add:])
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
@@ -453,7 +453,7 @@ class DllmManager:
         self.max_running_reqs = (
             dllm_config.max_running_requests if dllm_config is not None else 1
         )
-        self.waiting_queue = _RequestList(ListKind.DLLM, abort=self._abort)
+        self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         # A subset of the waiting queue.
         self.staging_queue: List[Req] = []
         self._release_aborted = release_aborted
@@ -500,7 +500,7 @@ class DllmManager:
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""
-        self.waiting_queue.leave_finished()
+        self.waiting_queue.take(lambda req: req.finished())
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
     def _abort(self, recv_req: AbortReq) -> None:
