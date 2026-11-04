@@ -9,7 +9,7 @@ end to end attention solution with aiter kernels
 import functools
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -520,6 +520,10 @@ class AiterAttnBackend(AttentionBackend):
         self.fp8_prefill_num_kv_head = self.num_kv_head + (
             (self.fp8_prefill_num_head or self.num_head) - self.num_head
         )
+        # forward_mha reads the prefix latent in bf16 whenever this hook exists;
+        # without the asm fp8 prefill, keep the model's dtype and its own K concat.
+        if not self.use_fp8_prefill_attn:
+            self.pack_prefix_chunk_kv = None
         if self.use_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
             logger.info(
                 f"aiter asm fp8 MLA prefill pads {self.num_head} query heads to "
@@ -3579,17 +3583,15 @@ class AiterAttnBackend(AttentionBackend):
         kv_indptr_cpu = torch.zeros(len(kv_lens_cpu) + 1, dtype=torch.int32)
         kv_indptr_cpu[1:] = torch.cumsum(kv_lens_cpu, dim=0)
 
-        row_ends = torch.cumsum(extend_lens_cpu, dim=0)
-        row_starts = row_ends - extend_lens_cpu
-        reqs = torch.nonzero(active).flatten().tolist()
-        if reqs[-1] - reqs[0] + 1 == len(reqs):
-            rows = slice(int(row_starts[reqs[0]]), int(row_ends[reqs[-1]]))
+        active_rows = torch.repeat_interleave(active, extend_lens_cpu.long())
+        active_rows = active_rows.nonzero().flatten()
+        first_row, last_row = int(active_rows[0]), int(active_rows[-1])
+        if last_row - first_row + 1 == len(active_rows):
+            rows = slice(first_row, last_row + 1)
         else:
-            rows = torch.cat(
-                [torch.arange(int(row_starts[b]), int(row_ends[b])) for b in reqs]
-            ).to(self.device)
+            rows = active_rows.to(self.device)
 
-        ps = self._build_prefill_ps_metadata(
+        return self._build_prefill_ps_metadata(
             qo_indptr=qo_indptr_cpu.to(self.device),
             qo_indptr_cpu=qo_indptr_cpu,
             kv_indptr=kv_indptr_cpu.to(self.device),
@@ -3599,8 +3601,8 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len=int(q_lens_cpu.max()),
             is_causal=False,
             need_lse=True,
+            active_q_rows=rows,
         )
-        return replace(ps, active_q_rows=rows)
 
     def _build_prefill_ps_metadata(
         self,
@@ -3615,6 +3617,7 @@ class AiterAttnBackend(AttentionBackend):
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         exact_partial_count: bool = True,
+        active_q_rows: Optional[Union[slice, torch.Tensor]] = None,
     ) -> MlaPrefillPsMetadata:
         """Plan one asm-prefill PS metadata over the key set the caller names."""
         (
@@ -3677,6 +3680,7 @@ class AiterAttnBackend(AttentionBackend):
             is_causal=is_causal,
             need_lse=need_lse,
             num_partial_tiles=num_partial_tiles,
+            active_q_rows=active_q_rows,
         )
 
     def pack_prefix_chunk_kv(
