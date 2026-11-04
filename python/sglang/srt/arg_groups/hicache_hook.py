@@ -20,6 +20,11 @@ def validate_hicache_mamba_size(server_args: Any):
         return
     if not cfg.enable_hierarchical_cache:
         raise ValueError("--hicache-mamba-size-gb needs --enable-hierarchical-cache.")
+    if cfg.hicache_size <= 0:
+        raise ValueError(
+            "--hicache-mamba-size-gb needs an explicit --hicache-size to take its "
+            "share from; it does not apply to --hicache-ratio sizing."
+        )
     if not 0 < size < cfg.hicache_size:
         raise ValueError(
             "--hicache-mamba-size-gb must be in (0, --hicache-size); "
@@ -40,7 +45,6 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
-    validate_hicache_mamba_size(server_args)
     config = cfg.unified_cache_external_linker_config
     if config is not None and not isinstance(config, dict):
         raise ValueError(

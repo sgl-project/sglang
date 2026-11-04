@@ -214,7 +214,7 @@ def build_kv_host_pool(
 
 
 def _split_hicache_size(
-    hicache_size: int, kv_pools: tuple[Any, ...]
+    hicache_size: float, kv_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
     device_pool_sizes = []
     for kv_pool in kv_pools:
@@ -233,7 +233,7 @@ def _split_hicache_size(
 
 def _split_hicache_size_with_mamba(
     *,
-    hicache_size: int,
+    hicache_size: float,
     hicache_mamba_size_gb: Optional[float],
     kv_pools: tuple[Any, ...],
     mamba_pool: Any,
