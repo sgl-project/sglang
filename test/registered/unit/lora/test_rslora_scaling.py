@@ -5,16 +5,21 @@ import pytest
 
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _make_config(r, lora_alpha, use_rslora=False):
-    return LoRAConfig.from_dict({
-        "peft_type": "LORA",
-        "r": r,
-        "lora_alpha": lora_alpha,
-        "target_modules": ["q_proj"],
-        "use_rslora": use_rslora,
-    })
+    return LoRAConfig.from_dict(
+        {
+            "peft_type": "LORA",
+            "r": r,
+            "lora_alpha": lora_alpha,
+            "target_modules": ["q_proj"],
+            "use_rslora": use_rslora,
+        }
+    )
 
 
 def _make_adapter(config):
@@ -55,10 +60,12 @@ class TestRSLoRAScaling:
 
 
 def test_use_rslora_default_false():
-    config = LoRAConfig.from_dict({
-        "peft_type": "LORA",
-        "r": 16,
-        "lora_alpha": 32,
-        "target_modules": ["q_proj"],
-    })
+    config = LoRAConfig.from_dict(
+        {
+            "peft_type": "LORA",
+            "r": 16,
+            "lora_alpha": 32,
+            "target_modules": ["q_proj"],
+        }
+    )
     assert config.use_rslora is False
