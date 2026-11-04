@@ -18,10 +18,11 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=144, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=240, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=220, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-large-amd")
 
 HIGH_ACCEPT_PROMPT = (
     "Output exactly 128 new lines. "
@@ -322,6 +323,115 @@ class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
         self.assertGreater(
             m3["spec_accept_rate"], 0.8, f"drafting not restored after steps=0: {m3}"
         )
+
+
+class TestAdaptiveMemoryBudgetServer(CustomTestCase):
+    """A budget of 0 GB builds only the start state; the rest leave the candidates.
+
+    candidate_steps [1, 3] starts on 3, so steps=1 is never built. Low-acceptance
+    prompts (which downshift 3 -> 1 on an unbudgeted server) must leave the server
+    on 3 without a switch and without a missing-state error.
+    """
+
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
+    base_url = DEFAULT_URL_FOR_TEST
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "1": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 1,
+                        "update_interval": 1,
+                        "up_hysteresis": 0.0,
+                    },
+                },
+                f,
+            )
+            cls.adaptive_config_path = f.name
+        cls.server_log = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        cls.process = None
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--dtype",
+                    "bfloat16",
+                    "--attention-backend",
+                    "triton",
+                    "--speculative-algorithm",
+                    "EAGLE3",
+                    "--speculative-draft-model-path",
+                    cls.draft_model,
+                    "--speculative-adaptive",
+                    "--speculative-adaptive-config",
+                    cls.adaptive_config_path,
+                    "--speculative-adaptive-memory-budget-gb",
+                    "0",
+                    "--skip-server-warmup",
+                    "--mem-fraction-static",
+                    "0.7",
+                ],
+                return_stdout_stderr=(cls.server_log, cls.server_log),
+            )
+        except Exception:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+            cls.process = None
+        if os.path.exists(cls.adaptive_config_path):
+            os.unlink(cls.adaptive_config_path)
+        cls.server_log.close()
+        if os.path.exists(cls.server_log.name):
+            os.unlink(cls.server_log.name)
+
+    def _steps(self) -> int:
+        r = requests.get(self.base_url + "/server_info", timeout=30)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["internal_states"][0]["speculative_num_steps"]
+
+    def _log(self) -> str:
+        with open(self.server_log.name) as f:
+            return f.read()
+
+    def test_unbuilt_state_is_never_requested(self):
+        self.assertEqual(self._steps(), 3)
+        self.assertIn(
+            "steps=[1]; removed from the candidates for this launch", self._log()
+        )
+
+        for _ in range(MAX_DOWNSHIFT_ATTEMPTS):
+            r = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": LOW_ACCEPT_PROMPT,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 64,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=180,
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(
+                self._steps(), 3, "switched into a state that was not built"
+            )
+
+        log = self._log()
+        self.assertNotIn("Switch adaptive runtime state", log)
+        self.assertNotIn("Missing adaptive runtime state", log)
 
 
 if __name__ == "__main__":
