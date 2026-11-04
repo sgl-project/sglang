@@ -4,13 +4,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_ocr import (
     _REL_POS_CACHE,
     DeepseekOCRForCausalLM,
     _cached_rel_pos,
-    get_rel_pos,
 )
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
 from sglang.srt.models.unlimited_ocr_v2 import (
