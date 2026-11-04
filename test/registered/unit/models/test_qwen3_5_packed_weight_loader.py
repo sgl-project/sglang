@@ -1,5 +1,6 @@
 """
-Unit tests for Qwen3_5GatedDeltaNet._make_packed_weight_loader.
+Unit tests for Qwen3_5GatedDeltaNet._make_packed_weight_loader and the MoE
+expert-mapping lookup of Qwen3.5 load_weights.
 
 Validates that per-tensor FP8 scales (scalar or single-element tensors)
 are broadcast to every logical shard, while normal multi-element weights
@@ -18,8 +19,13 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5GatedDeltaNet,
+    _index_expert_params_mapping,
+)
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_mock_module(output_sizes):
@@ -165,6 +171,43 @@ class TestMakePackedWeightLoader(unittest.TestCase):
     # ------------------------------------------------------------------ #
     #  Edge case: nested single-element tensors                           #
     # ------------------------------------------------------------------ #
+
+
+class TestExpertParamsLookup(CustomTestCase):
+    def test_lookup_keeps_every_entry_the_scan_matches(self):
+        """The candidates for a name must hold every mapping entry the linear scan
+        matches, in scan order; an expert tensor's name gets only its own entry."""
+        num_experts = 256
+        # A fused shared expert takes the id after the routed experts.
+        mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts + 1,
+        )
+        lookup = _index_expert_params_mapping(mapping)
+        expert_names = [
+            f"model.layers.{layer}.mlp.experts.{expert}.{proj}.weight"
+            for layer in (0, 39)
+            for expert in (0, 1, 10, 100, num_experts)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        ]
+        other_names = [
+            "model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.layers.0.mlp.experts.gate_up_proj",
+            # An expert id the mapping does not cover.
+            f"model.layers.0.mlp.experts.{num_experts + 1}.up_proj.weight",
+            # Two expert segments: the scan decides.
+            "model.layers.0.mlp.experts.1.gate_proj.experts.2.up_proj.weight",
+        ]
+        for name in expert_names + other_names:
+            scanned = [entry for entry in mapping if entry[1] in name]
+            candidates = lookup(name)
+            self.assertEqual(
+                [entry for entry in candidates if entry[1] in name], scanned, name
+            )
+        for name in expert_names:
+            self.assertEqual(len(lookup(name)), 1, name)
 
 
 if __name__ == "__main__":

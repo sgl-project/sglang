@@ -16,6 +16,7 @@
 
 import logging
 import os
+import re
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -204,6 +205,32 @@ _GDN_FUSED_QKVZBA_RATIOS = (
 )
 
 cached_get_processor = lru_cache(get_processor)
+
+# The per-expert name segment FusedMoE.make_expert_params_mapping keys on.
+_EXPERT_WEIGHT_NAME_RE = re.compile(r"experts\.\d+\.[a-z_]+_proj\.")
+
+
+def _index_expert_params_mapping(expert_params_mapping):
+    """Return ``lookup(name)``: the mapping entries a linear scan can match for
+    ``name``, in scan order.
+
+    A name with exactly one ``experts.<id>.<proj>.`` segment gets only the entries
+    for that segment; any other name gets the whole mapping.
+    """
+    by_weight_name = {}
+    for entry in expert_params_mapping:
+        if not _EXPERT_WEIGHT_NAME_RE.fullmatch(entry[1]):
+            # Such an entry can match names whose segment does not name it.
+            return lambda name: expert_params_mapping
+        by_weight_name.setdefault(entry[1], []).append(entry)
+
+    def lookup(name):
+        segments = _EXPERT_WEIGHT_NAME_RE.findall(name)
+        if len(segments) != 1:
+            return expert_params_mapping
+        return by_weight_name.get(segments[0], expert_params_mapping)
+
+    return lookup
 
 
 def _disable_shared_experts_fusion() -> bool:
@@ -2228,6 +2255,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        expert_mapping_lookup = _index_expert_params_mapping(expert_params_mapping)
+        # Properties; read once rather than per tensor.
+        start_layer, end_layer = self.start_layer, self.end_layer
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -2242,10 +2272,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(".self_attn", "")
 
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self, "start_layer")
-                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+            if layer_id is not None and (
+                layer_id < start_layer or layer_id >= end_layer
             ):
                 continue
 
@@ -2289,7 +2317,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 # Track if this is an expert weight to enable early skipping
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                candidates = (
+                    expert_params_mapping
+                    if is_fused_expert
+                    else expert_mapping_lookup(name)
+                )
+                for mapping in candidates:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
@@ -2797,6 +2830,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        expert_mapping_lookup = _index_expert_params_mapping(expert_params_mapping)
+        # Properties; read once rather than per tensor.
+        start_layer, end_layer = self.start_layer, self.end_layer
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -2820,10 +2856,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     weight_loader(lm_head_param, loaded_weight)
 
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self, "start_layer")
-                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+            if layer_id is not None and (
+                layer_id < start_layer or layer_id >= end_layer
             ):
                 continue
 
@@ -2872,7 +2906,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # Track if this is an expert weight to enable early skipping
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                candidates = (
+                    expert_params_mapping
+                    if is_fused_expert
+                    else expert_mapping_lookup(name)
+                )
+                for mapping in candidates:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue

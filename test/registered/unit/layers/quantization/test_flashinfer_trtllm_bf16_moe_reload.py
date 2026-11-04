@@ -20,7 +20,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.quantization.unquant import (
+    _TRTLLM_BF16_BLOCK_K,
+    _TRTLLM_BF16_EXPERTS_PER_CHUNK,
+    UnquantizedFusedMoEMethod,
+)
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA
 from sglang.srt.model_executor.model_runner_components import weight_updater
 from sglang.srt.model_loader.loader import DefaultModelLoader
@@ -77,17 +81,17 @@ def _mock_flashinfer():
 class _FakeMoELayer(torch.nn.Module):
     """The surface of ``FusedMoE`` that the layout code actually touches."""
 
-    def __init__(self, method, seed: int):
+    def __init__(self, method, seed: int, num_experts: int = NUM_EXPERTS):
         super().__init__()
         self.quant_method = method
-        self.num_local_experts = NUM_EXPERTS
+        self.num_local_experts = num_experts
         self.hidden_size = HIDDEN_SIZE
         self.intermediate_size_per_partition = INTERMEDIATE_SIZE
         self.moe_runner_config = SimpleNamespace(is_gated=True)
         generator = torch.Generator().manual_seed(seed)
         self.w13_weight = torch.nn.Parameter(
             torch.randn(
-                NUM_EXPERTS,
+                num_experts,
                 2 * INTERMEDIATE_SIZE,
                 HIDDEN_SIZE,
                 generator=generator,
@@ -97,7 +101,7 @@ class _FakeMoELayer(torch.nn.Module):
         )
         self.w2_weight = torch.nn.Parameter(
             torch.randn(
-                NUM_EXPERTS,
+                num_experts,
                 HIDDEN_SIZE,
                 INTERMEDIATE_SIZE,
                 generator=generator,
@@ -396,6 +400,34 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
             got, want = param.data, original[name]
             self.assertEqual(tuple(got.shape), tuple(want.shape))
             self.assertTrue(torch.equal(got, want), f"{name} round trip is lossy")
+
+    def test_chunked_layout_matches_per_expert_conversion(self):
+        """Experts are converted a chunk at a time; each must still get exactly
+        flashinfer's per-expert block layout, and the restore must invert it,
+        across chunk boundaries."""
+        num_experts = 2 * _TRTLLM_BF16_EXPERTS_PER_CHUNK + 1
+        method = _make_method()
+        layer = _FakeMoELayer(method, seed=4, num_experts=num_experts)
+        original = {name: param.data.clone() for name, param in _weights(layer)}
+
+        with _mock_flashinfer():
+            method._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
+        for name, param in _weights(layer):
+            tiles = [expert.view(torch.uint8) for expert in original[name]]
+            want = torch.stack(
+                [
+                    _fake_convert_to_block_layout(
+                        tile[_fake_permute_indices(tile)], _TRTLLM_BF16_BLOCK_K
+                    )
+                    for tile in tiles
+                ]
+            ).view(torch.bfloat16)
+            self.assertEqual(tuple(param.shape), tuple(want.shape))
+            self.assertTrue(torch.equal(param.data, want), name)
+
+        self._restore_for_load(method, layer)
+        for name, param in _weights(layer):
+            self.assertTrue(torch.equal(param.data, original[name]), name)
 
     def test_bucketed_update_reproduces_cold_load_layout(self):
         """Restore each weight once across buckets, then pack once at session end."""
