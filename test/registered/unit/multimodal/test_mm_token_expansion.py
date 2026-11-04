@@ -27,6 +27,7 @@ TokenSpaceProcessor.process(media, IDs)
   item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten;
       the global random stream is untouched
   item feature cache, a sampled hit computes to other features -> RuntimeError
+  item feature cache, a slow or failing write -> the request returns first; a failure is logged
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy and serving spec keep the legacy processor's loader and worker defaults
@@ -47,6 +48,7 @@ import contextlib
 import io
 import random
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -74,6 +76,7 @@ from sglang.srt.multimodal.token_space_mm_process.expansion import (
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
     TokenSpaceProcessStrategy,
 )
+from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
@@ -463,6 +466,43 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         cached["pixel_values"] = cached["pixel_values"] + 1
         with self.assertRaisesRegex(RuntimeError, "other pixel_values"):
             asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+
+    def test_item_feature_cache_writes_behind_the_request(self):
+        """A request returns with its features while the cache write is still running."""
+        image = Image.new("RGB", (2, 1))
+        written = {}
+        release = threading.Event()
+
+        class _SlowCache(dict):
+            def __setitem__(self, key, value):
+                release.wait(timeout=10)
+                written[key] = value
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT, item_feature_cache=_SlowCache()
+        )
+
+        async def run():
+            output = await processor.process([image], input_ids=[1, IMAGE])
+            self.assertEqual(written, {})
+            release.set()
+            return output
+
+        output = asyncio.run(run())
+        self.assertEqual(len(written), 1)
+        (cached,) = written.values()
+        self.assertTrue(torch.equal(cached["pixel_values"], output["pixel_values"]))
+
+        class _FailingCache(dict):
+            def __setitem__(self, key, value):
+                raise OSError("disk full")
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT, item_feature_cache=_FailingCache()
+        )
+        with self.assertLogs(processor_module.logger, level="WARNING") as logs:
+            asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        self.assertIn("disk full", "\n".join(logs.output))
 
     def test_item_feature_cache_is_shared_only_by_matching_processors(self):
         """A trainer and serving may share one map; another checkpoint, config or upgrade must miss."""
