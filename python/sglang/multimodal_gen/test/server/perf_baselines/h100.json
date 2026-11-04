@@ -1559,9 +1559,9 @@
             "expected_avg_denoise_ms": 136.85,
             "expected_median_denoise_ms": 129.34,
             "load_peak_vram_mb": 43920.0,
-            "runtime_peak_vram_mb": 57528.0,
+            "runtime_peak_vram_mb": 58834.0,
             "load_peak_allocated_mb": 43411.0,
-            "runtime_peak_allocated_mb": 54736.0,
+            "runtime_peak_allocated_mb": 56390.0,
             "estimated_full_test_time_s": 100.0
         },
         "wan2_2_ti2v_5b": {

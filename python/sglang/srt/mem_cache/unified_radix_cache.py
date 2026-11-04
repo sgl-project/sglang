@@ -85,9 +85,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
 )
-
-# UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
-# because other modules and tests import them from this module.
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -110,13 +107,8 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
-    UnifiedLRUList,
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    NodeId,
     uses_joint_lru,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -1103,19 +1095,140 @@ class UnifiedRadixCache(BasePrefixCache):
                 walk_quota = max(
                     request_cnt, tracker[ct] + self.tree_core.full_evictable_size()
                 )
-            self.tree_core.evict_device_start(ct, walk_quota)
-            try:
-                while True:
-                    node_id, made_progress = self._evict_device_next_node(ct, tracker)
-                    if node_id is None:
-                        if not made_progress:
-                            break
-                    else:
-                        self._evict_leaf_with_backup(node_id, tracker)
-                    if target_reached(ct):
+            self._evict_device_walk(
+                ct,
+                walk_quota,
+                request_cnt,
+                tracker,
+                target_reached,
+                available_size_targets,
+                allocation_reclaim_satisfied,
+            )
+
+    def _write_back_batch_tokens(
+        self,
+        ct: ComponentType,
+        request_cnt: int,
+        tracker: dict[ComponentType, int],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+    ) -> int:
+        """Full tokens the walk may leave queued before demoting; 0 (demote
+        per victim) when its target is only observable after each demote."""
+        if ct != BASE_COMPONENT_TYPE or allocation_reclaim_satisfied is not None:
+            return 0
+        need = request_cnt - tracker[ct]
+        target = (available_size_targets or {}).get(ct)
+        if target is not None:
+            target_component, target_size = target
+            if target_component != ct:
+                return 0
+            need = min(need, target_size - self._component_available_size(ct))
+        return max(need, 0)
+
+    def _evict_device_walk(
+        self,
+        ct: ComponentType,
+        walk_quota: int,
+        request_cnt: int,
+        tracker: dict[ComponentType, int],
+        target_reached: Callable[[ComponentType], bool],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+    ) -> None:
+        """One device-eviction walk: write-back victims queue their copies and
+        demotes, then one wait lands the batch. Queued victims count as
+        evicted, so the walk takes the per-victim walk's victims in its order.
+        One decision can differ: a queued victim's fresh host copy is not
+        host-evictable until its demote, so a later victim's host eviction
+        takes another entry."""
+        pending: list[NodeId] = []
+        pending_tokens = 0
+
+        def batch_need() -> int:
+            return self._write_back_batch_tokens(
+                ct,
+                request_cnt,
+                tracker,
+                available_size_targets,
+                allocation_reclaim_satisfied,
+            )
+
+        def demote_queued() -> None:
+            nonlocal pending_tokens
+            self._demote_backed_up(pending, tracker)
+            pending_tokens = 0
+
+        self.tree_core.evict_device_start(ct, walk_quota)
+        try:
+            while True:
+                # Queued victims count as evicted toward the walk's quota.
+                tracker[ct] += pending_tokens
+                node_id, made_progress = self._evict_device_next_node(ct, tracker)
+                tracker[ct] -= pending_tokens
+                if node_id is None:
+                    if not made_progress:
                         break
+                elif pending and self.tree_core.is_backuped(node_id):
+                    pending.append(node_id)
+                    pending_tokens += self.tree_core.mark_write_back_queued(node_id)
+                else:
+                    backup_kv = self._evict_device_leaf(node_id, tracker)
+                    if backup_kv is not None:
+                        written = self._execute_and_commit_kv_backup(
+                            backup_kv, write_back=True
+                        )
+                        if written == 0 and pending:
+                            # Make the queued victims host-evictable, as the
+                            # per-victim walk would have by now, and retry once.
+                            demote_queued()
+                            written = self._execute_and_commit_kv_backup(
+                                backup_kv, write_back=True
+                            )
+                        if written > 0:
+                            pending.append(node_id)
+                            pending_tokens += self.tree_core.mark_write_back_queued(
+                                node_id,
+                                self.ongoing_write_through[node_id].publish_node_ids,
+                            )
+                        elif self._drop_subtree_no_host(node_id, tracker):
+                            logger.warning(
+                                "write_back: KV subtree dropped without backup "
+                                "due to host memory pressure, root node %d",
+                                node_id,
+                            )
+                        else:
+                            logger.warning(
+                                "write_back: backup failed under host memory "
+                                "pressure but subtree drop declined (node "
+                                "locked); root node %d stays device-resident "
+                                "until host space frees",
+                                node_id,
+                            )
+                if pending and pending_tokens >= batch_need():
+                    demote_queued()
+                if not pending and target_reached(ct):
+                    break
+        finally:
+            try:
+                self._demote_backed_up(pending, tracker)
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _demote_backed_up(
+        self, node_ids: list[NodeId], tracker: dict[ComponentType, int]
+    ) -> None:
+        """Wait once for the queued copies, then demote the nodes in order."""
+        if not node_ids:
+            return
+        self.writing_check(write_back=True)
+        for node_id in node_ids:
+            self._demote(node_id, tracker)
+        node_ids.clear()
 
     def _evict_by_joint_lru(
         self,
@@ -1477,7 +1590,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         if self.enable_session_radix_cache and is_finished:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+            from sglang.srt.managers.req_types import FINISH_ABORT
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
                 self.session_refs.register_session_ref(
@@ -3192,6 +3305,9 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
+        # The op is retired without an IO transfer, so retire its hicache root
+        # span now (idempotent with the zero-hit finish in prefetch_thread_func).
+        self.cache_controller._finish_op_trace(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -3884,7 +4000,7 @@ class UnifiedRadixCache(BasePrefixCache):
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
         if failed:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+            from sglang.srt.managers.req_types import FINISH_ABORT
 
             for req in failed:
                 req.skip_radix_cache_insert = True

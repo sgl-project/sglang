@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sglang.srt import rust_extensions
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
 from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer

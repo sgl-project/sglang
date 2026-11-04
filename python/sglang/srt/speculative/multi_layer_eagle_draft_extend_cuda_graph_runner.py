@@ -35,15 +35,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -75,11 +72,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids,
     wide_row_softmax_triton,
 )
-from sglang.srt.speculative.spec_utils import (
-    fast_sample,
-    fast_topk,
-    resolve_num_tokens_per_req,
-)
+from sglang.srt.speculative.spec_utils import fast_sample, resolve_num_tokens_per_req
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_npu,
@@ -88,6 +81,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if is_npu():
