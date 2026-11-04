@@ -16,7 +16,8 @@ register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=Tr
 class TestGLM4_7FlashXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "zai-org/GLM-4.7-Flash"
     tp_size = 4
-    accuracy = 0.80
+    # 3 runs on 4x B60 scored 0.80-0.90; one question of margin below the lowest.
+    accuracy = 0.75
     timeout_for_server_launch = 3600
     num_examples = 20
     num_threads = 4
