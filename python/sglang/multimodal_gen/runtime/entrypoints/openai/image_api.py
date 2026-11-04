@@ -174,9 +174,7 @@ def _build_image_response_kwargs(
     result: OutputBatch,
     *,
     b64_list: list[str] | None = None,
-    cloud_url: str | None = None,
     cloud_urls: list[str | None] | None = None,
-    fallback_url: str | None = None,
     fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
     resize: str | None = None,
@@ -184,7 +182,7 @@ def _build_image_response_kwargs(
     """Build ImageResponse data list.
 
     For b64_json: uses b64_list, the base64 of the returned image bytes.
-    For url: uses cloud_url or fallback_url.
+    For url: uses cloud_urls or fallback_urls.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
     ret = None
@@ -202,11 +200,6 @@ def _build_image_response_kwargs(
         ]
         ret = {"data": data}
     elif resp_format == "url":
-        if cloud_urls is None and cloud_url is not None:
-            cloud_urls = [cloud_url]
-        if fallback_urls is None and fallback_url is not None:
-            fallback_urls = [fallback_url]
-
         data = []
         for idx, path in enumerate(save_file_path_list):
             url = None
@@ -459,6 +452,11 @@ async def edits(
     profile_all_stages: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
+    if mask is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Field 'mask' is not supported: no pipeline runs masked inpainting",
+        )
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)

@@ -305,6 +305,16 @@ class TestHiDreamO1Config(unittest.TestCase):
                     SimpleNamespace(**{**no_overrides, option: value})
                 )
 
+    def test_scheduler_overrides_are_refused(self) -> None:
+        """The pipeline builds its own scheduler, so overrides must not be dropped."""
+        for option, value, flag in (
+            ("flow_shift", 5.0, "--flow-shift"),
+            ("scheduler_class_override", "UniPCMultistepScheduler", "--scheduler"),
+        ):
+            config = HiDreamO1ImagePipelineConfig(**{option: value})
+            with self.subTest(option=option), self.assertRaisesRegex(ValueError, flag):
+                config.validate_server_args(SimpleNamespace(sp_degree=1))
+
     def test_dynamic_batching_is_disabled(self) -> None:
         """A merged multi-prompt batch fails every request in it."""
         self.assertFalse(HiDreamO1ImagePipelineConfig().supports_dynamic_batching())
