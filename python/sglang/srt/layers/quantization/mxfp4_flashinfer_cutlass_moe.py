@@ -30,14 +30,47 @@ if TYPE_CHECKING:
 _GROUP_SIZE = 32
 
 
-def _interleave_mxfp4_weights_inplace(weight: torch.Tensor) -> torch.Tensor:
-    from flashinfer.fused_moe import interleave_moe_weights_for_sm90_mixed_gemm
+def _prepare_mxfp4_weights_inplace(
+    weight: torch.Tensor, scale: torch.Tensor, *, use_humming: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    from flashinfer.fused_moe import (
+        interleave_moe_scales_for_sm90_mixed_gemm,
+        interleave_moe_weights_for_sm90_mixed_gemm,
+    )
 
+    if use_humming:
+        from flashinfer.fused_moe import (
+            preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+        )
+
+    # Loader inputs are contiguous; otherwise these make full-size copies.
     weight = weight.view(torch.uint8).contiguous()
-    # Experts are independent: bound scratch to eight instead of a full layer.
-    for block in weight.split(8):
-        block.copy_(interleave_moe_weights_for_sm90_mixed_gemm(block, "fp4"))
-    return weight
+    scale = scale.contiguous()
+    residuals = []
+    # FlashInfer processes weights and clamps Humming ranges per expert; scale
+    # folding preserves dim 0. Fresh outputs can safely replace each input chunk.
+    for weight_block, scale_block in zip(weight.split(8), scale.split(8)):
+        if use_humming:
+            weight_out, scale_out, residual = (
+                preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                    weight_block, scale_block
+                )
+            )
+            residuals.append(residual)
+        else:
+            weight_out = interleave_moe_weights_for_sm90_mixed_gemm(weight_block, "fp4")
+            scale_out = interleave_moe_scales_for_sm90_mixed_gemm(
+                scale_block, group_size=_GROUP_SIZE
+            )
+        weight_block.copy_(weight_out)
+        scale_block.copy_(scale_out.reshape_as(scale_block))
+        folded_shape = scale_out.shape[1:]
+        del weight_out, scale_out
+    return (
+        weight,
+        scale.view(scale.shape[0], *folded_shape),
+        torch.cat(residuals) if use_humming else None,
+    )
 
 
 class Mxfp4FlashinferCutlassMoEMethod:
@@ -182,23 +215,17 @@ class Mxfp4FlashinferCutlassMoEMethod:
             for scale_u8 in (w13_scale_u8, w2_scale_u8):
                 scale_u8.copy_(block_scale_interleave(scale_u8).reshape_as(scale_u8))
         else:
+            w13_il, w13_s_il, w13_residual = _prepare_mxfp4_weights_inplace(
+                layer.w13_weight.data,
+                w13_scale_u8,
+                use_humming=self._use_sm90_humming,
+            )
+            w2_il, w2_s_il, w2_residual = _prepare_mxfp4_weights_inplace(
+                layer.w2_weight.data,
+                w2_scale_u8,
+                use_humming=self._use_sm90_humming,
+            )
             if self._use_sm90_humming:
-                from flashinfer.fused_moe import (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
-                )
-
-                w13_il, w13_s_il, w13_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w13_weight.data.view(torch.uint8).contiguous(),
-                        w13_scale_u8,
-                    )
-                )
-                w2_il, w2_s_il, w2_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w2_weight.data.view(torch.uint8).contiguous(),
-                        w2_scale_u8,
-                    )
-                )
                 layer.w13_humming_residual_scale = Parameter(
                     (w13_residual * 64.0).contiguous(), requires_grad=False
                 )
@@ -208,19 +235,6 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 layer.humming_fc2_act_scale = Parameter(
                     torch.ones((), dtype=torch.float32, device=w13_scale_u8.device),
                     requires_grad=False,
-                )
-            else:
-                from flashinfer.fused_moe import (
-                    interleave_moe_scales_for_sm90_mixed_gemm,
-                )
-
-                w13_il = _interleave_mxfp4_weights_inplace(layer.w13_weight.data)
-                w2_il = _interleave_mxfp4_weights_inplace(layer.w2_weight.data)
-                w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
-                    w13_scale_u8, group_size=_GROUP_SIZE
-                )
-                w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
-                    w2_scale_u8, group_size=_GROUP_SIZE
                 )
             layer.w13_weight = Parameter(w13_il, requires_grad=False)
             layer.w2_weight = Parameter(w2_il, requires_grad=False)
@@ -236,7 +250,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 else "flashinfer_cutlass_sm90"
             )
         )
-        # Release SM90 preprocessing scratch and old scale layouts per layer.
+        # Release cached SM90 preprocessing scratch per layer.
         if not self._use_mxfp8_act_scaling:
             torch.cuda.empty_cache()
 
