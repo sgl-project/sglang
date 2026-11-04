@@ -28,7 +28,7 @@ def init_mxfp8_kv_scales(model, pool, cache_layout):
             _, v_scale = pool.get_kv_scale_buffer(module.layer_id)
             v_scale.copy_(
                 scheme.v_scale_encoded.view(
-                    1, v_scale.shape[1], 1, v_scale.shape[-2], 1
+                    1, 1, v_scale.shape[2], v_scale.shape[-2], 1
                 )
             )
     full_pool._mxfp8_scales_initialized = True
