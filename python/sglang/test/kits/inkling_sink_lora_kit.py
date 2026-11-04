@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.ops.moe.inkling_moe import silu_and_mul_triton  # noqa: E402
 from sglang.srt.lora.backend.triton_v2_backend import TritonV2LoRABackend  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.models.inkling_common.lora import (  # noqa: E402
     InklingBatchDenseMLPWithLoRAV2,
 )
