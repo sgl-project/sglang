@@ -956,6 +956,8 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         with (
             mock.patch.object(torch.cuda, "current_stream", return_value=stream),
             mock.patch.object(owner, "device", "cuda"),  # the wait's device check
+            # The band waits on the stream of the device module it caches.
+            mock.patch.object(owner, "device_module", torch.cuda),
         ):
             owner.settle_pending()
         stream.wait_event.assert_called_once_with(event)
@@ -979,12 +981,13 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         return stream, (
             mock.patch.object(torch.cuda, "current_stream", return_value=stream),
             mock.patch.object(owner, "device", "cuda"),
+            mock.patch.object(owner, "device_module", torch.cuda),
         )
 
     def test_a_take_of_the_older_batch_waits_only_its_event(self):
         allocator, owner, events = self._two_forwards_pending()
         stream, patches = self._cuda_stream(owner)
-        with patches[0], patches[1]:
+        with patches[0], patches[1], patches[2]:
             self.assertIsNotNone(owner.take_physical_pages(2))
         stream.wait_event.assert_called_once_with(events[0])
         self.assertEqual(owner._pending_until_retire_pages, 2)
@@ -1000,6 +1003,7 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         with (
             patches[0],
             patches[1],
+            patches[2],
             mock.patch.object(
                 torch.Tensor, "tolist", lambda t: order.append("read") or real_tolist(t)
             ),
