@@ -5,7 +5,7 @@ import pybase64
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, get_routed_experts_layer_ids
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_dp_local_slice_cpu,
@@ -36,6 +36,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     slicing. The device cache also holds extra columns for any fused shared
     experts; the host cache and user-facing return drop them via the
     [:topk_size] truncation.
+
+    Both caches, and the routing returned per request, keep one row per routed
+    layer, in layer order (for Nemotron-H, its MoE layers only).
     """
 
     @staticmethod
@@ -70,7 +73,16 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         topk_size = model_config.hf_text_config.num_experts_per_tok
-        num_layers = model_config.hf_text_config.num_hidden_layers
+        self.routed_layer_ids = get_routed_experts_layer_ids(
+            model_config.hf_text_config
+        )
+        if not self.routed_layer_ids:
+            raise ValueError(
+                "--enable-return-routed-experts needs a model with MoE layers"
+            )
+        self._slot_of_layer = {
+            layer_id: slot for slot, layer_id in enumerate(self.routed_layer_ids)
+        }
 
         # Scale by num_dp_ranks so the buffer covers the full DP-concatenated batch.
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
@@ -85,7 +97,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         super().__init__(
             num_tokens=num_tokens,
             max_batch_size=max_batch_size,
-            num_layers=num_layers,
+            num_layers=len(self.routed_layer_ids),
             topk_size=topk_size,
             device=device,
             name="routed_experts",
@@ -119,13 +131,19 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             topk_indices = F.pad(
                 topk_indices, (0, self.num_fused_shared_experts), value=-1
             )
+        slot = self._slot_of_layer.get(layer_id)
+        if slot is None:
+            raise RuntimeError(
+                f"Layer {layer_id} captured routed experts, but this model's "
+                f"routed layers are {self.routed_layer_ids}."
+            )
         if _is_scattered_a2a_backend():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]
             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
-        super().capture(layer_id, topk_indices)
+        super().capture(slot, topk_indices)
 
     def _get_local_slice(
         self,
