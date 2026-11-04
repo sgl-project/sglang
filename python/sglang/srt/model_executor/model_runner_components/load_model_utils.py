@@ -28,6 +28,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.kv_cache_dtype import is_fp8_family_kv_cache_dtype
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -189,7 +190,7 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str, device: str) -> None:
         # ModelSlim loads KV scales from the checkpoint with model weights.
         return
 
-    if kv_cache_dtype == "fp8_e4m3":
+    if is_fp8_family_kv_cache_dtype(kv_cache_dtype):
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(get_model().quantization_param_path)

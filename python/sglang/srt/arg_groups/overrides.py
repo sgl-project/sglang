@@ -577,7 +577,11 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "nvfp4_ds_mla",
+    ], (
+        "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3 or nvfp4_ds_mla "
+        "kv_cache_dtype"
+    )
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -598,10 +602,13 @@ def _check_dsa_backend_constraints(
 
     chosen = {prefill_backend, decode_backend}
 
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        _check_nvfp4_ds_mla_backends(prefill_backend, decode_backend, hip=hip)
     # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
-    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+    elif "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
         raise ValueError(
-            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3 "
+            "or nvfp4_ds_mla."
         )
 
     rocm_only = {"triton"} & chosen
@@ -647,6 +654,40 @@ def _check_dsa_backend_constraints(
         raise ValueError("Native raw FP8 NoPE sparse prefill requires SM90.")
     if (major, minor) < (8, 9):
         raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
+
+
+def _check_nvfp4_ds_mla_backends(
+    prefill_backend: Optional[str], decode_backend: Optional[str], *, hip: bool
+) -> None:
+    """nvfp4_ds_mla rows are read only by Prims-TS on SM100/SM103, and both DSA
+    phases of a server share one pool, so every local phase must be prims_ts."""
+    if hip:
+        raise ValueError("--kv-cache-dtype nvfp4_ds_mla requires CUDA.")
+    if prefill_backend != "prims_ts" or decode_backend != "prims_ts":
+        raise ValueError(
+            "--kv-cache-dtype nvfp4_ds_mla is read only by the prims_ts DSA backend; "
+            "set --dsa-prefill-backend prims_ts and --dsa-decode-backend prims_ts "
+            f"(got {prefill_backend!r} and {decode_backend!r})."
+        )
+    import torch
+
+    capability = torch.cuda.get_device_capability()
+    if tuple(capability) not in ((10, 0), (10, 3)):
+        raise ValueError(
+            "--kv-cache-dtype nvfp4_ds_mla (Prims-TS NVFP4 sparse MLA) requires "
+            f"SM100 or SM103; got sm_{capability[0]}{capability[1]}."
+        )
+
+
+def _check_nvfp4_ds_mla_latent(view: Any) -> None:
+    """The 352 B record is defined for the D576 latent only."""
+    model_config = model_config_of(view)
+    latent = (model_config.kv_lora_rank, model_config.qk_rope_head_dim)
+    if latent != (512, 64):
+        raise ValueError(
+            "--kv-cache-dtype nvfp4_ds_mla needs the D576 MLA latent "
+            f"(kv_lora_rank 512, qk_rope_head_dim 64); got {latent}."
+        )
 
 
 def _check_tilelang_dsa_fp8_kv(
@@ -787,6 +828,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "triton"
         if not user_set_decode:
             declared["dsa_decode_backend"] = "triton"
+    elif kv_cache_dtype == "nvfp4_ds_mla":
+        # Prims-TS is the only reader of nvfp4_ds_mla rows.
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "prims_ts"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "prims_ts"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
@@ -812,6 +859,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         kv_lora_rank=model_config_of(view).kv_lora_rank,
         qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,
     )
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        _check_nvfp4_ds_mla_latent(view)
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
@@ -853,11 +902,14 @@ def _kimi_k31_default_dsa_backend(view: Any) -> str:
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
-    if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+    if view.kv_cache_dtype not in ("auto", "fp8_e4m3", "nvfp4_ds_mla"):
         raise ValueError(
             "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
-            f"fp8_ds_mla format); got {view.kv_cache_dtype!r}."
+            "fp8_ds_mla format) or nvfp4_ds_mla (prims_ts only); got "
+            f"{view.kv_cache_dtype!r}."
         )
+    if view.kv_cache_dtype == "nvfp4_ds_mla":
+        return {}
     if view.kv_cache_dtype != "fp8_e4m3":
         logger.warning("Setting KV cache dtype to fp8_e4m3 for Kimi-K3.1.")
         return {"kv_cache_dtype": "fp8_e4m3"}
@@ -897,8 +949,20 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
             f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
-    backend = chosen.pop() if chosen else _kimi_k31_default_dsa_backend(view)
-    if backend in ("trtllm", "prims_ts"):
+    nvfp4_ds_mla = view.kv_cache_dtype == "nvfp4_ds_mla"
+    default_backend = (
+        "prims_ts" if nvfp4_ds_mla else _kimi_k31_default_dsa_backend(view)
+    )
+    backend = chosen.pop() if chosen else default_backend
+    if nvfp4_ds_mla:
+        _check_nvfp4_ds_mla_backends(backend, backend, hip=get_platform().is_hip)
+        _check_nvfp4_ds_mla_latent(view)
+        logger.warning(
+            "Kimi-K3.1 prims_ts DSA with nvfp4_ds_mla KV (352 B/token records, FP8 "
+            "q). PD prefill and decode servers must both use "
+            "--kv-cache-dtype nvfp4_ds_mla."
+        )
+    elif backend in ("trtllm", "prims_ts"):
         logger.warning(
             f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
             "the reference fp8_ds_mla numerics. PD prefill and decode servers must "

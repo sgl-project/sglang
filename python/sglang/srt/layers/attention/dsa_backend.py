@@ -130,6 +130,7 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv_cache_dtype import uses_nvfp4_ds_mla_kv
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -499,6 +500,21 @@ def uses_raw_fp8_dsa_kv_layout(backend: Optional[str]) -> bool:
     return backend in ("trtllm", "prims_ts")
 
 
+def _check_nvfp4_ds_mla_kv_scales(model: torch.nn.Module) -> None:
+    """nvfp4_ds_mla records carry their own block scales and Prims-TS applies no
+    per-tensor KV descale to them, so a checkpoint KV scale cannot be honoured."""
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    for name, module in model.named_modules():
+        if not isinstance(module, RadixAttention):
+            continue
+        if module.k_scale_float not in (None, 1.0):
+            raise ValueError(
+                "--kv-cache-dtype nvfp4_ds_mla has no per-tensor KV scale, but "
+                f"{name} loaded k_scale={module.k_scale_float}."
+            )
+
+
 # Largest head count the kernel has been measured at. Above it BLOCK_H=64/128
 # makes the [BLOCK_H, 512] fp32 accumulator spill or miss SM120's smem budget.
 _TRITON_SPARSE_MLA_MAX_HEADS = 32
@@ -806,6 +822,9 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
+        # --kv-cache-dtype nvfp4_ds_mla: the same resolved flag sized the pool
+        # rows (calculate_mla_kv_cache_dim) and selects the pool writer.
+        self.dsa_kv_nvfp4 = uses_nvfp4_ds_mla_kv(hf_config=hf_config)
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         kimi_k31 = is_kimi_k31(hf_config)
         self.plans_padded_extend_rows = kimi_k31
@@ -861,8 +880,11 @@ class DeepseekSparseAttnBackend(
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
         # sharded prefill on the sparse kernels with explicit scratch addresses.
         self.supports_mha_one_shot: bool = (
-            self.attn_dcp_size == 1 or self.dsa_shards_index_k
-        ) and self._kv_shard_pool is None
+            (self.attn_dcp_size == 1 or self.dsa_shards_index_k)
+            and self._kv_shard_pool is None
+            # dense MHA would read the NVFP4 rows as raw FP8
+            and not self.dsa_kv_nvfp4
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         if (
@@ -918,19 +940,37 @@ class DeepseekSparseAttnBackend(
         if "prims_ts" in (self.dsa_prefill_impl, self.dsa_decode_impl):
             if model_runner.kv_cache_dtype != torch.float8_e4m3fn:
                 raise ValueError(
-                    "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3."
+                    "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3 or "
+                    "nvfp4_ds_mla."
                 )
             _validate_prims_ts_dcp(
                 dcp_size=get_parallel().attn_dcp_size,
                 shards_index_k=self.dsa_shards_index_k,
             )
+            kv_cache_format = "nvfp4.fp8rope" if self.dsa_kv_nvfp4 else "native"
             check_prims_ts_sparse_mla_support(
                 device=torch.device(self.device),
                 num_heads=self.num_q_heads,
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
+                kv_cache_format=kv_cache_format,
             )
-            self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
+            self._prims_ts = PrimsTSSparseMLA(
+                torch.device(self.device), kv_cache_format=kv_cache_format
+            )
+            if self.kv_cache_dim != self._prims_ts.row_bytes:
+                raise ValueError(
+                    f"prims_ts with {kv_cache_format} cache rows needs a "
+                    f"{self._prims_ts.row_bytes} B KV pool row; the pool has "
+                    f"{self.kv_cache_dim} B."
+                )
+            if self.dsa_kv_nvfp4:
+                _check_nvfp4_ds_mla_kv_scales(model_runner.model)
+        elif self.dsa_kv_nvfp4:
+            raise ValueError(
+                "--kv-cache-dtype nvfp4_ds_mla is read only by the prims_ts DSA "
+                "backend."
+            )
         self._trtllm_q_pad_graph: Optional[torch.Tensor] = None
         self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
             self.local_num_q_heads

@@ -865,6 +865,11 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         dst_dtype: Optional[torch.dtype] = None,
         layer_id_override: Optional[int] = None,
     ):
+        if self.dsa_kv_nvfp4:
+            raise NotImplementedError(
+                "nvfp4_ds_mla rows are read only by Prims-TS; the page-interleave "
+                "row copy would read them as raw FP8"
+            )
         slot = self._acquire_slot_for_read(
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -1064,9 +1069,9 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         cache_v: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_fp8 or self.dsa_kv_nvfp4:
             raise NotImplementedError(
-                "packed DSA latent writes require set_mla_kv_buffer"
+                "packed and nvfp4_ds_mla DSA latent writes require set_mla_kv_buffer"
             )
         return super().set_kv_buffer(
             layer, loc_info, cache_k, cache_v, layer_id_override

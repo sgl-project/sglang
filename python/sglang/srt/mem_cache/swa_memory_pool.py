@@ -148,11 +148,13 @@ class SWAKVPool(BaseSWAKVPool):
                 pool.model_layer_ids = tuple(layer_ids)
         self.dsa_kv_cache_store_fp8 = False
         self.kv_scale_ue8m0 = False
+        self.dsa_kv_nvfp4 = False
         self.kv_cache_dim = None
         self.index_head_dim = None
         if isinstance(self.full_kv_pool, MLATokenToKVPool):
             self.dsa_kv_cache_store_fp8 = self.full_kv_pool.dsa_kv_cache_store_fp8
             self.kv_scale_ue8m0 = self.full_kv_pool.kv_scale_ue8m0
+            self.dsa_kv_nvfp4 = self.full_kv_pool.dsa_kv_nvfp4
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
         if isinstance(self.full_kv_pool, DSATokenToKVPool):
             self.index_head_dim = self.full_kv_pool.index_head_dim
