@@ -30,11 +30,9 @@ from sglang.srt.speculative import (
     eagle_worker_v2,
     spec_utils,
 )
-from sglang.srt.speculative.eagle_post_verify_graphs import (
-    EaglePostVerifyGraphs,
-    simulated_acc_len_generator,
-)
+from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
+from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
