@@ -2,9 +2,10 @@ from importlib.util import find_spec
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -45,7 +46,7 @@ def benchmark(vocab_size: int, batch_size: int, impl: str):
 
 
 if __name__ == "__main__":
-    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+    if is_hip_runtime() or not current_arch().is_sm(10):
         print("The JIT softmax requires an SM100-family CUDA GPU. Skipping.")
     else:
         benchmark.run()

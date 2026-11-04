@@ -24,12 +24,12 @@ from copy import copy
 from dataclasses import fields, replace
 from typing import Any
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     align_num_frames_for_num_gpus,
     resolve_sequence_shard,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (

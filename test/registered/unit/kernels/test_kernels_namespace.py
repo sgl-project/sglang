@@ -157,7 +157,7 @@ def test_platform_detection_distinguishes_musa_cuda_alias(
     if musa_available is not None:
         torch.musa = SimpleNamespace(is_available=lambda: musa_available)
     monkeypatch.setitem(sys.modules, "torch", torch)
-    assert PlatformInfo.detect().device_type == expected_device
+    assert PlatformInfo.detect(use_cache=False).device_type == expected_device
 
 
 def test_capabilities_or_semantics():
@@ -562,6 +562,7 @@ def test_muse_spark_kernels_are_inventoried_by_operator(op, backends):
         ("attention.deep_select_topk", (10, 0), True),
         ("attention.deep_select_topk", (10, 1), False),
         ("attention.deep_select_topk", (10, 3), True),
+        ("attention.deep_select_topk", (10, 7), True),
         ("attention.deep_select_topk", (12, 0), False),
         ("attention.chunk_kda_fwd", (9, 0), False),
         ("attention.chunk_kda_fwd", (10, 0), True),
