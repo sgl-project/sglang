@@ -124,8 +124,8 @@ class TestQwen3NextMTPLazyV2(
 @unittest.skip("Manual-only: forces all lazy spec preallocs to fail")
 class TestQwen3NextMTPLazyAllocFail(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
     # Small track interval (= draft tokens) maximizes boundary crossings;
-    # forced alloc failure exercises the in-place fallback and the
-    # finished-req skip-insert path on every crossing.
+    # forced alloc failure skips the snapshot on every crossing, so the
+    # keep checkpoint must stay valid for finished-req inserts.
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93

@@ -237,6 +237,81 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
                 set_mamba_track_indices_from_reqs(batch, positions)
                 self.assertEqual(batch.mamba_track_indices.tolist(), expected)
 
+    def test_rows_planned_at_minus_one_are_inert(self):
+        mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=0))
+                for _ in range(2)
+            ],
+            req_pool_indices=torch.arange(2),
+            req_to_token_pool=SimpleNamespace(
+                req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+            ),
+        )
+        set_mamba_track_indices_from_reqs(batch, [1, -1])
+        self.assertEqual(batch.mamba_track_indices.tolist(), [8, -1])
+
+
+class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
+    """A lazy boundary that cannot get a second tracking slot skips its snapshot:
+    nothing writes the keep slot, which still holds mamba_last_track_seqlen."""
+
+    @staticmethod
+    def _make_lazy_batch(took: bool) -> tuple[Req, ScheduleBatch]:
+        req, batch = _make_batch()
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, -1])
+        req.kv.mamba_ping_pong_empty = [False, True]
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 0
+        req.kv.mamba_last_track_seqlen = TRACK_INTERVAL
+        req.kv.kv_committed_len = 2 * TRACK_INTERVAL - 1
+        batch.seq_lens = torch.tensor([2 * TRACK_INTERVAL - 1], dtype=torch.int64)
+        batch.seq_lens_cpu = batch.seq_lens.clone()
+        batch.req_to_token_pool = None
+        batch.token_to_kv_pool_allocator = SimpleNamespace(
+            storage=SimpleNamespace(take_tracking_slot=lambda req, position: took)
+        )
+        return req, batch
+
+    def test_decode_boundary_clears_its_track_mask_bit(self):
+        for took in (True, False):
+            with self.subTest(took=took):
+                req, batch = self._make_lazy_batch(took)
+                with (
+                    get_context().override_server_args(
+                        mamba_radix_cache_strategy="extra_buffer_lazy",
+                        mamba_track_interval=TRACK_INTERVAL,
+                        _mamba_cache_chunk_size=TRACK_INTERVAL,
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                        return_value=torch.tensor([3], dtype=torch.int64),
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+                    ),
+                    patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+                ):
+                    batch.prepare_for_decode()
+                self.assertEqual(batch.mamba_track_mask_cpu, [took])
+                self.assertEqual(batch.mamba_track_mask.tolist(), [took])
+                self.assertEqual(req.kv.mamba_next_track_idx, 1 if took else 0)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+    def test_spec_crossing_plans_no_write_and_keeps_the_checkpoint(self):
+        req, batch = self._make_lazy_batch(took=False)
+        batch.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
+        self.assertEqual(batch.mamba_lazy_spec_track_positions_cpu, [-1])
+
+        _make_processor()._mamba_lazy_spec_update(
+            req, batch, 0, crossed=True, track_seqlen=2 * TRACK_INTERVAL
+        )
+        self.assertEqual(req.kv.mamba_ping_pong_track_buffer.tolist(), [10, -1])
+        self.assertEqual(req.kv.mamba_next_track_idx, 0)
+        self.assertEqual(req.kv.mamba_last_track_idx, 0)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
 
 if __name__ == "__main__":
     unittest.main()
