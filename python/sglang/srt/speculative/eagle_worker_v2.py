@@ -33,7 +33,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1092,6 +1092,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
                 mm_input_embeds=mm_input_embeds,
+                iteration_ids=iteration_ids,
             )
 
         # Construct input_ids
@@ -1174,6 +1175,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor],
+        iteration_ids: Optional[IterationIds],
     ) -> EagleDraftInput:
         """Write the draft KV of every request's tokens but its last without attention
         or MoE, then run the full draft layer on the last tokens."""
@@ -1193,6 +1195,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
+            iteration_ids=iteration_ids,
+            write_cols=None if iteration_ids is None else kv_rows,
         )
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds[kv_rows + 1]
@@ -1207,6 +1211,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             mm_input_embeds=(
                 None if mm_input_embeds is None else mm_input_embeds[last_rows]
             ),
+            iteration_ids=iteration_ids,
+            write_cols=None if iteration_ids is None else last_rows,
         )
 
     def _run_draft_extend_for_prefill(
@@ -1217,6 +1223,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor],
         iteration_ids: Optional[IterationIds] = None,
+        write_cols: Optional[Cols] = None,
     ) -> EagleDraftInput:
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
@@ -1241,6 +1248,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=False,
             iteration_ids=iteration_ids,
+            write_cols=write_cols,
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
