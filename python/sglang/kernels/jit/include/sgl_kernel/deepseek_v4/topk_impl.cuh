@@ -175,6 +175,7 @@ struct TopKConfig {
   // scores). A smaller cap leaves slots that handle_tie can only pad, and
   // padded slots inside the first min(seq_len, topk) entries are dereferenced
   // by downstream sparse attention.
+  // The actual bucket population can exceed this capacity; rescan on overflow.
   static constexpr uint32_t kMaxNumTie = 2048;
   static constexpr uint32_t kRadixSize = 1 << 8;
   // Radix width of the threshold-bin refinement (refine_ties). Wider
@@ -524,6 +525,69 @@ struct TopKRadixBase : TopKConfig {
     vec.store(histogram, tx);
   }
 
+  /// The coarse bin may contain arbitrarily many distinct fp32 values. If its
+  /// collection buffer overflowed, select from the input, not the truncated
+  /// buffer. Four byte-wise radix passes find the exact cutoff in bounded smem;
+  /// a final pass emits all greater keys and only the needed equal keys.
+  /// All threads in one CTA call this. For a cluster, only rank 0 rescans the
+  /// whole row; peers' already-selected outputs occupy [0, base), disjoint from
+  /// this helper's output range. No cluster synchronization is added here.
+  SGL_DEVICE static void
+  handle_tie_overflow(const TopKProblem& problem, uint32_t base, float v_lo, float v_hi, TieHandleSmem* smem) {
+    if (base >= problem.topk) return;
+    const auto tx = threadIdx.x;
+    const auto needed = problem.topk - base;
+    uint32_t remaining = needed;
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+
+#pragma unroll 1
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      if (tx < kRadixSize) smem->histogram[0][tx] = 0;
+      __syncthreads();
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        if (idx >= problem.input_start && val >= v_lo && val < v_hi) {
+          const auto key = extract_exact_bin(val);
+          if ((key & prefix_mask) == prefix) {
+            atomicAdd(&smem->histogram[0][(key >> shift) & 0xFFu], 1);
+          }
+        }
+      });
+      __syncthreads();
+      if (tx == 0) {
+        uint32_t above = 0;
+        for (int bin = kRadixSize - 1; bin >= 0; --bin) {
+          const auto count = smem->histogram[0][bin];
+          if (above + count >= remaining) {
+            smem->match = {static_cast<uint32_t>(bin), above, count};
+            break;
+          }
+          above += count;
+        }
+      }
+      __syncthreads();
+      prefix |= smem->match.bin << shift;
+      prefix_mask |= 0xFFu << shift;
+      remaining -= smem->match.above_count;
+    }
+
+    const auto num_greater = needed - remaining;
+    if (tx == 0) smem->counter = smem->counter_final = 0;
+    __syncthreads();
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if (idx >= problem.input_start && val >= v_lo && val < v_hi) {
+        const auto key = extract_exact_bin(val);
+        if (key > prefix) {
+          const auto pos = atomicAdd(&smem->counter, 1);
+          problem.emit(base + pos, idx);
+        } else if (key == prefix) {
+          const auto pos = atomicAdd(&smem->counter_final, 1);
+          if (pos < remaining) problem.emit(base + num_greater + pos, idx);
+        }
+      }
+    });
+  }
+
   /// Same, but scanning a histogram that need not be `smem`'s own -- the cluster
   /// path merges into one rank's copy and scans it there.
   template <typename Smem, typename Fn>
@@ -769,6 +833,9 @@ struct TopKRegister : TopKRadixBase<12> {
     }
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
+    if (count_eq > kMaxNumTie) [[unlikely]] {
+      return handle_tie_overflow(problem, count_gt, v_lo, v_hi, &smem->tie_handle);
+    }
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
@@ -855,6 +922,9 @@ struct TopKStreaming : TopKRadixBase<12> {
     }
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
+    if (count_eq > kMaxNumTie) [[unlikely]] {
+      return handle_tie_overflow(problem, count_gt, v_lo, v_hi, &smem->tie_handle);
+    }
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
@@ -976,7 +1046,9 @@ struct TopKCluster : TopKRadixBase<10> {
       });
       __syncthreads();
       const auto local_count_gt = smem->count_gt;
-      const auto local_count_eq = min(smem->count_eq, kMaxNumTie);
+      // Preserve the true population for overflow detection even when only
+      // kMaxNumTie entries were stored. The copy below remains capacity-bounded.
+      const auto local_count_eq = smem->count_eq;
       if (tx == 0) {
         const auto gt = atomicAdd(&smem_0->count_gt, local_count_gt);
         const auto eq = atomicAdd(&smem_0->count_eq, local_count_eq);
@@ -989,7 +1061,7 @@ struct TopKCluster : TopKRadixBase<10> {
 #pragma unroll
       for (uint32_t i = 0; i < kTieItems; ++i) {
         const auto t = tx + i * kBlockSize;
-        if (t < local_count_eq && local_start_eq + t < kMaxNumTie) {
+        if (t < min(local_count_eq, kMaxNumTie) && local_start_eq + t < kMaxNumTie) {
           smem_0->tie_values[local_start_eq + t] = smem->tie_values[t];
         }
       }
@@ -1041,6 +1113,9 @@ struct TopKCluster : TopKRadixBase<10> {
       // Phase 4: Handle ties.
       const auto count_gt = smem->count_gt;
       const auto count_eq = smem->count_eq;
+      if (count_eq > kMaxNumTie) [[unlikely]] {
+        return handle_tie_overflow(problem, count_gt, v_lo, v_hi, &smem->tie_handle);
+      }
       const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
       const auto tie_count = min(count_eq, kMaxNumTie);
       handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
