@@ -1673,54 +1673,93 @@ mod tests {
         assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
     }
 
-    /// A full-prompt cache hit also covers K3's generation stub, which usage
-    /// leaves out of `prompt_tokens`; `cached_tokens` must not exceed it.
+    /// `_reported_cached_tokens`, over the cases of its Python tests: a K3 cache
+    /// hit reaching the generation stub left out of `prompt_tokens` is capped at
+    /// `prompt_tokens`; one ending before the stub, and other models, keep the
+    /// engine's count. Unary, final-usage and continuous-usage replies agree.
     #[test]
-    fn kimi_k3_usage_caps_cached_tokens_at_reported_prompt_tokens() {
-        let body = json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        let settings = OpenAiSettings {
-            enable_cache_report: true,
-            ..OpenAiSettings::default()
-        };
+    fn kimi_k3_cached_tokens_exclude_the_generation_stub() {
         let k3 = ChatModel {
             chat_encoding_spec: Some("kimi_k3".into()),
             ..ChatModel::default()
+        };
+        let other = ChatModel::default();
+        // (model, engine prompt, engine cached, reported prompt, reported cached)
+        let cases = [
+            (&k3, 2075, 2073, 2072, 2072),
+            (&k3, 2075, 2000, 2072, 2000),
+            (&other, 2075, 2073, 2075, 2073),
+        ];
+        let stream_options = [
+            None,
+            Some(json!({"include_usage": true})),
+            Some(json!({"continuous_usage_stats": true})),
+        ];
+        for (model, prompt, cached, want_prompt, want_cached) in cases {
+            for options in &stream_options {
+                let usage = one_frame_usage(model, options.as_ref(), prompt, cached);
+                assert_eq!(
+                    usage["prompt_tokens"],
+                    json!(want_prompt),
+                    "{options:?} {usage}"
+                );
+                assert_eq!(
+                    usage["prompt_tokens_details"]["cached_tokens"],
+                    json!(want_cached),
+                    "{options:?} {usage}"
+                );
+            }
+        }
+    }
+
+    /// The usage of a one-frame chat reply with cache reporting on: unary
+    /// without `stream_options`, streamed with them.
+    fn one_frame_usage(
+        model: &ChatModel,
+        stream_options: Option<&Value>,
+        prompt_tokens: u32,
+        cached_tokens: u32,
+    ) -> Value {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        if let Some(options) = stream_options {
+            body["stream"] = json!(true);
+            body["stream_options"] = options.clone();
+        }
+        let settings = OpenAiSettings {
+            enable_cache_report: true,
+            ..OpenAiSettings::default()
         };
         let (_, mut responder) = lower_chat(
             &serde_json::to_vec(&body).unwrap(),
             &OpenAiHeaders::default(),
             &settings,
-            &k3,
+            model,
             |_: &Value| Some(vec![1]),
             None,
         )
         .unwrap();
-        let frame = json!({"text": "a", "output_ids": [2], "meta_info": {
-            "id": "r",
-            "finish_reason": {"type": "stop"},
-            "prompt_tokens": 1025,
-            "completion_tokens": 1,
-            "cached_tokens": 1024,
-        }});
-        let mut events = responder
-            .stream_data(Ok(serde_json::from_value(frame).unwrap()))
-            .unwrap();
+        let frame: GenerateResponse = serde_json::from_value(json!({
+            "text": "a",
+            "output_ids": [2],
+            "meta_info": {
+                "id": "r",
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 1,
+                "cached_tokens": cached_tokens,
+            },
+        }))
+        .unwrap();
+        if stream_options.is_none() {
+            let reply = responder.unary(vec![frame]).expect("unary reply");
+            return serde_json::from_str::<Value>(&reply.body).unwrap()["usage"].clone();
+        }
+        let mut events = responder.stream_data(Ok(frame)).unwrap();
         events.extend(responder.stream_end());
-        let usage = events
+        events
             .iter()
             .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
             .find_map(|chunk| chunk.get("usage").filter(|u| !u.is_null()).cloned())
-            .expect("usage chunk");
-        assert_eq!(usage["prompt_tokens"], json!(1022), "{usage}");
-        assert_eq!(
-            usage["prompt_tokens_details"]["cached_tokens"],
-            json!(1022),
-            "{usage}"
-        );
+            .expect("usage chunk")
     }
 }
