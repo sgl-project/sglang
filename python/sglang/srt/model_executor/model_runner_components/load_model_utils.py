@@ -16,12 +16,16 @@ from sglang.srt.arg_groups.overrides import (
     modelexpress_url_of,
 )
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadFormat,
+    LoadGroup,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -34,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -115,6 +120,12 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
+    quant_config = getattr(model, "quant_config", None)
+    if _is_npu and quant_config is not None and quant_config.get_name() == "modelslim":
+        # This helper loads a separate --quantization-param-path calibration file.
+        # ModelSlim loads KV scales from the checkpoint with model weights.
+        return
+
     if kv_cache_dtype == "fp8_e4m3":
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
@@ -202,6 +213,7 @@ def build_load_config(
     draft_model_idx: int | None,
     weight_cache_mode: str,
     weight_cache_socket: str | None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -231,6 +243,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        load_group=load_group,
     )
 
 
@@ -275,6 +288,27 @@ def load_model_with_memory_saver(
             )
         if is_qwen4_exp:
             model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
+            model_config.hf_text_config.ple_offload_backend = (
+                get_exec().offload.ple_offload_backend
+            )
+            if get_exec().offload.ple_offload_backend != "file":
+                model_config.hf_text_config.ple_offload_dir = (
+                    get_exec().offload.ple_offload_dir
+                )
+            else:
+                from sglang.srt.models.qwen4_exp_ple_table import (
+                    check_file_backend_supported,
+                    default_ple_table_dir,
+                )
+
+                model_config.hf_text_config.ple_offload_dir = (
+                    get_exec().offload.ple_offload_dir
+                    or default_ple_table_dir(get_model().model_path)
+                )
+                if ple_offload_embedding and device == "cuda":
+                    check_file_backend_supported(
+                        torch.cuda.current_device() if torch.cuda.is_available() else 0
+                    )
 
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
@@ -352,12 +386,12 @@ def dist_barrier_after_load(
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
         if not is_ep_joiner:
-            dist.barrier(group=get_tp_group().cpu_group)
+            dist.barrier(group=get_parallel().tp_group.cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
         try:
             dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
+                group=get_parallel().tp_group.cpu_group,
                 timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
                 wait_all_ranks=True,
             )

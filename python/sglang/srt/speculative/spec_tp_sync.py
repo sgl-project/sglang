@@ -18,17 +18,14 @@ class SpecTpSyncSite(IntEnum):
     """
 
     # -- DSpark --
-    DSPARK_MEM = 1  # gates both graph capture and folded sampling
-    DSPARK_DRAFT_GREEDY = 2
-    DSPARK_DRAFT_SAMPLE = 3
-    DSPARK_DRAFT_MULTINOMIAL = 4
-    DSPARK_GRAPH_SAMPLE = 5  # in-graph philox, redrawn per replay
-    DSPARK_GRAPH_GREEDY = 6
+    DSPARK_MEM = 1  # gates the draft graph capture
     DSPARK_PLAN = 7
     DSPARK_ACCEPT_GREEDY = 8
     DSPARK_ACCEPT_SAMPLE = 9
     DSPARK_ACCEPT_GRAPH = 10
     DSPARK_TARGET = 11
+    # A fresh number, so the retired 2-6 cannot silently select it.
+    DSPARK_DRAFT = 17
 
     # -- DFlash --
     DFLASH_MEM = 12
@@ -44,12 +41,11 @@ class SpecTpSyncSite(IntEnum):
 
 _ALL = frozenset(SpecTpSyncSite)
 _INIT = frozenset({SpecTpSyncSite.DSPARK_MEM, SpecTpSyncSite.DFLASH_MEM})
-# Sites that draw from the RNG, so they can differ under identical logits.
+# Sites that draw from the RNG, so they can differ under identical logits; so did the
+# renorm output the accept sites consume, before sampling_renorm.py made it
+# bit-identical across ranks whenever tp_size > 1.
 _RNG = frozenset(
     {
-        SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
-        SpecTpSyncSite.DSPARK_DRAFT_MULTINOMIAL,
-        SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
         SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
         SpecTpSyncSite.DSPARK_TARGET,
         SpecTpSyncSite.DFLASH_SELECTOR,
@@ -69,11 +65,36 @@ _PRESETS = {
 
 _BY_SLUG = {site.slug: site for site in SpecTpSyncSite}
 _BY_NUMBER = {str(int(site)): site for site in SpecTpSyncSite}
+# Retired handles of the per-path DSpark draft sites, merged into DSPARK_DRAFT.
+_RETIRED = {
+    token: SpecTpSyncSite.DSPARK_DRAFT
+    for token in (
+        "dspark-draft-greedy",
+        "dspark-draft-sample",
+        "dspark-draft-multinomial",
+        "dspark-graph-sample",
+        "dspark-graph-greedy",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+    )
+}
+assert not _RETIRED.keys() & (_BY_SLUG.keys() | _BY_NUMBER.keys())
 
 
 def _resolve(name: str) -> frozenset[SpecTpSyncSite]:
     if name in _PRESETS:
         return _PRESETS[name]
+    if name in _RETIRED:
+        site = _RETIRED[name]
+        logger.warning(
+            "SGLANG_SPEC_TP_SYNC token %r is retired; it selects %r.",
+            name,
+            site.slug,
+        )
+        return frozenset({site})
     site = _BY_SLUG.get(name) or _BY_NUMBER.get(name)
     if site is None:
         raise ValueError(
@@ -104,9 +125,13 @@ class SpecTpSync:
         # Parsed even on a single rank so a typo fails on every deployment.
         sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
         self._sites = sites if tp_group.world_size > 1 else frozenset()
-        if sites != _ALL and tp_group.world_size > 1 and tp_group.rank_in_group == 0:
-            logger.warning(
-                "Speculative TP sync limited to %s.",
+        if (
+            envs.SGLANG_SPEC_TP_SYNC.is_set()
+            and tp_group.world_size > 1
+            and tp_group.rank_in_group == 0
+        ):
+            logger.info(
+                "Speculative TP sync broadcasts %s.",
                 [f"{int(s)}:{s.slug}" for s in sorted(sites)] or "no site",
             )
 

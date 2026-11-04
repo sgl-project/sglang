@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import (
     LinearScalingRotaryEmbedding,
     RotaryEmbedding,
@@ -50,6 +51,21 @@ def _get_rope_param(rope_scaling, key, default, scaling_type):
         default,
     )
     return default
+
+
+def _bailing_yarn_kwargs(rope_scaling: Dict[str, Any], max_position: int) -> Dict:
+    """YaRN overrides for BailingMRotaryEmbedding; factor=1.0 is a no-op."""
+    return {
+        "scaling_factor": rope_scaling.get("factor", 1.0),
+        "original_max_position_embeddings": rope_scaling.get(
+            "original_max_position_embeddings", max_position
+        ),
+        "extrapolation_factor": rope_scaling.get("extrapolation_factor", 1),
+        "attn_factor": rope_scaling.get("attn_factor", 1),
+        "beta_fast": rope_scaling.get("beta_fast", 32),
+        "beta_slow": rope_scaling.get("beta_slow", 1),
+        "truncate": rope_scaling.get("truncate", True),
+    }
 
 
 _is_hip = is_hip()
@@ -209,7 +225,21 @@ def get_rope(
                 original_max_position,
             )
         elif scaling_type == "default":
-            if "mrope_section" in rope_scaling:
+            if "mrope_section" in rope_scaling and rope_scaling.get(
+                "video_rope", False
+            ):
+                rotary_emb = BailingMRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    video_rope=True,
+                    **_bailing_yarn_kwargs(rope_scaling, max_position),
+                )
+            elif "mrope_section" in rope_scaling:
                 rotary_emb = MRotaryEmbedding(
                     head_size,
                     rotary_dim,
@@ -300,7 +330,21 @@ def get_rope(
                 )
             }
             extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
-            if "mrope_section" in rope_scaling:
+            if "mrope_section" in rope_scaling and rope_scaling.get(
+                "video_rope", False
+            ):
+                rotary_emb = BailingMRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    video_rope=True,
+                    **_bailing_yarn_kwargs(rope_scaling, max_position),
+                )
+            elif "mrope_section" in rope_scaling:
                 rotary_emb = YaRNScalingMRotaryEmbedding(
                     head_size,
                     rotary_dim,

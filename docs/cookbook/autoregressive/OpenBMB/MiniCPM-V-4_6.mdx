@@ -32,7 +32,8 @@ Pull the nightly Docker image (rolling tag, tracks `main`):
 # CUDA 13 (Hopper / Blackwell, default)
 docker pull lmsysorg/sglang:dev
 
-# CUDA 12 (Ampere or older drivers)
+# CUDA 12 (Ampere or older drivers). Final build: the CUDA 12 lane is retired,
+# so this tag no longer tracks main.
 docker pull lmsysorg/sglang:dev-cu12
 ```
 
@@ -374,7 +375,7 @@ We use SGLang's built-in `bench_serving` tool with random text prompts (1000 inp
 #### 5.2.1 Latency Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
@@ -428,7 +429,7 @@ Max ITL (ms):                            5.79
 #### 5.2.2 Throughput Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
@@ -486,7 +487,7 @@ We use SGLang's built-in `bench_serving` tool with random images. Each request h
 #### 5.3.1 Latency Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
@@ -545,7 +546,7 @@ Max ITL (ms):                            2.89
 #### 5.3.2 Throughput Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \

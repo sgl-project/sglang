@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import ast
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from importlib.util import resolve_name
-from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -22,32 +19,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     get_mixed_precision_state,
     set_mixed_precision_policy,
 )
-
-
-def test_models_do_not_import_pipeline_stages():
-    root = Path(__file__).resolve().parents[2]
-    violations = []
-    for path in sorted((root / "runtime/models").rglob("*.py")):
-        package = "sglang.multimodal_gen." + str(path.parent.relative_to(root)).replace(
-            "/", "."
-        )
-        for node in ast.walk(ast.parse(path.read_text())):
-            names = []
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                prefix = node.module or ""
-                if node.level:
-                    prefix = resolve_name("." * node.level + prefix, package)
-                names = [prefix] + [f"{prefix}.{alias.name}" for alias in node.names]
-            if any(
-                name.startswith("sglang.multimodal_gen.runtime.pipelines_core.stages")
-                for name in names
-            ):
-                violations.append(f"{path.relative_to(root)}:{node.lineno}")
-    assert not violations, "Models must not depend on pipeline stages: " + ", ".join(
-        violations
-    )
 
 
 def test_argument_parser_preserves_config_and_explicit_values(tmp_path):

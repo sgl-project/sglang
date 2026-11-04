@@ -3,9 +3,7 @@ set -euo pipefail
 
 ROCM_VERSION=${1:-}
 
-if [[ "${ROCM_VERSION}" == "700" ]]; then
-  IMAGE="lmsysorg/sglang:v0.5.8.post1-rocm700-mi35x"
-elif [[ "${ROCM_VERSION}" == "720" ]]; then
+if [[ "${ROCM_VERSION}" == "720" ]]; then
   IMAGE="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 elif [[ "${ROCM_VERSION}" == "1000" ]]; then
   # Ubuntu 24.04 / Python 3.12 / torch 2.11 matches the stack the released
@@ -13,7 +11,7 @@ elif [[ "${ROCM_VERSION}" == "1000" ]]; then
   # wheel can still cover both gfx942 and gfx950.
   IMAGE="rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.11.0"
 else
-  echo "ERROR: Unsupported ROCM_VERSION='${ROCM_VERSION}'. Only '700', '720' and '1000' are supported." >&2
+  echo "ERROR: Unsupported ROCM_VERSION='${ROCM_VERSION}'. Only '720' and '1000' are supported." >&2
   exit 1
 fi
 
@@ -58,6 +56,19 @@ if [[ "${ROCM_VERSION}" == "1000" ]]; then
   WHEEL_ROCM_VERSION="1000"
 fi
 
+# The build reuses the CUDA pyproject.toml, which requires Python 3.11 and tags
+# its wheel cp311-abi3. The ROCm 7.2.0 image and amd-sglang still run on Python
+# 3.10, so the ROCm wheels keep the Python 3.10 floor and the cp310-abi3 tag.
+sed -i \
+  -e 's/^requires-python = ">=3.11"$/requires-python = ">=3.10"/' \
+  -e 's/^wheel.py-api = "cp311"$/wheel.py-api = "cp310"/' \
+  pyproject.toml
+if ! grep -qx 'requires-python = ">=3.10"' pyproject.toml \
+  || ! grep -qx 'wheel.py-api = "cp310"' pyproject.toml; then
+  echo "ERROR: could not set the ROCm Python 3.10 / cp310 metadata in pyproject.toml." >&2
+  exit 1
+fi
+
 # Pull and run the latest image
 echo "Pulling Docker image: ${IMAGE}"
 docker pull "${IMAGE}"
@@ -69,9 +80,7 @@ docker run --rm \
   ${IMAGE} \
   bash -c "
   # Install torch, triton, and friends, depending on the ROCm version
-  if [[ "${ROCM_VERSION}" == "700" ]]; then
-    ${PYTHON_ROOT_PATH}/pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torch-2.9.1.dev20251204%2Brocm7.0.2.lw.git351ff442-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/triton-3.5.1%2Brocm7.0.2.gita272dfa8-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl
-  elif [[ "${ROCM_VERSION}" == "720" ]]; then
+  if [[ "${ROCM_VERSION}" == "720" ]]; then
     ${PYTHON_ROOT_PATH}/pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl
   fi
 ${ROCM_SETUP}
@@ -90,5 +99,6 @@ ${ROCM_SETUP}
   rm -rf CMakeLists.txt && mv CMakeLists_rocm.txt CMakeLists.txt && \
   ${PYTHON_ROOT_PATH}/python rocm_hipify.py && \
   ${PYTHON_ROOT_PATH}/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
-  ./rename_wheels_rocm.sh ${WHEEL_ROCM_VERSION}
+  ./rename_wheels_rocm.sh ${WHEEL_ROCM_VERSION} && \
+  ${PYTHON_ROOT_PATH}/pip install --dry-run --no-deps dist/*.whl
 "

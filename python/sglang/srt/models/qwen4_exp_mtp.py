@@ -9,7 +9,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -48,11 +47,13 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
+        # The draft passes the fused HC stream in the inputs_embeds position.
+        # Register the replay slot at HC width, not the token embedding width.
+        self.input_embeds_hidden_size = self.hidden_size * self.hc_count
         self._mtp_input_fusion = self._init_mtp_input_fusion(config)
 
         self.model = Qwen4ExpModel(

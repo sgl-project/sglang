@@ -52,7 +52,7 @@ export const config = {
 
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -93,9 +93,10 @@ sgl-eval run mmmu_pro \\
 
   dockerImages: {
     // M3-specific dev images (multi-arch amd64+arm64). cu13 carries the sm_103
-    // (B300/GB300) + Grace arm64 builds; cu12 is the Hopper/CUDA-12 build;
-    // dev-minimax-m3 is the rolling default. M3 model support is not yet in a
-    // tagged release, so :latest cannot serve it.
+    // (B300/GB300) + Grace arm64 builds; cu12 is the final Hopper/CUDA-12 build
+    // (that lane is retired, so it no longer rebuilds); dev-minimax-m3 is the
+    // rolling default. M3 model support is not yet in a tagged release, so
+    // :latest cannot serve it.
     b200: "lmsysorg/sglang:dev-minimax-m3",
     b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
     gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",

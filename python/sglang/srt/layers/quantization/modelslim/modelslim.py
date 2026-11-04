@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
@@ -14,12 +15,14 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8MoEScheme,
     ModelSlimMXFP8Scheme,
+    ModelSlimQFP8DynamicKVFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A4MXFP4MoE,
@@ -37,7 +40,6 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
     )
@@ -63,6 +65,7 @@ def npu_wrapper_rmsnorm_forward(func):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
@@ -87,6 +90,62 @@ def npu_wrapper_rmsnorm_forward(func):
     return _rmsnorm_forward_oot
 
 
+def remap_dspark_weight_name_npu(
+    name: str, *, for_quant_config: bool = False
+) -> Optional[str]:
+    """Map a checkpoint name without consulting model state.
+
+    The loader selects vocabulary stages and filters disabled confidence-head
+    weights. ModelSlim uses the same names to add quantization-config aliases.
+    Config aliases retain scale suffixes and rotary entries and omit vocabulary
+    weights, matching the original ModelSlim configuration semantics.
+    """
+    if not name.startswith("mtp."):
+        return None
+    if not for_quant_config and "rotary_emb.inv_freq" in name:
+        return None
+    parts = name.split(".", 2)
+    if len(parts) < 3:
+        return None
+    stage_id, rest = parts[1], parts[2]
+    if not stage_id.isdigit():
+        return None
+    if not for_quant_config:
+        # Preserve the loader's integer-stage validation; isdigit() alone also
+        # accepts characters such as superscript digits that int() rejects.
+        int(stage_id)
+
+    if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+        if not for_quant_config:
+            if rest in ("embed.weight", "embed_tokens.weight"):
+                return "embed_tokens.weight"
+            if rest in ("head.weight", "lm_head.weight"):
+                return "lm_head.weight"
+        return None
+    if rest.startswith(("markov_head.", "confidence_head.")):
+        return rest
+
+    mapped_rest = rest
+    if mapped_rest.startswith("attn."):
+        mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
+    elif mapped_rest.startswith("ffn."):
+        mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
+    elif mapped_rest.startswith("attn_norm."):
+        mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
+    elif mapped_rest.startswith("ffn_norm."):
+        mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
+            "ffn_norm."
+        )
+    mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
+    mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
+    mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
+    mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+    mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+    if not for_quant_config and mapped_rest.endswith(".scale"):
+        mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
+    return f"stages.{stage_id}.{mapped_rest}"
+
+
 class ModelSlimConfig(QuantizationConfig):
     """
     Config class for ModelSlim Quantization, a NPU-specific quantization type.
@@ -96,6 +155,7 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
+        self.requested_kv_cache_dtype = "auto"
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
         if is_dsv4:
@@ -139,59 +199,18 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
-        # DSpark checkpoint weights use mtp.<stage>.*, while the runtime draft
-        # model constructs canonical modules under stages.<stage>.*.  Keep
-        # this transformation in sync with
-        # DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name.  Merely
-        # replacing ``mtp`` with ``stages`` is insufficient: it silently
-        # misses ModelSlim lookups such as stages.0.mlp.experts and
-        # stages.0.self_attn.
+        # Share DSpark path remapping while retaining config-specific suffixes,
+        # checkpoint keys, and the precedence of explicitly configured aliases.
         dspark_quant_aliases = {}
-        for name, scheme in quant_config.items():
-            if not isinstance(name, str) or not name.startswith("mtp."):
-                continue
-
-            parts = name.split(".", 2)
-            if len(parts) != 3:
-                continue
-
-            stage_id, rest = parts[1], parts[2]
-            if not stage_id.isdigit():
-                continue
-
-            # The draft model attaches the target model's shared embedding and
-            # LM head; mtp-local copies are not runtime draft modules.
-            if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-                continue
-            if rest.startswith("markov_head."):
-                alias = f"markov_head.{rest[len('markov_head.') :]}"
-            elif rest.startswith("confidence_head."):
-                alias = f"confidence_head.{rest[len('confidence_head.') :]}"
-            else:
-                mapped_rest = rest
-                if mapped_rest.startswith("attn."):
-                    mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
-                elif mapped_rest.startswith("ffn."):
-                    mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
-                elif mapped_rest.startswith("attn_norm."):
-                    mapped_rest = "input_layernorm." + mapped_rest.removeprefix(
-                        "attn_norm."
-                    )
-                elif mapped_rest.startswith("ffn_norm."):
-                    mapped_rest = (
-                        "post_attention_layernorm."
-                        + mapped_rest.removeprefix("ffn_norm.")
-                    )
-                mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
-                mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
-                mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
-                mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-                mapped_rest = mapped_rest.replace(
-                    ".gate.bias", ".gate.e_score_correction_bias"
-                )
-                alias = f"stages.{stage_id}.{mapped_rest}"
-
-            dspark_quant_aliases[alias] = scheme
+        if any(
+            isinstance(name, str) and name.startswith("mtp.") for name in quant_config
+        ):
+            for name, scheme in quant_config.items():
+                if not isinstance(name, str):
+                    continue
+                alias = remap_dspark_weight_name_npu(name, for_quant_config=True)
+                if alias is not None:
+                    dspark_quant_aliases[alias] = scheme
 
         quant_config = {
             **dspark_quant_aliases,
@@ -199,6 +218,80 @@ class ModelSlimConfig(QuantizationConfig):
         }
 
         self.quant_description = quant_config
+
+    def configure_kv_cache_quantization(self, dtype):
+        """Set this model's requested KV cache dtype."""
+        self.requested_kv_cache_dtype = dtype
+
+    def get_modelslim_kv_cache_layout(self, model, *, use_mla_backend):
+        """Return the layout of this worker's installed ModelSlim KV scheme."""
+        for module in model.modules():
+            if isinstance(
+                getattr(module, "quant_method", None), ModelSlimKVCacheMethod
+            ):
+                return module.scheme.get_cache_layout(use_mla_backend=use_mla_backend)
+        return None
+
+    @staticmethod
+    def _kv_scheme_class(quant_type):
+        # Map supported ModelSlim KV formats to their scheme classes.
+        kv_quant_schemes = {
+            "Q_FP8_DYNAMIC_KV_FP8": ModelSlimQFP8DynamicKVFP8Scheme,
+        }
+        scheme_class = kv_quant_schemes.get(quant_type)
+        if scheme_class is None:
+            raise ValueError(f"Unsupported ModelSlim KV quant_type: {quant_type!r}")
+        return scheme_class
+
+    def get_modelslim_kv_scheme(self, prefix):
+        if self.requested_kv_cache_dtype in ("auto", "bf16", "bfloat16"):
+            return None
+        # Map the model's layer prefix to checkpoint-name candidates, e.g.
+        # with or without "language_model."; try the original name first.
+        resolved_prefix = prefix
+        candidates = self._quant_prefix_candidates(prefix)
+        kv_suffixes = (
+            "quant_type",
+            "fa_k.scale",
+            "fa_k.offset",
+            "fa_v.scale",
+            "fa_v.offset",
+        )
+        has_layer_metadata = False
+        # Resolve to the first candidate with a quant_type or fa_k/fa_v key.
+        for candidate in candidates:
+            if any(
+                f"{candidate}.{suffix}" in self.quant_description
+                for suffix in kv_suffixes
+            ):
+                resolved_prefix = candidate
+                has_layer_metadata = True
+                break
+        quant_type = self.quant_description.get(f"{resolved_prefix}.quant_type")
+        if quant_type == "FLOAT" or any(
+            fnmatchcase(resolved_prefix, ignored)
+            or resolved_prefix.startswith(ignored + ".")
+            for ignored in self.ignore
+        ):
+            raise ValueError(
+                "ModelSlim quantized KV cache cannot share a pool "
+                f"with unquantized attention layer {resolved_prefix}. "
+                "Remove that layer's ignore/FLOAT declaration or use "
+                "--kv-cache-dtype auto for a BF16 cache."
+            )
+        if not has_layer_metadata:
+            raise ValueError(
+                f"{resolved_prefix}: ModelSlim quantized KV cache requires "
+                "a per-layer FA quantization declaration"
+            )
+        try:
+            scheme_class = self._kv_scheme_class(quant_type)
+        except ValueError as error:
+            raise ValueError(
+                f"{resolved_prefix}: unsupported ModelSlim KV format "
+                f"(quant_type={quant_type!r})"
+            ) from error
+        return scheme_class(resolved_prefix, self.requested_kv_cache_dtype)
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
@@ -217,6 +310,18 @@ class ModelSlimConfig(QuantizationConfig):
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
         for candidate in list(candidates):
+            if candidate.startswith("model.language_model."):
+                candidates.append(
+                    "model." + candidate.removeprefix("model.language_model.")
+                )
+            elif candidate.startswith("model."):
+                candidates.append(
+                    "model.language_model." + candidate.removeprefix("model.")
+                )
+            if candidate.startswith("model.visual."):
+                candidates.append(candidate.removeprefix("model."))
+            elif candidate.startswith("visual."):
+                candidates.append("model." + candidate)
             if candidate.startswith("language_model."):
                 candidates.append(candidate.removeprefix("language_model."))
             else:
@@ -275,11 +380,19 @@ class ModelSlimConfig(QuantizationConfig):
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
-            if proj_name in packed_modules_mapping_subset:
+            direct_prefix = self._resolve_quant_prefix(prefix)
+            if (
+                direct_prefix + ".weight" not in self.quant_description
+                and proj_name in packed_modules_mapping_subset
+            ):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
             prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
+            if prefix_in_quant_config + ".weight" not in self.quant_description:
+                # Fused-layout checkpoints (e.g. MiMo-V2.5 fused_qkv) keep the
+                # fused name in the quant description; fall back to it.
+                prefix_in_quant_config = self._resolve_quant_prefix(prefix)
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -311,6 +424,7 @@ class ModelSlimConfig(QuantizationConfig):
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
             ("W8A8", ModelSlimW8A8Int8),
+            ("W8A8S", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
             ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
             ("W4A8_MXFP", ModelSlimMXFP4W4A8Scheme),
@@ -439,6 +553,9 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        direct_prefix = self._resolve_quant_prefix(prefix)
+        if direct_prefix + ".weight" in self.quant_description:
+            return self.quant_description[direct_prefix + ".weight"] == "FLOAT"
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name)
@@ -469,6 +586,23 @@ class ModelSlimConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class ModelSlimKVCacheMethod(QuantizeMethodBase):
+    """Use the attention layer's scheme without GPU per-tensor KV fallbacks."""
+
+    def create_weights(self, layer, **kwargs):
+        layer.scheme.create_weights(layer, **kwargs)
+
+    def process_weights_after_loading(self, layer):
+        layer.scheme.process_weights_after_loading(layer)
+
+    def restore_weights_before_loading(self, layer):
+        for parameter in layer.parameters(recurse=False):
+            parameter.modelslim_loaded = False
+
+    def apply(self, layer, k, v):
+        return layer.scheme.quantize_cache(k, v)
 
 
 class ModelSlimLinearMethod(_NPULinearMethodBase):

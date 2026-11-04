@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import chain
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,6 +28,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 # Device growth between a component's stages on a shared pool: activations and
 # the allocator's reserve (9.4 GiB measured for H3 at 1344x768x124f) plus margin.
 SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES = 12 * 1024**3
+# Leave headroom for the allocator when deciding whether a warmup preload fits.
+_WARMUP_PRELOAD_MARGIN_BYTES = 1 * 1024**3
 
 logger = init_logger(__name__)
 
@@ -67,6 +70,51 @@ def _module_ready_on_local_device(
     if tensor.device != get_local_torch_device():
         return False
     return dtype is None or tensor.dtype == dtype
+
+
+def _cpu_module_nbytes(module: nn.Module, *, dtype: torch.dtype | None = None) -> int:
+    """Bytes the host tensors would occupy after an optional device cast.
+
+    ``module.to(device, dtype=...)`` only casts floating-point tensors, so
+    integer buffers keep their current nbytes.
+    """
+    total = 0
+    for tensor in (*module.parameters(), *module.buffers()):
+        if tensor.device.type != "cpu":
+            continue
+        if (
+            dtype is None
+            or not tensor.is_floating_point()
+            or dtype.itemsize == tensor.element_size()
+        ):
+            total += tensor.nbytes
+        else:
+            total += tensor.numel() * dtype.itemsize
+    return total
+
+
+def _device_free_bytes() -> int | None:
+    device_module = torch.get_device_module()
+    mem_get_info = getattr(device_module, "mem_get_info", None)
+    if mem_get_info is None or not device_module.is_available():
+        return None
+    try:
+        return int(mem_get_info()[0])
+    except RuntimeError:
+        # Some backends expose mem_get_info without implementing it.
+        return None
+
+
+def _is_out_of_memory_error(error: BaseException) -> bool:
+    return isinstance(error, torch.OutOfMemoryError) or (
+        "out of memory" in str(error).lower()
+    )
+
+
+def _empty_device_cache() -> None:
+    empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
+    if empty_cache is not None:
+        empty_cache()
 
 
 def is_fsdp_managed_module(module: nn.Module) -> bool:
@@ -191,8 +239,11 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         state: ResidencyState,
     ) -> None:
         self.wait_for_use(module, use, state)
-        tensor = _module_reference_tensor(module)
-        if tensor is not None and tensor.device.type != "cpu":
+        # a failed H2D may leave children on device while the first parameter is on CPU
+        if any(
+            tensor.device.type != "cpu"
+            for tensor in chain(module.parameters(), module.buffers())
+        ):
             # A non-blocking device->host move lands in pinned host memory the
             # size of the component. On a shared pool that pins a second copy
             # of the weights next to the device copy still being read from
@@ -213,8 +264,38 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         preferred: bool,
     ) -> None:
         if preferred and state.batch_is_warmup:
-            self.prepare_for_use(module, use, state)
-            self.wait_for_use(module, use, state)
+            if _module_ready_on_local_device(module, dtype=use.target_dtype):
+                self.wait_for_use(module, use, state)
+                return
+            required_bytes = _cpu_module_nbytes(module, dtype=use.target_dtype)
+            free_bytes = _device_free_bytes()
+            if free_bytes is not None and required_bytes > (
+                free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
+            ):
+                # reclaim unused allocator blocks only when driver-free memory is short
+                _empty_device_cache()
+                free_bytes = _device_free_bytes()
+            preload_failed = False
+            try:
+                if free_bytes is None or required_bytes <= (
+                    free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
+                ):
+                    self.prepare_for_use(module, use, state)
+                    self.wait_for_use(module, use, state)
+                    return
+            except RuntimeError as error:
+                if not _is_out_of_memory_error(error):
+                    raise
+                preload_failed = True
+            # Warmup preload is optional; the next request loads it on demand.
+            logger.warning(
+                "Warmup could not keep %s resident after request finalization; "
+                "leaving it offloaded until its next use.",
+                use.component_name,
+            )
+            self.finish_use(module, use, state)
+            if preload_failed:
+                _empty_device_cache()
             return
         self.finish_use(module, use, state)
 
@@ -278,12 +359,19 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
     ) -> None:
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             return
+        # Not release_all: this is a use ending, not a reset. Whether the
+        # resident set outlives the use is declared on the use, by whoever has
+        # the pipeline's per-phase headroom in view; the default is off, so
+        # this stays the long-standing behaviour until something sets it.
+        keep_resident = use.retain_resident_layers
         for manager in module.layerwise_offload_managers:
-            manager.release_all()
+            manager.release_after_use(keep_resident=keep_resident)
         # The layers are gone; the rest of this component is dead weight on the
         # device until it is used again, and the stage that follows may be the
-        # one that needs the room.
-        module.park_non_layer_weights()
+        # one that needs the room. That reasoning does not hold when the room
+        # was just judged available: parking would undo the transfer we kept.
+        if not keep_resident:
+            module.park_non_layer_weights()
         if current_platform.is_mps():
             torch.mps.synchronize()
             module.restore_mps_cpu_non_layer_weights()
@@ -310,7 +398,7 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
                 if advise_cold is not None:
                     paged_out += int(advise_cold(room_bytes=room_bytes) or 0)
             if paged_out:
-                logger.info(
+                logger.debug(
                     "Layerwise offload: paged out the first %.1f GiB of %s so the "
                     "next request's stream fits the %.1f GiB the cache can give it.",
                     paged_out / 1024**3,

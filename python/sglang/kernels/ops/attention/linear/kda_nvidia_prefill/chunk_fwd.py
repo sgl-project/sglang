@@ -37,20 +37,12 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
 
-try:
-    from .Akk_inverse_lower_triangle_bf16 import akk_inv_host as _akk_inv_host
-    from .fuse_k4_only_persistent import BYTES_PER_TENSORMAP as _K4P_BTM
-    from .fuse_k4_only_persistent import NUM_TENSORMAPS as _K4P_NTM
-    from .fuse_k4_only_persistent import make_host_fn as _k4p_make_host
-    from .fuse_kernel123_persistent import CHUNKS_PER_BLOCK as _K123_CHUNKS_PER_BLOCK
-    from .fuse_kernel123_persistent import make_host_function as _fused_make_host
-except ImportError:
-    from Akk_inverse_lower_triangle_bf16 import akk_inv_host as _akk_inv_host
-    from fuse_k4_only_persistent import BYTES_PER_TENSORMAP as _K4P_BTM
-    from fuse_k4_only_persistent import NUM_TENSORMAPS as _K4P_NTM
-    from fuse_k4_only_persistent import make_host_fn as _k4p_make_host
-    from fuse_kernel123_persistent import CHUNKS_PER_BLOCK as _K123_CHUNKS_PER_BLOCK
-    from fuse_kernel123_persistent import make_host_function as _fused_make_host
+from .Akk_inverse_lower_triangle_bf16 import akk_inv_host as _akk_inv_host
+from .fuse_k4_only_persistent import BYTES_PER_TENSORMAP as _K4P_BTM
+from .fuse_k4_only_persistent import NUM_TENSORMAPS as _K4P_NTM
+from .fuse_k4_only_persistent import make_host_fn as _k4p_make_host
+from .fuse_kernel123_persistent import CHUNKS_PER_BLOCK as _K123_CHUNKS_PER_BLOCK
+from .fuse_kernel123_persistent import make_host_function as _fused_make_host
 
 
 def _ct(t, etype):
@@ -219,62 +211,6 @@ _k4p_cache = {}
 _k4p_tm_ws = {}
 
 
-# Beta absorption (K1 fusion reverted; K123 stays at 375us baseline).
-# Two-stage strategy on side stream:
-#   1) v*beta runs PARALLEL with K123 (no data dep on K123 outputs)
-#   2) k_scaled*beta runs AFTER K123 on side stream, PARALLEL with akk_inv
-@torch.compile(fullgraph=True)
-def _v_absorb(v, beta):
-    return v * beta.unsqueeze(-1).to(v.dtype)
-
-
-@torch.compile(fullgraph=True)
-def _ks_absorb(k_scaled, beta):
-    return k_scaled * beta.unsqueeze(-1).to(k_scaled.dtype)
-
-
-# Side stream cache for v_absorb || K123 overlap.
-_side_streams = {}
-
-
-def _get_side_stream(dev):
-    idx = dev.index or 0
-    if idx not in _side_streams:
-        _side_streams[idx] = torch.cuda.Stream(device=dev)
-    return _side_streams[idx]
-
-
-# ===== Per-section timing (K123 / K4) =====
-# Set _TIMING_ENABLED=True to record CUDA-event timings for each call.
-# Times accumulate in _TIMING_STATS; use reset_timings() / get_timings() to manage.
-_TIMING_ENABLED = False
-_TIMING_STATS = {"k123_us": 0.0, "k4_us": 0.0, "count": 0}
-
-
-def enable_timing(enabled=True):
-    """Enable/disable per-section CUDA event timing in chunk_kda_fwd.
-    Each call adds CUDA event records around K123 and K4 launches and a sync
-    at end of forward, so this slows down execution. Use only for benchmarking."""
-    global _TIMING_ENABLED
-    _TIMING_ENABLED = enabled
-
-
-def reset_timings():
-    _TIMING_STATS["k123_us"] = 0.0
-    _TIMING_STATS["k4_us"] = 0.0
-    _TIMING_STATS["count"] = 0
-
-
-def get_timings():
-    """Returns (k123_avg_us, k4_avg_us, n_calls). Avgs are over all calls since last reset."""
-    n = max(_TIMING_STATS["count"], 1)
-    return (
-        _TIMING_STATS["k123_us"] / n,
-        _TIMING_STATS["k4_us"] / n,
-        _TIMING_STATS["count"],
-    )
-
-
 # Buffer cache: avoid re-allocating ~67us of intermediate tensors per call.
 # Also caches cute.Tensor wrappers (saves ~7us each call from from_dlpack).
 _buf_cache = {}
@@ -338,111 +274,6 @@ def _get_padded_input_buffers(
             g_pad[:, real_T:] = -1000.0
         e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
         _padded_input_cache[key] = e
-    return e
-
-
-# Multi-seq varlen repack cache for the Phase 2.2 path. Keyed by id(cu_seqlens).
-# Stores: (orig_seq_lens, padded_seq_lens, new_cu_seqlens_tensor,
-#          new_chunk_indices_tensor, new_T_total, padded_input_buffers).
-# All tensors are GPU-side and pre-allocated at cache build time. Per-call the
-# kernel reads from / writes to these buffers; we copy caller's input slices in
-# and output slices back (only the valid prefix of each seq).
-_multiseq_repack_cache = {}
-
-_caller_layout_O_cache = {}
-
-
-def _get_caller_layout_O_buffer(multiseq_info, dtype, V_dim, device):
-    """Per-shape cached output buffer at caller's contiguous layout (sum of
-    seq_lens, no padding gaps). Filled by per-seq copies from K4's padded O."""
-    caller_T = multiseq_info["caller_T"]
-    H_x_V = multiseq_info.get("_H_V")  # not strictly needed since we fix B=1 H known
-    key = (caller_T, V_dim, dtype, device.index if device.index is not None else 0)
-    e = _caller_layout_O_cache.get(key)
-    if e is None:
-        # B=1 enforced upstream when multiseq_info is built.
-        e = torch.empty(
-            1,
-            caller_T,
-            multiseq_info["q_pad"].shape[2],
-            V_dim,
-            dtype=dtype,
-            device=device,
-        )
-        _caller_layout_O_cache[key] = e
-    return e
-
-
-def _get_multiseq_repack_info(cu_seqlens, q, k, v, g, beta, BT, device):
-    """Build (and cache) the padded layout for multi-seq varlen with non-aligned
-    seqs. Returns None if all seqs are already 64-aligned (caller can use the
-    existing varlen_pure path)."""
-    import weakref
-
-    key = id(cu_seqlens)
-    cached = _multiseq_repack_cache.get(key)
-    if cached is not None:
-        wref, e = cached
-        if wref() is cu_seqlens:
-            return e
-        # id collision after GC: rebuild
-        del _multiseq_repack_cache[key]
-    cu_cpu = cu_seqlens.cpu().tolist()
-    seq_lens = [cu_cpu[i + 1] - cu_cpu[i] for i in range(len(cu_cpu) - 1)]
-    if all(sl % BT == 0 for sl in seq_lens):
-        _multiseq_repack_cache[key] = (weakref.ref(cu_seqlens), None)
-        return None
-    padded_lens = [((sl + BT - 1) // BT) * BT for sl in seq_lens]
-    new_cu = [0]
-    for pl in padded_lens:
-        new_cu.append(new_cu[-1] + pl)
-    new_T_total = new_cu[-1]
-    B = q.shape[0]
-    H = q.shape[2]
-    K = q.shape[3]
-    # Pre-allocated padded input buffers. q/k/v/beta tail = 0 (zero MMA), g
-    # tail = -1e3 sentinel (zero gate activation). The PER-SEQ tail regions
-    # are between (new_cu[i] + seq_lens[i], new_cu[i+1]) — pre-fill once.
-    q_pad = torch.zeros(B, new_T_total, H, K, dtype=q.dtype, device=device)
-    k_pad = torch.zeros_like(q_pad)
-    v_pad = torch.zeros(B, new_T_total, H, v.shape[3], dtype=v.dtype, device=device)
-    beta_pad = torch.zeros(B, new_T_total, H, dtype=beta.dtype, device=device)
-    g_pad = torch.zeros(B, new_T_total, H, K, dtype=g.dtype, device=device)
-    for i, (sl, pl) in enumerate(zip(seq_lens, padded_lens)):
-        if sl < pl:
-            tail_start = new_cu[i] + sl
-            tail_end = new_cu[i + 1]
-            g_pad[:, tail_start:tail_end] = -1000.0
-    new_cu_tensor = torch.tensor(new_cu, dtype=cu_seqlens.dtype, device=device)
-    new_chunk_indices = prepare_chunk_indices(new_cu_tensor, BT)
-    # Build index map: dst_indices[i] = position in padded layout where orig
-    # row i lives. Used by index_copy_ to do the scatter in one op (instead of
-    # N_seqs × 5 separate slice copies, which cost ~5us each in Python).
-    T_total_orig = cu_cpu[-1]
-    dst_indices_list = []
-    for i, sl in enumerate(seq_lens):
-        for j in range(sl):
-            dst_indices_list.append(new_cu[i] + j)
-    dst_indices = torch.tensor(dst_indices_list, dtype=torch.long, device=device)
-    # Mark this cu_seqlens as VARLEN_PURE eligible — every seq in the new
-    # layout is 64-aligned by construction.
-    _varlen_pure_cache[id(new_cu_tensor)] = True
-    e = {
-        "seq_lens": seq_lens,
-        "padded_lens": padded_lens,
-        "new_cu": new_cu,
-        "new_T_total": new_T_total,
-        "new_cu_tensor": new_cu_tensor,
-        "new_chunk_indices": new_chunk_indices,
-        "q_pad": q_pad,
-        "k_pad": k_pad,
-        "v_pad": v_pad,
-        "g_pad": g_pad,
-        "beta_pad": beta_pad,
-        "dst_indices": dst_indices,
-        "T_total_orig": T_total_orig,
-    }
-    _multiseq_repack_cache[key] = (weakref.ref(cu_seqlens), e)
     return e
 
 
@@ -511,11 +342,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT):
         s_ct = from_dlpack(S_out, assumed_align=16)
         s_ct.element_type = fp32
 
-        # Cache PyTorch streams once per buf_cache entry — torch.cuda.current_stream
-        # is a torch C call that costs ~2us each invocation.
-        main_stream_cached = torch.cuda.current_stream(dev)
-        side_stream_cached = _get_side_stream(dev)
-
         cute_wrappers = dict(
             a_ct=a_ct,
             aqc_ct=aqc_ct,
@@ -529,8 +355,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT):
             akk_in_view=akk_in_view,
             akk_out_view=akk_out_view,
             s_ct=s_ct,
-            main_stream=main_stream_cached,
-            side_stream=side_stream_cached,
             # Filled lazily on first launch — saves cache_key tuple build +
             # outer dict lookup on subsequent calls.
             _k123_fns={},
@@ -1041,18 +865,12 @@ def chunk_kda_fwd(
     # only pays off for huge multi-seq varlen states (~192MB at N=32); for
     # serving single-seq engagements the state is <1MB and the side stream
     # was the last remaining cross-stream surface in this path.
-    main_stream = torch.cuda.current_stream(device)
     needs_copy = S_in.data_ptr() != S_out.data_ptr()
     if needs_copy:
         S_out.copy_(S_in)
 
     # Beta is fused entirely in akk_inv kernel epilogue (post-inv column-scale).
     # No host v*beta and no K1 k_scaled*beta any more.
-    if _TIMING_ENABLED:
-        k123_s = torch.cuda.Event(enable_timing=True)
-        k123_e = torch.cuda.Event(enable_timing=True)
-        k123_s.record(stream=main_stream)
-
     _launch_fused_k123_inv(
         q,
         k,
@@ -1079,9 +897,6 @@ def chunk_kda_fwd(
         varlen_pure_override=(True if needs_varlen_single_pad else varlen_pure),
     )
 
-    if _TIMING_ENABLED:
-        k123_e.record(stream=main_stream)
-
     # ===== K4: persistent kernel (eqlen + varlen via cu_seqlens) =====
     if is_varlen:
         # GPU-side cumsum + cache by id(cu_seqlens). No host sync.
@@ -1091,11 +906,6 @@ def chunk_kda_fwd(
         chunk_offsets_for_k4 = co_eqlen
 
     # State copy now runs on the caller's stream; K4 is stream-ordered after it.
-
-    if _TIMING_ENABLED:
-        k4_s = torch.cuda.Event(enable_timing=True)
-        k4_e = torch.cuda.Event(enable_timing=True)
-        k4_s.record(stream=main_stream)
 
     _launch_k4_persistent(
         cute_wrappers,
@@ -1109,13 +919,6 @@ def chunk_kda_fwd(
         V_dim=V_dim,
         use_fast_sync=(not is_varlen),
     )
-
-    if _TIMING_ENABLED:
-        k4_e.record(stream=cute_wrappers["main_stream"])
-        torch.cuda.synchronize(device)
-        _TIMING_STATS["k123_us"] += k123_s.elapsed_time(k123_e) * 1000.0
-        _TIMING_STATS["k4_us"] += k4_s.elapsed_time(k4_e) * 1000.0
-        _TIMING_STATS["count"] += 1
 
     o = O_flat
     A_qk_out = A_qk

@@ -18,10 +18,14 @@ These are placed in a separate module to avoid circular imports between
 io_struct.py and schedule_batch.py.
 """
 
-from typing import List
+from __future__ import annotations
+
+from typing import Callable, List
 
 import msgspec
 import torch
+
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 
 class PositionalEmbeds(msgspec.Struct, array_like=True):
@@ -36,7 +40,8 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
         positions: List of positions where embeddings should be injected.
     """
 
-    embeds: torch.Tensor
+    # torch.Tensor or CudaIpcTensorTransportProxy; msgspec cannot type that union.
+    embeds: object
     positions: List[int]
 
     def __post_init__(self):
@@ -51,8 +56,24 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
             else:
                 # [1, hidden_dim] (already has the leading dim) → plain concat.
                 self.embeds = torch.cat(self.embeds, dim=0)
-        if self.embeds.shape[0] != len(self.positions):
+        if isinstance(self.embeds, torch.Tensor) and self.embeds.shape[0] != len(
+            self.positions
+        ):
             raise ValueError(
                 f"embeds length ({self.embeds.shape[0]}) != "
                 f"positions length ({len(self.positions)})"
             )
+
+    def map_object_fields(self, transform: Callable[[list], list]) -> PositionalEmbeds:
+        """Copy with transform applied to [embeds]; returning that list unchanged returns self."""
+        values = [self.embeds]
+        new_values = transform(values)
+        if new_values is values:
+            return self
+        (embeds,) = new_values
+        return msgspec.structs.replace(self, embeds=embeds)
+
+    def reconstruct(self, target_device: int) -> None:
+        """Copy embeds out of the CUDA IPC pool onto target_device and release the slot."""
+        if isinstance(self.embeds, CudaIpcTensorTransportProxy):
+            self.embeds = self.embeds.reconstruct_on_target_device(target_device)

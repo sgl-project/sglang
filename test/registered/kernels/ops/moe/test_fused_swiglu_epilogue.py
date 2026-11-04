@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -52,12 +53,8 @@ def _runtime_scaffolding():
     if not torch.distributed.is_initialized():
         init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
     if not model_parallel_is_initialized():
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            backend="gloo",
-        )
+        publish_build_topology(tp_size=1, ep_size=1, pp_size=1)
+        initialize_model_parallel(backend="gloo")
 
 
 def _interleave_w13_rows(w13: torch.Tensor) -> torch.Tensor:
