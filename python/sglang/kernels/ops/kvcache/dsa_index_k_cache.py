@@ -196,9 +196,6 @@ def _set_k_and_s_triton(
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
 
-    if num_tokens_to_write == 0:
-        return
-
     if _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
     else:
