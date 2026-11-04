@@ -15,6 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
@@ -713,6 +714,8 @@ class TestRustServerExtension(CustomTestCase):
             extension=extension,
             health_generate_headers={},
             default_max_new_tokens=128,
+            request_class=GenerateReqInput,
+            omit_custom_params=(),
         )
         extension.Server.assert_called_once_with(
             sentinel.args,

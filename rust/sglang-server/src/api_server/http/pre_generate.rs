@@ -104,6 +104,7 @@ pub mod test_support {
                 multimodal: false,
                 metadata: CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
                 peer_endpoints: Vec::new(),
             },
         );
@@ -178,6 +179,7 @@ mod tests {
                 multimodal: false,
                 metadata: CoreMetadata::from(server_args.as_ref()),
                 metrics: None,
+                request_log: None,
                 peer_endpoints: Vec::new(),
             },
         );

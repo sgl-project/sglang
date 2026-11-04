@@ -190,6 +190,7 @@ impl Runtime {
                 "shutdown: workers did not exit within {SHUTDOWN_JOIN_TIMEOUT:?}; abandoning join"
             );
         }
+        crate::api_server::core::flush_request_log();
     }
 }
 
@@ -417,6 +418,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             )?,
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
             metrics,
+            request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args),
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);

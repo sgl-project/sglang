@@ -23,7 +23,7 @@ use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
-use crate::api_server::core::CoreError;
+use crate::api_server::core::{CoreError, ReceivedAs};
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
     generation_event_stream_with,
@@ -187,7 +187,8 @@ pub(super) async fn chat(
         .iter()
         .map(|request| RequestState::new(state, request, headers, None, timing.clone()))
         .collect();
-    let calls: Vec<_> = match state.core.generate_batch(requests).await {
+    let received = ReceivedAs::Typed(state.core.logged_headers(headers));
+    let calls: Vec<_> = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };

@@ -11,6 +11,7 @@ mod frame;
 mod metrics;
 mod peer;
 pub(crate) mod prefetch;
+mod request_log;
 
 pub(crate) use drain::{DrainEnd, DrainState, InFlight};
 pub(crate) use error::{CoreError, CoreErrorKind};
@@ -19,3 +20,6 @@ pub(crate) use frame::frame_metadata_case;
 pub(crate) use frame::{CoreEvent, CoreOutput, HealthStatus};
 pub(crate) use metrics::{FLUSH_INTERVAL, FrontendMetrics, RequestMetrics};
 pub(crate) use peer::{FORWARD_PEER_PATH, peer_endpoints};
+pub(crate) use request_log::{
+    BodySnapshot, LoggedHeaders, ReceivedAs, RequestLog, RequestRecord, flush_request_log,
+};

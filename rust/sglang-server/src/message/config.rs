@@ -4,7 +4,7 @@
 //! [`RuntimeConfig`] pairing them for `runtime::start`, and the Rust MM
 //! pipeline handoff ([`MmSpec`]).
 //!
-//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] /
+//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] / [`RequestLogConfig`] /
 //! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
 //! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
@@ -239,6 +239,8 @@ pub struct ServerArgs {
     pub num_accelerators: u32,
     /// Prometheus metrics (`--enable-metrics`); `None` serves no `/metrics`.
     pub metrics: Option<MetricsConfig>,
+    /// Request logging (`--log-requests`); `None` logs no requests.
+    pub request_log: Option<RequestLogConfig>,
 }
 
 #[pyo3::pymethods]
@@ -297,6 +299,7 @@ impl ServerArgs {
         accelerator,
         num_accelerators,
         metrics,
+        request_log,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -353,6 +356,7 @@ impl ServerArgs {
         accelerator: Option<String>,
         num_accelerators: u32,
         metrics: Option<MetricsConfig>,
+        request_log: Option<RequestLogConfig>,
     ) -> Self {
         Self {
             model_path,
@@ -408,6 +412,7 @@ impl ServerArgs {
             accelerator,
             num_accelerators,
             metrics,
+            request_log,
         }
     }
 }
@@ -470,6 +475,7 @@ impl Default for ServerArgs {
             accelerator: None,
             num_accelerators: 0,
             metrics: None,
+            request_log: None,
         }
     }
 }
@@ -609,6 +615,81 @@ impl MetricsConfig {
             bucket_e2e_request_latency: None,
             bucket_prompt_tokens: None,
             bucket_generation_tokens: None,
+        }
+    }
+}
+
+/// Python's `RequestLogger` settings for `--log-requests` (text format to
+/// stdout; Rust mode refuses the other formats and targets at startup). Every
+/// value comes from Python so the two servers render the same lines: the
+/// level's metadata (`RequestLogger._compute_metadata`), the request class
+/// with its fields in order and each default as Python renders it, the header
+/// whitelist and `SGLANG_LOG_REQUEST_EXCEEDED_MS`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct RequestLogConfig {
+    /// Strings and lists longer than this are cut to their two halves.
+    pub max_length: usize,
+    /// Request fields and output keys left out of the lines at this level.
+    pub skip_names: Vec<String>,
+    pub out_skip_names: Vec<String>,
+    /// The request class name and its `(field, rendered default)` pairs, in
+    /// declaration order.
+    pub class_name: String,
+    pub fields: Vec<(String, String)>,
+    /// The fields a batch item's object (Python `obj[i]`) takes from the
+    /// batch: its own entry of the per-item ones, the shared ones as they are;
+    /// the rest keep their defaults.
+    pub batch_item_fields: Vec<String>,
+    pub batch_shared_fields: Vec<String>,
+    /// Request headers a line carries when present, lowercase.
+    pub headers: Vec<String>,
+    /// A finished request faster than this (ms) is not logged; `<= 0` logs all.
+    pub exceeded_ms: i64,
+    /// `sampling_params.custom_params` keys the server itself adds to a
+    /// request before it is logged (none from a client); left out of the lines.
+    pub omit_custom_params: Vec<String>,
+}
+
+#[pyo3::pymethods]
+impl RequestLogConfig {
+    #[new]
+    #[pyo3(signature = (*,
+        max_length,
+        skip_names,
+        out_skip_names,
+        class_name,
+        fields,
+        batch_item_fields,
+        batch_shared_fields,
+        headers,
+        exceeded_ms,
+        omit_custom_params = Vec::new(),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        max_length: usize,
+        skip_names: Vec<String>,
+        out_skip_names: Vec<String>,
+        class_name: String,
+        fields: Vec<(String, String)>,
+        batch_item_fields: Vec<String>,
+        batch_shared_fields: Vec<String>,
+        headers: Vec<String>,
+        exceeded_ms: i64,
+        omit_custom_params: Vec<String>,
+    ) -> Self {
+        Self {
+            max_length,
+            skip_names,
+            out_skip_names,
+            class_name,
+            fields,
+            batch_item_fields,
+            batch_shared_fields,
+            headers,
+            exceeded_ms,
+            omit_custom_params,
         }
     }
 }

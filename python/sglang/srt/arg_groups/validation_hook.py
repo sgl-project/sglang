@@ -172,6 +172,21 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     )
 
 
+def check_rust_server_request_logging(cfg: Any) -> None:
+    """The Rust server logs requests as text to stdout only."""
+    if cfg.log_requests_format != "text":
+        raise ValueError(
+            f"--log-requests-format {cfg.log_requests_format} is not supported "
+            "with SGLANG_RUST_SERVER; it logs requests in the text format"
+        )
+    # `stdout` is the default target, matched as `create_log_targets` does.
+    if any(target.lower() != "stdout" for target in cfg.log_requests_target or ()):
+        raise ValueError(
+            f"--log-requests-target {' '.join(cfg.log_requests_target)} is not "
+            "supported with SGLANG_RUST_SERVER; it logs requests to stdout"
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -198,6 +213,9 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
+
+    if envs.SGLANG_RUST_SERVER.get() and cfg.log_requests:
+        check_rust_server_request_logging(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "
