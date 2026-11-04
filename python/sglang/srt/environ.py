@@ -693,10 +693,6 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
-    # Charge the chunked-prefill compute budget in tokens, not page-ceiled
-    # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
-    # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
-    SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -1006,9 +1002,6 @@ class Envs:
     # is a diagnostic switch, not a supported off-ramp -- to actually stop
     # serving FP8, drop --quantization fp8.
     SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
-    # Kill-switch for the gfx115x row-stride pad on unquantized linear and lm_head
-    # weights (see maybe_pad_weight_for_gfx115). Speed only; outputs do not depend on it.
-    SGLANG_DISABLE_GFX115_WEIGHT_PADDING = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -1086,9 +1079,6 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
-    # Run Quark MXFP4 (W4A4) MoE checkpoints as W4A16 via triton_kernels on
-    # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
-    SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
@@ -1101,9 +1091,7 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
-    SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
-    SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -1392,12 +1380,6 @@ class Envs:
     # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
-    # Route Triton MLA prefill that carries a cached prefix through dense
-    # (non-absorbed) one-shot MHA: up-project the prefix out of the latent KV
-    # cache and run a single dense FP8 kernel instead of the absorbed 576/512
-    # prefill. Materializes K/V for the whole batch, so it only engages when
-    # the batch fits the chunk budget.
-    SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
@@ -1721,11 +1703,6 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
-    # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
-    # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
-    # extend_attention_fwd for unsupported cases or when set false (e.g. for
-    # debugging). Correctness is unaffected; this only changes performance.
-    SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
 
     # ===================================================================
     # Multimodal processing

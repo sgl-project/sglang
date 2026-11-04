@@ -592,7 +592,7 @@ def maybe_pad_weight_for_gfx115(weight: torch.Tensor) -> torch.Tensor:
     slice, not the full checkpoint K. Non-contiguous weights, including ones
     already padded, come back unchanged, which keeps a reload from padding twice.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return weight
     if weight.dim() != 2 or not weight.is_contiguous():
         return weight
@@ -613,7 +613,7 @@ def finalize_gfx115_weight_padding(model: torch.nn.Module) -> None:
     Also runs after every weight update; already-padded weights are skipped, so
     storage pointers stay stable for CUDA graphs.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return
     for head in _unquantized_lm_heads(model):
         head.weight.data = maybe_pad_weight_for_gfx115(head.weight.data)

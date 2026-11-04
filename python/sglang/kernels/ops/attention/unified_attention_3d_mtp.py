@@ -60,8 +60,6 @@ except ImportError:
     _AsmKernelUnavailable = RuntimeError
     _reset_seg_plan_cache = None
 
-import os as _os
-
 from sglang.srt.utils import get_hip_version, is_gfx95_supported
 
 
@@ -74,13 +72,11 @@ def reset_verify_attn_plan_cache() -> None:
 
 def asm_verify_attn_enabled() -> bool:
     """The in-tree gfx950 assembly attention kernel (vattn_asm_gfx950) is used
-    by default on gfx950 with ROCm 7.2 or newer when ROCm clang is available and
-    the batch shape is supported; SGLANG_ASM_VERIFY_ATTN=0 keeps everything on
-    the Triton path. A failed assembly or module load disables it for the rest
-    of the process."""
+    on gfx950 with ROCm 7.2 or newer when ROCm clang is available and the batch
+    shape is supported. A failed assembly or module load disables it for the
+    rest of the process."""
     return (
-        _os.environ.get("SGLANG_ASM_VERIFY_ATTN", "1") == "1"
-        and _mtp_verify_attn_fwd_asm is not None
+        _mtp_verify_attn_fwd_asm is not None
         and is_gfx95_supported()
         and get_hip_version() >= (7, 2, 0)
         and _asm_kernel_available()

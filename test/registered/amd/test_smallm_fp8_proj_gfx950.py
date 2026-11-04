@@ -14,7 +14,12 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-_OFF = {"SGLANG_ROCM_SMALLM_FP8_PROJ": "0"}
+
+def _off():
+    """The kernel as it is off gfx950 (or after a failed build): not loaded."""
+    from sglang.kernels.ops.gemm import smallm_fp8_gfx950
+
+    return patch.object(smallm_fp8_gfx950, "_mod", False)
 
 
 def _per_token_scheme():
@@ -101,9 +106,9 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                 self.assertEqual(calls, 2 * in_range)
                 self.assertTrue(torch.equal(got, got_tuple))
 
-    def test_kill_switch(self):
+    def test_falls_back_without_kernel(self):
         for n, m, w, s, _, x, _, _, ref in self.cases():
-            with self.subTest(n=n, m=m), patch.dict(os.environ, _OFF):
+            with self.subTest(n=n, m=m), _off():
                 (off,), calls = self.run_counted(lambda: self.linear(x, w, s))
                 self.assertEqual(calls, 0)
                 self.assertTrue(torch.equal(off.float(), ref))
@@ -122,7 +127,7 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             self.assertFalse(fp8_in(o_proj, 37))
             self.assertFalse(fp8_in(other, 4))  # shape outside SHAPES
             self.assertFalse(fp8_in(torch.nn.Linear(8, 8), 4))  # BF16 MTP layer
-            with patch.dict(os.environ, _OFF):
+            with _off():
                 self.assertFalse(fp8_in(o_proj, 4))
 
     def producers(self, t, trial=0, tp=4):
@@ -200,7 +205,7 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                         )
                         self.assertEqual(n, 2)
                         self.assertTrue(torch.equal(got, ref))
-            with patch.dict(os.environ, _OFF), self.assertRaises(AssertionError):
+            with _off(), self.assertRaises(AssertionError):
                 proj(fused[0]())
 
     def test_graph_replay_matches_eager(self):

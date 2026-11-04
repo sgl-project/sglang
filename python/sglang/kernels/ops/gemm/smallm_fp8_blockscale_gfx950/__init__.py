@@ -7,6 +7,7 @@ import tempfile
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
 
 _SRC = os.path.join(os.path.dirname(__file__), "smallm_fp8_blockscale_gemm.hip")
@@ -48,6 +49,10 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
     ):
         return None
     if _mod is None:
+        hip = current_arch().hip
+        if hip is None or hip.gcn_arch != "gfx950":
+            _mod = False
+            return None
         co = os.path.join(tempfile.mkdtemp(), "k.co")
         cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
         try:

@@ -12,7 +12,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -103,10 +102,6 @@ class TestQuarkMxfp4MoeW4A16Gate(unittest.TestCase):
 
     def test_gfx1151_uses_the_w4a16_path(self):
         self.assertTrue(_w4a16_enabled_on("gfx1151"))
-
-    def test_env_switch_disables_the_w4a16_path_on_gfx1151(self):
-        with envs.SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16.override(False):
-            self.assertFalse(_w4a16_enabled_on("gfx1151"))
 
 
 @unittest.skipUnless(
