@@ -767,7 +767,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         self.num_indexer_layers,
                         self.index_size // self.index_page_size
                         + self.index_page_padding,
-                        self.index_page_size * (self.index_head_dim + 4),
+                        self.index_page_size
+                        * (self.index_head_dim + torch.float32.itemsize),
                     )
                 else:
                     index_shape = (
@@ -825,7 +826,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
             # Existing NPU HiCache exchanges whole pages using a 5D descriptor.
             # This is an opaque byte view, NOT token-major [K, scale] records.
-            index_width += 4
+            index_width += torch.float32.itemsize
             index_k = index_k.view(
                 self.num_indexer_layers,
                 index_k.shape[1],
