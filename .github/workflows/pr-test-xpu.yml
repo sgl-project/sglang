@@ -165,9 +165,10 @@ jobs:
           # docker/xpu.Dockerfile that already ships libssl-dev.
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
+          # Pin the image's torch so test deps (e.g. lmcache) cannot swap in a CUDA build.
+          docker exec ci_sglang_xpu bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
+          docker exec ci_sglang_xpu uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
           docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           # Fetch tags so setuptools_scm resolves a real version instead of
           # falling back to 0.0.0 on a shallow/tag-less checkout.
@@ -272,9 +273,10 @@ jobs:
           # docker/xpu.Dockerfile that already ships libssl-dev.
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
+          # Pin the image's torch so test deps (e.g. lmcache) cannot swap in a CUDA build.
+          docker exec ci_sglang_xpu bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
+          docker exec ci_sglang_xpu uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
           docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           # Fetch tags so setuptools_scm resolves a real version instead of
           # falling back to 0.0.0 on a shallow/tag-less checkout.
