@@ -2,7 +2,7 @@
 
 Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 
-SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
+SM90 (Hopper): full support — decode, prefill, MTP.
 SM100 (Blackwell): full support — decode, prefill, MTP.
 
 Requires flashinfer >= 0.6.14.
@@ -19,9 +19,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.runtime_context import (
-    mamba_cache_chunk_size,
-)
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -178,8 +176,8 @@ def is_flashinfer_gdn_prefill_available() -> bool:
 class FlashInferGDNKernel(LinearAttnKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
-    SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
-    SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
+    SM90 (Hopper): decode uses indexed state pool; prefill and MTP verify supported.
+    SM100 (Blackwell): decode uses indexed state pool; prefill and MTP verify supported.
 
     Requires flashinfer >= 0.6.14.
     """
@@ -438,41 +436,28 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             A_log_dtype=torch.float32 if self.use_state_pool else None,
         )
 
-        if self.use_state_pool:
-            cache_indices_fi = self._prepare_dynamic_input(
-                "decode_cache_indices", cache_indices
-            )
-            output_fi, _ = self._decode_fn(
-                q=query_fi,
-                k=key_fi,
-                v=value_fi,
-                state=None,
-                A_log=A_log_fi,
-                a=a_fi,
-                dt_bias=dt_bias_fi,
-                b=b_fi,
-                use_qk_l2norm=True,
-                initial_state=ssm_states,
-                initial_state_indices=cache_indices_fi,
-            )
-        else:
-            # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
-            # will no longer be needed here.
-            state_batch = ssm_states[cache_indices]
-            output_fi, new_state = self._decode_fn(
-                q=query_fi,
-                k=key_fi,
-                v=value_fi,
-                state=state_batch,
-                A_log=A_log_fi,
-                a=a_fi,
-                dt_bias=dt_bias_fi,
-                b=b_fi,
-                scale=None,
-                output=None,
-                use_qk_l2norm=True,
-            )
-            ssm_states[cache_indices] = new_state
+        # FlashInfer supports indexed decode on SM90 as well as SM100+. Pass
+        # padding indices through to the kernel: gathering/scattering with -1
+        # would read and overwrite the last (allocatable) state-pool slot.
+        if not self.use_state_pool:
+            # The SM90 pooled kernel requires int32 indices when handling -1.
+            cache_indices = cache_indices.to(dtype=torch.int32)
+        cache_indices_fi = self._prepare_dynamic_input(
+            "decode_cache_indices", cache_indices
+        )
+        output_fi, _ = self._decode_fn(
+            q=query_fi,
+            k=key_fi,
+            v=value_fi,
+            state=None,
+            A_log=A_log_fi,
+            a=a_fi,
+            dt_bias=dt_bias_fi,
+            b=b_fi,
+            use_qk_l2norm=True,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices_fi,
+        )
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
@@ -494,9 +479,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state_checkpoint_every_n_tokens: int = 0,
         **kwargs,
     ) -> tuple:
-        from sglang.kernels.ops.attention.fla.l2norm import (
-            gdn_prefill_qkv_prepare_fwd,
-        )
+        from sglang.kernels.ops.attention.fla.l2norm import gdn_prefill_qkv_prepare_fwd
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
