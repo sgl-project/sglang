@@ -225,7 +225,6 @@ class RunnerIds:
                 }
 
         self._token_to_kv_pool_allocator = token_to_kv_pool_allocator
-
         self._rows: Optional[torch.Tensor] = (
             torch.arange(req_to_token.shape[0], dtype=torch.int64, device=device)
             if self.is_translating
@@ -237,6 +236,23 @@ class RunnerIds:
         names the iteration's slots, or None when its pool has no such
         sub-pool."""
         return self._spaces.get(kind)
+
+    def swa_write_ids(self, full_loc: torch.Tensor) -> Optional[torch.Tensor]:
+        """Map owner write ids to sliding-window ids when that route exists.
+
+        A fused draft may have its sliding-window layers folded into the full
+        host when the target has no sliding-window storage. In that layout
+        the owner ids are already the locations the draft writes, so there is
+        no secondary location to attach to ``KVWriteLoc``.
+        """
+        space = self.space(IdSpaceKind.SLIDING_WINDOW)
+        if space is None:
+            return None
+        if self.is_translating:
+            return self._token_to_kv_pool_allocator.translate_physical_full_to_swa(
+                full_loc
+            )
+        return space.ids(full_loc)
 
     def ids_in(self, kind: str, virtual_ids: torch.Tensor) -> torch.Tensor:
         """``virtual_ids`` as this runner's ``kind`` sub-pool indexes them, for

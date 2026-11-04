@@ -343,6 +343,9 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
 
             is_translating = True
 
+            def swa_write_ids(self, full_loc):
+                raise AssertionError("full-only KV needs no SWA ids")
+
         virtual = torch.tensor([4, 5, 6, 9], dtype=torch.int64)
         physical = virtual + 100
         draft_translator = _Shift()

@@ -231,6 +231,7 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
+                swa_write_ids=self.draft_model_runner.runner_ids.swa_write_ids,
             )
 
     def _inject_mla(
