@@ -23,7 +23,7 @@ def validate_spec_sampling_mask_request(
 ) -> Optional[str]:
     """Reject configurations whose committed tokens are not exact samples from
     the captured target distribution."""
-    if not spec_algorithm.is_dflash_family():
+    if not spec_algorithm.is_dflash_family() or spec_algorithm.is_ubtree():
         return "return_sampling_mask is not supported with speculative decoding."
 
     # build_speculative_verify_target_probs applies top-k/top-p only.

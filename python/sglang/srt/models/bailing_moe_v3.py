@@ -1728,6 +1728,10 @@ class BailingMoeV3ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Module:
         return self.model.word_embeddings
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
+        """Capture completed target-layer outputs for Ling DFlash/UBTree drafts."""
+        self.set_dspark_layers_to_capture(layer_ids)
+
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
         """Configure per-layer hidden-state capture for DSpark.
 

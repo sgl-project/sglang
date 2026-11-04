@@ -1712,7 +1712,13 @@ class Envs:
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
+    # UBTree target only: capture supported FA3 verify metadata in the target
+    # graph and reuse its scheduler metadata across MHA layers. Ignored by
+    # other speculative algorithms, draft workers and unsupported layouts.
+    SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Use compact tree-only visibility with UBTree's FA3 target verification.
+    SGLANG_OPT_UBTREE_FA3_TREE_ONLY_MASK = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)

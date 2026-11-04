@@ -95,6 +95,10 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMLATokenToKVPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.ubtree_state import (
+    ubtree_spec_state_bytes_per_req,
+    use_ubtree_factorized_kda,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
@@ -1595,6 +1599,10 @@ class KVCacheConfigurator:
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
+            # Other speculative algorithms keep their per-node state cache.
+            enable_ubtree_factorized_kda=(
+                self.spec_algorithm.is_ubtree() and not self.is_draft_worker
+            ),
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -3184,6 +3192,27 @@ class KVCacheConfigurator:
         stage_per_req = int(per_req * pp_layer_scale)
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        ubtree_factorized = use_ubtree_factorized_kda(
+            enabled=(
+                get_spec().speculative_algorithm == "UBTREE"
+                and not self.is_draft_worker
+            ),
+            cache_params=config.mamba2_cache_params,
+            spec_state_size=(get_schedule().max_running_requests or 0)
+            // self.attn_dp_size,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            speculative_eagle_topk=get_spec().speculative_eagle_topk,
+        )
+        if ubtree_factorized:
+            # Fixed request scratch, not one full SSM snapshot per tree node.
+            # Charge it before the capacity solve, including the padding row.
+            scratch_bytes = ubtree_spec_state_bytes_per_req(
+                config.mamba2_cache_params, get_spec().speculative_num_draft_tokens
+            )
+            request_slots = get_schedule().max_running_requests // self.attn_dp_size + 1
+            total_rest_memory -= (
+                scratch_bytes * pp_layer_scale * request_slots / (1 << 30)
+            )
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
@@ -3219,6 +3248,7 @@ class KVCacheConfigurator:
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active
+            and not ubtree_factorized
             and not _pd_prefill_skips_mamba_spec_state()
         )
         if has_spec_dec:
