@@ -79,26 +79,22 @@ Agentic workloads, such as coding agents and other multi-turn, tool-using assist
 
 import { AgentX } from "/src/snippets/_agentx.jsx";
 import { agentx } from "/src/snippets/agentx/Qwen/qwen3.8-flash-next.jsx";
-import { b300Cells } from "/src/snippets/agentx/Qwen/qwen3.8-flash-next-b300.jsx";
 
-The B300 HiCache configurations reserve 298 GB of host memory for the combined target/draft KV and Mamba pool, in addition to pinned PLE embeddings and process overhead. Provision sufficient free host RAM and container shared memory before starting them. GPU KV configurations also offload PLE embeddings to host memory.
-
-For the B300 NVIDIA configurations at concurrency 12 and above, `--mamba-track-interval 262144` reduces intermediate state checkpoints. The concurrency-80 configuration also uses `--strip-thinking-cache` and `--mamba-max-states-per-path 2`. These settings target replay traffic that does not resend model output; reassess prefix reuse for conversational clients that do.
-
-<AgentX data={{ ...agentx, cells: [...agentx.cells, ...b300Cells] }} />
+<AgentX data={agentx} />
 
 ### MI355X deployment measured with SemiAnalysis InferenceX
 
-AMD's Quark MXFP4 checkpoint with NEXTN MTP on one MI355X (TP1) and GPU-resident KV, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4680](https://github.com/SemiAnalysisAI/InferenceX/pull/4680)) at concurrency 1–16.
+AMD's Quark MXFP4 checkpoint with NEXTN MTP on one MI355X (TP1) and GPU-resident KV, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4680](https://github.com/SemiAnalysisAI/InferenceX/pull/4680), [#4542](https://github.com/SemiAnalysisAI/InferenceX/pull/4542)) at concurrency 1–16. Concurrency 12 and 16 run the default path; concurrency 1–8 run the FlyDSL monokernel.
 
-- **Container image.** `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261030` (`sha256:1ff42c238adfca9a55e8d3d3dc859a4e4e88b23e7f9340e86d17ff042b933bda`, the image tested in InferenceX, run without patches). This dated nightly is built from SGLang `main` at [`17e94c4677`](https://github.com/sgl-project/sglang/commit/17e94c4677d7beb58a89b104fd61b3768994e45e) with AITER [`285579b6`](https://github.com/ROCm/aiter/commit/285579b6211b0da30f35b91a890c29c823597cd1).
+- **Container image.** `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261031` (`sha256:3867dc07ba2530f914e1f210ed829f7a572a75286c8c362dbc22cbecf9b5a7e6`, the image tested in InferenceX, run without patches). This dated nightly is built from SGLang `main` at [`e9c18259c7`](https://github.com/sgl-project/sglang/commit/e9c18259c77dad912a13b0df3148a472d19630f4) with AITER [`285579b6`](https://github.com/ROCm/aiter/commit/285579b6211b0da30f35b91a890c29c823597cd1) and the monokernel package [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) at [`b10f3b71`](https://github.com/sgl-project/sgl-amd-mono/commit/b10f3b71c45a70f504c5cad2d622c3e423196e90), the pin SGLang carries since [#47483](https://github.com/sgl-project/sglang/pull/47483).
 - **Checkpoint.** [`amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8) has MXFP4 MoE experts (the MTP head's included), FP8 attention and an FP8 N-gram table, 116 GiB in all.
-- **PLE offload.** `--ple-offload-embedding` keeps the 47.7 GiB FP8 N-gram table in pinned host memory, which leaves about 82 GB of weights on the GPU. On ROCm the server leaves it off unless you pass the flag. Offloading this checkpoint also needs the `--json-model-override-args` value, which declares the table's FP8 storage up front; without it the server stops at load with `fp8 PLE auto-switch is unsupported with ple_offload_embedding`.
+- **PLE offload.** At concurrency 12 and 16, `--ple-offload-embedding` keeps the 47.7 GiB FP8 N-gram table in pinned host memory, which leaves about 82 GB of weights on the GPU. On ROCm the server leaves it off unless you pass the flag. Offloading this checkpoint also needs the `--json-model-override-args` value, which declares the table's FP8 storage up front; without it the server stops at load with `fp8 PLE auto-switch is unsupported with ple_offload_embedding`. The monokernel reads the table on the GPU, so the concurrency 1–8 command leaves the offload off; it keeps the override value, as in InferenceX.
 - **Memory fraction.** For models with a context above 8,192 tokens, the aiter attention backend multiplies `--mem-fraction-static` by 0.85. `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` keeps 0.9 as given.
-- **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency, so request bursts above it still decode in a captured graph: 2, 4, 8, 16, 24 and 32 at concurrency 1, 2, 4, 8, 12 and 16. The command below uses concurrency 16.
+- **Monokernel (concurrency 1–8).** `--enable-amd-monokernel` runs MTP target verify (13 persistent launches per step) and every MTP draft step (one launch) through the FlyDSL kernels of `sgl-amd-mono`, for up to 8 running requests on one MI355X (TP1). Other steps use the standard forward. It needs NEXTN with 3 steps, eagle-topk 1 and 4 draft tokens, and the Quark checkpoint above. Its verify writes the per-draft SSM states itself, so leave out `--enable-linear-replayssm-spec`. The flag is marked experimental, and SGLang stops at startup with the list of reasons if the setup is outside what the kernel supports.
+- **Batch limits.** At concurrency 12 and 16, set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency, so request bursts above it still decode in a captured graph: 24 and 32. With the monokernel, set both to the concurrency: 1, 2, 4 and 8. The commands below use concurrency 16 and 8.
 - **Thinking.** `--default-chat-template-kwargs '{"enable_thinking": false}'` makes non-thinking the default: the chat template opens each reply with an empty `<think></think>` block. A request turns thinking back on with `"chat_template_kwargs": {"enable_thinking": true}`.
 
-```bash Command
+```bash Concurrency 12–16
 SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
 AITER_GDR_FLYDSL=1 \
 sglang serve \
@@ -121,6 +117,40 @@ sglang serve \
   --chunked-prefill-size 16384 \
   --max-running-requests 32 \
   --cuda-graph-max-bs-decode 32 \
+  --scheduler-recv-interval 10 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash Concurrency 1–8 (monokernel)
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+AITER_GDR_FLYDSL=1 \
+sglang serve \
+  --model-path amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 \
+  --trust-remote-code \
+  --tp-size 1 \
+  --quantization quark \
+  --attention-backend aiter \
+  --page-size 64 \
+  --kv-cache-dtype auto \
+  --mamba-ssm-dtype bfloat16 \
+  --json-model-override-args '{"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-amd-monokernel \
+  --mem-fraction-static 0.9 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs-decode 8 \
   --scheduler-recv-interval 10 \
   --stream-interval 50 \
   --tokenizer-worker-num 6 \

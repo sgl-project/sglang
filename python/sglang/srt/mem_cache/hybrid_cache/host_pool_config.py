@@ -6,11 +6,15 @@ buffer information and never ask a device pool to describe host construction.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import msgspec
 
-from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, IndexKeyBufferInfo
+from sglang.srt.mem_cache.device_pool_info import (
+    DevicePoolInfo,
+    IndexKeyBufferInfo,
+    IndexKeyLayout,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 
 
@@ -53,11 +57,15 @@ def with_packed_draft_layer_mapping(
     }
 
 
-def collect_host_pool_infos(root: Any) -> tuple[DevicePoolInfo, ...]:
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+def _host_pool_infos(pool: Any) -> tuple[Any, dict[PoolName, DevicePoolInfo]]:
+    """The KV device pool and the infos of every pool its host group carries."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    # Other KV formats still use their existing host constructor.
-    return root.get_device_pool_infos() if isinstance(root, DSATokenToKVPool) else ()
+    if not isinstance(pool, HybridLinearKVPool):
+        return pool, _pool_infos_by_name(pool.get_device_pool_infos())
+    # A hybrid pool describes the sidecars it owns beside its full KV child.
+    infos = pool.full_kv_pool.get_device_pool_infos() + pool.get_device_pool_infos()
+    return pool.full_kv_pool, _pool_infos_by_name(infos)
 
 
 def _pool_infos_by_name(
@@ -68,8 +76,6 @@ def _pool_infos_by_name(
         raise ValueError(
             f"duplicate device pool names: {[info.pool_name for info in infos]}"
         )
-    if not pools:
-        return pools
     if PoolName.KV not in pools:
         raise ValueError(f"expected primary KV pool, got {tuple(pools)}")
     for info in infos:
@@ -145,7 +151,11 @@ def _prepare_sidecar(
         transfer_layers.add(len(model_layer_ids) + depth)
         packed_buffers.extend(draft_buffers.buffers)
     packed = msgspec.structs.replace(buffers, buffers=tuple(packed_buffers))
-    if packed.kernel_page_bytes % packed.page_size:
+    # The DSA indexer host copies kernel_page_bytes / page_size bytes per token.
+    if (
+        packed.key_layout is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+        and packed.kernel_page_bytes % packed.page_size
+    ):
         raise ValueError(
             f"{target.pool_name}: kernel_page_bytes={packed.kernel_page_bytes} must split over page_size={packed.page_size}"
         )
@@ -173,13 +183,11 @@ def prepare_host_pool_config(
     packed_draft_device_pools: tuple[Any, ...] = (),
 ) -> HostPoolGroupConfig:
     """Capture each provider once, check packing, and bind before allocating host memory."""
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    # Hybrid drafts pack their full-attention KV child into the target KV host.
-    packed_draft_device_pools = tuple(
-        pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
-        for pool in packed_draft_device_pools
-    )
+    # Hybrid pools pack their full-attention KV child into the KV host.
+    root, targets = _host_pool_infos(root)
+    packed_drafts = tuple(_host_pool_infos(pool) for pool in packed_draft_device_pools)
+    packed_draft_device_pools = tuple(pool for pool, _ in packed_drafts)
+    drafts = tuple(infos for _, infos in packed_drafts)
     for transfer_id, device_id in full_layer_mapping.items():
         if not 0 <= transfer_id < transfer_layer_id_max:
             raise ValueError(
@@ -187,11 +195,6 @@ def prepare_host_pool_config(
             )
         if not 0 <= device_id < root.layer_num:
             raise ValueError(f"device layer {device_id} outside [0, {root.layer_num})")
-    targets = _pool_infos_by_name(collect_host_pool_infos(root))
-    drafts = tuple(
-        _pool_infos_by_name(collect_host_pool_infos(pool))
-        for pool in packed_draft_device_pools
-    )
     for pool, pools in zip(packed_draft_device_pools, drafts):
         if set(pools) != set(targets):
             raise ValueError(
@@ -201,7 +204,6 @@ def prepare_host_pool_config(
             raise ValueError(
                 f"packed draft requires exactly one KV layer per draft pool, got {pool.layer_num}"
             )
-    check_packed_kv_rows(kv_pool=root, drafts=packed_draft_device_pools)
     mapping = with_packed_draft_layer_mapping(
         full_layer_mapping,
         transfer_layer_start=transfer_layer_id_max,
@@ -233,31 +235,3 @@ def prepare_host_pool_config(
         packed_draft_device_pools=packed_draft_device_pools,
         sidecars=sidecars,
     )
-
-
-def is_mla_pool(pool: Any) -> bool:
-    from sglang.srt.mem_cache.kv.memory.views import MLAKVView
-
-    return isinstance(pool, MLAKVView)
-
-
-def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
-    if use_mla:
-        return (pool.kv_cache_dim, pool.store_dtype)
-    return (pool.head_num, pool.head_dim, pool.v_head_dim, pool.store_dtype)
-
-
-def check_packed_kv_rows(
-    *, kv_pool: Any, drafts: tuple[Any, ...], use_mla: Optional[bool] = None
-):
-    if not drafts:
-        return
-    if use_mla is None:
-        use_mla = is_mla_pool(kv_pool)
-    target = _kv_row_signature(kv_pool, use_mla=use_mla)
-    for draft in drafts:
-        row = _kv_row_signature(draft, use_mla=use_mla)
-        if row != target:
-            raise ValueError(
-                f"packed draft KV row {row} differs from target KV row {target}"
-            )

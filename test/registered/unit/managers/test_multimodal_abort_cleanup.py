@@ -10,30 +10,28 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     AbortReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
-    Req,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.deferred_responses import (
-    DeferredResponses,
-)
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -93,21 +91,18 @@ def _rank(rank):
 
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
-    scheduler.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
-    )
-    scheduler.waiting_queue = [req]
-    scheduler.chunked_req = scheduler.mm_receiver = scheduler.dllm_config = None
+    empty_request_lists(scheduler)
+    scheduler.waiting_queue.join([req])
+    scheduler.mm_receiver = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.tree_cache = MagicMock()
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
     scheduler.rust_server = None
     scheduler.output_streamer = MagicMock()
-    scheduler.grammar_manager = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.hisparse_coordinator = None
+    scheduler.init_request_retirer()
     return scheduler
 
 
@@ -120,7 +115,7 @@ def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
             scheduler = _queued_scheduler(req)
             with _rank(rank):
                 scheduler.abort_request(AbortReq(rid=req.rid))
-            assert scheduler.waiting_queue == []
+            assert list(scheduler.waiting_queue) == []
         vmm_pool._recycle_chunks()
         assert not vmm_pool.occupied_chunks
 
