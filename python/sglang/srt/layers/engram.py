@@ -23,10 +23,10 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.communication.engram_gather_peer import engram_gather_peer
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import (
     engram_gather,
-    engram_gather_peer,
     engram_rows_to_token_major,
     unpack_mxfp4_rows,
 )
