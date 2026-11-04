@@ -346,9 +346,7 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # flavor name, so they apply here unchanged.
 FROM $BASE_IMAGE_1250_ROCM1000 AS gfx1250-rocm1000
 ENV BUILD_VLLM="0"
-# Unlike the gfx942/gfx950 images, this one replaces the SDK's Triton: the
-# revision below is what the MI45x bring-up ran on, and it carries a fix the
-# SDK build does not have yet.
+# Unlike the gfx942/gfx950 images, this one replaces the SDK's Triton.
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -357,9 +355,8 @@ ENV BUILD_MOONCAKE="1"
 # shared pin. Validated by the manual gfx1250 AITER Scout #173 A/B (no automated
 # gfx1250 Scout): gpt-oss, Flux.2, Wan2.2 and Kimi-K2 all NO_NEW_REGRESSION.
 ENV AITER_COMMIT_DEFAULT="26f4f1fb2de14d122c71f5fed7afb97a5c97cade"
-# The upstream Triton the gfx1250 bring-up was validated against, carried over
-# from the ROCm 7.14 flavor this image replaced. Built from source below.
-ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
+# Triton v3.9.0, built from source below.
+ENV TRITON_COMMIT_DEFAULT="b7ddcf86c095de79527ba3098503e73158bb94bd"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -367,15 +364,10 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 1250 with ROCm 10.1.0 and args (Python 3.12 + torch 2.12)
 FROM $BASE_IMAGE_1250_ROCM1010 AS gfx1250-rocm1010
 ENV BUILD_VLLM="0"
-# Keep the Triton that comes with the SDK. The rocm1000 flavor builds a newer
-# Triton from source, and that one no longer has block pointers or
-# triton_kernels (triton-lang/triton#10833), which sglang still uses.
 ENV BUILD_TRITON="1"
-ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
-# triton-lang/triton#10833 removed block pointers, which sglang's FLA kernels
-# (fla/, used by Qwen3-Next, MiniMax and Kimi Linear) still call. The revert is
-# pure Python: #9668 had already moved block pointers out of C++/MLIR.
-ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
+# Triton v3.9.0. No revert of triton-lang/triton#10833 needed: sglang#45470
+# restores block pointers for the FLA kernels.
+ENV TRITON_COMMIT_DEFAULT="b7ddcf86c095de79527ba3098503e73158bb94bd"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
