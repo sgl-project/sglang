@@ -11,7 +11,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
