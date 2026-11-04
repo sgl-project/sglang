@@ -176,7 +176,7 @@ struct KdaPackedDecodeKernel {
     auto K_ = SymbolicSize{"head_k_dim"};
     auto Slots_ = SymbolicSize{"pool_slots"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({B_, MixedDim_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(mixed_qkv);
     TensorMatcher({B_, ADim_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(a);

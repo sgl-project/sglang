@@ -199,7 +199,7 @@ struct QKNormKernelWarp {
     auto Sk = SymbolicSize{"k_stride"};
     auto device = SymbolicDevice{};
     D.set_value(kHeadDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Sq, D, 1})
@@ -289,7 +289,7 @@ struct QKNormKernelCTA {
     auto Sk = SymbolicSize{"k_stride"};
     auto device = SymbolicDevice{};
     D.set_value(kHeadDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Sq, D, 1})
