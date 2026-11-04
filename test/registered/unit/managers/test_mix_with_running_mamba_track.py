@@ -202,7 +202,7 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
                 )
                 self.assertEqual(batch.mamba_track_seqlens.tolist(), [428, -1, -1, -1])
                 self.assertEqual(batch.mamba_track_indices.tolist()[:2], [7, 9])
-                self.assertEqual(batch.mamba_track_indices.tolist()[2:], [-1, -1])
+                self.assertEqual(batch.mamba_track_indices.tolist()[2:], [0, 0])
 
                 # The slot checkpoint_kv_cache donates (donate_mamba_ping_pong_slot)
                 # for the tracked prefill row ...

@@ -1740,18 +1740,11 @@ def set_mamba_track_indices_from_reqs(
     """
     mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
-        # A request without a ping-pong buffer yet (spec v2 verify) records 0.
-        track_positions = [
-            (
-                req.kv.mamba_next_track_idx
-                if req.kv.mamba_next_track_idx is not None
-                else 0
-            )
-            for req in batch.reqs
-        ]
-    batch.mamba_track_buffer_indices = list(track_positions)
-    # A request whose state was freed under overlap (it may already belong to
-    # another request) has no slot.
+        track_positions = [req.kv.mamba_next_track_idx for req in batch.reqs]
+    batch.mamba_track_buffer_indices = [0 if p is None else p for p in track_positions]
+    # A request with no ping-pong buffer (none given yet in spec v2 verify, or
+    # freed under overlap, when it may already belong to another request) has
+    # no slot.
     positions = async_h2d(
         [
             -1 if req.kv.mamba_next_track_idx is None else position
@@ -2768,12 +2761,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = out_cache_loc
         if prefill_track is not None:
             indices, mask, seqlens, mask_cpu, seqlens_cpu = prefill_track
-            untracked = torch.full(
-                (running_bs,), -1, dtype=torch.int64, device=indices.device
+            # Decode rows track nothing here; their index is the reserved slot 0.
+            untracked = torch.zeros(
+                running_bs, dtype=torch.int64, device=indices.device
             )
             self.mamba_track_indices = torch.cat([indices, untracked])
-            self.mamba_track_mask = torch.cat([mask, untracked >= 0])
-            self.mamba_track_seqlens = torch.cat([seqlens, untracked])
+            self.mamba_track_mask = torch.cat(
+                [mask, torch.zeros_like(untracked, dtype=torch.bool)]
+            )
+            self.mamba_track_seqlens = torch.cat(
+                [seqlens, torch.full_like(untracked, -1)]
+            )
             self.mamba_prefill_track_mask_cpu = mask_cpu + [False] * running_bs
             self.mamba_track_seqlens_cpu = seqlens_cpu + [-1] * running_bs
         if merged_seq_lens_cpu is not None:
