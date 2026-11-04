@@ -95,7 +95,7 @@ class CustomAllreduce:
         if full_nvlink is None:
             return  # fail to get nvlink status
 
-        if _is_hip and not full_nvlink and not self.use_amd_deterministic_impl:
+        if _is_hip and full_nvlink is False and not self.use_amd_deterministic_impl:
             # should_custom_ar() never selects this path, so skip the IPC setup,
             # which also fails on expandable_segments (VMM) allocations.
             logger.info(
