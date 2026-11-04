@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_disagg, get_exec, max_prefill_buffer_tokens
+from sglang.srt.utils.common import get_eager_max_batch_size
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 HEAD_DIM = 512
 
@@ -31,6 +37,22 @@ def pack_query(
     return out
 
 
+def max_packed_query_rows(*, max_running_requests: int, rows_per_request: int) -> int:
+    # A decode or verify batch and, except on a PD decode server (no extend forwards),
+    # a prefill chunk or a prefill-graph or decoder-tail bucket.
+    graphs = get_exec().graph.cuda_graph_config
+    max_bs = max(max_running_requests, graphs.decode.max_bs or 0)
+    rows = get_eager_max_batch_size(max_bs) * rows_per_request
+    if get_disagg().disaggregation_mode == "decode":
+        return rows
+    return max(
+        rows,
+        max_prefill_buffer_tokens(),
+        graphs.prefill.max_bs or 0,
+        envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get(),
+    )
+
+
 def interleave_output_columns(w: torch.Tensor) -> torch.Tensor:
     return w.view(*w.shape[:-1], 8, 16, 32).transpose(-3, -2).reshape(w.shape)
 
@@ -49,6 +71,38 @@ def quantize_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
     mega_attn: bool = True
+
+    def __init__(self, model_runner: ModelRunner, **kwargs):
+        super().__init__(model_runner, **kwargs)
+        self.max_packed_query_rows = max_packed_query_rows(
+            max_running_requests=model_runner.max_running_requests,
+            rows_per_request=self.speculative_num_draft_tokens or 1,
+        )
+        self._packed_query: Optional[torch.Tensor] = None
+
+    def packed_query_buffer(
+        self, rows: int, padded_heads: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # Zeroed once and never reallocated, so captured graphs keep its address;
+        # packs write only the real heads' slots.
+        if self._packed_query is None:
+            assert not torch.cuda.is_current_stream_capturing()
+            self._packed_query = torch.zeros(
+                self.max_packed_query_rows,
+                padded_heads,
+                HEAD_DIM,
+                dtype=dtype,
+                device=self.device,
+            )
+        buf = self._packed_query
+        if rows > buf.shape[0]:
+            raise RuntimeError(
+                f"a MegaAttention forward of {rows} rows exceeds the packed query "
+                f"buffer's {buf.shape[0]}, sized from --chunked-prefill-size, "
+                "--max-running-requests and the CUDA graph sizes"
+            )
+        assert buf.shape[1] == padded_heads and buf.dtype == dtype
+        return buf[:rows]
 
     def _mega_paged_prefill(
         self,

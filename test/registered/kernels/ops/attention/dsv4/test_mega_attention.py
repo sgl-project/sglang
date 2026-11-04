@@ -1,7 +1,6 @@
 import copy
 import itertools
 import unittest
-from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,7 +10,9 @@ from sglang.kernels.ops.attention.flash_mla_interface import (
     flash_mla_mega_decode,
     flash_mla_mega_prefill,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention import deepseek_v4_mega_backend as mega_backend_module
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     DeepseekV4MegaAttnBackend,
     interleave_output_columns,
@@ -19,16 +20,14 @@ from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     pack_query,
     quantize_wo_a,
 )
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.runner import row_bucket_graph_runner
-from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.models import deepseek_v4_replay_tail
-from sglang.srt.models.deepseek_v4 import (
-    DeepseekV4Model,
-    MQALayer,
-    _fp8_wo_a_einsum,
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_v4 import MQALayer, _fp8_wo_a_einsum
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
     interleave_pages,
@@ -37,7 +36,7 @@ from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def unpack_output(data, scale):
@@ -56,462 +55,6 @@ def paged_view(raw, page_size, bytes_per_token):
     return raw[:, : page_size * bytes_per_token].view(
         raw.shape[0], page_size, 1, bytes_per_token
     )
-
-
-def pack_query_reference(q, padded_heads):
-    # pack_query as it was before the persistent buffer: fresh zeros every call.
-    tokens, heads, _ = q.shape
-    out = q.new_zeros(tokens, 32, padded_heads, 16)
-    out[:, :, :heads] = q.view(tokens, heads, 32, 16).transpose(1, 2)
-    return out.view(tokens, padded_heads, 512)
-
-
-class _MegaQueryLayer:
-    """The state MQALayer._forward_mega reads before the attention call, which
-    records the packed query it is handed."""
-
-    head_dim = 512
-    mega_wq_b_permuted = False
-    _zero_packed_q = MQALayer._zero_packed_q
-    _forward_mega = MQALayer._forward_mega
-
-    def __init__(self):
-        self.packed = []
-
-    def _mega_core(
-        self, q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=False
-    ):
-        self.packed.append(q.clone())
-        return q
-
-
-def new_metadata():
-    return DSV4Metadata(core_attn_metadata=None, indexer_metadata=None)
-
-
-def new_tail_metadata():
-    return DSV4Metadata(
-        core_attn_metadata=SimpleNamespace(request_window_layout=None),
-        indexer_metadata=None,
-        late_layer_tail=SimpleNamespace(real_rows_count=None, cp_metadata=None),
-    )
-
-
-def prefill_forward_batch():
-    return SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        attn_cp_metadata=None,
-        global_num_token_non_padded_cpu=None,
-        global_num_token_non_padded=None,
-        num_token_non_padded=None,
-        residual_stream=None,
-    )
-
-
-class _KeptMetadataBackend(DeepseekV4MegaAttnBackend):
-    """A MegaAttention backend with only the state it reads to share the packed
-    query buffer between metadata that captured graphs keep, to switch the late
-    layers onto their tail metadata, and to release the buffer."""
-
-    def __init__(self):
-        self.forward_metadata = None
-        self.tail_forward_metadata = None
-        self._last_kept_metadata = None
-        self.token_to_kv_pool = SimpleNamespace(request_window=None)
-        self.req_to_token_pool = None
-
-
-class TestMegaPackedQueryBuffer(CustomTestCase):
-    """The packed query lives in one zeroed buffer per metadata that pack_query
-    writes only the real heads of, so its padding must stay zero across layers,
-    shrinking and growing token counts, and CUDA graph capture and replay."""
-
-    def _forward(self, layer, backend, q, padded_heads, mode=ForwardMode.DECODE):
-        forward_batch = SimpleNamespace(forward_mode=mode)
-        return layer._forward_mega(q, padded_heads, None, forward_batch, backend)
-
-    def test_matches_fresh_zeros_across_calls(self):
-        torch.manual_seed(0)
-        decode_tokens = (8, 48, 3, 48, 64, 1)
-        cases = [
-            (heads, padded, ForwardMode.DECODE, decode_tokens)
-            for heads, padded in ((8, 64), (16, 64), (32, 64), (64, 64), (128, 128))
-        ]
-        cases.append((16, 64, ForwardMode.EXTEND, (8192, 1000, 8192, 4096)))
-        for heads, padded, mode, token_counts in cases:
-            with self.subTest(heads=heads, padded=padded, mode=mode):
-                layer = _MegaQueryLayer()
-                backend = SimpleNamespace(forward_metadata=new_metadata())
-                for tokens in token_counts:
-                    for _ in range(3):  # layers of one forward
-                        q = torch.randn(
-                            tokens, heads, 512, device="cuda", dtype=torch.bfloat16
-                        )
-                        out = self._forward(layer, backend, q, padded, mode)
-                        layer.packed.clear()
-                        buf = backend.forward_metadata.q_mega_pad_buffer
-                        self.assertEqual(out.data_ptr(), buf.data_ptr())
-                        self.assertTrue(
-                            torch.equal(out, pack_query_reference(q, padded))
-                        )
-                        self.assertTrue(torch.equal(pack_query(q, padded), out))
-                self.assertEqual(buf.shape[0], max(token_counts))
-                # q_pad_buffer's layout pads where the packed layout holds real heads.
-                self.assertIsNone(backend.forward_metadata.q_pad_buffer)
-
-    def test_cuda_graph_reuses_buffer_allocated_before_capture(self):
-        # Metadata kept across warmup and capture (prefill graphs, and decode
-        # graphs that keep the full metadata): warmup allocates and zeroes the
-        # buffer eagerly, so the graph holds no memset and replays reuse it.
-        torch.manual_seed(1)
-        layer = _MegaQueryLayer()
-        backend = SimpleNamespace(forward_metadata=new_metadata())
-        static_q = [
-            torch.randn(48, 16, 512, device="cuda", dtype=torch.bfloat16)
-            for _ in range(4)
-        ]
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for q in static_q:
-                self._forward(layer, backend, q, 64)
-        torch.cuda.current_stream().wait_stream(stream)
-        meta = backend.forward_metadata
-        warm_ptr = meta.q_mega_pad_buffer.data_ptr()
-        self.assertFalse(meta.q_mega_pad_captured)
-
-        layer.packed.clear()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for q in static_q:
-                self._forward(layer, backend, q, 64)
-        self.assertTrue(meta.q_mega_pad_captured)
-        self.assertEqual(meta.q_mega_pad_buffer.data_ptr(), warm_ptr)
-        for _ in range(3):
-            for q in static_q:
-                q.copy_(torch.randn_like(q))
-            graph.replay()
-            torch.cuda.synchronize()
-            for q, packed in zip(static_q, layer.packed, strict=True):
-                self.assertTrue(torch.equal(packed, pack_query_reference(q, 64)))
-
-        # A captured buffer may not be replaced by a larger one.
-        with self.assertRaisesRegex(AssertionError, "grew after a CUDA graph"):
-            self._forward(
-                layer,
-                backend,
-                torch.randn(64, 16, 512, device="cuda", dtype=torch.bfloat16),
-                64,
-            )
-
-    def test_cuda_graph_rezeroes_buffer_allocated_in_capture(self):
-        # Metadata built inside the captured forward (raw decode metadata upgraded
-        # in the graph): the buffer comes from the graph pool, so each replay must
-        # zero it again whatever that memory held in between.
-        torch.manual_seed(2)
-        layer = _MegaQueryLayer()
-        backend = SimpleNamespace(forward_metadata=None)
-        static_q = [
-            torch.randn(40, 16, 512, device="cuda", dtype=torch.bfloat16)
-            for _ in range(4)
-        ]
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            backend.forward_metadata = new_metadata()
-            for q in static_q:
-                self._forward(layer, backend, q, 64)
-        meta = backend.forward_metadata
-        self.assertTrue(meta.q_mega_pad_captured)
-        for _ in range(3):
-            meta.q_mega_pad_buffer.fill_(float("nan"))
-            for q in static_q:
-                q.copy_(torch.randn_like(q))
-            graph.replay()
-            torch.cuda.synchronize()
-            for q, packed in zip(static_q, layer.packed, strict=True):
-                self.assertTrue(torch.equal(packed, pack_query_reference(q, 64)))
-
-    def _prefill_forward(self, layer, backend, forward_batch, queries):
-        # Two early layers over every row, then two late layers over the tail.
-        for q in queries[:2]:
-            self._forward(layer, backend, q, 64, ForwardMode.EXTEND)
-        saved = backend.enter_late_layer_tail(forward_batch)
-        for q in queries[2:]:
-            self._forward(layer, backend, q, 64, ForwardMode.EXTEND)
-        backend.exit_late_layer_tail(saved, forward_batch)
-
-    def test_kept_metadata_share_one_buffer(self):
-        # Breakable prefill graphs keep one metadata per captured shape, built
-        # largest first and warmed up eagerly before capture, and switch the late
-        # layers onto a tail metadata. They share one buffer, and each graph still
-        # replays exactly after the others ran. A shape that needs more rows than
-        # the shared buffer gets its own; the graphs before it keep theirs.
-        torch.manual_seed(3)
-        layer = _MegaQueryLayer()
-        backend = _KeptMetadataBackend()
-        forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            attn_cp_metadata=None,
-            global_num_token_non_padded_cpu=None,
-            global_num_token_non_padded=None,
-            num_token_non_padded=None,
-        )
-        captured = []
-        for tokens in (512, 256, 48, 1024):
-            meta, tail = new_metadata(), new_tail_metadata()
-            backend._share_q_mega_pad_buffer(meta)
-            backend.forward_metadata, backend.tail_forward_metadata = meta, tail
-            queries = [
-                torch.randn(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
-                for rows in (tokens, tokens, tokens // 4, tokens // 4)
-            ]
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                self._prefill_forward(layer, backend, forward_batch, queries)
-            torch.cuda.current_stream().wait_stream(stream)
-            layer.packed.clear()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                self._prefill_forward(layer, backend, forward_batch, queries)
-            self.assertTrue(meta.q_mega_pad_captured and tail.q_mega_pad_captured)
-            captured.append((meta, tail, graph, queries, list(layer.packed)))
-            layer.packed.clear()
-
-        shared = captured[0][0].q_mega_pad_buffer
-        self.assertEqual(shared.shape[0], 512)
-        for meta, tail, *_ in captured[:3]:
-            self.assertIs(meta.q_mega_pad_buffer, shared)
-            self.assertIs(tail.q_mega_pad_buffer, shared)
-        meta, tail, *_ = captured[3]
-        self.assertEqual(meta.q_mega_pad_buffer.shape[0], 1024)
-        self.assertIs(tail.q_mega_pad_buffer, meta.q_mega_pad_buffer)
-
-        for i in (2, 0, 3, 1, 2):
-            _, _, graph, queries, packed = captured[i]
-            for q in queries:
-                q.copy_(torch.randn_like(q))
-            graph.replay()
-            torch.cuda.synchronize()
-            for q, p in zip(queries, packed, strict=True):
-                self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
-
-    def _model_forward(self, backend, forward_batch, run_layers):
-        # DeepseekV4Model.forward around stand-in layers: what it does once they
-        # return is under test.
-        model = SimpleNamespace(
-            _forward_impl=lambda *args: run_layers(), use_mega_attention=True
-        )
-        with patch(
-            "sglang.srt.models.deepseek_v4.get_attn_backend", return_value=backend
-        ):
-            DeepseekV4Model.forward(model, None, None, forward_batch, None)
-
-    def test_eager_forward_drops_buffer_when_it_ends(self):
-        # An eager forward builds its metadata anew and the backend keeps that
-        # metadata until the next forward, so the forward's buffer (tokens x 64
-        # padded heads x 512 bf16, shared by the late-layer tail) must be dropped
-        # when the forward ends rather than held between forwards.
-        torch.manual_seed(4)
-        layer, backend = _MegaQueryLayer(), _KeptMetadataBackend()
-        forward_batch = prefill_forward_batch()
-        for tokens in (1024, 256):
-            queries = [
-                torch.randn(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
-                for rows in (tokens, tokens, tokens // 4, tokens // 4)
-            ]
-            backend.forward_metadata = new_metadata()
-            backend.tail_forward_metadata = new_tail_metadata()
-            allocated = []
-
-            def run_layers():
-                self._prefill_forward(layer, backend, forward_batch, queries)
-                allocated.append(backend.forward_metadata.q_mega_pad_buffer.nbytes)
-
-            torch.cuda.synchronize()
-            before = torch.cuda.memory_allocated()
-            self._model_forward(backend, forward_batch, run_layers)
-            torch.cuda.synchronize()
-            self.assertTrue(
-                all(
-                    torch.equal(p, pack_query_reference(q, 64))
-                    for q, p in zip(queries, layer.packed, strict=True)
-                )
-            )
-            # The recorded copies count toward memory_allocated; nothing here may
-            # keep one.
-            layer.packed.clear()
-            self.assertEqual(allocated, [tokens * 64 * 512 * 2])
-            self.assertEqual(torch.cuda.memory_allocated() - before, 0)
-
-    def test_forward_end_keeps_warmup_and_captured_buffers(self):
-        # A graph's warmup allocates the buffer its capture records, and every
-        # replay writes and reads a captured buffer. The end of a forward keeps
-        # both, also an eager (idle) forward's end while the backend still holds
-        # the graph's metadata.
-        torch.manual_seed(5)
-        layer, backend = _MegaQueryLayer(), _KeptMetadataBackend()
-        forward_batch = prefill_forward_batch()
-        meta, tail = new_metadata(), new_tail_metadata()
-        backend._share_q_mega_pad_buffer(meta)
-        backend.forward_metadata, backend.tail_forward_metadata = meta, tail
-        queries = [
-            torch.randn(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
-            for rows in (512, 512, 128, 128)
-        ]
-
-        def run_layers():
-            self._prefill_forward(layer, backend, forward_batch, queries)
-
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with model_capture_mode(), torch.cuda.stream(stream):
-            self._model_forward(backend, forward_batch, run_layers)
-        torch.cuda.current_stream().wait_stream(stream)
-        self.assertIsNotNone(meta.q_mega_pad_buffer)
-        warm_ptr = meta.q_mega_pad_buffer.data_ptr()
-        layer.packed.clear()
-        graph = torch.cuda.CUDAGraph()
-        with model_capture_mode(), torch.cuda.graph(graph):
-            self._model_forward(backend, forward_batch, run_layers)
-        packed = list(layer.packed)
-        layer.packed.clear()
-        self.assertTrue(meta.q_mega_pad_captured and tail.q_mega_pad_captured)
-
-        self._model_forward(backend, forward_batch, lambda: None)
-        # A dropped buffer's memory would go back to the warmup stream's pool,
-        # and from there to this tensor.
-        with torch.cuda.stream(stream):
-            _poison = torch.full(
-                (512, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
-            )
-        torch.cuda.current_stream().wait_stream(stream)
-        for _ in range(2):
-            for q in queries:
-                q.copy_(torch.randn_like(q))
-            graph.replay()
-            torch.cuda.synchronize()
-            for q, p in zip(queries, packed, strict=True):
-                self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
-        self.assertEqual(meta.q_mega_pad_buffer.data_ptr(), warm_ptr)
-        self.assertIs(tail.q_mega_pad_buffer, meta.q_mega_pad_buffer)
-
-    def test_forward_end_rejects_a_wrapped_backend(self):
-        # Under a wrapper such as TboAttnBackend the end of the forward must fail,
-        # not skip the release and keep the forward's buffer.
-        backend = TboAttnBackend.init_new(_KeptMetadataBackend)
-        with self.assertRaisesRegex(AssertionError, "TboAttnBackend"):
-            self._model_forward(backend, prefill_forward_batch(), lambda: None)
-
-    @contextmanager
-    def _row_bucket_runtime(self, backend):
-        # RowBucketGraphRunner on one GPU without the distributed runtime: a graph
-        # pool, a capture stream, a no-op TP barrier, and the backend whose
-        # metadata a recorded graph keeps.
-        pool, stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
-
-        @contextmanager
-        def graph_capture(stream):
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                yield SimpleNamespace(stream=stream)
-
-        parallel = SimpleNamespace(
-            tp_group=SimpleNamespace(barrier=lambda: None), tp_rank=0
-        )
-        runtime = {
-            "get_or_create_global_graph_memory_pool": lambda device_module: pool,
-            "get_or_create_global_graph_capture_stream": lambda: stream,
-            "set_graph_pool_id": lambda pool_id: None,
-            "graph_capture": graph_capture,
-            "get_parallel": lambda: parallel,
-            "get_attn_backend": lambda: backend,
-            "graph_pool_capture_scope": nullcontext,
-            "graph_pool_replay_scope": nullcontext,
-        }
-        with ExitStack() as stack:
-            for name, value in runtime.items():
-                stack.enter_context(patch.object(row_bucket_graph_runner, name, value))
-            yield
-
-    def test_tail_graph_leaves_the_forward_buffer_to_the_forward(self):
-        # A decoder tail graph (deepseek_v4_replay_tail) captures on first use,
-        # inside an eager prefill's late-layer tail, and keeps the metadata it
-        # captured with: that forward's tail metadata, which holds the forward's
-        # buffer. The buffer must still be freed when the forward ends, and the
-        # graph must keep packing exactly once that memory is reused.
-        torch.manual_seed(6)
-        layer, backend = _MegaQueryLayer(), _KeptMetadataBackend()
-        forward_batch = prefill_forward_batch()
-        forward_batch.attn_tp_sequence_sharded = False
-        tokens, tail_rows = 1024, 100
-        queries = [
-            torch.randn(tokens, 16, 512, device="cuda", dtype=torch.bfloat16)
-            for _ in range(2)
-        ]
-        tail_queries = [
-            torch.randn(tail_rows, 16, 512, device="cuda", dtype=torch.bfloat16)
-            for _ in range(2)
-        ]
-        backend.forward_metadata = new_metadata()
-        backend.tail_forward_metadata = new_tail_metadata()
-        # 64-row buckets up to 256: the 100 tail rows replay the 128-row graph,
-        # captured after the 256- and 192-row ones (largest first).
-        runner = row_bucket_graph_runner.RowBucketGraphRunner(
-            row_step=64, max_rows=256, label="test"
-        )
-
-        def body(inputs, batch):
-            for q in inputs:
-                layer._forward_mega(q, 64, None, batch, backend)
-            return []
-
-        def run_tail():
-            runner.run(
-                key=(),
-                live=tail_queries,
-                forward_batch=forward_batch,
-                body=body,
-                context=lambda batch: deepseek_v4_replay_tail._replay_tail_scope(),
-            )
-
-        buffer_bytes, allocated_at_end = [], []
-
-        def run_layers():
-            for q in queries:
-                self._forward(layer, backend, q, 64, ForwardMode.EXTEND)
-            saved = backend.enter_late_layer_tail(forward_batch)
-            run_tail()
-            backend.exit_late_layer_tail(saved, forward_batch)
-            buffer_bytes.append(backend.forward_metadata.q_mega_pad_buffer.nbytes)
-            torch.cuda.synchronize()
-            allocated_at_end.append(torch.cuda.memory_allocated())
-
-        with self._row_bucket_runtime(backend):
-            self._model_forward(backend, forward_batch, run_layers)
-            torch.cuda.synchronize()
-            freed = allocated_at_end[0] - torch.cuda.memory_allocated()
-            # The eager layers' packs, then three captures (two warmups each) of
-            # the tail's two layers; the 128-row graph's capture comes last.
-            self.assertEqual(len(layer.packed), 2 + 3 * 3 * 2)
-            for q, p in zip(queries, layer.packed[:2], strict=True):
-                self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
-            graph_packed = layer.packed[-2:]
-            self.assertEqual(buffer_bytes, [tokens * 64 * 512 * 2])
-            self.assertEqual(freed, buffer_bytes[0])
-            # The freed buffer's memory goes back to this stream and this tensor.
-            _poison = torch.full(
-                (tokens, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
-            )
-            for _ in range(2):
-                for q in tail_queries:
-                    q.copy_(torch.randn_like(q))
-                run_tail()
-                torch.cuda.synchronize()
-                for q, p in zip(tail_queries, graph_packed, strict=True):
-                    self.assertTrue(
-                        torch.equal(p[:tail_rows], pack_query_reference(q, 64))
-                    )
 
 
 @unittest.skipUnless(
@@ -632,8 +175,8 @@ class TestMegaAttention(CustomTestCase):
                 )
 
     def test_mega_kernels_leave_q_unchanged(self):
-        # The model zeroes the packed query's padding once per forward and every
-        # layer reuses the buffer, so no MegaAttention kernel may write its query.
+        # The packed query's padding is zeroed once per backend and never rewritten,
+        # so no MegaAttention kernel may write its query.
         torch.manual_seed(789)
         tokens, topk, extra_topk, page = 48, 128, 512, 64
         positions = torch.randint(0, 4096, (tokens,), device="cuda", dtype=torch.int32)
@@ -667,8 +210,8 @@ class TestMegaAttention(CustomTestCase):
         prefill_indices = torch.randint(
             0, 512, (tokens, 1, topk), device="cuda", dtype=torch.int32
         )
-        # "decode_swa" passes no extra cache, as the model does on its
-        # compress_ratio 0 layers and the SWA-only DSpark draft blocks.
+        # "decode_swa" passes no extra cache;
+        # so do the model's compress_ratio 0 layers and SWA-only DSpark draft blocks.
         for (heads, padded), use_legacy, op in itertools.product(
             ((16, 64), (64, 64), (128, 128)),
             (True, False),
@@ -715,6 +258,234 @@ class TestMegaAttention(CustomTestCase):
                     )
                 torch.cuda.synchronize()
                 self.assertTrue(torch.equal(q, pack_query_reference(q_real, padded)))
+
+
+def pack_query_reference(q, padded_heads):
+    # pack_query without a buffer: fresh zeros every call.
+    tokens, heads, _ = q.shape
+    out = q.new_zeros(tokens, 32, padded_heads, 16)
+    out[:, :, :heads] = q.view(tokens, heads, 32, 16).transpose(1, 2)
+    return out.view(tokens, padded_heads, 512)
+
+
+class _MegaQueryLayer:
+    """The state MQALayer._forward_mega reads before the attention call, which
+    records the packed query it is handed."""
+
+    head_dim = 512
+    mega_wq_b_permuted = False
+    _forward_mega = MQALayer._forward_mega
+
+    def __init__(self):
+        self.packed = []
+
+    def _mega_core(
+        self, q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=False
+    ):
+        self.packed.append(q.clone())
+        return q
+
+
+def mega_backend(max_rows):
+    # DeepseekV4MegaAttnBackend.__init__ over a base class that sets only what it reads.
+    def base_init(self, model_runner, **kwargs):
+        self.device = torch.device("cuda")
+        self.speculative_num_draft_tokens = None
+
+    with (
+        patch.object(DeepseekV4AttnBackend, "__init__", base_init),
+        patch.object(
+            mega_backend_module, "max_packed_query_rows", return_value=max_rows
+        ),
+    ):
+        return DeepseekV4MegaAttnBackend(SimpleNamespace(max_running_requests=1))
+
+
+def poison_allocator(rows, padded_heads):
+    # The caching allocator hands this freed block to the next allocation of its size.
+    torch.full(
+        (rows, padded_heads, 512), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    torch.cuda.synchronize()
+
+
+def forward(layer, backend, q, padded_heads, mode=ForwardMode.DECODE):
+    forward_batch = SimpleNamespace(forward_mode=mode)
+    return layer._forward_mega(q, padded_heads, None, forward_batch, backend)
+
+
+def padding_nonzero(backend, heads, padded_heads):
+    padding = backend._packed_query.view(-1, 32, padded_heads, 16)[:, :, heads:]
+    return torch.count_nonzero(padding).item()
+
+
+class TestMegaPackedQueryBuffer(CustomTestCase):
+    """Every pack writes only the real heads of one buffer per backend, zeroed once;
+    its padding must stay zero across layers, token counts, captures and replays."""
+
+    def test_packs_match_fresh_zeros(self):
+        torch.manual_seed(0)
+        decode_tokens = (8, 48, 3, 64, 1)
+        cases = [
+            (heads, padded, ForwardMode.DECODE, decode_tokens)
+            for heads, padded in ((8, 64), (16, 64), (32, 64), (64, 64), (128, 128))
+        ]
+        cases.append((16, 64, ForwardMode.EXTEND, (8192, 1000, 4096)))
+        for heads, padded, mode, token_counts in cases:
+            with self.subTest(heads=heads, padded=padded, mode=mode):
+                max_rows = max(token_counts)
+                backend = mega_backend(max_rows)
+                layer = _MegaQueryLayer()
+                for tokens in token_counts:
+                    for _ in range(3):  # layers of one forward
+                        q = torch.randn(
+                            tokens, heads, 512, device="cuda", dtype=torch.bfloat16
+                        )
+                        if backend._packed_query is None:
+                            poison_allocator(max_rows, padded)
+                        out = forward(layer, backend, q, padded, mode)
+                        self.assertTrue(
+                            torch.equal(out, pack_query_reference(q, padded))
+                        )
+                        self.assertEqual(
+                            out.data_ptr(), backend._packed_query.data_ptr()
+                        )
+                        layer.packed.clear()
+                self.assertEqual(padding_nonzero(backend, heads, padded), 0)
+
+    def test_cuda_graphs_and_eager_forwards_share_the_buffer(self):
+        # Graphs are captured largest first after an eager warmup,
+        # then replayed in turn with eager forwards of another size in between.
+        torch.manual_seed(1)
+        layer = _MegaQueryLayer()
+        backend = mega_backend(64)
+        static = {
+            rows: [
+                torch.randn(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
+                for _ in range(4)
+            ]
+            for rows in (64, 40)
+        }
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            # A freed block is reused only by allocations on its own stream.
+            poison_allocator(64, 64)
+            for q in static[64]:
+                forward(layer, backend, q, 64)
+        torch.cuda.current_stream().wait_stream(stream)
+        ptr = backend._packed_query.data_ptr()
+        graphs = {}
+        for rows in (64, 40):
+            layer.packed = []
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for q in static[rows]:
+                    forward(layer, backend, q, 64)
+            graphs[rows] = (graph, layer.packed)
+        layer.packed = []
+        self.assertEqual(backend._packed_query.data_ptr(), ptr)
+        for _ in range(3):
+            for rows in (40, 64):
+                for q in static[rows]:
+                    q.copy_(torch.randn_like(q))
+                graph, packed = graphs[rows]
+                graph.replay()
+                torch.cuda.synchronize()
+                for q, p in zip(static[rows], packed, strict=True):
+                    self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
+                q = torch.randn(17, 16, 512, device="cuda", dtype=torch.bfloat16)
+                out = forward(layer, backend, q, 64)
+                self.assertTrue(torch.equal(out, pack_query_reference(q, 64)))
+        self.assertEqual(padding_nonzero(backend, 16, 64), 0)
+
+    def test_forward_beyond_the_buffer_fails_without_reallocating(self):
+        # Captured graphs keep the buffer's address, so it is never replaced.
+        layer = _MegaQueryLayer()
+        backend = mega_backend(48)
+        q = torch.randn(49, 16, 512, device="cuda", dtype=torch.bfloat16)
+        forward(layer, backend, q[:48], 64)
+        ptr = backend._packed_query.data_ptr()
+        with self.assertRaisesRegex(RuntimeError, "49 rows exceeds"):
+            forward(layer, backend, q, 64)
+        self.assertEqual(backend._packed_query.data_ptr(), ptr)
+
+    def test_backends_keep_separate_buffers(self):
+        """Backends that run at once on different streams must not share a buffer;
+        PD multiplexing gives prefill and each decode SM group its own backend."""
+        torch.manual_seed(2)
+        layer = _MegaQueryLayer()
+        first, second = mega_backend(32), mega_backend(32)
+        q_first, q_second = (
+            torch.randn(32, 16, 512, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        out = forward(layer, first, q_first, 64)
+        forward(layer, second, q_second, 64)
+        self.assertTrue(torch.equal(out, pack_query_reference(q_first, 64)))
+
+
+class TestMaxPackedQueryRows(CustomTestCase):
+    """The buffer must hold every forward MegaAttention can see:
+    a decode or verify batch padded for MLP sync, a prefill chunk,
+    and every prefill-graph and decoder-tail bucket, since capture runs each one."""
+
+    def _rows(self, *, mode, chunk, prefill_graph, decode_graph, requests, align):
+        graphs = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=decode_graph),
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=prefill_graph),
+        )
+        with (
+            get_context().override_server_args(
+                cuda_graph_config=graphs,
+                chunked_prefill_size=chunk,
+                disaggregation_mode=mode,
+            ),
+            envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(2048),
+            # MLP sync pads the request count to the attention TP size.
+            patch.object(
+                mega_backend_module,
+                "get_eager_max_batch_size",
+                side_effect=lambda bs: -(-bs // align) * align,
+            ),
+        ):
+            return mega_backend_module.max_packed_query_rows(
+                max_running_requests=requests, rows_per_request=4
+            )
+
+    def test_bound_covers_every_forward(self):
+        # Expected values derived by hand; every case has 4 rows per request.
+        cases = (
+            # 64 graph requests x 4 = 256 rows, under the 8192-token chunk.
+            (8192, "null", 8192, 2048, 64, 48, 1),
+            # The 2048-row decoder-tail bucket outgrows a 1024-token chunk.
+            (2048, "null", 1024, 512, 64, 48, 1),
+            # An 8192-token prefill-graph bucket outgrows a 4096-token chunk.
+            (8192, "null", 4096, 8192, 64, 48, 1),
+            # A PD decode server: 1000 eager requests (over the 256 of the graphs) x 4.
+            (4000, "decode", 16384, 2048, 256, 1000, 1),
+            # 50 requests padded to 56 for MLP sync, x 4.
+            (224, "decode", 16384, 2048, None, 50, 8),
+        )
+        for (
+            expected,
+            mode,
+            chunk,
+            prefill_graph,
+            decode_graph,
+            requests,
+            align,
+        ) in cases:
+            with self.subTest(mode=mode, chunk=chunk, requests=requests):
+                rows = self._rows(
+                    mode=mode,
+                    chunk=chunk,
+                    prefill_graph=prefill_graph,
+                    decode_graph=decode_graph,
+                    requests=requests,
+                    align=align,
+                )
+                self.assertEqual(rows, expected)
 
 
 if __name__ == "__main__":
