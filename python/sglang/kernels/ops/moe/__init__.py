@@ -61,14 +61,6 @@ register_kernel(
         capabilities=_HIP,
     )
 )
-register_kernel(
-    KernelSpec(
-        op="moe.topk_softmax",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
-        capabilities=CUDA_ONLY,
-    )
-)
 
 
 register_kernel(
