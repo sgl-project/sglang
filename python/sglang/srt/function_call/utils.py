@@ -325,24 +325,25 @@ def safe_ast_parse(source: str) -> ast.Module:
     return _run_ast_quiet(ast.parse, source)
 
 
-def _get_tool_schema_defs(tools: List[Tool]) -> dict:
+def _get_tool_schema_defs(tools: List[Tool], key: str = "$defs") -> dict:
     """
-    Get consolidated $defs from all tools, validating for conflicts.
+    Get consolidated definitions under ``key`` from all tools, validating for conflicts.
 
     Args:
         tools: List of tools to process
+        key: Definitions keyword, ``$defs`` or legacy ``definitions``
 
     Returns:
-        Dictionary of consolidated $defs from all tools
+        Dictionary of consolidated definitions from all tools
 
     Raises:
-        ValueError: If conflicting $defs are found
+        ValueError: If conflicting definitions are found
     """
     all_defs = {}
     for tool in tools:
-        if tool.function.parameters is None:
+        if not isinstance(tool.function.parameters, dict):
             continue
-        defs = tool.function.parameters.get("$defs", {})
+        defs = tool.function.parameters.get(key, {})
         for def_name, def_schema in defs.items():
             if def_name in all_defs and all_defs[def_name] != def_schema:
                 raise ValueError(
@@ -522,9 +523,10 @@ def get_json_schema_constraint(
                 }
                 if not parallel_tool_calls:
                     schema["maxItems"] = 1
-                json_schema_defs = _get_tool_schema_defs([tool])
-                if json_schema_defs:
-                    schema["$defs"] = json_schema_defs
+                for key in ("$defs", "definitions"):
+                    tool_defs = _get_tool_schema_defs([tool], key=key)
+                    if tool_defs:
+                        schema[key] = tool_defs
                 return schema
         return None
     elif tool_choice == "required":

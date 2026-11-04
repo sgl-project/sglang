@@ -111,32 +111,44 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         self.assertIn("parameters", item_schema["properties"])
 
     def test_specific_tool_choice_resolves_defs(self):
-        self.tools[0].function.parameters = {
-            "type": "object",
-            "properties": {"wait": {"$ref": "#/$defs/WaitFor"}},
-            "required": ["wait"],
-            "$defs": {
-                "WaitFor": {
+        for key in ("$defs", "definitions"):
+            with self.subTest(key=key):
+                self.tools[0].function.parameters = {
                     "type": "object",
-                    "properties": {"delay": {"$ref": "#/$defs/Delay"}},
-                    "required": ["delay"],
-                },
-                "Delay": {"type": "integer", "minimum": 0},
-            },
-        }
-        # A conflicting definition in an unselected tool must not leak in.
-        self.tools[1].function.parameters["$defs"] = {"Delay": {"type": "string"}}
-        schema = get_json_schema_constraint(
-            self.tools, ToolChoice(function={"name": "get_weather"})
-        )
-        validator = jsonschema.Draft202012Validator(schema)
-        validator.validate(
-            [{"name": "get_weather", "parameters": {"wait": {"delay": 1}}}]
-        )
-        with self.assertRaises(jsonschema.ValidationError):
-            validator.validate(
-                [{"name": "get_weather", "parameters": {"wait": {"delay": -1}}}]
-            )
+                    "properties": {"wait": {"$ref": f"#/{key}/WaitFor"}},
+                    "required": ["wait"],
+                    key: {
+                        "WaitFor": {
+                            "type": "object",
+                            "properties": {"delay": {"$ref": f"#/{key}/Delay"}},
+                            "required": ["delay"],
+                        },
+                        "Delay": {"type": "integer", "minimum": 0},
+                    },
+                }
+                # A conflicting definition in an unselected tool must not leak in.
+                self.tools[1].function.parameters[key] = {"Delay": {"type": "string"}}
+                schema = get_json_schema_constraint(
+                    self.tools, ToolChoice(function={"name": "get_weather"})
+                )
+                validator = jsonschema.Draft202012Validator(schema)
+                validator.validate(
+                    [{"name": "get_weather", "parameters": {"wait": {"delay": 1}}}]
+                )
+                with self.assertRaises(jsonschema.ValidationError):
+                    validator.validate(
+                        [{"name": "get_weather", "parameters": {"wait": {"delay": -1}}}]
+                    )
+
+    def test_boolean_parameters_schema(self):
+        """A boolean ``parameters`` schema must yield a constraint, not raise."""
+        tools = [Tool(type="function", function=Function(name="noop", parameters=True))]
+        for tool_choice in (ToolChoice(function={"name": "noop"}), "required"):
+            with self.subTest(tool_choice=tool_choice):
+                schema = get_json_schema_constraint(tools, tool_choice)
+                jsonschema.Draft202012Validator(schema).validate(
+                    [{"name": "noop", "parameters": {"any": 1}}]
+                )
 
     def test_specific_tool_choice_dict_schema(self):
         """Test schema generation for specific tool choice as ToolChoice object"""
