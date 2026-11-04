@@ -19,7 +19,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -95,7 +97,7 @@ def create_kt_config_from_server_args(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
     """Mask CPU expert IDs by setting them to -1.
 
