@@ -4,7 +4,7 @@ Qwen3.5-4B is a gated-delta-net / linear-attention hybrid, which exercises the
 path most prone to subtle bugs: the Mamba conv/SSM state stays a strided
 envelope view (its kernels are stride-aware by design) while the
 full-attention KV is per-layer views, which the fa3 / flashinfer cells read
-through the translator's read tables.
+through the `RunnerIds`' read tables.
 """
 
 import unittest

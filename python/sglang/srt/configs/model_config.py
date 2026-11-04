@@ -26,23 +26,26 @@ import torch
 from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.unlimited_ocr_v2 import (
+    FALLBACK_CONTEXT_LENGTH,
+    UocrDocumentConfig,
+)
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
+from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
@@ -210,6 +213,15 @@ def is_deepseek_dsa(config) -> bool:
         )
         and _hf_attr(config, "index_topk") is not None
     )
+
+
+def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
+    """Whether a DSA EAGLE/NEXTN draft shards its KV like the DCP target.
+
+    Only on ROCm; elsewhere the draft keeps a replicated pool and attends it
+    with dcp_size 1.
+    """
+    return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
 
 
 def is_glm_moe_dsa(config) -> bool:
@@ -443,6 +455,33 @@ def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
     return quantization == "minimax_m3_nvfp4" and get_platform().is_blackwell
 
 
+# v2 checkpoints reuse the v1 arch name; the DASH training stage selects this arch.
+UNLIMITED_OCR_V2_ARCH = "UnlimitedOCRV2ForCausalLM"
+
+
+def is_unlimited_ocr_v2(config) -> bool:
+    """Identify v2 checkpoints by ``training_stage == "dash"``.
+
+    Both versions publish ``UnlimitedOCRForCausalLM``, so the arch alone is not enough.
+    """
+    if _hf_arch(config) not in ("UnlimitedOCRForCausalLM", UNLIMITED_OCR_V2_ARCH):
+        return False
+    sparse_cfg = _hf_attr(config, "sparse_attention_config")
+    if not isinstance(sparse_cfg, dict):
+        return False
+    return sparse_cfg.get("training_stage") == "dash"
+
+
+def get_unlimited_ocr_v2_sparse_config(config) -> dict:
+    """Return the checkpoint's ``sparse_attention_config`` dict, or raise."""
+    sparse_cfg = _hf_attr(config, "sparse_attention_config")
+    if not isinstance(sparse_cfg, dict):
+        raise ValueError(
+            "sparse_attention_config missing; is this an Unlimited-OCR v2 checkpoint?"
+        )
+    return sparse_cfg
+
+
 def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
     text_cfg = getattr(config, "text_config", None)
     cfg = (
@@ -588,6 +627,7 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -596,6 +636,7 @@ class ModelConfig:
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
+        self.uocr_v2_default_context_len = uocr_v2_default_context_len
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -646,6 +687,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        if is_embedding_nemotron3(self.hf_config):
+            # A bare Ministral3 backbone configured as a mean-pooled embedder.
+            self.hf_config.architectures = ["EmbeddingNemotron3Model"]
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
@@ -718,6 +762,11 @@ class ModelConfig:
 
         # Config draft model
         self._config_draft_model()
+
+        # Remap the v2 arch before DASH tower, sparse backend and two-group KV
+        # pool selection read it.
+        if is_unlimited_ocr_v2(self.hf_config):
+            self.hf_config.architectures[0] = UNLIMITED_OCR_V2_ARCH
 
         # Mixed FP8/MXFP4 ckpts mark mxfp4 routed experts via this key.
         quantization_config = (
@@ -855,10 +904,13 @@ class ModelConfig:
             enable_multimodal
             and not self.is_lm_only
             and (
-                hasattr(self.hf_config, "audio_config")
-                or hasattr(
-                    getattr(self.hf_config, "thinker_config", None), "audio_config"
+                getattr(self.hf_config, "audio_config", None) is not None
+                or getattr(
+                    getattr(self.hf_config, "thinker_config", None),
+                    "audio_config",
+                    None,
                 )
+                is not None
                 or getattr(self.hf_config, "sound_config", None) is not None
                 or is_audio_model(self.hf_config.architectures)
             )
@@ -979,6 +1031,9 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            uocr_v2_default_context_len=UocrDocumentConfig.from_args(
+                cfg
+            ).default_context_length(),
             **kwargs,
         )
 
@@ -1212,10 +1267,17 @@ class ModelConfig:
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        layer_types_only = is_layer_types_hybrid_swa_model(
+            self.hf_config.architectures, self.hf_text_config
+        )
+        # Drafts keep the listed rules: speculative workers size draft KV pools
+        # themselves, e.g. FROZEN_KV_MTP passes a single-pool dummy config.
         self.is_hybrid_swa = (
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
+            and not (layer_types_only and self.is_draft_model)
             and not self.disable_hybrid_swa_memory
         )
+        self.is_layer_types_hybrid_swa = self.is_hybrid_swa and layer_types_only
         # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
         self.swa_attention_layer_ids: Optional[List[int]] = None
         self.full_attention_layer_ids: Optional[List[int]] = None
@@ -1291,6 +1353,13 @@ class ModelConfig:
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
         derived_context_len = get_context_length(self.hf_text_config)
+        if context_length is None and is_unlimited_ocr_v2(self.hf_config):
+            # Page-local RoPE has no position limit; size for the longest window.
+            context_length = derived_context_len = self.uocr_v2_default_context_len
+            logger.info(
+                "Unlimited-OCR v2: context_length defaults to %d (longest window)",
+                context_length,
+            )
 
         if context_length is not None:
             if context_length > derived_context_len:
@@ -1331,6 +1400,20 @@ class ModelConfig:
     def _derive_model_shapes(self):
         from sglang.srt.configs.dots3 import Dots3Config
 
+        is_dflash_mla_draft = False
+        if getattr(self.hf_config, "dflash_config", None):
+            from sglang.srt.speculative.dflash_utils import (
+                parse_dflash_draft_config,
+                validate_dflash_mla_draft_config,
+            )
+
+            is_dflash_mla_draft = parse_dflash_draft_config(
+                draft_hf_config=self.hf_config
+            ).is_mla
+            if is_dflash_mla_draft:
+                # Validate before the generic defaults below fill missing fields.
+                validate_dflash_mla_draft_config(self.hf_config)
+
         # Pure SSM models have no attention heads; use head_dim == 0 so the
         # KV-cell size is 0 rather than a division on a missing head count.
         is_pure_ssm = any(
@@ -1365,7 +1448,8 @@ class ModelConfig:
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
-            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            is_dflash_mla_draft
+            or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
@@ -1405,6 +1489,9 @@ class ModelConfig:
             else:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+            if is_dflash_mla_draft:
+                # Sliding draft layers share the latent rows, not a GQA head_dim.
+                self.swa_v_head_dim = self.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)
@@ -1998,6 +2085,9 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
+        # Deferred: the registry imports every quantization method's kernels.
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
@@ -2357,6 +2447,21 @@ def is_embedding_gemma(config) -> bool:
     )
 
 
+def is_embedding_nemotron3(config) -> bool:
+    """Whether ``config`` is an NVIDIA Nemotron-3-Embed checkpoint.
+
+    Nemotron-3-Embed is serialized as the bare ``Ministral3Model`` backbone,
+    which is also used by generative checkpoints. Its bidirectional attention
+    and mean pooling fields are the defining distinction.
+    """
+    fields = config.to_dict()
+    return (
+        config.architectures == ["Ministral3Model"]
+        and fields.get("is_causal") is False
+        and fields.get("pooling") == "avg"
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -2375,6 +2480,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
+        or "EmbeddingNemotron3Model" in model_architectures
         or "Contriever" in model_architectures
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
@@ -2395,6 +2501,7 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
+    "UnlimitedOCRV2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
@@ -2648,7 +2755,50 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     return base_scaling * mscale * mscale
 
 
+def mixed_sliding_layer_types(
+    hf_text_config: Optional[PretrainedConfig],
+) -> Optional[List[str]]:
+    """Per-layer kinds of a config that mixes sliding-window and full attention.
+
+    None unless `sliding_window` is set and the first `num_hidden_layers` entries
+    of `layer_types` are all "sliding_attention" or "full_attention", both present.
+    """
+    if hf_text_config is None or not getattr(hf_text_config, "sliding_window", None):
+        return None
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    layer_types = getattr(hf_text_config, "layer_types", None)
+    if num_layers is None or not layer_types or len(layer_types) < num_layers:
+        return None
+    layer_types = list(layer_types[:num_layers])
+    if set(layer_types) != {"sliding_attention", "full_attention"}:
+        return None
+    return layer_types
+
+
 def is_hybrid_swa_model(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig] = None,
+):
+    return _is_listed_hybrid_swa_model(model_architectures, hf_text_config) or (
+        mixed_sliding_layer_types(hf_text_config) is not None
+    )
+
+
+def is_layer_types_hybrid_swa_model(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig],
+) -> bool:
+    """Hybrid SWA only because `layer_types` mixes sliding and full layers.
+
+    Such a split comes from the HF config alone, so ModelRunner checks it against
+    the attention layers the model builds.
+    """
+    return not _is_listed_hybrid_swa_model(model_architectures, hf_text_config) and (
+        mixed_sliding_layer_types(hf_text_config) is not None
+    )
+
+
+def _is_listed_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
@@ -2819,6 +2969,13 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif (layer_types := mixed_sliding_layer_types(hf_text_config)) is not None:
+        swa_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "full_attention"
         ]
     else:
         swa_attention_layer_ids = None

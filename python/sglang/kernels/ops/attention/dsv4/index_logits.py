@@ -9,6 +9,7 @@ from typing import Iterator, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
@@ -19,13 +20,8 @@ from sglang.srt.utils.common import ceil_align
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
 
-@functools.cache
 def _is_sm100() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability()[0] == 10
-    )
+    return current_arch().is_sm(10)
 
 
 @functools.cache
@@ -51,6 +47,11 @@ def index_weights_dtype() -> torch.dtype:
 FLAT_LOGITS_WIDTH_ALIGN = 64
 
 
+def flat_index_logits_row_alignment(heads: int) -> int:
+    """Query rows per 128-head-row MMA tile of the flat score kernel."""
+    return 128 // heads
+
+
 def flat_index_logits_rows_per_tile(
     rows: int,
     width: int,
@@ -62,7 +63,7 @@ def flat_index_logits_rows_per_tile(
     Tiles are sized as fp32 logits whatever the logits dtype: bf16 tiles then fill
     half the budget, which leaves room for the per-row selection scratch that
     grows with the tile."""
-    row_alignment = 128 // heads
+    row_alignment = flat_index_logits_row_alignment(heads)
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
         row_bytes=mqa_logits_row_bytes(width),
@@ -70,7 +71,14 @@ def flat_index_logits_rows_per_tile(
     )
     if rows_per_chunk is None:
         return rows
-    return max(row_alignment, rows_per_chunk // row_alignment * row_alignment)
+    rows_per_tile = max(row_alignment, rows_per_chunk // row_alignment * row_alignment)
+    # DeepGEMM strides the row blocks over one CTA per SM; past one wave, round the
+    # tile down to whole waves so no tile ends in a partial wave.
+    if torch.version.cuda is not None:
+        rows_per_wave = row_alignment * current_arch().num_sms
+        if rows_per_tile > rows_per_wave:
+            rows_per_tile = rows_per_tile // rows_per_wave * rows_per_wave
+    return rows_per_tile
 
 
 def flat_index_logits_tiles(

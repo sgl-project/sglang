@@ -254,6 +254,45 @@ def test_qwen_image_edit_pack_keeps_all_ref_latents() -> None:
     assert packed.extra_req["image_latent"].shape[1] == expected_tokens
 
 
+def test_qwen_image_edit_pack_rejects_unsupported_kwargs() -> None:
+    """attention_mask, additional_t_cond and ref_latents_method must be
+    rejected instead of silently dropped."""
+    adapter = _qwen_image_edit_adapter()
+    x = torch.ones(1, 16, 1, 90, 160)
+    timestep = torch.tensor([1.0])
+    context = torch.ones(1, 19, 2560)
+
+    with pytest.raises(ValueError, match="attention_mask"):
+        adapter.pack(x, timestep, context, attention_mask=torch.ones(1, 19))
+    with pytest.raises(ValueError, match="additional_t_cond"):
+        adapter.pack(x, timestep, context, additional_t_cond=torch.zeros(1))
+    with pytest.raises(ValueError, match="ref_latents_method"):
+        adapter.pack(x, timestep, context, ref_latents_method="negative_index")
+
+    # The default method and absent kwargs must not be rejected.
+    adapter.pack(x, timestep, context, ref_latents_method="index")
+    adapter.pack(x, timestep, context)
+
+
+def test_zimage_pack_rejects_omni_reference_conditioning() -> None:
+    """siglip_feats/ref_contexts must be rejected; num_tokens/attention_mask
+    (sent on every real call) must keep working."""
+    adapter = ZImageAdapter()
+    x = torch.ones(1, 16, 90, 160)
+    timestep = torch.tensor([1.0])
+    context = torch.ones(1, 19, 2560)
+
+    with pytest.raises(ValueError, match="siglip_feats"):
+        adapter.pack(x, timestep, context, siglip_feats=[torch.ones(1, 4, 8)])
+    with pytest.raises(ValueError, match="ref_contexts"):
+        adapter.pack(x, timestep, context, ref_contexts=[torch.ones(1, 4)])
+
+    # Sent on every real ComfyUI call; must not be rejected.
+    adapter.pack(x, timestep, context, num_tokens=19, attention_mask=torch.ones(1, 19))
+    adapter.pack(x, timestep, context, siglip_feats=[], ref_contexts=None)
+    adapter.pack(x, timestep, context)
+
+
 class _RowRecordingExecutor(SGLDiffusionExecutor):
     """Real forward/pack/unpack; the worker round trip just records the request."""
 
