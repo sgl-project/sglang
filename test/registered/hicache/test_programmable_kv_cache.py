@@ -116,7 +116,7 @@ def public_action(service, kind, target, source, destination, message):
                     action_type="sglang." + kind,
                     action_version="1.0",
                     payload=dict(
-                        target=target,
+                        target=msgspec.json.decode(msgspec.json.encode(target)),
                         source=source,
                         destination=destination,
                         timeout_ms=10000,
@@ -144,6 +144,75 @@ def describe(service, target, location):
 
 
 class TestProgrammableKVCache(CustomTestCase):
+    def test_mooncake_host_demote_reclaims_and_restores_exact_slots(self):
+        extra = os.environ.get("KV_CONTROL_MOONCAKE_CONFIG")
+        if not extra:
+            self.skipTest("requires a private Mooncake master")
+        namespace = "host-demote-" + uuid.uuid4().hex
+        with mooncake_owner(json.loads(extra), namespace, "host-owner") as owner:
+            cache, service, pool = owner
+            tokens = tuple(range(1, 9))
+            target = TokensTarget(namespace=namespace, token_ids=tokens)
+            slots = cache.token_to_kv_pool_allocator.alloc(len(tokens))
+            expected = []
+            for layer in range(pool.layer_num):
+                shape = pool.k_buffer[layer][slots].shape
+                values = torch.arange(
+                    pool.k_buffer[layer][slots].numel(),
+                    device="cuda",
+                    dtype=pool.k_buffer[layer].dtype,
+                ).reshape(shape)
+                pool.k_buffer[layer][slots] = values + layer * 3
+                pool.v_buffer[layer][slots] = -values - layer * 5
+                expected.append(
+                    (
+                        pool.k_buffer[layer][slots].clone(),
+                        pool.v_buffer[layer][slots].clone(),
+                    )
+                )
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(
+                        array("q", tokens), cache_salt=service.cache_salt(None)
+                    ),
+                    value=slots.to(torch.int64),
+                )
+            )
+            self._wait(
+                service,
+                public_action(
+                    service, "demote", target, {"tier": "gpu"}, {"tier": "host"}, "host"
+                ).ref,
+            )
+            host = cache.host_pool_group.anchor_entry.host_pool
+            available = host.available_size()
+            location = {"tier": "storage", "backend": "mooncake"}
+            saved = self._wait(
+                service,
+                public_action(
+                    service, "demote", target, {"tier": "host"}, location, "store"
+                ).ref,
+            )
+            self.assertTrue(saved.public_result.reclaimed_scope)
+            self.assertEqual(host.available_size(), available + len(tokens))
+            self.assertFalse(cache.tree_core.root_node.children)
+            self._wait(
+                service,
+                public_action(
+                    service, "prefetch", target, location, {"tier": "gpu"}, "read"
+                ).ref,
+            )
+            path = service.control.executor._walk(
+                tokens, service.control.executor._compatibility(target)
+            )
+            actual = torch.cat(
+                [node.component_data[ComponentType.FULL].value for node, *_ in path]
+            )
+            for layer, (key, value) in enumerate(expected):
+                self.assertTrue(torch.equal(pool.k_buffer[layer][actual], key))
+                self.assertTrue(torch.equal(pool.v_buffer[layer][actual], value))
+            cache.sanity_check()
+
     def test_roundtrip_and_preparation_handoff(self):
         for storage in (False, True):
             with self.subTest(storage=storage):

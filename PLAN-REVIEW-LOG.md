@@ -4964,3 +4964,9 @@ parent 审阅完整差异并独立执行 transfers/service/cache/prefetch lifecy
 新增独立、有界的 preparation 模块，按实际选中 worker/epoch/兼容布局/backend namespace 与前缀大小分组，使用最近成本分位及最大提前量。完整 L3→L2 准备样本与未完成操作的耗时下界区分；其他 tier path 不混入。成本包括实际 admission/control/publication，不能当作纯 I/O。未配置 preparation_policy 时保留旧策略。
 
 复核修正了预选 worker 与实际执行 worker 不一致、H2D 样本混入、后端身份变化，以及 tool_done 提前结束时遗留旧 due 的问题；旧分支完成记录不会代替增长后的当前范围。parent 已审阅完整差异。core 48 项测试通过（另 1 项 live 后端用例按原配置忽略），Router HTTP 19 项通过，覆盖早到、增长范围、late 部分重叠、旧策略与反馈边界。日志为 lifecycle-opt/o2-core-tests.log、o2-router-tests.log。Rust fmt 通过；本机精确 1.92.0 工具链已补齐，后续将执行该版本检查。
+
+### O3a — 实际 GPU/Mooncake 字节验收
+
+实际 GPU/file/Mooncake 原有 2 项测试及 2 子测试通过。新增非恒定、分层 K/V 数据的 host DEMOTE→L3→GPU 回读测试，实际 host slots 释放及逐元素 K/V 一致检查通过，18.79s；测试采用原生 JSON action 封装及实际 tensor dtype，未使用模型输出代替搬运字节证明。
+
+真实 Qwen3 2K 控制观察保留于 lifecycle-opt/live-host-demote-proof.json：首次完整 prefill 与恢复生成的一位数字不同。对照 v2 证明不执行 DEMOTE 的 GPU 暖缓存也出现同样差异；GPU 暖缓存、仅 host 恢复、L3 回收后恢复的输出完全一致，实际释放/恢复 2048 tokens，后续请求 host 命中 2048。该观察用于区分计算形状数值变化与 KV 数据错误，不删除首次观察。日志：gpu-mooncake-tests.log、gpu-host-demote-exact-tests-v4.log、live-host-demote-v2-proof.log。
