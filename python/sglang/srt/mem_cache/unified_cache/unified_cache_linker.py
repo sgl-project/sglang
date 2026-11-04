@@ -257,6 +257,7 @@ class _ExternalCachePrefetch:
     anchor_node_id: NodeId
     anchor_lock: DecLockRefParams
     component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    req: Req
     future: Future[bool] | None = None
     timeout_s: float = 0.0
     wait_started: float | None = None
@@ -431,6 +432,7 @@ class UnifiedCacheLinkerWrapper:
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
             [],
+            req,
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
         )
@@ -573,6 +575,11 @@ class UnifiedCacheLinkerWrapper:
             )
             if mamba is not None and inserted.mamba_exist:
                 self.cache.req_to_token_pool.mamba_allocator.free(mamba.device_indices)
+            if get_disagg().disaggregation_mode == "decode":
+                new_lock = self.cache.lock(inserted.last_device_node)
+                old_lock = state.req.lock
+                state.req.lock = new_lock
+                self.cache.unlock(old_lock)
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
