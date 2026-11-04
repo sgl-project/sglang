@@ -379,7 +379,7 @@ class Band:
         page_size: int = 1,
         shards_under_dcp: bool = False,
         need_sort: bool = False,
-        forward_stream: Optional[torch.cuda.Stream] = None,
+        forward_stream: Optional[torch.Stream] = None,
         lazy_compaction: bool = True,
     ):
         band = arena.band(sub_pool_name)
@@ -390,6 +390,7 @@ class Band:
         dcp_size = get_parallel().attn_dcp_size if shards_under_dcp else 1
         self.size = max_slots * dcp_size
         self.device = device
+        self.device_module = torch.get_device_module(self.device)
         self.need_sort = need_sort
         # None: free right away. A list: hold frees until free_group_end().
         self.free_group: Optional[List[torch.Tensor]] = None
@@ -714,7 +715,7 @@ class Band:
         memory and without blocking: a pageable copy first synchronizes the
         stream, which after a forward wait parks the host until that forward
         ends."""
-        pinned = torch.device(self.device).type == "cuda"
+        pinned = torch.device(self.device).type in ("cuda", "xpu")
         return torch.tensor(host_ids, dtype=torch.int64, pin_memory=pinned).to(
             self.device, non_blocking=True
         )
@@ -739,7 +740,11 @@ class Band:
         self._before_wait()
         if signal_fired(event):
             return
-        wait_signals(event, network_waiter=self.network_waiter)
+        wait_signals(
+            event,
+            self.device_module.current_stream(),
+            network_waiter=self.network_waiter,
+        )
 
     def _before_wait(self) -> None:
         """Before a stream wait: every band of the current allocator operation
@@ -1811,12 +1816,13 @@ class Band:
         keys = tuple(e for e in events if e is not None)
         if keys and not signal_fired(keys):
             # Whether they fired decides only whether a wait is queued.
-            wait_signals(keys)
+            wait_signals(keys, self.device_module.current_stream())
         if len(keys) < len(events) and (
-            self.forward_stream is not None and torch.device(self.device).type == "cuda"
+            self.forward_stream is not None
+            and torch.device(self.device).type in ("cuda", "xpu")
         ):
             # Recorded without an event: the forward is enqueued.
-            torch.cuda.current_stream().wait_stream(self.forward_stream)
+            self.device_module.current_stream().wait_stream(self.forward_stream)
         if prepared_holes is not None:
             self._set_free_pages(
                 torch.cat([self._free_phys_pages, *chunks]), host=prepared_holes
@@ -1950,11 +1956,11 @@ class Band:
         # A hole take's sort and reversal (`_take_free_pages_from_end`).
         torch.sort(sink)
         sink.flip(0)
-        torch.cuda.current_stream().synchronize()
+        self.device_module.current_stream().synchronize()
 
     # -- lazy compaction primitives --
 
-    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
+    def set_latest_forward_done_event(self, event: Optional[torch.Event]) -> None:
         """Record the most-recent forward's `forward_done` event; pending pages
         are reused only after its retirement. None = no in-flight forward.
         """
@@ -1964,7 +1970,7 @@ class Band:
 
     def set_inflight_forward(
         self,
-        forward_done: torch.cuda.Event,
+        forward_done: torch.Event,
         written_virtual: Optional[torch.Tensor],
         *,
         writes_unknown: bool = False,
@@ -2003,7 +2009,7 @@ class Band:
         Band._check_host_read(self, "pages named by ids")
         return set(phys_tokens.tolist())  # syncs the stream
 
-    def _inflight_write_sets(self) -> List[Tuple[torch.cuda.Event, Optional[Set[int]]]]:
+    def _inflight_write_sets(self) -> List[Tuple[torch.Event, Optional[Set[int]]]]:
         """Each unretired forward with the physical PAGE ids it writes in this
         band (None when unknown), oldest first. Pays a bs-sized D2H sync per
         forward; call it before any stream wait, or the read parks the host.
@@ -2133,7 +2139,7 @@ class Band:
     def _wait_writers(
         self,
         srcs: Sequence[int],
-        write_sets: List[Tuple[torch.cuda.Event, Optional[Set[int]]]],
+        write_sets: List[Tuple[torch.Event, Optional[Set[int]]]],
         transfer_sets=(),
     ) -> None:
         """Order a copy of ``srcs`` after the newest unfinished forward that
@@ -2739,7 +2745,7 @@ class Band:
         self,
         srcs: List[int],
         dsts: List[int],
-        latest_event: Optional[torch.cuda.Event],
+        latest_event: Optional[torch.Event],
         released_fired: List[Tuple[torch.Tensor, List[int]]],
         *,
         fence: bool = False,

@@ -187,7 +187,7 @@ class _SharedPageEnvelopeHostBacking:
 
         self.pin_memory = pin_memory
         self.lock = threading.RLock()
-        alloc_func = ALLOC_MEMORY_FUNCS[device_buffers[0].device]
+        alloc_func = ALLOC_MEMORY_FUNCS[device_buffers[0].device.type]
         self.raw = alloc_func(
             (total_bytes,),
             dtype=torch.uint8,
