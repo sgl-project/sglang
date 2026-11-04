@@ -2307,8 +2307,18 @@ class KimiK3DeltaAttention(nn.Module):
 
         heads = self.local_num_heads
         seg = heads * 128
+        # SAIL serves the same path through PLA, which covers a wider head set.
+        sail_kda = None
+        if is_sail():
+            from sglang.srt.hardware_backend.sail.kernels import kda as sail_kda
+
+        supported_heads = (
+            sail_kda.supported_fused_decode_heads(kda_fused_decode.SUPPORTED_HEADS)
+            if sail_kda is not None
+            else kda_fused_decode.SUPPORTED_HEADS
+        )
         if (
-            heads not in kda_fused_decode.SUPPORTED_HEADS
+            heads not in supported_heads
             or w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
@@ -2322,7 +2332,7 @@ class KimiK3DeltaAttention(nn.Module):
         ):
             rank0_log(
                 f"K3 fused KDA decode disabled: {heads} local heads "
-                f"(kernel supports {sorted(kda_fused_decode.SUPPORTED_HEADS)}) or "
+                f"(kernel supports {sorted(supported_heads)}) or "
                 "unexpected conv/A_log/dt_bias "
                 f"layout (conv {None if w is None else tuple(w.shape)}, "
                 f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
@@ -2354,6 +2364,8 @@ class KimiK3DeltaAttention(nn.Module):
                 target.copy_(source)
         else:
             layer._k3_fused_decode_args = fused_decode_args
+        if sail_kda is not None:
+            sail_kda.bind_fused_decode_weight(layer)
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(

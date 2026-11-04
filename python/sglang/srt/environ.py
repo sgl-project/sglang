@@ -1572,6 +1572,11 @@ class Envs:
     # all-vm, ppu_10, ppu_15, vm_10, vm_15. "native" builds for the local
     # device only, matching how the nvcc path pins -gencode to this GPU.
     SGLANG_SAIL_GPU_ARCH = EnvStr("native")
+    # SAIL PLA: master switch for every PLA kernel on PPU (KDA decode / MTP
+    # and prefill). handle_sail_backends turns it on when PLA imports;
+    # otherwise the community Triton kernels stay in charge. An explicit
+    # --linear-attn-prefill-backend still wins for prefill alone.
+    SGLANG_SAIL_PLA = EnvBool(False)
 
     # Per-file overrides for packaged MoE LoRA plans, tiles, and base GEMM configs.
     SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
