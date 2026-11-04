@@ -32,14 +32,14 @@ def _dense_target_probs(logits, info):
     probs = sampling_softmax(
         logits, temperatures=info.temperatures, rows_per_request=ROWS_PER_REQUEST
     )
-    probs = top_k_renorm_probs_triton(
-        probs, info.top_ks.repeat_interleave(ROWS_PER_REQUEST)
-    )
+    # top-p on the full distribution first, then top-k, as _apply_joint_top_k_top_p
     if info.need_top_p_sampling:
         probs = top_p_renorm_probs_triton(
             probs, info.top_ps.repeat_interleave(ROWS_PER_REQUEST)
         )
-    return probs
+    return top_k_renorm_probs_triton(
+        probs, info.top_ks.repeat_interleave(ROWS_PER_REQUEST)
+    )
 
 
 @pytest.mark.parametrize("vocab_size", [151936, 248320])

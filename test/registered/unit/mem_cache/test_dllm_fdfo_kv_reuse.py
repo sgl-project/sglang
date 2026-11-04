@@ -11,6 +11,7 @@ from sglang.srt.dllm.algorithm.joint_threshold import JointThreshold
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
@@ -229,21 +230,22 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "full block"):
             alloc_for_extend(batch)
 
-    def test_dllm_manager_pop_aborted_reqs_removes_waiting_and_staging(self):
-        manager = DllmManager(SimpleNamespace(max_running_requests=4))
-        waiting = _make_req("abort-waiting", [1], self.block_size)
-        staging = _make_req("abort-staging", [2], self.block_size)
-        keep = _make_req("keep", [3], self.block_size)
-        manager.waiting_queue = [waiting, keep]
-        manager.staging_queue = [staging, waiting]
-
-        aborted = manager.pop_aborted_reqs(False, "abort")
-
-        self.assertEqual(
-            [req.rid for req in aborted], ["abort-waiting", "abort-staging"]
+    def test_dllm_abort_removes_waiting_and_staging(self):
+        released = []
+        manager = DllmManager(
+            SimpleNamespace(max_running_requests=4), release_aborted=released.append
         )
-        self.assertEqual(manager.waiting_queue, [keep])
-        self.assertEqual(manager.staging_queue, [])
+        staged, waiting, keep = (
+            Mock(rid=rid) for rid in ("abort-staged", "abort-waiting", "keep")
+        )
+        manager.waiting_queue.join([staged, waiting, keep])
+        manager.staging_queue = [staged, keep]
+
+        manager.waiting_queue.abort(AbortReq(rid="abort"))
+
+        self.assertEqual(released, [staged, waiting])
+        self.assertEqual(list(manager.waiting_queue), [keep])
+        self.assertEqual(manager.staging_queue, [keep])
 
 
 class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
