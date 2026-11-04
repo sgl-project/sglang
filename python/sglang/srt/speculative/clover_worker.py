@@ -29,8 +29,8 @@ from sglang.srt.speculative.clover_info import (
     CloverVerifyInput,
 )
 from sglang.srt.speculative.clover_penalty import (
-    CloverPenaltyState,
     apply_clover_penalties,
+    copy_clover_sampling_info,
 )
 from sglang.srt.speculative.clover_utils import (
     clover_accept_tokens,
@@ -76,7 +76,6 @@ class CloverWorker(BaseSpecWorker):
         self.verify_graph_replay_ct = 0
         self._accept_graph = None
         self._accept_graph_key = None
-        self.penalty_state = CloverPenaltyState()
 
     def alloc_memory_pool(self, **kwargs):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -154,7 +153,7 @@ class CloverWorker(BaseSpecWorker):
         plan.bind(fb, self.model_runner.kv_index_translator)
         return fb
 
-    def _draft(self, fb, reqs):
+    def _draft(self, fb, reqs, *, penalty_state, penalties):
         with forward_context(ForwardContext(attn_backend=self.draft_backend)):
             if self.draft_graph is not None and self.draft_graph.can_run_graph(fb):
                 output = self.draft_graph.execute(fb)
@@ -176,7 +175,8 @@ class CloverWorker(BaseSpecWorker):
             reqs,
             fb.input_ids.view(fb.batch_size, self.block_size),
             preview=True,
-            state=self.penalty_state,
+            state=penalty_state,
+            penalties=penalties,
         )
         candidates = logits.argmax(-1)
         candidates[:, 0].copy_(fb.input_ids.view(fb.batch_size, self.block_size)[:, 0])
@@ -241,6 +241,7 @@ class CloverWorker(BaseSpecWorker):
     @torch.no_grad()
     def forward_batch_generation(self, batch, on_publish=None, pp_proxy_tensors=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            batch.sampling_info = copy_clover_sampling_info(batch.sampling_info)
             result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
@@ -258,6 +259,14 @@ class CloverWorker(BaseSpecWorker):
         state = batch.spec_info
         if not isinstance(state, CloverDraftInput):
             raise RuntimeError("CLOVER decode requires pending tokens from prefill")
+        penalty_state = state.penalty_state
+        state.penalty_state = None
+        penalties = (
+            batch.sampling_info.acc_additive_penalties,
+            batch.sampling_info.acc_scaling_penalties,
+        )
+        # Avoid applying block penalties again in the boundary sampler.
+        batch.sampling_info = copy_clover_sampling_info(batch.sampling_info)
         if bs == 0:
             empty = torch.empty(0, device=self.device, dtype=torch.int64)
             return GenerationBatchResult(
@@ -290,7 +299,14 @@ class CloverWorker(BaseSpecWorker):
         )
         block[:, 0].copy_(state.bonus_tokens)
         draft_fb = self._preview_batch(batch, block, positions, cache_loc, plan)
-        candidates = self._draft(draft_fb, batch.reqs)
+        if penalty_state is None:
+            raise RuntimeError("CLOVER decode requires prepared penalty state")
+        candidates = self._draft(
+            draft_fb,
+            batch.reqs,
+            penalty_state=penalty_state,
+            penalties=penalties,
+        )
 
         verify_input = CloverVerifyInput(
             draft_token=candidates.reshape(-1),
@@ -316,7 +332,13 @@ class CloverWorker(BaseSpecWorker):
             logger.info("CLOVER verify CUDA graph replay active")
         logits = result.logits_output.next_token_logits.view(bs, width, -1)
         logits[..., self.mask_id] = float("-inf")
-        apply_clover_penalties(logits, batch.reqs, candidates, state=self.penalty_state)
+        apply_clover_penalties(
+            logits,
+            batch.reqs,
+            candidates,
+            state=penalty_state,
+            penalties=penalties,
+        )
         greedy = (
             result.can_run_cuda_graph
             and bs == 1

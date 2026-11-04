@@ -97,7 +97,7 @@ def configure_clover(server_args):
 def validate_clover_request(req, *, generation_config=None):
     sp = req.sampling_params
     unsupported = []
-    for name, default in (("min_p", 0.0),):
+    for name, default in (("min_p", 0.0), ("min_new_tokens", 0)):
         if getattr(sp, name) != default:
             unsupported.append(name)
     for name in ("json_schema", "regex", "ebnf", "structural_tag", "logit_bias"):

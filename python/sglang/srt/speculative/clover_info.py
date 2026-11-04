@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Draft state and preview/verify metadata for Clover."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -11,9 +12,27 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
+if TYPE_CHECKING:
+    from sglang.srt.speculative.clover_penalty import CloverPenaltyState
+
 
 @dataclass
 class CloverDraftInput(DFlashDraftInputV2):
+    penalty_state: "CloverPenaltyState | None" = field(
+        default=None, init=False, repr=False
+    )
+
+    def prepare_for_decode(self, batch):
+        from sglang.srt.speculative.clover_penalty import (
+            get_clover_penalty_state,
+        )
+
+        self.penalty_state = None
+        super().prepare_for_decode(batch)
+        orchestrator = batch.sampling_info.penalizer_orchestrator
+        self.penalty_state = get_clover_penalty_state(orchestrator)
+        self.penalty_state.sync_native(orchestrator)
+
     def __post_init__(self):
         super().__post_init__()
         self.spec_input_type = SpecInputType.CLOVER_DRAFT
@@ -35,9 +54,8 @@ class CloverDraftInput(DFlashDraftInputV2):
 class CloverPreviewInput(SpecInput):
     """Fixed-width noncausal draft forward; KV lengths already include the block.
 
-    Separate from CloverDraftInput, which carries scheduler state between rounds.
-    Only scalar shape metadata is retained, so graph replay rebuilds indices from
-    the current batch's KV plan, including padded request slots.
+    Graph replay rebuilds indices from the current batch's KV plan, including
+    padded request slots.
     """
 
     num_tokens_per_req: int

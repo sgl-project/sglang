@@ -1,44 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
+import dataclasses
 import math
-from collections import Counter
+import weakref
 
 import torch
 
 
+def copy_clover_sampling_info(sampling_info):
+    """Disable standard penalties; Clover applies output penalties explicitly."""
+    return dataclasses.replace(
+        sampling_info,
+        penalizer_orchestrator=None,
+        acc_additive_penalties=None,
+        acc_scaling_penalties=None,
+    )
+
+
 class CloverPenaltyState:
+    """CPU history metadata; vocabulary-sized tensors belong to native penalizers."""
+
     def __init__(self):
         self._histories = {}
-        self._committed = {}
-        self._parameters = {}
+        self._buffers = None
+        self._synced = {}
 
     def retain(self, reqs):
         active = {id(req) for req in reqs}
         self._histories = {
             key: value for key, value in self._histories.items() if key in active
         }
-        self._committed = {
-            key: value for key, value in self._committed.items() if key in active
+        self._synced = {
+            key: value for key, value in self._synced.items() if key in active
         }
-        self._parameters = {
-            key: value for key, value in self._parameters.items() if key in active
-        }
-
-    def parameters(self, req, device):
-        sp = req.sampling_params
-        values = (sp.frequency_penalty, sp.presence_penalty, sp.repetition_penalty)
-        previous = self._parameters.get(id(req))
-        if (
-            previous is None
-            or previous[0] is not req
-            or previous[1] != values
-            or previous[2].device != device
-        ):
-            params = torch.tensor(
-                values, dtype=torch.float32, pin_memory=device.type == "cuda"
-            ).to(device, non_blocking=True)
-            self._parameters[id(req)] = (req, values, params)
-            return params
-        return previous[2]
 
     def history(self, req, vocab_size):
         previous = self._histories.get(id(req))
@@ -49,38 +42,126 @@ class CloverPenaltyState:
             or previous[1] is not output
             or previous[2] > len(output)
         ):
-            old_len, counts = 0, Counter()
+            old_len, seen = 0, set()
         else:
-            old_len, counts = previous[2:]
-        counts.update(t for t in output[old_len:] if 0 <= t < vocab_size)
-        self._histories[id(req)] = (req, output, len(output), counts)
-        return counts
+            old_len, seen = previous[2:]
+        seen.update(t for t in output[old_len:] if 0 <= t < vocab_size)
+        self._histories[id(req)] = (req, output, len(output), seen)
+        return seen
 
-    def committed_counts(self, req, vocab_size, device):
-        previous = self._committed.get(id(req))
-        output = req.output_ids
-        if (
-            previous is None
-            or previous[0] is not req
-            or previous[1] is not output
-            or previous[2] > len(output)
-            or previous[3].numel() != vocab_size
-            or previous[3].device != device
-        ):
-            old_len = 0
-            counts = torch.zeros(vocab_size, device=device, dtype=torch.float32)
-        else:
-            old_len, counts = previous[2:]
-        if old_len < len(output):
-            delta = [t for t in output[old_len:] if 0 <= t < vocab_size]
-            if delta:
-                # Fresh pinned storage outlives the async copy, a reused one races it.
+    def sync_native(self, orchestrator):
+        """Sync committed outputs; rebuild when native storage or row ownership changes."""
+        from sglang.srt.sampling import penaltylib
+
+        reqs = orchestrator.reqs()
+        self.retain(reqs)
+        specs = (
+            (penaltylib.BatchedFrequencyPenalizer, "cumulated_frequency_penalties", 0),
+            (penaltylib.BatchedPresencePenalizer, "cumulated_presence_penalties", 0),
+            (
+                penaltylib.BatchedRepetitionPenalizer,
+                "cumulated_repetition_penalties",
+                1,
+            ),
+        )
+        penalizers = [orchestrator.penalizers.get(cls) for cls, _, _ in specs]
+        buffers = tuple(
+            getattr(p, name) if p is not None and p.is_prepared() else None
+            for p, (_, name, _) in zip(penalizers, specs)
+        )
+        # Detect replaced buffers without keeping their storage alive.
+        layout = tuple(id(req) for req in reqs)
+        rebuild = (
+            self._buffers is None
+            or self._buffers[1] != layout
+            or any(
+                (old() if old is not None else None) is not new
+                for old, new in zip(self._buffers[0], buffers)
+            )
+        )
+        if rebuild:
+            self._synced.clear()
+            for buf, (_, _, default) in zip(buffers, specs):
+                if buf is not None:
+                    buf.fill_(default)
+        self._buffers = (
+            tuple(weakref.ref(buf) if buf is not None else None for buf in buffers),
+            layout,
+        )
+        if not any(buf is not None for buf in buffers):
+            return buffers
+        device = torch.device(orchestrator.device)
+        vocab = orchestrator.vocab_size
+        for row, req in enumerate(reqs):
+            previous = self._synced.get(id(req))
+            output = req.output_ids
+            reset = (
+                previous is None
+                or previous[0] is not output
+                or previous[1] > len(output)
+            )
+            old_len = 0 if reset else previous[1]
+            if reset and not rebuild:
+                for buf, (_, _, default) in zip(buffers, specs):
+                    if buf is not None:
+                        buf[row].fill_(default)
+            changed = [t for t in output[old_len:] if 0 <= t < vocab]
+            if buffers[0] is None:
+                changed = list(dict.fromkeys(changed))
+            if buffers[0] is None and not reset:
+                # Without frequency penalties, only newly seen tokens need updates.
+                previous_history = self._histories[id(req)][3]
+                changed = [t for t in changed if t not in previous_history]
+            self.history(req, vocab)
+            if changed:
                 ids = torch.tensor(
-                    delta, dtype=torch.long, pin_memory=device.type == "cuda"
+                    changed, dtype=torch.long, pin_memory=device.type == "cuda"
                 ).to(device, non_blocking=True)
-                counts.scatter_add_(0, ids, torch.ones_like(ids, dtype=counts.dtype))
-        self._committed[id(req)] = (req, output, len(output), counts)
-        return counts
+                frequency, presence, repetition = buffers
+                if frequency is not None:
+                    # The native update accepts only one token per request.
+                    frequency[row].scatter_add_(
+                        0, ids, penalizers[0].frequency_penalties[row].expand(ids.shape)
+                    )
+                if presence is not None:
+                    presence[row].index_fill_(
+                        0, ids, req.sampling_params.presence_penalty
+                    )
+                if repetition is not None:
+                    repetition[row].index_fill_(
+                        0, ids, req.sampling_params.repetition_penalty
+                    )
+            self._synced[id(req)] = (output, len(output))
+        return buffers
+
+
+def get_clover_penalty_state(orchestrator):
+    """Return the committed-history state owned by this native batch."""
+    state = getattr(orchestrator, "_clover_penalty_state", None)
+    if state is None:
+        state = orchestrator._clover_penalty_state = CloverPenaltyState()
+    return state
+
+
+def _apply_native_penalties(scores, additive, scaling):
+    if (
+        scores.is_cuda
+        and scores.dtype == torch.float32
+        and scores.stride(1) == 1
+        and scores.shape[0] <= 128
+    ):
+        from sglang.kernels.ops.sampling.clover_penalty import clover_penalty
+
+        clover_penalty(scores, additive, scaling)
+        return
+    if additive is not None:
+        scores.add_(additive)
+    if scaling is not None:
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            apply_scaling_penalties,
+        )
+
+        apply_scaling_penalties(scores, scaling[None, :])
 
 
 def validate_clover_penalties(req, *, generation_config=None):
@@ -146,18 +227,17 @@ def _stop_tokens(req, vocab_size):
     return sorted(t for t in stops if t is not None and 0 <= t < vocab_size)
 
 
-def apply_clover_penalties(logits, reqs, visible_tokens, *, preview=False, state=None):
-    """Modify [batch, width, vocab] logits in place; explicitly disabled penalties are a no-op.
+def apply_clover_penalties(
+    logits, reqs, visible_tokens, *, state, preview=False, penalties=None
+):
+    """Apply penalties to [batch, width, vocab] logits in place.
 
     Row zero of the preview is an already committed pending token; row one
     predicts the next output. Verify row zero predicts that same next output.
-    Length ramps use actual output lengths plus these aligned offsets. Custom
-    biases apply to speculative rounds; initial prefill sampling retains the
-    native penalties.
+    Length ramps use actual output lengths plus these aligned offsets. Output
+    penalties and custom biases apply only to speculative rounds, not prefill.
     """
     _, width, vocab_size = logits.shape
-    if state is None:
-        state = CloverPenaltyState()
     state.retain(reqs)
     for row, req in enumerate(reqs):
         sp = req.sampling_params
@@ -168,7 +248,6 @@ def apply_clover_penalties(logits, reqs, visible_tokens, *, preview=False, state
             sp.frequency_penalty
             or sp.presence_penalty
             or sp.repetition_penalty != 1
-            or sp.min_new_tokens
             or length_bias
             or think_bias
         ):
@@ -176,36 +255,14 @@ def apply_clover_penalties(logits, reqs, visible_tokens, *, preview=False, state
         scores = logits[row]
         history = state.history(req, vocab_size)
         if sp.frequency_penalty or sp.presence_penalty or sp.repetition_penalty != 1:
-            counts = state.committed_counts(req, vocab_size, logits.device)
-            if (
-                scores.is_cuda
-                and scores.dtype == torch.float32
-                and scores.stride(1) == 1
-                and width <= 128
-            ):
-                from sglang.kernels.ops.sampling.clover_penalty import clover_penalty
-
-                clover_penalty(
-                    scores,
-                    counts,
-                    state.parameters(req, logits.device),
-                    frequency=bool(sp.frequency_penalty),
-                    presence=bool(sp.presence_penalty),
-                    repetition=sp.repetition_penalty != 1,
+            if penalties is None:
+                raise ValueError(
+                    "Clover output penalties require synchronized native buffers"
                 )
-            else:
-                seen = counts > 0
-                if sp.frequency_penalty:
-                    scores.sub_(counts * sp.frequency_penalty)
-                if sp.presence_penalty:
-                    scores.sub_(seen.to(scores.dtype) * sp.presence_penalty)
-                if sp.repetition_penalty != 1:
-                    scale = torch.where(seen, sp.repetition_penalty, 1.0)
-                    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-                        apply_scaling_penalties,
-                    )
-
-                    apply_scaling_penalties(scores, scale[None, :])
+            additive, scaling = (
+                buf[row] if buf is not None else None for buf in penalties
+            )
+            _apply_native_penalties(scores, additive, scaling)
 
         # One-based response positions of the token predicted by each row.
         first_position = len(req.output_ids) + (0 if preview else 1)
@@ -238,8 +295,3 @@ def apply_clover_penalties(logits, reqs, visible_tokens, *, preview=False, state
                 if preview:
                     bias = bias * ~(visible_tokens[row] == token).any()
                 scores[index, token] += bias
-        # Hard minimum wins over either positive bias. The EOS itself does not
-        # count towards the required number of preceding response tokens.
-        if sp.min_new_tokens and stops:
-            num_blocked = min(width, max(0, sp.min_new_tokens - first_position + 1))
-            scores[:num_blocked, stops] = -float("inf")

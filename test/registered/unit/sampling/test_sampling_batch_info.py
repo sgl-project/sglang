@@ -788,8 +788,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
-    def test_spec_owned_penalties_skip_native_count_buffers(self):
-        """Clover penalizes from its own counts; only min_new_tokens stays native."""
+    def test_clover_reuses_native_penalty_buffers(self):
+        """Clover and AR allocate the same native penalizers."""
         native = {
             BatchedFrequencyPenalizer,
             BatchedMinNewTokensPenalizer,
@@ -797,7 +797,7 @@ class TestFromScheduleBatch(CustomTestCase):
             BatchedRepetitionPenalizer,
         }
         for algorithm, expected in (
-            (SpeculativeAlgorithm.CLOVER, {BatchedMinNewTokensPenalizer}),
+            (SpeculativeAlgorithm.CLOVER, native),
             (SpeculativeAlgorithm.NONE, native),
         ):
             with self.subTest(algorithm=algorithm):
@@ -818,7 +818,7 @@ class TestFromScheduleBatch(CustomTestCase):
                 info.update_penalties()
                 self.assertEqual(
                     info.acc_scaling_penalties is None,
-                    algorithm.owns_output_penalties(),
+                    False,
                 )
                 logits = torch.zeros(1, VOCAB_SIZE)
                 info.apply_logits_bias(logits)

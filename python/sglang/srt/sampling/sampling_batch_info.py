@@ -276,17 +276,12 @@ class SamplingBatchInfo:
         penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
-            penalizers=(
-                # min_new_tokens still guards the token sampled at prefill.
-                {penaltylib.BatchedMinNewTokensPenalizer}
-                if batch.spec_algorithm.owns_output_penalties()
-                else {
-                    penaltylib.BatchedFrequencyPenalizer,
-                    penaltylib.BatchedMinNewTokensPenalizer,
-                    penaltylib.BatchedPresencePenalizer,
-                    penaltylib.BatchedRepetitionPenalizer,
-                }
-            ),
+            penalizers={
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedMinNewTokensPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
+            },
         )
 
         ret = cls(

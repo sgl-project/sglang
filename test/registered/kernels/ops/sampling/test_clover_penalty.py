@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Clover penalties must preserve the original operation rounding."""
+"""Fused Clover penalties must match public additive/scaling application."""
 
 import unittest
 
@@ -17,6 +17,7 @@ class TestCloverPenalty(CustomTestCase):
     def test_exact_committed_history_reference_with_strides(self):
         torch.manual_seed(27)
         for width, vocab, frequency, presence, repetition in (
+            (32, 248320, 0, 0.9, 1.05),
             (16, 248320, 0.7, -0.3, 0.8),
             (16, 248320, -0.5, 0, 2),
             (16, 248320, 0, 1, 1),
@@ -31,30 +32,22 @@ class TestCloverPenalty(CustomTestCase):
                 expected = actual.clone()
                 guard = storage[:, vocab:].clone()
                 counts = torch.randint(0, 4, (vocab,), device="cuda").float()
-                original_counts = counts.clone()
                 seen = counts > 0
+                additive = torch.zeros(vocab, device="cuda")
                 if frequency:
-                    expected.sub_(counts * frequency)
+                    additive.sub_(counts * frequency)
                 if presence:
-                    expected.sub_(seen.float() * presence)
+                    additive.sub_(seen.float() * presence)
+                expected.add_(additive)
                 if repetition != 1:
                     scale = torch.where(seen, repetition, 1.0)
                     apply_scaling_penalties(expected, scale[None, :])
-                params = torch.tensor(
-                    [frequency, presence, repetition],
-                    device="cuda",
-                    dtype=torch.float32,
-                )
                 clover_penalty(
                     actual,
-                    counts,
-                    params,
-                    frequency=bool(frequency),
-                    presence=bool(presence),
-                    repetition=repetition != 1,
+                    additive,
+                    torch.where(seen, repetition, 1.0) if repetition != 1 else None,
                 )
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                torch.testing.assert_close(counts, original_counts, rtol=0, atol=0)
                 torch.testing.assert_close(storage[:, vocab:], guard, rtol=0, atol=0)
 
 
