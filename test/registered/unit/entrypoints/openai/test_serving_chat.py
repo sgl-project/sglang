@@ -3048,6 +3048,94 @@ class ServingChatTestCase(CustomTestCase):
                     "Tool names must be unique across request and message tools.",
                 )
 
+    def test_kimi_k3_rejects_message_tools_the_encoding_cannot_render(self):
+        """Kimi-K3 renders message-level tools only from a system message
+        without content; other encodings keep accepting every case."""
+
+        def tool(name="lookup", **fields):
+            return {"type": "function", "function": {"name": name}, **fields}
+
+        def declare(role, tools, content=""):
+            return [
+                {"role": role, "content": content, "tools": tools},
+                {"role": "user", "content": "Hi?"},
+            ]
+
+        untyped = {"function": {"name": "lookup"}}
+        cases = {
+            "user message": (declare("user", [tool()], "Hi"), True),
+            "assistant message": (declare("assistant", [tool()]), True),
+            "root message": (declare("root", [tool()], "You are A."), True),
+            "system message with content": (declare("system", [tool()], "A"), True),
+            "missing type": (declare("system", [untyped]), True),
+            "non-function type": (declare("system", [tool(type="bogus")]), True),
+            "name starts with a digit": (declare("system", [tool("1x")]), True),
+            "name with a symbol": (declare("system", [tool("a@b")]), True),
+            "empty name": (declare("system", [tool("")]), True),
+            "name over 256 chars": (declare("system", [tool("a" * 257)]), True),
+            "system message": (declare("system", [tool("_a-1" + "b" * 252)]), False),
+            "developer message": (declare("developer", [tool()], None), False),
+        }
+        for chat_encoding_spec in (None, "kimi_k3"):
+            self.chat.chat_encoding_spec = chat_encoding_spec
+            for name, (messages, rejected_by_k3) in cases.items():
+                with self.subTest(chat_encoding_spec=chat_encoding_spec, case=name):
+                    error = self.chat._validate_request(
+                        ChatCompletionRequest(model="x", messages=messages)
+                    )
+                    self.assertEqual(
+                        error is not None,
+                        rejected_by_k3 and chat_encoding_spec == "kimi_k3",
+                        error,
+                    )
+
+    def test_kimi_k3_forced_tool_call_overrides_json_response_format(self):
+        """Kimi-K3 states response_format in the prompt, so a forced tool call
+        keeps its constraint and the JSON grammar is dropped; other encodings
+        reject the conflict, and regex keeps conflicting under Kimi-K3."""
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {"type": "function", "function": {"name": "get_weather"}}
+        json_object = {"type": "json_object"}
+        json_schema = {
+            "type": "json_schema",
+            "json_schema": {"name": "a", "schema": {"type": "object"}},
+        }
+        named = {"type": "function", "function": {"name": "get_weather"}}
+        cases = (
+            ("kimi_k3", "required", json_object, None, True),
+            ("kimi_k3", named, json_schema, None, True),
+            ("kimi_k3", "required", json_object, "a+", False),
+            (None, "required", json_object, None, False),
+        )
+        for spec, tool_choice, response_format, regex, accepted in cases:
+            self.chat.chat_encoding_spec = spec
+            self.chat.tool_call_parser = "kimi_k3" if spec else "hermes"
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Weather in Paris?"}],
+                tools=[tool],
+                tool_choice=tool_choice,
+                response_format=response_format,
+                regex=regex,
+            )
+            with self.subTest(spec=spec, tool_choice=tool_choice, regex=regex):
+                if not accepted:
+                    with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                        self.chat._convert_to_internal_request(
+                            request, self.fastapi_request
+                        )
+                    continue
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                self.assertNotIn("json_schema", adapted.sampling_params)
+                self.assertIn("structural_tag", adapted.sampling_params)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(
+                    kwargs["response_format"]["type"], response_format["type"]
+                )
+
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
         self.template_manager.chat_template_name = None

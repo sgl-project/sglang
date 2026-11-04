@@ -968,6 +968,9 @@ class ChatCompletionRequest(PDRoutingFields):
     # Whether the client sent tool_choice, as opposed to the default filled in
     # by set_tool_choice_default.
     _tool_choice_explicit: bool = PrivateAttr(default=False)
+    # Indices of the messages the client sent a non-empty `tools` on, including
+    # user messages, whose model drops the field.
+    _message_tools_indices: List[int] = PrivateAttr(default_factory=list)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1104,6 +1107,19 @@ class ChatCompletionRequest(PDRoutingFields):
                 values["tool_choice"] = "auto"
         request = handler(values)
         request._tool_choice_explicit = explicit
+        return request
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _record_message_tools_indices(cls, values, handler):
+        request = handler(values)
+        messages = values.get("messages") if isinstance(values, dict) else None
+        if isinstance(messages, list):
+            request._message_tools_indices = [
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message, dict) and message.get("tools")
+            ]
         return request
 
     @field_validator("reasoning_effort", mode="before")
@@ -1274,6 +1290,25 @@ class ChatCompletionRequest(PDRoutingFields):
                 self.response_format.model_dump(by_alias=True)
             )
 
+        forces_tool_call = (
+            tool_call_constraint is not None
+            and tool_call_constraint[0] != "full_assistant_ebnf"
+            and (
+                self.tool_choice == "required"
+                or isinstance(self.tool_choice, ToolChoice)
+            )
+        )
+        # A forced tool call leaves no content for a JSON response_format to
+        # shape. When the renderer states response_format in the prompt, the
+        # tool-call constraint replaces its grammar instead of conflicting.
+        if (
+            forces_tool_call
+            and renderer_handles_response_format
+            and self.response_format
+            and self.response_format.type in ("json_object", "json_schema")
+        ):
+            sampling_params.pop("json_schema", None)
+
         # Check if there are already existing output constraints
         has_existing_constraints = (
             sampling_params.get("regex")
@@ -1283,10 +1318,7 @@ class ChatCompletionRequest(PDRoutingFields):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            if tool_call_constraint[0] != "full_assistant_ebnf" and (
-                self.tool_choice == "required"
-                or isinstance(self.tool_choice, ToolChoice)
-            ):
+            if forces_tool_call:
                 raise ValueError(
                     "tool_choice 'required' or a named tool cannot be combined with "
                     "response_format, regex, or ebnf: the tool-call constraint and the "
