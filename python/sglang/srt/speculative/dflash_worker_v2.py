@@ -482,7 +482,7 @@ class _AcceptBonusBuffers:
 
 class DFlashWorkerV2(BaseSpecWorker):
     # Platform hooks below are overridden by DFlashWorkerV2ROCm
-    # (dflash_worker_v2_rocm.py); the defaults are the portable path.
+    # (hardware_backend/rocm/speculative/dflash_worker_v2_rocm.py); the defaults are the portable path.
     _packed_draft_argmax = False
     _publish_before_mamba_commit = False
 
@@ -862,7 +862,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._warm_eager_selector()
             self._k3_prep_graph = None
             if capture_decode_cuda_graph:
-                from sglang.srt.speculative.k3_dflash_prep_graph import (
+                from sglang.srt.hardware_backend.rocm.speculative.dflash_prep_graph import (
                     K3DFlashPrepGraph,
                 )
 

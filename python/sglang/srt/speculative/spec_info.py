@@ -327,7 +327,7 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.utils import is_hip
 
             if is_hip():
-                from sglang.srt.speculative.dflash_worker_v2_rocm import (
+                from sglang.srt.hardware_backend.rocm.speculative.dflash_worker_v2_rocm import (
                     DFlashWorkerV2ROCm,
                 )
 

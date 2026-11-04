@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.speculative import spec_info
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
-from sglang.srt.speculative.dflash_worker_v2_rocm import DFlashWorkerV2ROCm
+from sglang.srt.hardware_backend.rocm.speculative.dflash_worker_v2_rocm import DFlashWorkerV2ROCm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
