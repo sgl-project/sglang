@@ -169,6 +169,37 @@ class TestNvFp4LinearBackends(CustomTestCase):
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")
 
+    def test_preserves_leading_dimensions(self):
+        torch.manual_seed(7)
+        n, k = 160, 336
+        for backend in (
+            "flashinfer_cutedsl",
+            "flashinfer_cutlass",
+            "flashinfer_cudnn",
+            "flashinfer_trtllm",
+        ):
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(
+                    fp4_utils,
+                    "FP4_GEMM_RUNNER_BACKEND",
+                    Fp4GemmRunnerBackend(backend),
+                ),
+            ):
+                layer, w_dequant = _make_quantized_layer(n, k)
+                layer.quant_method.process_weights_after_loading(layer)
+                x = torch.randn((2, 3, k), device="cuda", dtype=torch.bfloat16) / 10
+
+                out, _ = layer(x)
+
+                self.assertEqual(tuple(out.shape), (2, 3, n))
+                self._assert_matches(
+                    layer,
+                    x.reshape(-1, k),
+                    out.reshape(-1, n),
+                    w_dequant,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
