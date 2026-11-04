@@ -1,31 +1,27 @@
-"""Task accuracy of the direct linker on a plain MLA pool.
+"""Accuracy of the direct linker on a plain MLA pool, over long prompts.
 
-One server scores the same evaluation twice: first with an empty store, then
-after flushing the device tier. The second round therefore restores every
-prompt's KV from Mooncake instead of recomputing it, and must reproduce the
-same answers. A restore path that mixes up or truncates pages shows up as
-different generations here long before a reviewer would notice.
+The question this answers is narrow: with `--enable-unified-cache-external-linker`
+enabled, a prefix restored from Mooncake must decode exactly like the same prefix
+computed on the device.
 
-`--enable-deterministic-inference` keeps greedy decoding reproducible across
-the two rounds, so "same generations" is a real assertion rather than a
-tolerance. `SGLANG_LINKER_MLA_ACCURACY_DATASET` switches the benchmark;
-gsm8k over 100 examples is the statistically stronger variant (57.00% cold and
-57.00% restored measured on DeepSeek-V2-Lite-Chat), aime25 is the default
-because it is the harder, coarser signal.
+Prompt length decides whether that is even testable. The store is page-granular,
+so a 226-token prompt only ever restores its three full pages (~8% of the
+request) and a corrupted page has little chance of changing the answer. These
+samples are ~3k tokens, so >95% of the prompt comes back from the store and the
+comparison covers the whole read path: one wrong page changes the logprobs.
 """
 
-import json
 import os
 import unittest
-from pathlib import Path
-from types import SimpleNamespace
-
-import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kl_test_utils import _flush_cache
+from sglang.test.kl_test_utils import (
+    _extract_output_logprobs,
+    _flush_cache,
+    _generate,
+    get_input_ids,
+)
 from sglang.test.mooncake_utils import MooncakeTestServices
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
@@ -35,20 +31,23 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get(
     "SGLANG_LINKER_MLA_ACCURACY_MODEL", "deepseek-ai/DeepSeek-V2-Lite-Chat"
 )
-_DATASET = os.environ.get("SGLANG_LINKER_MLA_ACCURACY_DATASET", "aime25")
-_NUM_EXAMPLES = int(os.environ.get("SGLANG_LINKER_MLA_ACCURACY_EXAMPLES", "12"))
-_MAX_TOKENS = int(os.environ.get("SGLANG_LINKER_MLA_ACCURACY_MAX_TOKENS", "8192"))
-# Measured score minus a margin; 0 for the datasets whose score is too coarse
-# over this many examples to carry the assertion on its own.
-BASELINE_SCORE = float(os.environ.get("SGLANG_LINKER_MLA_ACCURACY_BASELINE", "0.0"))
+
+PAGE_SIZE = 64
+PROMPT_TOKENS = 3000
+NUM_SAMPLES = 4
+MAX_NEW_TOKENS = 32
+# Whole pages only, minus the last partial one: 3000 tokens restore 2944.
+MIN_RESTORE_RATIO = 0.9
 
 
-class TestPlainMLALinkerAccuracy(CustomTestCase):
+class _MLALinkerCase(CustomTestCase):
+    """One linker-enabled MLA server with long prompts loaded."""
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
@@ -56,7 +55,6 @@ class TestPlainMLALinkerAccuracy(CustomTestCase):
         cls.mooncake = MooncakeTestServices()
         cls.addClassCleanup(cls.mooncake.stop)
         cls.mooncake.start()
-        cls.out_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "linker_mla_accuracy"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -66,15 +64,14 @@ class TestPlainMLALinkerAccuracy(CustomTestCase):
                 "--attention-backend",
                 "triton",
                 "--page-size",
-                "64",
+                str(PAGE_SIZE),
                 # Greedy decoding must be reproducible across the two rounds.
                 "--enable-deterministic-inference",
                 "--mem-fraction-static",
                 "0.85",
+                "--max-total-tokens",
+                "16384",
                 "--enable-cache-report",
-                # The restored round must prove it read the store, not just
-                # reproduce the same answers with an empty cache.
-                "--enable-metrics",
                 "--enable-unified-cache-external-linker",
             ],
             env=unified_radix_tree_server_env("python", **cls.mooncake.server_env()),
@@ -82,87 +79,104 @@ class TestPlainMLALinkerAccuracy(CustomTestCase):
         cls.addClassCleanup(
             terminate_and_kill_process_tree, cls.process, wait_timeout=60
         )
-
-    def _store_cached_tokens(self) -> float:
-        """Store-served prompt tokens so far, from the Prometheus counters.
-
-        The linker reports its hits as the `host` cache source; a device hit is
-        what an unchanged prompt would get within one round.
-        """
-        total = 0.0
-        metrics = requests.get(f"{self.base_url}/metrics", timeout=30).text
-        for line in metrics.splitlines():
-            if not line.startswith("sglang:cached_tokens_total"):
-                continue
-            if 'cache_source="host"' in line:
-                total += float(line.rsplit(" ", 1)[1])
-        return total
-
-    def _score(self) -> tuple[dict, list[str]]:
-        metrics = run_sgl_eval(
-            SimpleNamespace(
-                eval_name=_DATASET,
-                base_url=f"{self.base_url}/v1",
-                model=self.model,
-                num_examples=_NUM_EXAMPLES,
-                num_threads=1,
-                # One pass: a repeat would multiply the run by the spec's default.
-                repeat=1,
-                max_tokens=_MAX_TOKENS,
-                temperature=0.0,
-                sgl_eval_out_dir=str(self.out_dir),
+        cls.input_ids = [
+            ids[:PROMPT_TOKENS]
+            for ids in get_input_ids(
+                tokenizer_path=cls.model,
+                max_prompt_tokens=PROMPT_TOKENS,
+                num_samples=NUM_SAMPLES,
+                trust_remote_code=True,
             )
-        )
-        predictions = sorted(
-            (Path(metrics["sgl_eval_metrics_path"]).parent).glob("*.jsonl")
-        )
-        generations = [
-            json.loads(line)["generation"]
-            for line in predictions[0].read_text().splitlines()
         ]
-        return metrics, generations
 
-    def test_store_restore_preserves_task_accuracy(self):
-        cold_metrics, cold_generations = self._score()
+    def _run(self):
+        return [
+            _generate(self.base_url, [ids], MAX_NEW_TOKENS, return_logprob=True)[0]
+            for ids in self.input_ids
+        ]
+
+
+class TestPlainMLALinkerRestoreAccuracy(_MLALinkerCase):
+    def test_restored_prefix_decodes_like_a_computed_one(self):
+        cold_results = self._run()
 
         _flush_cache(self.base_url)
-        store_tokens_before = self._store_cached_tokens()
 
-        restored_metrics, restored_generations = self._score()
-        restored_store_tokens = self._store_cached_tokens() - store_tokens_before
+        restored_results = self._run()
 
-        # Without this the equality checks below would also pass on a run whose
-        # lookup missed: deterministic decoding hides an entirely cold cache.
-        self.assertGreater(
-            restored_store_tokens,
-            0,
-            "the restored round served no prompt tokens from the store",
-        )
+        restores = []
+        for index, (cold, restored) in enumerate(zip(cold_results, restored_results)):
+            meta = restored["meta_info"]
+            details = meta.get("cached_tokens_details") or {}
+            prompt_tokens = int(meta["prompt_tokens"])
+            store_tokens = int(details.get("host", 0))
+            restores.append(f"{store_tokens}/{prompt_tokens}")
 
-        for name, metrics in (("cold", cold_metrics), ("restored", restored_metrics)):
+            # Without this the decode comparison below could pass on a run whose
+            # lookup missed entirely.
             self.assertGreaterEqual(
-                metrics["score"], BASELINE_SCORE, f"{name} score regressed"
+                store_tokens,
+                MIN_RESTORE_RATIO * prompt_tokens,
+                f"sample {index}: only {store_tokens} of {prompt_tokens} prompt "
+                "tokens came from the store",
             )
-        self.assertEqual(restored_metrics["score"], cold_metrics["score"])
-        self.assertEqual(
-            restored_metrics["truncated_rate"], cold_metrics["truncated_rate"]
-        )
-        self.assertEqual(len(restored_generations), len(cold_generations))
-        for index, (restored, cold) in enumerate(
-            zip(restored_generations, cold_generations)
-        ):
             self.assertEqual(
-                restored, cold, f"restored generation differs at example {index}"
+                int(details.get("device", 0)), 0, f"sample {index}: device hit"
             )
-        print(
-            f"{_DATASET}: cold={cold_metrics['score']:.4f} "
-            f"restored={restored_metrics['score']:.4f} "
-            f"examples={_NUM_EXAMPLES} "
-            f"store_tokens={restored_store_tokens:.0f} "
-            f"latency cold={cold_metrics['latency']:.1f}s "
-            f"restored={restored_metrics['latency']:.1f}s",
-            flush=True,
-        )
+            self.assertEqual(
+                restored["output_ids"],
+                cold["output_ids"],
+                f"sample {index}: restored decode diverged",
+            )
+            self.assertEqual(
+                _extract_output_logprobs(restored),
+                _extract_output_logprobs(cold),
+                f"sample {index}: restored logprobs diverged",
+            )
+
+        print(f"store-restored prompt tokens per sample: {', '.join(restores)}", flush=True)
+
+
+@unittest.skipUnless(
+    os.environ.get("SGLANG_LINKER_MLA_RUN_AIME"),
+    "opt-in: scores the shared server with sgl-eval",
+)
+class TestPlainMLALinkerAimeAccuracy(_MLALinkerCase):
+    """Task-level companion: an AIME score must not move either.
+
+    Kept opt-in because sgl-eval is a heavier dependency and, with unique short
+    problems, it restores ~8% of each prompt — a coarse signal next to the long
+    prompt test above.
+    """
+
+    def test_store_restore_preserves_task_accuracy(self):
+        from types import SimpleNamespace
+
+        from sglang.test.sgl_eval_utils import run_sgl_eval
+
+        out_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "linker_mla_aime")
+
+        def score():
+            return run_sgl_eval(
+                SimpleNamespace(
+                    eval_name="aime25",
+                    base_url=f"{self.base_url}/v1",
+                    model=self.model,
+                    num_examples=12,
+                    num_threads=1,
+                    repeat=1,
+                    max_tokens=8192,
+                    temperature=0.0,
+                    sgl_eval_out_dir=out_dir,
+                )
+            )
+
+        cold = score()
+        _flush_cache(self.base_url)
+        restored = score()
+
+        self.assertEqual(restored["score"], cold["score"])
+        self.assertEqual(restored["truncated_rate"], cold["truncated_rate"])
 
 
 if __name__ == "__main__":
