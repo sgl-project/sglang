@@ -219,42 +219,49 @@ class NomasCameraAttention(nn.Module):
         """``x`` holds video tokens [token_offset, token_offset + n) of the segment."""
         b, n, _ = x.shape
         frames = camera.shape[1]
-        q = self.img_attn_q(x).view(b, n, 16, 64)
-        k, v = (
-            self.keyboard_attn_kv(self.keyboard_embed(camera))
-            .view(b, frames, 2, 16, 64)
-            .unbind(2)
-        )
-        tokens = torch.arange(n, device=x.device) + token_offset
-        qids = (tokens // spatial_tokens).clamp(max=7499)
-        kids = torch.arange(frames, device=x.device).clamp(max=7499)
-        q = rms_norm_rotate(
-            self.key_attn_q_norm,
-            q,
-            (self.freqs_cos[qids], self.freqs_sin[qids]),
-            v.dtype,
-        )
-        k = rms_norm_rotate(
-            self.key_attn_k_norm,
-            k,
-            (self.freqs_cos[kids], self.freqs_sin[kids]),
-            v.dtype,
-        )
-        chunks = []
-        # Each camera chunk covers a contiguous token range; intersect with ours.
-        for start in range(0, frames, self.chunk_size):
-            end = min(start + self.chunk_size, frames)
-            lo = max(start * spatial_tokens, token_offset) - token_offset
-            hi = min(end * spatial_tokens, token_offset + n) - token_offset
-            if hi <= lo:
-                continue
-            out = F.scaled_dot_product_attention(
-                q[:, lo:hi].transpose(1, 2),
-                k[:, start:end].transpose(1, 2),
-                v[:, start:end].transpose(1, 2),
+        if self.chunk_size == 1:
+            # Softmax over a single key is exactly 1, so each token reads its frame's value.
+            v = self.keyboard_attn_kv(self.keyboard_embed(camera))
+            v = v.view(b, frames, 2, 16, 64)[:, :, 1]
+            frame = (torch.arange(n, device=x.device) + token_offset) // spatial_tokens
+            out = self.proj_keyboard(v[:, frame].flatten(2))
+        else:
+            q = self.img_attn_q(x).view(b, n, 16, 64)
+            k, v = (
+                self.keyboard_attn_kv(self.keyboard_embed(camera))
+                .view(b, frames, 2, 16, 64)
+                .unbind(2)
             )
-            chunks.append(out.transpose(1, 2).flatten(2))
-        out = self.proj_keyboard(torch.cat(chunks, 1))
+            tokens = torch.arange(n, device=x.device) + token_offset
+            qids = (tokens // spatial_tokens).clamp(max=7499)
+            kids = torch.arange(frames, device=x.device).clamp(max=7499)
+            q = rms_norm_rotate(
+                self.key_attn_q_norm,
+                q,
+                (self.freqs_cos[qids], self.freqs_sin[qids]),
+                v.dtype,
+            )
+            k = rms_norm_rotate(
+                self.key_attn_k_norm,
+                k,
+                (self.freqs_cos[kids], self.freqs_sin[kids]),
+                v.dtype,
+            )
+            chunks = []
+            # Each camera chunk covers a contiguous token range; intersect with ours.
+            for start in range(0, frames, self.chunk_size):
+                end = min(start + self.chunk_size, frames)
+                lo = max(start * spatial_tokens, token_offset) - token_offset
+                hi = min(end * spatial_tokens, token_offset + n) - token_offset
+                if hi <= lo:
+                    continue
+                out = F.scaled_dot_product_attention(
+                    q[:, lo:hi].transpose(1, 2),
+                    k[:, start:end].transpose(1, 2),
+                    v[:, start:end].transpose(1, 2),
+                )
+                chunks.append(out.transpose(1, 2).flatten(2))
+            out = self.proj_keyboard(torch.cat(chunks, 1))
         if has_camera is not None:
             # Upstream intentionally promotes this residual to float32.
             out = out * has_camera.float()[:, None, None]
