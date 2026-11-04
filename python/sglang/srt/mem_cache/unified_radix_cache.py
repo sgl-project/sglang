@@ -3415,7 +3415,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     operation, info, hit_tokens, aux_hit_tokens
                 )
             aux_hit_tokens = hit_tokens
-            
+
             # Hybrid pools (SWA / Mamba) are trailing-window aligned, so a
             # shortened recovery boundary may be invalid in storage; only
             # full-only models may truncate the prefix to fit host capacity.
