@@ -17,8 +17,9 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_rocm import (
     get_num_packed_prefix_chunks,
     get_packed_prefix_chunk_seq_lens,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
