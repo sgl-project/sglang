@@ -10,13 +10,13 @@ Launch with torchrun:
 
 from __future__ import annotations
 
-import contextlib
 import unittest
 
 import torch
 import torch.distributed as dist
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.parallel_state import (
     destroy_model_parallel,
@@ -29,8 +29,13 @@ from sglang.srt.layers.moe.ep_to_tp_transform import (
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.runtime_context import get_flags, get_model, override_platform
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_model,
+    override_platform,
+    reset_context,
+)
+from sglang.test.test_utils import publish_build_topology
 
 
 def _make_tiny_config(n_routed_experts: int = 16) -> PretrainedConfig:
@@ -213,20 +218,15 @@ def _mock_flashinfer_trtllm():
     return get_flags().moe.override(runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM)
 
 
-@contextlib.contextmanager
 def _force_shared_experts_fusion():
-    """Enable fused shared experts for the enclosed block.
+    """Fuse the single shared expert for models built in the enclosed block.
 
-    The ACTIVE decision lives in the runtime-flags tier: the loader calls
-    install_shared_experts_fusion_decision() once per runner, and the model
-    classes are pure readers via is_shared_experts_fusion_disabled(). These
-    tests construct the model directly, so that installer never runs and the
-    flag keeps whatever initialize_moe_config() seeded — hence the override
-    goes on the flags leaf, not the exec.moe bag (the bag is only consulted
-    when the flag is still None).
+    The loader resolves this layout per model and scopes it on the model bag
+    while building; these tests construct the model directly, so they scope it.
     """
-    with get_flags().moe.override(disable_shared_experts_fusion=False):
-        yield
+    return get_model().override(
+        shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+    )
 
 
 class _MoEOnlyNvFp4Config(ModelOptFp4Config):
@@ -536,10 +536,6 @@ def _create_model_and_load(
 class TestEpToTpTransform(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        server_args = ServerArgs(model_path="dummy", disable_shared_experts_fusion=True)
-        set_global_server_args_for_scheduler(server_args)
-        initialize_moe_config()
-
         init_distributed_environment(
             world_size=-1,
             rank=-1,
@@ -550,22 +546,20 @@ class TestEpToTpTransform(unittest.TestCase):
         cls.rank = dist.get_rank()
         device = torch.device(f"cuda:{cls.rank % torch.cuda.device_count()}")
         torch.cuda.set_device(device)
-        initialize_model_parallel(tensor_model_parallel_size=cls.world_size)
-
-        # Initialize dp attention globals (not using DP attention, just set defaults)
-        # Hack to avoid using top-level APIs in unit test.
-        import sglang.srt.layers.dp_attention as dp_attn
-
-        dp_attn._ATTN_DP_SIZE = 1
-        dp_attn._ATTN_DP_RANK = 0
-        dp_attn._LOCAL_ATTN_DP_SIZE = 1
-        dp_attn._LOCAL_ATTN_DP_RANK = 0
+        publish_build_topology(
+            tp_size=cls.world_size,
+            world_rank=cls.rank,
+            disable_shared_experts_fusion=True,
+        )
+        initialize_model_parallel()
+        initialize_moe_config()
 
     @classmethod
     def tearDownClass(cls):
         destroy_model_parallel()
         if dist.is_initialized():
             dist.destroy_process_group()
+        reset_context()
 
     def test_ep_to_tp_matches_normal_tp(self):
         """EP-load + transform should produce identical weights to normal TP load."""
