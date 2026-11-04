@@ -166,6 +166,13 @@ class TestTokenReqIndicesCompactVerify(CustomTestCase):
             token_req_indices(batch, num_tokens=8).tolist(), [7, 7, 9, 9, 9, 0, 0, 0]
         )
 
+    def test_default_covers_dp_padded_positions(self):
+        positions = torch.zeros(8, dtype=torch.int64)
+        batch = verify_batch(
+            torch.tensor([7, 5]), positions, packed_layout([2, 3], 6, "cpu")
+        )
+        self.assertEqual(token_req_indices(batch).tolist(), [7, 7, 5, 5, 5, 0, 0, 0])
+
     def test_uniform_layout_matches_dense_path(self):
         slots = torch.tensor([7, 5])
         uniform = verify_batch(slots, None, packed_layout([WIDTH] * 2, 12, "cpu"))

@@ -78,10 +78,11 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_target_verify():
         layout = forward_batch.ragged_verify_layout
         if layout is not None:
-            # Tokens past qo_indptr[-1] map to row bs (pool slot 0); padding the
-            # staged layout gave to padding rows or the last real row follows them.
+            # Tokens past qo_indptr[-1] take pool slot 0, like the padded rows of
+            # a dense verify graph.
             rows = ragged_verify_token_rows(
-                layout, layout.graph_num_tokens if num_tokens is None else num_tokens
+                layout,
+                forward_batch.positions.shape[0] if num_tokens is None else num_tokens,
             )
             return torch.cat([req, req.new_zeros(1)])[rows]
         return torch.repeat_interleave(
