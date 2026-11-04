@@ -54,36 +54,21 @@ ACL_EVENT_SYNC = 0x01  # Create an event for cross-stream synchronization.
 ACL_EVENT_RECORD_EXTERNAL = 0x01  # Keep the graph record visible outside the graph.
 
 
-def _check_acl_error(result, function, args):
+def _call_acl(function, *args):
+    result = function(*args)
     if result:
         raise RuntimeError(f"{function.__name__} failed with ACL error {result}")
     return result
 
 
 @cache
-def _event_api():
-    # pyACL lacks record_event_with_flag; torch.npu.ExternalEvent requires reset.
-    # Bind the CANN APIs directly for a graph record that needs no reset.
+def _record_event_with_flag_api():
+    # pyACL exposes the other event operations, but not record-with-flag.
     library = ctypes.CDLL("libascendcl.so")
-    signatures = {
-        "aclrtCreateEventExWithFlag": (
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_uint32,
-        ),
-        "aclrtRecordEventWithFlag": (
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ),
-        "aclrtStreamWaitEvent": (ctypes.c_void_p, ctypes.c_void_p),
-        "aclrtDestroyEvent": (ctypes.c_void_p,),
-    }
-    for name, argtypes in signatures.items():
-        function = getattr(library, name)
-        function.argtypes = argtypes
-        function.restype = ctypes.c_int
-        function.errcheck = _check_acl_error
-    return library
+    function = library.aclrtRecordEventWithFlag
+    function.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32)
+    function.restype = ctypes.c_int
+    return function
 
 
 class NPUSharedReadEvent:
@@ -95,12 +80,18 @@ class NPUSharedReadEvent:
     """
 
     def __init__(self, device_module):
+        import acl
+
         self._device_module = device_module
-        self._api = _event_api()
-        self._event = ctypes.c_void_p()
-        self._api.aclrtCreateEventExWithFlag(ctypes.byref(self._event), ACL_EVENT_SYNC)
+        self._acl_rt = acl.rt
+        self._record_event = _record_event_with_flag_api()
+        self._event, result = self._acl_rt.create_event_ex_with_flag(ACL_EVENT_SYNC)
+        if result:
+            raise RuntimeError(
+                f"create_event_ex_with_flag failed with ACL error {result}"
+            )
         self._finalizer = weakref.finalize(
-            self, self._api.aclrtDestroyEvent, self._event
+            self, _call_acl, self._acl_rt.destroy_event, self._event
         )
         # The runtime owns process-exit cleanup; it may shut down before Python
         # finalizers. Normal object disposal still releases the event.
@@ -111,14 +102,17 @@ class NPUSharedReadEvent:
             stream = self._device_module.current_stream()
         # Reading npu_stream drains torch_npu's host submission queue, without
         # waiting for device completion. Do not cache the raw stream handle.
-        self._api.aclrtRecordEventWithFlag(
-            self._event, stream.npu_stream, ACL_EVENT_RECORD_EXTERNAL
+        _call_acl(
+            self._record_event,
+            self._event,
+            stream.npu_stream,
+            ACL_EVENT_RECORD_EXTERNAL,
         )
 
     def wait(self, stream=None):
         if stream is None:
             stream = self._device_module.current_stream()
-        self._api.aclrtStreamWaitEvent(stream.npu_stream, self._event)
+        _call_acl(self._acl_rt.stream_wait_event, stream.npu_stream, self._event)
 
 
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
