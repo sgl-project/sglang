@@ -42,6 +42,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    extend_honors_slot_pitch: bool = False
 
     def packed_decode(
         self,
