@@ -1,0 +1,25 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "a100_sxm",
+      "hbm_capacity_gb": 80
+    }
+  },
+  "predictor": {
+    "name": "aisimulate",
+    "estimation_mode": "op_level",
+    "database_mode": "SOL",
+    "estimator_config": {
+      "correction": {
+        "enabled": false
+      }
+    }
+  },
+  "scheduler": {
+    "tp_size": 1,
+    "ep_size": 1,
+    "dp_size": 1,
+    "backend_name": "sglang",
+    "backend_version": "0.5.10"
+  }
+}
