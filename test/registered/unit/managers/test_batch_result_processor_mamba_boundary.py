@@ -256,8 +256,9 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
 
 
 class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
-    """A lazy boundary that cannot get a second tracking slot skips its snapshot:
-    nothing writes the keep slot, which still holds mamba_last_track_seqlen."""
+    """A lazy boundary first evicts one cached state for its second tracking
+    slot; if it still gets none it skips its snapshot: nothing writes the keep
+    slot, which still holds mamba_last_track_seqlen."""
 
     @staticmethod
     def _make_lazy_batch(took: bool) -> tuple[Req, ScheduleBatch]:
@@ -313,6 +314,47 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         self.assertEqual(req.kv.mamba_next_track_idx, 0)
         self.assertEqual(req.kv.mamba_last_track_idx, 0)
         self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+    def test_eviction_frees_the_slot_before_skipping(self):
+        for spec in (False, True):
+            with self.subTest(spec=spec):
+                req, batch = self._make_lazy_batch(took=False)
+                free_slots = []
+                evicted = []
+                batch.token_to_kv_pool_allocator.storage.take_tracking_slot = (
+                    lambda req, position: bool(free_slots and free_slots.pop())
+                )
+                batch.tree_cache = SimpleNamespace(
+                    page_size=TRACK_INTERVAL,
+                    supports_mamba=lambda: True,
+                    evict_for_alloc=lambda params: (
+                        evicted.append(params.mamba_num),
+                        free_slots.append(True),
+                    ),
+                )
+                if spec:
+                    batch.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
+                    self.assertEqual(batch.mamba_lazy_spec_track_positions_cpu, [1])
+                else:
+                    with (
+                        get_context().override_server_args(
+                            mamba_radix_cache_strategy="extra_buffer_lazy",
+                            mamba_track_interval=TRACK_INTERVAL,
+                            _mamba_cache_chunk_size=TRACK_INTERVAL,
+                        ),
+                        patch(
+                            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                            return_value=torch.tensor([3], dtype=torch.int64),
+                        ),
+                        patch(
+                            "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+                        ),
+                        patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+                    ):
+                        batch.prepare_for_decode()
+                    self.assertEqual(batch.mamba_track_mask_cpu, [True])
+                    self.assertEqual(req.kv.mamba_next_track_idx, 1)
+                self.assertEqual(evicted, [1])
 
 
 if __name__ == "__main__":
