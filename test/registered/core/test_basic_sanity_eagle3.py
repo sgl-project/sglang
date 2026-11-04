@@ -3,7 +3,7 @@ test_basic_sanity.py with the spec-decoding path active."""
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -16,12 +16,19 @@ from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
+    DEFAULT_MODEL_NAME_FOR_TEST_UNGATED,
     DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
     popen_launch_server,
+)
+
+# AMD runners may have no HF token; the ungated mirror has the same weights,
+# so the Llama-3.1-8B EAGLE3 draft still matches.
+TARGET_MODEL = (
+    DEFAULT_MODEL_NAME_FOR_TEST_UNGATED if is_hip() else DEFAULT_TARGET_MODEL_EAGLE3
 )
 
 register_cuda_ci(est_time=120, stage="base-a", runner_config="1-gpu-small")
@@ -38,7 +45,7 @@ class TestBasicSanityEagle3(
     MMLUSanityMixin,
     CustomTestCase,
 ):
-    served_model_name = DEFAULT_TARGET_MODEL_EAGLE3
+    served_model_name = TARGET_MODEL
     # CUDA 5090 + Llama-3.1-8B measured ~99 median in CI with async-assert
     # probes off in base-a. AMD EAGLE3 currently sustains lower single-batch
     # occupancy and needs a longer measurement window to avoid too few
@@ -47,14 +54,14 @@ class TestBasicSanityEagle3(
     fwd_occupancy_max_new_tokens = 4096 if is_in_amd_ci() else 2048
     fwd_occupancy_acc_length_threshold: float = 1.6
 
-    model = DEFAULT_TARGET_MODEL_EAGLE3
+    model = TARGET_MODEL
     mmlu_accept_length_thres = 1.5
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_TARGET_MODEL_EAGLE3,
+            TARGET_MODEL,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
