@@ -107,6 +107,7 @@ from sglang.srt.speculative.spec_utils import (
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
+    mask_rows_without_track_slot,
     simulated_acc_len_generator,
 )
 from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
@@ -2141,16 +2142,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            # A row with no track destination (-1) commits no snapshot.
-            can_track_mask = (
-                to_track_mask
-                & (to_track_ith < commit_lens.to(to_track_ith.dtype))
-                & (batch.mamba_track_indices >= 0)
+            can_track_mask = to_track_mask & (
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
             )
             mamba_steps_to_track = torch.where(
                 can_track_mask,
                 to_track_ith.to(torch.int64),
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
+            )
+            mamba_steps_to_track = mask_rows_without_track_slot(
+                batch.mamba_track_indices, mamba_steps_to_track
             )
 
         model_runner = self.target_worker.model_runner

@@ -117,6 +117,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocation import (
     alloc_for_decode,
     alloc_for_extend,
+    alloc_tracking_slots,
     retire_window,
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
@@ -124,7 +125,6 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
-    EvictParams,
     TreeLock,
 )
 from sglang.srt.mem_cache.common import (
@@ -3059,17 +3059,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
-    def _take_tracking_slot_or_evict(self, storage, req, position: int) -> bool:
-        """take_tracking_slot, retried once after evicting one cached state
-        slot from the tree (locked nodes are never evicted)."""
-        if storage.take_tracking_slot(req, position):
-            return True
-        if not self.tree_cache.supports_mamba():
-            return False
-        self.tree_cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-        return storage.take_tracking_slot(req, position)
-
-    def mamba_lazy_prealloc_at_boundary(self, track_mask_cpu: torch.Tensor):
+    def mamba_lazy_prealloc_at_boundary(
+        self, track_mask_cpu: torch.Tensor
+    ) -> torch.Tensor:
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
         In lazy mode each request normally holds only 1 ping-pong slot.
@@ -3078,29 +3070,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         there. The old slot is freed after the forward in
         mamba_lazy_post_decode_at_boundary.
 
-        A req that cannot get the second slot, even after evicting one cached
-        state, skips this boundary: its bit in
-        ``track_mask_cpu`` is cleared, so the forward writes no track state and
-        the keep slot still holds the checkpoint at mamba_last_track_seqlen.
+        A req that cannot get the second slot, even after evicting cached
+        states, skips this boundary: its bit is cleared in the returned
+        track mask, so the forward writes no track state and the keep slot
+        still holds the checkpoint at mamba_last_track_seqlen.
         """
         storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        track_mask_cpu = track_mask_cpu.clone()
+        # A held other slot means the previous boundary's post-processing
+        # (which frees it) has not run yet under overlap.
+        rows = []
         for i, (req, at_boundary) in enumerate(zip(self.reqs, track_mask_cpu.tolist())):
-            buf = req.kv.mamba_ping_pong_track_buffer
-            assert buf is not None
-            if not at_boundary:
-                continue
+            assert req.kv.mamba_ping_pong_track_buffer is not None
             other_idx = 1 - req.kv.mamba_next_track_idx
-            # A held other slot means the previous boundary's post-processing
-            # (which frees it) has not run yet under overlap.
-            took = (
-                req.kv.mamba_ping_pong_empty[other_idx]
-                and not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get()
-                and self._take_tracking_slot_or_evict(storage, req, other_idx)
-            )
-            if took:
+            if at_boundary and req.kv.mamba_ping_pong_empty[other_idx]:
+                rows.append((i, req, other_idx))
+            elif at_boundary:
+                track_mask_cpu[i] = False
+        took = alloc_tracking_slots(
+            storage,
+            self.token_to_kv_pool_allocator.state,
+            self.tree_cache,
+            [(req, other_idx) for _, req, other_idx in rows],
+        )
+        for (i, req, other_idx), ok in zip(rows, took):
+            if ok:
                 req.kv.mamba_next_track_idx = other_idx
             else:
                 track_mask_cpu[i] = False
+        return track_mask_cpu
 
     def mamba_lazy_undo_prealloc_at_boundary(self):
         """Give back the slots mamba_lazy_prealloc_at_boundary handed this decode
@@ -3123,15 +3121,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         unknown), so ensure the pending slot exists for reqs whose next
         boundary is reachable, WITHOUT swapping mamba_next_track_idx; the
         mask-gated commit writes it only on a real crossing, and
-        _mamba_lazy_spec_confirm_crossing promotes it afterwards. The per-req
+        _mamba_lazy_spec_update promotes it afterwards. The per-req
         scatter position is recorded on the batch and rides the result-queue
         copy (forward isolation restores batch fields).
         """
         storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         track_positions: List[int] = []
-        for req in self.reqs:
-            buf = req.kv.mamba_ping_pong_track_buffer
-            assert buf is not None
+        rows = []
+        for i, req in enumerate(self.reqs):
+            assert req.kv.mamba_ping_pong_track_buffer is not None
             if not mamba_lazy_spec_in_window(
                 req, mamba_track_interval, max_draft_tokens
             ):
@@ -3140,14 +3138,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions.append(req.kv.mamba_next_track_idx)
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            has_pending = not req.kv.mamba_ping_pong_empty[other_idx]
-            if not has_pending:
-                has_pending = not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get() and (
-                    self._take_tracking_slot_or_evict(storage, req, other_idx)
-                )
-            # On failure the verify skips this crossing's snapshot (-1), so the
-            # keep slot still holds the checkpoint at mamba_last_track_seqlen.
-            track_positions.append(other_idx if has_pending else -1)
+            if req.kv.mamba_ping_pong_empty[other_idx]:
+                rows.append((i, req, other_idx))
+            track_positions.append(other_idx)
+        took = alloc_tracking_slots(
+            storage,
+            self.token_to_kv_pool_allocator.state,
+            self.tree_cache,
+            [(req, other_idx) for _, req, other_idx in rows],
+        )
+        # On failure the verify skips this crossing's snapshot (-1), so the
+        # keep slot still holds the checkpoint at mamba_last_track_seqlen.
+        for (i, _, _), ok in zip(rows, took):
+            if not ok:
+                track_positions[i] = -1
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):
@@ -3249,7 +3253,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_buffer_indices = []
             else:
                 if get_exec().mamba.enable_mamba_extra_buffer_lazy:
-                    self.mamba_lazy_prealloc_at_boundary(track_mask_cpu)
+                    track_mask_cpu = self.mamba_lazy_prealloc_at_boundary(
+                        track_mask_cpu
+                    )
                 set_mamba_track_indices_from_reqs(self)
 
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()

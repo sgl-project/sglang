@@ -273,7 +273,10 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         batch.seq_lens_cpu = batch.seq_lens.clone()
         batch.req_to_token_pool = None
         batch.token_to_kv_pool_allocator = SimpleNamespace(
-            storage=SimpleNamespace(take_tracking_slot=lambda req, position: took)
+            storage=SimpleNamespace(take_tracking_slot=lambda req, position: took),
+            state=SimpleNamespace(
+                slots=SimpleNamespace(schedulable_available_size=lambda: int(took))
+            ),
         )
         return req, batch
 
@@ -321,15 +324,19 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                 req, batch = self._make_lazy_batch(took=False)
                 free_slots = []
                 evicted = []
-                batch.token_to_kv_pool_allocator.storage.take_tracking_slot = (
-                    lambda req, position: bool(free_slots and free_slots.pop())
+                allocator = batch.token_to_kv_pool_allocator
+                allocator.storage.take_tracking_slot = lambda req, position: bool(
+                    free_slots and free_slots.pop()
+                )
+                allocator.state.slots.schedulable_available_size = lambda: len(
+                    free_slots
                 )
                 batch.tree_cache = SimpleNamespace(
                     page_size=TRACK_INTERVAL,
                     supports_mamba=lambda: True,
                     evict_for_alloc=lambda params: (
                         evicted.append(params.mamba_num),
-                        free_slots.append(True),
+                        free_slots.extend([True] * params.mamba_num),
                     ),
                 )
                 if spec:
