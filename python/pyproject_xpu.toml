@@ -20,6 +20,7 @@ dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
