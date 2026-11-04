@@ -179,6 +179,7 @@ srt_sail = [
   "flash-attn",
   "flashinfer-python",
   "flash-mla",
+  "pla",
   "sailify==1.0.0",
   "sglang[runtime_common]",
   "torch",

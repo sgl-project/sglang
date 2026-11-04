@@ -221,6 +221,20 @@ def _disable_sail_unsupported_mhc_paths() -> None:
 def handle_sail_backends(server_args: Any):
     if not get_platform().is_sail:
         return
+    # PLA ships as its own wheel, so its absence is a supported setup: every
+    # PLA kernel stays off and the KDA paths run on the community Triton
+    # kernels. An explicit SGLANG_SAIL_PLA=0 still keeps them there.
+    try:
+        import pla  # noqa: F401
+    except ImportError:
+        logger.warning(
+            "PLA is not installed; SGLANG_SAIL_PLA stays off and the KDA "
+            "kernels use the community Triton implementations."
+        )
+        envs.SGLANG_SAIL_PLA.set(False)
+    else:
+        if not envs.SGLANG_SAIL_PLA.is_set():
+            envs.SGLANG_SAIL_PLA.set(True)
     from sglang.srt.configs.model_config import is_deepseek_dsa
     from sglang.srt.platforms import current_platform
 
