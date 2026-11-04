@@ -20,6 +20,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -60,9 +61,21 @@ def log_mla_gluon_capability(log: logging.Logger | None = None) -> None:
     )
 
 
-def mla_gluon_available() -> bool:
-    """Whether aiter's Gluon MLA decode can run here; _gluon_fn logs why not."""
-    return _gluon_fn() is not None
+def mla_gluon_supports_dcp_decode(
+    *, gathered_num_head: int, kv_cache_dtype: torch.dtype
+) -> bool:
+    """Whether aiter's Gluon MLA can run a DCP decode of this shape here.
+
+    mla_gluon asserts gfx950, and decodes only in its bh16 regimes: at most 96
+    heads but not 64, over a bf16 or e4m3fn cache. Its bh64 regime needs batch % 64.
+    """
+    return (
+        _gluon_fn() is not None
+        and is_gfx95_supported()
+        and 1 <= gathered_num_head <= 96
+        and gathered_num_head != 64
+        and kv_cache_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    )
 
 
 def prefer_mla_gluon_decode(

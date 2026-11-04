@@ -474,5 +474,41 @@ class TestMlaDcpDecodeRoute(CustomTestCase):
         self.assertFalse(self._selected(decode_backend="gluon"))
 
 
+class TestMlaGluonSupportsDcpDecode(CustomTestCase):
+    """mla_gluon asserts gfx950, runs decode only in its bh16 regimes (<= 96 heads,
+    not 64, bf16 or e4m3fn KV), and its bh64 regime (64, 128 heads) needs batch % 64.
+    A DCP decode routed to Gluon outside these must fail at startup, not at decode."""
+
+    def _supports(self, *, gfx950=True, **overrides):
+        kwargs = dict(gathered_num_head=96, kv_cache_dtype=torch.bfloat16)
+        kwargs.update(overrides)
+        with (
+            mock.patch(_GLUON_FN, return_value=mock.Mock()),
+            mock.patch.object(mod, "is_gfx95_supported", return_value=gfx950),
+        ):
+            return mod.mla_gluon_supports_dcp_decode(**kwargs)
+
+    def test_bh16_shapes_on_gfx950(self):
+        self.assertTrue(self._supports())
+        self.assertTrue(self._supports(kv_cache_dtype=torch.float8_e4m3fn))
+        self.assertTrue(self._supports(gathered_num_head=48))
+
+    def test_bh64_and_oversized_head_counts(self):
+        for heads in (64, 97, 128):
+            self.assertFalse(self._supports(gathered_num_head=heads))
+
+    def test_other_arch_and_kv_dtype(self):
+        self.assertFalse(self._supports(gfx950=False))
+        self.assertFalse(self._supports(kv_cache_dtype=torch.float8_e4m3fnuz))
+
+    def test_unavailable_gluon(self):
+        with mock.patch(_GLUON_FN, return_value=None):
+            self.assertFalse(
+                mod.mla_gluon_supports_dcp_decode(
+                    gathered_num_head=96, kv_cache_dtype=torch.bfloat16
+                )
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
