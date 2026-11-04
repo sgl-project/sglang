@@ -34,10 +34,10 @@ Then run the **Python** output of the command panel below in that environment. T
 docker pull lmsysorg/sglang:v0.5.23-cu130
 ```
 
-The command panel below fills in the right tag per platform: B200 / B300 / GB200 / H200 keep the M3 dev images their verified rows were measured on (`dev-minimax-m3` / `dev-cu13-minimax-m3` / `dev-cu12-minimax-m3`; final 2026-06 builds — the dev lane is retired, and these bundle the MSA kernel). GB300 uses the versioned CUDA-13 release image instead — its recipe's per-phase decode split needs the page-128 `trtllm_mha` support that ships in tagged releases since v0.5.22, and its benchmark row is measured on that image (with MSA installed per §2.1, a **required** GB300 step). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
+The command panel below fills in the right tag per platform: on NVIDIA (Hopper and Blackwell, x86_64 and aarch64/Grace) it uses the versioned CUDA-13 release image `lmsysorg/sglang:v0.5.23-cu130` — MiniMax-M3 is fully supported in tagged releases since v0.5.22, which replaces the retired M3 dev images (`dev-minimax-m3` / `dev-cu13-minimax-m3` / `dev-cu12-minimax-m3`, last pushed 2026-06). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
 
 <Note>
-**GB300 only:** unlike the M3 dev images, the release image does **not** bundle MiniMax's MSA sparse-attention kernel (`fmha_sm100`), so on GB300 installing it per **§2.1** is a **required** step (one pip install; the kernels JIT-compile on first use) — the GB300 benchmark row is measured on the MSA path. Without it, the same recipe serves on the built-in Triton sparse path (~9–12% slower prefill TTFT, and it can OOM where MSA does not).
+Unlike the retired M3 dev images, the release image does **not** bundle MiniMax's MSA sparse-attention kernel (`fmha_sm100`), so the recipe serves M3's sparse step on the built-in Triton path. That is the recommended path: on v0.5.22, MSA is slower than Triton (see **§2.1**), so do not install it.
 </Note>
 
 </Tab>
@@ -71,7 +71,7 @@ Key characteristics as served by SGLang:
 - **Multimodal (vision + text)**: accepts interleaved text and images through the OpenAI-compatible chat API (loaded as `MiniMaxM3SparseForConditionalGeneration`). Image input via URL and base64 is validated; video input has not been tested here.
 - **Reasoning model**: emits its chain of thought wrapped in `<mm:think>...</mm:think>`. Always launch with **`--reasoning-parser auto`** — it auto-detects the right parser from the chat template, and SGLang then strips the tags and returns the trace separately in `message.reasoning_content`.
 - **Native tool calling**: a custom namespace-token XML format, parsed into standard OpenAI `tool_calls`. Always launch with **`--tool-call-parser auto`** — it auto-detects the right parser from the chat template. Single, parallel, and nested (object / array) arguments are supported.
-- **Sparse attention**: most layers use M3's "lightning indexer" block-sparse attention (top-k 128-token blocks), which keeps decode cost roughly flat in context length. On Blackwell, MiniMax's open-source [MSA kernel](https://github.com/MiniMax-AI/MSA) accelerates this path further (§2.1).
+- **Sparse attention**: most layers use M3's "lightning indexer" block-sparse attention (top-k 128-token blocks), which keeps decode cost roughly flat in context length. SGLang serves it on a built-in Triton kernel. MiniMax's open-source [MSA kernel](https://github.com/MiniMax-AI/MSA) is an alternative on Blackwell, but it is currently slower (§2.1).
 - **MXFP8 quantization across vendors**: the MXFP8 MoE weights run natively on NVIDIA Blackwell (B200 / B300 / GB200 / GB300) and on AMD Instinct MI350X/MI355X (gfx950 / CDNA4), both of which have hardware MX-scaled matmul. On AMD MI300X/MI325X (gfx942 / CDNA3) — no hardware MX — SGLang converts the weights to block-fp8 `[128,128]` at load and serves them on the tuned ROCm kernels (§2.3). The vision tower stays unquantized.
 
 **Recommended generation**: the model's `generation_config.json` sets `temperature` 1.0 / `top_p` 0.95, which SGLang applies automatically (the default `--sampling-defaults model`). The model card additionally suggests `top_k` 40, but that value is **not** in `generation_config.json`, so SGLang does not apply it by default. `top_k` is a per-request sampling parameter (not a launch flag) — set it per call if you want it, e.g. `extra_body={"top_k": 40}` with the OpenAI client.
@@ -80,56 +80,25 @@ Key characteristics as served by SGLang:
 
 ## 2. Configuration Tips
 
-### 2.1 MSA sparse-attention fast path (recommended for Blackwell users)
+### 2.1 Sparse attention on Blackwell: use the built-in Triton path (MSA not recommended)
 
-[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`, MIT-licensed) is the recommended Blackwell kernel for M3's main sparse-attention step — faster and more memory-efficient than the built-in Triton fallback. The release image (`v0.5.23-cu130`) does **not** bundle it, so install it (below) for the fast path — one pip install, and the recipe engages it automatically (the retired M3 dev images shipped it pre-installed). It is purely additive: without it the same recipe still serves on the built-in Triton path. The swap is numerically equivalent (cosine ≥ 0.99999 vs Triton), decode stays CUDA-graph-capturable, prefill TTFT drops ~9–12% at 8K–64K context, and the MSA path survives memory configurations where the Triton path OOMs.
+The Blackwell recipes serve M3's sparse-attention step on SGLang's built-in Triton kernel. This is what the release image does out of the box, and it is what the benchmark card measures. SGLang auto-forces `page_size` to 128 for the `fa4` backend (#28976), so `--page-size 128` is omitted from the Blackwell cells.
 
-**Requirements** (from the [MSA README](https://github.com/MiniMax-AI/MSA#requirements)):
+[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`) is an optional Blackwell kernel for the same step, and SGLang uses it automatically when it is installed. **We do not recommend installing it with current SGLang releases (v0.5.22, v0.5.23):**
 
-- **GPU**: NVIDIA SM100 family — sm_100 (B200 / GB200) and sm_103 (B300 / GB300).
-- **Toolchain**: CUDA Toolkit with `nvcc` ≥ 12.x on `PATH` (or `CUDA_HOME` set) — the kernels are JIT-compiled at first import.
-- **Python**: ≥ 3.11; **OS**: Linux — works on both **x86_64 and aarch64 (Grace, e.g. GB200 / GB300)**; the aarch64 build needs no source edits.
+- **It fails to start.** MSA's `main` branch calls `quack.activation.sub_packed_f32x2`, which quack-kernels removed in 0.6.3. SGLang v0.5.22 and v0.5.23 pin quack-kernels 0.6.5, so the server dies at warm-up with an `AttributeError` even though the install succeeds. This is tracked in [MiniMax-AI/MSA#24](https://github.com/MiniMax-AI/MSA/issues/24), with a fix open in [MiniMax-AI/MSA#27](https://github.com/MiniMax-AI/MSA/pull/27).
+- **With that fix, it is slower than Triton.** On `v0.5.23-cu130` GB300 (TP4, the GB300 recipe), MSA raised mean TPOT from 31.5 to 54.3 ms at random 2048/256 (concurrency 64) and from 20.0 to 23.4 ms at 8192/256 (concurrency 24), and raised TTFT by 41–84%. On `v0.5.22-cu130` at 2048/256, it raised mean TPOT from 26.8 to 38.6 ms on B200 (TP8) and from 32.7 to 46.9 ms on B300 (TP4).
 
-<Accordion title="Install MSA (release image or custom image) & verify the gate (Python)">
-
-On the GB300 release image — and any custom image without `fmha_sm100` — run the `git clone` / `pip install` steps below, then the gate check. (The M3 dev images the other NVIDIA cells use bundle MSA, so only the gate check is needed there.)
-
-```bash Command
-# Release/custom image: --recursive pulls the CUTLASS submodule required for JIT compilation
-git clone --recursive https://github.com/MiniMax-AI/MSA.git msa
-cd msa && pip install .
-# quack-kernels >= 0.6 (bundled in v0.5.23-cu130) removed the module-level
-# sub_packed_f32x2 alias that MSA still calls; restore it (additive one-liner,
-# no existing quack symbols change) or the server crashes at the first MSA
-# softmax step. Not needed on images whose quack is < 0.6.
-python - <<'PY'
-import pathlib, quack.activation as qa
-p = pathlib.Path(qa.__file__); s = p.read_text()
-if "\nsub_packed_f32x2" not in s:
-    p.write_text(s + "\n# MSA compat: quack 0.5.x alias, removed in 0.6.x\nsub_packed_f32x2 = cute.arch.sub_packed_f32x2\n")
-PY
-# Verify the SGLang gate (True -> MSA engaged on this device; False -> Triton fallback):
-python -c "from sglang.srt.layers.attention.minimax_sparse_ops.msa import msa_available; print(msa_available())"
-```
-
-</Accordion>
+If `fmha_sm100` is already installed in your environment, set `SGLANG_DISABLE_MSA=1` to keep the Triton path. MSA is a Blackwell (SM100) kernel and does not apply to Hopper or AMD ROCm.
 
 <Note>
-The first import JIT-compiles the kernels, which can take 30 s to a few minutes on a cold `nvcc` cache — this is normal, not a hang. Subsequent server starts hit the JIT cache.
-</Note>
+**GB300: per-phase attention split.** The GB300 cell adds `--decode-attention-backend trtllm_mha`. Decode on M3's full-attention layers then runs on FlashInfer's trtllm-gen paged decode, which is ~2x faster than fa4 at the kernel level for this TP4 geometry. Prefill stays on `--attention-backend fa4`, which also keeps page size 128. The sparse layers are unaffected. `trtllm_mha` accepts page 128 through trtllm-gen's dynamic tokens-per-page kernels (FlashInfer ≥ 0.6.12, SGLang ≥ 0.5.22), which the recipe image satisfies.
 
-<Warning>
-**Warm the JIT cache before a multi-GPU launch.** On a *cold* cache, several tensor-parallel ranks racing to JIT-compile MSA's plan kernel can leave one rank loading a half-linked module (`AttributeError: Module has no function 'plan'` at CUDA-graph capture). Run the gate-check `python -c "..."` (or any single-process `fmha_sm100_plan` call) once before launching the server — that compiles the kernel single-process, and every rank then hits the warm cache.
-</Warning>
-
-The gate requires `--attention-backend fa4` (MSA's sparse blocks are 128 tokens, so the page size must be 128). SGLang auto-forces `page_size` to 128 for the `fa4` backend — including the combined `--attention-backend fa4` the M3 recipe uses (#28976) — so `--page-size 128` is omitted from the Blackwell cells below. Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
-
-<Note>
-**GB300: per-phase attention split.** The GB300 cell adds `--decode-attention-backend trtllm_mha`: decode runs on FlashInfer's trtllm-gen paged decode (~2x faster than fa4 on M3's full-attention decode shapes at this TP4 geometry; +11–15% median per-user interactivity in 900 s serving replays at concurrency 1–60), while `--attention-backend fa4` stays — it serves prefill (where fa4 remains the faster backend) and keys the page-128 auto-force MSA requires. The MSA sparse layers are unaffected in both phases. `trtllm_mha` accepts page 128 through trtllm-gen's dynamic tokens-per-page kernels (FlashInfer ≥ 0.6.12; allowed in-tree since sglang v0.5.22) — the recipe image above satisfies this, and the full recipe (image + MSA install + split) is benchmarked on `v0.5.23-cu130` (benchmark card): profiler-verified decode on trtllm-gen with fa4 prefill, MSA sparse engaged, page 128 kept; at the card's steady-state points the split is TPOT-neutral vs fa4-only on the same image (within ~1%), with its gains showing in interactivity-style replays. B200 (TP8, different shard geometry) and GB200 are not benchmarked with the split and keep fa4-only.
+End-to-end on `v0.5.23-cu130`, the split performs **on par with fa4-only on the benchmark card's workloads**. Mean TPOT is 31.5 vs 31.5 ms at 2048/256 (concurrency 64) and 20.0 vs 19.8 ms at 8192/256 (concurrency 24). GSM8K stays within run-to-run noise: 95.3% vs 97.0% on v0.5.23, and 95.3% vs 94.5% on v0.5.22. The gain shows up in long-context agentic serving: +11–15% median per-user interactivity in 900 s agentic-replay runs at concurrency 1–60 (measured on the earlier M3 dev image). B200 (TP8, different shard geometry) and GB200 are not benchmarked with the split and keep fa4-only.
 </Note>
 
 <Note>
-For multimodal (image) serving, keep the same text recipe above — `--attention-backend fa4` (MSA) is unchanged — and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
+For multimodal (image) serving, keep the same text recipe above and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; the sparse-attention path only touches the language model, not image handling.
 </Note>
 
 ### 2.2 Memory and workload tuning
@@ -161,7 +130,7 @@ The AMD recipes are validated end-to-end on **text** workloads — chat, reasoni
 The MXFP8 kernels are Blackwell-only, so Hopper (H200) serves the full-precision bfloat16 build [`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3). Select **H200 + BF16** in the Deploy panel above for the exact command — it runs at `--tp 8` (the bf16 weights need a full 8-GPU node). SGLang picks the right backends for Hopper automatically, so the recipe stays minimal:
 
 - **MoE runner**: Triton, auto-selected for bf16 weights.
-- **Attention**: FlashAttention-3 with page size 1. MSA (§2.1) is a Blackwell kernel, so M3's sparse step runs on the built-in Triton path here.
+- **Attention**: FlashAttention-3 with page size 128, both auto-selected. M3's sparse step runs on the built-in Triton path, as on Blackwell (§2.1).
 - **CUDA graph**: on, with full decode-graph capture.
 
 **High-concurrency throughput (optional).** On Hopper the sparse prefill runs on the Triton path as a separate eager forward, which briefly stalls the in-flight decode batch under heavy concurrent load. Adding `--enable-mixed-chunk --chunked-prefill-size 2048` merges the running decodes into the prefill step instead of preempting them, which recovers roughly **+10% output throughput** and **~10% lower median TPOT** at high concurrency on 8×H200, with no change in accuracy. Leave it off for latency-sensitive low-concurrency serving.
@@ -402,7 +371,7 @@ Launch the prefill server, then the decode server — the same recipe with `--di
 
 <Tab title="Blackwell · MXFP8">
 
-On Blackwell the MXFP8 recipe — fa4, page size 128, deep_gemm MoE, and the MSA fast path (§2.1) — is auto-selected, so each role adds only the `--disaggregation-*` flags. This is the validated **2 × 4×B200** setup (TP4 prefill on node A, TP4 decode on node B); point `--disaggregation-ib-device` at your RDMA NIC(s).
+On Blackwell the MXFP8 recipe — fa4, page size 128, and deep_gemm MoE — is auto-selected, so each role adds only the `--disaggregation-*` flags. This is the validated **2 × 4×B200** setup (TP4 prefill on node A, TP4 decode on node B); point `--disaggregation-ib-device` at your RDMA NIC(s).
 
 ```bash Prefill server (node A)
 sglang serve \

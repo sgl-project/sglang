@@ -92,20 +92,14 @@ sgl-eval run mmmu_pro \\
   ],
 
   dockerImages: {
-    // NVIDIA: every cell stays on the image its verified rows were measured
-    // on. B200/B300/GB200/H200 keep the M3 dev images (bundle the MSA kernel;
-    // last 2026-06 builds — the dev lane is retired). GB300 moves to the
-    // versioned CUDA-13 release image: its recipe's decode split needs the
-    // page-128 trtllm_mha support that ships in tagged releases since
-    // v0.5.22, and its benchmark row was re-measured on that image. The
-    // release image does NOT bundle MiniMax's MSA kernel — on GB300 install
-    // it per the page's MSA section (required step for the measured fast
-    // path); without it the same recipe serves on the Triton sparse path.
-    b200: "lmsysorg/sglang:dev-minimax-m3",
-    b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
-    gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    // NVIDIA: the CUDA-13 release image (amd64+arm64, Hopper + Blackwell).
+    // Every NVIDIA cell was re-validated on it. It does not bundle MSA, so the
+    // sparse step runs on the built-in Triton path (recommended; see §2.1).
+    b200: "lmsysorg/sglang:v0.5.23-cu130",
+    b300: "lmsysorg/sglang:v0.5.23-cu130",
+    gb200: "lmsysorg/sglang:v0.5.23-cu130",
     gb300: "lmsysorg/sglang:v0.5.23-cu130",
-    h200: "lmsysorg/sglang:dev-cu12-minimax-m3",
+    h200: "lmsysorg/sglang:v0.5.23-cu130",
     // AMD ROCm images — published M3 builds, by arch (gfx942 -> mi30x, gfx950 -> mi35x).
     mi300x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
     mi325x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
@@ -203,10 +197,9 @@ sgl-eval run mmmu_pro \\
 
   // NVIDIA Blackwell: one validated single-node recipe per family — tp4 across
   // B300 / GB200 / GB300, tp8 on B200. fa4 + page 128 + deep_gemm are the M3
-  // SM100 auto-defaults on current main, so this is also the bare-launch
-  // behavior; they engage MiniMax's MSA sparse-attention kernel (fmha_sm100,
-  // installed per the MSA section — not bundled in the release image), Triton
-  // fallback otherwise.
+  // SM100 auto-defaults, so this is also the bare-launch behavior. The sparse
+  // step runs on the built-in Triton path; MSA (fmha_sm100) is not recommended
+  // on v0.5.22/v0.5.23 because it measured slower (see §2.1 on the page).
   // AMD: tp8. MI350X/MI355X (gfx950) serve MXFP8 natively (backends auto). MI300X/
   // MI325X (gfx942) need --attention-backend aiter + --moe-runner-backend triton,
   // and the MXFP8 weights are auto-converted to block-fp8 at load; the cold-start
@@ -268,9 +261,9 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      // GB300: decode uses FlashInfer trtllm-gen (trtllm_mha, ~2x faster than fa4
-      // on M3's decode shapes) while fa4 keeps serving prefill. Needs sglang >= 0.5.22
-      // and flashinfer >= 0.6.12 (the recipe image has both); B200/GB200 keep fa4-only.
+      // GB300: decode on FlashInfer trtllm-gen (trtllm_mha), prefill on fa4. On par with
+      // fa4-only on the card workloads; gains in long-context agentic serving (§2.1 Note).
+      // Needs sglang >= 0.5.22 and flashinfer >= 0.6.12. B200/GB200 keep fa4-only.
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -379,9 +372,9 @@ sgl-eval run mmmu_pro \\
       // Hopper (H200): MXFP8 MoE kernels are Blackwell-only, so Hopper serves the
       // full-precision bf16 build (MiniMaxAI/MiniMax-M3) at tp8 — bf16 weights don't
       // fit a single 4-GPU node. Everything else auto-resolves for Hopper: fa3
-      // attention, page_size 1, MoE auto-pins to Triton (the bf16 deep_gemm path is
-      // not used), decode keeps full CUDA graph; MSA (§2.1) is Blackwell-only so the
-      // sparse step runs on the built-in Triton fallback. See §2.4.
+      // attention, page_size 128, MoE auto-pins to Triton (the bf16 deep_gemm path is
+      // not used), decode keeps full CUDA graph; the sparse step runs on the built-in
+      // Triton path. See §2.4.
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
