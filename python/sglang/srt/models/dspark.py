@@ -18,7 +18,10 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logits_processor import (
+    bf16_lm_head_matmul,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
@@ -139,7 +142,7 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
         and weight.shape[-1] % 16 == 0
     ):
         return _fp8_lm_head_matmul(hidden, lm_head)
-    return torch.matmul(hidden.to(weight.dtype), weight.T)
+    return bf16_lm_head_matmul(hidden, weight)
 
 
 class VocabShard(msgspec.Struct, frozen=True):
