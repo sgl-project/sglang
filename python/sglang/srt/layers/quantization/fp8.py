@@ -61,6 +61,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
+    deepgemm_mxfp8_input_flashinfer_min_rows,
+    deepgemm_mxfp8_scale_to_flashinfer,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     deepgemm_w8a8_mxfp8_linear_with_fallback,
     dense_mxscale_wanted,
@@ -496,6 +498,16 @@ class Fp8Config(QuantizationConfig):
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
             )
+
+
+def _batch_invariant_or_deterministic() -> bool:
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.runtime_context import get_exec
+
+    return (
+        is_batch_invariant_mode_enabled()
+        or get_exec().deterministic.enable_deterministic_inference
+    )
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -1055,6 +1067,9 @@ class Fp8LinearMethod(LinearMethodBase):
             "weight_scale_inv_deepgemm",
             pack_mxfp8_weight_scale_for_deepgemm(scale_u8, n, k),
         )
+        layer.deepgemm_mxfp8_input_flashinfer_min_rows = (
+            deepgemm_mxfp8_input_flashinfer_min_rows(n, k)
+        )
         return True
 
     def _process_mxfp8_linear_weight_scale(
@@ -1417,13 +1432,20 @@ class Fp8LinearMethod(LinearMethodBase):
             and not self.mxfp8_dense_backend.is_deep_gemm()
         ):
             # DeepGEMM-packed activation scales; see LinearBase.deepgemm_mxfp8_input.
-            return deepgemm_w8a8_mxfp8_linear_with_fallback(
-                x[0],
-                layer.weight,
-                layer.weight_scale_inv_deepgemm,
-                input_scale=x[1],
-                bias=bias,
-            )
+            min_rows = getattr(layer, "deepgemm_mxfp8_input_flashinfer_min_rows", None)
+            if (
+                min_rows is None
+                or x[0].shape[0] < min_rows
+                or _batch_invariant_or_deterministic()
+            ):
+                return deepgemm_w8a8_mxfp8_linear_with_fallback(
+                    x[0],
+                    layer.weight,
+                    layer.weight_scale_inv_deepgemm,
+                    input_scale=x[1],
+                    bias=bias,
+                )
+            x = (x[0], deepgemm_mxfp8_scale_to_flashinfer(x[1]))
         elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
             # A legacy (q, scale) block-fp8 pair keeps the block kernel.
             mxfp8_view = False
@@ -1434,15 +1456,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_tensor = x[0] if isinstance(x, tuple) else x
                 num_tokens = input_tensor.numel() // input_tensor.shape[-1]
                 if num_tokens >= self.mxfp8_prefill_autotune_min_tokens:
-                    from sglang.srt.batch_invariant_ops import (
-                        is_batch_invariant_mode_enabled,
-                    )
-                    from sglang.srt.runtime_context import get_exec
-
-                    extra_kwargs["pin_tactic"] = (
-                        is_batch_invariant_mode_enabled()
-                        or get_exec().deterministic.enable_deterministic_inference
-                    )
+                    extra_kwargs["pin_tactic"] = _batch_invariant_or_deterministic()
             if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():

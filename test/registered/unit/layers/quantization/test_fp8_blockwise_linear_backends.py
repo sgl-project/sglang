@@ -402,6 +402,67 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
             with self.assertRaises(ValueError):
                 plain_layer.quant_method.apply(plain_layer, Mxfp8SwizzledInput(q, s))
 
+    def test_deepgemm_pair_input_routes_to_flashinfer(self):
+        if "flashinfer_cutedsl" not in _block32_backends():
+            self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")
+        from flashinfer import block_scale_interleave
+
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+        from sglang.srt.layers.quantization import fp8 as fp8_module
+
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        ):
+            n, k = 512, 2048
+            layer, w_dequant = self._build_layer(n, k)
+            layer.deepgemm_mxfp8_input = True
+            layer.quant_method.process_weights_after_loading(layer)
+            if not layer.deepgemm_mxfp8_input:
+                self.skipTest("DeepGEMM-packed MXFP8 input is not available")
+            self.assertEqual(
+                layer.deepgemm_mxfp8_input_flashinfer_min_rows,
+                fp8_utils.deepgemm_mxfp8_input_flashinfer_min_rows(n, k),
+            )
+
+            for rows in (200, 256):
+                with self.subTest(rows=rows):
+                    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) / 10
+                    q, s = sglang_per_token_group_quant_fp8(
+                        x,
+                        32,
+                        column_major_scales=True,
+                        scale_tma_aligned=True,
+                        scale_ue8m0=True,
+                    )
+                    swizzled = fp8_utils.deepgemm_mxfp8_scale_to_flashinfer(s)
+                    expected = block_scale_interleave(
+                        s.contiguous().view(torch.uint8).view(rows, k // 32)
+                    )
+                    self.assertTrue(torch.equal(swizzled.flatten(), expected.flatten()))
+
+                    outs = {}
+                    for min_rows in (None, rows + 1, rows):
+                        layer.deepgemm_mxfp8_input_flashinfer_min_rows = min_rows
+                        with mock.patch.object(
+                            fp8_module,
+                            "deepgemm_w8a8_mxfp8_linear_with_fallback",
+                            wraps=fp8_module.deepgemm_w8a8_mxfp8_linear_with_fallback,
+                        ) as dg:
+                            outs[min_rows] = layer.quant_method.apply(layer, (q, s))
+                        self.assertEqual(dg.call_count, 0 if min_rows == rows else 1)
+
+                    self.assertEqual(outs[rows].dtype, outs[None].dtype)
+                    ref = x.float() @ w_dequant.T
+                    assert_output_close(self, outs[rows], ref, rtol=5e-2, atol=1e-1)
+                    assert_output_close(
+                        self, outs[rows], outs[None].float(), rtol=1e-2, atol=1e-2
+                    )
+
 
 @unittest.skipUnless(get_device_sm() == 90, "Native block32 DeepGEMM requires SM90")
 class TestSm90Block32Linear(_LinearBackendCheck):

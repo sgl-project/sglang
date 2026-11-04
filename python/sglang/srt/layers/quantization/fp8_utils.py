@@ -1030,6 +1030,31 @@ def pack_mxfp8_weight_scale_for_deepgemm(
     )
 
 
+# (SM, N, K) -> rows from which a DeepGEMM-packed MXFP8 input runs faster through
+# FlashInfer, scale conversion included. Shapes not listed stay on DeepGEMM.
+_DEEPGEMM_MXFP8_INPUT_FLASHINFER_MIN_ROWS = {(107, 5120, 8192): 8192}
+
+
+def deepgemm_mxfp8_input_flashinfer_min_rows(n: int, k: int) -> Optional[int]:
+    return _DEEPGEMM_MXFP8_INPUT_FLASHINFER_MIN_ROWS.get((get_device_sm(), n, k))
+
+
+def deepgemm_mxfp8_scale_to_flashinfer(scale: torch.Tensor) -> torch.Tensor:
+    """DeepGEMM-packed UE8M0 activation scales ([rows, K // 128] int32, MN-major)
+    -> FlashInfer 128x4-swizzled UE8M0 bytes (flat uint8, padded rows * K // 32)."""
+    rows, k_tiles = scale.shape
+    padded = -(-rows // 128) * 128
+    if padded != rows:
+        scale = torch.nn.functional.pad(scale, (0, 0, 0, padded - rows))
+    return (
+        scale.view(padded // 128, 4, 32, k_tiles)
+        .permute(0, 3, 2, 1)
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1)
+    )
+
+
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():
