@@ -922,21 +922,14 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST} python setup.py install'
 
 # -----------------------
-# sgl-amd-mono (monokernel plugin; needs the sglang install above). A private
-# SGL_AMD_MONO_REPO clones with --secret id=github_token; the token is used for
-# the clone only and kept in no layer.
-RUN --mount=type=secret,id=github_token,required=false /bin/bash -lc 'set -euo pipefail; \
+# sgl-amd-mono (monokernel plugin; needs the sglang install above)
+RUN /bin/bash -lc 'set -euo pipefail; \
     [ "${ENABLE_SGL_AMD_MONO}" = "1" ] || { echo "[sgl-amd-mono] skip (ENABLE_SGL_AMD_MONO=${ENABLE_SGL_AMD_MONO})"; exit 0; }; \
     case "${GPU_ARCH}" in gfx950*) ;; *) echo "[sgl-amd-mono] skip (GPU_ARCH=${GPU_ARCH})"; exit 0 ;; esac; \
     python3 -m pip show sgl-amd-mono > /dev/null || { echo "[sgl-amd-mono] skip (this SGLang does not install it)"; exit 0; }; \
     commit="${SGL_AMD_MONO_COMMIT:-$(python3 -c "import json, importlib.metadata as md; print(json.loads(md.distribution(\"sgl-amd-mono\").read_text(\"direct_url.json\"))[\"vcs_info\"][\"commit_id\"])")}"; \
-    repo="${SGL_AMD_MONO_REPO}"; \
-    if [ -s /run/secrets/github_token ]; then \
-      repo="https://x-access-token:$(cat /run/secrets/github_token)@${repo#https://}"; \
-    fi; \
-    git clone "${repo}" /sgl-workspace/sgl-amd-mono; \
+    git clone "${SGL_AMD_MONO_REPO}" /sgl-workspace/sgl-amd-mono; \
     cd /sgl-workspace/sgl-amd-mono; \
-    git remote set-url origin "${SGL_AMD_MONO_REPO}"; \
     git checkout -f "${commit}"; \
     python3 -m pip install --no-cache-dir --no-deps -e .; \
     python3 -c "from importlib.metadata import entry_points; \
