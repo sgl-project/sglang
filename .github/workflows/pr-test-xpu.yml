@@ -196,7 +196,7 @@ jobs:
             --timeout-override kv_canary/test_self_unit_plan_input.py=120
             --timeout-override kernels/ops/kvcache/test_hisparse.py=120
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
+          docker exec -e SGLANG_IS_IN_CI=true ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
 
       - name: Cleanup container
         if: always()
@@ -290,7 +290,7 @@ jobs:
         run: |
           # xpu_b60.json is seeded with this flag on; without it the SYCL queue
           # is deep enough that step timings record host enqueue, not device time.
-          docker exec -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
+          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
