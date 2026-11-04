@@ -78,6 +78,21 @@ The Python engine exposes `kv_control(command)` and `async_kv_control(command)`.
 An inference request can attach the existing `KvHintsEnvelope` through
 `kv_hints`; other consumers' actions remain available to those consumers.
 
+Capability discovery advertises `read_batch` version `1.0` with `max_queries: 8`.
+Its `commands` list contains `capabilities`, `query`, `residency`, `claim`, and
+`events`. Submit `{"kind":"read_batch","context":CONTEXT,"version":"1.0",
+"queries":[QUERY,...]}` to execute 1–8 typed read queries in order during one
+owner turn. Every child carrying a context must exactly match the batch context,
+including caller, binding and owner epoch. Writes and nested batches are rejected
+before execution. A `capabilities` child has no context; the other four require it.
+The reply data is `{"version":"1.0","results":[DATA,...]}`,
+using each command's existing data format. Any child error returns the usual
+error for the whole batch; preceding reads may already have progressed state.
+This is not a global atomic snapshot: `events` can advance owner state, and
+clients must retain the existing watermark and invalidation checks. Existing
+transport response byte limits apply to the entire reply. Clients must negotiate
+this capability; older Engines reject `read_batch` and require single queries.
+
 Control commands use `engine_id`, `engine_epoch` and `namespace` from discovery,
 a caller-supplied `caller_id`, and a versioned envelope:
 

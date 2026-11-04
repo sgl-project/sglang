@@ -5038,3 +5038,9 @@ C16 首轮筛选出现六次工具观测异常：合法 scheduled Job 的 result
 新增独立 analyze_lifecycle_costs 入口，复用既有资源解析和轮次统计。按实际工作区间筛选资源采样，GPU 容量读取唯一 TP1 internal state，host/gpu 分配与活动 token 分开；CPU 仅按稳定 PID/create-time 区间计量，缺口、重启及捕获边界未知显式保留。存储增量需要同 epoch 的前后请求及完整响应证据，gauge 不差分，缺失/回退为 unknown；GET payload 与 wire bytes 分开。
 
 parent 阅读完整生产代码与测试差异，独立新增及既有分析 30 项通过，2.229s；覆盖缺失统计、计数重置、多池、PID 复用、坏记录、压缩分片、所有完成请求尾延迟与归档重放一致。日志：lifecycle-opt/lifecycle-costs-parent-tests.log。该工具只读离线证据，不改变运行负载或接受门槛。
+
+### O5 — 有界只读批量查询（Engine）
+
+新增经能力协商的 read_batch 1.0，最多八个非递归只读命令，复用 capabilities/query/residency/claim/events。执行任何 child 前验证全部 context 与顶层一致，复用既有 owner、校验、错误及传输通道；三动作 schema 保持原样。Events 可以推进状态，文档明确不承诺全局原子快照，Router 仍需验证水位和反馈失效。
+
+parent 阅读完整生产、文档及新测试差异，并独立执行 read_batch/service/feedback/protection CPU/HTTP 回归：49 项及 47 子测试通过；selected Ruff、isort、格式和 diff 检查通过。日志：lifecycle-opt/read-batch-parent-tests.log。覆盖数量/版本/递归/写命令拒绝、全量 context 预检、隔离、HTTP/msgpack、原错误和批内 generation 变化。Router 接入另提交，正在运行的旧测试进程保持原版本。
