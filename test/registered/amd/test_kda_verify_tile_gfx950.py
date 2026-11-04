@@ -23,7 +23,9 @@ class TestKDAVerifyTileGfx950(CustomTestCase):
 
         for n, bv in ((1, 4), (2, 4), (3, 8), (8, 8), (9, 16), (16, 16), (17, 32)):
             self.assertEqual(cfg(n, 16, 16, 128, 128, True, True), (bv, 1), f"n={n}")
-        self.assertEqual(cfg(1, 8, 8, 128, 128, True, True), (4, 1))
+        self.assertEqual(cfg(1, 8, 8, 128, 128, True, True), (32, 1))
+        self.assertEqual(cfg(1, 12, 12, 128, 128, True, True), (8, 1))
+        self.assertEqual(cfg(5, 12, 12, 128, 128, True, True), (32, 1))
         self.assertEqual(cfg(1, 17, 17, 128, 128, True, True), (32, 1))
         self.assertEqual(cfg(1, 32, 32, 128, 128, True, True), (32, 1))
         self.assertEqual(cfg(1, 16, 16, 128, 128, True, False), (32, 1))

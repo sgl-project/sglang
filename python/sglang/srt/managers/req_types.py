@@ -6,6 +6,7 @@ can use them without loading the runtime.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 from typing import (
@@ -23,6 +24,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -61,6 +63,17 @@ def get_return_hidden_states_mode(
     raise ValueError(
         "return_hidden_states must be a boolean or the string literal 'last'."
     )
+
+
+def get_request_return_hidden_states_mode(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> CaptureHiddenMode:
+    if isinstance(return_hidden_states, list):
+        return max(
+            (get_return_hidden_states_mode(mode) for mode in return_hidden_states),
+            default=CaptureHiddenMode.NULL,
+        )
+    return get_return_hidden_states_mode(return_hidden_states)
 
 
 def _compute_pad_values(identity: bytes) -> Tuple[int, ...]:
@@ -473,3 +486,284 @@ class MultimodalProcessorOutput(
                     )
                 token_modalities[start : end + 1] = [modality] * (end - start + 1)
         return token_modalities
+
+
+class BaseFinishReason:
+    def to_json(self):
+        raise NotImplementedError()
+
+
+class FINISH_MATCHED_TOKEN(BaseFinishReason):
+    def __init__(self, matched: Union[int, List[int]]):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISH_MATCHED_STR(BaseFinishReason):
+    def __init__(self, matched: str):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISHED_MATCHED_REGEX(BaseFinishReason):
+    def __init__(self, matched: str):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISH_LENGTH(BaseFinishReason):
+    def __init__(self, length: int):
+        super().__init__()
+        self.length = length
+
+    def to_json(self):
+        return {
+            "type": "length",  # to match OpenAI API's return value
+            "length": self.length,
+        }
+
+
+class FINISH_ABORT(BaseFinishReason):
+    def __init__(self, message=None, status_code=None, err_type=None):
+        super().__init__()
+        self.message = message or "Aborted"
+        self.status_code = status_code
+        self.err_type = err_type
+
+    def to_json(self):
+        return {
+            "type": "abort",
+            "message": self.message,
+            "status_code": self.status_code,
+            "err_type": self.err_type,
+        }
+
+
+@dataclasses.dataclass
+class MultimodalInputs:
+    """The multimodal data related inputs."""
+
+    # items of data
+    mm_items: List[MultimodalDataItem]
+    padded_input_ids: Optional[List[int]] = None
+    image_pad_len: Optional[list] = None
+    num_image_tokens: Optional[int] = None
+    token_modalities: Optional[List[int]] = None
+
+    # image
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+
+    # video
+    video_token_id: Optional[int] = None
+
+    # audio
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
+    mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+
+    # Moss-VL related
+    vision_position_ids: Optional[torch.Tensor] = None
+    media_nums_per_sample: Optional[List[int]] = None
+    visible_frame_counts: Optional[torch.Tensor] = None
+
+    def release_features(self):
+        """Release feature tensors to free GPU memory."""
+        for item in self.mm_items:
+            try:
+                # Release both deferred features that were never used and
+                # borrowed features retained for possible re-prefill.
+                item.release_transport_proxies()
+            except Exception:
+                logger.warning(
+                    "Failed to release an unused multimodal feature transport",
+                    exc_info=True,
+                )
+            finally:
+                item.feature = None
+
+    @staticmethod
+    def from_processor_output(
+        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
+    ):
+        mm_items = obj.mm_items
+        assert isinstance(mm_items, list)
+        mm_items = [item for item in mm_items if item.is_valid()]
+
+        # try reconstructing from cuda-ipc
+        reconstruct_device = None
+        try:
+            for mm_item in mm_items:
+                if (
+                    mm_item.has_cuda_ipc_proxy()
+                    and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
+                ):
+                    if reconstruct_device is None:
+                        reconstruct_device = torch.cuda.current_device()
+                    mm_item.reconstruct(reconstruct_device)
+        except BaseException:
+            for mm_item in mm_items:
+                mm_item.release_transport_proxies()
+            raise
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            # Multi-modal feature hashing optimization:
+            # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
+            # for faster hash computation, while avoiding OOM issues.
+            from sglang.srt.managers.mm_utils import (
+                init_feature_buffer,
+                is_feature_buffer_initialized,
+                reset_buffer_offset,
+                try_add_to_buffer,
+            )
+
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if not is_feature_buffer_initialized():
+                init_feature_buffer(device)
+            reset_buffer_offset()
+            for item in mm_items:
+                if item.feature is not None:
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = try_add_to_buffer(item.feature)
+
+        token_modalities = (
+            MultimodalProcessorOutput.build_token_modalities(obj.input_ids, mm_items)
+            if requires_mm_token_modalities
+            else None
+        )
+
+        for item in mm_items:
+            item.set_pad_value()
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            for item in mm_items:
+                if item.feature is not None:
+                    item.feature = item.feature.to("cpu", non_blocking=True)
+
+        mm_inputs = MultimodalInputs(
+            mm_items=mm_items,
+            padded_input_ids=obj.padded_input_ids,
+            token_modalities=token_modalities,
+        )
+        optional_args = [
+            "mrope_positions",
+            "mrope_position_delta",
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "video_token_id",
+            "slice_start_id",
+            "slice_end_id",
+            "audio_start_id",
+            "audio_end_id",
+            "audio_token_id",
+            "vision_position_ids",
+            "media_nums_per_sample",
+            "visible_frame_counts",
+        ]
+        for arg in optional_args:
+            val = getattr(obj, arg, None)
+            if val is not None:
+                setattr(mm_inputs, arg, val)
+
+        return mm_inputs
+
+    def contains_image_inputs(self) -> bool:
+        return any(item.is_image() for item in self.mm_items)
+
+    def contains_video_inputs(self) -> bool:
+        return any(item.is_video() for item in self.mm_items)
+
+    def contains_audio_inputs(self) -> bool:
+        return any(item.is_audio() for item in self.mm_items)
+
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
+
+    def compute_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Count prompt tokens consumed by each modality (image, audio, video).
+
+        A modality's token count is the total span covered by its items'
+        offsets. Returns a (image_tokens, audio_tokens, video_tokens) tuple.
+        """
+        image_tokens = audio_tokens = video_tokens = 0
+        for item in self.mm_items:
+            if not item.offsets:
+                continue
+            num_tokens = sum(end - start + 1 for start, end in item.offsets)
+            if item.is_image():
+                image_tokens += num_tokens
+            elif item.is_audio():
+                audio_tokens += num_tokens
+            elif item.is_video():
+                video_tokens += num_tokens
+        return image_tokens, audio_tokens, video_tokens
+
+    def merge(self, other: MultimodalInputs):
+
+        # args needed to be merged
+        optional_args = [
+            "mm_items",
+            "image_pad_len",
+        ]
+        for arg in optional_args:
+            self_arg = getattr(self, arg, None)
+            if self_arg is not None:
+                setattr(self, arg, self_arg + getattr(other, arg))
+
+        if other.token_modalities is not None:
+            if self.token_modalities is None:
+                self.token_modalities = list(other.token_modalities)
+            else:
+                self.token_modalities += other.token_modalities
+
+        mrope_positions = self.mrope_positions
+        if mrope_positions is not None:
+            if other.mrope_positions is None:
+                self.mrope_positions = mrope_positions
+            else:
+                self.mrope_positions = torch.cat(
+                    [self.mrope_positions, other.mrope_positions], dim=1
+                )
+
+        mrope_position_delta = self.mrope_position_delta
+        if mrope_position_delta is not None:
+            if other.mrope_position_delta is None:
+                self.mrope_position_delta = mrope_position_delta
+            else:
+                self.mrope_position_delta = torch.cat(
+                    [self.mrope_position_delta, other.mrope_position_delta], dim=0
+                )
+
+        for key, val in other.__dict__.items():
+            if "_id" in key:
+                # set token_ids
+                if getattr(self, key, None) is None:
+                    setattr(self, key, getattr(other, key, None))
+        # other args would be kept intact

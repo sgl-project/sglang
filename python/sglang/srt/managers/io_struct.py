@@ -2025,7 +2025,7 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+    """Sent by each tokenizer worker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 
@@ -2365,6 +2365,10 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+    def matches(self, rid: str) -> bool:
+        """Whether this abort targets the request `rid`."""
+        return self.abort_all or rid.startswith(self.rid)
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):

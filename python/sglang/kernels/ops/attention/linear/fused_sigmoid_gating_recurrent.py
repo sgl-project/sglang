@@ -48,15 +48,27 @@ def _select_recurrent_launch_config(
         _is_hip
         and _is_gfx95
         and is_kda
+        and 0 < n <= 4
+        and h == hv == 12
+        and k == 128
+        and v == 128
+    ):
+        # Kimi-K3 TP8 (12 heads) gets 48 CTAs at BV=32; tuned on MI355X at n=1 and n=4,
+        # where BV=8 is 15.2 vs 19.9 us at n=1, T=8. One warp matches BV=32 bit for bit.
+        return 8, 1
+    if (
+        _is_hip
+        and _is_gfx95
+        and is_kda
         and target_verify
         and 0 < n <= 16
-        and hv <= 16
+        and hv == 16
         and k == 128
         and v == 128
     ):
         # One wave per program; narrower V tiles widen the grid past the 64
         # programs of BV=32 at TP4 small batch. Bit-identical across BV. Only
-        # measured up to 16 heads per GPU (GLM-5.3-Flash TP4).
+        # measured at 16 heads per GPU (GLM-5.3-Flash TP4).
         return (4 if n <= 2 else 8 if n <= 8 else 16), 1
     if (
         target_verify
