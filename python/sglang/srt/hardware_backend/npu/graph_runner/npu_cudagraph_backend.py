@@ -49,8 +49,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-ACL_EVENT_SYNC = 0x01
-ACL_EVENT_RECORD_EXTERNAL = 0x01
+# CANN acl_rt.h flags belong to separate creation and recording APIs.
+ACL_EVENT_SYNC = 0x01  # Create an event for cross-stream synchronization.
+ACL_EVENT_RECORD_EXTERNAL = 0x01  # Keep the graph record visible outside the graph.
 
 
 def _check_acl_error(result, function, args):
@@ -61,6 +62,8 @@ def _check_acl_error(result, function, args):
 
 @cache
 def _event_api():
+    # pyACL lacks record_event_with_flag; torch.npu.ExternalEvent requires reset.
+    # Bind the CANN APIs directly for a graph record that needs no reset.
     library = ctypes.CDLL("libascendcl.so")
     signatures = {
         "aclrtCreateEventExWithFlag": (
@@ -157,18 +160,19 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     @property
     def supports_shared_read_events(self) -> bool:
-        # QFA snapshots shared pool mappings inside the graph. Preserve the
-        # existing event behavior for the other NPU attention paths.
-        return self._use_flash_attn
+        # In-graph metadata reads shared pool mappings before recording read-done.
+        return self._use_in_graph_metadata
 
     @property
     def cache_loc_dtype(self):
         return torch.int32
 
     @property
-    def _use_flash_attn(self):
-        cache_layout = self._decode_runner.model_runner.kv_cache_configurator.modelslim_cache_layout
-        return cache_layout is not None and cache_layout.layout == "gqa_mxfp8"
+    def _use_in_graph_metadata(self):
+        attn_backend = self._decode_runner.attn_backend
+        # Hybrid models delegate dense attention metadata to the full backend.
+        attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+        return getattr(attn_backend, "use_in_graph_metadata", False)
 
     def get_update_attr_name(self):
         """Preserve each runner's existing captured attention update protocol."""
@@ -283,9 +287,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         runner = self._decode_runner
         if runner is None or forward_batch.needs_forward_metadata_init():
             return False
-        if self._use_flash_attn:
-            # Use the common runner's device input staging, including pre-planned
-            # batches. QFA rebuilds its metadata inside the captured graph.
+        if self._use_in_graph_metadata:
+            # False delegates to the common runner's load_batch: stage device
+            # inputs for in-graph metadata, including pre-planned batches.
             return False
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
@@ -540,7 +544,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         runner = self._decode_runner
-        if runner is not None and not self._use_flash_attn:
+        # In-graph metadata needs no FIA host-length rebinding; replay still runs.
+        if runner is not None and not self._use_in_graph_metadata:
             from sglang.srt.speculative import (
                 multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,
             )

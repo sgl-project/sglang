@@ -6,7 +6,6 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
@@ -86,24 +85,6 @@ def _init_npu_conv_state(
     return conv_state
 
 
-def init_mxfp8_kv_scales(model, pool, cache_layout):
-    # Draft steps share the same pool; initialize its static scales only once.
-    full_pool = pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
-    if full_pool._mxfp8_scales_initialized:
-        return
-    for module in model.modules():
-        scheme = getattr(module, "scheme", None)
-        if getattr(scheme, "cache_layout", None) == cache_layout:
-            # Keep the hybrid pool's global-to-local layer mapping.
-            _, v_scale = pool.get_kv_scale_buffer(module.layer_id)
-            v_scale.copy_(
-                scheme.v_scale_encoded.view(
-                    1, v_scale.shape[1], 1, v_scale.shape[-2], 1
-                )
-            )
-    full_pool._mxfp8_scales_initialized = True
-
-
 class NPUMHATokenToKVPool(MHATokenToKVPool):
     def __init__(
         self,
@@ -162,25 +143,22 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            pages = self.size // self.page_size + 1
+            if self.is_modelslim_mxfp8:
+                shape = (self.layer_num, pages, self.head_num, self.page_size)
+            else:
+                shape = (self.layer_num, pages, self.page_size, self.head_num)
+            k_buffer = torch.zeros(
+                (*shape, self.head_dim), dtype=self.store_dtype, device=self.device
+            )
+            v_buffer = torch.zeros(
+                (*shape, self.v_head_dim), dtype=self.store_dtype, device=self.device
+            )
             if self.is_modelslim_mxfp8:
                 self._mxfp8_scales_initialized = False
-                pages = self.size // self.page_size + 1
-                shape = (self.layer_num, pages, self.head_num, self.page_size)
                 # QFA uses PA_BNBD, with pairs of per-32 UE8M0 scales.
-                self.k_buffer = list(
-                    torch.zeros(
-                        (*shape, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    ).unbind(0)
-                )
-                self.v_buffer = list(
-                    torch.zeros(
-                        (*shape, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    ).unbind(0)
-                )
+                self.k_buffer = list(k_buffer.unbind(0))
+                self.v_buffer = list(v_buffer.unbind(0))
                 self.k_scale_buffer = list(
                     torch.full(
                         (*shape, self.head_dim // 64, 2),
@@ -213,28 +191,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # capture does not retain the full multi-layer tensor. HiCache's
             # NPU exchange operator still requires the original contiguous
             # [layer, page, token, head, dim] allocation.
-            self._hicache_k_buffer = torch.zeros(
-                (
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self._hicache_v_buffer = torch.zeros(
-                (
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.v_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
+            self._hicache_k_buffer = k_buffer
+            self._hicache_v_buffer = v_buffer
             # Keep a reference to the contiguous tensor for HiCache
             # D2H/H2D transfers (transfer_kv_dim_exchange expects a
             # tensor, not the per-layer list used in FIA mode below).
