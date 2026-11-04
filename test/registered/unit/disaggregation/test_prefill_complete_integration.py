@@ -779,7 +779,7 @@ class TestAllocationIntegration(CustomTestCase):
 
         schedulers = []
         for pp_rank, sender in enumerate(senders):
-            req = SimpleNamespace(
+            req = FakeReq(
                 rid="pending",
                 disagg_kv_sender=sender,
                 pending_bootstrap=True,
@@ -788,23 +788,27 @@ class TestAllocationIntegration(CustomTestCase):
             )
             scheduler = self.inflight_scheduler([] if waiting else [req])
             scheduler.pp_group = None
-            scheduler.waiting_queue = [req] if waiting else []
+            scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
+            if waiting:
+                scheduler.waiting_queue.join([req])
             scheduler.handle_bootstrap_failure = Mock()
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
-            queue.queue = []
+            queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
             if queued_senders is not None:
-                queue.queue.append(
-                    SimpleNamespace(
-                        rid="queued",
-                        disagg_kv_sender=queued_senders[pp_rank],
-                        pending_bootstrap=True,
-                        to_finish=None,
-                        finished_reason=None,
-                        prefill_attempt_count=0,
-                        is_retracted=False,
-                        metadata_buffer_index=0,
-                        time_stats=MagicMock(),
-                    )
+                queue.queue.join(
+                    [
+                        FakeReq(
+                            rid="queued",
+                            disagg_kv_sender=queued_senders[pp_rank],
+                            pending_bootstrap=True,
+                            to_finish=None,
+                            finished_reason=None,
+                            prefill_attempt_count=0,
+                            is_retracted=False,
+                            metadata_buffer_index=0,
+                            time_stats=MagicMock(),
+                        )
+                    ]
                 )
             queue.pp_rank, queue.pp_size = pp_rank, len(senders)
             queue.pp_poll_sync_work_list = []
@@ -851,7 +855,7 @@ class TestAllocationIntegration(CustomTestCase):
             self.assertTrue(req.pending_bootstrap)
             # The queued request is admitted on the same shared poll.
             self.assertEqual([r.rid for r in scheduler.waiting_queue], ["queued"])
-            self.assertEqual(scheduler.disagg_prefill_bootstrap_queue.queue, [])
+            self.assertEqual(list(scheduler.disagg_prefill_bootstrap_queue.queue), [])
         stages[0].update_status(1, KVPoll.WaitingForInput)
         self.wait_until(
             lambda: (
@@ -863,7 +867,7 @@ class TestAllocationIntegration(CustomTestCase):
         for scheduler, req in zip(schedulers, reqs):
             scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
             self.assertFalse(req.pending_bootstrap)
-            self.assertEqual(scheduler.disagg_prefill_transfer_queue, [req])
+            self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [req])
 
     def test_pp_stage_local_bootstrap_failure_drops_parked_prefill_everywhere(self):
         stages = self.pp_stages(2)
@@ -876,7 +880,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.pp_step(schedulers)
         for scheduler, req in zip(schedulers, reqs):
             scheduler.handle_bootstrap_failure.assert_called_once_with(req)
-            self.assertEqual(scheduler.disagg_prefill_transfer_queue, [])
+            self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
             scheduler.send_kv_chunk.assert_not_called()
 
     def test_pp_stage_local_bootstrap_failure_drops_waiting_prefill_everywhere(self):
@@ -891,21 +895,19 @@ class TestAllocationIntegration(CustomTestCase):
         self.pp_step(schedulers)
         for scheduler, req in zip(schedulers, reqs):
             scheduler.handle_bootstrap_failure.assert_called_once_with(req)
-            self.assertEqual(scheduler.waiting_queue, [])
+            self.assertEqual(list(scheduler.waiting_queue), [])
 
     def test_pp_release_leaves_parked_prefill_to_consensus(self):
         """The release poll is stage-local: failing a parked request there lets
         the stages' parked sets diverge and the next consensus poll misalign."""
         sender = self.sender()
         sender.abort()
-        req = SimpleNamespace(
-            rid="parked", disagg_kv_sender=sender, pending_bootstrap=True
-        )
+        req = FakeReq(rid="parked", disagg_kv_sender=sender, pending_bootstrap=True)
         scheduler = self.inflight_scheduler([req])
         scheduler.handle_bootstrap_failure = Mock()
         scheduler.process_disagg_prefill_transfer_queue(rids_to_check={"parked": True})
         scheduler.handle_bootstrap_failure.assert_not_called()
-        self.assertEqual(scheduler.disagg_prefill_transfer_queue, [req])
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [req])
 
     def test_pp_consensus_fails_when_stages_order_requests_differently(self):
         """Stages holding as many requests as PP0 per queue, or in total, but in
