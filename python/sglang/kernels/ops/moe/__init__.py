@@ -61,14 +61,6 @@ register_kernel(
         capabilities=_HIP,
     )
 )
-register_kernel(
-    KernelSpec(
-        op="moe.topk_softmax",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
-        capabilities=CUDA_ONLY,
-    )
-)
 
 
 register_kernel(
@@ -266,6 +258,22 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shuffle_rows_with_scales:shuffle_rows_with_scales",
         capabilities=CUDA_ONLY,
+    )
+)
+
+# EPLB logical->physical expert id remap fused with the per-expert count.
+register_kernel(
+    KernelSpec(
+        op="moe.eplb_map_and_record",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:eplb_map_and_record",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.record_physical_counts",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:record_physical_counts",
     )
 )
 
