@@ -1853,8 +1853,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                 )
 
-        # A self-reference in the helper would keep params_dict (and pre-repack
-        # Parameters) alive until cyclic GC runs.
+        # Print warning once per load_weights() call
         ple_warned_downcast = False
 
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
