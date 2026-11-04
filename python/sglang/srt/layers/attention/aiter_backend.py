@@ -142,10 +142,8 @@ def _asm_cprr_supports_shape(
     v_head_dim: int,
 ) -> bool:
     """Whether aiter schedules this head count natively at this query length."""
-    allowed = _MLA_ASM_CPRR_NATIVE_QLENS.get(heads, frozenset())
-    in_table = allowed is None or q_len in allowed
     if get_mla_decode_shape_support is None:
-        return in_table
+        return _in_asm_cprr_native_table(heads, q_len)
     support = get_mla_decode_shape_support(
         num_heads=heads,
         max_seqlen_qo=q_len,
@@ -162,8 +160,13 @@ def _asm_cprr_supports_shape(
     # has no kernel table for the selected backend; then the copied table decides
     # availability, but never against a fold.
     if support.supported is None:
-        return support.native and in_table
+        return support.native and _in_asm_cprr_native_table(heads, q_len)
     return support.native and support.supported
+
+
+def _in_asm_cprr_native_table(heads: int, q_len: int) -> bool:
+    allowed = _MLA_ASM_CPRR_NATIVE_QLENS.get(heads, frozenset())
+    return allowed is None or q_len in allowed
 
 
 def _asm_cprr_kernel_heads(gathered_heads: int, supports: Callable[[int], bool]) -> int:
@@ -495,19 +498,16 @@ class AiterAttnBackend(AttentionBackend):
             ]
         # Only the MLA DCP target verify reads these. Its absorbed attention
         # writes the kv_lora_rank-wide latent, not the model's v_head_dim.
-        self.cprr_v_head_dim = (
-            model_runner.model_config.kv_lora_rank if self.use_mla else 0
-        )
-        self.cprr_kernel_heads = (
-            _asm_cprr_kernel_heads(
+        self.cprr_v_head_dim = 0
+        self.cprr_kernel_heads = 0
+        if self.use_mla and self.dcp_world_size > 1:
+            self.cprr_v_head_dim = model_runner.model_config.kv_lora_rank
+            self.cprr_kernel_heads = _asm_cprr_kernel_heads(
                 self.num_head * self.dcp_world_size,
                 lambda heads: self._asm_cprr_supports(
                     heads, self.num_draft_tokens or 1
                 ),
             )
-            if self.use_mla and self.dcp_world_size > 1
-            else 0
-        )
 
         # The asm fp8 prefill reduces through mla_reduce_v1, which only has
         # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS; anything
