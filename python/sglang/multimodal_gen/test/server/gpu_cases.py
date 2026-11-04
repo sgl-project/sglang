@@ -1683,6 +1683,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
+        "../single_test_file/test_usp_strided_qkv_aiter_2_gpu.py",
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
@@ -1743,6 +1744,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
+        # no model load; skipped outside ROCm, where it runs eight exchanges
+        "../single_test_file/test_usp_strided_qkv_aiter_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
