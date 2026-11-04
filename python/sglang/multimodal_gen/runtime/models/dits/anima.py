@@ -83,9 +83,8 @@ def _is_anima_block(name, module):
 
 
 def _anima_residual_add(residual, update, gate):
-    # The fused kernel saves GPU time, but its dispatch is slower in eager.
-    # BCG marks both its pre-capture warmup and capture with this context.
-    if not torch.compiler.is_compiling() and is_in_breakable_cuda_graph():
+    # Fuse in BCG warmup/capture; dispatch overhead outweighs the savings in eager.
+    if is_in_breakable_cuda_graph() and not torch.compiler.is_compiling():
         return residual_gate_add(residual, update, gate)
     return residual + gate * update
 
