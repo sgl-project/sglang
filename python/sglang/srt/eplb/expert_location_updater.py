@@ -23,6 +23,8 @@ from torch.distributed import P2POp
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import (
+    TARGET_EXPERT_LOCATION_FAMILY,
+    ExpertLocationFamily,
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
@@ -54,6 +56,7 @@ class ExpertLocationUpdater:
         nnodes: int,
         rank: int,
         use_flat_topology: bool = False,
+        family: ExpertLocationFamily = TARGET_EXPERT_LOCATION_FAMILY,
     ):
         """
         Update experts' physical location after EPLB.
@@ -65,7 +68,7 @@ class ExpertLocationUpdater:
             self._first_execution = False
             torch.get_device_module().empty_cache()
 
-        old_expert_location_metadata = get_global_expert_location_metadata()
+        old_expert_location_metadata = get_global_expert_location_metadata(family)
         assert old_expert_location_metadata is not None
         topology_num_nodes = 1 if use_flat_topology else nnodes
 

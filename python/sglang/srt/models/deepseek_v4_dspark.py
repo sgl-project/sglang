@@ -16,7 +16,8 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import draft_expert_distribution_scope
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
@@ -38,6 +39,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -45,6 +51,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common.utils import _is_cuda
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4CudaDecoderLayer,
@@ -69,6 +76,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    dspark_num_stages,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -741,10 +749,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
-        if dspark_config.target_layer_ids is not None:
-            self.num_stages = len(dspark_config.target_layer_ids)
-        else:
-            self.num_stages = int(getattr(config, "num_nextn_predict_layers", 1) or 1)
+        self.num_stages = dspark_num_stages(draft_hf_config=config)
 
         target_num_layers = (
             int(dspark_config.num_target_layers)
@@ -838,6 +843,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         if self.lm_head is not None:
             self.markov_head.configure_tp_shard(lm_head=self.lm_head)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=dspark_num_stages(draft_hf_config=config),
+            num_logical_experts=_dspark_stage_config(config).n_routed_experts,
+            num_groups=None,
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return {
+            stage.layer_id: stage.mlp.get_moe_weights()
+            for stage in self.stages
+            if isinstance(stage.mlp, DeepseekV2MoE)
+        }
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -955,13 +976,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pre = None
         if _is_cuda:
             residual_batch.start(forward_batch)
-        # Draft stages do not have recorder layer indices.
-        with get_global_expert_distribution_recorder().disable_this_region():
+        with draft_expert_distribution_scope() as draft_recorder:
             for stage in self.stages:
-                if _is_cuda:
-                    x = stage(positions, x, forward_batch)
-                else:
-                    x, pre = stage(positions, x, forward_batch, pre)
+                with (
+                    draft_recorder.with_current_layer(stage.layer_id)
+                    if draft_recorder is not None
+                    and not check_cuda_graph_backend(
+                        Phase.PREFILL, Backend.TC_PIECEWISE
+                    )
+                    else nullcontext()
+                ):
+                    if _is_cuda:
+                        x = stage(positions, x, forward_batch)
+                    else:
+                        x, pre = stage(positions, x, forward_batch, pre)
         if _is_cuda:
             x = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None

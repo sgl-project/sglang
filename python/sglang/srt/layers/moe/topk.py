@@ -97,6 +97,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import (
+    TARGET_EXPERT_LOCATION_FAMILY,
+    ExpertLocationFamily,
+    resolve_layer_expert_location_family,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -719,7 +724,7 @@ def _can_bypass_trtllm_routing(config: TopKConfig) -> bool:
 def resolve_routing_inputs(
     *,
     layer_id: int,
-    is_draft: bool,
+    expert_location_family: Optional[ExpertLocationFamily],
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
@@ -727,10 +732,12 @@ def resolve_routing_inputs(
         get_bound = get_forward_context().moe_num_token_non_padded
         if get_bound is not None:
             num_token_non_padded = get_bound()
-    if is_draft:
+    if expert_location_family is None:
         expert_location_dispatch_info = None
     elif expert_location_dispatch_info is None:
-        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id)
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id, family=expert_location_family
+        )
     return num_token_non_padded, expert_location_dispatch_info
 
 
@@ -770,6 +777,9 @@ class TopK(BaseFusedOp):
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
         fused_gate_packed_ids: bool = False,
+        expert_location_family: Optional[
+            ExpertLocationFamily
+        ] = TARGET_EXPERT_LOCATION_FAMILY,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -781,6 +791,9 @@ class TopK(BaseFusedOp):
         self.layer_id = layer_id
         self.is_draft = (
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
+        )
+        self.expert_location_family = resolve_layer_expert_location_family(
+            expert_location_family, is_draft=self.is_draft
         )
         self._runner_backend_bound = False
 
@@ -817,14 +830,16 @@ class TopK(BaseFusedOp):
         )
 
     def routing_inputs(self):
-        return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
+        return resolve_routing_inputs(
+            layer_id=self.layer_id, expert_location_family=self.expert_location_family
+        )
 
     def _resolve_routing_inputs(
         self, num_token_non_padded, expert_location_dispatch_info
     ):
         return resolve_routing_inputs(
             layer_id=self.layer_id,
-            is_draft=self.is_draft,
+            expert_location_family=self.expert_location_family,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )

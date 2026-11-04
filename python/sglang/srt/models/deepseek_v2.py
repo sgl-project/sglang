@@ -66,7 +66,11 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location import (
+    TARGET_EXPERT_LOCATION_FAMILY,
+    ModelConfigForExpertLocation,
+    draft_expert_location_family,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -754,9 +758,15 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        uses_expert_location = not (is_nextn and is_deepseek_v4)
+        expert_location_family = (
+            draft_expert_location_family()
+            if is_nextn and is_deepseek_v4
+            else TARGET_EXPERT_LOCATION_FAMILY
+        )
         num_redundant_experts = (
-            get_exec().moe.ep_num_redundant_experts if uses_expert_location else 0
+            get_exec().moe.ep_num_redundant_experts
+            if expert_location_family is not None
+            else 0
         )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_experts_for_moe + num_redundant_experts,
@@ -772,7 +782,7 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
-            uses_expert_location=uses_expert_location,
+            expert_location_family=expert_location_family,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
@@ -784,6 +794,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
+                expert_location_family=self.experts.expert_location_family,
             )
             # Hash routing folds the factor only when its flag asks for it.
             self.routed_scaling_factor_fused_in_topk = (
@@ -794,6 +805,7 @@ class DeepseekV2MoE(nn.Module):
             topk_kwargs = dict(
                 top_k=config.num_experts_per_tok,
                 layer_id=self.layer_id,
+                expert_location_family=self.experts.expert_location_family,
                 renormalize=config.norm_topk_prob,
                 use_grouped_topk=True,
                 num_expert_group=config.n_group,

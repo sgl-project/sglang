@@ -59,6 +59,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.draft_expert_location import init_draft_expert_location
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -68,6 +69,7 @@ from sglang.srt.eplb.expert_distribution import (
     should_advance_eplb_counter,
 )
 from sglang.srt.eplb.expert_location import (
+    TARGET_EXPERT_LOCATION_FAMILY,
     ExpertLocationMetadata,
     append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
@@ -740,6 +742,7 @@ class ModelRunner:
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
+        self.init_expert_location_family()
         self.maybe_init_lplb_solvers()
         self.maybe_init_eplb_manager()
         self.expert_location_updater = ExpertLocationUpdater()
@@ -816,6 +819,17 @@ class ModelRunner:
                 get_global_expert_location_metadata(),
                 rank=expert_rank,
             )
+        )
+
+    def init_expert_location_family(self):
+        """Pick the placement family this runner's MoE layers follow and record into."""
+        self.expert_location_family = (
+            init_draft_expert_location(
+                model_config=self.model_config,
+                moe_ep_rank=get_parallel().moe_ep_rank,
+            )
+            if self.is_draft_worker
+            else TARGET_EXPERT_LOCATION_FAMILY
         )
 
     def maybe_init_lplb_solvers(self):
@@ -1905,7 +1919,9 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
-            get_global_expert_distribution_recorder().with_forward_pass(
+            get_global_expert_distribution_recorder(
+                self.expert_location_family
+            ).with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,

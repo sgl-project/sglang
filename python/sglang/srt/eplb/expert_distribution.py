@@ -40,6 +40,11 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location import (
+    DRAFT_EXPERT_LOCATION_FAMILY,
+    TARGET_EXPERT_LOCATION_FAMILY,
+    ExpertLocationFamily,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -138,6 +143,8 @@ class ExpertDistributionRecorder(ABC):
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        *,
+        report_balancedness: bool = True,
     ):
         if get_exec().moe.expert_distribution_recorder_mode is not None:
             assert expert_location_metadata is not None, (
@@ -145,7 +152,11 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
+            return _ExpertDistributionRecorderReal(
+                expert_location_metadata,
+                rank,
+                report_balancedness=report_balancedness,
+            )
         else:
             return _ExpertDistributionRecorderNoop()
 
@@ -169,6 +180,11 @@ class ExpertDistributionRecorder(ABC):
         pass
 
     def get_current_pass_count_buffer(self):
+        return None
+
+    def get_current_pass_local_count_buffer(
+        self, *, num_experts: int, ep_rank: int, ep_size: int
+    ) -> Optional[torch.Tensor]:
         return None
 
     def on_deepep_dispatch_normal(
@@ -213,6 +229,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        *,
+        report_balancedness: bool = True,
     ):
         self._expert_location_metadata = expert_location_metadata
 
@@ -222,13 +240,15 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
+        self._accumulator = _Accumulator.init_new(
+            expert_location_metadata, rank, report_balancedness=report_balancedness
+        )
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
-        if reports_expert_balancedness():
+        if report_balancedness and reports_expert_balancedness():
             logger.info(
                 "ExpertDistributionRecorder auto start record since "
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
@@ -291,6 +311,19 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
             return None
         return gatherer._data[self._current_layer_idx.value]
+
+    def get_current_pass_local_count_buffer(
+        self, *, num_experts: int, ep_rank: int, ep_size: int
+    ) -> Optional[torch.Tensor]:
+        # Physical experts are rank-major, so this rank's experts are one slice of
+        # the layer's row. None without a current layer or on a width mismatch.
+        if self._current_layer_idx.value is None:
+            return None
+        counts = self.get_current_pass_count_buffer()
+        if counts is None or counts.numel() != num_experts:
+            return None
+        num_local = num_experts // ep_size
+        return counts[ep_rank * num_local : (ep_rank + 1) * num_local]
 
     def on_deepep_dispatch_normal(
         self,
@@ -372,20 +405,53 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._recording
 
 
-def get_global_expert_distribution_recorder():
+def get_global_expert_distribution_recorder(
+    family: Optional[ExpertLocationFamily] = None,
+):
+    """The recorder of ``family``; None means the one routing hooks write into now."""
     from sglang.srt.runtime_context import get_resources
 
     resources = get_resources()
+    if family is None:
+        family = resources.active_expert_distribution_family
+    if family == DRAFT_EXPERT_LOCATION_FAMILY:
+        assert resources.draft_expert_distribution_recorder is not None
+        return resources.draft_expert_distribution_recorder
     if resources.expert_distribution_recorder is None:
         # Call sites expect a recorder unconditionally; default to the noop.
         resources.expert_distribution_recorder = _ExpertDistributionRecorderNoop()
     return resources.expert_distribution_recorder
 
 
-def set_global_expert_distribution_recorder(value):
+def set_global_expert_distribution_recorder(
+    value, family: ExpertLocationFamily = TARGET_EXPERT_LOCATION_FAMILY
+):
     from sglang.srt.runtime_context import get_resources
 
-    get_resources().expert_distribution_recorder = value
+    if family == DRAFT_EXPERT_LOCATION_FAMILY:
+        get_resources().draft_expert_distribution_recorder = value
+    else:
+        get_resources().expert_distribution_recorder = value
+
+
+@contextmanager
+def draft_expert_distribution_scope():
+    """A draft forward records into the draft family's recorder (yielded), or
+    nowhere without one; its routes never reach the target's count buffers."""
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    draft_recorder = resources.draft_expert_distribution_recorder
+    if draft_recorder is None:
+        with get_global_expert_distribution_recorder().disable_this_region():
+            yield None
+        return
+    previous = resources.active_expert_distribution_family
+    resources.active_expert_distribution_family = DRAFT_EXPERT_LOCATION_FAMILY
+    try:
+        yield draft_recorder
+    finally:
+        resources.active_expert_distribution_family = previous
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
@@ -738,8 +804,12 @@ class _Accumulator(ABC):
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        *,
+        report_balancedness: bool = True,
     ) -> _Accumulator:
-        return _Accumulator.get_class()(expert_location_metadata, rank)
+        return _Accumulator.get_class()(
+            expert_location_metadata, rank, report_balancedness=report_balancedness
+        )
 
     @staticmethod
     def get_class() -> Type[_Accumulator]:
@@ -754,9 +824,12 @@ class _Accumulator(ABC):
         self,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        *,
+        report_balancedness: bool = True,
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._report_balancedness = report_balancedness
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -784,7 +857,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._enable = reports_expert_balancedness()
+        # A second recorder would register the balancedness metrics twice.
+        self._enable = self._report_balancedness and reports_expert_balancedness()
 
         if self._enable:
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
