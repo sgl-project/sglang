@@ -3661,6 +3661,14 @@ class NixlKVManager(CpuBufferMixin, StagingManagerMixin, CommonKVManager):
             str(self.dcp_size).encode("ascii"),
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
+            *(
+                [
+                    CPU_BUFFER_VERSION,
+                    json.dumps(self.kv_args.state_types or []).encode(),
+                ]
+                if self.cpu_buffer_enabled
+                else []
+            ),
         ]
 
     def build_receiver_metadata_message(
@@ -3892,123 +3900,6 @@ class NixlKVReceiver(CommonKVReceiver):
         if status == KVPoll.Success and self.kv_mgr.cpu_buffer_enabled:
             return self._complete_receive()
         return status
-
-    def _register_kv_args(self) -> bool:
-        if not self.kv_mgr.cpu_buffer_enabled:
-            return super()._register_kv_args()
-        for bootstrap_info in self.bootstrap_infos:
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_kv_data_mem_kinds = _pack_kv_mem_kinds(
-                self.kv_mgr.kv_args.kv_data_mem_kinds
-            )
-            packed_kv_item_lens = b"".join(
-                struct.pack("Q", item_len)
-                for item_len in self.kv_mgr.kv_args.kv_item_lens
-            )
-            packed_kv_layer_ids = b"".join(
-                struct.pack("I", layer_id)
-                for layer_id in self.kv_mgr.kv_args.kv_layer_ids
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-            packed_state_data_ptrs = pack_int_lists(
-                self.kv_mgr.kv_args.state_data_ptrs or [], "Q"
-            )
-            packed_state_item_lens = pack_int_lists(
-                self.kv_mgr.kv_args.state_item_lens or [], "I"
-            )
-            packed_state_data_lens = pack_int_lists(
-                self.kv_mgr.kv_args.state_data_lens or [], "Q"
-            )
-            packed_state_dim_per_tensor = pack_int_lists(
-                getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
-            )
-            packed_state_layer_ids = pack_int_lists(
-                self.kv_mgr.kv_args.state_layer_ids, "I"
-            )
-
-            # Include staging allocator metadata if available
-            if (
-                self.kv_mgr.enable_staging
-                and self.kv_mgr._staging_ctx.allocator is not None
-            ):
-                _alloc = self.kv_mgr._staging_ctx.allocator
-                packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
-                staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
-            else:
-                packed_staging_base_ptr = b""
-                staging_total_size_str = b""
-            if self.kv_mgr.kv_args.kv_item_lens:
-                dst_kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-                dst_num_slots = num_kv_slots(
-                    self.kv_mgr.kv_args.kv_data_lens, self.kv_mgr.kv_args.kv_item_lens
-                )
-            else:
-                dst_kv_item_len = 0
-                dst_num_slots = 0
-
-            try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            GUARD,
-                            "None".encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.kv_mgr.agent.name.encode("ascii"),
-                            self.kv_mgr.agent.get_agent_metadata(),
-                            packed_kv_data_ptrs,
-                            packed_aux_data_ptrs,
-                            (
-                                struct.pack(
-                                    f"{len(self.kv_mgr.kv_args.aux_item_lens)}Q",
-                                    *self.kv_mgr.kv_args.aux_item_lens,
-                                )
-                                if self.kv_mgr.customized_info_enabled
-                                else b""
-                            ),
-                            packed_state_data_ptrs,
-                            str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                            str(self.kv_mgr.attn_tp_size).encode("ascii"),
-                            str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
-                            str(dst_kv_item_len).encode("ascii"),
-                            packed_state_item_lens,
-                            packed_state_dim_per_tensor,
-                            packed_staging_base_ptr,
-                            staging_total_size_str,
-                            str(dst_num_slots).encode("ascii"),
-                            packed_kv_data_mem_kinds,
-                            packed_kv_item_lens,
-                            packed_state_layer_ids,
-                            packed_kv_layer_ids,
-                            str(self.kv_mgr.dcp_size).encode("ascii"),
-                            str(self.kv_mgr.dcp_rank).encode("ascii"),
-                            packed_state_data_lens,
-                            *(
-                                [
-                                    CPU_BUFFER_VERSION,
-                                    json.dumps(
-                                        self.kv_mgr.kv_args.state_types or []
-                                    ).encode("ascii"),
-                                ]
-                                if self.kv_mgr.cpu_buffer_enabled
-                                else []
-                            ),
-                        ]
-                    )
-            except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
-                )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return False
-        return True
 
     def failure_exception(self):
         if self.conclude_state is None:

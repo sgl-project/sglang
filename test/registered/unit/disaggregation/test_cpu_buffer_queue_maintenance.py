@@ -10,7 +10,12 @@ from sglang.srt.disaggregation.decode import (
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -32,7 +37,7 @@ class TestQueueMaintenance(CustomTestCase):
                             scheduler_stage_metrics=None,
                             enable_decode_hicache=False,
                             enable_hisparse=False,
-                            waiting_queue=[],
+                            waiting_queue=IndexedReqList(ListKind.WAITING),
                             polling_count=count,
                             polling_interval=2,
                             disagg_decode_prealloc_queue=MagicMock(),
@@ -67,7 +72,7 @@ class TestQueueMaintenance(CustomTestCase):
                         )
                         transfer.resolve_deferred_releases.assert_called_once()
                         transfer.pop_transferred.assert_called_once()
-                        self.assertEqual(scheduler.waiting_queue, [completed])
+                        self.assertEqual(list(scheduler.waiting_queue), [completed])
                         self.assertEqual(
                             order,
                             ["preallocate", "transfer"]
@@ -89,10 +94,11 @@ class TestQueueMaintenance(CustomTestCase):
 
         def entry(rid, finished=None):
             return SimpleNamespace(
-                req=SimpleNamespace(
+                req=FakeReq(
                     rid=rid,
                     bootstrap_room=42,
                     finished_reason=finished,
+                    kv=SimpleNamespace(holds_mamba=False, holds_kv=False),
                     return_logprob=False,
                     time_stats=MagicMock(),
                 ),
@@ -106,7 +112,10 @@ class TestQueueMaintenance(CustomTestCase):
             entry("cancelled", FINISH_ABORT()),
         )
         receivers = [item.kv_receiver for item in (live, failed, cancelled)]
-        queue.queue = [live, failed, cancelled]
+        queue.queue = IndexedReqList(
+            ListKind.PD_PREALLOC, req_of=lambda entry: entry.req
+        )
+        queue.queue.join([live, failed, cancelled])
         queue.pending_reqs = [failed, cancelled]
 
         def abort(req, *args, **kwargs):
@@ -127,7 +136,7 @@ class TestQueueMaintenance(CustomTestCase):
         poll.assert_called_once()
         self.assertEqual(ready, [])
         self.assertEqual(dead, [failed, cancelled])
-        self.assertEqual(queue.queue, [live])
+        self.assertEqual(list(queue.queue.items()), [live])
         self.assertEqual(queue.pending_reqs, [])
         self.assertTrue(live.waiting_for_input)
         receivers[0].clear.assert_not_called()

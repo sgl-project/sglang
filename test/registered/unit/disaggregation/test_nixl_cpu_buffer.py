@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregatio
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
 from sglang.srt.disaggregation.common.conn import KVTransferError
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
@@ -32,7 +33,6 @@ from sglang.srt.disaggregation.nixl.cpu_buffer import (
     page_views,
     scatter_pages,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -48,6 +48,7 @@ def manager(size=1024):
     mgr._deferred_abort_generation = 0
     mgr._deferred_abort_ack_tracker = {}
     mgr.attn_tp_size = 1
+    mgr.customized_info_enabled = False
     mgr.kv_args = SimpleNamespace(
         kv_item_lens=[4],
         kv_layer_ids=[0],
@@ -334,6 +335,7 @@ class TestCpuBufferConfiguration(CustomTestCase):
             b"peer",
             b"metadata",
             struct.pack("Q", 4096),
+            b"",  # aux pointers
             b"",
             b"",
             b"0",
@@ -557,7 +559,7 @@ class TestCpuBufferOwnership(CustomTestCase):
         mgr.agent.transfer.side_effect = RuntimeError("partial aux post")
         handles = []
         with self.assertRaisesRegex(RuntimeError, "partial aux post"):
-            mgr.send_aux("peer", 0, [256], 0, handles=handles)
+            mgr.send_aux("peer", 0, [256], None, 0, handles=handles)
         self.assertEqual(handles, ["aux"])
 
     def test_mixed_protocol_and_tp_are_rejected(self):

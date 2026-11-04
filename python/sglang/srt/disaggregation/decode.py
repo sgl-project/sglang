@@ -1509,9 +1509,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ]
 
         if not allow_preallocation:
-            self.queue = [
-                req for i, req in enumerate(self.queue) if i not in indices_to_remove
-            ]
+            for decode_req in failed_reqs:
+                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
+                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
+            self.queue.leave([queue[i].req for i in indices_to_remove])
             return [], failed_reqs
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
