@@ -401,9 +401,7 @@ class Envs:
     # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
-    SGLANG_FORCE_SHUTDOWN = EnvBoolWithAlias(
-        False, deprecated_name="SGL_FORCE_SHUTDOWN"
-    )
+    SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
