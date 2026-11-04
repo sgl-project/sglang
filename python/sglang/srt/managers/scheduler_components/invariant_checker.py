@@ -7,14 +7,17 @@ from typing import (
     TYPE_CHECKING,
     Callable,
     Deque,
+    Dict,
+    Iterable,
     List,
     Optional,
+    Set,
     Tuple,
 )
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -23,6 +26,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_swa_tokens,
     kv_private_tokens,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -41,7 +45,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -49,6 +53,11 @@ logger = logging.getLogger(__name__)
 
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+
+
+def _raise_if_any(reqs: Set[Req], message: str) -> None:
+    if reqs:
+        raise RuntimeError(f"{message}: {sorted(req.rid for req in reqs)}")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -61,11 +70,15 @@ class SchedulerInvariantChecker:
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
-    get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks is in neither batch;
-    # it still owns its KV row.
+    # The lists that hold the live requests, by kind (`Scheduler.request_lists`).
+    get_request_lists: Callable[[], Dict[ListKind, Iterable[Req]]] = field(
+        default=lambda: {}
+    )
     get_chunked_req: Callable = field(default=lambda: None)
+    get_running_batches: Callable = field(default=lambda: ())
+    # Under PP, the micro-batches' launched steps.
+    get_pp_mbs: Callable = field(default=lambda: ())
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -261,16 +274,7 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        reqs = [] if last_batch is None else list(last_batch.reqs)
-        # After decode running_batch IS last_batch. Compare by identity:
-        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
-        if running_batch is not None and running_batch is not last_batch:
-            reqs += running_batch.reqs
-        chunked_req = self.get_chunked_req()
-        if chunked_req is not None:
-            reqs.append(chunked_req)
+        reqs = [req for reqs in self.get_request_lists().values() for req in reqs]
 
         # A request running on a session's record does not own that row.
         session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
@@ -475,6 +479,74 @@ class SchedulerInvariantChecker:
             messages.append(mamba_msg)
 
         return has_leak, messages
+
+    def maybe_check_request_lists(self, batch: ScheduleBatch) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, at the launch of `batch`: each
+        live request is in exactly one list, one that matches its state."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        lists = self.get_request_lists()
+        owners: Dict[Req, ListKind] = {}
+        for kind, reqs in lists.items():
+            for req in reqs:
+                if req in owners:
+                    raise RuntimeError(
+                        f"Request {req.rid} is in both {owners[req].name} and {kind.name}"
+                    )
+                owners[req] = kind
+
+        chunked_req = self.get_chunked_req()
+
+        def live(reqs: Iterable[Req]) -> Set[Req]:
+            return {
+                req for req in reqs if not req.finished() and req is not chunked_req
+            }
+
+        in_running_batch = {
+            req for b in self.get_running_batches() if b is not None for req in b.reqs
+        }
+        in_step = {
+            req for b in (batch, *self.get_pp_mbs()) if b is not None for req in b.reqs
+        }
+        running = set(lists.get(ListKind.DECODING, ()))
+
+        _raise_if_any(
+            live(in_running_batch | in_step) - owners.keys(),
+            "Requests held by a running batch or a step but in no list",
+        )
+        _raise_if_any(
+            in_running_batch & set(lists.get(ListKind.PREFILL_LAUNCHED, ())),
+            "Requests in prefill_launched but in a running batch",
+        )
+        _raise_if_any(
+            live(in_running_batch) - running,
+            "Requests in a running batch but not in running",
+        )
+        # Only a step in flight takes a running request out of every running
+        # batch: a mixed step's decode row, or an overlap result that finishes it.
+        _raise_if_any(
+            {req for req in running - in_running_batch if req.inflight_steps <= 0},
+            "Requests in running but in no running batch or step",
+        )
+
+    def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
+        the requests it was launched with."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        launched = batch.launched_reqs or ()
+        if len(batch.reqs) != len(launched) or any(
+            req is not launched_req for req, launched_req in zip(batch.reqs, launched)
+        ):
+            raise RuntimeError(
+                f"Step processed with requests {[req.rid for req in batch.reqs]}, "
+                f"launched with {[req.rid for req in launched]}"
+            )
+        uncounted = [req.rid for req in batch.reqs if req.inflight_steps <= 0]
+        if uncounted:
+            raise RuntimeError(
+                f"Requests processed by a step they were not launched in: {uncounted}"
+            )
 
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():

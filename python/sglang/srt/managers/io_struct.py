@@ -58,14 +58,14 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -565,6 +565,18 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            # A single request's media list holds all of its items; batch fields hold one entry per request.
+            # A list that is already one entry per request (e.g. [["a.png", "b.png"]]) is kept as is.
+            for field_name in (
+                "image_data",
+                "video_data",
+                "audio_data",
+                "mm_hashes",
+                "mm_content_hashes",
+            ):
+                value = getattr(self, field_name)
+                if isinstance(value, list) and value and not isinstance(value[0], list):
+                    setattr(self, field_name, [value])
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -1278,6 +1290,9 @@ class EmbeddingReqInput:
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # "float" (default / None) returns list[float]; "tensor" returns the raw
+    # torch.Tensor at the engine's native compute dtype.
+    encoding_format: Optional[str] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Whether to return prompt token IDs without computing logprobs
@@ -1472,6 +1487,7 @@ class EmbeddingReqInput:
                 priority=self.priority,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
+                encoding_format=self.encoding_format,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1504,6 +1520,7 @@ class EmbeddingReqInput:
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
                 dimensions=self.dimensions,
+                encoding_format=self.encoding_format,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 external_trace_header=self.external_trace_header,
@@ -1548,6 +1565,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # Encoding format for the returned embedding. See EmbeddingReqInput.
+    encoding_format: Optional[str] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Pre-computed delimiter indices for multi-item scoring
@@ -1878,6 +1897,9 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
+    # Tensor-format embeddings use a separate typed field because msgspec does not
+    # allow a custom type such as torch.Tensor in a union with other value types.
+    tensor_embeddings: Optional[List[Optional[torch.Tensor]]] = None
     # Each request is output once, so every row carries its stats.
     request_stats: List[RequestOutputStats]
     # Placeholder token info
@@ -2003,7 +2025,7 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+    """Sent by each tokenizer worker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 
@@ -2344,6 +2366,10 @@ class AbortReq(BaseReq, kw_only=True):
         if self.rid is None:
             self.rid = ""
 
+    def matches(self, rid: str) -> bool:
+        """Whether this abort targets the request `rid`."""
+        return self.abort_all or rid.startswith(self.rid)
+
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
     """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
@@ -2484,6 +2510,12 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
+
+
+class ReleaseUocrDocReqInput(BaseReq, kw_only=True):
+    """Free the KV a split document retained for its next window."""
+
+    doc_id: str
 
 
 class OpenSessionReqOutput(BaseReq, kw_only=True):
