@@ -22,6 +22,15 @@ A positive remaining wait can overlap part of a late preparation. Missing or
 zero remaining wait retains on-demand recovery. Omitting this config preserves
 the existing global cost/lead policy. No new Engine action fields are required.
 
+With this policy enabled, lifecycle recovery windows start when the Router API
+enqueues the event. Mailbox and worker discovery time consume that same window.
+If every live interest's window has elapsed before the first attempt, the query
+reports `policy_fallback: "late_before_submit"` without issuing an Engine action.
+A future shared interest or an explicit interest without a window can still
+prepare the scope. Attempted work keeps its original wire identity and drain
+requirements. An elapsed prediction also suppresses new automatic PIN claims;
+existing claims retain their normal TTL and cleanup behavior.
+
 `preparation_policy.ready_pin_ttl_ms` optionally submits a separate finite host
 PIN after confirmed lifecycle storage-to-host preparation. It defaults to zero
 (disabled), and is limited to 60,000ms. `auto_pin_max_tokens` defaults to 65,536

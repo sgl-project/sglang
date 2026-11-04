@@ -5060,3 +5060,11 @@ strict 模式仅将明确整数 0 解释为各层零命中，保留 details_pres
 ### Rust Router 静态检查
 
 精确 Rust 1.92.0 release Clippy 检出反馈构造器原有 min/max 形式的 manual_clamp。单行替换为等价 clamp，未改变合法 limit 或协议语义。parent 独立 release lib Clippy（-D warnings）通过，HTTP orchestration 40 项复测通过，3.55s。日志：lifecycle-opt/router-clippy-1.92-final-parent.log、router-clamp-parent-http-tests.log。运行中的压力进程继续使用 61284379d0，后续二进制切换在配对实验边界进行。
+
+### O5 — 入口绝对恢复窗口与过期推测退回
+
+新版 C8 的 30 条准备响应晚于真实恢复时刻，18 次完整 native GET 发布时已存在整个前缀，约 43.49GB API payload 没有新增 L2。内部消息未记录入口时间，出队和 worker 发现后用相对等待计算 due，延长了预测窗口。
+
+现内部消息携带入口 Instant，Intent 保存绝对窗口，按实际 worker 提前量计算 due。原始 Value 仍用于指纹和重放。所有存活兴趣窗口均过期时，仅未尝试的准备以 late_before_submit 正常退回；任一未来或显式无窗口兴趣可继续。已尝试/丢响应动作沿原 wire ID 收尾，已有 PIN 保留正常 TTL，新 PIN 首次写前重查窗口。恢复从未启动的共享工作会撤销旧本地 quiescence，取消仍不可逆。
+
+parent 审阅完整 runtime/core/HTTP 差异并独立复测：48 HTTP 项通过，5.24s；精确 Rust 1.92 核心 50 项通过、1 live 项按原配置忽略。精确 1.92 release lib Clippy（-D warnings）及全 workspace fmt 通过。日志：lifecycle-opt/resume-window-parent-http-tests.log、resume-window-parent-core-tests.log、resume-window-parent-clippy.log。仅将旧回归中无法跨真实 HTTP 存活的 1ms 窗口调整为仍小于估计提前量的 100ms；新增排队/发现、共享/取消/重放、PIN 子发现期间到期等真实等待回归。

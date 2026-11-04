@@ -75,7 +75,7 @@ struct Published {
     ready: Vec<Ready>,
 }
 enum Message {
-    Api(Value, oneshot::Sender<Value>),
+    Api(Value, Instant, oneshot::Sender<Value>),
     Request {
         context: KvContext,
         tokens: Vec<u32>,
@@ -124,7 +124,11 @@ impl Runtime {
     }
     pub async fn api(&self, value: Value) -> Value {
         let (tx, rx) = oneshot::channel();
-        if self.tx.try_send(Message::Api(value, tx)).is_err() {
+        if self
+            .tx
+            .try_send(Message::Api(value, Instant::now(), tx))
+            .is_err()
+        {
             return error("capacity", "orchestration queue full");
         }
         match tokio::time::timeout(
@@ -364,6 +368,7 @@ struct Job {
     ready_pin_eligible: bool,
     ready_pin: Option<Box<Job>>,
     ready_pin_error: Option<String>,
+    late_before_submit: bool,
 }
 impl Job {
     fn material_bytes(&self) -> usize {
@@ -413,6 +418,7 @@ struct Intent {
     jobs: Vec<String>,
     frozen: FrozenTarget,
     expires: Instant,
+    resume_at: Option<Instant>,
     released: bool,
     claims: Vec<ClaimIdentity>,
 }
@@ -507,7 +513,7 @@ impl Actor {
         loop {
             tokio::select! {
                 message=rx.recv()=>match message {
-                    Some(Message::Api(value,reply))=> { let result=self.api(value).await;let _=reply.send(result); }
+                    Some(Message::Api(value,received_at,reply))=> { let result=self.api(value,received_at).await;let _=reply.send(result); }
                     Some(Message::Request {context,tokens,salt,worker})=> { if let Err(reason)=self.record(context,tokens,salt,worker).await { tracing::debug!(%reason,"KV association unavailable"); } }
                     Some(Message::Routed {context,worker})=> { self.changed_route(&context.task(&self.config.caller_id),&worker); }
                     None=>break,
@@ -882,7 +888,7 @@ impl Actor {
         };
         Ok(self.index.resolve(selector))
     }
-    async fn api(&mut self, value: Value) -> Value {
+    async fn api(&mut self, value: Value, received_at: Instant) -> Value {
         if let Err(reason) = validate_input(&value) {
             return error("invalid_payload", reason);
         }
@@ -920,7 +926,7 @@ impl Actor {
                 return error("conflict", "stale lifecycle revision");
             }
         }
-        let result = match self.apply(value.clone()).await {
+        let result = match self.apply(value.clone(), received_at).await {
             Ok(data) => ok(data),
             Err(e) => error(
                 if e.to_lowercase().contains("capacity") {
@@ -946,7 +952,7 @@ impl Actor {
         }
         result
     }
-    async fn apply(&mut self, value: Value) -> Result<Value, String> {
+    async fn apply(&mut self, value: Value, received_at: Instant) -> Result<Value, String> {
         let kind = value["kind"].as_str().ok_or("kind required")?;
         if kind == "feedback" {
             return Ok(self.feedback.view());
@@ -1144,6 +1150,19 @@ impl Actor {
                         Ok(json!({"state":"request_unbound","task_state":"active"}))
                     }
                     "tool_wait" | "resume_expected" | "tool_done" => {
+                        // Keep the original Value for replay identity. The local
+                        // absolute window also covers mailbox and discovery waits.
+                        let resume_at = self.preparation_costs.as_ref().and_then(|_| {
+                            let millis = if event == "tool_done" {
+                                value["available_ms"].as_u64()
+                            } else {
+                                value["expected_wait_ms"].as_u64()
+                            };
+                            millis.map(|ms| received_at + Duration::from_millis(ms))
+                        });
+                        let remaining_ms = resume_at.map(|at| {
+                            at.saturating_duration_since(Instant::now()).as_millis() as u64
+                        });
                         if self.index.session_revision(&task).is_none() {
                             return Err("unknown task incarnation".into());
                         }
@@ -1208,16 +1227,20 @@ impl Actor {
                         );
                         if event == "tool_done"
                             && cost
-                                > value["available_ms"]
-                                    .as_u64()
-                                    .unwrap_or(self.config.max_resume_prefetch_ms)
+                                > remaining_ms.unwrap_or_else(|| {
+                                    value["available_ms"]
+                                        .as_u64()
+                                        .unwrap_or(self.config.max_resume_prefetch_ms)
+                                })
                         {
                             return Ok(
                                 json!({"state":"on_demand_fallback","estimated_ms":cost,"reason":"preparation too late"}),
                             );
                         }
                         if event == "resume_expected"
-                            && (value["expected_wait_ms"].as_u64().unwrap_or(0) == 0
+                            && (remaining_ms
+                                .unwrap_or_else(|| value["expected_wait_ms"].as_u64().unwrap_or(0))
+                                == 0
                                 || (self.preparation_costs.is_none()
                                     && value["expected_wait_ms"].as_u64().unwrap_or(0) < lead))
                         {
@@ -1236,7 +1259,7 @@ impl Actor {
                                 task: task.clone(),
                                 id: pin_id,
                             };
-                            let retained = self.submit(pin, task.clone(), pin_demand).await;
+                            let retained = self.submit(pin, task.clone(), pin_demand, None).await;
                             if !value["pressure"].as_bool().unwrap_or(false) {
                                 return Ok(
                                     json!({"retention":retained.unwrap_or_else(|e|error("unsupported",e)),"demote":"skipped_no_pressure"}),
@@ -1250,9 +1273,10 @@ impl Actor {
                                 .preparation_policy
                                 .as_ref()
                                 .is_some_and(|policy| {
-                                    value["expected_wait_ms"]
-                                        .as_u64()
-                                        .unwrap_or(0)
+                                    remaining_ms
+                                        .unwrap_or_else(|| {
+                                            value["expected_wait_ms"].as_u64().unwrap_or(0)
+                                        })
                                         .saturating_sub(lead)
                                         <= policy.min_cold_residency_ms
                                 })
@@ -1263,8 +1287,9 @@ impl Actor {
                         }
                         if event == "tool_wait"
                             && (!value["pressure"].as_bool().unwrap_or(false)
-                                || value["expected_wait_ms"].as_u64().unwrap_or(0)
-                                    < self.config.poll_ms)
+                                || remaining_ms.unwrap_or_else(|| {
+                                    value["expected_wait_ms"].as_u64().unwrap_or(0)
+                                }) < self.config.poll_ms)
                         {
                             return Ok(
                                 json!({"state":"skipped","reason":"insufficient pressure/wait evidence"}),
@@ -1312,7 +1337,7 @@ impl Actor {
                                 }
                             }
                         }
-                        let mut result = self.submit(command, task, demand).await?;
+                        let mut result = self.submit(command, task, demand, resume_at).await?;
                         if self.preparation_costs.is_some() {
                             result["preparation_estimate"] = result["operations"]
                                 .as_array()
@@ -1325,7 +1350,7 @@ impl Actor {
                     _ => Err("unsupported lifecycle signal".into()),
                 }
             }
-            "submit" => self.submit(value, task, demand).await,
+            "submit" => self.submit(value, task, demand, None).await,
             _ => Err("unsupported Router control kind".into()),
         }
     }
@@ -1334,6 +1359,7 @@ impl Actor {
         value: Value,
         task: SessionIdentity,
         demand: DemandId,
+        resume_at: Option<Instant>,
     ) -> Result<Value, String> {
         let admitted_at = Instant::now();
         let fingerprint = digest(&value);
@@ -1464,13 +1490,21 @@ impl Actor {
                     })
             });
             let job_due = preparation_estimate.map_or(due, |estimate| {
-                admitted_at
-                    + Duration::from_millis(
-                        value["expected_wait_ms"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            .saturating_sub(estimate.lead_ms),
-                    )
+                resume_at.map_or_else(
+                    || {
+                        admitted_at
+                            + Duration::from_millis(
+                                value["expected_wait_ms"]
+                                    .as_u64()
+                                    .unwrap_or(0)
+                                    .saturating_sub(estimate.lead_ms),
+                            )
+                    },
+                    |at| {
+                        at.checked_sub(Duration::from_millis(estimate.lead_ms))
+                            .unwrap_or(admitted_at)
+                    },
+                )
             });
             let mut src = value["source"].clone();
             let mut dst = value["destination"].clone();
@@ -1509,6 +1543,20 @@ impl Actor {
                 ))
             );
             ids.insert(id.clone());
+            let future = self.has_future_demand(&id);
+            if self.preparation_costs.is_some() && resume_at.is_none_or(|at| Instant::now() < at) {
+                if let Some(job) = self.jobs.get_mut(&id).filter(|job| {
+                    !job.attempted
+                        && !job.submitted
+                        && (job.preparation_estimate.is_some() || job.late_before_submit)
+                }) {
+                    job.due = if future {
+                        job.due.min(job_due)
+                    } else {
+                        job_due
+                    };
+                }
+            }
             if !self.jobs.contains_key(&id) {
                 // Concurrent interests share the logical job. A new lifecycle
                 // episode needs a fresh Engine envelope, while lost replies
@@ -1553,6 +1601,7 @@ impl Actor {
                         ready_pin_eligible: false,
                         ready_pin: None,
                         ready_pin_error: None,
+                        late_before_submit: false,
                     },
                 );
             }
@@ -1647,6 +1696,7 @@ impl Actor {
                 jobs: ids.into_iter().collect(),
                 frozen,
                 expires,
+                resume_at,
                 released: false,
                 claims: Vec::new(),
             },
@@ -1786,6 +1836,7 @@ impl Actor {
                         .filter(|ttl| ttl.is_finite() && *ttl > 0.0 && *ttl <= 31_536_000.0)
                         .map(Duration::from_secs_f64)
                         .unwrap_or(Duration::from_millis(self.config.operation_ttl_ms)),
+                resume_at: None,
                 released: false,
                 claims: identities,
             },
@@ -1838,7 +1889,7 @@ impl Actor {
             "admission_gaps":intent.admission_gaps,"claims":intent.claims.iter().filter_map(|id|self.claims.get(id)).map(|c|json!({"claim":c.view,"error":c.error,"feedback_unknown":c.feedback_unknown,"release_requested":c.release_requested})).collect::<Vec<_>>(),
             "released":intent.released,"quiescent":intent.claims.iter().all(|id|self.claims.get(id).is_none_or(|c|c.view["backend_quiescent"]==true)) && intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|self.job_quiescent(j))),
             "operations":intent.jobs.iter().filter_map(|id|self.jobs.get(id)).map(|j|json!({"child_id":j.id,"worker_url":j.url,"engine_id":j.caps.engine_id,"owner_epoch":j.caps.epoch,
-                "action":j.action,"result":j.result,"preparation_estimate":j.preparation_estimate,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":self.job_quiescent(j),"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
+                "action":j.action,"result":j.result,"policy_fallback":j.late_before_submit.then_some("late_before_submit"),"preparation_estimate":j.preparation_estimate,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":self.job_quiescent(j),"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
                 "auto_pin":j.ready_pin.as_ref().map(|pin|json!({"child_id":pin.id,"result":pin.result,"state":if pin.pin_refused(){json!("not_acquired")}else{pin.claim_view["state"].clone()},"claim":pin.claim_view,"error":pin.last_error,"quiescent":self.job_quiescent(j),"release_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested)||now>=pin.deadline})),"auto_pin_error":j.ready_pin_error,
                 "ready_scope":if !intent.released && self.feedback.current(&j.url,&j.cache_watermark) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
     }
@@ -1903,7 +1954,7 @@ impl Actor {
         let result = if fresh {
             Ok(())
         } else {
-            self.advance(&mut job, cancel).await
+            self.advance(&mut job, cancel, None).await
         };
         if let Err(e) = result {
             job.last_error = Some(e);
@@ -1939,8 +1990,48 @@ impl Actor {
             })
     }
 
+    fn has_future_demand(&self, id: &str) -> bool {
+        let now = Instant::now();
+        self.book.job(id).is_some_and(|job| {
+            job.interests.iter().any(|demand| {
+                self.intents.get(demand).is_some_and(|intent| {
+                    !intent.released
+                        && now < intent.expires
+                        && intent.resume_at.is_none_or(|at| now < at)
+                })
+            })
+        })
+    }
+    fn defer_late_preparation(&mut self, job: &mut Job) -> bool {
+        if self.preparation_costs.is_none()
+            || job.action != "sglang.prefetch"
+            || job.attempted
+            || job.submitted
+        {
+            return false;
+        }
+        if self.has_future_demand(&job.id) {
+            if job.late_before_submit {
+                // Only a never-attempted predicted preparation may resume.
+                // The book rejects cancelled jobs and preserves their drain.
+                if self.book.mark_running(&job.id).is_err() {
+                    return true;
+                }
+                job.late_before_submit = false;
+                job.quiescent = false;
+            }
+            return false;
+        }
+        job.late_before_submit = true;
+        job.quiescent = true;
+        job.ready_end = 0;
+        job.ready_at = None;
+        job.last_error = None;
+        true
+    }
     async fn poll_ready_pin(&mut self, job: &mut Job, cancel: bool) {
         if job.ready_pin_eligible
+            && self.has_future_demand(&job.id)
             && job.ready_pin.is_none()
             && !cancel
             && job.last_error.is_none()
@@ -2004,6 +2095,7 @@ impl Actor {
                     ready_pin_eligible: false,
                     ready_pin: None,
                     ready_pin_error: None,
+                    late_before_submit: false,
                 }));
             }
         }
@@ -2012,19 +2104,24 @@ impl Actor {
                 return;
             }
             let release = cancel || Instant::now() >= pin.deadline;
-            if let Err(error) = self.advance(pin, release).await {
+            if let Err(error) = self.advance(pin, release, Some(&job.id)).await {
                 pin.last_error = Some(error);
                 pin.claim_view = Value::Null;
             }
         }
     }
-    async fn advance(&mut self, job: &mut Job, cancel: bool) -> Result<(), String> {
+    async fn advance(
+        &mut self,
+        job: &mut Job,
+        cancel: bool,
+        parent: Option<&str>,
+    ) -> Result<(), String> {
         let negotiated = self.preparation_costs.is_some()
             && self
                 .caps
                 .get(&job.url)
                 .is_some_and(Capabilities::supports_read_batch);
-        let result = self.advance_inner(job, cancel).await;
+        let result = self.advance_inner(job, cancel, parent).await;
         if let Err(reason) = &result {
             if negotiated
                 || (self.preparation_costs.is_some()
@@ -2038,9 +2135,17 @@ impl Actor {
         }
         result
     }
-    async fn advance_inner(&mut self, job: &mut Job, cancel: bool) -> Result<(), String> {
+    async fn advance_inner(
+        &mut self,
+        job: &mut Job,
+        cancel: bool,
+        parent: Option<&str>,
+    ) -> Result<(), String> {
         if !job.submitted && !job.attempted && !job.releasing_pin && cancel {
             job.quiescent = true;
+            return Ok(());
+        }
+        if self.defer_late_preparation(job) {
             return Ok(());
         }
         if cancel
@@ -2143,6 +2248,20 @@ impl Actor {
                 )
             );
         if !job.submitted {
+            // A new child claim has no effect yet. Existing/uncertain claims
+            // and releases still use their original wire identity and drain.
+            if !job.attempted
+                && !job.releasing_pin
+                && parent.is_some_and(|id| !self.has_future_demand(id))
+            {
+                job.quiescent = true;
+                job.last_error = None;
+                return Ok(());
+            }
+            // Discovery may have consumed the remaining prediction window.
+            if self.defer_late_preparation(job) {
+                return Ok(());
+            }
             if !job.attempted && !job.releasing_pin && Instant::now() >= job.deadline {
                 job.quiescent = true;
                 return Err("expired before submission".into());

@@ -68,6 +68,7 @@ struct EngineState {
     feedback_events: Vec<Value>,
     residency_override: Option<Value>,
     delayed_query: Option<Arc<DelayedQuery>>,
+    delayed_capabilities: Option<Arc<DelayedQuery>>,
 }
 #[derive(Default)]
 struct DelayedQuery {
@@ -93,9 +94,16 @@ impl Drop for Engine {
     }
 }
 async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Value> {
-    let mut s = state.lock().unwrap();
-    s.capability_gets += 1;
-    Json(capabilities_reply(&s))
+    let (reply, delayed) = {
+        let mut s = state.lock().unwrap();
+        s.capability_gets += 1;
+        (capabilities_reply(&s), s.delayed_capabilities.take())
+    };
+    if let Some(delayed) = delayed {
+        delayed.started.notify_one();
+        delayed.release.notified().await;
+    }
+    Json(reply)
 }
 fn capabilities_reply(s: &EngineState) -> Value {
     let mut reply = json!({"success":true,"data":{"engine_id":"mock-engine","engine_epoch":s.epoch,"namespace":"weights-v1",
@@ -970,22 +978,25 @@ async fn measured_policy_keeps_late_preparation_and_learns_confirmed_scope() {
     let mut cfg = orchestration();
     cfg.preparation_policy = Some(sgl_kv_orchestrator::preparation::PreparationConfig {
         min_samples: 1,
-        max_lead_ms: 2,
+        max_lead_ms: 200,
         ..Default::default()
     });
+    // Keep preparation useful despite a lead estimate beyond the remaining
+    // window; one millisecond cannot survive a real HTTP discovery round trip.
+    cfg.initial_prefetch_ms_per_token = 100.0;
     let router = router_with(&[&engine], false, Some(cfg)).await;
     start(&router, "measured").await;
     api(&router,json!({"kind":"session_event","task":task("measured"),"event":"request_observed","event_id":"observed","revision":1,
         "branch_id":"main","branch_revision":1,"request_id":"r","request_incarnation":"one","input_ids":[1,2,3,4],"worker_url":engine.url})).await;
     let view = api(&router,json!({"kind":"session_event","task":task("measured"),"event":"resume_expected","event_id":"resume","revision":2,
-        "target":{"kind":"session"},"expected_wait_ms":1,"worker_url":engine.url})).await;
-    assert_eq!(view["preparation_estimate"]["lead_ms"], 2);
+        "target":{"kind":"session"},"expected_wait_ms":100,"worker_url":engine.url})).await;
+    assert_eq!(view["preparation_estimate"]["lead_ms"], 200);
     assert_eq!(view["preparation_estimate"]["samples"], 0);
     assert_eq!(view["operations"].as_array().unwrap().len(), 1);
     ready(&router, "measured", "resume").await;
     let caps = api(&router, json!({"kind":"capabilities"})).await;
     assert_eq!(caps["preparation_cost_groups"], 1);
-    assert_eq!(caps["preparation_policy"]["max_lead_ms"], 2);
+    assert_eq!(caps["preparation_policy"]["max_lead_ms"], 200);
 }
 
 #[tokio::test]
@@ -1037,6 +1048,302 @@ async fn pin_view(router: &TestRouter, id: &str, expected: &str) -> Value {
     })
     .await
     .unwrap()
+}
+
+fn window_config() -> OrchestrationConfig {
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(Default::default());
+    cfg.poll_ms = 10_000;
+    cfg.initial_prefetch_ms_per_token = 100.0;
+    cfg
+}
+fn resume_event(id: &str, wait_ms: u64, engine: &Engine) -> Value {
+    json!({"kind":"session_event","task":task(id),"event":"resume_expected",
+        "event_id":"prepare","revision":2,"target":prefix(vec![1,2,3,4]),
+        "expected_wait_ms":wait_ms,"worker_url":engine.url})
+}
+
+#[tokio::test]
+async fn absolute_resume_window_includes_mailbox_wait_and_keeps_replay_identity() {
+    for measured in [false, true] {
+        let engine = Engine::start().await;
+        let mut cfg = window_config();
+        if !measured {
+            cfg.preparation_policy = None;
+            cfg.initial_prefetch_ms_per_token = 0.5;
+        }
+        let router = Arc::new(router_with(&[&engine], false, Some(cfg)).await);
+        start(&router, "block").await;
+        start(&router, "late").await;
+        engine.state.lock().unwrap().partial = Some(2);
+        submit(
+            &router,
+            "block",
+            "prepare",
+            prefix(vec![9, 8, 7, 6]),
+            &engine,
+        )
+        .await;
+        ready(&router, "block", "prepare").await;
+        engine.state.lock().unwrap().partial = None;
+        let delayed = Arc::new(DelayedQuery::default());
+        engine.state.lock().unwrap().delayed_query = Some(delayed.clone());
+        let r = router.clone();
+        let blocker = tokio::spawn(async move { query(&r, "block", "prepare").await });
+        tokio::time::timeout(Duration::from_secs(2), delayed.started.notified())
+            .await
+            .unwrap();
+        let body = resume_event("late", 100, &engine);
+        let r = router.clone();
+        let request = body.clone();
+        let queued = tokio::spawn(async move { api(&r, request).await });
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        delayed.release.notify_one();
+        blocker.await.unwrap();
+        let receipt = queued.await.unwrap();
+        if measured {
+            assert_eq!(receipt["state"], "on_demand_fallback");
+            assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
+        } else {
+            assert!(receipt["operations"].is_array());
+            ready(&router, "late", "prepare").await;
+            assert_eq!(engine.state.lock().unwrap().operations.len(), 2);
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(api(&router, body.clone()).await, receipt);
+    }
+}
+
+#[tokio::test]
+async fn absolute_resume_due_does_not_slide_by_mailbox_time() {
+    let engine = Engine::start().await;
+    let mut cfg = window_config();
+    cfg.initial_prefetch_ms_per_token = 70.0;
+    let router = Arc::new(router_with(&[&engine], false, Some(cfg)).await);
+    start(&router, "block").await;
+    start(&router, "due").await;
+    engine.state.lock().unwrap().partial = Some(2);
+    submit(
+        &router,
+        "block",
+        "prepare",
+        prefix(vec![9, 8, 7, 6]),
+        &engine,
+    )
+    .await;
+    ready(&router, "block", "prepare").await;
+    engine.state.lock().unwrap().partial = None;
+    let delayed = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_query = Some(delayed.clone());
+    let r = router.clone();
+    let blocker = tokio::spawn(async move { query(&r, "block", "prepare").await });
+    tokio::time::timeout(Duration::from_secs(2), delayed.started.notified())
+        .await
+        .unwrap();
+    let sent = tokio::time::Instant::now();
+    let body = resume_event("due", 1000, &engine);
+    let r = router.clone();
+    let queued = tokio::spawn(async move { api(&r, body).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    delayed.release.notify_one();
+    blocker.await.unwrap();
+    queued.await.unwrap();
+    tokio::time::sleep_until(sent + Duration::from_millis(780)).await;
+    assert_eq!(
+        query(&router, "due", "prepare").await["operations"][0]["ready_scope"]["end_token"],
+        4
+    );
+}
+
+#[tokio::test]
+async fn discovery_delay_expires_unattempted_preparation_without_engine_submit() {
+    let engine = Engine::start().await;
+    let router = Arc::new(router_with(&[&engine], false, Some(window_config())).await);
+    start(&router, "discovery").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let delayed = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_capabilities = Some(delayed.clone());
+    let r = router.clone();
+    let body = resume_event("discovery", 100, &engine);
+    let queued = tokio::spawn(async move { api(&r, body).await });
+    delayed.started.notified().await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    delayed.release.notify_one();
+    queued.await.unwrap();
+    let late = query(&router, "discovery", "prepare").await;
+    assert_eq!(
+        late["operations"][0]["policy_fallback"],
+        "late_before_submit"
+    );
+    assert_eq!(late["quiescent"], true);
+    assert!(late["operations"][0]["error"].is_null());
+    assert!(engine.state.lock().unwrap().operations.is_empty());
+}
+
+#[tokio::test]
+async fn expired_preparation_can_take_future_or_explicit_shared_interest() {
+    for explicit in [false, true] {
+        let engine = Engine::start().await;
+        let router = router_with(&[&engine], false, Some(window_config())).await;
+        start(&router, "old").await;
+        start(&router, "new").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        api(&router, resume_event("old", 100, &engine)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let expired = query(&router, "old", "prepare").await;
+        assert_eq!(
+            expired["operations"][0]["policy_fallback"],
+            "late_before_submit"
+        );
+        assert_eq!(expired["quiescent"], true);
+        engine.state.lock().unwrap().running = true;
+        let admitted = if explicit {
+            submit(&router, "new", "prepare", prefix(vec![1, 2, 3, 4]), &engine).await
+        } else {
+            api(&router, resume_event("new", 200, &engine)).await
+        };
+        assert_eq!(
+            admitted["operations"][0]["child_id"],
+            expired["operations"][0]["child_id"]
+        );
+        let running = query(&router, "new", "prepare").await;
+        assert_eq!(running["quiescent"], false);
+        assert!(running["operations"][0]["policy_fallback"].is_null());
+        assert_eq!(query(&router, "old", "prepare").await["quiescent"], false);
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.running = false;
+            s.resident = 4;
+            let result = s.operations.values_mut().next().unwrap();
+            result["sequence"] = json!(2);
+            result["update"] = json!({"status":"completed","quiescent":true});
+        }
+        ready(&router, "new", "prepare").await;
+        assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_preparation_does_not_reopen_for_a_new_predicted_interest() {
+    let engine = Engine::start().await;
+    engine.state.lock().unwrap().running = true;
+    let router = router_with(&[&engine], false, Some(window_config())).await;
+    start(&router, "old").await;
+    start(&router, "new").await;
+    submit(&router, "old", "prepare", prefix(vec![1, 2, 3, 4]), &engine).await;
+    query(&router, "old", "prepare").await;
+    api(
+        &router,
+        json!({"kind":"cancel","task":task("old"),"message_id":"prepare"}),
+    )
+    .await;
+    let cancelled = query(&router, "old", "prepare").await;
+    assert_eq!(
+        cancelled["operations"][0]["result"]["update"]["status"],
+        "cancelled"
+    );
+    let reply: Value = reqwest::Client::new()
+        .post(format!("{}/v1/kv/control", router.url))
+        .bearer_auth("test-control")
+        .json(&resume_event("new", 1000, &engine))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reply["success"], false);
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
+}
+
+#[tokio::test]
+async fn attempted_lost_response_keeps_wire_identity_after_window_and_skips_new_pin() {
+    let engine = Engine::start().await;
+    engine.state.lock().unwrap().lose_submit_once = true;
+    let mut cfg = window_config();
+    cfg.preparation_policy.as_mut().unwrap().ready_pin_ttl_ms = 1000;
+    cfg.preparation_policy.as_mut().unwrap().auto_pin_max_tokens = 4;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "attempted").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    api(&router, resume_event("attempted", 100, &engine)).await;
+    assert_eq!(
+        query(&router, "attempted", "prepare").await["quiescent"],
+        false
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let done = ready(&router, "attempted", "prepare").await;
+    assert!(done["operations"][0]["auto_pin"].is_null());
+    let s = engine.state.lock().unwrap();
+    let submits: Vec<_> = s
+        .commands
+        .iter()
+        .filter(|c| c["kind"] == "submit")
+        .collect();
+    assert!(submits.len() >= 2);
+    assert!(submits
+        .iter()
+        .all(|c| c["envelope"]["message_id"] == submits[0]["envelope"]["message_id"]));
+    assert_eq!(s.operations.len(), 1);
+    assert!(s.claims.is_empty());
+}
+
+#[tokio::test]
+async fn existing_ready_pin_is_kept_after_resume_window_until_normal_cleanup() {
+    let engine = Engine::start().await;
+    let mut cfg = window_config();
+    cfg.preparation_policy.as_mut().unwrap().ready_pin_ttl_ms = 1000;
+    cfg.preparation_policy.as_mut().unwrap().auto_pin_max_tokens = 4;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "retained").await;
+    api(&router, resume_event("retained", 100, &engine)).await;
+    pin_view(&router, "retained", "active").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        pin_view(&router, "retained", "active").await["operations"][0]["auto_pin"]["state"],
+        "active"
+    );
+    event(&router, "retained", "task_finished", 3, "finish").await;
+    assert_eq!(
+        pin_view(&router, "retained", "released").await["quiescent"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn pin_child_discovery_cannot_issue_a_new_claim_after_resume_window() {
+    let engine = Engine::start().await;
+    let mut cfg = window_config();
+    cfg.preparation_policy.as_mut().unwrap().ready_pin_ttl_ms = 1000;
+    cfg.preparation_policy.as_mut().unwrap().auto_pin_max_tokens = 4;
+    let router = Arc::new(router_with(&[&engine], false, Some(cfg)).await);
+    start(&router, "pin-discovery").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    api(&router, resume_event("pin-discovery", 250, &engine)).await;
+    let scope = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_query = Some(scope.clone());
+    let r = router.clone();
+    let query_task = tokio::spawn(async move { query(&r, "pin-discovery", "prepare").await });
+    tokio::time::timeout(Duration::from_secs(2), scope.started.notified())
+        .await
+        .unwrap();
+    let caps = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_capabilities = Some(caps.clone());
+    scope.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), caps.started.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    caps.release.notify_one();
+    let view = query_task.await.unwrap();
+    assert_eq!(view["quiescent"], true);
+    let s = engine.state.lock().unwrap();
+    assert!(s.claims.is_empty());
+    assert!(s
+        .commands
+        .iter()
+        .filter(|c| c["kind"] == "submit")
+        .all(|c| c["envelope"]["actions"][0]["action_type"] != "sglang.pin"));
 }
 
 #[tokio::test]
