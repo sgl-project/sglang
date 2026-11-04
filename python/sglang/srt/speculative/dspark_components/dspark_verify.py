@@ -33,7 +33,6 @@ from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_partials_graph,
-    simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
@@ -1208,13 +1207,13 @@ def sample_simulated_bonus(
         ).view(bs, -1)
         bonus = torch.multinomial(probs, num_samples=1)
     else:
-        bonus = simulated_bonus_sample(
+        bonus = simulated_bonus_sample_graph(
             target_logits=target_logits,
-            correct_len=correct_len,
-            temperatures=sampling_info.temperatures,
+            correct_len=correct_len.contiguous(),
+            temperatures=sampling_info.temperatures.reshape(-1).contiguous(),
+            seed=torch.full((1,), seed, dtype=torch.int32, device=target_logits.device),
             bs=bs,
             rows_per_request=verify_num_draft_tokens,
-            seed=seed,
         )
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 

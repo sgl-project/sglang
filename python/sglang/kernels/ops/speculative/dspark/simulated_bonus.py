@@ -68,9 +68,9 @@ def simulated_bonus_sample_graph(
     bs: int,
     rows_per_request: int,
 ) -> torch.Tensor:
-    """Graph-safe variant of simulated_bonus_sample: seed ([1] int) and per-request
-    temperatures ([bs] float; <= 0 means argmax) are read from device buffers, and
-    only the row at ``correct_len`` is sampled. [bs] int64."""
+    """Gumbel-max temperature sample of each request's row at ``correct_len``; seed
+    ([1] int) and per-request temperatures ([bs] float; <= 0 means argmax) are read
+    from device buffers, so it is graph-safe. [bs] int64."""
     part_val, part_idx = simulated_bonus_partials_graph(
         target_logits=target_logits,
         correct_len=correct_len,
@@ -131,24 +131,3 @@ def simulated_bonus_select_partials(
     top = part_val.max(dim=1, keepdim=True).values
     sentinel = torch.full_like(part_idx, vocab)
     return torch.where(part_val == top, part_idx, sentinel).min(dim=1).values.long()
-
-
-def simulated_bonus_sample(
-    *,
-    target_logits: torch.Tensor,
-    correct_len: torch.Tensor,
-    temperatures: torch.Tensor,
-    bs: int,
-    rows_per_request: int,
-    seed: int,
-) -> torch.Tensor:
-    """Gumbel-max temperature sample of each request's row at ``correct_len``.
-    [bs] int64."""
-    return simulated_bonus_sample_graph(
-        target_logits=target_logits,
-        correct_len=correct_len.contiguous(),
-        temperatures=temperatures.reshape(-1).contiguous(),
-        seed=torch.full((1,), seed, dtype=torch.int32, device=target_logits.device),
-        bs=bs,
-        rows_per_request=rows_per_request,
-    )
