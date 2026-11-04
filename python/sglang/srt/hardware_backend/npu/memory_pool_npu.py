@@ -822,23 +822,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _mla_native_buffers(self):
         from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
 
-        index_k = self.index_k_buffer
         index_width = self.index_head_dim or 0
         if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
-            # Existing NPU HiCache exchanges whole pages using a 5D descriptor.
-            # This is an opaque byte view, NOT token-major [K, scale] records.
             index_width += torch.float32.itemsize
-            index_k = index_k.view(
-                self.num_indexer_layers,
-                index_k.shape[1],
-                self.index_page_size,
-                1,
-                index_width,
-            )
         return MLASplitBuffers(
             k=self.k_buffer,
             v=self.v_buffer,
-            index_k=index_k,
+            # Existing NPU HiCache exchanges whole pages using a 5D descriptor.
+            # This is an opaque byte view, NOT token-major [K, scale] records.
+            index_k=(
+                self.index_k_buffer.view(
+                    self.num_indexer_layers,
+                    self.index_k_buffer.shape[1],
+                    self.index_page_size,
+                    1,
+                    index_width,
+                )
+                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0
+                else self.index_k_buffer
+            ),
             index_scales=self.index_k_scale_buffer,
             index_layer_indices=tuple(
                 i - self.start_layer for i in self.indexer_layer_ids
