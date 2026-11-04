@@ -912,6 +912,7 @@ def test_topk_v2_packed_dsa_dispatch(chunked: bool) -> None:
             cu_seqlens_q_topk=None if chunked else cu_q,
             row_starts=starts[lo:hi],
             batch_idx_list=row_to_batch[lo:hi] if chunked else None,
+            packed_extend_topk=True,
         )
     packed.assert_called_once()
     torch.cuda.synchronize()
