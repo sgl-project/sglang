@@ -17,7 +17,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestNemotronHConfig(CustomTestCase):
     def test_transformers_v5_layer_names_match_legacy_layout(self):
-        """A config.json written by transformers >= 5 parses to the legacy layer layout."""
+        """A config.json written by transformers >= 5.13 parses to the legacy layer layout."""
         legacy = NemotronHConfig(
             layers_block_type=["mamba", "moe", "attention", "mlp"],
             num_nextn_predict_layers=1,
@@ -52,7 +52,7 @@ class TestNemotronHOmniConfig(CustomTestCase):
         self.assertEqual(config.model_type, "nemotron_h_omni")
 
     def test_normalizes_current_nemotron_h_layer_names(self):
-        """Every VL wrapper accepts the transformers >= 5 layer names in llm_config."""
+        """Every VL wrapper accepts the transformers >= 5.13 layer names in llm_config."""
         llm_config = {
             "layers_block_type": ["linear_attention", "moe", "full_attention"],
             "num_nextn_predict_layers": 1,

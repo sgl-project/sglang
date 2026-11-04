@@ -39,7 +39,7 @@ MOE = "E"
 DEFAULT_LAYERS_BLOCK_TYPE = ["mamba", "moe", "attention", "moe"]
 DEFAULT_MTP_LAYERS_BLOCK_TYPE = ["attention", "moe"]
 DEFAULT_MAMBA_CHUNK_SIZE = 256
-# transformers >= 5 writes these names into config.json.
+# transformers >= 5.13 writes these names into config.json.
 TRANSFORMERS_V5_LAYER_TYPE_ALIASES = {
     "linear_attention": "mamba",
     "full_attention": "attention",
@@ -76,7 +76,7 @@ class NemotronHConfig(PretrainedConfig):
             or MoE (`E`).
         layers_block_type (`list[str]`, *optional*):
             Canonical layer layout. Each entry is one of:
-            `"mamba"`, `"attention"`, `"mlp"`, `"moe"`. The transformers >= 5
+            `"mamba"`, `"attention"`, `"mlp"`, `"moe"`. The transformers >= 5.13
             names `"linear_attention"` and `"full_attention"` are accepted as
             aliases of `"mamba"` and `"attention"`.
         num_attention_heads (`int`, *optional*, defaults to 32):
