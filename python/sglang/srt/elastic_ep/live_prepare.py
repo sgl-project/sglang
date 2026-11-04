@@ -1,9 +1,4 @@
-"""Background preparation only: this module must never issue PG collectives.
-
-All participants prepare one cohort. The serving thread observes ``poll()``
-and agrees on activation through the existing WORLD forward-boundary protocol.
-Target-world CUDA graph capture is scheduled separately after admission.
-"""
+"""Background connection preparation; process-group collectives stay on the scheduler."""
 
 from __future__ import annotations
 
@@ -16,12 +11,9 @@ logger = logging.getLogger(__name__)
 
 
 class PreparationStore:
-    """Namespace one scale operation and retain NIXL metadata until commit.
+    """Namespace each operation and retain NIXL records for slower readers.
 
-    NIXL's Python exchange deletes its own metadata after connecting. A faster
-    old rank can finish before a slower joiner reads it. Keeping these small
-    records for the lifetime of this operation avoids that race. Failed
-    operations cannot currently be retried; a server restart is required.
+    NIXL deletes metadata after connecting, before all peers may have read it.
     """
 
     def __init__(self, store, prefix: str):
@@ -47,7 +39,7 @@ class PreparationStore:
         return self.store.wait(keys, timeout)
 
     def delete_key(self, key):
-        # The operation namespace is never reused after a failure.
+        # Slow peers may still need these records.
         return True
 
 

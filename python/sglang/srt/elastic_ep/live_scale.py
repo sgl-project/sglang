@@ -1,24 +1,19 @@
-"""Live scale coordinator. All WORLD operations run on the scheduler.
-
-SGLANG_ELASTIC_LIVE_SCALE=prepare overlaps inactive NIXL connection only;
-``split`` reuses graphs with --elastic-ep-reuse-cuda-graph; otherwise it
-yields to eager serving between target CUDA graph captures.
-The first implementation deliberately requires the non-overlap scheduler.
-"""
+"""Coordinate live scaling on the scheduler; see README_live_serving.md for modes."""
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 import uuid
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 
 def live_scale_mode():
-    mode = os.getenv("SGLANG_ELASTIC_LIVE_SCALE", "")
+    mode = envs.SGLANG_ELASTIC_LIVE_SCALE.get()
     if mode not in ("", "prepare", "split"):
         raise ValueError("SGLANG_ELASTIC_LIVE_SCALE must be prepare or split")
     return mode
@@ -51,7 +46,6 @@ class CaptureProgress:
 
 class LiveScaleCoordinator:
     def __init__(self, runner):
-        from sglang.srt.environ import envs
         from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 
         self.runner = runner
@@ -65,9 +59,8 @@ class LiveScaleCoordinator:
         self.candidate = None
         self.progress = None
         self.agreed_target = 0
-        self.service_steps = int(
-            os.getenv("SGLANG_ELASTIC_CAPTURE_SERVICE_STEPS", "32")
-        )
+        self.joiner_finalized = False
+        self.service_steps = int(envs.SGLANG_ELASTIC_CAPTURE_SERVICE_STEPS.get())
         if self.service_steps < 1:
             raise ValueError("SGLANG_ELASTIC_CAPTURE_SERVICE_STEPS must be positive")
         if not get_schedule().disable_overlap_schedule:
@@ -211,8 +204,7 @@ class LiveScaleCoordinator:
         dist.all_reduce(consensus, op=dist.ReduceOp.MIN, group=dist.group.WORLD)
         vote = consensus.item()
         if vote < 0:
-            # A failed connection attempt cannot currently be cancelled reliably.
-            # Fail closed, rather than allowing a retry to race a connection worker.
+            # A retry could race the uncancellable connection worker.
             raise RuntimeError(
                 error or "Peer failed live preparation; restart required"
             )
@@ -257,15 +249,12 @@ class LiveScaleCoordinator:
                 self.runner._recapture_elastic_cuda_graphs()
             finalize_cuda_graph_capture(self.runner)
             self.runner._finish_joiner_ready(target)
-            self.preparation = None
+            self.complete_preparation()
 
     def capture_joiner_graphs(self, target):
-        """Capture on joiner GPUs while the old cohort keeps replaying its graphs.
+        """Capture before admission, using only cohort-local TP barriers.
 
-        The joiner's scheduler has not entered serving yet. Its TP barriers are
-        cohort-local, DP scheduling has not started, and remote NIXL peers stay
-        masked until the whole cohort commits. No expanded WORLD operation is
-        allowed here. The same buffers and graph entries survive admission.
+        Remote NIXL peers stay masked; expanded WORLD operations are forbidden.
         """
         from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
         from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -312,8 +301,7 @@ class LiveScaleCoordinator:
             tuple(id(g) for g in runner.backend._graphs.values()),
             id(NixlEPBuffer._state().buffer),
             pointers,
-            # Admission may reload relabelled joiner slots. Such reloads must
-            # copy into captured parameter/scale storage, never replace it.
+            # Weight reloads must preserve captured parameter/scale addresses.
             tuple(
                 (name, tensor.data_ptr())
                 for name, tensor in (
@@ -330,13 +318,6 @@ class LiveScaleCoordinator:
         )
 
         mr = self.runner
-        if (
-            mr.decode_cuda_graph_runner is None
-            or mr.decode_cuda_graph_runner is mr.eager_runner
-        ):
-            raise RuntimeError(
-                "Cannot commit graph reuse without prepared decode graphs"
-            )
         if self.graph_storage_snapshot() != self.reuse_snapshot:
             raise RuntimeError(
                 "Graph-facing storage changed during live scale preparation"
@@ -344,12 +325,8 @@ class LiveScaleCoordinator:
         if joiner:
             finalize_cuda_graph_capture(mr)
             self.joiner_finalized = True
-        # All graph-facing storage was updated in place. Only host bookkeeping
-        # follows the new width; there is no eager interval or graph recapture.
-        mr.decode_cuda_graph_runner.num_dp_ranks = mr.eager_runner.num_dp_ranks
-        # Joiners did not receive the HTTP scale request. Give commit_scale the
-        # same pending target so they enter warming_up/serving_expanded too;
-        # otherwise they skip EPLB's WORLD collectives while survivors enter them.
+        # Joiners receive no HTTP request but must enter the same EPLB lifecycle.
+        # Without a pending target, they would skip its WORLD collectives.
         if joiner:
             ElasticEPStateManager.instance().pending_ep_size = target
         ElasticEPStateManager.mark_syncing_new_world()
@@ -416,9 +393,25 @@ class LiveScaleCoordinator:
         self.event("serving_ready", target=target)
         self.report(complete=False)
 
+    def complete_preparation(self):
+        from sglang.srt.distributed.utils import get_global_tcp_store
+
+        if self.preparation is None:
+            return
+        if self.runner._elastic_global_rank() == 0:
+            # After the ready barrier, remove discovery so regrowth waits for
+            # a fresh ID. Keep UUID-scoped NIXL records for slower readers.
+            get_global_tcp_store().delete_key(
+                f"elastic_ep/live_operation/{self.preparation.old_size}/"
+                f"{self.preparation.target_size}"
+            )
+        self.preparation = None
+
     def report(self, *, complete):
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
+        if complete:
+            self.complete_preparation()
         if self.runner._elastic_global_rank() == 0:
             self.runner._pending_elastic_scale_update = ElasticScaleUpdateReq(
                 success=True,
@@ -427,8 +420,6 @@ class LiveScaleCoordinator:
                 slot_count=self.target - self.old,
                 graph_ready=complete,
             )
-        if complete:
-            self.preparation = None
 
     def local_control_target(self):
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -476,9 +467,8 @@ class LiveScaleCoordinator:
             self.agreed_target = 0
             return
         if self.candidate is None:
-            # The existing DP batch gather observes staggered HTTP delivery.
-            # A separate WORLD operation during idle joiner startup can race
-            # the launch-time TP gather. Only enter WORLD after agreed demand.
+            # Wait for DP target agreement: an idle WORLD op could race
+            # the joiner's launch-time TP gather.
             if self.agreed_target > 0:
                 mr.maybe_join_ep_ranks()
             return
@@ -504,9 +494,7 @@ class LiveScaleCoordinator:
         )
         from sglang.srt.runtime_context import get_exec
 
-        if get_exec().moe.is_ep_scale_joiner and not getattr(
-            self, "joiner_finalized", False
-        ):
+        if get_exec().moe.is_ep_scale_joiner and not self.joiner_finalized:
             finalize_cuda_graph_capture(mr)
             self.joiner_finalized = True
         mr.graph_time_usage["decode"] = self.capture_seconds

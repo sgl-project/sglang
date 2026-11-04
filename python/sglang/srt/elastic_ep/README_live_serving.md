@@ -48,9 +48,15 @@ control protocol as the original serving ranks.
   Earlier request deadlines fail the scale operation without terminating serving. An in-flight connection cannot be safely
   cancelled; restart before retrying. Operation metadata remains in TCPStore for
   the process lifetime to avoid early-deletion races with slow participants.
-- This port has CPU protocol tests. Distributed serving/accuracy and failure tests
-  must be rerun on this exact base before claiming production readiness. Results
-  from the earlier development branch are not validation of this rebased branch.
+
+Two-H100-node validation covers live and synchronous 4→8→4 and live 4→5→6
+(job 21188689, source 11be64c35f): 1,941 serving requests without failures.
+After the operation-discovery fix, live 4→8→4→8 passed with fresh joiners and
+distinct operation IDs (job 21282175, source b639a15f25): 961 serving requests
+without failures; growth gaps of 0.401/0.398 s and a shrink gap of 2.085 s.
+GSM32 scores stayed 7/32 and all generated-logprob probes were finite. These
+are smoke checks, not full accuracy certification. Fault-injection recovery
+remains unvalidated. Unit/CUDA checks passed 154 tests and 128 subtests.
 
 CPU tests: `test/registered/unit/elastic_ep/test_live_scale.py`.
 Tensor/CUDA regressions: `test/manual/ep/test_live_graph_reuse_tensors.py`.
