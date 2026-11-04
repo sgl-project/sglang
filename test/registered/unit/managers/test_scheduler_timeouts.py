@@ -25,15 +25,18 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.deferred_responses import (
-    DeferredResponses,
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -77,14 +80,10 @@ def _batch(reqs):
 
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
-    s.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
-    )
+    empty_request_lists(s)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
-    s.waiting_queue = waiting_queue
+    s.waiting_queue.join(waiting_queue)
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
@@ -100,7 +99,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
 class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -124,7 +123,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.tree_cache.finish.assert_called_once_with(
             candidate.cache_request_handle, CacheRequestOutcome.ABORT
         )
-        self.assertEqual(s.waiting_queue, [])
+        self.assertEqual(list(s.waiting_queue), [])
 
 
 class TestWaitingTimeout(CustomTestCase):
@@ -158,7 +157,7 @@ class TestQueuedAbort(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -174,14 +173,14 @@ class TestQueuedAbort(CustomTestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
-        s._release_aborted_request = MagicMock()
+        s.release_aborted_request = MagicMock()
 
         s.abort_request(AbortReq(rid="queued"))
         s.abort_request(AbortReq(abort_all=True))
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
-        s._release_aborted_request.assert_called_once_with(req)
+        s.release_aborted_request.assert_called_once_with(req)
 
 
 class TestRunningTimeout(CustomTestCase):
@@ -222,8 +221,9 @@ class TestRunningTimeout(CustomTestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
-        s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        s.disagg_prefill_transfer_queue = []
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            queue=IndexedReqList(ListKind.PD_BOOTSTRAP)
+        )
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
             self.assertEqual([abort.rid for abort in aborts], ["stale"])
