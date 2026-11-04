@@ -5,10 +5,10 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass
