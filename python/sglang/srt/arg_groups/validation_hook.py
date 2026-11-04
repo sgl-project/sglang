@@ -177,6 +177,13 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.lpm_window_size < 0:
+        raise ValueError("--lpm-window-size must be non-negative")
+    if cfg.lpm_window_size and cfg.schedule_policy != "lpm":
+        raise ValueError("--lpm-window-size requires --schedule-policy lpm")
+    if cfg.lpm_window_size and cfg.enable_priority_scheduling:
+        raise ValueError("--lpm-window-size does not support priority scheduling")
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
