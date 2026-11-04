@@ -11,7 +11,6 @@ in ``sglang.kernels.kda_kernels.kda_prefill_gfx950``.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 
 import torch
@@ -19,12 +18,13 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.environ import envs
 
 
 @lru_cache(maxsize=1)
 def available() -> bool:
     """gfx950 only: the kernel uses the 16x16x32 bf16 MFMA and up to 157 KiB of LDS."""
-    if os.environ.get("SGLANG_ROCM_KDA_HIP_PREFILL", "1").lower() in ("0", "false"):
+    if envs.SGLANG_ROCM_KDA_HIP_PREFILL.get().lower() in ("0", "false"):
         return False
     if not torch.version.hip or not torch.cuda.is_available():
         return False
