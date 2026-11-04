@@ -5068,3 +5068,9 @@ strict 模式仅将明确整数 0 解释为各层零命中，保留 details_pres
 现内部消息携带入口 Instant，Intent 保存绝对窗口，按实际 worker 提前量计算 due。原始 Value 仍用于指纹和重放。所有存活兴趣窗口均过期时，仅未尝试的准备以 late_before_submit 正常退回；任一未来或显式无窗口兴趣可继续。已尝试/丢响应动作沿原 wire ID 收尾，已有 PIN 保留正常 TTL，新 PIN 首次写前重查窗口。恢复从未启动的共享工作会撤销旧本地 quiescence，取消仍不可逆。
 
 parent 审阅完整 runtime/core/HTTP 差异并独立复测：48 HTTP 项通过，5.24s；精确 Rust 1.92 核心 50 项通过、1 live 项按原配置忽略。精确 1.92 release lib Clippy（-D warnings）及全 workspace fmt 通过。日志：lifecycle-opt/resume-window-parent-http-tests.log、resume-window-parent-core-tests.log、resume-window-parent-clippy.log。仅将旧回归中无法跨真实 HTTP 存活的 1ms 窗口调整为仍小于估计提前量的 100ms；新增排队/发现、共享/取消/重放、PIN 子发现期间到期等真实等待回归。
+
+### O7 — 延迟观测到的正常退回
+
+工具将中间 query 或最终 drain 才出现的 late_before_submit 标记累计到 policy_fallback，保留原始响应及初始退回状态，不把正常策略退回记作异常。已创建 intent 的 admitted 状态不变，继续完整 cancel/query/ack，未取得 Engine 回执仍为 unknown。
+
+parent 审阅完整两文件差异，并独立 lifecycle 工具 20 项通过，14.756s；selected Ruff、格式及 diff 检查通过。新增回归分别在 query/drain 阶段给出退回标记，证明各执行一次 cancel/ack、最终 quiescent 且不产生错误；无标记的 null 回执仍计零。日志：lifecycle-opt/fallback-parent-tests.log。

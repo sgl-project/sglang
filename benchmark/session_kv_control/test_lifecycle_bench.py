@@ -1,5 +1,6 @@
 """Lifecycle replay contracts; loopback fixtures never start a GPU server."""
 
+import copy
 import json
 import os
 import tempfile
@@ -224,6 +225,7 @@ class PlanningTests(unittest.TestCase):
             result = preparation.run()
         self.assertEqual(reported, [7000])
         self.assertTrue(result["quiescent"])
+        self.assertTrue(result["policy_fallback"])
 
     def test_scheduled_job_without_engine_receipt_remains_unknown(self):
         holder = {}
@@ -278,6 +280,81 @@ class PlanningTests(unittest.TestCase):
         self.assertFalse(result["strict_preparation_complete"])
         self.assertEqual(result["prepared_tokens_observed"], 0)
         self.assertTrue(result["quiescent"])
+        self.assertFalse(result["policy_fallback"])
+
+    def test_late_policy_fallback_in_query_or_drain_keeps_admitted_cleanup(self):
+        for observed_in in ("query", "drain"):
+            with self.subTest(observed_in=observed_in):
+                calls, holder = [], {}
+                view = {
+                    "state": "scheduled",
+                    "known_scope": [{"branch": "main", "end_token": 1}],
+                    "quiescent": True,
+                    "operations": [
+                        {
+                            "action": "sglang.prefetch",
+                            "worker_url": "http://b",
+                            "engine_id": "b",
+                            "owner_epoch": "epoch",
+                            "quiescent": True,
+                            "result": None,
+                            "ready_scope": None,
+                            "error": None,
+                        }
+                    ],
+                }
+
+                def event(task, name, *args, **kwargs):
+                    calls.append(name)
+                    if name == "resume_expected":
+                        if observed_in == "drain":
+                            holder["preparation"].done.set()
+                        return copy.deepcopy(view)
+                    return {}
+
+                def query(*args):
+                    calls.append("query")
+                    reply = copy.deepcopy(view)
+                    if observed_in == "drain" or "cancel" not in calls:
+                        reply["operations"][0]["policy_fallback"] = "late_before_submit"
+                    holder["preparation"].done.set()
+                    return reply
+
+                def command(body, *args):
+                    calls.append(body["kind"])
+                    return {"acknowledged": body["kind"] == "ack"}
+
+                preparation = lb.Preparation(
+                    args_for(),
+                    SimpleNamespace(
+                        event=event, query=query, command=command, poll_ms=1
+                    ),
+                    SimpleNamespace(
+                        http=SimpleNamespace(url="http://b"),
+                        cap={"engine_id": "b", "engine_epoch": "epoch"},
+                    ),
+                    {"session_id": "task"},
+                    {"prefix": [1], "salt": "salt"},
+                    {
+                        "trial": "late",
+                        "arm": "lifecycle",
+                        "tool_wait_s": 10,
+                        "predicted_wait_s": 10,
+                    },
+                    time.monotonic() + 10,
+                    SimpleNamespace(emit=lambda *args, **kwargs: None),
+                )
+                holder["preparation"] = preparation
+                result = preparation.run()
+                self.assertTrue(result["policy_fallback"])
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["child_statuses"], ["unknown"])
+                self.assertTrue(result["quiescent"])
+                self.assertEqual(calls.count("cancel"), 1)
+                self.assertEqual(calls.count("ack"), 1)
+                self.assertEqual(
+                    calls.count("query"), 2 if observed_in == "query" else 1
+                )
 
     def test_block_statistics_include_incomplete_and_invalid_responses(self):
         args = args_for(min_arm_seconds=10, min_arm_resumes=3)

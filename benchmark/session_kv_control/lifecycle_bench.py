@@ -493,6 +493,9 @@ class Preparation:
                 result["policy_fallback"] = not admitted
                 result["decision"] = copy.deepcopy(view)
                 while True:
+                    result["policy_fallback"] = result["policy_fallback"] or any(
+                        op.get("policy_fallback") for op in view.get("operations", [])
+                    )
                     prepared = inspect_ready(view, self.b, len(self.case["prefix"]))
                     with self.lock:
                         self.observed = {
@@ -544,6 +547,12 @@ class Preparation:
                 if admitted or (attempted and "decision" not in result):
                     result["last_view"] = drain_router(
                         self.router, self.task, "prepare", trial, args.cleanup_timeout_s
+                    )
+                    result["policy_fallback"] = result.get(
+                        "policy_fallback", False
+                    ) or any(
+                        op.get("policy_fallback")
+                        for op in result["last_view"].get("operations", [])
                     )
                 result["quiescent"] = native_quiescent
             except Exception as exc:
