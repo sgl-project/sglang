@@ -47,9 +47,13 @@ from sglang.srt.utils import (
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
 from sglang.srt.utils.network import is_port_available
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
+
+# Tests load HF configs, tokenizers, and models straight from transformers.
+apply_all_hf_patches()
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -1280,7 +1284,7 @@ def run_score_benchmark_multi(
 
     async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers import get_tokenizer
 
         tokenizer = get_tokenizer(model)
 
@@ -1612,7 +1616,7 @@ def run_bench_one_batch_server(
     other_server_args,
     simulate_spec_acc_lens=None,
 ):
-    from sglang.bench_one_batch_server import run_benchmark
+    from sglang.benchmark.one_batch_server import run_benchmark
 
     if simulate_spec_acc_lens is not None:
         env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}
