@@ -402,6 +402,11 @@ impl Job {
             && self.result["public_result"]["claim"].is_null()
     }
 }
+struct ReadObservation {
+    result: Option<Value>,
+    scope: Option<Value>,
+    after: Option<Value>,
+}
 struct Intent {
     fingerprint: String,
     admission_gaps: Vec<String>,
@@ -531,24 +536,7 @@ impl Actor {
     }
     async fn refresh(&mut self, url: &str) -> Result<Capabilities, String> {
         match self.client.capabilities(url).await {
-            Ok(caps) => {
-                let effect = self.feedback.bind(url, &caps);
-                self.invalidate_feedback(url, effect, "discovered owner/source change");
-                if self.caps.get(url).is_some_and(|old| {
-                    old.epoch != caps.epoch
-                        || old.generation != caps.generation
-                        || old.compatibility != caps.compatibility
-                }) {
-                    for job in self.jobs.values_mut().filter(|j| j.url == url) {
-                        job.ready_end = 0;
-                        job.ready_at = None;
-                    }
-                }
-                if self.caps.contains_key(url) || self.caps.len() < self.config.max_workers {
-                    self.caps.insert(url.into(), caps.clone());
-                }
-                Ok(caps)
-            }
+            Ok(caps) => Ok(self.bind_caps(url, caps)),
             Err(e) => {
                 let effect = self.feedback.fail(url, "capabilities unavailable");
                 self.invalidate_feedback(url, effect, "capabilities unavailable");
@@ -560,6 +548,24 @@ impl Actor {
                 Err(e)
             }
         }
+    }
+    fn bind_caps(&mut self, url: &str, caps: Capabilities) -> Capabilities {
+        let effect = self.feedback.bind(url, &caps);
+        self.invalidate_feedback(url, effect, "discovered owner/source change");
+        if self.caps.get(url).is_some_and(|old| {
+            old.epoch != caps.epoch
+                || old.generation != caps.generation
+                || old.compatibility != caps.compatibility
+        }) {
+            for job in self.jobs.values_mut().filter(|j| j.url == url) {
+                job.ready_end = 0;
+                job.ready_at = None;
+            }
+        }
+        if self.caps.contains_key(url) || self.caps.len() < self.config.max_workers {
+            self.caps.insert(url.into(), caps.clone());
+        }
+        caps
     }
     fn invalidate_feedback(&mut self, url: &str, effect: Effect, reason: &str) {
         for job in self.jobs.values_mut().filter(|job| job.url == url) {
@@ -581,20 +587,29 @@ impl Actor {
         self.publish();
     }
     async fn poll_feedback(&mut self, url: &str, caps: &Capabilities) -> Result<(), String> {
-        let limit = self.config.queue_capacity.min(256).max(1);
-        let request = self
+        let limit = self.config.queue_capacity.clamp(1, 256);
+        let result = match self
             .feedback
-            .command(url, caps.context(&self.config.caller_id), limit);
-        let result = match request {
+            .command(url, caps.context(&self.config.caller_id), limit)
+        {
             Ok(None) => return Ok(()),
-            Ok(Some(command)) => match self.client.command(url, &command).await {
-                Ok(page) => self
-                    .feedback
-                    .apply(url, &self.config.caller_id, &page, limit),
-                Err(reason) => Err(reason),
-            },
+            Ok(Some(command)) => self.client.command(url, &command).await,
             Err(reason) => Err(reason),
         };
+        match result {
+            Ok(page) => self.apply_feedback_page(url, &page),
+            Err(reason) => {
+                let effect = self.feedback.fail(url, &reason);
+                self.invalidate_feedback(url, effect, &reason);
+                Err(reason)
+            }
+        }
+    }
+    fn apply_feedback_page(&mut self, url: &str, page: &Value) -> Result<(), String> {
+        let limit = self.config.queue_capacity.clamp(1, 256);
+        let result = self
+            .feedback
+            .apply(url, &self.config.caller_id, page, limit);
         match result {
             Ok(effect) => {
                 self.invalidate_feedback(url, effect, "feedback invalidation/gap");
@@ -605,6 +620,108 @@ impl Actor {
                 self.invalidate_feedback(url, effect, &reason);
                 Err(reason)
             }
+        }
+    }
+    async fn read_observation(
+        &mut self,
+        job: &mut Job,
+        live: &mut Capabilities,
+        reuse_result: bool,
+        cancel: bool,
+    ) -> Result<ReadObservation, String> {
+        let scope = if job.action == "sglang.pin" && !job.pin_refused() {
+            Some(json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]}))
+        } else if job.action == "sglang.prefetch" && !cancel {
+            Some(EngineClient::residency_command(
+                live,
+                &self.config.caller_id,
+                &job.prefix,
+                job.payload["destination"]["tier"]
+                    .as_str()
+                    .unwrap_or("host"),
+            ))
+        } else {
+            None
+        };
+        let limit = self.config.queue_capacity.clamp(1, 256);
+        let events = self
+            .feedback
+            .command(&job.url, job.context.clone(), limit)?;
+        let mut queries = vec![json!({"kind":"capabilities"})];
+        queries.extend(events.clone());
+        if !reuse_result {
+            queries.push(json!({"kind":"query","context":job.context,"message_id":job.message_id}));
+        }
+        queries.extend(scope.clone());
+        if scope.is_some() {
+            queries.extend(events.clone());
+        }
+        let mut results = self
+            .client
+            .read_batch(&job.url, &job.context, queries)
+            .await?
+            .into_iter();
+        *live = self.bind_caps(
+            &job.url,
+            Capabilities::parse(results.next().ok_or("batch capabilities absent")?)?,
+        );
+        if live.engine_id != job.caps.engine_id
+            || live.epoch != job.caps.epoch
+            || live.compatibility != job.caps.compatibility
+        {
+            return Err("owner epoch/compatibility changed during read batch".into());
+        }
+        job.caps.generation = live.generation;
+        if events.is_some() {
+            let page = results.next().ok_or("batch feedback absent")?;
+            self.apply_feedback_page(&job.url, &page)?;
+            Self::batch_feedback_complete(&page)?;
+        }
+        Ok(ReadObservation {
+            result: (!reuse_result).then(|| results.next()).flatten(),
+            scope: scope.is_some().then(|| results.next()).flatten(),
+            after: (scope.is_some() && events.is_some())
+                .then(|| results.next())
+                .flatten(),
+        })
+    }
+    fn batch_feedback_complete(page: &Value) -> Result<(), String> {
+        // Both event reads use the same prior cursor. A truncated/filtered page
+        // cannot prove that post-query history was consumed; repair separately.
+        if page["gap"] != false
+            || page["next_cursor"]["sequence"]
+                .as_u64()
+                .zip(page["latest_sequence"].as_u64())
+                .is_none_or(|(next, latest)| next != latest)
+        {
+            return Err("read batch feedback requires catch-up".into());
+        }
+        Ok(())
+    }
+    async fn finish_observation(
+        &mut self,
+        job: &mut Job,
+        live: &Capabilities,
+        batch: &mut Option<ReadObservation>,
+    ) -> Result<(), String> {
+        if let Some(observation) = batch {
+            if let Some(page) = observation.after.take() {
+                self.apply_feedback_page(&job.url, &page)?;
+                Self::batch_feedback_complete(&page)?;
+            }
+            Ok(())
+        } else {
+            self.poll_feedback(&job.url, live).await
+        }
+    }
+    async fn repair_batch_failure(&mut self, job: &mut Job, reason: &str) {
+        job.ready_end = 0;
+        job.ready_at = None;
+        job.claim_view = Value::Null;
+        let effect = self.feedback.fail(&job.url, reason);
+        self.invalidate_feedback(&job.url, effect, reason);
+        if let Ok(caps) = self.refresh(&job.url).await {
+            let _ = self.poll_feedback(&job.url, &caps).await;
         }
     }
     async fn record(
@@ -1902,6 +2019,26 @@ impl Actor {
         }
     }
     async fn advance(&mut self, job: &mut Job, cancel: bool) -> Result<(), String> {
+        let negotiated = self.preparation_costs.is_some()
+            && self
+                .caps
+                .get(&job.url)
+                .is_some_and(Capabilities::supports_read_batch);
+        let result = self.advance_inner(job, cancel).await;
+        if let Err(reason) = &result {
+            if negotiated
+                || (self.preparation_costs.is_some()
+                    && self
+                        .caps
+                        .get(&job.url)
+                        .is_some_and(Capabilities::supports_read_batch))
+            {
+                self.repair_batch_failure(job, reason).await;
+            }
+        }
+        result
+    }
+    async fn advance_inner(&mut self, job: &mut Job, cancel: bool) -> Result<(), String> {
         if !job.submitted && !job.attempted && !job.releasing_pin && cancel {
             job.quiescent = true;
             return Ok(());
@@ -1954,13 +2091,37 @@ impl Actor {
         if !self.workers().iter().any(|w| w.url == job.url) {
             return Err("worker unavailable".into());
         }
-        let live = self.refresh(&job.url).await?;
-        if live.epoch != job.caps.epoch || live.compatibility != job.caps.compatibility {
+        let cached = self
+            .caps
+            .get(&job.url)
+            .filter(|caps| {
+                self.preparation_costs.is_some()
+                    && job.submitted
+                    && job.last_error.is_none()
+                    && caps.supports_read_batch()
+            })
+            .cloned();
+        let mut live = if let Some(caps) = cached {
+            caps
+        } else {
+            self.refresh(&job.url).await?
+        };
+        if live.engine_id != job.caps.engine_id
+            || live.epoch != job.caps.epoch
+            || live.compatibility != job.caps.compatibility
+        {
             return Err(
                 "owner epoch/compatibility changed; reconcile old operation separately".into(),
             );
         }
-        self.poll_feedback(&job.url, &live).await?;
+        // A failed aggregate read may hide an operation update behind a missing
+        // claim. One existing serial observation repairs that state before retry.
+        let use_batch = self.preparation_costs.is_some()
+            && job.last_error.is_none()
+            && live.supports_read_batch();
+        if !use_batch {
+            self.poll_feedback(&job.url, &live).await?;
+        }
         job.caps.generation = live.generation;
         // Reuse a drained terminal receipt, not its historical location/claim.
         // New submissions (including PIN release) still query their new ID.
@@ -2010,14 +2171,28 @@ impl Actor {
                 }
             }
         }
+        let mut batch = if use_batch {
+            Some(
+                self.read_observation(job, &mut live, reuse_result, cancel)
+                    .await?,
+            )
+        } else {
+            None
+        };
         if !reuse_result {
-            let reply = self
-                .client
-                .command(
-                    &job.url,
-                    &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
-                )
-                .await?;
+            let reply = if let Some(observation) = &mut batch {
+                observation
+                    .result
+                    .take()
+                    .ok_or("batch operation result absent")?
+            } else {
+                self.client
+                    .command(
+                        &job.url,
+                        &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
+                    )
+                    .await?
+            };
             self.update_result(job, reply)?;
         }
         job.ready_end = 0;
@@ -2031,11 +2206,15 @@ impl Actor {
                 return Ok(());
             }
             let ticket = self.feedback.ticket(&job.url)?;
-            let claim=self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
+            let claim = if let Some(observation) = &mut batch {
+                observation.scope.take().ok_or("batch claim absent")?
+            } else {
+                self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?
+            };
             if claim["owner_epoch"] != job.caps.epoch {
                 return Err("stale claim owner epoch".into());
             }
-            self.poll_feedback(&job.url, &live).await?;
+            self.finish_observation(job, &live, &mut batch).await?;
             if !self.feedback.accept_claim(&job.url, &ticket) {
                 return Err("claim query crossed feedback invalidation".into());
             }
@@ -2045,13 +2224,17 @@ impl Actor {
             // A terminal result alone cannot establish current location.
             let tier = job.payload["destination"]["tier"]
                 .as_str()
-                .unwrap_or("host");
+                .unwrap_or("host")
+                .to_owned();
             let ticket = self.feedback.ticket(&job.url)?;
-            let snapshot = self
-                .client
-                .residency(&job.url, &live, &self.config.caller_id, &job.prefix, tier)
-                .await?;
-            self.poll_feedback(&job.url, &live).await?;
+            let snapshot = if let Some(observation) = &mut batch {
+                observation.scope.take().ok_or("batch residency absent")?
+            } else {
+                self.client
+                    .residency(&job.url, &live, &self.config.caller_id, &job.prefix, &tier)
+                    .await?
+            };
+            self.finish_observation(job, &live, &mut batch).await?;
             let effect =
                 self.feedback
                     .accept_query(&job.url, &ticket, &snapshot["cache_watermark"])?;
@@ -2060,7 +2243,7 @@ impl Actor {
                 .get("cache_watermark")
                 .cloned()
                 .unwrap_or(Value::Null);
-            job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, tier)?;
+            job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, &tier)?;
             job.ready_at = Some(Instant::now());
             if job.ready_end == job.prefix.end_token && !job.cost_recorded {
                 if let Some(start) = job.started {

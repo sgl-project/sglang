@@ -15,6 +15,7 @@ pub struct Capabilities {
     pub generation: Option<u64>,
     pub salt_encoding: String,
     pub feedback: Option<Value>,
+    read_batch: Value,
 }
 impl Capabilities {
     pub fn parse(value: Value) -> Result<Self, String> {
@@ -61,9 +62,23 @@ impl Capabilities {
                 _ => "unsupported",
             }.into(),
             feedback:value.get("feedback").filter(|v|!v.is_null()).cloned(),
+            read_batch: value["read_batch"].clone(),
             compatibility,
             public,
         })
+    }
+    pub fn supports_read_batch(&self) -> bool {
+        self.read_batch["version"] == "1.0"
+            && self.read_batch["max_queries"]
+                .as_u64()
+                .is_some_and(|n| (5..=8).contains(&n))
+            && self.read_batch["commands"]
+                .as_array()
+                .is_some_and(|commands| {
+                    ["capabilities", "query", "residency", "claim", "events"]
+                        .iter()
+                        .all(|kind| commands.iter().any(|value| value == kind))
+                })
     }
     pub fn context(&self, caller: &str) -> Value {
         json!({"engine_id":self.engine_id,"engine_epoch":self.epoch,"namespace":self.compatibility.namespace,"caller_id":caller,"binding_id":null})
@@ -141,6 +156,42 @@ impl EngineClient {
     pub async fn command(&self, url: &str, body: &Value) -> Result<Value, String> {
         self.request(url, Some(body)).await
     }
+    pub async fn read_batch(
+        &self,
+        url: &str,
+        context: &Value,
+        queries: Vec<Value>,
+    ) -> Result<Vec<Value>, String> {
+        let count = queries.len();
+        if !(1..=8).contains(&count) {
+            return Err("read batch query capacity".into());
+        }
+        let reply = self
+            .command(
+                url,
+                &json!({"kind":"read_batch","context":context,"version":"1.0","queries":queries}),
+            )
+            .await?;
+        if reply["version"] != "1.0" {
+            return Err("read batch version mismatch".into());
+        }
+        reply["results"]
+            .as_array()
+            .filter(|results| results.len() == count)
+            .cloned()
+            .ok_or_else(|| "incomplete read batch results".into())
+    }
+    pub fn residency_command(
+        caps: &Capabilities,
+        caller: &str,
+        prefix: &PrefixTarget,
+        tier: &str,
+    ) -> Value {
+        json!({"kind":"residency","context":caps.context(caller),"limit":256,
+            "target":{"kind":"tokens","namespace":prefix.compatibility.namespace,"token_ids":prefix.token_ids,
+                "cache_salt":prefix.compatibility.cache_salt,"layout_id":prefix.compatibility.layout_id},
+            "location":{"tier":tier,"engine_id":caps.engine_id}})
+    }
     /// Logical TokensTarget is understood by residency; public PrefixTarget is
     /// normalized only on submit. No Engine-local session binding is required.
     pub async fn residency(
@@ -151,10 +202,8 @@ impl EngineClient {
         prefix: &PrefixTarget,
         tier: &str,
     ) -> Result<Value, String> {
-        self.command(url,&json!({"kind":"residency","context":caps.context(caller),"limit":256,
-            "target":{"kind":"tokens","namespace":prefix.compatibility.namespace,"token_ids":prefix.token_ids,
-                "cache_salt":prefix.compatibility.cache_salt,"layout_id":prefix.compatibility.layout_id},
-            "location":{"tier":tier,"engine_id":caps.engine_id}})).await
+        self.command(url, &Self::residency_command(caps, caller, prefix, tier))
+            .await
     }
 }
 

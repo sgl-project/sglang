@@ -32,11 +32,19 @@ use tokio::task::JoinHandle;
 struct EngineState {
     operations: BTreeMap<String, Value>,
     commands: Vec<Value>,
+    http_commands: Vec<Value>,
+    capability_gets: usize,
     inference: Vec<Value>,
     resident: u64,
     partial: Option<u64>,
     running: bool,
     queued: bool,
+    read_batch: bool,
+    batch_error: Option<String>,
+    batch_remove_after_scope: bool,
+    batch_gap_after_scope: bool,
+    batch_generation_after_scope: bool,
+    batch_filtered_page: bool,
     cancelled: bool,
     claims: BTreeMap<String, Value>,
     claim_deadlines: BTreeMap<String, Instant>,
@@ -85,7 +93,11 @@ impl Drop for Engine {
     }
 }
 async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Value> {
-    let s = state.lock().unwrap();
+    let mut s = state.lock().unwrap();
+    s.capability_gets += 1;
+    Json(capabilities_reply(&s))
+}
+fn capabilities_reply(s: &EngineState) -> Value {
     let mut reply = json!({"success":true,"data":{"engine_id":"mock-engine","engine_epoch":s.epoch,"namespace":"weights-v1",
         "cache_salt_encoding":"owner_assertion","executor":{"cache_generation":1},"public_protocol":{"actions":{"sglang.prefetch":["1.0"],"sglang.demote":["1.0"],"sglang.pin":["1.0"]},
         "paths":{"sglang.prefetch":[["storage","host"],["host","gpu"]],"sglang.demote":[["gpu","storage"],["gpu","host"],["host","storage"]]},
@@ -94,12 +106,17 @@ async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Valu
         reply["data"]["feedback"] = json!({"query":"events","version":"1.0","source_id":"control:mock","source_epoch":s.feedback_epoch,
             "recovery":"query_known_scopes","cache_watermark":cache_watermark(&s)});
     }
-    Json(reply)
+    if s.read_batch {
+        reply["data"]["read_batch"] = json!({"version":"1.0","max_queries":8,
+            "commands":["capabilities","query","residency","claim","events"]});
+    }
+    reply
 }
 async fn command(
     State(state): State<Arc<Mutex<EngineState>>>,
     Json(body): Json<Value>,
 ) -> (axum::http::StatusCode, Json<Value>) {
+    state.lock().unwrap().http_commands.push(body.clone());
     let delayed = if body["kind"] == "residency" {
         state.lock().unwrap().delayed_query.take()
     } else {
@@ -117,6 +134,89 @@ fn command_now(
     body: Value,
 ) -> (axum::http::StatusCode, Json<Value>) {
     use axum::http::StatusCode;
+    if body["kind"] == "read_batch" {
+        let mode;
+        {
+            let mut s = state.lock().unwrap();
+            s.commands.push(body.clone());
+            if !s.read_batch || body["context"]["engine_epoch"] != s.epoch {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"success":false,"error":{"code":"stale_epoch"}})),
+                );
+            }
+            mode = s.batch_error.clone();
+        }
+        let queries = body["queries"].as_array().unwrap();
+        assert!((1..=8).contains(&queries.len()));
+        let mut results = Vec::new();
+        let mut saw_scope = false;
+        for query in queries {
+            assert!(matches!(
+                query["kind"].as_str(),
+                Some("capabilities" | "query" | "residency" | "claim" | "events")
+            ));
+            if query["kind"] == "capabilities" {
+                assert!(query.get("context").is_none());
+                results.push(capabilities_reply(&state.lock().unwrap())["data"].clone());
+                continue;
+            }
+            assert_eq!(query["context"], body["context"]);
+            if query["kind"] == "events"
+                && !query["cursor"].is_null()
+                && query["cursor"]["source_epoch"] != state.lock().unwrap().feedback_epoch
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"success":false,"error":{"code":"stale_cursor"}})),
+                );
+            }
+            let (status, reply) = command_now(state.clone(), query.clone());
+            if !status.is_success() {
+                return (status, reply);
+            }
+            let mut data = reply.0["data"].clone();
+            if query["kind"] == "events" && !saw_scope && state.lock().unwrap().batch_filtered_page
+            {
+                state.lock().unwrap().batch_filtered_page = false;
+                data["items"] = json!([]);
+                data["earliest_sequence"] = json!(1);
+                data["next_cursor"]["sequence"] =
+                    json!(data["latest_sequence"].as_u64().unwrap().saturating_sub(1));
+            }
+            if query["kind"] == "residency" || query["kind"] == "claim" {
+                saw_scope = true;
+                let mut s = state.lock().unwrap();
+                if s.batch_remove_after_scope {
+                    s.batch_remove_after_scope = false;
+                    s.resident = 0;
+                    s.cache_version += 1;
+                    feedback_event(&mut s, "invalidation", json!({"tiers":["host"]}));
+                }
+                if s.batch_gap_after_scope {
+                    s.feedback_gap = true;
+                }
+                if s.batch_generation_after_scope {
+                    s.batch_generation_after_scope = false;
+                    s.native_generation += 1;
+                    s.cache_version = 0;
+                    feedback_event(&mut s, "invalidation", json!({"tiers":["host"]}));
+                }
+            }
+            results.push(data);
+        }
+        if mode.as_deref() == Some("partial") {
+            results.pop();
+        }
+        if mode.as_deref() == Some("oversized") {
+            results[0]["padding"] = json!("x".repeat(1_100_000));
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({"success":true,"data":{
+            "version":if mode.as_deref()==Some("version"){"2.0"}else{"1.0"},"results":results}})),
+        );
+    }
     let mut s = state.lock().unwrap();
     s.commands.push(body.clone());
     if body["kind"] == "events" {
@@ -937,6 +1037,394 @@ async fn pin_view(router: &TestRouter, id: &str, expected: &str) -> Value {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn read_batch_negotiates_opt_in_and_preserves_old_engine_fallback() {
+    for (measured, supported) in [(false, true), (true, false), (true, true)] {
+        let engine = Engine::start().await;
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.read_batch = supported;
+            s.feedback = true;
+        }
+        let mut cfg = orchestration();
+        if measured {
+            cfg.preparation_policy = Some(Default::default());
+        }
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "batch").await;
+        submit(
+            &router,
+            "batch",
+            "prepare",
+            prefix(vec![1, 2, 3, 4]),
+            &engine,
+        )
+        .await;
+        ready(&router, "batch", "prepare").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        ready(&router, "batch", "prepare").await;
+        let s = engine.state.lock().unwrap();
+        let batches: Vec<_> = s
+            .commands
+            .iter()
+            .filter(|c| c["kind"] == "read_batch")
+            .collect();
+        assert_eq!(!batches.is_empty(), measured && supported);
+        if measured && supported {
+            assert!(batches.iter().any(|b| b["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|q| q["kind"] == "query")));
+            assert!(batches
+                .iter()
+                .any(|b| b["queries"].as_array().unwrap().len() == 4));
+            for batch in batches {
+                let kinds: Vec<_> = batch["queries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|q| q["kind"].as_str().unwrap())
+                    .collect();
+                assert!(
+                    kinds == ["capabilities", "events", "query", "residency", "events"]
+                        || kinds == ["capabilities", "events", "residency", "events"]
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn read_batch_ongoing_partial_observation_uses_one_http_rpc() {
+    let engine = Engine::start().await;
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.read_batch = true;
+        s.feedback = true;
+        s.partial = Some(2);
+    }
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(Default::default());
+    cfg.poll_ms = 10_000;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "batch").await;
+    submit(
+        &router,
+        "batch",
+        "prepare",
+        prefix(vec![1, 2, 3, 4]),
+        &engine,
+    )
+    .await;
+    ready(&router, "batch", "prepare").await;
+    // Let the interval's first immediate tick settle. The next tick is ten
+    // seconds away; partial coverage deliberately bypasses the ready cache.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let gets;
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.http_commands.clear();
+        gets = s.capability_gets;
+    }
+    assert_eq!(
+        query(&router, "batch", "prepare").await["operations"][0]["ready_scope"]["end_token"],
+        2
+    );
+    let s = engine.state.lock().unwrap();
+    assert_eq!(s.capability_gets, gets);
+    assert_eq!(s.http_commands.len(), 1);
+    assert_eq!(s.http_commands[0]["kind"], "read_batch");
+    assert_eq!(s.http_commands[0]["queries"].as_array().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn read_batch_queries_queued_receipts_and_current_partial_residency() {
+    let engine = Engine::start().await;
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.read_batch = true;
+        s.feedback = true;
+        s.queued = true;
+    }
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(Default::default());
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "batch").await;
+    submit(
+        &router,
+        "batch",
+        "prepare",
+        prefix(vec![1, 2, 3, 4]),
+        &engine,
+    )
+    .await;
+    let queued = query(&router, "batch", "prepare").await;
+    assert_eq!(
+        queued["operations"][0]["result"]["update"]["status"],
+        "queued"
+    );
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.queued = false;
+        s.resident = 2;
+        let result = s.operations.values_mut().next().unwrap();
+        result["sequence"] = json!(2);
+        result["update"] = json!({"status":"completed","quiescent":true});
+    }
+    let partial = ready(&router, "batch", "prepare").await;
+    assert_eq!(partial["operations"][0]["ready_scope"]["end_token"], 2);
+    assert_eq!(partial["operations"][0]["result"]["sequence"], 2);
+}
+
+#[tokio::test]
+async fn read_batch_retains_pin_claim_ttl_and_new_release_messages() {
+    let engine = Engine::start().await;
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.read_batch = true;
+        s.feedback = true;
+    }
+    let router = router_with(&[&engine], false, Some(auto_pin_config(2000, 4))).await;
+    start(&router, "batch-pin").await;
+    lifecycle_prepare(&router, &engine, "batch-pin", vec![1, 2, 3, 4]).await;
+    pin_view(&router, "batch-pin", "active").await;
+    event(&router, "batch-pin", "task_finished", 3, "finish").await;
+    assert_eq!(
+        pin_view(&router, "batch-pin", "released").await["quiescent"],
+        true
+    );
+    let s = engine.state.lock().unwrap();
+    assert!(s.commands.iter().any(|c| c["kind"] == "read_batch"
+        && c["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q["kind"] == "claim")));
+    assert!(s.commands.iter().any(|c| c["kind"] == "query"
+        && c["message_id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with("-release"))));
+    drop(s);
+    start(&router, "batch-ttl").await;
+    lifecycle_prepare(&router, &engine, "batch-ttl", vec![5, 6, 7, 8]).await;
+    pin_view(&router, "batch-ttl", "active").await;
+    {
+        let mut s = engine.state.lock().unwrap();
+        for deadline in s.claim_deadlines.values_mut() {
+            *deadline = Instant::now();
+        }
+    }
+    assert_eq!(
+        pin_view(&router, "batch-ttl", "expired").await["quiescent"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn read_batch_rejects_partial_version_and_oversized_replies_then_recovers() {
+    for mode in ["partial", "version", "oversized"] {
+        let engine = Engine::start().await;
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.read_batch = true;
+            s.feedback = true;
+            s.batch_error = Some(mode.into());
+        }
+        let mut cfg = orchestration();
+        cfg.preparation_policy = Some(Default::default());
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "batch").await;
+        submit(
+            &router,
+            "batch",
+            "prepare",
+            prefix(vec![1, 2, 3, 4]),
+            &engine,
+        )
+        .await;
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let view = query(&router, "batch", "prepare").await;
+                if view["operations"][0]["error"].is_string() {
+                    break view;
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            failed["operations"][0]["ready_scope"].is_null(),
+            "{mode}: {failed}"
+        );
+        engine.state.lock().unwrap().batch_error = None;
+        assert_eq!(
+            ready(&router, "batch", "prepare").await["operations"][0]["ready_scope"]["end_token"],
+            4
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_batch_rebinds_feedback_epoch_and_downgrades_transport_without_stale_ready() {
+    let engine = Engine::start().await;
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.read_batch = true;
+        s.feedback = true;
+    }
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(Default::default());
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "batch").await;
+    submit(
+        &router,
+        "batch",
+        "prepare",
+        prefix(vec![1, 2, 3, 4]),
+        &engine,
+    )
+    .await;
+    ready(&router, "batch", "prepare").await;
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.feedback_epoch = "journal-2".into();
+        s.feedback_sequence = 0;
+        s.feedback_events.clear();
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    ready(&router, "batch", "prepare").await;
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.read_batch = false;
+        s.resident = 0;
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let absent = query(&router, "batch", "prepare").await;
+    assert!(absent["operations"][0]["ready_scope"].is_null());
+    engine.state.lock().unwrap().resident = 4;
+    ready(&router, "batch", "prepare").await;
+    let batches = engine
+        .state
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .filter(|c| c["kind"] == "read_batch")
+        .count();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    ready(&router, "batch", "prepare").await;
+    assert_eq!(
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|c| c["kind"] == "read_batch")
+            .count(),
+        batches
+    );
+    engine.state.lock().unwrap().epoch = "epoch-2".into();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(query(&router, "batch", "prepare").await["operations"][0]["ready_scope"].is_null());
+}
+
+#[tokio::test]
+async fn read_batch_rejects_scope_crossing_native_removal_or_feedback_gap() {
+    for mode in ["removal", "gap", "generation"] {
+        let engine = Engine::start().await;
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.read_batch = true;
+            s.feedback = true;
+        }
+        let mut cfg = orchestration();
+        cfg.preparation_policy = Some(Default::default());
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "batch").await;
+        submit(
+            &router,
+            "batch",
+            "prepare",
+            prefix(vec![1, 2, 3, 4]),
+            &engine,
+        )
+        .await;
+        ready(&router, "batch", "prepare").await;
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.batch_gap_after_scope = mode == "gap";
+            s.batch_remove_after_scope = mode == "removal";
+            s.batch_generation_after_scope = mode == "generation";
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let view = query(&router, "batch", "prepare").await;
+                if view["operations"][0]["ready_scope"].is_null() {
+                    break view;
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            failed["operations"][0]["ready_scope"].is_null(),
+            "{mode}: {failed}"
+        );
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.resident = 4;
+            s.batch_gap_after_scope = false;
+        }
+        ready(&router, "batch", "prepare").await;
+    }
+}
+
+#[tokio::test]
+async fn read_batch_catches_up_full_and_filtered_feedback_pages_before_ready() {
+    for filtered in [false, true] {
+        let engine = Engine::start().await;
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.read_batch = true;
+            s.feedback = true;
+            if filtered {
+                s.feedback_sequence = 10;
+                s.batch_filtered_page = true;
+            } else {
+                for _ in 0..33 {
+                    feedback_event(&mut s, "operation", json!({}));
+                }
+            }
+        }
+        let mut cfg = orchestration();
+        cfg.preparation_policy = Some(Default::default());
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "batch").await;
+        submit(
+            &router,
+            "batch",
+            "prepare",
+            prefix(vec![1, 2, 3, 4]),
+            &engine,
+        )
+        .await;
+        // Background discovery may already advance a page. Every accepted
+        // positive result must nevertheless be backed by a caught-up batch.
+        ready(&router, "batch", "prepare").await;
+        let feedback = api(&router, json!({"kind":"feedback"})).await;
+        assert!(feedback["owners"][0]["error"].is_null());
+        assert_eq!(
+            feedback["owners"][0]["cursor"]["sequence"],
+            if filtered { 10 } else { 33 }
+        );
+    }
 }
 
 #[tokio::test]

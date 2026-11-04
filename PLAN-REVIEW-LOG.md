@@ -5044,3 +5044,9 @@ parent 阅读完整生产代码与测试差异，独立新增及既有分析 30 
 新增经能力协商的 read_batch 1.0，最多八个非递归只读命令，复用 capabilities/query/residency/claim/events。执行任何 child 前验证全部 context 与顶层一致，复用既有 owner、校验、错误及传输通道；三动作 schema 保持原样。Events 可以推进状态，文档明确不承诺全局原子快照，Router 仍需验证水位和反馈失效。
 
 parent 阅读完整生产、文档及新测试差异，并独立执行 read_batch/service/feedback/protection CPU/HTTP 回归：49 项及 47 子测试通过；selected Ruff、isort、格式和 diff 检查通过。日志：lifecycle-opt/read-batch-parent-tests.log。覆盖数量/版本/递归/写命令拒绝、全量 context 预检、隔离、HTTP/msgpack、原错误和批内 generation 变化。Router 接入另提交，正在运行的旧测试进程保持原版本。
+
+### O5 — Router 协商批量观察
+
+新策略且 Engine 明确支持 read_batch 时，将能力、反馈、操作及 scope/claim 观察合入一次 RPC；初次发现/提交、取消与释放仍单独执行。抽取既有能力绑定及反馈应用，串行与批量共用操作身份、ticket、水位、范围和 claim 验证。日志分页未追上、gap、错误/超限回复或失效都撤销 readiness，按既有单查询路径修复后再尝试；不依赖批量“原子快照”。旧 Engine 和未配置策略保留原路径。
+
+parent 阅读完整三个文件差异，并独立 HTTP orchestration 40 项通过，3.46s；精确 Rust 1.92 fmt 全 workspace 检查通过。新增回归核验持续 partial 观察实际只发一个 HTTP RPC、终态与 queued、PIN TTL/新 release 消息、协商回退、坏/缺/超限结果、epoch/generation/gap、分页及失效恢复。日志：lifecycle-opt/read-batch-parent-http-tests.log。后续真实压力需统一切换两端再评估，原筛选负结果完整保留。
