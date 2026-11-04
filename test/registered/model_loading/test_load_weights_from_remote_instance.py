@@ -20,11 +20,10 @@ import unittest
 
 import numpy as np
 import requests
+import torch
 import torch.multiprocessing as mp
 
 import sglang as sgl
-from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_device_count
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
@@ -69,7 +68,7 @@ def init_process(
     event_dst_ready_list,
     remote_instance_loader_backend,
 ):
-    current_platform.set_device(current_platform.get_device(rank))
+    torch.cuda.set_device(rank)
 
     if rank == 0:
         init_process_seed(
@@ -112,13 +111,12 @@ def init_process_seed(
 ):
     # These two environment variables are very important
     # to avoid unexpected behaviors of CUDA and NCCL.
-    if current_platform.is_cuda_alike():
-        os.environ["NCCL_CUMEM_ENABLE"] = "0"
-        os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
 
     # Load model and get parameters
-    current_platform.set_device(current_platform.get_device(rank))
-    current_platform.synchronize()
+    torch.cuda.set_device(rank)
+    torch.cuda.synchronize()
 
     url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -133,7 +131,7 @@ def init_process_seed(
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
         ),
     )
-    current_platform.synchronize()
+    torch.cuda.synchronize()
 
     seed_params = []
     # Get the weights of seed instance for correctness check.
@@ -170,9 +168,9 @@ def init_process_dst(
     event_dst_ready_list,
     remote_instance_loader_backend,
 ):
+    torch.cuda.set_device(rank * tp_size)
+    torch.cuda.synchronize()
     base_gpu_id = rank * tp_size
-    current_platform.set_device(current_platform.get_device(base_gpu_id))
-    current_platform.synchronize()
 
     event_seed_ready.wait()
     print(f"rank {rank}, seed ready")
@@ -232,7 +230,7 @@ def init_process_dst(
                 str(6789 + rank),
             ),
         )
-    current_platform.synchronize()
+    torch.cuda.synchronize()
 
     event_dst_ready_list[rank - 1].set()
 
@@ -348,13 +346,13 @@ def test_load_weights_from_remote_instance(
     param_queue.close()
     param_queue.join_thread()
     gc.collect()
-    current_platform.empty_cache()
+    torch.cuda.empty_cache()
 
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
     def test_load_weights_from_remote_instance(self):
 
-        assert get_device_count() >= 2, "At least 2 GPUs are required"
+        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
             # FIXME: refactor this test to have less random behavior

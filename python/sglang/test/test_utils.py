@@ -37,7 +37,6 @@ from PIL import Image
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.lang.global_config import global_config
-from sglang.srt.configs.device_config import SUPPORTED_DEVICES
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -290,7 +289,6 @@ def auto_config_device() -> str:
 
 
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
-    device_choices = ["auto"] + SUPPORTED_DEVICES
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
@@ -299,11 +297,8 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         "--device",
         type=str,
         default="auto",
-        choices=device_choices,
-        help=(
-            f"Device type ({'/'.join(device_choices)}). "
-            "'auto' detects the available platform."
-        ),
+        choices=["auto", "cuda", "rocm", "cpu"],
+        help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
     parser.add_argument("--raw-result-file", type=str)
@@ -752,7 +747,7 @@ def popen_launch_server(
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
-    `device="auto"` appends a detected `--device`; other values are ignored.
+    `device` is one of "auto", "cuda", "rocm", "cpu";
     `num_replicas` applies to mixed PD mode.
     """
     other_args = other_args or []
@@ -1519,6 +1514,8 @@ def run_bench_serving_multi(
 
 def run_bench_one_batch(model, other_args):
     """Launch an offline process with automatic device detection."""
+    # Auto-detect device if needed
+
     device = auto_config_device()
     print(f"Auto-configed device: {device}", flush=True)
     other_args += ["--device", str(device)]

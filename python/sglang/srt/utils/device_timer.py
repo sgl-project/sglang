@@ -1,7 +1,7 @@
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Dict, List, Optional, Protocol
+from typing import Callable, Deque, Dict, List, Optional, Protocol
 
 import torch
 
@@ -138,8 +138,8 @@ class GapTimer(DeviceTimer):
 
 @dataclass
 class _TimingInterval:
-    start_event: Any
-    end_event: Optional[Any] = None
+    start_event: torch.Event
+    end_event: Optional[torch.Event] = None
     metadata: Optional[Dict] = None
     observer: Optional[TimingObserver] = None
     stream: Optional[torch.Stream] = None
