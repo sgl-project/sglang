@@ -21,14 +21,14 @@ def prepare_passthrough_request(req):
         ]
 
 
-def check_passthrough_output(generator, req, *, label=""):
+def check_passthrough_output(generator, req, *, label="", device="cuda"):
     output_batch = generator._send_to_scheduler_and_wait_for_response([req])
     noise_pred = output_batch.noise_pred
 
     assert noise_pred is not None, "noise_pred should not be None in OutputBatch"
     assert isinstance(noise_pred, torch.Tensor), "noise_pred should be a torch.Tensor"
-    assert noise_pred.device.type == "cuda", (
-        f"noise_pred should be on cuda, got {noise_pred.device}"
+    assert noise_pred.device.type == device, (
+        f"noise_pred should be on {device}, got {noise_pred.device}"
     )
     assert noise_pred.dtype == torch.bfloat16, (
         f"noise_pred should be bfloat16, got {noise_pred.dtype}"

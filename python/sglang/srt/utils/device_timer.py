@@ -1,9 +1,11 @@
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, List, Optional, Protocol
+from typing import Any, Callable, Deque, Dict, List, Optional, Protocol
 
 import torch
+
+from sglang.srt.utils.common import device_timing_event, get_device_module
 
 
 def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
@@ -27,6 +29,9 @@ class TimingObserver(Protocol):
 
 class DeviceTimer:
     def __init__(self, reporter: Optional[Callable] = None):
+        self._device_module = get_device_module()
+        # CPU has no timing event; degrade to a no-op rather than raise from every wrap.
+        self.timing_supported = device_timing_event(self._device_module) is not None
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [] if reporter is None else [reporter]
         self._in_wrap = False
@@ -58,10 +63,17 @@ class DeviceTimer:
 
     @contextmanager
     def wrap(self, metadata: Dict):
+        if not self.timing_supported:
+            yield
+            return
+
         # Not re-entrant: a nested wrap would end the wrong interval and leave
         # an un-ended one at the head of the queue for _report() to trip over.
         assert not self._in_wrap, "DeviceTimer.wrap is not re-entrant"
-        interval = _TimingInterval.create(track_stream=self._observer is not None)
+        interval = _TimingInterval.create(
+            device_module=self._device_module,
+            track_stream=self._observer is not None,
+        )
         interval.observer = self._observer
         if interval.observer is not None:
             interval.observer.on_interval_start(interval)
@@ -71,7 +83,7 @@ class DeviceTimer:
             yield
         finally:
             self._in_wrap = False
-            interval.end(metadata=metadata)
+            interval.end(device_module=self._device_module, metadata=metadata)
             self._report()
 
     def _report(self):
@@ -105,15 +117,19 @@ class GapTimer(DeviceTimer):
 
     @contextmanager
     def wrap(self, metadata: Dict):
+        if not self.timing_supported:
+            yield
+            return
+
         if self._pending is not None:
-            self._pending.end(metadata=metadata)
+            self._pending.end(device_module=self._device_module, metadata=metadata)
             self._intervals.append(self._pending)
             self._pending = None
             self._report()
         try:
             yield
         finally:
-            self._pending = _TimingInterval.create()
+            self._pending = _TimingInterval.create(device_module=self._device_module)
 
     def cancel(self):
         """Discard a pending gap (e.g. server went idle)."""
@@ -122,8 +138,8 @@ class GapTimer(DeviceTimer):
 
 @dataclass
 class _TimingInterval:
-    start_event: torch.Event
-    end_event: Optional[torch.Event] = None
+    start_event: Any
+    end_event: Optional[Any] = None
     metadata: Optional[Dict] = None
     observer: Optional[TimingObserver] = None
     stream: Optional[torch.Stream] = None
@@ -145,16 +161,15 @@ class _TimingInterval:
         return self._started
 
     @staticmethod
-    def create(track_stream: bool = False):
-        device_module = torch.get_device_module()
+    def create(device_module, track_stream: bool = False):
+        # Only reached past wrap()'s timing_supported gate, so the event exists.
         stream = device_module.current_stream() if track_stream else None
-        start_event = device_module.Event(enable_timing=True)
+        start_event = device_timing_event(device_module)
         start_event.record()
         return _TimingInterval(start_event=start_event, stream=stream)
 
-    def end(self, metadata: Dict):
-        device_module = torch.get_device_module()
-        end_event = device_module.Event(enable_timing=True)
+    def end(self, device_module, metadata: Dict):
+        end_event = device_timing_event(device_module)
         end_event.record()
 
         assert self.end_event is None
