@@ -1267,7 +1267,7 @@ class FusedMoE(torch.nn.Module):
         end_idx = start_idx + self._num_local_routed
         return [i for i in physical_expert_ids if start_idx <= i < end_idx]
 
-    def ep_to_tp_transform(self) -> None:
+    def ep_to_tp_transform(self, *, group: torch.distributed.ProcessGroup) -> None:
         """Transform EP-loaded weights to TP layout via all_to_all.
 
         After load_tp_by_experts loading, each rank holds a disjoint subset of
@@ -1287,7 +1287,7 @@ class FusedMoE(torch.nn.Module):
 
         tp_size = self._orig_moe_tp_size
         tp_rank = self._orig_moe_tp_rank
-        tp_group = get_parallel().tp_group.device_group
+        tp_group = group
         num_shared = self.num_fused_shared_experts
         num_routed_local = self.num_local_experts - num_shared
         src_isp, dst_isp = self._ep_to_tp_isp_pair()

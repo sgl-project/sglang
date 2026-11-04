@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import orjson
 import torch
 
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_model, get_parallel
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -62,6 +62,18 @@ def is_load_tp_by_experts_enabled() -> bool:
     return load_tp_by_experts_requested(get_model().model_loader_extra_config)
 
 
+def _new_transform_group() -> torch.distributed.ProcessGroup:
+    # NCCL keeps an all_to_all's per-peer buffers (about 1.2 GiB per rank on a 4-GPU
+    # GB300 node) until its communicator is destroyed; TP serving never uses all_to_all.
+    tp_group = get_parallel().tp_group
+    return torch.distributed.new_group(
+        tp_group.ranks,
+        backend=torch.distributed.get_backend(tp_group.device_group),
+        use_local_synchronization=True,
+        group_desc="ep_to_tp_transform",
+    )
+
+
 def maybe_ep_to_tp_transform_all_layers(model: nn.Module) -> None:
     """After EP-style weight loading, transform all MoE layers to TP layout.
 
@@ -90,56 +102,63 @@ def maybe_ep_to_tp_transform_all_layers(model: nn.Module) -> None:
         raise ValueError("Internal error: model has no layers or decoder attribute")
 
     transformed = 0
-    for layer in layers:
-        mlp = layer.mlp
+    group = None
+    try:
+        for layer in layers:
+            mlp = layer.mlp
 
-        # Find the FusedMoE module (either mlp itself or mlp.experts)
-        moe_layer = None
-        if isinstance(mlp, FusedMoE):
-            moe_layer = mlp
-        elif hasattr(mlp, "experts") and isinstance(mlp.experts, FusedMoE):
-            moe_layer = mlp.experts
+            # Find the FusedMoE module (either mlp itself or mlp.experts)
+            moe_layer = None
+            if isinstance(mlp, FusedMoE):
+                moe_layer = mlp
+            elif hasattr(mlp, "experts") and isinstance(mlp.experts, FusedMoE):
+                moe_layer = mlp.experts
 
-        # FusedMoE always sets _ep_load_for_tp in __init__, so a plain read is
-        # safe once the isinstance check above has narrowed the type.
-        if moe_layer is None or not moe_layer._ep_load_for_tp:
-            continue
+            # FusedMoE always sets _ep_load_for_tp in __init__, so a plain read is
+            # safe once the isinstance check above has narrowed the type.
+            if moe_layer is None or not moe_layer._ep_load_for_tp:
+                continue
 
-        # Allocate or reuse buffers for each parameter. The layer owns the
-        # target-shape rule because the shard dim is not a plain //tp_size once
-        # the backend pads each partition; see ep_to_tp_target_shape().
-        # Params sharing a (shape, dtype) within one layer must still get
-        # distinct buffers — they are all live simultaneously — so the slot
-        # index disambiguates. Across layers the same slots are reused.
-        claimed: dict[tuple[torch.Size, torch.dtype], int] = {}
-        for name, param in moe_layer.named_parameters():
-            target_shape = moe_layer.ep_to_tp_target_shape(name, param)
+            # Allocate or reuse buffers for each parameter. The layer owns the
+            # target-shape rule because the shard dim is not a plain //tp_size once
+            # the backend pads each partition; see ep_to_tp_target_shape().
+            # Params sharing a (shape, dtype) within one layer must still get
+            # distinct buffers — they are all live simultaneously — so the slot
+            # index disambiguates. Across layers the same slots are reused.
+            claimed: dict[tuple[torch.Size, torch.dtype], int] = {}
+            for name, param in moe_layer.named_parameters():
+                target_shape = moe_layer.ep_to_tp_target_shape(name, param)
 
-            shape_key = (target_shape, param.data.dtype)
-            slot = claimed.get(shape_key, 0)
-            claimed[shape_key] = slot + 1
-            cache_key = shape_key + (slot,)
+                shape_key = (target_shape, param.data.dtype)
+                slot = claimed.get(shape_key, 0)
+                claimed[shape_key] = slot + 1
+                cache_key = shape_key + (slot,)
 
-            if cache_key not in buf_cache:
-                # Zero-filled: alignment padding beyond the real per-rank width
-                # is never written by the transform and must read as zero.
-                buf_cache[cache_key] = torch.zeros(
-                    target_shape, dtype=param.data.dtype, device=param.data.device
-                )
-            else:
-                # Reused across layers — clear the previous layer's padding.
-                buf_cache[cache_key].zero_()
+                if cache_key not in buf_cache:
+                    # Zero-filled: alignment padding beyond the real per-rank width
+                    # is never written by the transform and must read as zero.
+                    buf_cache[cache_key] = torch.zeros(
+                        target_shape, dtype=param.data.dtype, device=param.data.device
+                    )
+                else:
+                    # Reused across layers — clear the previous layer's padding.
+                    buf_cache[cache_key].zero_()
 
-            param._ep_to_tp_buf = buf_cache[cache_key]
+                param._ep_to_tp_buf = buf_cache[cache_key]
 
-        started = time.perf_counter()
-        moe_layer.ep_to_tp_transform()
-        transformed += 1
-        logger.debug(
-            "EP-to-TP transformed layer %d in %.2fs",
-            moe_layer.layer_id,
-            time.perf_counter() - started,
-        )
+            if group is None:
+                group = _new_transform_group()
+            started = time.perf_counter()
+            moe_layer.ep_to_tp_transform(group=group)
+            transformed += 1
+            logger.debug(
+                "EP-to-TP transformed layer %d in %.2fs",
+                moe_layer.layer_id,
+                time.perf_counter() - started,
+            )
+    finally:
+        if group is not None:
+            torch.distributed.destroy_process_group(group)
 
     # Free cached buffers
     buf_cache.clear()
