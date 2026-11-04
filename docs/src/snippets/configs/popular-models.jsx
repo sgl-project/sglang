@@ -13,6 +13,23 @@
 
 export const popularModels = [
   {
+    name: "Kimi-K3.1-Pro",
+    vendor: "Moonshot AI",
+    href: "/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro",
+    logo: "/cards/logos/moonshotai.png",
+    badge: "New",
+    tags: ["12 platforms", "KDA + DSA hybrid", "MXFP4"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet Kimi K3.1 Pro on SGLang",
+      blurb:
+        "Moonshot AI's open-weight, natively multimodal agentic model \u2014 2.8T total parameters with 104B active, 69 KDA linear-attention and 24 Gated Sparse-MLA (DSA) layers over 896 experts, a MoonViT-V2 vision encoder for image input, and MXFP4 weights. Recipes cover NVIDIA Vera Rubin, Blackwell and Hopper, AMD MI350X / MI355X, PPU and Google TPU7x, with DFLASH speculative decoding and PD disaggregation.",
+      tags: ["2.8T / 104B active", "1M context", "NVIDIA + AMD + PPU + TPU"],
+      cta: "Open the Kimi K3.1 Pro cookbook",
+      caption: "Kimi K3.1 Pro deployment guide",
+    },
+  },
+  {
     name: "Muse Spark Open",
     vendor: "Meta",
     href: "/cookbook/autoregressive/Meta/MuseSparkOpen",
@@ -78,23 +95,6 @@ export const popularModels = [
       tags: ["320B / 18B active", "1M context", "Text + image + video"],
       cta: "Open the GLM-5.3-Flash cookbook",
       caption: "GLM-5.3-Flash deployment guide",
-    },
-  },
-  {
-    name: "MiniMax-H3",
-    vendor: "MiniMax",
-    href: "/cookbook/diffusion/MiniMax/MiniMax-H3",
-    logo: "/cards/logos/minimax.png",
-    badge: "New",
-    tags: ["7 platforms", "Video + audio", "BF16 / FP8"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet MiniMax-H3 on SGLang",
-      blurb:
-        "MiniMax's video-and-audio diffusion model — one request returns an MP4 carrying 24 fps video and a synchronized stereo audio track. SGLang Diffusion serves all three task profiles — text, first/last frame, and image / video / audio reference conditioning — with Ulysses × Ring sequence parallelism and recipes across B200, B300, H200, H100, AMD MI300X / MI355X, and 2× RTX 5090.",
-      tags: ["Video + synced audio", "4–15 s at 24 fps", "8× B200 → 2× RTX 5090"],
-      cta: "Open the MiniMax-H3 cookbook",
-      caption: "MiniMax-H3 deployment guide",
     },
   },
 ];
