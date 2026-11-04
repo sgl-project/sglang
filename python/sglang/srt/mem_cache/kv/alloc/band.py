@@ -304,6 +304,7 @@ class Band:
         dcp_size = get_parallel().attn_dcp_size if shards_under_dcp else 1
         self.size = max_slots * dcp_size
         self.device = device
+        self.device_module = torch.get_device_module(self.device)
         self.need_sort = need_sort
         # None: free right away. A list: hold frees until free_group_end().
         self.free_group: Optional[List[torch.Tensor]] = None
@@ -1166,7 +1167,7 @@ class Band:
             # forward_stream); in overlap mode it does the serializing.
             if self.forward_stream is not None:
                 with record_function("Band.free.wait_stream"):
-                    torch.cuda.current_stream().wait_stream(self.forward_stream)
+                    self.device_module.current_stream().wait_stream(self.forward_stream)
             with record_function("Band.free.v2p_lookup"):
                 free_v_pages = (
                     _pages
@@ -1390,7 +1391,7 @@ class Band:
         # The commit's p2v check; its page-table gather and writes are the ones
         # alloc and free run, so they are warm before any compaction can exist.
         torch._assert_async((sink >= 0).all(), "prewarm_compaction")
-        torch.cuda.current_stream().synchronize()
+        self.device_module.current_stream().synchronize()
 
     # -- lazy compaction primitives --
 
@@ -1532,7 +1533,7 @@ class Band:
                     ready_tensors.extend(gpu_batches)
                     ready_entries.append((event, cpu_list))
                 elif urgent:
-                    torch.cuda.current_stream().wait_event(event)
+                    self.device_module.current_stream().wait_event(event)
                     ready_tensors.extend(gpu_batches)
                     ready_entries.append((event, cpu_list))
 
@@ -1631,7 +1632,7 @@ class Band:
         """
         ev = self._latest_forward_done_event
         if ev is not None:
-            torch.cuda.current_stream().wait_event(ev)
+            self.device_module.current_stream().wait_event(ev)
             self._inflight_forward = None
 
     def _flush(self, *, urgent: bool) -> int:
@@ -1729,7 +1730,7 @@ class Band:
                         dsts.clear()
                         inflight = self._inflight_forward
                         if inflight is not None:
-                            torch.cuda.current_stream().wait_event(inflight[0])
+                            self.device_module.current_stream().wait_event(inflight[0])
                             self._inflight_forward = None
                         write_set = set()  # forward drained -> no race
                         latest_event = None
@@ -1924,7 +1925,7 @@ class Band:
         its finish event is observed, so allocation never reuses them."""
         if not self._hicache_transfer_done_events:
             return
-        current_stream = torch.cuda.current_stream()
+        current_stream = self.device_module.current_stream()
         events = tuple(self._hicache_transfer_done_events.values())
         self._hicache_transfer_done_events.clear()
         for event in events:
@@ -1982,7 +1983,7 @@ class Band:
         )
         self._wait_hicache_transfers()
         if self.forward_stream is not None and not self.lazy_compaction:
-            torch.cuda.current_stream().wait_stream(self.forward_stream)
+            self.device_module.current_stream().wait_stream(self.forward_stream)
         virtual_pages = self.ids.physical_to_virtual[physical_pages]
         bound_mask = virtual_pages >= 0
         self.ids.virtual_to_physical.index_fill_(0, virtual_pages[bound_mask], -1)

@@ -8,11 +8,12 @@ import torch
 from sglang.srt.mem_cache.device_pool_info import MHABufferInfo, PageEnvelopeBufferInfo
 from sglang.srt.mem_cache.kv.memory.host_backing import _SharedPageEnvelopeHostBacking
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-if _is_cuda or _is_hip:
+_is_xpu = is_xpu()
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import transfer_kv_direct, transfer_kv_per_layer_mla
 
 
@@ -326,9 +327,9 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             dst.index_copy_(0, dst_pages, src.index_select(0, src_pages))
             return
 
-        if not (_is_cuda or _is_hip):
+        if not (_is_cuda or _is_hip or _is_xpu):
             raise RuntimeError(
-                "Unified page-envelope transfers require a CUDA or ROCm device."
+                "Unified page-envelope transfers require a CUDA, ROCm or XPU device."
             )
         if io_backend == "kernel":
             transfer_kv_per_layer_mla(
