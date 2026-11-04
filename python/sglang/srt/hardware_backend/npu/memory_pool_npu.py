@@ -758,10 +758,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 # index_size, not self.size: the indexer is replicated.
-                use_quant_indexer = (
-                    self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0
-                )
-                if use_quant_indexer:
+                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
                     # One allocation per layer: [P*128 FP8 bytes][P FP32 scales].
                     index_shape = (
                         self.num_indexer_layers,
@@ -781,10 +778,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     )
                 self.index_k_buffer = torch.zeros(
                     index_shape,
-                    dtype=torch.uint8 if use_quant_indexer else self.store_dtype,
+                    dtype=(
+                        torch.uint8
+                        if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0
+                        else self.store_dtype
+                    ),
                     device=self.device,
                 )
-                if use_quant_indexer:
+                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
