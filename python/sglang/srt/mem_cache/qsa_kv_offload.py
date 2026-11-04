@@ -334,12 +334,11 @@ class QSAKVHostOffload:
             layout.scratch_rows,
         )
         self.req_to_token: Optional[torch.Tensor] = None
-        # The fused resolve reads the host store through raw UVA pointers,
-        # validated on CUDA only.
+        # The fused resolve and the selected-row prefill gather read the host
+        # store through raw UVA pointers, validated on CUDA only.
+        self._uva = self.device.type == "cuda" and not is_hip()
         self.use_fused = (
-            self.device.type == "cuda"
-            and not is_hip()
-            and not envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
+            self._uva and not envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
         )
         self.fused = None
         self._resolve_errors_host = torch.zeros(
@@ -561,13 +560,32 @@ class QSAKVHostOffload:
         )
 
     def gather_context(
-        self, layer_idx: int, slots: torch.Tensor
+        self,
+        layer_idx: int,
+        slots: torch.Tensor,
+        selected: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Host K/V rows of these logical slots, in order, on the device."""
+        """Host K/V rows of these logical slots, in order, on the device. With
+        ``selected``, rows ``i`` with ``selected[i] == 0`` may be left unwritten
+        (on CUDA they are)."""
         rows = slots.numel()
         shape = (rows, *self.dev_k[layer_idx].shape[1:])
         k = torch.empty(shape, dtype=self.dev_k[layer_idx].dtype, device=self.device)
         v = torch.empty_like(k)
+        if selected is not None and self._uva:
+            from sglang.srt.mem_cache.qsa_kv_offload_kernels import (
+                gather_selected_rows,
+            )
+
+            gather_selected_rows(
+                slots=slots,
+                selected=selected,
+                host_k=self.host_k[layer_idx],
+                host_v=self.host_v[layer_idx],
+                out_k=k,
+                out_v=v,
+            )
+            return k, v
         dst = torch.arange(rows, dtype=torch.int64, device=self.device)
         _copy_rows(
             k_dst=k,

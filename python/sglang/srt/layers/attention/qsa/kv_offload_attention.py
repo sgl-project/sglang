@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
 )
+from sglang.srt.mem_cache.qsa_kv_offload_kernels import mark_context_rows
 
 
 class QSAKVGatherSource(msgspec.Struct, frozen=True):
@@ -112,11 +113,14 @@ def gather_offloaded_context(
     forward_batch,
     sequence_lens: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    topk_indices: torch.Tensor,
     total_k: int,
     output_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Every context token of each request, in ``cu_seqlens_k`` order, read
-    from the host (the layout ``pack_qsa_prefill_kv`` builds from the pool)."""
+    """The context of each request in ``cu_seqlens_k`` order (the layout
+    ``pack_qsa_prefill_kv`` builds from the pool), read from the host. Only
+    the rows ``topk_indices`` selects are copied: the sparse prefill reads
+    no others."""
     device = sequence_lens.device
     owner = torch.repeat_interleave(
         torch.arange(sequence_lens.numel(), device=device),
@@ -130,7 +134,13 @@ def gather_offloaded_context(
     ]
     pool = backend.token_to_kv_pool
     layer_idx = pool.full_attention_layer_index(layer.layer_id)
-    k, v = offload.gather_context(layer_idx=layer_idx, slots=slots)
+    selected = mark_context_rows(
+        indices=topk_indices,
+        cu_seqlens_k=cu_seqlens_k,
+        extend_seq_lens=forward_batch.extend_seq_lens,
+        total=total_k,
+    )
+    k, v = offload.gather_context(layer_idx=layer_idx, slots=slots, selected=selected)
     pool_k = pool.layer_router.read(layer.layer_id).key()
     pool_v = pool.layer_router.read(layer.layer_id).value()
     packed = (
@@ -138,6 +148,20 @@ def gather_offloaded_context(
         v.view(pool_k.dtype).to(output_dtype),
     )
     if offload.verify:
+        # The rows the prefill reads, derived without the mark kernel.
+        idx = topk_indices.reshape(topk_indices.shape[0], -1).long()
+        ends = forward_batch.extend_seq_lens.to(device=device).long().cumsum(0)
+        owner_q = torch.searchsorted(
+            ends, torch.arange(idx.shape[0], device=device), right=True
+        )
+        reference = torch.zeros_like(selected)
+        reference[(cu_seqlens_k.long()[owner_q, None] + idx)[idx >= 0]] = 1
+        offload.check(
+            what="prefill mark",
+            layer_idx=layer_idx,
+            actual=[selected],
+            expected=[reference],
+        )
         expected = pack_qsa_prefill_kv(
             k=pool_k,
             v=pool_v,
@@ -148,11 +172,12 @@ def gather_offloaded_context(
             max_k=int(sequence_lens.max()),
             output_dtype=output_dtype,
         )
+        read = reference.bool().view(-1, *([1] * (expected[0].ndim - 1)))
         offload.check(
             what="prefill context",
             layer_idx=layer_idx,
-            actual=packed,
-            expected=expected,
+            actual=[torch.where(read, x, 0) for x in packed],
+            expected=[torch.where(read, x, 0) for x in expected],
         )
     return packed
 

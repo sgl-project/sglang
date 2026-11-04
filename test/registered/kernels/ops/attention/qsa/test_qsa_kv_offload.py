@@ -18,11 +18,13 @@ from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
+    sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.mem_cache.qsa_kv_offload import (
     QSAKVHostOffload,
     compute_offload_layout,
 )
+from sglang.srt.mem_cache.qsa_kv_offload_kernels import mark_context_rows
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -282,6 +284,86 @@ def test_fused_resolve_in_cuda_graph_with_padding(request):
             for old, new in zip(before, after):
                 assert torch.equal(old, new[0, padded])
     assert int(fused.errors) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_prefill_gathers_only_the_rows_it_reads(dtype, request):
+    """A chunk prefill on cached prefixes: the mark flags exactly the context
+    rows the top-k references, the offload copies exactly those from the host,
+    and the sparse prefill output is bit-identical when every other context row
+    holds NaN."""
+    torch.manual_seed(5)
+    q_heads, topk, layout_slots = 16, BLOCK_TOPK * CR, 3
+    seq, ext = [12000, 9000], [96, 300]
+    total_k, rows = sum(seq), sum(ext)
+    cu_k = torch.tensor([0, seq[0], total_k], dtype=torch.int32, device="cuda")
+    cu_q = torch.tensor([0, ext[0], rows], dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor(seq, dtype=torch.int32, device="cuda")
+    indices = torch.full((rows, topk), -1, dtype=torch.int32, device="cuda")
+    expected = torch.zeros(total_k, dtype=torch.int8, device="cuda")
+    row = 0
+    for r in range(2):
+        for j in range(ext[r]):
+            visible = seq[r] - ext[r] + j + 1
+            chosen = torch.randperm(visible, device="cuda")[:topk]
+            indices[row, : chosen.numel()] = chosen.int()
+            expected[int(cu_k[r]) + chosen] = 1
+            row += 1
+    ext_lens = torch.tensor(ext, device="cuda")
+    selected = mark_context_rows(
+        indices=indices, cu_seqlens_k=cu_k, extend_seq_lens=ext_lens, total=total_k
+    )
+    assert torch.equal(selected, expected)
+    assert 0 < int(selected.sum()) < total_k
+    # Indices with a group dimension mark the same rows.
+    grouped = mark_context_rows(
+        indices=indices.view(rows, 2, topk // 2),
+        cu_seqlens_k=cu_k,
+        extend_seq_lens=ext_lens,
+        total=total_k,
+    )
+    assert torch.equal(grouped, expected)
+
+    layout = compute_offload_layout(
+        compress_ratio=CR,
+        token_topk=topk,
+        hot_blocks=BLOCK_TOPK,
+        num_request_slots=layout_slots,
+        rows_per_request=1,
+        max_extend_tokens=4096,
+        page_size=64,
+    )
+    dev_k = torch.zeros((layout.device_rows + 64, HEADS, DIM), device="cuda").to(dtype)
+    offload = QSAKVHostOffload(
+        layout=layout, k_buffers=[dev_k], v_buffers=[dev_k.clone()], host_rows=40000
+    )
+    request.addfinalizer(offload.destroy)
+    pool_k = torch.randn(40000, HEADS, DIM, device="cuda").to(dtype)
+    pool_v = torch.randn_like(pool_k.float()).to(dtype)
+    offload.host_k[0].copy_(pool_k.cpu())
+    offload.host_v[0].copy_(pool_v.cpu())
+    slots = torch.randperm(40000, device="cuda")[:total_k].int()
+    k, v = offload.gather_context(layer_idx=0, slots=slots, selected=selected)
+    read = selected.bool()
+    full_k, full_v = (x.view(torch.uint8)[slots.long()] for x in (pool_k, pool_v))
+    assert torch.equal(k.view(torch.uint8)[read], full_k[read])
+    assert torch.equal(v.view(torch.uint8)[read], full_v[read])
+
+    q = torch.randn(rows, q_heads, DIM, device="cuda").bfloat16()
+    k, v, full_k, full_v = (
+        x.view(dtype).to(torch.bfloat16) for x in (k, v, full_k, full_v)
+    )
+    keep = read[:, None, None]
+    out = [
+        sparse_gqa_fwd_interface_triton_ck(
+            q, ck, cv, indices, cu_q, cu_k, kv_lens, DIM**-0.5
+        )
+        for ck, cv in (
+            (full_k, full_v),
+            (torch.where(keep, k, torch.nan), torch.where(keep, v, torch.nan)),
+        )
+    ]
+    assert torch.equal(out[0].view(torch.int16), out[1].view(torch.int16))
 
 
 if __name__ == "__main__":

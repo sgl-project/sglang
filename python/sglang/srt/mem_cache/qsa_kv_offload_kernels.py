@@ -19,6 +19,10 @@ synchronization, so decode and target-verify forwards can be captured:
 ``_copy_plan_kernel`` and ``_ring_load_kernel`` then copy the planned host rows
 (read through their pinned UVA addresses). Requests at or past ``num_real``
 (CUDA-graph padding) change no state and get ``-1`` rows.
+
+A prefill on a cached prefix reads only the context rows its top-k selects:
+``mark_context_rows`` flags them and ``gather_selected_rows`` copies only those
+from the host.
 """
 
 import torch
@@ -513,3 +517,120 @@ class QSAKVFusedResolve:
             ROW_WORDS=self.row_words,
             num_warps=2,
         )
+
+
+@triton.jit
+def _mark_context_rows_kernel(
+    indices_ptr,
+    stride_row,
+    row_base_ptr,
+    selected_ptr,
+    topk,
+    total,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    base = tl.load(row_base_ptr + row)
+    ptrs = indices_ptr + row * stride_row + cols
+    idx = tl.load(ptrs, mask=cols < topk, other=-1).to(tl.int64)
+    dst = base + idx
+    tl.store(
+        selected_ptr + dst,
+        tl.full([BLOCK], 1, tl.int8),
+        mask=(idx >= 0) & (dst < total),
+    )
+
+
+def mark_context_rows(
+    *,
+    indices: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    total: int,
+) -> torch.Tensor:
+    """int8 ``[total]``: 1 at every packed context row a sparse prefill reads.
+    Query row ``i`` of request ``r`` (rows ordered by request, ``extend_seq_lens``
+    each) reads packed rows ``cu_seqlens_k[r] + j`` for ``j`` in ``indices[i]``
+    with ``j >= 0``."""
+    selected = torch.zeros(total, dtype=torch.int8, device=indices.device)
+    rows = indices.shape[0]
+    if rows == 0 or total == 0:
+        return selected
+    flat = indices.reshape(rows, -1).contiguous()
+    row_base = (
+        cu_seqlens_k[:-1]
+        .long()
+        .repeat_interleave(
+            extend_seq_lens.to(device=indices.device, dtype=torch.long),
+            output_size=rows,
+        )
+    )
+    block = 1024
+    _mark_context_rows_kernel[(rows, triton.cdiv(flat.shape[1], block))](
+        flat,
+        flat.stride(0),
+        row_base,
+        selected,
+        flat.shape[1],
+        total,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return selected
+
+
+@triton.jit
+def _gather_selected_kernel(
+    slots_ptr,
+    selected_ptr,
+    total,
+    host_k_addr,
+    host_v_addr,
+    out_k_ptr,
+    out_v_ptr,
+    ROWS: tl.constexpr,
+    ROW_WORDS: tl.constexpr,
+):
+    r = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+    ok = r < total
+    ok = ok & (tl.load(selected_ptr + r, mask=ok, other=0) != 0)
+    src = tl.load(slots_ptr + r, mask=ok, other=0).to(tl.int64)
+    col = tl.arange(0, ROW_WORDS)
+    hk = (host_k_addr + src * (ROW_WORDS * 8)).to(tl.pointer_type(tl.int64))
+    hv = (host_v_addr + src * (ROW_WORDS * 8)).to(tl.pointer_type(tl.int64))
+    out = r[:, None] * ROW_WORDS + col[None, :]
+    k = tl.load(hk[:, None] + col[None, :], mask=ok[:, None], other=0)
+    v = tl.load(hv[:, None] + col[None, :], mask=ok[:, None], other=0)
+    tl.store(out_k_ptr + out, k, mask=ok[:, None])
+    tl.store(out_v_ptr + out, v, mask=ok[:, None])
+
+
+def gather_selected_rows(
+    *,
+    slots: torch.Tensor,
+    selected: torch.Tensor,
+    host_k: torch.Tensor,
+    host_v: torch.Tensor,
+    out_k: torch.Tensor,
+    out_v: torch.Tensor,
+) -> None:
+    """``out[i] = host[slots[i]]`` for every ``selected[i] != 0``, read through
+    the pinned host rows' UVA addresses; other rows of ``out`` are not written."""
+    total = slots.numel()
+    if total == 0:
+        return
+    row_bytes = out_k[0].numel() * out_k.element_size()
+    rows = 32
+    _gather_selected_kernel[(triton.cdiv(total, rows),)](
+        slots,
+        selected,
+        total,
+        host_k.data_ptr(),
+        host_v.data_ptr(),
+        out_k.view(total, -1).view(torch.int64),
+        out_v.view(total, -1).view(torch.int64),
+        ROWS=rows,
+        ROW_WORDS=row_bytes // 8,
+        num_warps=8,
+    )

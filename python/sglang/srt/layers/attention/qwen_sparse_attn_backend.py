@@ -1607,6 +1607,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 forward_batch=forward_batch,
                 sequence_lens=sequence_lens_tensor,
                 cu_seqlens_k=cu_seqlens_k,
+                topk_indices=topk_indices,
                 total_k=sum(sequence_lens),
                 output_dtype=q.dtype,
             )
