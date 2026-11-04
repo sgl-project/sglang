@@ -16,8 +16,8 @@ direct delivery, and layouts without trailing state skip this confirmation.
 ## Setup
 
 Install KVCR with its NIXL/UCX dependencies in the serving environment. Use the
-public API from KVCR revision `0fd754d8` (PR #133) or a compatible revision with
-optional framework-pinning callbacks and the local-copy timeout lifecycle fix.
+public API from KVCR revision `5d5fa152` (PR #161) or a later revision with the
+split framework/router `KeyAdapter` API. The linker supports TP1 workers for now.
 
 DRAM additions and removals carry `ownership="kvcr"` in the existing KV event
 stream. Engine GPU events and cache clears retain the default ownership. Dynamo
@@ -39,8 +39,8 @@ completes. Layer waits resolve without publishing partial cache contents;
 the scheduler then waits for terminal native batch completion and aborts a
 failed load before consuming its output. Queued, unstarted loads may be
 cancelled, but active native transfers retain their slots until quiescence.
-TP replicated-page dedup and process-wide GC tuning are excluded from this
-initial integration. No new model accuracy or performance result is claimed.
+Process-wide GC tuning is excluded from this initial integration. No new model
+accuracy or performance result is claimed.
 
 ## Worker configuration
 
@@ -92,7 +92,7 @@ fails startup: these do not prove that falling back is safe. KVCR owns Guard
 claiming, recovery, and release; SGLang does not allocate a second DRAM pool
 when a claim succeeds.
 
-Provision the service using KVCR's `python -m kvcr.kvcr_service` command with
+Provision the service using KVCR's `kvcr-service` command with
 `--socket-path`, `--pool-dir`, `--guard-count`, `--pool-sizes-gb`, and
 `--compatibility-digest`. Startup logs include the requested digest and ordered
 pool layouts (name and block bytes). The service's ordered pool capacities, not
