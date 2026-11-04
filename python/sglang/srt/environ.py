@@ -557,7 +557,6 @@ class Envs:
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
-    SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     # Argmax every draft row, sampling requests included, accepted as a one-hot
     # draft: no step logits kept, lower acceptance at high temperatures.
@@ -573,10 +572,6 @@ class Envs:
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
-    # With the TP-sharded markov_w2, keep each draft step's logits on the local
-    # vocab shard and run the sampling accept on the shards, instead of
-    # all-gathering the full logits every step. Same accept distribution.
-    SGLANG_DSPARK_SHARDED_ACCEPT = EnvBool(_default_hip)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
@@ -1117,7 +1112,6 @@ class Envs:
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
-    SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
     # Smaller MegaMoEV2 capacity for decode steps; a step with an extend on any
     # DP rank keeps SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR. Must hold one rank's
@@ -1153,12 +1147,10 @@ class Envs:
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
-    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
-    SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     # DSPARK: run the target lm_head projection (verify logits) in fp8 via
     # torch._scaled_mm (per-token activation scale + per-output-channel weight
     # scale, weight quantized once and cached). Halves the per-step head GEMM;
@@ -1537,7 +1529,6 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
 
@@ -1991,36 +1982,19 @@ class Envs:
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
-    # SM90 paged decode indexer: split all rows' tiles evenly over the GPU instead of a
-    # fixed number of CTAs per row, so one long context no longer sets the step time, and
-    # load each row's queries once. Scores are bitwise identical to the per-row kernel.
-    SGLANG_OPT_DSV41_FAST_DECODE_INDEXER = EnvBool(True)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
-    # gfx950 MXFP8 dense GEMMs run the in-tree FlyDSL kernel mxfp8_flydsl_gfx95 at prefill
-    # sizes; decode stays on aiter.
-    SGLANG_OPT_HIP_FLYDSL_MXFP8 = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
-    # gfx950 MXFP8 dense routes (aiter group32 / native): the producer emits fp8 + ue8m0 for its
-    # consumer instead of bf16 plus a separate quant launch -- the shared expert's SwiGLU for
-    # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
-    SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
-    SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
     # gfx950 aiter MXFP8 dense route: keep the weight (16, 16)-preshuffled and run aiter's FlyDSL MXFP8
     # GEMM (needs aiter with ROCm/aiter#5896) instead of the Triton group32 GEMM on the plain weight.
     SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE = EnvBool(False)
-    SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
     # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
     # FP4 MQA logits kernel, a request's verify rows sharing each key load.
     SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
-    # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
-    # its workspace built in the graph without a schedule; a request's verify rows share each
-    # key load.
-    SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP = EnvBool(False)
     # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
     # 64-slot page), so a candidate consumer layer scores only its published blocks.
     SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
@@ -2029,18 +2003,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
-    # Fuse inverse RoPE into wo_a activation quantization: CUDA UE8M0 JIT
-    # or ROCm gfx950 aiter inverse_rope_group_quant. Off by default;
-    # requires the corresponding FP8 wo_a path.
+    # CUDA: fuse inverse RoPE into the UE8M0 FP8 wo_a activation quantization.
+    # Off by default; requires the FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
-    # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
-    # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
-    # Emits MXFP8 when wo_b supports it, otherwise BF16.
-    SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
-    # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
-    # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
-    # _apply_wo_a_bf16_matmul.
-    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one
@@ -2150,8 +2115,6 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
-    # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
-    SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
@@ -2171,13 +2134,6 @@ class Envs:
     # different GEMM accumulation order), hence default OFF until accuracy-
     # gated (oracle + full-set gsm8k).
     SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q = EnvBool(False)
-    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: pass a
-    # per-row valid-topk count (derived from the trailing -1 pad run of the
-    # topk indices) so the kernel skips whole pad-only topk blocks instead of
-    # computing masked zero contributions.  Bit-exact by construction: skipped
-    # blocks contain only -1 pads, and -1 entries inside the consumed range
-    # still take the in-kernel clamp+mask path.
-    SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
     # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
     # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
     # chains fork independently from the q_a_layernorm output.  Requires

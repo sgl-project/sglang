@@ -217,7 +217,10 @@ pass_configs = {
 
 
 def _use_deep_gemm_hc_prenorm() -> bool:
-    if is_hip() or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    platform = get_platform()
+    if not (platform.is_sm90 or platform.is_sm100):
+        return False
+    if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         return False
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM

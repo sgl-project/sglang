@@ -6,10 +6,12 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -121,7 +123,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
         free = cache.token_to_kv_pool_allocator.free_swa_segment
         with (
             patch("sglang.srt.managers.schedule_batch._is_hip", True),
-            envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.override(True),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
             envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
             envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
         ):

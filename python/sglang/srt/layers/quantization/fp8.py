@@ -2013,10 +2013,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
-            if (
-                get_moe_a2a_backend().is_megamoe()
-                and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
-            ):
+            if get_moe_a2a_backend().is_megamoe():
                 if self.dequant_fp4_to_fp8:
                     raise ValueError(
                         "SGLANG_DSV4_FP4_DEQUANT strips the packed FP4 layout that "
