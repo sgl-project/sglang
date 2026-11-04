@@ -534,7 +534,6 @@ def _create_model_and_load(
 
 
 class TestEpToTpTransform(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         server_args = ServerArgs(model_path="dummy", disable_shared_experts_fusion=True)
