@@ -2,9 +2,9 @@
 
 At decode-sized M, cuBLAS's heuristic can pick a kernel whose grid leaves most SMs
 idle. When a GEMM runs without split-K, every output element is one fp32
-accumulator over K in ascending order followed by one rounding to BF16, so other
-split-K-free cuBLASLt algorithms of the same build often give the same bits while
-using the GPU better. ``benchmark/kernels/pinned_bf16_gemm/tune_pinned_bf16_gemm.py``
+accumulator over K followed by one rounding to BF16, so other split-K-free
+cuBLASLt algorithms of the same build that accumulate K in the same order give the
+same bits while using the GPU better. ``benchmark/kernels/pinned_bf16_gemm/tune_pinned_bf16_gemm.py``
 searches them per (N, K, M) and keeps only algorithms that give torch.mm's bits on
 ``order_check_operands``, inputs on which an algorithm that accumulates K in
 another order differs from torch.mm with overwhelming probability. It writes the
