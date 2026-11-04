@@ -39,6 +39,11 @@ else:
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    ReqList,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
@@ -68,6 +73,53 @@ class HiSparseAct(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     req: Req
+
+
+class _HiSparseStagingQueue(IndexedReqList):
+    """Deque-backed IndexedReqList with O(1) FIFO popleft when draining head items."""
+
+    def __init__(self, kind: ListKind, **kwargs) -> None:
+        from collections import deque
+
+        super().__init__(kind, **kwargs)
+        self._items = deque()
+
+    def prepend(self, items) -> None:
+        for item in reversed(list(items)):
+            self._items.appendleft(item)
+
+    def replace(self, items) -> None:
+        from collections import deque
+
+        self._items = deque(items)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return list(self._items)[index]
+        return self._items[index]
+
+    def leave(self, reqs) -> None:
+        leaving = list(reqs)
+        if not leaving:
+            return
+        idx = 0
+        while (
+            idx < len(leaving)
+            and self._items
+            and self._req_of(self._items[0]) is leaving[idx]
+        ):
+            self._items.popleft()
+            idx += 1
+        if idx < len(leaving):
+            from collections import deque
+
+            remaining = set(leaving[idx:])
+            self._items = deque(
+                item for item in self._items if self._req_of(item) not in remaining
+            )
 
 
 class HiSparseTokenStats(NamedTuple):
@@ -654,6 +706,9 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self.ack_staging_queue = _HiSparseStagingQueue(
+            ListKind.HISPARSE_STAGING, req_of=lambda x: x.req
+        )
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
