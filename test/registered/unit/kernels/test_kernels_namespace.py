@@ -562,6 +562,7 @@ def test_muse_spark_kernels_are_inventoried_by_operator(op, backends):
         ("attention.deep_select_topk", (10, 0), True),
         ("attention.deep_select_topk", (10, 1), False),
         ("attention.deep_select_topk", (10, 3), True),
+        ("attention.deep_select_topk", (10, 7), True),
         ("attention.deep_select_topk", (12, 0), False),
         ("attention.chunk_kda_fwd", (9, 0), False),
         ("attention.chunk_kda_fwd", (10, 0), True),

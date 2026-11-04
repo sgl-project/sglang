@@ -30,6 +30,9 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
 )
 from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    _token_loc as _dsa_token_loc,
+)
 
 from ..attention_methods.dense_attention import (
     DEFAULT_DEVICE,
@@ -52,9 +55,6 @@ from ..attention_methods.dsa_attention import (
     DSA_SPARSE_INDEX_TOPK,
     DSA_SPARSE_RTOL,
     DSAAttentionCase,
-)
-from ..attention_methods.dsa_attention import _token_loc as _dsa_token_loc
-from ..attention_methods.dsa_attention import (
     build_dsa_sparse_attention_fixture,
 )
 from ..attention_methods.dsv4_attention import (
