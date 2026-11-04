@@ -353,8 +353,6 @@ def _accepts_value(grammar, value):
 
 
 def test_strict_schema_resolves_refs_into_the_root_structure():
-    """Each argument compiles as its own schema, so refs into the root's
-    properties must still resolve there."""
     sibling = _grammar(
         [
             _value_tool(
@@ -389,7 +387,6 @@ def test_strict_schema_resolves_refs_into_the_root_structure():
     assert _accepts_value(items, '{"list":["a"],"one":"b"}')
     assert not _accepts_value(items, '{"one":2}')
 
-    # A ref chain through both a definition pool and the root structure.
     chained = _grammar(
         [
             _value_tool(
