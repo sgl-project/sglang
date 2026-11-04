@@ -74,7 +74,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
 Or run a benchmark:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 4000 \
