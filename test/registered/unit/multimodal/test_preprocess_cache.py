@@ -5,7 +5,7 @@ DiskPreprocessCache(dir)
       umask file mode; a file deleted mid-read (ESTALE) is a miss
   a key whose file exists -> not rewritten
   a key another writer is writing -> left to it; a failed write -> the next writer takes it
-  a temporary file a killed process left -> removed when the directory is opened
+  another process opening the dir -> a writer's temporary file stays
 
 snapshot_media / parse_content_hash
   hash strings -> strict, normalized format
@@ -157,19 +157,20 @@ class TestDiskPreprocessCache(unittest.TestCase):
         cache[failing_key] = torch.ones(8)
         self.assertTrue(torch.equal(cache.get(failing_key), torch.ones(8)))
 
-    def test_opening_the_directory_removes_stale_temporary_files(self):
-        """A claim left by a killed process would otherwise keep its key from ever being written."""
+    def test_opening_the_directory_leaves_temporary_files(self):
+        """Removing a live writer's claim lets its rename publish another writer's partial file."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         key = build_cache_key("image.png")
-        stale = DiskPreprocessCache(directory.name)._path(key)
-        stale.parent.mkdir(parents=True)
-        stale.with_name(stale.name + ".tmp").write_bytes(b"half")
+        path = DiskPreprocessCache(directory.name)._path(key)
+        path.parent.mkdir(parents=True)
+        claim = path.with_name(path.name + ".tmp")
+        claim.write_bytes(b"half")
 
         cache = DiskPreprocessCache(directory.name)
-        self.assertEqual(list(Path(directory.name).rglob("*.tmp")), [])
         cache[key] = torch.ones(8)
-        self.assertTrue(torch.equal(cache.get(key), torch.ones(8)))
+        self.assertEqual(claim.read_bytes(), b"half")
+        self.assertIsNone(cache.get(key))
 
 
 class TestMediaIdentity(unittest.TestCase):
