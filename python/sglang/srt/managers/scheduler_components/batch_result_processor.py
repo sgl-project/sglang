@@ -1692,7 +1692,7 @@ class SchedulerBatchResultProcessor:
         Running req with a confirmed crossing: the commit scattered the
         crossing state into the planned position; promote it to keep unless
         the plan already pointed at the keep slot (promoted by an earlier
-        overlapped confirmation). A -1 plan wrote nothing: the keep slot and
+        overlapped confirmation). A -1 plan had no slot: the keep slot and
         mamba_last_track_seqlen stay.
         Finishing req: donate the keep slot only if this step's scatter did
         not write it.
