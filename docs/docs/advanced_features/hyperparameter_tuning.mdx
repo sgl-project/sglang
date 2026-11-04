@@ -65,10 +65,15 @@ If you encounter out-of-memory (OOM) errors, you can adjust the following parame
 - You can also reduce `--mem-fraction-static` to a smaller value, such as 0.8 or 0.7. This decreases the memory usage of the KV cache memory pool and helps prevent OOM errors during both prefill and decoding. However, it limits maximum concurrency and reduces peak throughput.
 
 ### Tune `--cuda-graph-max-bs-decode`
-By default, CUDA graph is enabled only for small batch sizes (e.g., less than 160 or 256).
+On a single NVIDIA GPU, eligible text-generation models without hybrid state, speculative or diffusion decoding, or LoRA receive wider decode CUDA graph coverage when you leave `--cuda-graph-max-bs-decode` and `--mem-fraction-static` unset: up to 512 requests on GPUs with more than 60 GB (for example an 80 GB H100), and up to 256 on 35 to 60 GB GPUs (for example an L40S). The running limit is unchanged, so larger decode batches still run eagerly, and the static memory reserve grows by the memory of the extra graphs, exactly as it would with the matching explicit `--cuda-graph-max-bs-decode`. With an explicit `--max-running-requests` below that ceiling, the graphs cover up to the limit, so every decode batch is graphed. Models with custom memory overrides or unsupported graph-capture configurations keep the existing plan. Set `SGLANG_ENABLE_DECODE_GRAPH_PLANNER=0` to restore the tier defaults.
+
+With `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1`, the KV cache pool is sized from the GPU memory left after graph capture instead. On a single GPU, decode CUDA graphs then cover up to 512 requests and the default running batch is capped at the largest captured graph, so no decode step falls back to the slower eager path because of its batch size, and the pool keeps a reserve for that batch's sampling state, the eager decode and prefill tails and allocator fragmentation. Where that reserve for 512 requests would exceed a tenth of the KV cache budget (a large model on the GPU), the cap backs off to a smaller captured size; the startup log reports the final `max_running_requests`.
+
+In other configurations (for example multiple GPUs, speculative decoding or diffusion LLMs), CUDA graph is enabled only for small batch sizes by default (e.g., less than 160 or 256).
 However, for some models, especially at large tensor parallelism sizes, CUDA graph can be useful for batch sizes up to 512 or 768.
 Therefore, it may be beneficial to increase `--cuda-graph-max-bs-decode` to a larger value.
 Note that CUDA graph consumes more memory, so you may need to reduce `--mem-fraction-static` at the same time.
+An explicit `--cuda-graph-max-bs-decode` keeps its exact meaning: decode batches above the captured size still run eagerly.
 
 ### Tune `--dp-size` and `--tp-size`
 

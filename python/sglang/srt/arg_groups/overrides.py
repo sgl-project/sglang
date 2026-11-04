@@ -184,6 +184,14 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     return with_fallback(type(server_args), field, getattr(server_args, field, default))
 
 
+def resolution_source(server_args: Any, field: str) -> Optional[str]:
+    """The source of the last declaration of ``field``; None if none declared it."""
+    for source, declared in reversed(server_args._resolved_overrides):
+        if field in declared:
+            return source
+    return None
+
+
 def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
     """Return the activation reserve in MB before CUDA graph capture."""
     if cfg.disaggregation_mode == "decode":
@@ -1871,6 +1879,13 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     """Whether the mem_fraction heuristic may skip the graph reserve; must be
     False for any config the runtime won't post-capture-size, else it gets an
     under-reserved fraction."""
+    if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
+        return False
+    return post_capture_kv_sizing_supported(server_args)
+
+
+def post_capture_kv_sizing_supported(server_args: Any) -> bool:
+    """Whether the runtime can size this config's KV pool after graph capture."""
     cfg = resolving_view(server_args)
     # Logical-page sharding always runs prefill eagerly. This predicate runs
     # before the sharding hook disables prefill capture, so gate on the feature
@@ -1879,8 +1894,6 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
 
     mla_enabled = use_mla_backend(server_args)
-    if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
-        return False
     if cfg.device != "cuda":
         return False
     if cfg.dcp_size != 1:

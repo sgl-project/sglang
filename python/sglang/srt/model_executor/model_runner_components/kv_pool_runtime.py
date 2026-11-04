@@ -9,6 +9,7 @@ import torch
 from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
+from sglang.srt.mem_cache.runtime_reserve import transient_reserve
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_utils.pool import graph_pool_borrow_enabled
 from sglang.srt.platforms import current_platform
@@ -111,6 +112,17 @@ def compute_post_capture_kv_resize(
                 )
                 / 1024,
             )
+    else:
+        # Every decode batch replays a captured graph, so what capture did not
+        # measure is the sampling state and the eager forward tails.
+        headroom_gb = max(
+            headroom_gb,
+            _transient_headroom_gb(
+                vocab_size=model_runner.model_config.vocab_size,
+                running_requests=running_requests,
+                prefill_graph_gb=model_runner.graph_memory_usage.get("prefill", 0.0),
+            ),
+        )
     if not graph_pool_borrow_enabled():
         # Borrowing serves the sampling temporaries out of idle graph storage;
         # without it they need real headroom the KV pool must not claim.
@@ -214,3 +226,29 @@ def compute_post_capture_kv_resize(
         unified_memory_pool_bytes=config.unified_memory_pool_bytes,
         capped_max_running_requests=capped_max_running_requests,
     )
+
+
+def _transient_headroom_gb(
+    *, vocab_size: int, running_requests: int, prefill_graph_gb: float
+) -> float:
+    reserve = transient_reserve(
+        vocab_size=vocab_size,
+        max_running_requests=running_requests,
+        chunked_prefill_size=get_schedule().chunked_prefill_size,
+        enable_deterministic_inference=(
+            get_exec().deterministic.enable_deterministic_inference
+        ),
+        prefill_graph_bytes=int(prefill_graph_gb * (1 << 30)),
+    )
+    logger.info(
+        "Post-capture KV sizing: runtime headroom %.2f GB for %d requests "
+        "(sampling state %.2f GB, decode tail %.2f GB, prefill tail %.2f GB, "
+        "fragmentation %.2f GB)",
+        reserve.total_bytes / (1 << 30),
+        running_requests,
+        reserve.persistent_bytes / (1 << 30),
+        reserve.decode_bytes / (1 << 30),
+        reserve.prefill_bytes / (1 << 30),
+        reserve.fragmentation_bytes / (1 << 30),
+    )
+    return reserve.total_bytes / (1 << 30)

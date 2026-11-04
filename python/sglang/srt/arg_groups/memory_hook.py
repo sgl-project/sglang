@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
@@ -16,15 +16,22 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     post_capture_kv_sizing_planned,
+    post_capture_kv_sizing_supported,
+    resolution_source,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
+
+# vLLM's default capture ceiling too; at 512 the decode graphs of Qwen3 0.6B to
+# 30B-A3B took 0.2-0.3 GB on an H100, against a 2.6-7.5x slower eager step.
+_PLANNED_DECODE_MAX_BS = 512
 
 
 def handle_offload_compatibility(server_args: Any) -> None:
@@ -281,67 +288,10 @@ def handle_gpu_memory_settings(server_args: Any):
     # ------------------------------------------------------------------
 
     if cfg.mem_fraction_static is None:
-        model_config = model_config_of(server_args)
-        is_vlm = (
-            model_config.is_multimodal
-            and not cfg.language_only
-            and not cfg.language_model_only
-            and cfg.disaggregation_mode != "decode"
-        )
-        post_capture_kv_sizing = post_capture_kv_sizing_planned(server_args)
-
-        if post_capture_kv_sizing:
-            # Post-capture sizing measures free memory after graph capture, so
-            # skip the graph/activation reserve; keep only the floor + parallel slack.
-            reserved_mem = 1536
-            reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
-        else:
-            # Tokens the activation working set scales with (per serving mode).
-            if cfg.disaggregation_mode == "decode":
-                running_requests = (
-                    cfg.max_running_requests or decode_cuda_graph_config.max_bs or 1
-                )
-                draft_tokens = cfg.speculative_num_draft_tokens or 1
-                activation_tokens = max(running_requests * draft_tokens, 2048)
-            elif cfg.chunked_prefill_size > 0:
-                activation_tokens = max(cfg.chunked_prefill_size, 2048)
-            else:
-                activation_tokens = max(cfg.max_prefill_tokens, 2048)
-            # Constant meta data (e.g., from attention backend) + activation slack.
-            reserved_mem = 512
-            reserved_mem += activation_tokens * 1.5
-            # Some adjustments for large parallel size
-            reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
-            reserved_mem += reserve_for_graph_mb(server_args)
-            if gpu_mem is not None and gpu_mem > 60 * 1024:
-                reserved_mem = max(reserved_mem, 10 * 1024)
-            # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
-            reserved_mem += reserve_for_deepep_a2a_mb(server_args)
-            # XPU: oneDNN allocates scratch space for matmul when
-            # M is not a power-of-2-aligned value (e.g. M=2100).  Reserve extra
-            # headroom so non-aligned prefill lengths don't hit OOM.
-            if get_platform().is_xpu:
-                reserved_mem += 2 * 1024
-
-        mem_fraction_static = (
-            round((gpu_mem - reserved_mem) / gpu_mem, 3)
-            if gpu_mem is not None
-            else 0.95
-        )
-
-        # Multimodal models need more memory for the image processing.
-        if is_vlm:
-            mem_fraction_static = adjust_mem_fraction_for_vlm(
-                mem_fraction_static,
-                model_config,
-                post_capture_kv_sizing,
-                gpu_mem,
-            )
-
         declare_resolution(
             server_args,
             "_handle_gpu_memory_settings",
-            mem_fraction_static=mem_fraction_static,
+            mem_fraction_static=_derived_mem_fraction_static(server_args, gpu_mem),
         )
 
     # ------------------------------------------------------------------
@@ -354,6 +304,194 @@ def handle_gpu_memory_settings(server_args: Any):
             "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
             "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
         )
+
+
+def _derived_mem_fraction_static(server_args: Any, gpu_mem: Optional[float]) -> float:
+    cfg = resolving_view(server_args)
+    model_config = model_config_of(server_args)
+    is_vlm = (
+        model_config.is_multimodal
+        and not cfg.language_only
+        and not cfg.language_model_only
+        and cfg.disaggregation_mode != "decode"
+    )
+    post_capture_kv_sizing = post_capture_kv_sizing_planned(server_args)
+
+    if post_capture_kv_sizing:
+        # Post-capture sizing measures free memory after graph capture, so
+        # skip the graph/activation reserve; keep only the floor + parallel slack.
+        reserved_mem = 1536
+        reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
+    else:
+        # Tokens the activation working set scales with (per serving mode).
+        if cfg.disaggregation_mode == "decode":
+            running_requests = (
+                cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
+            )
+            draft_tokens = cfg.speculative_num_draft_tokens or 1
+            activation_tokens = max(running_requests * draft_tokens, 2048)
+        elif cfg.chunked_prefill_size > 0:
+            activation_tokens = max(cfg.chunked_prefill_size, 2048)
+        else:
+            activation_tokens = max(cfg.max_prefill_tokens, 2048)
+        # Constant meta data (e.g., from attention backend) + activation slack.
+        reserved_mem = 512
+        reserved_mem += activation_tokens * 1.5
+        # Some adjustments for large parallel size
+        reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
+        reserved_mem += reserve_for_graph_mb(server_args)
+        if gpu_mem is not None and gpu_mem > 60 * 1024:
+            reserved_mem = max(reserved_mem, 10 * 1024)
+        # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
+        reserved_mem += reserve_for_deepep_a2a_mb(server_args)
+        # XPU: oneDNN allocates scratch space for matmul when
+        # M is not a power-of-2-aligned value (e.g. M=2100).  Reserve extra
+        # headroom so non-aligned prefill lengths don't hit OOM.
+        if get_platform().is_xpu:
+            reserved_mem += 2 * 1024
+
+    mem_fraction_static = (
+        round((gpu_mem - reserved_mem) / gpu_mem, 3) if gpu_mem is not None else 0.95
+    )
+
+    # Multimodal models need more memory for the image processing.
+    if is_vlm:
+        mem_fraction_static = adjust_mem_fraction_for_vlm(
+            mem_fraction_static,
+            model_config,
+            post_capture_kv_sizing,
+            gpu_mem,
+        )
+    return mem_fraction_static
+
+
+def plan_decode_graph_coverage(server_args: Any) -> None:
+    """Raise single-GPU decode CUDA graph coverage above the GPU-tier ceiling.
+
+    By default the plan stays static: the running limit is kept and the extra
+    graphs are charged to the static reserve, as an explicit
+    --cuda-graph-max-bs-decode would. With SGLANG_ENABLE_POST_CAPTURE_KV_SIZING
+    the pool is sized from free memory measured after capture: graphs cover 512
+    requests and the default running batch is capped there, so no decode step runs
+    eagerly and the runtime reserve is bounded by the cap; the KV configurator
+    backs the cap off on a small pool. Runs after every other handler, so each
+    gate reads the final configuration.
+    """
+    cfg = resolving_view(server_args)
+    gpu_mem = get_device_memory_capacity(cfg.device)
+    if not _decode_graph_coverage_applies(server_args, gpu_mem):
+        return
+    measured = envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
+    if measured:
+        ceiling = _PLANNED_DECODE_MAX_BS
+    else:
+        ceiling = _static_plan_decode_max_bs(
+            gpu_mem=gpu_mem, tier_max_bs=cfg.cuda_graph_config.decode.max_bs
+        )
+    if cfg.max_running_requests is not None:
+        ceiling = min(ceiling, cfg.max_running_requests)
+    if ceiling <= cfg.cuda_graph_config.decode.max_bs and not measured:
+        return
+    if ceiling > cfg.cuda_graph_config.decode.max_bs:
+        _declare_decode_graph_ceiling(server_args, ceiling)
+    capped = measured and cfg.max_running_requests is None
+    if capped:
+        declare_resolution(
+            server_args, "plan_decode_graph_coverage", _decode_graph_running_cap=ceiling
+        )
+    # For the graphs a static plan now captures, or for the post-capture floor.
+    declare_resolution(
+        server_args,
+        "plan_decode_graph_coverage",
+        mem_fraction_static=_derived_mem_fraction_static(server_args, gpu_mem),
+    )
+    logger.info(
+        "Decode graph planner: CUDA graphs up to %d requests, %s, KV pool sized %s "
+        "graph capture.",
+        ceiling,
+        "default running batch capped there" if capped else "running limit unchanged",
+        "after" if measured else "before",
+    )
+
+
+def _decode_graph_coverage_applies(server_args: Any, gpu_mem: Optional[float]) -> bool:
+    """Single-GPU CUDA serving with default decode-graph and memory settings, on a
+    model whose KV pool can be sized after capture; the rest keep the tier plan."""
+    cfg = resolving_view(server_args)
+    if gpu_mem is None or gpu_mem < 20 * 1024 or not get_platform().is_cuda:
+        return False
+    if not envs.SGLANG_ENABLE_DECODE_GRAPH_PLANNER.get():
+        return False
+    single_gpu = (
+        cfg.tp_size == 1
+        and cfg.pp_size == 1
+        and cfg.dp_size == 1
+        and not attn_dp_enabled_of(resolved_view(server_args))
+        and cfg.disaggregation_mode == "null"
+        and cfg.moe_a2a_backend == "none"
+    )
+    locked = server_args._cuda_graph_config_locked
+    default_decode_graph = (
+        cfg.cuda_graph_config.decode.backend == Backend.FULL
+        and (Phase.DECODE, "max_bs") not in locked
+        and (Phase.DECODE, "bs") not in locked
+        and not cfg.disable_cuda_graph_padding
+    )
+    # A fraction from the raw input, a launcher or a model override is a
+    # deliberate plan to leave alone; only the memory heuristic's is re-derived.
+    derived_memory = (
+        resolution_source(server_args, "mem_fraction_static")
+        == "_handle_gpu_memory_settings"
+    )
+    model_config = model_config_of(server_args)
+    # One logits row per request: speculative and dLLM decode graphs capture
+    # several tokens per request, which the reserve and the cap do not model.
+    plain_decode = (
+        cfg.speculative_algorithm is None
+        and cfg.dllm_algorithm is None
+        and not model_config.is_multimodal
+        and mambaish_config(model_config) is None
+        and not (cfg.enable_lora or cfg.lora_paths)
+        and not cfg.enable_two_batch_overlap
+        and not cfg.enable_paged_experts
+        and not cfg.enable_nvidia_megakernel
+    )
+    return (
+        single_gpu
+        and default_decode_graph
+        and derived_memory
+        and plain_decode
+        and post_capture_kv_sizing_supported(server_args)
+    )
+
+
+def _static_plan_decode_max_bs(*, gpu_mem: float, tier_max_bs: int) -> int:
+    # A static plan charges 2 MiB per captured slot to its fixed reserve, with no
+    # KV-aware back-off. Measured with that charge: 256 on an L40S, 512 on an H100
+    # (Qwen3 0.6B to 30B-A3B); below 35 GiB the tier value stays.
+    if gpu_mem > 60 * 1024:
+        return _PLANNED_DECODE_MAX_BS
+    if gpu_mem >= 35 * 1024:
+        return max(tier_max_bs, 256)
+    return tier_max_bs
+
+
+def _declare_decode_graph_ceiling(server_args: Any, ceiling: int) -> None:
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_decode_cuda_graph_batch_sizes,
+    )
+
+    cfg = resolving_view(server_args)
+    declare_resolution(
+        server_args,
+        "plan_decode_graph_coverage",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.DECODE,
+            max_bs=ceiling,
+            bs=generate_decode_cuda_graph_batch_sizes(server_args, ceiling),
+        ),
+    )
 
 
 def reserve_for_graph_mb(server_args: Any) -> float:
