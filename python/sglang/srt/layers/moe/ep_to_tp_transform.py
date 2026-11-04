@@ -49,10 +49,17 @@ EP_TO_TP_SUPPORTED_ARCHS = frozenset(
 )
 
 
+def load_tp_by_experts_requested(model_loader_extra_config: str | dict) -> bool:
+    # The CLI value is a JSON string; the expert_pack hook resolves it to a dict
+    # for raw GGUF inputs.
+    if isinstance(model_loader_extra_config, str):
+        model_loader_extra_config = orjson.loads(model_loader_extra_config)
+    return model_loader_extra_config.get("load_tp_by_experts", False)
+
+
 def is_load_tp_by_experts_enabled() -> bool:
     """Whether ``--model-loader-extra-config`` requested EP-style TP loading."""
-    extra_config = orjson.loads(get_model().model_loader_extra_config)
-    return extra_config.get("load_tp_by_experts", False)
+    return load_tp_by_experts_requested(get_model().model_loader_extra_config)
 
 
 def maybe_ep_to_tp_transform_all_layers(model: nn.Module) -> None:

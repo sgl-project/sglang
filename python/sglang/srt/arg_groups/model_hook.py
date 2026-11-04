@@ -200,12 +200,12 @@ def handle_model_specific_adjustments(server_args: Any):
     # load_tp_by_experts requires load_weights() to call
     # maybe_ep_to_tp_transform_all_layers() after loading. Fail early if the
     # architecture doesn't use one of those code paths.
-    extra_config = json.loads(cfg.model_loader_extra_config)
-    if extra_config.get("load_tp_by_experts", False):
-        from sglang.srt.layers.moe.ep_to_tp_transform import (
-            EP_TO_TP_SUPPORTED_ARCHS,
-        )
+    from sglang.srt.layers.moe.ep_to_tp_transform import (
+        EP_TO_TP_SUPPORTED_ARCHS,
+        load_tp_by_experts_requested,
+    )
 
+    if load_tp_by_experts_requested(cfg.model_loader_extra_config):
         assert model_arch in EP_TO_TP_SUPPORTED_ARCHS, (
             f"load_tp_by_experts is only supported for models whose "
             f"load_weights() drives the EP-to-TP transform "
