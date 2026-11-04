@@ -84,3 +84,14 @@ cd benchmark/session_kv_control
 Engine `--kv-control-config` accepts `"cache_limits":{"max_concurrent_storage_reads":4}` (default 4, range 1–64). Different effective cache salts may pipeline native storage-to-host reads. Same-salt scopes retain serialization and exact identical scopes share one physical read. GPU destinations retain exclusive admission; an older live GPU waiter blocks newer cold jobs until its turn, cancellation or expiry. Complete host-resident targets can finish immediately. Setting 1 serializes the cold stage for comparisons. This does not add Mooncake GET worker threads or widen supported topology.
 
 Queries reserve their full missing host span before asynchronous allocation; after real allocation, free-pool accounting owns that space. Cancellation retains the reservation until physical drain. PIN and native references still constrain host reclamation. More admitted reads can increase scratch occupancy and contention; report readiness, total cycle and throughput against the same setting-1 or previous-source control. A larger admission bound alone does not establish a gain.
+
+## Offline verification and comparison
+
+```sh
+.venv/bin/python benchmark/session_kv_control/analyze_stress.py \
+  --results /tmp/sglang-rfc-build/mem08 --output /tmp/mem08-analysis
+```
+
+The output directory must be new. Completed formal cells require a manifest, full paired schedule, arm files, summary and SHA-256 index. Live partial cells, functional smoke and failed setup remain separately listed. The verifier recomputes numeric summaries, checks actual tier metadata/output equality/full ready scopes and raw PIN acquisition/release proofs. All completed generations contribute even when a later control fails. A completed request with unverifiable cache metadata stays in throughput and latency and is flagged explicitly. Source publication, foreground recovery and pressure requests remain separate. JSON/gzipped JSON and raw JSONL/gzipped JSONL are accepted; regenerate the physical-file checksum index after packing and preserve the original index as provenance.
+
+`resources.jsonl` from `observe_resources.py` supplies sampled GPU and cache facts. `kv_used_tokens` and `token_usage` count active slots and exclude evictable radix cache. Total allocated/reserved GPU KV slots use boot capacity minus `kv_available_tokens`; this includes transfer allocations. The report discloses 2s sampling and approximate arm bounds rather than claiming exact byte peaks. Standalone CSV/PNG export uses an already-installed matplotlib; dependencies are not installed by this tool.

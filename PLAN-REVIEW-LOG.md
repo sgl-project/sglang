@@ -4892,3 +4892,9 @@ Docs PLAN.md, Router runbook and final report now describe completed P0–P8 fir
 root 审阅发现较早 GPU waiter 可能被后续 host job 持续填充挤占，补固定 admission 顺序与 live-interest 屏障；取消及过期解除屏障，已有完整 host 目标仍可完成。未增加底层 GET worker。CPU fake-driver fixture 的注销路径按模拟 CUDA 注册配对，运行环境用不存在的 CUDA 设备 999 隐藏 GPU；仓库 test_utils 不能接受空 CUDA_VISIBLE_DEVICES。
 
 root 独立 proof：最终 transfers 42 passed、25 subtests，16.19s；cache/service/protection/feedback/controller 76 passed、68 subtests，22.29s。测试涵盖并发上限、相同 salt、容量重复批准、allocation 后不重复扣减、PIN 压力与退避、取消/期限/query miss/partial、精确共享与 demand 所有权、GPU DMA fence 及 FIFO 饥饿边界。日志 native-fifo-transfers-root.log、native-regressions-root-v2.log。当前性能长测仍由不可变 f65 源执行；本提交的真实收益待同配置长测比较。按用户授权测试通过后提交，不推送。
+
+### 0.8 离线证据复核
+
+新增 analyze_stress.py 与验证测试。root 审阅全部实现及测试，补充“恢复完成但 cache metadata 不可验证”仍保留延迟与吞吐的回归。独立验证共 39 项通过（1.915s）；对已完成显式 L2 六组实际记录运行离线 CLI，366 条请求、12 条释放 tombstone、3 组各 4 条 active/full PIN 均通过，数值重算及 SHA-256 无错误。
+
+监控语义经源码核对：token_usage/kv_used_tokens 仅为 active，不能冒充全部缓存占用。分开记录 active/evictable/free，并用实际启动容量减 free 推导 resident/reserved；自然驱逐实验已观察到 free=2880/346944，即约 99.17% 分配占用。资源为 2s 采样、边界估计，物理 I/O 与精确峰值不推断。失败/未完成实验及负收益保持可见。
