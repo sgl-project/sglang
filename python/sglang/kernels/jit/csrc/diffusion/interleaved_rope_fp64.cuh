@@ -21,25 +21,12 @@ constexpr uint32_t kBlockSize = 256;
 constexpr uint32_t kMaxGrid = 65535;
 
 template <typename T>
-SGL_DEVICE device::AlignedVector<T, 2> rotate_pair_fp64(device::AlignedVector<T, 2> input, double cos, double sin) {
-  static_assert(std::is_same_v<T, bf16_t>);
-  const double x1 = static_cast<double>(input[0]);
-  const double x2 = static_cast<double>(input[1]);
-  const double x1_cos = __dmul_rn(x1, cos);
-  const double x2_sin = __dmul_rn(x2, sin);
-  const double x1_sin = __dmul_rn(x1, sin);
-  const double x2_cos = __dmul_rn(x2, cos);
-  device::AlignedVector<T, 2> output;
-  // TensorIterator casts the fp64 expression through fp32 before its bf16
-  // store. Preserving both conversions is required at bf16 tie boundaries.
-  output[0] = static_cast<T>(static_cast<float>(__dsub_rn(x1_cos, x2_sin)));
-  output[1] = static_cast<T>(static_cast<float>(__dadd_rn(x1_sin, x2_cos)));
-  return output;
-}
-
-template <typename T>
 SGL_DEVICE device::AlignedVector<T, 2> rotate_pair(device::AlignedVector<T, 2> input, double cos, double sin) {
+  static_assert(std::is_same_v<T, bf16_t>);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+  // Directed FP32 bounds enclose each separately rounded FP64 operation.
+  // Matching finite BF16 endpoint bits certify the original two-stage rounding;
+  // ambiguous boundaries and nonfinite values use the FP64 expression below.
   const float a = static_cast<float>(input[0]);
   const float b = static_cast<float>(input[1]);
   const float cl = __double2float_rd(cos), ch = __double2float_ru(cos);
@@ -65,15 +52,26 @@ SGL_DEVICE device::AlignedVector<T, 2> rotate_pair(device::AlignedVector<T, 2> i
     const T lo1 = static_cast<T>(__fadd_rd(asl, bcl));
     const T hi1 = static_cast<T>(__fadd_ru(ash, bch));
     const auto bits0 = __bfloat16_as_ushort(lo0), bits1 = __bfloat16_as_ushort(lo1);
-    if (bits0 == __bfloat16_as_ushort(hi0) && bits1 == __bfloat16_as_ushort(hi1) &&
-        (bits0 & 0x7f80) != 0x7f80 && (bits1 & 0x7f80) != 0x7f80) {
+    if (bits0 == __bfloat16_as_ushort(hi0) && bits1 == __bfloat16_as_ushort(hi1) && (bits0 & 0x7f80) != 0x7f80 &&
+        (bits1 & 0x7f80) != 0x7f80) {
       output[0] = lo0;
       output[1] = lo1;
       return output;
     }
   }
 #endif
-  return rotate_pair_fp64(input, cos, sin);
+  const double x1 = static_cast<double>(input[0]);
+  const double x2 = static_cast<double>(input[1]);
+  const double x1_cos = __dmul_rn(x1, cos);
+  const double x2_sin = __dmul_rn(x2, sin);
+  const double x1_sin = __dmul_rn(x1, sin);
+  const double x2_cos = __dmul_rn(x2, cos);
+  device::AlignedVector<T, 2> output;
+  // TensorIterator casts the fp64 expression through fp32 before its bf16
+  // store. Preserving both conversions is required at bf16 tie boundaries.
+  output[0] = static_cast<T>(static_cast<float>(__dsub_rn(x1_cos, x2_sin)));
+  output[1] = static_cast<T>(static_cast<float>(__dadd_rn(x1_sin, x2_cos)));
+  return output;
 }
 
 template <typename T>
