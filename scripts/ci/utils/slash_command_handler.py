@@ -1287,7 +1287,11 @@ def _resolve_amd_entries(test_spec, resolved_path, test_command):
     suites = _partition.amd_suites(Path(full_path))
     if not suites:
         return [
-            {"spec": test_spec, "error": f"`{full_path}` is not registered for AMD."}
+            {
+                "spec": test_spec,
+                "error": f"`{full_path}` is not registered for AMD.",
+                "not_on_amd": True,
+            }
         ]
     out = []
     for suite in dict.fromkeys(suites):
@@ -1506,6 +1510,7 @@ def handle_rerun_test(
     refresh_precision_baseline=False,
     include_changed_tests=False,
     run_on_amd=False,
+    expanded_from_group=False,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -1555,6 +1560,12 @@ def handle_rerun_test(
             )
             return False
         test_specs = list(test_specs or []) + changed
+    else:
+        changed = []
+    # Files a group, glob or --changed selected rather than ones the user named;
+    # on --amd, those without an AMD registration are summarized, not each a ⛔.
+    bulk_selected = set(changed) | (set(test_specs) if expanded_from_group else set())
+    not_on_amd = []
 
     # Phase 0: Expand wildcard specs into concrete test files. A spec whose
     # file part contains a glob metacharacter (* ? [) expands to every
@@ -1595,6 +1606,7 @@ def handle_rerun_test(
             _record_failure(spec, err)
             continue
         expanded_specs.extend(matched)
+        bulk_selected.update(matched)
 
     # Phase 1: Resolve all specs, de-duping by the *resolved* identity. A glob
     # expands to `test/`-prefixed paths while an explicit spec keeps the form
@@ -1607,6 +1619,9 @@ def handle_rerun_test(
     seen_commands = set()
     for spec in expanded_specs:
         for r in _resolve_test_spec(spec, run_on_amd):
+            if r.get("not_on_amd") and spec in bulk_selected:
+                not_on_amd.append(spec)
+                continue
             if r.get("error"):
                 _record_failure(r["spec"], r["error"])
                 continue
@@ -1701,12 +1716,21 @@ def handle_rerun_test(
     for r in resolve_failures:
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
+    if not_on_amd:
+        lines.append(
+            f"<details><summary>ℹ️ Skipped {len(not_on_amd)} selected "
+            f"file{'s' if len(not_on_amd) > 1 else ''} with no `register_amd_ci`"
+            "</summary>\n\n"
+            + "\n".join(f"- `{s}`" for s in sorted(not_on_amd))
+            + "\n</details>"
+        )
+
     body = "\n\n".join(lines)
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
         comment.create_reaction("+1")
-    if not successes and (resolve_failures or dispatch_results):
+    if not successes and (resolve_failures or dispatch_results or not_on_amd):
         comment.create_reaction("confused")
 
     reply_comment.edit(body)
@@ -1771,6 +1795,7 @@ def handle_rerun_group(
         skip_permission_check=True,
         command_label=command_label,
         run_on_amd=run_on_amd,
+        expanded_from_group=True,
     )
 
 
