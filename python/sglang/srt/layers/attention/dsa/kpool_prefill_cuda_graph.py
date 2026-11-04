@@ -2,6 +2,7 @@
 
 import torch
 
+from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -22,6 +23,11 @@ def _kpool_indexer_prefill_with_output(
     # Resolve the live batch inside the eager break, never from capture args.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     n = forward_batch.extend_num_tokens
+    num_logical = sum(forward_batch.extend_seq_lens_cpu)
+    if is_interleave_extend(forward_batch):
+        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
+
+        n, num_logical = cp_interleave_indexer_rows(forward_batch)
     if n is None or not 0 <= n <= x.shape[0]:
         raise ValueError(f"Invalid pooled-indexer prefill token count: {n}")
     if n > q_lora.shape[0] or n > positions.shape[0]:
@@ -37,7 +43,6 @@ def _kpool_indexer_prefill_with_output(
     )
     if not return_indices:
         return
-    num_logical = sum(forward_batch.extend_seq_lens_cpu)
     if (
         result is None
         or result.ndim != 2
@@ -54,17 +59,6 @@ def _kpool_indexer_prefill_with_output(
     output[num_logical:].fill_(-1)
 
 
-def _kpool_indexer_prefill_capture_stub(
-    indexer,
-    x: torch.Tensor,
-    q_lora: torch.Tensor,
-    positions: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    output.fill_(-1)
-
-
-bcg_kpool_indexer_prefill_with_output = eager_on_graph(
-    True, capture_stub=_kpool_indexer_prefill_capture_stub
-)(_kpool_indexer_prefill_with_output)
+bcg_kpool_indexer_prefill_with_output = eager_on_graph(True)(
+    _kpool_indexer_prefill_with_output
+)

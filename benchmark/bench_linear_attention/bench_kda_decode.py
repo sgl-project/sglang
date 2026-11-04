@@ -26,11 +26,11 @@ import torch
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
 from sglang.kernels.ops.attention.helion.kda_decode import (
     helion_fused_recurrent_kda_packed_decode,
+)
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
 )
 
 
