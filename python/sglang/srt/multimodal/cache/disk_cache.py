@@ -18,17 +18,15 @@ class DiskPreprocessCache:
     Every process that sees the directory shares it, e.g. an RL job's rollout
     engines and trainers. A value is written to a temporary file and renamed into
     place, so a reader sees all of it or none, and a key is written once: a writer
-    that finds the file or the temporary file leaves it. Opening the directory
-    removes temporary files a killed process left. Nothing else is deleted: the
-    directory lives as long as the job that created it. Values are unpickled on read, since
-    processor outputs hold non-tensor objects such as video metadata, so only
-    trusted processes may write the directory.
+    that finds the file or the temporary file leaves it. A temporary file is never
+    removed by another process, so a key whose writer was killed stays uncached.
+    Nothing is deleted: the directory lives as long as the job that created it.
+    Values are unpickled on read, since processor outputs hold non-tensor objects
+    such as video metadata, so only trusted processes may write the directory.
     """
 
     def __init__(self, directory: str):
         self.directory = Path(directory)
-        for temp_path in self.directory.glob("*/*.tmp"):
-            temp_path.unlink(missing_ok=True)
 
     def get(self, key: str) -> Optional[Any]:
         try:
