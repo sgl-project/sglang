@@ -200,7 +200,10 @@ def router_handler(state):
                     if not actual or actual[-1]["input_ids"] != body["input_ids"]:
                         self.reply({"success": False, "error": {"code": "unobserved_input"}}, 400)
                         return
-                    state.tasks[key].update(tokens=body["input_ids"], salt=body["cache_salt"])
+                    # The real Router associates complete pages only.
+                    page = state.a.caps()["public_protocol"]["prefix"]["page_size"]
+                    tokens = body["input_ids"][:len(body["input_ids"]) // page * page]
+                    state.tasks[key].update(tokens=tokens, salt=body["cache_salt"])
                     value = {"state": "associated", "residency": "unknown"}
                 elif event == "tool_wait":
                     value = {"state": "skipped"}

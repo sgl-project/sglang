@@ -4,6 +4,8 @@
 
 三组均调用 `task_started`、`request_observed`、`task_finished`，以避免将 Router 关联管理成本只算入候选组。`on_demand` 关闭准备事件，`fixed_prefetch` 在固定提前量直接提交 Engine PREFETCH，`lifecycle` 发送 `tool_wait`、`resume_expected`，由 Router 当前配置选择准备时机和保护。运行清单保存 Engine/Router capabilities 和源码摘要；Router 策略配置与服务启动命令需另行归档。
 
+恢复输入在已发布前缀后追加一个固定的合成工具结果 token，取值为前缀末 token。源输出参考使用同一完整输入，发布/准备目标只包含原始页对齐前缀。这样完整前缀可以实际复用，`repeated_prefill_tokens` 不会把“输入完全相同时为生成 logits 强制重算末页”的工作算成恢复失误。manifest 明确记录此合成输入规则。
+
 每组只在开始时清理 A/B 本地缓存，再在 A 生成和发布完整源前缀。每个源输入执行两次相同的固定输出长度和 seed，第二次暖缓存生成作为恢复输出参考；首次源生成与两次输出是否相同均保留。真实 Qwen3 BF16 对照出现过完整 prefill 与 GPU 暖缓存之间的一位数字差异，暖 GPU、L2 与 L3 恢复则一致，单独的 GPU 测试再核验搬运 K/V 的逐元素一致性。源端两次生成耗时都计入源发布及完整作业口径。B 从冷本地状态开始，组内按自然驻留和淘汰推进。A 的源缓存保留；直接 A 的路由变化实验及自由路由中选择 A 的请求可能命中 GPU，按实际命中层级记录。
 
 **计量和控制收尾**

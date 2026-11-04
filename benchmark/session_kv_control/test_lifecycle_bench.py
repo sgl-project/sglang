@@ -113,6 +113,8 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(lb.logical_working_set(cases, 16), 96)
         cases[1]["salt"] = "independent"
         self.assertEqual(lb.logical_working_set(cases, 16), 128)
+        self.assertEqual(len(lb.resume_prompt(cases[0])), 65)
+        self.assertEqual(lb.resume_prompt(cases[0])[:-1], cases[0]["prefix"])
 
     def test_long_replay_metadata_preflight_excludes_secrets(self):
         args = args_for(cases=64, passes=20, blocks=5)
@@ -342,7 +344,7 @@ class LifecycleHTTPTests(unittest.TestCase):
         self.assertFalse(analyze(args.output)["verification"]["verified"])
 
     def prepare_source(self, case):
-        self.a.http.generate(case["prefix"], case["salt"], 1, trial="source", seed=1)
+        self.a.http.generate(lb.resume_prompt(case), case["salt"], 1, trial="source", seed=1)
         lb.publish(
             self.a,
             self.a.target(case["prefix"], case["salt"]),

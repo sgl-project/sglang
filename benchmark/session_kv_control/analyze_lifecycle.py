@@ -11,6 +11,7 @@ from lifecycle_bench import (
     cases_for_arm,
     logical_working_set,
     output_equal,
+    resume_prompt,
     summarize,
     write_json,
 )
@@ -78,7 +79,7 @@ def analyze(directory):
                 continue
             if any(row.get(key) != value for key, value in planned.items()):
                 errors.append("replay fields differ: " + row["trial"])
-            if row["input_sha256"] != digest(cases[planned["case"]]["prefix"]):
+            if row["input_sha256"] != digest(resume_prompt(cases[planned["case"]])):
                 errors.append("input digest differs: " + row["trial"])
             control = controls.get(row["trial"])
             if control is None:

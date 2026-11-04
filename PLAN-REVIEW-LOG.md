@@ -5002,3 +5002,9 @@ parent 独立 HTTP 回归 28 项通过；新增测试同时验证近恢复跳过
 启动 trace 显示完整 ready 后仍有重复 query 与正式 decode 重叠。新策略在原 poll freshness、反馈水位及 worker 健康条件内复用已完成观测，取消及 PIN 子操作仍独立推进；PIN missing 明确撤销父 readiness。harness 完整观测或请求开始后停止主动轮询，消费结束再收尾，保留观测年龄。大段服务/成本快照仅保留逐组证据文件，汇总和 console 不重复展开。
 
 parent 独立 HTTP orchestration 29 项通过，4.71s；harness 15 项通过，8.777s。覆盖窗口内去重、过期/失败后重新查询、取消推进，以及完整准备后无持续轮询。日志：lifecycle-opt/o5-observation-parent-tests.log、o5-observation-harness-tests.log。正式性能使用 release Router，源码与配置另行记录。
+
+### O7 — 完整前缀的恢复输入与启动验证
+
+恢复输入在发布前缀后追加一个固定合成工具结果 token；源参考使用相同完整输入，发布目标保持页对齐前缀。这样按需与准备组均可复用完整前缀，避免将生成 logits 必须重算的末页计为缓存恢复缺失。request_observed 报告真实完整源输入，Router 继续按既有语义关联完整页；mock 同步采用所声明页大小。全部输入规则、初次/暖参考及发送记录保留。
+
+parent 独立 lifecycle/Router 工具 23 项通过，19.739s；Ruff 和 diff 检查通过。deterministic+release 的 4-case 启动验证三组均 4/4 完成、输出相同且 control drain 完成，重复前缀 prefill 为零。生命周期平均 TTFT 107ms 对按需 302ms，工作吞吐 +4.9%；仅为小工作集配置验证，不作为正式容量压力结论。证据：lifecycle-opt/smoke-deterministic-release，离线复核随后统一归档。

@@ -221,6 +221,13 @@ def logical_working_set(cases, page_size):
     return len(pages) * page_size
 
 
+def resume_prompt(case):
+    # A fixed synthetic tool-result token makes the complete published prefix
+    # reusable. Repeating the prefix alone forces its final page to be computed
+    # for logits and would count that mandatory work as a recovery miss.
+    return case["prefix"] + [case["prefix"][-1]]
+
+
 class PressureSampler:
     """One optional low-rate sampler; unknown or stale data cannot assert pressure."""
 
@@ -557,7 +564,9 @@ def resume_task(args, a, b, router, case, spec, controls, journal, pressure=None
         "session_id": "lifecycle-" + digest([args.run_id, spec["trial"]])[:40],
         "incarnation": "1",
     }
-    row.update(task=task, cache_salt=case["salt"], input_sha256=digest(case["prefix"]))
+    row.update(
+        task=task, cache_salt=case["salt"], input_sha256=digest(resume_prompt(case))
+    )
     preparation = None
     try:
         router.event(task, "task_started", 0, "start", spec["trial"])
@@ -571,7 +580,7 @@ def resume_task(args, a, b, router, case, spec, controls, journal, pressure=None
             branch_revision=1,
             request_id="source",
             request_incarnation="source",
-            input_ids=case["prefix"],
+            input_ids=resume_prompt(case),
             cache_salt=case["salt"],
             worker_url=a.http.url,
         )
@@ -606,7 +615,7 @@ def resume_task(args, a, b, router, case, spec, controls, journal, pressure=None
             }
             http = router.formal if args.via_router else destination.http
             row["generation"] = http.generate(
-                case["prefix"],
+                resume_prompt(case),
                 case["salt"],
                 args.output_tokens,
                 trial=spec["trial"],
@@ -807,7 +816,7 @@ def run(args):
         metadata = {"a": get_metadata(a.http), "b": get_metadata(b.http)}
         configuration = parity(a, b, metadata, args.expected_mem_fraction)
         context = configuration["fingerprint_b"].get("context_length")
-        if context and args.prefix_tokens + args.output_tokens > context:
+        if context and args.prefix_tokens + 1 + args.output_tokens > context:
             raise BenchError("input and output exceed serving context budget")
         router = Router(
             HTTP(args.router, journal, args.timeout_s, bearer),
@@ -858,6 +867,7 @@ def run(args):
             "input_material": material,
             "input_mode": "synthetic_ledger",
             "output_reference": "source warm-cache generation; initial generation also retained to expose full-prefill versus cached-prefix numerical differences",
+            "tool_result": "one fixed synthetic token after the published prefix, equal to its final token",
             "fixed_plan": lanes,
             "schedule": schedule,
             "acceptance": "minimum duration is checked, never padded by idle sleep; identical fixed-work plan in all arms",
@@ -887,7 +897,7 @@ def run(args):
             for case in cases:
                 trial = spec["id"] + "-source-" + str(case["id"])
                 initial = a.http.generate(
-                    case["prefix"],
+                    resume_prompt(case),
                     case["salt"],
                     args.output_tokens,
                     trial=trial,
@@ -898,7 +908,7 @@ def run(args):
                 # Full-prefill and warm-cache BF16 generation may differ at a
                 # near tie even with unmodified GPU residency. Retain both.
                 response = a.http.generate(
-                    case["prefix"],
+                    resume_prompt(case),
                     case["salt"],
                     args.output_tokens,
                     trial=trial,
