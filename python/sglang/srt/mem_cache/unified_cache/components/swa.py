@@ -29,10 +29,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     SWARebuild,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
-    CacheTransferPhase,
     ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.base import (
+    CacheTransferPhase,
     EvictLayer,
     ExternalLinkerLoadPhase,
     InternalStateBackup,
@@ -51,11 +53,9 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedRadixCache,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 class SWAComponent(TreeComponent):
@@ -128,7 +128,12 @@ class SWAComponent(TreeComponent):
         while (
             cur is not self.tree_core.root_node and covered < self.sliding_window_size
         ):
-            if cur.write_through_pending_id is not None:
+            # A copy in the same write-back batch already committed this SWA
+            # host value.
+            if (
+                cur.write_through_pending_id is not None
+                and not self.tree_core._is_round_write_pending(cur)
+            ):
                 break
 
             cd = cur.component_data[ct]
