@@ -12,6 +12,9 @@ if TYPE_CHECKING:
 
 _MAX_M = 16
 _MAX_K = 4096  # 16 x K bytes of activation slab in shared memory
+_MAX_WIDE_K = 8192  # above _MAX_K, M <= 8 only: 8 x K bytes of slab
+# Measured against DeepGEMM on H200: K=6144 pays up to here, N=9856 is slower.
+_MAX_WIDE_K_N = 8192
 _MAX_SIDE_N = 8  # side projection columns, one extra block each
 
 # Occupancy inputs measured with ncu on H20 for the shipped variants.
@@ -89,11 +92,16 @@ def use_hopper_fp8_block_gemv(
     if not (
         1 <= m <= _MAX_M
         and tuple(block_size) == (128, 128)
-        and k % 128 == 0
-        and 128 <= k <= _MAX_K
+        # An odd K block count can neither split across warps nor unroll the loads;
+        # DeepGEMM wins there on H200 (K=384: GEMV takes 1.1x-1.4x the time).
+        and k % 256 == 0
+        and 0 < k <= _MAX_WIDE_K
         and n >= 16
     ):
         return False
+    if k > _MAX_K:
+        # Needs the 8-warp K split to beat DeepGEMM on H200; K=4608 and 5632 lose at M=8.
+        return m <= 8 and n <= _MAX_WIDE_K_N and k % 1024 == 0
     # Past M=8 a second column group doubles MMA work; it wins on H20 only for N <= 1536.
     return m <= 8 or n <= 1536
 
