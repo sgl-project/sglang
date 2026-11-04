@@ -887,6 +887,12 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+# From this many rows (prefill chunks) each rank projects only its 1/TP of the
+# target hidden rows: the replicated [6 x 7168 -> 7168] fc took 7.6 ms of a
+# 16K-token DCP8 prefill step on MI355X, against ~0.6 ms for the all-gather.
+_FC_ROW_SHARD_MIN_ROWS = 4096
+
+
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
@@ -1076,13 +1082,35 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.quantizable:
-            projected = projected[0]
-        elif self.fc_tp_columns is not None:
+        group = get_parallel().tp_group
+        if (
+            self.fc_tp_columns is None
+            and group.world_size > 1
+            and target_hidden.shape[0] >= _FC_ROW_SHARD_MIN_ROWS
+        ):
+            return self._project_row_sharded(target_hidden, group)
+        projected = self._fc(target_hidden)
+        if self.fc_tp_columns is not None:
             projected = self._gather_fc_columns(projected)
-        ctx_hidden = self.hidden_norm(projected)
-        return ctx_hidden
+        return self.hidden_norm(projected)
+
+    def _fc(self, x: torch.Tensor) -> torch.Tensor:
+        projected = self.fc(x)
+        return projected[0] if self.quantizable else projected
+
+    def _project_row_sharded(self, target_hidden: torch.Tensor, group) -> torch.Tensor:
+        """The replicated fc and the norm on this rank's 1/TP of the rows, then
+        an all-gather, instead of every rank projecting every row."""
+        num_rows = target_hidden.shape[0]
+        rows = -(-num_rows // group.world_size)
+        start = group.rank_in_group * rows
+        shard = target_hidden[start : start + rows]
+        if shard.shape[0] < rows:
+            shard = torch.nn.functional.pad(shard, (0, 0, 0, rows - shard.shape[0]))
+        normed = self.hidden_norm(self._fc(shard))
+        gathered = normed.new_empty(rows * group.world_size, normed.shape[1])
+        group.all_gather_into_tensor(gathered, normed.contiguous())
+        return gathered[:num_rows]
 
     def _fc_tp_columns(self, hidden_size: int) -> Optional[Tuple[int, int]]:
         parallel = get_parallel()
