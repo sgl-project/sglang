@@ -38,6 +38,9 @@ class PythonicDetector(BaseFormatDetector):
             r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
             re.DOTALL,
         )
+        # (text, bracket_count) of the last unmatched call prefix scanned by
+        # _find_matching_bracket, so streaming resumes where it stopped.
+        self._bracket_scan = ("", 0)
 
     @staticmethod
     def _text_strip(text: str) -> str:
@@ -138,14 +141,22 @@ class PythonicDetector(BaseFormatDetector):
         Returns:
             Position of the matching closing bracket ']', or -1 if not found
         """
-        bracket_count = 0
-        for i in range(start, len(buffer)):
+        # While streaming, the buffer still starts with the text scanned on the
+        # previous call; resume from its end instead of rescanning it per chunk.
+        scanned, bracket_count = self._bracket_scan
+        if scanned and buffer.startswith(scanned, start):
+            first = start + len(scanned)
+        else:
+            first, bracket_count = start, 0
+        for i in range(first, len(buffer)):
             if buffer[i] == "[":
                 bracket_count += 1
             elif buffer[i] == "]":
                 bracket_count -= 1
                 if bracket_count == 0:
+                    self._bracket_scan = ("", 0)
                     return i
+        self._bracket_scan = (buffer[start:], bracket_count)
         return -1  # No matching bracket found
 
     def _strip_and_split_buffer(self, buffer: str) -> tuple[str, str]:
