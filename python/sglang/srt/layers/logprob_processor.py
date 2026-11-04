@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import itertools
 import logging
 from contextlib import nullcontext
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
+import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -18,7 +21,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_largest_run,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import async_d2h, is_pin_memory_available
+from sglang.srt.utils.common import async_d2h, async_h2d, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -33,13 +36,59 @@ class LogprobStage(Enum):
     DECODE = auto()
 
 
+class PackedTopLogprobs(msgspec.Struct):
+    """Next-token top-k logprobs of a batch as two ``[rows, max(ks)]`` matrices.
+
+    Row i keeps its first ks[i] columns. The scheduler copies each matrix to
+    the host once and slices rows there, instead of one copy per row.
+    """
+
+    values: torch.Tensor
+    indices: torch.Tensor
+    ks: List[int]
+
+    def map_device_tensors(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> None:
+        self.values = fn(self.values)
+        self.indices = fn(self.indices)
+
+    def to_rows(self) -> Tuple[List[List[float]], List[List[int]]]:
+        max_k = self.values.shape[-1]
+        values = self.values.tolist()
+        indices = self.indices.tolist()
+        return (
+            [row if k == max_k else row[:k] for row, k in zip(values, self.ks)],
+            [row if k == max_k else row[:k] for row, k in zip(indices, self.ks)],
+        )
+
+
+class PackedTokenIdsLogprobs(msgspec.Struct):
+    """Next-token logprobs of each row's requested token ids, gathered in row
+    order into one flat tensor; a row that requested none has token_ids []."""
+
+    values: torch.Tensor
+    token_ids: List[List[int]]
+
+    def map_device_tensors(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> None:
+        self.values = fn(self.values)
+
+    def to_rows(self) -> Tuple[List[List[float]], List[List[int]]]:
+        flat = self.values.tolist()
+        rows = []
+        start = 0
+        for ids in self.token_ids:
+            rows.append(flat[start : start + len(ids)])
+            start += len(ids)
+        return rows, self.token_ids
+
+
 @dataclasses.dataclass
 class LogprobResult:
     """Logprob fields produced by Input/OutputLogprobProcessor.
 
     Input (prefill) always fills token_logprobs; output (decode / scoring)
-    fills on demand. write_input_to / write_output_to flush populated fields
-    onto LogitsProcessorOutput, so the IPC / D2H wire format stays unchanged.
+    fills on demand and keeps top-k / token-ids logprobs packed on the device.
+    write_input_to / write_output_to flush populated fields onto
+    LogitsProcessorOutput, so the IPC wire format stays unchanged.
     """
 
     token_logprobs: Optional[torch.Tensor] = None
@@ -47,6 +96,8 @@ class LogprobResult:
     top_logprobs_idx: Optional[List] = None
     token_ids_logprobs_val: Optional[List] = None
     token_ids_logprobs_idx: Optional[List] = None
+    top_logprobs_packed: Optional[PackedTopLogprobs] = None
+    token_ids_logprobs_packed: Optional[PackedTokenIdsLogprobs] = None
     input_copy_done: Optional[torch.cuda.Event] = None
 
     def write_input_to(self, logits_output: LogitsProcessorOutput) -> None:
@@ -63,15 +114,11 @@ class LogprobResult:
     def write_output_to(self, logits_output: LogitsProcessorOutput) -> None:
         if self.token_logprobs is not None:
             logits_output.next_token_logprobs = self.token_logprobs
-        if self.top_logprobs_val is not None:
-            logits_output.next_token_top_logprobs_val = self.top_logprobs_val
-            logits_output.next_token_top_logprobs_idx = self.top_logprobs_idx
-        if self.token_ids_logprobs_val is not None:
-            logits_output.next_token_token_ids_logprobs_val = (
-                self.token_ids_logprobs_val
-            )
-            logits_output.next_token_token_ids_logprobs_idx = (
-                self.token_ids_logprobs_idx
+        if self.top_logprobs_packed is not None:
+            logits_output.next_token_top_logprobs_packed = self.top_logprobs_packed
+        if self.token_ids_logprobs_packed is not None:
+            logits_output.next_token_token_ids_logprobs_packed = (
+                self.token_ids_logprobs_packed
             )
 
 
@@ -198,6 +245,47 @@ def get_token_ids_logprobs(logprobs, token_ids_logprobs, no_copy_to_cpu=False):
         stage=LogprobStage.DECODE,
         no_copy_to_cpu=no_copy_to_cpu,
     )
+
+
+def get_top_logprobs_packed(
+    logprobs: torch.Tensor, top_logprobs_nums: List[int]
+) -> PackedTopLogprobs:
+    values, indices = logprobs.topk(max(top_logprobs_nums), dim=-1)
+    return PackedTopLogprobs(values=values, indices=indices, ks=top_logprobs_nums)
+
+
+def get_token_ids_logprobs_packed(
+    logprobs: torch.Tensor, token_ids_logprobs: List[Optional[List[int]]]
+) -> PackedTokenIdsLogprobs:
+    token_ids = [[] if ids is None else ids for ids in token_ids_logprobs]
+    index = _token_ids_gather_index(token_ids=token_ids, device=logprobs.device)
+    return PackedTokenIdsLogprobs(
+        values=logprobs[index[0], index[1]], token_ids=token_ids
+    )
+
+
+# Measured on A10G: Python lists win below ~128 ids (numpy's fixed cost),
+# numpy wins above (torch.tensor on the id lists is 3-7x slower).
+_LIST_INDEX_MAX_IDS = 128
+
+
+def _token_ids_gather_index(
+    token_ids: List[List[int]], device: torch.device
+) -> torch.Tensor:
+    num_ids = sum(map(len, token_ids))
+    if num_ids <= _LIST_INDEX_MAX_IDS:
+        rows = [i for i, ids in enumerate(token_ids) for _ in ids]
+        cols = list(itertools.chain.from_iterable(token_ids))
+        return async_h2d([rows, cols], dtype=torch.long, device=device)
+    lens = np.fromiter(map(len, token_ids), dtype=np.int64, count=len(token_ids))
+    pin = is_pin_memory_available(device)
+    index = torch.empty((2, num_ids), dtype=torch.long, pin_memory=pin)
+    host_index = index.numpy()
+    host_index[0] = np.repeat(np.arange(len(token_ids), dtype=np.int64), lens)
+    host_index[1] = np.fromiter(
+        itertools.chain.from_iterable(token_ids), dtype=np.int64, count=num_ids
+    )
+    return index.to(device, non_blocking=pin)
 
 
 def get_top_logprobs_chunk(
@@ -435,11 +523,8 @@ def compute_spec_logprobs(
         top_logprobs_nums_expanded = [
             num for num in batch.top_logprobs_nums for _ in range(max_accept)
         ]
-        (
-            logits_output.next_token_top_logprobs_val,
-            logits_output.next_token_top_logprobs_idx,
-        ) = get_top_logprobs(
-            gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
+        logits_output.next_token_top_logprobs_packed = get_top_logprobs_packed(
+            gathered_logprobs, top_logprobs_nums_expanded
         )
 
     if batch.token_ids_logprobs and any(
@@ -448,11 +533,10 @@ def compute_spec_logprobs(
         token_ids_logprobs_expanded = [
             ids for ids in batch.token_ids_logprobs for _ in range(max_accept)
         ]
-        (
-            logits_output.next_token_token_ids_logprobs_val,
-            logits_output.next_token_token_ids_logprobs_idx,
-        ) = get_token_ids_logprobs(
-            gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
+        logits_output.next_token_token_ids_logprobs_packed = (
+            get_token_ids_logprobs_packed(
+                gathered_logprobs, token_ids_logprobs_expanded
+            )
         )
 
 
@@ -818,94 +902,6 @@ class InputLogprobProcessor:
         )
 
 
-def get_token_ids_logprobs_batch_optimized(
-    logprobs: torch.Tensor,
-    token_ids_logprobs: List[List[int]],
-) -> Tuple[List, List]:
-    """
-    Vectorized batch processing for token ID logprobs extraction.
-
-    Uses a single GPU kernel call for the entire batch instead of multiple
-    separate calls, significantly improving performance for large batches.
-
-    Args:
-        logprobs: Log probabilities tensor [batch_size, vocab_size]
-        token_ids_logprobs: List of token IDs to extract logprobs for
-
-    Example:
-        # Input: batch_size=3, vocab_size=5
-        logprobs = torch.tensor([
-            [-1.2, -2.1, -0.8, -3.0, -1.5],  # batch 0
-            [-0.5, -1.8, -2.2, -1.1, -2.7],  # batch 1
-            [-2.0, -0.9, -1.4, -2.8, -1.6],  # batch 2
-        ])
-        token_ids_logprobs = [[1, 3], [2], [0, 2, 4]]
-
-        # Output:
-        # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
-        # indices = [[1, 3], [2], [0, 2, 4]]
-    """
-    batch_size = len(token_ids_logprobs)
-    device = logprobs.device
-
-    # Step 1: Calculate lengths for each request, treating None as empty list
-    # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
-    token_lengths = torch.tensor(
-        [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
-    )
-    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
-
-    # Handle edge case where no tokens are requested
-    if total_tokens == 0:
-        return [logprobs.new_empty(0) for _ in token_ids_logprobs], [
-            [] for _ in token_ids_logprobs
-        ]
-
-    # Step 2: Build flattened indices using torch operations
-    # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
-    row_indices = torch.repeat_interleave(
-        torch.arange(batch_size, device=device), token_lengths
-    )
-    # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
-    col_indices = torch.tensor(
-        [
-            token_id
-            for token_ids in token_ids_logprobs
-            for token_id in (token_ids or [])
-        ],
-        device=device,
-        dtype=torch.long,
-    )
-
-    # Step 3: Single vectorized gather operation
-    # Example: logprobs[row_indices, col_indices] -> [-2.1, -3.0, -2.2, -2.0, -1.4, -1.6]
-    gathered_logprobs = logprobs[row_indices, col_indices]
-
-    # Step 4: Split results back per request using torch operations
-    # Example: split tensor [6] into chunks of sizes [2, 1, 3] -> [tensor(2), tensor(1), tensor(3)]
-    split_logprobs = torch.split_with_sizes(
-        gathered_logprobs, token_lengths.tolist(), dim=0
-    )
-
-    # Step 5: Format output to match expected return structure
-    # Example: Convert split tensors back to list format with proper empty handling
-    # i=0: [1,3] -> append split_logprobs[0] and [1,3]
-    # i=1: [2] -> append split_logprobs[1] and [2]
-    # i=2: [0,2,4] -> append split_logprobs[2] and [0,2,4]
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None and len(token_ids) > 0:
-            output_token_ids_logprobs_val.append(split_logprobs[i])
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append(logprobs.new_empty(0))
-            output_token_ids_logprobs_idx.append([])
-
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
-
-
 class OutputLogprobProcessor:
     """Output (decode) logprob processing: logprobs -> topk / token-ids /
     sampled-token gather, returned as a LogprobResult for the caller to
@@ -927,17 +923,13 @@ class OutputLogprobProcessor:
 
         result = LogprobResult()
         if any(x > 0 for x in top_logprobs_nums):
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            result.top_logprobs_packed = get_top_logprobs_packed(
+                logprobs, top_logprobs_nums
+            )
 
         if any(x is not None for x in token_ids_logprobs):
-            (
-                result.token_ids_logprobs_val,
-                result.token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+            result.token_ids_logprobs_packed = get_token_ids_logprobs_packed(
+                logprobs, token_ids_logprobs
             )
 
         result.token_logprobs = logprobs[
@@ -983,19 +975,15 @@ class OutputLogprobProcessor:
         result = LogprobResult()
         # Handle top logprobs if requested
         if needs_top_logprobs:
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            result.top_logprobs_packed = get_top_logprobs_packed(
+                logprobs, top_logprobs_nums
+            )
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
-            # no_copy_to_cpu avoids the .item()/.tolist() CUDA sync that regresses
+            # Stays on the device: an .item()/.tolist() CUDA sync here regresses
             # prefill-only Score throughput at high concurrency.
-            (
-                result.token_ids_logprobs_val,
-                result.token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+            result.token_ids_logprobs_packed = get_token_ids_logprobs_packed(
+                logprobs, token_ids_logprobs
             )
         return result

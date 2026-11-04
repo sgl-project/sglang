@@ -198,6 +198,12 @@ class GenerationBatchResult:
                 self.logits_output.input_token_logprobs = _async_d2h(
                     self.logits_output.input_token_logprobs
                 )
+            for packed in (
+                self.logits_output.next_token_top_logprobs_packed,
+                self.logits_output.next_token_token_ids_logprobs_packed,
+            ):
+                if packed is not None:
+                    packed.map_device_tensors(_async_d2h)
             if self.logits_output.next_token_top_logprobs_val is not None:
                 self.logits_output.next_token_top_logprobs_val = [
                     _async_d2h(v) if torch.is_tensor(v) else v
@@ -326,10 +332,14 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "extend_input_len_per_req": result.extend_input_len_per_req,
         "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
         "next_token_logprobs": result.logits_output.next_token_logprobs,
-        "next_token_top_logprobs_val": result.logits_output.next_token_top_logprobs_val,
-        "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
-        "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
-        "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "next_token_top_logprobs_val": logits_output.next_token_top_logprobs_val,
+        "next_token_top_logprobs_idx": logits_output.next_token_top_logprobs_idx,
+        "next_token_token_ids_logprobs_val": logits_output.next_token_token_ids_logprobs_val,
+        "next_token_token_ids_logprobs_idx": logits_output.next_token_token_ids_logprobs_idx,
+        # Keep one storage per packed tensor. Pickling per-row views would
+        # serialize the entire backing storage once for every row.
+        "next_token_top_logprobs_packed": logits_output.next_token_top_logprobs_packed,
+        "next_token_token_ids_logprobs_packed": logits_output.next_token_token_ids_logprobs_packed,
         "sampling_mask_token_ids": (
             None if sampling_mask_output is None else sampling_mask_output.token_ids
         ),
@@ -388,6 +398,12 @@ def get_logprob_from_pp_outputs(
         ],
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
+        ],
+        next_token_top_logprobs_packed=next_pp_outputs[
+            "next_token_top_logprobs_packed"
+        ],
+        next_token_token_ids_logprobs_packed=next_pp_outputs[
+            "next_token_token_ids_logprobs_packed"
         ],
         sampling_mask_output=sampling_mask_output,
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
