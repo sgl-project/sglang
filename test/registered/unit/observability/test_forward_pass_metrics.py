@@ -1361,9 +1361,7 @@ class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
         scheduler = types.SimpleNamespace()
         scheduler.waiting_queue = []
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        hf_text_config = types.SimpleNamespace(
-            intermediate_size=self.INTERMEDIATE_SIZE
-        )
+        hf_text_config = types.SimpleNamespace(intermediate_size=self.INTERMEDIATE_SIZE)
         if layers_block_type is not None:
             hf_text_config.layers_block_type = layers_block_type
         if full_attention_layer_ids is not None:

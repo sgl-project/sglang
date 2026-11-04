@@ -27,15 +27,18 @@ class TestAutoTokenizerDeclaredClassFallback(CustomTestCase):
         """When AutoTokenizer can't build a backend tokenizer, the declared
         tokenizer_config.json class should be used if it loads successfully."""
         sentinel_tokenizer = object()
-        with patch.object(
-            tokenizer_mod.AutoTokenizer,
-            "from_pretrained",
-            side_effect=ValueError(COULDNT_INSTANTIATE_ERR),
-        ), patch.object(
-            tokenizer_mod,
-            "_load_tokenizer_by_declared_class",
-            return_value=sentinel_tokenizer,
-        ) as mock_declared:
+        with (
+            patch.object(
+                tokenizer_mod.AutoTokenizer,
+                "from_pretrained",
+                side_effect=ValueError(COULDNT_INSTANTIATE_ERR),
+            ),
+            patch.object(
+                tokenizer_mod,
+                "_load_tokenizer_by_declared_class",
+                return_value=sentinel_tokenizer,
+            ) as mock_declared,
+        ):
             result = tokenizer_mod._auto_tokenizer_from_pretrained("some/model")
 
         self.assertIs(result, sentinel_tokenizer)
@@ -45,14 +48,17 @@ class TestAutoTokenizerDeclaredClassFallback(CustomTestCase):
         """If the declared-class fallback can't improve on AutoTokenizer
         either (returns None), the original ValueError must propagate
         unchanged rather than being swallowed or replaced."""
-        with patch.object(
-            tokenizer_mod.AutoTokenizer,
-            "from_pretrained",
-            side_effect=ValueError(COULDNT_INSTANTIATE_ERR),
-        ), patch.object(
-            tokenizer_mod,
-            "_load_tokenizer_by_declared_class",
-            return_value=None,
+        with (
+            patch.object(
+                tokenizer_mod.AutoTokenizer,
+                "from_pretrained",
+                side_effect=ValueError(COULDNT_INSTANTIATE_ERR),
+            ),
+            patch.object(
+                tokenizer_mod,
+                "_load_tokenizer_by_declared_class",
+                return_value=None,
+            ),
         ):
             with self.assertRaises(ValueError) as ctx:
                 tokenizer_mod._auto_tokenizer_from_pretrained("some/model")
