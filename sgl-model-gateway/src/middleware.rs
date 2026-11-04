@@ -434,7 +434,10 @@ impl QueueProcessor {
             if self.token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
+                // The client disconnected while queued, so no TokenGuardBody will return it.
+                if queued.permit_tx.send(Ok(())).is_err() {
+                    self.token_bucket.return_tokens_sync(1.0);
+                }
             } else {
                 // Need to wait for token
                 let token_bucket = self.token_bucket.clone();
@@ -447,7 +450,10 @@ impl QueueProcessor {
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
+                        // The client disconnected while queued, so no TokenGuardBody will return it.
+                        if queued.permit_tx.send(Ok(())).is_err() {
+                            token_bucket.return_tokens_sync(1.0);
+                        }
                     } else {
                         warn!("Queue: request timed out waiting for token");
                         let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
@@ -1045,5 +1051,54 @@ mod tests {
         // Regular words
         assert!(!is_dynamic_id("completions"));
         assert!(!is_dynamic_id("chat"));
+    }
+
+    fn spawn_queue_processor(bucket: &Arc<TokenBucket>) -> mpsc::Sender<QueuedRequest> {
+        let (queue_tx, queue_rx) = mpsc::channel(8);
+        tokio::spawn(QueueProcessor::new(bucket.clone(), queue_rx, Duration::from_secs(5)).run());
+        queue_tx
+    }
+
+    /// A queued client that disconnects before being dequeued must not leak the token.
+    #[tokio::test]
+    async fn test_queue_returns_token_when_client_gone_immediate() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let queue_tx = spawn_queue_processor(&bucket);
+
+        let (permit_tx, permit_rx) = oneshot::channel();
+        drop(permit_rx);
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(bucket.available_tokens().await, 1.0);
+    }
+
+    /// Same as above, but the client disconnects while the processor waits for a token.
+    #[tokio::test]
+    async fn test_queue_returns_token_when_client_gone_after_wait() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        bucket.try_acquire(1.0).await.unwrap();
+        let queue_tx = spawn_queue_processor(&bucket);
+
+        let (permit_tx, permit_rx) = oneshot::channel();
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(permit_rx);
+        bucket.return_tokens_sync(1.0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(bucket.available_tokens().await, 1.0);
     }
 }
