@@ -15,9 +15,9 @@ except ImportError as e:
 
 from openai_harmony import Author, Message, Role, StreamState, TextContent
 
+from sglang.srt.entrypoints.harmony_recovery import RecoveringHarmonyParser
 from sglang.srt.entrypoints.harmony_utils import (
     get_encoding,
-    get_streamable_parser_for_assistant,
     render_for_completion,
 )
 from sglang.srt.entrypoints.tool import Tool
@@ -63,13 +63,17 @@ class HarmonyContext(ConversationContext):
         self,
         messages: list,
         tool_sessions: dict[str, Union["ClientSession", Tool]],
+        *,
+        function_names: set[str] | None = None,
     ):
         # TODO: Remove the hack of Union[ClientSession, Tool] by using MCP
         # when demo.
         self._messages = messages
         self.tool_sessions = tool_sessions
 
-        self.parser = get_streamable_parser_for_assistant()
+        self.parser = RecoveringHarmonyParser(
+            get_encoding(), function_names=function_names
+        )
         self.num_init_messages = len(messages)
         # TODO
         self.num_prompt_tokens = 0
@@ -84,8 +88,6 @@ class HarmonyContext(ConversationContext):
 
             for token_id in output_token_ids:
                 self.parser.process(token_id)
-            output_msgs = self.parser.messages
-
             meta_info = output["meta_info"]
 
             if isinstance(meta_info, dict):
@@ -96,6 +98,10 @@ class HarmonyContext(ConversationContext):
                 if "completion_tokens" in meta_info:
                     self.num_output_tokens += meta_info["completion_tokens"]
                 self._record_finish_reason(meta_info)
+                if meta_info.get("finish_reason") is not None:
+                    self.parser.finish()
+
+            output_msgs = self.parser.messages
 
         else:
             output_msgs = output
@@ -183,7 +189,6 @@ class StreamingHarmonyContext(HarmonyContext):
         super().__init__(*args, **kwargs)
         self.last_output = None
 
-        self.parser = get_streamable_parser_for_assistant()
         self.encoding = get_encoding()
         self.last_tok = None
         self.num_processed_tokens = 0
@@ -219,6 +224,8 @@ class StreamingHarmonyContext(HarmonyContext):
 
             for token_id in new_token_ids:
                 self.parser.process(token_id)
+            if meta_info.get("finish_reason") is not None:
+                self.parser.finish()
 
         else:
             # Handle the case of tool output in direct message format
