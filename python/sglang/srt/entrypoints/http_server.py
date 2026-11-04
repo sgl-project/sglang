@@ -119,7 +119,10 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.request_headers import (
+    apply_header_overrides,
+    apply_session_id_header,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -942,6 +945,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    apply_session_id_header(obj, request.headers)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1856,6 +1860,7 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    apply_session_id_header(request, raw_request.headers)
     return model_json_response(
         await raw_request.app.state.openai_serving_completion.handle_request(
             request, raw_request
@@ -1868,6 +1873,7 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    apply_session_id_header(request, raw_request.headers)
     return model_json_response(
         await raw_request.app.state.openai_serving_chat.handle_request(
             request, raw_request
@@ -2064,6 +2070,7 @@ async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
+    apply_session_id_header(request, raw_request.headers)
 
     result = await raw_request.app.state.openai_serving_responses.create_responses(
         request, raw_request
@@ -2202,6 +2209,7 @@ async def sagemaker_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    apply_session_id_header(request, raw_request.headers)
     return model_json_response(
         await raw_request.app.state.openai_serving_chat.handle_request(
             request, raw_request

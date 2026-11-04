@@ -18,6 +18,33 @@ _HEADER_OVERRIDES = {
     "x-override-priority": ("priority", int),
 }
 
+# Same header the vLLM OpenAI server accepts, and the one sgl-router already
+# uses for sticky session routing.
+SESSION_ID_HEADER = "x-session-id"
+
+
+def apply_session_id_header(obj, headers) -> None:
+    """Fall back to ``X-Session-ID`` when the body carries no session identity.
+
+    The body always wins: this only fills a missing ``session_id``, so a caller
+    that sets the field explicitly is unaffected. ``session_params`` describes a
+    scheduler-managed session and is mutually exclusive with ``session_id``, so
+    the header is ignored when ``session_params`` is present.
+
+    Callers apply this to the request object before dispatch, not to the
+    ``GenerateReqInput`` built from it, so the identity is visible to anything
+    that inspects the request early: ``GenerateReqInput`` validation rejects
+    ``session_id`` together with ``session_params``, and the Unlimited-OCR v2
+    document splitter refuses to split a request that carries a session.
+    """
+    if getattr(obj, "session_id", None) is not None:
+        return
+    if getattr(obj, "session_params", None) is not None:
+        return
+    value = headers.get(SESSION_ID_HEADER)
+    if value:
+        obj.session_id = value
+
 
 def apply_header_overrides(obj, headers) -> None:
     """Override request based on header values. Fail the request when any override has issues."""
