@@ -415,43 +415,32 @@ class SchedulerWeightUpdaterManager:
         )
         with self._observe_weight_load("plugin"):
             try:
-                # materialized once: every selected runner loads the same list
-                weights = list(handler(context=context, payload=recv_req.payload) or [])
+                weights = handler(context=context, payload=recv_req.payload)
                 error = None
             except Exception as e:
                 logger.exception("weight transport failed on this TP rank")
                 weights, error = [], f"TP rank {context.tp_rank}: {e}"
-            # Agree on the receive before any rank loads: load_weights can run
-            # collectives (engram host tables barrier on the TP CPU group), which a
-            # rank that skipped the load would never reach.
-            received, message, counts = self._agree_across_tp_ranks(
-                error=error, count=len(weights)
-            )
-            if not received:
-                return PluginWeightUpdateReqOutput(success=False, message=message)
-            if weights:
+            if error is None and weights:
                 loaded, message = self._load_into_selected_runners(
                     weights, recv_req.selector
                 )
-                if loaded:
-                    # this rank wrote through load_weights; a rank that received
-                    # nothing wrote directly (or not at all) and keeps post_load_weights
-                    self._session = msgspec.structs.replace(
-                        self._session, loaded_weights=True
-                    )
-                else:
+                if not loaded:
                     error = f"TP rank {context.tp_rank}: {message}"
             # only TP rank 0 replies, so its reply must carry every rank's outcome
-            success, message, _ = self._agree_across_tp_ranks(
+            success, message, counts = self._agree_across_tp_ranks(
                 error=error, count=len(weights)
             )
             if success:
+                if any(counts):
+                    self._session = msgspec.structs.replace(
+                        self._session, loaded_weights=True
+                    )
                 self.record_weight_version_after_update(recv_req.weight_version)
                 success, message = self.flush_cache_after_weight_update(
                     recv_req, success, message
                 )
             else:
-                # every rank loads before this gather, so the ranks that did not fail hold the bucket
+                # each rank loads before the gather, so the ranks that did not fail already have
                 message += "; the other TP ranks have loaded the bucket, redo it or retire the engine"
             return PluginWeightUpdateReqOutput(
                 success=success,
