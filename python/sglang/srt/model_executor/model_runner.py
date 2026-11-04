@@ -204,6 +204,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1566,6 +1567,14 @@ class ModelRunner:
         """Logical request limit, preserving hybrid SWA's separate pool bounds."""
         if self.is_hybrid_swa:
             return self.effective_max_total_num_tokens
+        if self.enable_hisparse and get_disagg().disaggregation_mode == "decode":
+            # PD writes full prompt KV directly to the host pool. Its sparse
+            # device working set must not cap the accepted prompt length.
+            return self.req_to_token_pool.schedulable_token_capacity(
+                self.kv_cache_configurator.logical_token_capacity(
+                    max_total_num_tokens=self.max_token_pool_size
+                )
+            )
         return self.logical_max_total_num_tokens
 
     @property
