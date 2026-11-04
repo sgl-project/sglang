@@ -406,7 +406,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if native.index_k is not None:
                 self.index_k_buffer = alloc_func(
                     (*indexer_dims, native.index_width),
-                    dtype=native.index_k.dtype,
+                    dtype=self.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
