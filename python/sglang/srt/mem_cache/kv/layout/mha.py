@@ -41,7 +41,10 @@ from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
-    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+    from sglang.srt.mem_cache.device_pool_info import (
+        DevicePoolInfo,
+        PageEnvelopeBufferInfo,
+    )
     from sglang.srt.mem_cache.kv.memory.arena import KVArena
 
 
@@ -498,15 +501,21 @@ class MHAView(MHAKVView):
                         else torch.device(self.device)
                     ),
                     scales=None,
+                    page_envelope=self._page_envelope_info(),
                 ),
             ),
         )
 
-    def host_pool_decls(self):
-        """The host pool HiCache keeps for this view's buffers."""
-        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
+    def _page_envelope_info(self) -> "Optional[PageEnvelopeBufferInfo]":
+        from sglang.srt.mem_cache.device_pool_info import PageEnvelopeBufferInfo
 
-        return (make_kv_pool_decl(self),)
+        return PageEnvelopeBufferInfo(
+            allocation=self._arena.raw,
+            registration_bytes=self._arena.accessible_bytes,
+            pages=self.get_page_envelope_buffer(),
+            page_size=self.page_size,
+            grow_direction=self.grow_direction,
+        )
 
     def get_contiguous_buf_infos(self):
         """PD registration: the raw arena as physical page envelopes. Every token
@@ -617,6 +626,9 @@ class DraftMHAView(MHAView):
 
     def get_page_envelope_buffer(self) -> torch.Tensor:
         raise NotImplementedError("fused draft KV rides in its host's envelopes")
+
+    def _page_envelope_info(self) -> None:
+        return None
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("CPU offloading is unsupported for fused draft KV")

@@ -674,6 +674,7 @@ class HiCacheController:
                     "mori",
                     "tensorcast",
                     "seaweedfs",
+                    "fast_file",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -845,7 +846,6 @@ class HiCacheController:
         self, model_name: Optional[str], attn_cp_size: int
     ) -> Optional[UnifiedKVPlan]:
         """Pair topology-free chunk coordinates with local page ranges."""
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         memory = get_memory()
         if memory.hicache_storage_key_scheme != "unified":
@@ -884,7 +884,7 @@ class HiCacheController:
             # uint8 but must land in distinct keyspaces.
             dtype=normalize_dtype(device_pool.dtype),
             page_size=self.page_size,
-            rank_replicated=isinstance(device_pool, MLATokenToKVPool),
+            rank_replicated=isinstance(device_pool, MLAKVView),
             local_kv_heads=getattr(host_pool, "head_num", 0),
             attn_tp_rank=parallel.attn_tp_rank,
             attn_tp_size=parallel.attn_tp_size,
@@ -1428,6 +1428,14 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _on_prefetch_dequeue(self, operation: PrefetchOperation) -> None:
+        """Prepare an op after dequeue on the prefetch storage thread.
+
+        The default controller does no extra preparation. Subclasses can use
+        this hook to initialize backreferences or observability state while
+        keeping the work out of the scheduler thread.
+        """
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1437,6 +1445,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self._on_prefetch_dequeue(operation)
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0

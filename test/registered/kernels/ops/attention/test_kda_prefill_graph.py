@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillGraphMetadata
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -64,6 +64,7 @@ def _layer():
 def _backend(conv_pool, ssm_pool, prefill_backend=LinearAttnKernelBackend.TRITON):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = KDAAttnBackend.__new__(KDAAttnBackend)
+    backend.state_pool = None
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
     backend.state_layer_cache = lambda layer_id: cache
     backend.req_to_token_pool = SimpleNamespace(
