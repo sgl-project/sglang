@@ -79,6 +79,13 @@ class RadixLinearAttention(nn.Module):
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
 
+        # Kimi-K3 fused KDA handoff, set around each forward by the model.
+        self._k3_deferred_f_b = False
+        self._k3_onorm_gate = None
+        self._k3_onorm_consumed = False
+        # (f_b_weight, norm_weight, norm_eps, A_log) once the HIP fused verify is armed.
+        self._k3_hip_fused_verify_args = None
+
     def refresh_conv_weights(self, weight: torch.Tensor) -> None:
         """Rebuild the cached convolution view after replacing its parameter."""
         if weight.dim() == 3 and weight.size(1) == 1:

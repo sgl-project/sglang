@@ -787,3 +787,181 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _aiter_has_kda_verify() -> bool:
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import (  # noqa: F401
+            flydsl_kda_verify_with_f_b,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+def _verify_backend(state, slots: torch.Tensor, steps: int):
+    from sglang.srt.layers.attention.linear.kda_backend import (
+        KDAAttnBackend,
+        KDAKernelDispatcher,
+    )
+    from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+
+    backend = KDAAttnBackend.__new__(KDAAttnBackend)
+    backend.state_layer_cache = state.at_layer_idx
+    backend.state_pool = SimpleNamespace(replayssm_request_ring=False)
+    backend.req_to_token_pool = SimpleNamespace(size=state.temporal.shape[1])
+    backend.forward_metadata = SimpleNamespace(
+        query_start_loc=torch.arange(slots.numel() + 1, device=_DEVICE, dtype=torch.int32)
+        * steps,
+        mamba_cache_indices=slots,
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_parent_token=None,
+    )
+    backend.verify_intermediate_state_indices = torch.arange(
+        state.temporal.shape[1], device=_DEVICE, dtype=torch.int32
+    )
+    backend.accept_lens_pool = None
+    backend.kernel_dispatcher = KDAKernelDispatcher(
+        LinearAttnKernelBackend.TRITON,
+        LinearAttnKernelBackend.TRITON,
+        LinearAttnKernelBackend.TRITON,
+    )
+    backend._fused_chain_verify_fn = None
+    return backend
+
+
+@pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")
+@pytest.mark.parametrize("ring", [False, True])
+def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
+    """The fused verify must reproduce the backend's unfused chain plus o_norm.
+
+    Covers the handoff the kernel depends on: the deferred f_a, the o_norm gate,
+    the slot/scratch index slices and the transposed conv-cache views.
+    """
+    from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
+    from sglang.srt.layers.attention.linear.kda_backend import _materialize_k3_f_b
+    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+    from sglang.srt.mem_cache.memory_pool import MambaPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    torch.manual_seed(20261104)
+    batch, steps, num_slots, ring_len = 3, 5, 7, 8
+    tokens = batch * steps
+
+    def randn(*shape, dtype=torch.bfloat16, scale=1.0):
+        return (scale * torch.randn(*shape, device=_DEVICE)).to(dtype)
+
+    layer = RadixLinearAttention(
+        layer_id=0,
+        num_q_heads=_HEADS,
+        num_k_heads=_HEADS,
+        num_v_heads=_HEADS,
+        head_q_dim=_DIM,
+        head_k_dim=_DIM,
+        head_v_dim=_DIM,
+        conv_weights=randn(_CHANNELS, _CONV_WIDTH, dtype=torch.float32, scale=0.5),
+        A_log=randn(_HEADS, dtype=torch.float32, scale=0.5),
+        dt_bias=randn(_HEADS * _DIM, dtype=torch.float32, scale=0.5),
+        lower_bound=_LOWER_BOUND,
+    )
+    norm_weight = randn(_DIM)
+    layer._k3_hip_fused_verify_args = (
+        randn(_HEADS, _DIM, _DIM, scale=0.05),
+        norm_weight,
+        _NORM_EPS,
+        layer.A_log,
+    )
+    # The model slices these out of one in-projection: [q,k,v,g | f_a | b | pad].
+    wide = randn(tokens, _CHANNELS + _HEADS * _DIM + _DIM + _HEADS + 4)
+    mixed_qkv, gate, f_a, beta, _ = wide.split(
+        [_CHANNELS, _HEADS * _DIM, _DIM, _HEADS, 4], dim=-1
+    )
+    beta = beta.unsqueeze(0)
+
+    template = MambaPool.SpeculativeState(
+        conv=[randn(1, num_slots, _CONV_WIDTH - 1, _CHANNELS)],
+        temporal=randn(1, num_slots, _HEADS, _DIM, _DIM, scale=0.05),
+        intermediate_ssm=None if ring else randn(1, num_slots, steps, _HEADS, _DIM, _DIM),
+        intermediate_conv_window=[randn(1, num_slots, steps, _CONV_WIDTH - 1, _CHANNELS)],
+        replayssm_rawv=randn(1, num_slots, _HEADS, ring_len, _DIM) if ring else None,
+        replayssm_rawk=randn(1, num_slots, _HEADS, ring_len, _DIM) if ring else None,
+        replayssm_g=(
+            randn(1, num_slots, _HEADS, ring_len, _DIM, dtype=torch.float32)
+            if ring
+            else None
+        ),
+        replayssm_beta=(
+            randn(1, num_slots, _HEADS, ring_len, dtype=torch.float32) if ring else None
+        ),
+    )
+    # Mamba slots differ from the positional scratch rows.
+    slots = torch.tensor([5, 0, 3], device=_DEVICE, dtype=torch.int32)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        ragged_verify_layout=None,
+        req_pool_indices=torch.arange(batch, device=_DEVICE, dtype=torch.int32),
+        spec_info=SimpleNamespace(draft_token_num=steps),
+    )
+
+    def clone_state():
+        return MambaPool.SpeculativeState(
+            **{
+                name: (
+                    None
+                    if value is None
+                    else [v.clone() for v in value]
+                    if isinstance(value, list)
+                    else value.clone()
+                )
+                for name, value in vars(template).items()
+            }
+        )
+
+    fused_state = clone_state()
+    layer._k3_deferred_f_b = True
+    layer._k3_onorm_gate = gate
+    layer._k3_onorm_consumed = False
+    fused = _verify_backend(fused_state, slots, steps)._forward_target_verify(
+        layer, forward_batch, mixed_qkv, f_a, beta
+    )
+    assert layer._k3_onorm_consumed
+
+    ref_state = clone_state()
+    layer._k3_deferred_f_b = False
+    layer._k3_onorm_gate = None
+    unfused = _verify_backend(ref_state, slots, steps)._forward_target_verify(
+        layer, forward_batch, mixed_qkv, _materialize_k3_f_b(layer, f_a), beta
+    )
+    unfused = rms_norm_gated(
+        unfused,
+        gate.view(1, tokens, _HEADS, _DIM),
+        norm_weight,
+        None,
+        "sigmoid",
+        eps=_NORM_EPS,
+    )
+    torch.cuda.synchronize()
+
+    # One BF16 ulp: the kernels reduce K in different orders.
+    torch.testing.assert_close(fused, unfused, rtol=2**-7, atol=2e-3)
+    windows = slice(0, batch)
+    torch.testing.assert_close(
+        fused_state.intermediate_conv_window[0][:, windows],
+        ref_state.intermediate_conv_window[0][:, windows],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(fused_state.temporal, template.temporal, rtol=0, atol=0)
+    if ring:
+        for name in ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta"):
+            torch.testing.assert_close(
+                getattr(fused_state, name), getattr(ref_state, name), rtol=1e-2, atol=1e-2
+            )
+    else:
+        torch.testing.assert_close(
+            fused_state.intermediate_ssm[:, windows],
+            ref_state.intermediate_ssm[:, windows],
+            rtol=1e-2,
+            atol=1e-4,
+        )

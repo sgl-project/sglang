@@ -1130,6 +1130,9 @@ class Envs:
     SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
         "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
     )
+    # Run KDA target verify as one AITER FlyDSL kernel (f_b, conv, gate,
+    # recurrence, gated RMSNorm); needs the "aiter" fused KDA decode armed.
+    SGLANG_OPT_HIP_K3_KDA_FUSED_VERIFY = EnvBool(False)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
