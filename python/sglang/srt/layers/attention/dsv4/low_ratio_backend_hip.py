@@ -751,6 +751,7 @@ def low_ratio_index_topk_hip_extend(
             page_indices,
             raw_indices,
             publish,
+            num_rows=num_tokens,
             published=[
                 t > 0 and lc > 0 and not ident
                 for t, lc, ident in zip(extend_lens_cpu, lc_per_req, is_identity)
@@ -801,14 +802,15 @@ def _gather_shard(
     raw_indices: Optional[torch.Tensor],
     local_publish: Optional[List[Optional[CandidateBlocks]]],
     *,
+    num_rows: int,
     published: List[bool],
     extend_lens: List[int],
     topk_blocks: int,
     block_size: int,
 ) -> Optional[List[Optional[CandidateBlocks]]]:
     """All-gathers every rank's rows of the selections and, on a source layer, of the candidate
-    blocks (ids, then the compact length); returns the publication of every request."""
-    num_rows = sum(extend_lens)
+    blocks (ids, then the compact length); returns the publication of every request.
+    num_rows is the count rows was cut from, padding rows included."""
     topk = page_indices.shape[1]
     parts = [page_indices[rows]]
     if raw_indices is not None:
