@@ -17,7 +17,8 @@ from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     MockMLAModelRunner,
@@ -27,10 +28,13 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
 from sglang.test.parallel_groups import publish
 
 register_cuda_ci(est_time=40, stage="base-b", runner_config="4-gpu-b200")
+# backend-specific: ROCm serves DFLASH MLA drafts on the triton draft backend
+register_amd_ci(est_time=40, stage="stage-b", runner_config="1-gpu-small-amd")
 
 HIDDEN, HEADS, RANK, NOPE, ROPE, VALUE, BLOCK = 128, 32, 512, 128, 64, 128, 8
 CAPACITY = 256
-BACKENDS = ("triton", "flashinfer", "tokenspeed_mla")
+# flashinfer and TokenSpeed MLA have no ROCm build.
+BACKENDS = ("triton",) if is_hip() else ("triton", "flashinfer", "tokenspeed_mla")
 
 
 def _rope(x, positions):
@@ -161,11 +165,13 @@ class TestDFlashMLABackends(unittest.TestCase):
         runner, backend = self._make_runner(backend_name, config, fp8)
         module = DFlashMLAAttention(config, layer_id=0)
         # get_rope() shares one cached instance, and the CUDA RoPE kernel reads
-        # an FP32 table that Module.to would round to BF16.
+        # an FP32 table that Module.to would round to BF16. AITER's rope (HIP)
+        # keeps cos_cache/sin_cache and casts them to the query dtype itself.
         module.rotary_emb = copy.deepcopy(module.rotary_emb)
-        rope_cache = module.rotary_emb.cos_sin_cache
+        rope_cache = getattr(module.rotary_emb, "cos_sin_cache", None)
         module = module.to(device="cuda", dtype=torch.bfloat16).eval()
-        module.rotary_emb.cos_sin_cache = rope_cache.to(device="cuda")
+        if rope_cache is not None:
+            module.rotary_emb.cos_sin_cache = rope_cache.to(device="cuda")
         with torch.no_grad():
             for name, param in module.named_parameters():
                 if "layernorm" in name:

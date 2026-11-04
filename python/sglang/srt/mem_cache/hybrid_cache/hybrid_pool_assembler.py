@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1264,9 +1265,10 @@ def build_mamba_host_pool(
     capacity = mamba_pool.host_capacity_tokens
     if capacity is None:
         capacity = mamba_pool.size
+    mamba_host_ratio = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO.get()
     return MambaPoolHost(
         pool_info.buffer_info,
-        get_memory().hicache_ratio,
+        get_memory().hicache_ratio if mamba_host_ratio is None else mamba_host_ratio,
         host_size,
         device_capacity=capacity,
         mtp_draft_buffer_infos=draft_buffer_infos,

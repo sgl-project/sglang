@@ -22,7 +22,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary import ops as comm_moves
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
-from sglang.srt.layers.layer_boundary.residual import attn_bank
+from sglang.srt.layers.layer_boundary.residual import attn_bank, attn_bank_hip
 from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
@@ -180,6 +180,18 @@ def _staged(
     )
     torch.testing.assert_close(head, contribution + residual, rtol=0, atol=0)
     return hidden
+
+
+class TestRowShard(CustomTestCase):
+    def test_shards_past_the_last_token_are_empty(self):
+        """With fewer tokens than the padded shards need, the last ranks own no real
+        rows; a negative count would slice the wrong rows off the reduced shard."""
+        self.assertEqual(attn_bank_hip.row_shard(9, 8, 7), (14, 0))
+        self.assertEqual(attn_bank_hip.row_shard(9, 8, 4), (8, 1))
+        self.assertEqual(attn_bank_hip.row_shard(4097, 8, 7), (3591, 506))
+        for num_tokens in (1, 9, 49, 64, 4097):
+            shards = [attn_bank_hip.row_shard(num_tokens, 8, r) for r in range(8)]
+            self.assertEqual(sum(valid for _, valid in shards), num_tokens)
 
 
 class TestAttnBankResidualOps(CustomTestCase):

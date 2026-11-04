@@ -1,0 +1,147 @@
+"""Kimi-K3.1's ROCm DSA indexer hooks (dsa_indexer_hip) against their plain counterparts.
+
+- Store under DCP: a rank's index-K equals a DCP1 store of only the tokens it owns
+  (slot % N == rank) at row slot // N, as with the CUDA fused store.
+- Target verify: the shared-index-K logits equal the per-row aiter call on every
+  row's keys, layer after layer and forward after forward.
+"""
+
+import sys
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+import sglang.srt.layers.attention.dsa.dsa_indexer as dsa_indexer
+import sglang.srt.layers.attention.dsa.dsa_indexer_hip as dsa_indexer_hip
+from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.dcp import layout as dcp_layout
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_parallel
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase, published_topology
+
+# backend-specific: AITER's preshuffled index-K store and paged-MQA logits.
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+PAGE, HEADS, HEAD_DIM = 64, 32, 128
+ROWS = 4096
+
+
+def _make_pool() -> DSATokenToKVPool:
+    return DSATokenToKVPool(
+        size=ROWS,
+        page_size=PAGE,
+        kv_lora_rank=512,
+        dtype=torch.float8_e4m3fn,
+        qk_rope_head_dim=64,
+        layer_num=1,
+        device="cuda",
+        index_head_dim=HEAD_DIM,
+        enable_memory_saver=False,
+        kv_cache_dim=656,
+    )
+
+
+class _IndexerStub:
+    _store_index_k_cache = Indexer._store_index_k_cache
+    block_size, scale_fmt = 128, "ue8m0"
+
+
+def _store(pool, loc, key) -> torch.Tensor:
+    backend = SimpleNamespace(token_to_kv_pool=pool)
+    with forward_context(ForwardContext(attn_backend=backend)):
+        _IndexerStub()._store_index_k_cache(SimpleNamespace(out_cache_loc=loc), 0, key)
+    return pool.get_index_k_with_scale_buffer(0)
+
+
+@unittest.skipUnless(
+    dsa_indexer._use_aiter_preshuffle, "needs SGLANG_USE_AITER=1 and preshuffle"
+)
+class TestDSAIndexerHip(CustomTestCase):
+    def test_dcp_store_keeps_this_ranks_tokens(self):
+        dcp_size = 8
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        loc = torch.randperm(ROWS * dcp_size, device="cuda", generator=gen)[:700]
+        loc[::50] = -1  # padded tokens write nothing
+        key = torch.randn(loc.numel(), HEAD_DIM, device="cuda", generator=gen)
+        key = key.bfloat16()
+        dcp_layout._dsa_shards_index_k = True
+        try:
+            for rank in (0, dcp_size - 1):
+                with self.subTest(rank=rank):
+                    with published_topology(tp_size=dcp_size, dcp_size=dcp_size):
+                        with get_parallel().override(attn_dcp_rank=rank, dcp_rank=rank):
+                            got = _store(_make_pool(), loc, key)
+                    owned = (loc >= 0) & (loc % dcp_size == rank)
+                    with published_topology():
+                        ref = _store(_make_pool(), loc[owned] // dcp_size, key[owned])
+                    self.assertTrue(ref.any(), "no index-K row was stored")
+                    self.assertTrue(torch.equal(got, ref))
+        finally:
+            dcp_layout._dsa_shards_index_k = False
+
+    def test_verify_logits_match_per_row_call(self):
+        num_reqs, next_n, req_pages = 3, 4, 8
+        q_offset = num_reqs * next_n
+        max_seq_len = req_pages * PAGE
+        gen = torch.Generator(device="cuda").manual_seed(1)
+        with published_topology():
+            pool = _make_pool()
+        key = torch.randn(ROWS, HEAD_DIM, device="cuda", generator=gen).bfloat16()
+        kv = _store(pool, torch.arange(ROWS, device="cuda"), key)
+        kv = kv.view(kv.shape[0], PAGE, 1, HEAD_DIM + 4)
+        # The same batch object every forward: only the layer order tells them apart.
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        for step in range(2):
+            pages = torch.randperm(ROWS // PAGE, device="cuda", generator=gen)
+            tables = pages[: num_reqs * req_pages].view(num_reqs, req_pages).int()
+            tables = tables.repeat_interleave(next_n, dim=0)
+            last = torch.randint(
+                next_n, max_seq_len + 1, (num_reqs, 1), device="cuda", generator=gen
+            )
+            lens = (last - next_n + 1 + torch.arange(next_n, device="cuda")).view(-1)
+            lens = lens.int()
+            for layer_id in range(2):
+                q = torch.randn(q_offset, HEADS, HEAD_DIM, device="cuda", generator=gen)
+                q = q.to(torch.float8_e4m3fn)
+                w = torch.randn(q_offset, HEADS, device="cuda", generator=gen)
+                self.assertTrue(
+                    dsa_indexer_hip.verify_shares_index_k(
+                        forward_batch, q, tables, PAGE, q_offset, num_reqs, next_n, 1
+                    )
+                )
+                shared = dsa_indexer_hip.verify_paged_mqa_logits(
+                    forward_batch,
+                    layer_id,
+                    q,
+                    kv,
+                    w,
+                    lens.view(-1, 1),
+                    tables,
+                    max_seq_len,
+                    q_offset,
+                    num_reqs,
+                    next_n,
+                    PAGE,
+                )
+                per_row = aiter_paged_mqa_logits(
+                    q,
+                    kv,
+                    w,
+                    lens,
+                    tables,
+                    max_seq_len,
+                    preshuffle=True,
+                    kv_block_size=PAGE,
+                )
+                for row, n in enumerate(lens.tolist()):
+                    with self.subTest(step=step, layer=layer_id, row=row):
+                        self.assertTrue(torch.equal(shared[row, :n], per_row[row, :n]))
+
+
+if __name__ == "__main__":
+    sys.exit(unittest.main())

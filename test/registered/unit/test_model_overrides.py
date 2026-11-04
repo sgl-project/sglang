@@ -4097,11 +4097,11 @@ class TestKimiK3DcpSpeculativeAttentionMode(CustomTestCase):
 
 class TestKimiK31DcpOverrides(CustomTestCase):
     """Kimi-K3.1 DCP: a DFLASH MLA draft attends over DCP owner rows on the
-    draft-verify path (cute-dsl MLA), and a DCP decode node takes the KV of a
-    DCP-1 or same-DCP PD prefill over Mooncake."""
+    draft-verify path (cute-dsl MLA on CUDA, Triton on ROCm), and a DCP decode
+    node takes the KV of a DCP-1 or same-DCP PD prefill over Mooncake."""
 
     @staticmethod
-    def _overrides(**fields):
+    def _overrides(is_hip=False, **fields):
         from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
 
         cfg = SimpleNamespace(
@@ -4120,7 +4120,8 @@ class TestKimiK31DcpOverrides(CustomTestCase):
         )
         for name, value in fields.items():
             setattr(cfg, name, value)
-        return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
+        with override_platform(is_cuda=not is_hip, is_hip=is_hip):
+            return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
 
     def test_dflash_defaults_to_cutedsl_mla_draft_and_decode_verify(self):
         overrides = self._overrides(speculative_algorithm="DFLASH")
@@ -4134,6 +4135,30 @@ class TestKimiK31DcpOverrides(CustomTestCase):
             with self.subTest(backend=backend):
                 with self.assertRaisesRegex(ValueError, "cutedsl_mla"):
                     self._overrides(
+                        speculative_algorithm="DFLASH",
+                        speculative_draft_attention_backend=backend,
+                    )
+
+    def test_dflash_on_rocm_takes_the_triton_draft_and_decode_verify(self):
+        for backend in (None, "triton"):
+            with self.subTest(backend=backend):
+                overrides = self._overrides(
+                    is_hip=True,
+                    speculative_algorithm="DFLASH",
+                    speculative_draft_attention_backend=backend,
+                )
+                self.assertEqual(
+                    overrides["speculative_draft_attention_backend"], "triton"
+                )
+                self.assertEqual(overrides["speculative_attention_mode"], "decode")
+
+    def test_dflash_on_rocm_rejects_other_draft_backends(self):
+        # cutedsl_mla is CUDA-only.
+        for backend in ("flashinfer", "cutedsl_mla", "trtllm_mla", "aiter"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "other than triton"):
+                    self._overrides(
+                        is_hip=True,
                         speculative_algorithm="DFLASH",
                         speculative_draft_attention_backend=backend,
                     )

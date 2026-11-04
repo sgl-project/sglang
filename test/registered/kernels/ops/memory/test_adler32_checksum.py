@@ -6,9 +6,11 @@ import zlib
 import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: the kernel looks up ROCm streams through kDLROCM
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _ref_adler32(tensor: torch.Tensor) -> int:
@@ -73,6 +75,19 @@ class TestAdler32(unittest.TestCase):
         t = torch.randn(1000, 128, dtype=torch.bfloat16, device="cuda")
         idx = torch.arange(1000, dtype=torch.int64, device="cuda")
         self._check_strided([t], [idx], [128 * 2])
+
+    def test_strided_nondefault_stream(self):
+        # ROCm must look up the stream with kDLROCM. Using kDLCUDA can launch
+        # on the default stream while result.item() waits on this stream only.
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for _ in range(8):
+                for rows in [63, 64, 65, 1023, 1024, 1025]:
+                    tensor = torch.randint(
+                        0, 256, (rows, 32), dtype=torch.uint8, device="cuda"
+                    )
+                    indices = torch.arange(rows, dtype=torch.int64, device="cuda")
+                    self._check_strided([tensor], [indices], [32])
 
     def test_strided_large_items(self):
         first = torch.randint(

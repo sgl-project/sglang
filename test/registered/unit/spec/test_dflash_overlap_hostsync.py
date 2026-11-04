@@ -9,10 +9,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+# backend-specific: the compact draft req_to_token rebuild kernel runs on HIP.
+register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _HAS_CUDA = torch.cuda.is_available()
 

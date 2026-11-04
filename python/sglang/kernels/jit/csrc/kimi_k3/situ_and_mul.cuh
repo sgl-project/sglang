@@ -62,6 +62,12 @@ struct SituAndMulParams {
   uint32_t hidden_dim;  // D (output width, half of input last dim)
   uint32_t num_tokens;
   uint32_t stride_in_vecs;  // input row stride in vector units (2*D/vec if dense)
+  // Optional rows cast TIn -> TOut in the same launch (cast_vecs 0: none): the
+  // routed input sharing an fp32 fused-GEMM output with the shared gate_up.
+  const void* __restrict__ cast_in;
+  void* __restrict__ cast_out;
+  uint32_t cast_vecs;  // per token, dense in cast_out
+  uint32_t cast_stride_in_vecs;
 };
 
 template <typename TIn, typename TOut, bool kHasLinearBeta, bool kUsePDL>
@@ -76,7 +82,22 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto token_id = tid / num_vecs;
 
-  if (token_id >= params.num_tokens) return;
+  if (token_id >= params.num_tokens) {
+    // past the activation's items: the optional cast rows
+    const auto c = tid - params.num_tokens * num_vecs;
+    const auto ct = c / (params.cast_vecs != 0 ? params.cast_vecs : 1u);
+    if (params.cast_vecs == 0 || ct >= params.num_tokens) return;
+    const auto co = c % params.cast_vecs;
+    PDLWaitPrimary<kUsePDL>();
+    const auto v = load_as<vec_t>(params.cast_in, static_cast<uint64_t>(ct) * params.cast_stride_in_vecs + co);
+    PDLTriggerSecondary<kUsePDL>();
+    out_vec_t w;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      w[i] = cast<TOut>(cast<fp32_t>(v[i]));
+    store_as<out_vec_t>(params.cast_out, w, c);
+    return;
+  }
 
   const auto offset = tid % num_vecs;
   // Input rows may be strided (e.g. a slice of a wider fused-GEMM output);
@@ -122,6 +143,29 @@ struct SituAndMulKernel {
       const double beta,
       const double linear_beta,
       const bool has_linear_beta) {
+    launch(input, out, nullptr, nullptr, beta, linear_beta, has_linear_beta);
+  }
+
+  // run() plus cast_in [N, C] (row-strided TIn) -> cast_out [N, C] (dense TOut) in the same launch.
+  static void run_with_cast(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView cast_in,
+      const tvm::ffi::TensorView cast_out,
+      const double beta,
+      const double linear_beta,
+      const bool has_linear_beta) {
+    launch(input, out, &cast_in, &cast_out, beta, linear_beta, has_linear_beta);
+  }
+
+  static void launch(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView* cast_in,
+      const tvm::ffi::TensorView* cast_out,
+      const double beta,
+      const double linear_beta,
+      const bool has_linear_beta) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -149,7 +193,20 @@ struct SituAndMulKernel {
     RuntimeCheck(hidden_size % kVecSize == 0, "hidden size must be divisible by vector size");
     RuntimeCheck(input.stride(0) % kVecSize == 0, "input row stride must be divisible by vector size");
 
-    const auto num_total_items = num_tokens * (hidden_size / kVecSize);
+    uint32_t cast_vecs = 0, cast_stride_in_vecs = 0;
+    if (cast_in != nullptr) {
+      auto C = SymbolicSize{"cast_width"};
+      TensorMatcher({N, C}).with_dtype<TOut>().with_device(device_).verify(*cast_out);
+      TensorMatcher({N, C}).with_dtype<TIn>().with_device(device_).with_strides({-1, 1}).verify(*cast_in);
+      RuntimeCheck(C.unwrap() % kVecSize == 0, "cast width must be divisible by vector size");
+      RuntimeCheck(cast_in->stride(0) % kVecSize == 0, "cast row stride must be divisible by vector size");
+      RuntimeCheck(
+          reinterpret_cast<uintptr_t>(cast_in->data_ptr()) % device::kMaxVecBytes == 0,
+          "cast input must be vector aligned");
+      cast_vecs = static_cast<uint32_t>(C.unwrap() / kVecSize);
+      cast_stride_in_vecs = static_cast<uint32_t>(cast_in->stride(0) / kVecSize);
+    }
+    const auto num_total_items = static_cast<uint64_t>(num_tokens) * (hidden_size / kVecSize + cast_vecs);
     RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
 
     const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), kBlockSize);
@@ -166,6 +223,10 @@ struct SituAndMulKernel {
         .hidden_dim = hidden_size,
         .num_tokens = num_tokens,
         .stride_in_vecs = static_cast<uint32_t>(input.stride(0) / kVecSize),
+        .cast_in = cast_in != nullptr ? cast_in->data_ptr() : nullptr,
+        .cast_out = cast_out != nullptr ? cast_out->data_ptr() : nullptr,
+        .cast_vecs = cast_vecs,
+        .cast_stride_in_vecs = cast_stride_in_vecs,
     };
 
     if (has_linear_beta) {

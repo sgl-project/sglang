@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _FP8_MAX,
     _LOG2E,
     _PREFERRED_BLOCK_K,
+    _as_scaled_fp8_kv,
     _cu_count,
     _gfx950_sparse_mla_kv_splits,
     _gfx950_sparse_mla_num_warps,
@@ -85,7 +86,10 @@ def triton_sparse_mla_decode_splitk(
     d_v: int = 512,
     kv_splits: int | None = None,
     workspace: _SplitKWorkspace | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    topk_length: torch.Tensor | None = None,
+    expected_topk: int | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
     q_nope:  [bs, H, d_v] fp8/bf16
@@ -93,10 +97,15 @@ def triton_sparse_mla_decode_splitk(
     kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
-    returns: [1, bs, H, d_v] bf16
+    topk_length: [bs] int32; row t attends indices[t, 0, :topk_length[t]] only,
+        e.g. a DCP rank's compacted share of the global top-k
+    expected_topk: typical topk_length, which sizes the split count instead of topk
+    returns: [1, bs, H, d_v] bf16, plus the [bs, H] fp32 natural-log LSE
+    (-inf for rows with no key) when return_lse
     """
+    kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8
+    use_fp8_dot = is_fp8 and not kv_scaled
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -119,9 +128,14 @@ def triton_sparse_mla_decode_splitk(
     assert d_v % 128 == 0, f"d_v must be divisible by 128, got {d_v}"
     num_groups = d_v // 128
 
+    use_topk_length = topk_length is not None
+    if use_topk_length:
+        assert topk_length.dtype == torch.int32 and topk_length.is_contiguous()
+        assert topk_length.numel() >= bs
     # Keep the number of split partials independent of a smaller LDS-safe
     # BLOCK_K. This retains the existing reduction cost on 64 KiB devices.
-    max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
+    split_topk = min(expected_topk or topk, topk) if use_topk_length else topk
+    max_kv_splits = max(1, split_topk // _PREFERRED_BLOCK_K)
     num_cu = _cu_count(q_nope.device)
     base_ctas = max(1, bs * n_head_blocks)
     optimize_gfx950_fp8 = H == 16 and _is_gfx950_sparse_mla_fp8(
@@ -168,14 +182,18 @@ def triton_sparse_mla_decode_splitk(
         if optimize_gfx950_fp8:
             fused_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, 1, num_cu)
         out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+        lse = torch.empty(
+            (bs, H) if return_lse else (0,), device=q_nope.device, dtype=torch.float32
+        )
         with _no_async_copy():
             _sparse_mla_fused_kernel[(bs, n_head_blocks)](
                 q_nope,
                 q_rope,
                 kv,
                 idx_flat,
-                idx_flat,
+                topk_length if use_topk_length else idx_flat,
                 out,
+                lse,
                 qk_scale,
                 _FP8_MAX,
                 topk=topk,
@@ -189,7 +207,9 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_T=stride_qr_t,
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
-                USE_TOPK_LENGTH=False,
+                KV_SCALED=kv_scaled,
+                STORE_LSE=return_lse,
+                USE_TOPK_LENGTH=use_topk_length,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (
@@ -201,13 +221,14 @@ def triton_sparse_mla_decode_splitk(
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
-        return out.unsqueeze(0)
+        return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
     active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
         tiles_per_split * BLOCK_K
     )
-    active_splits = min(active_splits, kv_splits)
+    # Under topk_length every split may hold a row's tiles.
+    active_splits = kv_splits if use_topk_length else min(active_splits, kv_splits)
     split_num_warps = 4
     if optimize_gfx950_fp8:
         split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
@@ -216,6 +237,9 @@ def triton_sparse_mla_decode_splitk(
         bs, kv_splits, h_padded, d_v, q_nope.device, workspace
     )
     out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+    lse = torch.empty(
+        (bs, H) if return_lse else (0,), device=q_nope.device, dtype=torch.float32
+    )
 
     grid_split = (bs, n_head_blocks, kv_splits)
     with _no_async_copy():
@@ -239,9 +263,12 @@ def triton_sparse_mla_decode_splitk(
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
+            KV_SCALED=kv_scaled,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
+            topk_length_ptr=topk_length,
+            USE_TOPK_LENGTH=use_topk_length,
             num_warps=split_num_warps,
             num_stages=2,
         )
@@ -252,6 +279,7 @@ def triton_sparse_mla_decode_splitk(
         lse_partial,
         acc_partial,
         out,
+        lse,
         H=H,
         D_V=d_v,
         KV_SPLITS=kv_splits,
@@ -259,9 +287,10 @@ def triton_sparse_mla_decode_splitk(
         ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
+        STORE_LSE=return_lse,
         num_warps=4,
     )
-    return out.unsqueeze(0)
+    return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------

@@ -5032,7 +5032,12 @@ class MLATokenToKVPool(KVCache):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+        if (
+            _is_hip
+            and self.use_dsa
+            and self.dtype == fp8_dtype
+            and not self.dsa_kv_cache_store_fp8
+        ):
             # HIP TileLang FP8 consumes the model's raw MLA layout
             # (NoPE + optional RoPE) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.

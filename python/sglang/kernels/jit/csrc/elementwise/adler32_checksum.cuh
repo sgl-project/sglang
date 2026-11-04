@@ -213,9 +213,7 @@ struct Adler32StridedKernel {
     uint32_t* out_b = out_a + num_blocks;
     uint64_t* out_len = reinterpret_cast<uint64_t*>(out_b + num_blocks);
 
-    DLDevice device;
-    device.device_type = kDLCUDA;
-    device.device_id = ptrs.device().device_id;
+    DLDevice device = ptrs.device();
 
     size_t smem_bytes = (kBlockSize / 32) * sizeof(Adler32State);
     LaunchKernel(num_blocks, kBlockSize, device, smem_bytes)(
@@ -277,9 +275,7 @@ struct Adler32ReduceKernel {
     threads = t;
     if (threads > kBlockSize) threads = kBlockSize;
 
-    DLDevice device;
-    device.device_type = kDLCUDA;
-    device.device_id = states.device().device_id;
+    DLDevice device = states.device();
 
     size_t smem_bytes = ((threads + 31) / 32) * sizeof(Adler32State);
     LaunchKernel(1, threads, device, smem_bytes)(

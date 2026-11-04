@@ -843,6 +843,10 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Host-to-device ratio of the hierarchical Mamba state pool alone, in place of
+    # --hicache-ratio (ratio mode only). Agentic replay can fill the host state slots long
+    # before the host KV pool, and a host KV prefix without its state cannot be reused.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -990,6 +994,12 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # gfx950 DSA sparse MLA decode / verify over fp8_ds_mla KV with the MXFP8 kernel ported
+    # from aiter's opus decode (Q quantized to MXFP8) instead of the Triton split-K kernel.
+    SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
+    # GiB of ROCm device memory kept out of torch's allocator (0 = no cap): HSA
+    # allocates per-queue scratch outside it, e.g. for RCCL's spilling generic kernel.
+    SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

@@ -82,6 +82,8 @@ class TestMlaOnlyDraftBackends(CustomTestCase):
                 "get_platform",
                 return_value=SimpleNamespace(is_xpu=False),
             ),
+            # The CUDA fallback, also on a ROCm host.
+            patch.object(draft_worker_common.torch.version, "hip", None),
         ):
             return draft_worker_common.resolve_draft_worker_attention_backend(
                 algo_label=algo_label

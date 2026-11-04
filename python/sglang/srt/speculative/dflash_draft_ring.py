@@ -38,7 +38,11 @@ def draft_kv_ring_enabled() -> bool:
 
 
 def draft_kv_ring_unsupported_reason(
-    draft_hf_config, *, draft_backend: Optional[str], draft_window_size
+    draft_hf_config,
+    *,
+    draft_backend: Optional[str],
+    draft_window_size,
+    dcp_size: int = 1,
 ) -> Optional[str]:
     """Why a draft KV ring cannot serve this DFLASH draft, or None if it can."""
     from sglang.srt.speculative.dflash_utils import (
@@ -48,13 +52,17 @@ def draft_kv_ring_unsupported_reason(
     from sglang.srt.speculative.draft_worker_common import (
         DFLASH_MLA_ONLY_DRAFT_BACKENDS,
     )
+    from sglang.srt.utils import is_hip
 
     if not is_dflash_mla_draft_config(draft_hf_config):
         return "the draft is not MLA"
     layer_types = get_dflash_layer_types(draft_hf_config)
     if not layer_types or any(t != "sliding_attention" for t in layer_types):
         return f"not every draft layer is sliding_attention ({layer_types})"
-    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS and not (
+        # ROCm's triton draft backend reads the window by index under DCP
+        draft_backend == "triton" and dcp_size > 1 and is_hip()
+    ):
         return f"draft backend {draft_backend!r} has no window index path"
     if draft_window_size is not None:
         return "--speculative-draft-window-size keeps the compact draft table"

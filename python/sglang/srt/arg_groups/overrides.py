@@ -765,8 +765,6 @@ _KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
-    if get_platform().is_hip:
-        raise ValueError("Kimi-K3.1 DSA requires CUDA (FlashMLA / DeepGEMM).")
     if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
         raise ValueError(
             "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
@@ -779,6 +777,10 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 
 
 def _kimi_k31_dsa_backends(view: Any) -> dict:
+    if get_platform().is_hip:
+        from sglang.srt.models.kimi_k3_amd.dsa_backends import kimi_k31_dsa_backends_hip
+
+        return kimi_k31_dsa_backends_hip(view)
     fields = ("dsa_prefill_backend", "dsa_decode_backend")
     for field in fields:
         value = getattr(view, field)

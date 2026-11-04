@@ -492,6 +492,12 @@ def _validate_dcp_backend(
     # per-forward plan.
     if not kimi_k31:
         raise ValueError("DSA with --dcp-size > 1 is implemented for Kimi-K3.1 only.")
+    if _is_hip:
+        from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+            validate_dcp_backend_hip,
+        )
+
+        return validate_dcp_backend_hip(prefill_impl, decode_impl)
     if not use_fused_topk:
         raise ValueError("DSA with --dcp-size > 1 needs fused DSA top-k.")
     if not use_topk_v2:
@@ -891,9 +897,10 @@ class DeepseekSparseAttnBackend(
             max_rows = max(model_runner.max_running_requests, 1) * max(
                 self.speculative_num_draft_tokens or 1, 1
             )
-            init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            if not get_exec().features.enable_return_indexer_topk:
-                init_dcp_topk_merge(max_rows, self.dsa_index_topk)
+            if not _is_hip:  # both workspaces are NVLS multicast buffers
+                init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
+                if not get_exec().features.enable_return_indexer_topk:
+                    init_dcp_topk_merge(max_rows, self.dsa_index_topk)
 
         if _is_xpu:
             self.device_capability = (0, 0)
@@ -2642,6 +2649,15 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            # DCP target verify, like decode, returns this rank's partial.
+            if self.attn_dcp_size > 1 and forward_batch.forward_mode.is_target_verify():
+                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+                    forward_triton_dcp_partial,
+                )
+
+                return forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
+                )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
@@ -2992,6 +3008,14 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            if self.attn_dcp_size > 1:
+                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+                    forward_triton_dcp_partial,
+                )
+
+                return forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
+                )
             return self._forward_triton_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,

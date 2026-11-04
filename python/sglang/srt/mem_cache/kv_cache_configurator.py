@@ -3579,9 +3579,14 @@ def calculate_mla_kv_cache_dim(
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
-    if _is_hip and (
-        get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
-        or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+    # Kimi-K3.1 keeps the reference scaled layout; its Triton kernels dequantize it.
+    if (
+        _is_hip
+        and not is_kimi_k31(model_config.hf_config)
+        and (
+            get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
+            or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+        )
     ):
         return kv_cache_dim
 

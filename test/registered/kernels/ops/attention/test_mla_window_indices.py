@@ -13,9 +13,11 @@ from sglang.kernels.ops.attention.mla_window_indices import (
     mla_window_sparse_indices,
     mla_window_top_k,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: ROCm's Triton DFLASH draft verify under DCP reads these indices
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE = 64
 
@@ -58,7 +60,7 @@ def _reference(req_to_token, pool_idx, positions, q_len, window_left, dcp, rank,
 
 
 @pytest.mark.parametrize("dcp", [1, 8])
-@pytest.mark.parametrize("window_left", [4095, 127])
+@pytest.mark.parametrize("window_left", [4095, 1023, 255, 127])
 @pytest.mark.parametrize("with_v2p", [False, True])
 def test_window_indices(dcp, window_left, with_v2p):
     q_len = 8

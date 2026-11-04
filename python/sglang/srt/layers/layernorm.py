@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -49,6 +50,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -135,6 +137,8 @@ elif _is_hip:
         _has_vllm_rms_norm = False
 
 if _is_hip:
+    from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
+
     try:
         from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
@@ -1077,6 +1081,21 @@ class LayerNorm(BaseFusedOp):
             x = x.reshape(-1, self.hidden_size)
             return layer_norm(x, self.weight, self.bias, self.variance_epsilon).view(
                 orig_shape
+            )
+        elif (
+            _is_gfx95
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and self.dtype == torch.float32
+            and self.elementwise_affine
+        ):
+            # fp32 math in one launch instead of upcast + layer_norm + downcast: the
+            # fused norm without a gate is a LayerNorm.
+            return rms_norm_gated(
+                x=x,
+                weight=self.weight,
+                bias=self.bias if self.use_bias else None,
+                eps=self.variance_epsilon,
+                is_rms_norm=False,
             )
         else:
             return self.forward_native(x)

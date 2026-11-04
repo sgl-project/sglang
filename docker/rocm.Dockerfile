@@ -810,6 +810,19 @@ RUN cd sglang \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install $CONS -e "python[${all_extras}]"; \
        fi
 
+# Rust radix TreeCore, built in place against this image's ROCm torch (pyproject_other.toml builds
+# only the multimodal extension, and an isolated build would pull CUDA torch). As in the CUDA
+# image, SGLANG_RUST_BUILD_MODE=never then loads it on every rank with no Cargo probe at startup:
+# without it each rank probes Cargo, the ranks can mix Rust and Python TreeCores, and HiCache
+# write-back asserts once the host pool fills.
+RUN cd sglang/python \
+    && python -m pip --no-cache-dir install "setuptools-rust>=1.11" \
+    && sed -i -E 's/^rust-extensions = \["multimodal"\]$/rust-extensions = ["multimodal", "rust_tree_core"]/' pyproject.toml \
+    && SGLANG_BUILD_RUST_EXTS=rust_tree_core python setup.py build_rust --inplace \
+    && rm -rf ../rust/sglang-radix-tree/target \
+    && SGLANG_RUST_BUILD_MODE=never python -c "from sglang.srt.mem_cache.rust_tree_core import extension"
+ENV SGLANG_RUST_BUILD_MODE=never
+
 RUN python -m pip cache purge
 
 RUN case "${GPU_ARCH##*-}" in \
@@ -909,14 +922,21 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST} python setup.py install'
 
 # -----------------------
-# sgl-amd-mono (monokernel plugin; needs the sglang install above)
-RUN /bin/bash -lc 'set -euo pipefail; \
+# sgl-amd-mono (monokernel plugin; needs the sglang install above). A private
+# SGL_AMD_MONO_REPO clones with --secret id=github_token; the token is used for
+# the clone only and kept in no layer.
+RUN --mount=type=secret,id=github_token,required=false /bin/bash -lc 'set -euo pipefail; \
     [ "${ENABLE_SGL_AMD_MONO}" = "1" ] || { echo "[sgl-amd-mono] skip (ENABLE_SGL_AMD_MONO=${ENABLE_SGL_AMD_MONO})"; exit 0; }; \
     case "${GPU_ARCH}" in gfx950*) ;; *) echo "[sgl-amd-mono] skip (GPU_ARCH=${GPU_ARCH})"; exit 0 ;; esac; \
     python3 -m pip show sgl-amd-mono > /dev/null || { echo "[sgl-amd-mono] skip (this SGLang does not install it)"; exit 0; }; \
     commit="${SGL_AMD_MONO_COMMIT:-$(python3 -c "import json, importlib.metadata as md; print(json.loads(md.distribution(\"sgl-amd-mono\").read_text(\"direct_url.json\"))[\"vcs_info\"][\"commit_id\"])")}"; \
-    git clone "${SGL_AMD_MONO_REPO}" /sgl-workspace/sgl-amd-mono; \
+    repo="${SGL_AMD_MONO_REPO}"; \
+    if [ -s /run/secrets/github_token ]; then \
+      repo="https://x-access-token:$(cat /run/secrets/github_token)@${repo#https://}"; \
+    fi; \
+    git clone "${repo}" /sgl-workspace/sgl-amd-mono; \
     cd /sgl-workspace/sgl-amd-mono; \
+    git remote set-url origin "${SGL_AMD_MONO_REPO}"; \
     git checkout -f "${commit}"; \
     python3 -m pip install --no-cache-dir --no-deps -e .; \
     python3 -c "from importlib.metadata import entry_points; \

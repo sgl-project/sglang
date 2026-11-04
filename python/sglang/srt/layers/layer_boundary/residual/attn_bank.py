@@ -14,7 +14,7 @@
 """A residual read that aggregates a bank of snapshots of itself."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -100,6 +100,11 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # Whether a batch of this many tokens completes the attention output's sum
+    # onto this rank's 1/TP of the rows, reads the FFN input there and gathers
+    # it, leaving the written residual on the shard for an FFN that consumes
+    # it there (K3's row-sharded MoE tail on gfx950), or None.
+    ffn_row_shards: Optional[Callable[[int], bool]] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -274,15 +279,20 @@ class _FfnReadout(_BankReadout):
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state
+        fusions = state.ffn_input_fusions
+        if state.ffn_row_shards is not None:
+            from sglang.srt.layers.layer_boundary.residual import attn_bank_hip
+
+            fusions = (attn_bank_hip.row_sharded_ffn_read(state), *fusions)
         if not state.fuses_slice_collectives:
-            return state.ffn_input_fusions
+            return fusions
         reads = ReadoutFusion(
             SumGroup.ATTN_TP,
             state.reduce_scatter_and_read_ffn_input,
             scatters=True,
             reads=True,
         )
-        return (reads, *state.ffn_input_fusions)
+        return (reads, *fusions)
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         # The attention read of a write layer leaves the residual empty, so the
