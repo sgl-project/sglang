@@ -69,6 +69,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        speculative_step_id: Optional[int] = None,
     ):
         super().__init__(
             model_runner,
@@ -76,6 +77,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             kv_indptr_buf,
             q_indptr_decode_buf,
             backend="cute-dsl",
+            speculative_step_id=speculative_step_id,
         )
 
     # ------------------------------------------------------------------
@@ -306,6 +308,7 @@ class CuteDslMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
+                speculative_step_id=i,
             )
 
 
