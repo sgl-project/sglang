@@ -249,9 +249,14 @@ class TestTriPoolAssembly(CustomTestCase):
                     state_slots=SimpleNamespace(alloc=Mock(), free=Mock()),
                 )
                 params = SimpleNamespace(
+                    page_size=1,
                     mtp_draft_device_pools=(),
                     mtp_draft_mamba_pools=(),
                     token_to_kv_pool_allocator=composite,
+                    tp_cache_group=None,
+                    attn_cp_cache_group=None,
+                    attn_tp_cache_group=None,
+                    pp_cache_group=None,
                 )
                 memory = MagicMock(enable_unified_memory=unified, hicache_size=0)
                 host = MagicMock()
@@ -284,8 +289,6 @@ class TestTriPoolAssembly(CustomTestCase):
                         full_layer_mapping={0: 0},
                         swa_layer_mapping={1: 0},
                         start_layer=0,
-                        page_size=1,
-                        tp_group=None,
                         load_cache_event=None,
                         storage_backend=None,
                     )
