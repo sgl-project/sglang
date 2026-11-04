@@ -1047,15 +1047,17 @@ distinguishes those rounded probabilities from the FP32 denominator.
 | Numerical mode | Prerequisites and bounds | Softmax and probability rounding | Graph replay |
 | --- | --- | --- | --- |
 | Online (`online`) | All supported BF16/FP16 head dimensions; also the final guarded fallback. | Subtract the running maximum before scaling. Rescale FP32 accumulators as the maximum changes. PV uses input-dtype probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
-| First-tile fixed shift (`local_guarded`) | Selected D64/D128 pipeline tiles with at least three K/V tiles, and long FP16/D128 ping-pong. Every valid row must have `abs(first_max*a) <= 64`, a positive FP32 denominator below `1e30`, and output within the input dtype’s finite range. | Keep the first tile’s maximum, defer denominator reductions, and omit accumulator rescaling. PV uses input-dtype probabilities; the denominator sums unrounded FP32 probabilities. | Check every launch and replay. A failed workgroup recomputes all its keys using online softmax before returning. |
+| First-tile fixed shift (`local_guarded`) | Selected D64/D128 pipeline tiles with at least three K/V tiles, long FP16/D128 ping-pong, and long square BF16/D128 ping-pong on 96-CU devices. Every valid row must have `abs(first_max*a) <= 64`, a positive FP32 denominator below `1e30`, and output within the input dtype's finite range. | Keep the first tile's maximum, defer denominator reductions, and omit accumulator rescaling. PV uses input-dtype probabilities; the denominator sums unrounded FP32 probabilities. | Check every launch and replay. A failed workgroup recomputes all its keys using online softmax before returning. |
 | Persistent (`persistent`) | Contiguous BF16/D128, 257–512 K/V tokens, and a valid persistent launch. | Subtract one maximum across all cached keys before scaling. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
 | Norm-bounded fixed shift (inside `guarded`) | Every Q/K row has squared L2 norm at most `(32/a) * (1 - 1e-4)`. Every V magnitude is zero or in `[2^-32, 2^64]`. | Use `exp2(score*a - 32)`, with exponent arguments in `[-64, 0]`. PV and the FP32 denominator use the same rounded BF16 probabilities. | Clear and recompute Q/K/V guard flags on every replay. |
 | Element-bounded fused exponent (inside `guarded`) | The norm route is unavailable, but every Q/K magnitude is at most `sqrt(1024/(128*a)) * (1 - 1e-5)`. | Use an online maximum and a fused scaled subtraction. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | Recompute the guards on every replay; use online subtraction if this bound fails too. |
 
-Automatic `guarded` policy is limited to BF16/D128 ping-pong, both sequence
-lengths at least 65,536, K/V length below `2^31`, and the default scale
-`128**-0.5`. FP16/D128 ping-pong uses `local_guarded` under the same shape
-and scale conditions. It writes one retry flag per workgroup, then a separate
+Automatic guards require D128 ping-pong, both sequence lengths at least
+65,536, K/V length below `2^31`, and the default scale `128**-0.5`.
+FP16 uses `local_guarded` under these conditions. BF16 also uses
+`local_guarded` for square attention on devices with 96 CUs; other BF16
+shapes and CU counts retain `guarded`. The local path writes one retry flag
+per workgroup, then a separate
 kernel recomputes failed workgroups with online softmax; separating the retry
 keeps its register allocation out of the fast kernel. Every replay overwrites
 all flags. An explicit ping-pong launch uses online softmax without these
@@ -1104,7 +1106,10 @@ supported ROCm environment:
 ```bash
 python test/registered/amd/test_gluon_fa_policy.py
 python test/registered/amd/test_gluon_fa3_gfx1250.py
+python test/registered/amd/test_gluon_fa_dpx.py
 ```
+
+The DPX replay suite runs only on 96-CU gfx1250 devices; other configurations skip it.
 
 These tests do not require model weights or generation. On a shared development
 host, run them through the site's GPU lock wrapper.
