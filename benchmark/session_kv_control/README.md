@@ -164,3 +164,5 @@ summary 同时提供全部已完成恢复、验证通过、`prefetch_ready_befor
 最终执行快照、238 条场景、性能与限制见 [整合验收](results/2026-11-04/FINAL_ACCEPTANCE.md)。初始退化结果保留，容量修复后的实测单独列出。
 
 `mem_fraction_static=0.8` 的多会话、超 L2 工作集和 8/16 并发持续测试使用 [stress_bench.py](STRESS_BENCH.md)。该入口移除显式 KV token cap，并分别比较 L2 PIN 保留和 L3 异步预取，保留失败、压力请求成本与完整周期吞吐。
+
+强化的 `0.8` 实测见 [持续压力最终报告](results/2026-11-04-mem08/FINAL_ACCEPTANCE.zh-CN.md)：5,724 次正式生成，L1/L2 接近满载，扫描 8/16/32 并发；保留全部退化、容量退回和重算。该矩阵与原 0.45 单次恢复实验的负载不同。

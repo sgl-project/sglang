@@ -1,6 +1,6 @@
 # SGLang Session-Aware KV Cache Orchestrator 实现方案与实施计划
 
-日期：2026-11-04。状态：首轮 P0–P8 已实现并完成 TP=1 FULL/Mooncake 验收；执行快照为 `f65f0393c4`。P9 配置扩展保留为后续工作。测试通过后按功能提交。最终性能与限制见 `benchmark/session_kv_control/results/2026-11-04/FINAL_ACCEPTANCE.md`，阶段证据见 `PLAN-REVIEW-LOG.md`。
+日期：2026-11-04。状态：首轮 P0–P8 已实现；0.8 显存预算下的 TP=1 FULL/Mooncake 持续压力测试已完成。强化测试对照快照为 `f65f0393c4`，优化快照为 `ff764308fb`，含有界 native host read 流水与排队需求复用。P9 配置扩展保留为后续工作。功能测试通过后分别提交。当前实测与边界见 `benchmark/session_kv_control/results/2026-11-04-mem08/FINAL_ACCEPTANCE.zh-CN.md`；原 0.45 配置验收保留于 `benchmark/session_kv_control/results/2026-11-04/FINAL_ACCEPTANCE.md`，过程证据见 `PLAN-REVIEW-LOG.md`。
 
 目标是在保留 `rfc-kvc` 引擎控制实现的基础上，接入 Router 侧的 session 编排，完成 `PREFETCH`、`DEMOTE`、`PIN`、Mooncake 执行适配及结果反馈。主要验证场景是：应用等待工具期间，将已存在于 Mooncake 的上下文准备到另一个 Engine 的 L2，并在恢复推理时实际复用。
 
@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | C1 | 在现有 `rfc-kvc` 基础上修改，保留提交历史并合入上游基线 | 采用 merge 整合；本计划不要求重写已有提交 |
 | C2 | Mooncake 为主要存储后端，file 用于测试 | 真实功能验收必须覆盖 Mooncake；file 和 mock 用于可控测试 |
-| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 当前任务执行晚到请求与 native PREFETCH 的重复 I/O 优化；按本任务明确限制保持未提交、不推送，由 parent 审查和提交；未授权部署 |
+| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 执行实现和性能测试，按功能提交；委派产出由 parent 独立审查与验证后提交。当前授权未要求推送或部署 |
 
 ### 已采用的实施默认值 D1–D7
 
@@ -623,3 +623,11 @@ request metadata 的变更还涉及 [io_struct.py](/home/youwei/bzh/project/Toke
 | 后续依赖 | 未完成前不能宣布支持的能力 |
 
 当前进度：首轮 P0–P8 完成，功能提交至 `f65f0393c4`，后续提交记录最终文档与证据。CPU 154 tests/96 subtests、GPU 2 tests/2 subtests、Router unit 1114、proxy 241、Indexer 156、orchestrator 44、benchmark 16 均通过；可选或既有长耗时用例按报告说明跳过。共归档 238 条有效场景及独立保护验收。最终 8K host 压力配对的 TTFT 下降约 84%、完整前台周期下降约 16%，每组 N=3；短窗口 2K 周期未见正收益，并发场景存在后台吞吐代价。结果不推广到未测配置。运行入口、能力边界、失败记录和重算方式见 `benchmark/session_kv_control/results/2026-11-04/FINAL_ACCEPTANCE.md` 与 `sgl-router/KV_ORCHESTRATION.md`。
+
+## 0.8 显存预算持续压力补充验收
+
+GPU KV 自动扩至 B 346944 tokens、host 693952 tokens；natural 场景 L1/L2 分配占用约99.24%/99.75%。64×16K 工作集、8/16/32 并发、每组两次遍历与3轮配对，共5724次正式生成全部完成、8矩阵全部通过离线重算。保留旧1次预取失败和新4次容量DEFERRED，严格每次预取完成的矩阵为6/8；所有恢复输出跨条件一致。
+
+优化后相对同轮按需组：C8平均TTFT−48.0%、受控客户端工作吞吐+11.5%；C16平均TTFT−9.9%、吞吐−1.1%；C32平均TTFT−28.2%、吞吐+13.9%、p95+16.2%，包括4次容量退回。L2 natural热点TTFT−87.1%，全混合吞吐约持平。吞吐包含工具等待和控制收尾，仅排除实验初始flush，不是生产GPU容量指标。负结果、重算、资源成本与N=3限制见当前实测报告。
+
+原P5补充：不同salt并发nativehostreads有界为4，同salt/GPU目标维持串行/独占，查询阶段完整缺口预留；排队exacthostjob可共享普通需求，GPU屏障或整段host容量不足时保留DEFERRED/正常计算退回。受控两个scope读取次数3→2；CPU123项、工具41项、GPU/Mooncake2项测试通过。

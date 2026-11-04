@@ -4922,3 +4922,15 @@ root 阅读全部生产与测试差异并独立运行 transfers、cache、servic
 两种 L2 口径共 732 次真实生成均有效；完整 HTTP/SSE/control、schedule、manifest、scope/claim/tombstone、启动命令、分阶段测试与 2s 原始监控已压缩归档到 benchmark/session_kv_control/results/2026-11-04-mem08。保留压缩前索引与压缩后物理 SHA，root 对实际打包目录离线重算：2 cells 全部 verified/valid，732 原始调用与完成数一致。SHA256SUMS 全部通过。
 
 结果：natural 热点 TTFT 4552.012→586.192ms（约−87.1%）；仅排除实验 flush 后，全工作耗时 453.716/451.510s，总吞吐约+0.49%。demote 热点 3630.534→573.820ms（约−84.2%），工作耗时 421.662/422.218s，总吞吐约−0.13%。L1/L2 natural 采样分配占用约99.24%/99.75%；热点收益与整体吞吐区分，全部负差异及59.3s flush 干扰保留。N=3配对轮次，热点每组N=12，不能宣称稳定尾延迟或跨环境吞吐。L3长测尚在继续。
+
+## 0.8 显存预算强化长测完成
+
+正式执行时段 2026-11-04 08:07:53–10:24:54 UTC，约137分钟，含数据准备、实验重置和快照切换。5724次正式生成全部完成，93879792 input tokens（含缓存）、150060 output tokens；4656条相同输入恢复跨快照/负载输出一致。两个Engine均mem_fraction_static0.8，无max_total_tokens cap，B L1346944/L2693952，actualnatural分配占用约99.24%/99.75%；MooncakeTCP128GiB每Engine，64×16K工作集、C8/C16/C32，3轮配对、两次遍历。
+
+源码快照f65与ff764308fb独立保存。新C8对同轮按需组：平均TTFT−47.96%、work吞吐+11.47%、p95−28.31%；C16平均TTFT−9.94%、work吞吐−1.05%；C32平均TTFT−28.17%、work吞吐+13.92%、p95+16.18%。该工作吞吐包含3s工具等待、响应与控制收尾，仅排除初始实验flush；HTTP指标另列，不能冒充生产无等待GPU容量。跨快照按需基线自身也改变，存储历史/时段未隔离，不能把绝对加速全归因代码。L2热点−87.1%，混合吞吐约持平。
+
+原C32保留1条FAILED/incomplete_storage_read，普通请求日志先完整L3load随后准入范围丢失并重算；新C32保留4条DEFERRED/whole_scope_capacity，ready空，正常计算退回，全部输出一致。它们计入所有完成请求，不筛掉。严格每次PF成功矩阵为6/8，离线verified为8/8。Host驱逐仅处理evicted且无引用的host叶节点，GPU副本与在途引用可能限制L2可回收空间；本轮保持该语义，不以驱逐GPU热数据换取所有PF成功。
+
+CPU123测试/96子测试、工具41测试、真实GPU/file/Mooncake2测试/2子测试通过。实际CPU file-store前后独立重放3query/3GET→2/2，span相同。0.8实际GPU证明在旧矩阵完成且队列为空后执行；优化runtime正确性通过后启动。结束捕获idle/caps/serverinfo，停止且核实本任务Engine/Master及采样器；端口51801/51803/52091/52092/52093无监听，GPU0/1回到130/78MiB，GPU2/3未操作。
+
+归档共8正式矩阵与启动观察、4570条完整2s监控，以9个gzip parts无损重建原SHA；各cell保留原始与压缩后checksum，CPU进程树计数、全部命令/环境/源hash/正确性日志、静态PNG/SVG/CSV均保存。verify_acceptance.py实际通过：所有文件hash、5724调用、4656输出、已知1+4未完成控制及4570采样无损重建。32并发p95回退、CPU成本、N3与合成轨迹/单机TCP限制写入最终报告。性能原始数据与限制见 benchmark/session_kv_control/results/2026-11-04-mem08/FINAL_ACCEPTANCE.zh-CN.md。按授权分功能提交，未推送。

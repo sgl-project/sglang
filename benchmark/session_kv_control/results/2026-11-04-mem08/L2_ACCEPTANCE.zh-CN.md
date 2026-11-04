@@ -36,7 +36,7 @@ natural 每轮 PIN 减按需的工作时长差为 +1.25s、−7.88s、+4.43s；d
 
 ## 证据与重算
 
-两个子目录保留 schedule、manifest、每组完整记录、raw HTTP/SSE/control JSONL、原始未压缩 checksum 索引及压缩后的物理文件 checksum 索引。`provenance` 保存实际启动参数、执行命令和测试日志。本阶段 `resources.jsonl.gz` 是两种 L2 实验时段的原始监控记录截取，截取边界与 SHA-256 在 `provenance/l2-resource-capture.json`。后续总报告会补充完整长测监控。
+两个子目录保留 schedule、manifest、每组完整记录、raw HTTP/SSE/control JSONL、原始未压缩 checksum 索引及压缩后的物理文件 checksum 索引。`provenance` 保存实际启动参数、执行命令和测试日志。`provenance/resources-l2-clipped.jsonl.gz` 是首次 L2 阶段的原始监控记录截取，截取边界与 SHA-256 在 `provenance/l2-resource-capture.json`。完整长测监控已经通过根目录 resources-index.json 分片归档。
 
 ```sh
 .venv/bin/python benchmark/session_kv_control/analyze_stress.py \
