@@ -9,7 +9,7 @@ from sglang.srt.state_capturer.indexer_topk import (
     extract_indexer_topk_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=253, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(est_time=375, stage="extra-b", runner_config="large-8-gpu-amd")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 

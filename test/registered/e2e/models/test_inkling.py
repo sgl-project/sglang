@@ -19,7 +19,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.cache_consistency_jitter import get_jitter_engine, run_jitter_test
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Aliased so pytest does not collect the imported `test_`-prefixed helper as a test.
 from sglang.test.kl_test_utils import (
@@ -33,6 +33,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=146, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=227, stage="stage-b", runner_config="1-gpu-large-amd")
 
 # Defaults to the HF `test` revision; override MODEL/REVISION to point at a
 # local checkpoint. Empty REVISION drops the flag (for local paths).

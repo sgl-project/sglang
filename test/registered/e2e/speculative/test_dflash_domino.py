@@ -5,7 +5,7 @@ from tempfile import NamedTemporaryFile
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=180, stage="stage-b", runner_config="2-gpu-large-amd")
 
 
 class TestDFlashDominoFullVocab(CustomTestCase):

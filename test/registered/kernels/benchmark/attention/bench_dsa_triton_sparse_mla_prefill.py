@@ -16,7 +16,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
     sparse_mla_prefill,
 )
 from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
 try:
@@ -45,6 +45,7 @@ HAS_FLASHMLA = _flashmla_runnable()
 register_cuda_ci(
     est_time=90, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=135, stage="jit-kernel-benchmark", runner_config="amd")
 
 IS_CI = is_in_ci()
 D_QK, D_V, SM_SCALE = 576, 512, 0.0625

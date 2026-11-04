@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicac
 from sglang.srt.mem_cache.kv.alloc.pricing import ends_compaction_allowed
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     chain_snapshot,
@@ -22,6 +22,7 @@ from sglang.test.unified_allocator_fixtures import (
 )
 
 register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 class TestHiCacheIndexDomains(unittest.TestCase):

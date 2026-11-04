@@ -4,12 +4,13 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.elementwise.window_unpartition_add import (
     window_unpartition_add,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.sam import make_windows, window_unpartition_add_reference
 
 register_cuda_ci(
     est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=12, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 @marker.parametrize("batch", [1, 2, 4, 8], [1, 8])

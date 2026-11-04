@@ -15,13 +15,14 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     PADDED_SCALE_PER_TOKEN,
     dequantize_k_cache_paged_dsv4,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4.k_cache_reference import (
     dequantize_k_cache_paged_ref,
 )
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
 
 # (num_tokens, page_size): tails of 0/1/3 modulo the kernel's 4 tokens per
 # program, both cache page sizes the pool uses, and a many-page gather.

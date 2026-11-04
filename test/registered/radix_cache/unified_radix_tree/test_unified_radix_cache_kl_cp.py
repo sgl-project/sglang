@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.test_utils import (
@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=224, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(est_time=339, stage="extra-b", runner_config="4-gpu-amd")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 

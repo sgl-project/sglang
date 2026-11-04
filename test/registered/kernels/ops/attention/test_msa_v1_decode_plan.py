@@ -8,10 +8,11 @@ from sglang.kernels.ops.attention.msa_v1.decode_plan import update_msa_v1_decode
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
     build_msa_v1_page_table,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=23, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE = 128
 # Queries per MSA-v1 decode indexer launch.

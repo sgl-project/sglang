@@ -21,10 +21,11 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=18, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 class TestBuildFusedAcceptIndices(CustomTestCase):

@@ -31,11 +31,12 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=200, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=180, stage="nightly", runner_config="1-gpu-large")
+register_amd_ci(est_time=480, stage="jit-kernel-unit", runner_config="amd")
 
 G = 128
 FMAX = float(fp8_max)  # 448 for e4m3

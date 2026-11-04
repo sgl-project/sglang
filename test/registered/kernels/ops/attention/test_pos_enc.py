@@ -8,9 +8,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.rope import rotary_embedding
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=27, stage="jit-kernel-unit", runner_config="amd")
 
 
 @triton.jit

@@ -9,10 +9,11 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import quantize_fp4_indexer_ref
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2

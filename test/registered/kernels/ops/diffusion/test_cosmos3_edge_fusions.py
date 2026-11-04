@@ -15,10 +15,11 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     _apply_qwen3_qk_norm_rope_pack_kv,
     _apply_qwen3_qk_norm_rope_split,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 @pytest.mark.parametrize(

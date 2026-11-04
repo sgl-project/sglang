@@ -2,9 +2,10 @@ import unittest
 
 import test_unified_radix_cache_kl_dsv4 as dsv4_kl
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=471, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(est_time=714, stage="extra-b", runner_config="large-8-gpu-amd")
 
 
 class TestUnifiedDeepSeekV4FlashHiCachePP4TP2(

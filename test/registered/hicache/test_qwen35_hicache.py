@@ -9,7 +9,7 @@ import zmq
 from msgspec.msgpack import Decoder
 
 from sglang.srt.disaggregation.kv_events import BlockStored, KVEventBatch
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
@@ -23,6 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=306, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(est_time=470, stage="extra-b", runner_config="4-gpu-amd")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}

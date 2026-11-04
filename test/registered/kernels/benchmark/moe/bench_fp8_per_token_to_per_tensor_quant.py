@@ -14,11 +14,12 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     _fp8_per_token_quant_to_per_tensor_quant_kernel,
     fp8_per_token_to_per_tensor_quant_triton,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=45, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=68, stage="jit-kernel-benchmark", runner_config="amd")
 
 FP8 = torch.float8_e4m3fn
 K_SCALE_BLOCK_SIZE = 128

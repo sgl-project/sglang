@@ -9,7 +9,7 @@ silently alter what this exercises.
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
@@ -21,6 +21,7 @@ from sglang.test.kits.spec_server_kits import (
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=392, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=602, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _KITS = (
     SpecCorrectnessKit,

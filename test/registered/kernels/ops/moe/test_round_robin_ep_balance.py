@@ -14,9 +14,10 @@ from sglang.srt.layers.moe.topk import (
     select_experts,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 NUM_EXPERTS = 256
 TOPK = 8

@@ -4,7 +4,7 @@ MTP's verify widths never exercise the QSA sparse-decode path."""
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=706, stage="extra-b", runner_config="4-gpu-b200")
+register_amd_ci(est_time=1059, stage="extra-b", runner_config="4-gpu-amd")
 
 MODEL = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 

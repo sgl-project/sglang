@@ -18,7 +18,7 @@ import requests
 from sglang.srt.observability.mooncake_trace import MooncakeRequestStage
 from sglang.srt.observability.req_time_stats import RequestStage
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.otel_collector import LightweightOtlpCollector
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.test_utils import (
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 # CI registration - PD disaggregation requires 2 GPUs
 register_cuda_ci(est_time=69, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=105, stage="stage-b", runner_config="2-gpu-large-amd")
 
 
 class TestTraceDisaggregation(CustomTestCase):

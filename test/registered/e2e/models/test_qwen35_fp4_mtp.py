@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=670, stage="extra-b", runner_config="4-gpu-b200")
+register_amd_ci(est_time=1005, stage="extra-b", runner_config="4-gpu-amd")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-122B-A10B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}

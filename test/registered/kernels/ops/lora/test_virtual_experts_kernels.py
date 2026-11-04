@@ -16,13 +16,14 @@ from itertools import product
 import torch
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: XPU runs the torch.compile align fallback in production and
 # builds the Triton topk remap with its own backend.
 register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
+register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _require_accelerator_device():

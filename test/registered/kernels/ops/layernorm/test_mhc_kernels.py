@@ -6,9 +6,10 @@ import torch
 
 import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=24, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 @pytest.fixture

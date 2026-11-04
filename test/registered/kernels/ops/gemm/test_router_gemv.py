@@ -12,9 +12,10 @@ from sglang.kernels.ops.gemm.router_gemv import (
     router_gemv_supported,
 )
 from sglang.kernels.ops.quantization.bf16x3_split import split_fp32_to_bf16x3
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,

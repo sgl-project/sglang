@@ -12,7 +12,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
@@ -25,6 +25,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=430, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=645, stage="extra-a", runner_config="1-gpu-large-amd")
 
 PROMPTS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many "

@@ -32,7 +32,7 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_marlin_utils import (
     make_mxfp4_weight_and_ref,
     make_nvfp4_weight_and_ref,
@@ -41,6 +41,7 @@ from sglang.test.test_marlin_utils import (
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=720, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=1163, stage="jit-kernel-unit", runner_config="amd")
 
 requires_fp4_marlin = pytest.mark.skipif(
     not (

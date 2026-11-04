@@ -22,7 +22,7 @@ gpt-oss is too noisy to (single-server unified and static both score 0.570 at
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.pd_parity_kit import PDLogprobParityMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -30,6 +30,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
 register_cuda_ci(est_time=109, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=158, stage="extra-a", runner_config="2-gpu-large-amd")
 
 UNIFIED_SWA_ARGS = [
     "--skip-tokenizer-init",

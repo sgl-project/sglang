@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     float_end_certificate,
     float_high_target,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import chain_snapshot, float_chain
 from sglang.test.unified_allocator_trace import (
@@ -43,6 +43,7 @@ from sglang.test.unified_allocator_trace import (
 )
 
 register_cuda_ci(est_time=40, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=41, stage="extra-a", runner_config="1-gpu-small-amd")
 
 _SEEDS = (0, 1, 2, 3)
 _STEPS = 60

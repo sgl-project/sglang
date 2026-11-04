@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=545, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(est_time=957, stage="extra-b", runner_config="large-8-gpu-amd")
 
 
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):

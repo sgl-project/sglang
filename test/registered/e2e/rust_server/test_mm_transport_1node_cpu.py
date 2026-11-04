@@ -7,12 +7,13 @@ default transport, which is the layout every 1-GPU VLM deployment runs.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.rust_mm_transport_fixture import (
     RustMmTransportServerBase,
 )
 
 register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=83, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 class TestRustMmTransport1NodeCpu(RustMmTransportServerBase):

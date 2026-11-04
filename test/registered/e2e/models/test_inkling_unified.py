@@ -32,7 +32,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Aliased so pytest does not collect the imported `test_`-prefixed helper.
 from sglang.test.kl_test_utils import (
@@ -46,6 +46,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=200, stage="stage-b", runner_config="1-gpu-large-amd")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

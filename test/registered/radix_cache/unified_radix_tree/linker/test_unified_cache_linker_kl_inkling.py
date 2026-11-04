@@ -4,7 +4,7 @@ prefill and decode score identically, so any nonzero KL is a wrong restored stat
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import _random_suffixes
 from sglang.test.kl_multiturn_utils import (
     _extract_output_logprobs,
@@ -29,6 +29,7 @@ register_cuda_ci(
     # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
     runner_config="4-gpu-h100",
 )
+register_amd_ci(est_time=165, stage="extra-b", runner_config="4-gpu-amd")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

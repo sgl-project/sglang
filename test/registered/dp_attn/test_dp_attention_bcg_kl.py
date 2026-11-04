@@ -12,7 +12,7 @@ import numpy as np
 import requests
 
 from sglang.srt.utils import get_device_capability, is_blackwell, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kl_test_utils import (
     _extract_output_logprobs,
     _flush_cache,
@@ -29,6 +29,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=186, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=279, stage="extra-a", runner_config="2-gpu-large-amd")
 
 PREFILL_GRAPH_REPLAY_PATTERN = re.compile(r"Prefill batch.*cuda graph: True")
 CACHED_PREFIX_GRAPH_REPLAY_PATTERN = re.compile(

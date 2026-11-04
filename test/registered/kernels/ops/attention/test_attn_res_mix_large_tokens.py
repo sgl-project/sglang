@@ -7,10 +7,11 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attn_residual import _mix_fused
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
 
 _H, _NB, _NVB = 7168, 8, 7
 _T = 2**31 // (_NB * _H) + 2  # 37,451: the first row count whose offset overflows

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.test_utils import (
@@ -22,6 +22,7 @@ register_cuda_ci(
     stage="base-c",
     runner_config="4-gpu-h100",
 )
+register_amd_ci(est_time=284, stage="stage-c", runner_config="4-gpu-amd")
 
 ib_devices = get_rdma_devices_args()
 

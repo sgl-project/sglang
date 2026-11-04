@@ -10,11 +10,12 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
 register_cuda_ci(est_time=199, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=299, stage="extra-a", runner_config="1-gpu-large-amd")
 
 _UNIFIED_COMMON_ARGS = [
     "--enable-unified-memory",

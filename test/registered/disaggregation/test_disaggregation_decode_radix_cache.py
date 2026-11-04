@@ -10,7 +10,7 @@ import requests
 
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.cache_hit_kit import (
     async_request_sglang_generate,
     gen_payload,
@@ -28,6 +28,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=155, stage="extra-b", runner_config="8-gpu-h20")
+register_amd_ci(est_time=233, stage="extra-b", runner_config="large-8-gpu-amd")
 
 
 def _has_mooncake():

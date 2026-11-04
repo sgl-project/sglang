@@ -6,7 +6,7 @@ mixed-chunk retract variant lives in test_streaming_session_swa_extra.py.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.streaming_session_kit import (
     AbortLeakReproKitMixin,
     StreamingSessionKitMixin,
@@ -21,6 +21,7 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
 )
 
 register_cuda_ci(est_time=329, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=485, stage="extra-a", runner_config="1-gpu-large-amd")
 
 
 class TestStreamingSessionSWA(StreamingSessionServerBase, StreamingSessionKitMixin):

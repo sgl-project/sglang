@@ -16,7 +16,7 @@ import time
 import unittest
 from urllib import error, request
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,6 +29,7 @@ from sglang.test.test_utils import (
 from sglang.utils import wait_for_http_ready
 
 register_cuda_ci(est_time=226, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=339, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):

@@ -8,10 +8,11 @@ from sglang.kernels.ops.moe.paged_experts import (
     paged_experts_gather,
     paged_experts_host_device_pointer,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
 
 E, K = 64, 16
 

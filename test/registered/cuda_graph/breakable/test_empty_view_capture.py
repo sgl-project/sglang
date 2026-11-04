@@ -12,10 +12,11 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
     _weak_ref_if_tensor,
     eager_on_graph,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=21, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class TestEmptyViewCapture(CustomTestCase):

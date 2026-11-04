@@ -16,7 +16,7 @@ import requests
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,6 +26,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=59, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=78, stage="stage-b", runner_config="1-gpu-large-amd")
 
 IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"

@@ -15,10 +15,11 @@ from concurrent.futures import ThreadPoolExecutor
 import openai
 from PIL import Image, ImageDraw, ImageFont
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.vlm_utils import TestOpenAIMLLMServerBase
 
 register_cuda_ci(est_time=68, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=102, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 class TestPaddleOCRVLServer(TestOpenAIMLLMServerBase):

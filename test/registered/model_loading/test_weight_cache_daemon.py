@@ -10,7 +10,7 @@ import torch
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -31,6 +31,7 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # visible (i.e. on the 1-gpu runner).
 register_cuda_ci(est_time=390, stage="extra-a", runner_config="2-gpu-large")
 register_cuda_ci(est_time=71, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=110, stage="stage-b", runner_config="1-gpu-small-amd")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).

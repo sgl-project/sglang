@@ -30,9 +30,10 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformerBlo
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _require_sm90() -> None:

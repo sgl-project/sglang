@@ -44,7 +44,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
@@ -54,6 +54,7 @@ register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 # device="cuda" on a CPU box does not reach them, so a leak confined to a GPU
 # handler would never fail the CPU registration alone.
 register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=36, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _MINI_CONFIG = {
     "architectures": ["LlamaForCausalLM"],

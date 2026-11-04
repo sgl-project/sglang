@@ -33,11 +33,12 @@ from sglang.srt.speculative import (
 from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
 from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=26, stage="stage-b", runner_config="1-gpu-small-amd")
 
 TOKENS = 7
 VOCAB = 257

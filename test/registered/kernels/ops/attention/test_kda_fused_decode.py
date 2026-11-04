@@ -18,9 +18,10 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 _HEAD_DIM = 128
 _CONV_STATE_W = 3

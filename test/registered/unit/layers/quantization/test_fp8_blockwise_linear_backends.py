@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.utils import get_device_sm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.layer_ut_utils import (
     assert_output_close,
     init_single_process_dist,
@@ -30,6 +30,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=139, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 register_cuda_ci(est_time=141, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=80, stage="stage-b", runner_config="1-gpu-large-amd")
 
 FP8_MAX = 448.0
 

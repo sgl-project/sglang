@@ -12,9 +12,10 @@ from sglang.srt.lora.lora_moe_runners import (
     _naive_moe_lora_align_block_size,
 )
 from sglang.srt.utils import get_device, is_xpu, set_random_seed
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=26, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=39, stage="jit-kernel-unit", runner_config="amd")
 
 # lora_moe_runners launches both the gate/up and the down delta with
 # BLOCK_SIZE_M 64 (also the align block size), shrink BLOCK_SIZE_K and expand

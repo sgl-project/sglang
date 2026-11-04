@@ -16,9 +16,10 @@ from sglang.srt.lora.backend.triton_v2_backend import TritonV2LoRABackend  # noq
 from sglang.srt.lora.dense.plan import DenseLoraKind  # noqa: E402
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import reset_context  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=38, stage="jit-kernel-unit", runner_config="amd")
 
 
 pytestmark = pytest.mark.skipif(

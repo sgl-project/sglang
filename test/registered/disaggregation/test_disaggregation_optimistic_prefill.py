@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -49,6 +49,7 @@ from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=310, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=465, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 FORCE_RETRY_PROB = 0.1

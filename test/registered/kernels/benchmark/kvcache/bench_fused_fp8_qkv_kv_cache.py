@@ -2,11 +2,12 @@ import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=10, stage="jit-kernel-benchmark", runner_config="amd")
 
 FP8 = torch.float8_e4m3fn
 D = 128

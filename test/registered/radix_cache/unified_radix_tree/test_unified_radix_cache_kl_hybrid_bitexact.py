@@ -53,7 +53,7 @@ import unittest
 import requests
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     _extract_output_logprobs,
     _flush_cache,
@@ -86,6 +86,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=837, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=1392, stage="extra-a", runner_config="1-gpu-large-amd")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

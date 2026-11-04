@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.mooncake_utils import MooncakeTestServices
@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(est_time=1341, stage="extra-b", runner_config="large-8-gpu-amd")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 LAUNCH_TIMEOUT = 3600

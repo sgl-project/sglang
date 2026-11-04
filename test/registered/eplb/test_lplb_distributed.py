@@ -37,10 +37,11 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=23, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=35, stage="stage-b", runner_config="2-gpu-large-amd")
 
 NUM_GPUS = 2
 TOPK = 2

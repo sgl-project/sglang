@@ -26,10 +26,11 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=91, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=144, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _SEQCLS_MODEL = os.environ.get(
     "TEST_CLASSIFICATION_BASE_MODEL",

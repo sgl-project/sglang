@@ -3,9 +3,10 @@ Usage:
 python3 -m unittest test_pp_with_hicache.TestPPWithHiCache.test_eval_accuracy
 """
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=143, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(est_time=215, stage="extra-b", runner_config="4-gpu-amd")
 
 import os
 import subprocess

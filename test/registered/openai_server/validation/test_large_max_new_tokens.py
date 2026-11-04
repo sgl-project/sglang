@@ -11,10 +11,7 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers import get_tokenizer
-from sglang.test.ci.ci_register import (
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -27,6 +24,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=70, stage="base-b", runner_config="1-gpu-large")
 register_cpu_ci(est_time=101, suite="stage-b-test-cpu-intel")
+register_amd_ci(est_time=108, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 class TestLargeMaxNewTokens(CustomTestCase):

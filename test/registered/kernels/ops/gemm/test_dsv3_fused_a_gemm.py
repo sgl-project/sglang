@@ -9,9 +9,10 @@ import torch.nn.functional as F
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import dsv3_fused_a_gemm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
 
 # hd_in must be a multiple of 256; 2048/6144/7168 cover the real fused-A shapes
 # (2048 is q_b_proj TP4/TP8, 6144/7168 are qkv_a).

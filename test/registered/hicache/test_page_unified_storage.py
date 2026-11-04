@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kl_test_utils import compare_kl_divergence
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -30,6 +30,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=360, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(est_time=332, stage="extra-b", runner_config="4-gpu-amd")
 
 
 class TestPageUnifiedStorage(CustomTestCase):

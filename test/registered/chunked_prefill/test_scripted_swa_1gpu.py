@@ -1,11 +1,12 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import base_engine_kwargs
 
 register_cuda_ci(est_time=260, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=420, stage="extra-a", runner_config="1-gpu-large-amd")
 
 
 _SWA_MODEL = "openai/gpt-oss-20b"

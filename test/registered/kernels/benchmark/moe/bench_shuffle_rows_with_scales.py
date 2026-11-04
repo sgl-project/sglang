@@ -8,11 +8,12 @@ from sglang.kernels.jit.benchmark.utils import (
     run_benchmark,
 )
 from sglang.kernels.ops.moe.shuffle_rows_with_scales import shuffle_rows_with_scales
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=23, stage="jit-kernel-benchmark", runner_config="amd")
 
 GROUP_SIZE = 128
 

@@ -10,13 +10,14 @@ import pytest
 import torch
 
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Also exercise the Blackwell implementation in per-PR CI.
 # The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
 # its four GPUs are allocation granularity, not multi-GPU coverage.
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=120, stage="jit-kernel-unit", runner_config="amd")
 
 _E = 4
 _H = 512

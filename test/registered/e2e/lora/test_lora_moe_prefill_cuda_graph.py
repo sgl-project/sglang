@@ -19,7 +19,7 @@ The remaining backend/graph matrix is in test_lora_moe_prefill_cuda_graph_extra.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.lora_prefill_graph_kit import (
     EAGER_REFERENCE,
     run_prefill_graph_matrix,
@@ -27,6 +27,7 @@ from sglang.test.kits.lora_prefill_graph_kit import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=155, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=233, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 class TestMoELoRAPrefillCudaGraph(CustomTestCase):

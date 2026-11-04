@@ -22,13 +22,14 @@ from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import _declared_default
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
 )
 
 register_cuda_ci(est_time=137, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=209, stage="stage-b", runner_config="1-gpu-small-amd")
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(

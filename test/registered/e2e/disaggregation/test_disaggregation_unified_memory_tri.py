@@ -26,13 +26,14 @@ dropped or misaddressed component moves logprobs immediately.
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.pd_parity_kit import PDLogprobParityMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
 register_cuda_ci(est_time=105, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=162, stage="extra-a", runner_config="2-gpu-large-amd")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

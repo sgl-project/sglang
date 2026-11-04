@@ -6,7 +6,7 @@ import unittest
 from sglang.srt.kv_canary.canary_info.checker import CANARY_INFO_MISMATCH_CODE
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.detokenizer_swap import DetokenizerSwapRecord
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.canary_info_e2e_base import (
     CanaryInfoE2EBase,
     DetokenizerSwapE2EBase,
@@ -14,6 +14,7 @@ from sglang.test.kv_canary.canary_info_e2e_base import (
 )
 
 register_cuda_ci(est_time=520, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=315, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 class TestCanaryInfoPassthroughEagle(CanaryInfoE2EBase):

@@ -10,10 +10,11 @@ import torch.nn.functional as F
 import sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt as wan
 from sglang.kernels.ops.diffusion import wan_norm_silu_post
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=68, stage="jit-kernel-unit", runner_config="amd")
 
 
 def reference(x, gamma, bias, scale):

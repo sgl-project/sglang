@@ -8,9 +8,10 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     _get_b_tma_desc_cached,
     clear_b_tma_desc_cache,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

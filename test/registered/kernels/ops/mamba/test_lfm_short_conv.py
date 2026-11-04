@@ -14,10 +14,11 @@ from sglang.kernels.ops.mamba.lfm_short_conv import (
     fused_lfm_short_conv_decode,
     fused_lfm_short_conv_prefill,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=23, stage="jit-kernel-unit", runner_config="amd")
 
 PAD_SLOT_ID = -1
 requires_sm90 = unittest.skipUnless(

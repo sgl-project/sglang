@@ -16,11 +16,12 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device, get_device_count
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=34, stage="base-b", runner_config="2-gpu-large")
 register_xpu_ci(est_time=60, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_amd_ci(est_time=50, stage="stage-b", runner_config="2-gpu-large-amd")
 
 NUM_GPUS = 2
 

@@ -3,10 +3,11 @@ import unittest
 import torch
 
 from sglang.srt.models.iquest_q1 import _apply_learned_sink
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=90, stage="jit-kernel-unit", runner_config="amd")
 
 
 def torch_reference(query, sink_key, attn_output, lse, scale):
