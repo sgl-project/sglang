@@ -19,7 +19,6 @@ from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     pack_latents_2x2,
     shard_rotary_emb_for_sp,
 )
@@ -27,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
