@@ -939,11 +939,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _get_indexer_slot(self, layer_id: int) -> int:
         return self.indexer_layer_id_to_slot[layer_id]
 
-    def get_index_k_scale_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
-
     def get_index_k_with_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
