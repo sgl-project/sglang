@@ -3078,10 +3078,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         there. The old slot is freed after the forward in
         mamba_lazy_post_decode_at_boundary.
 
-        A req that cannot get the second slot, even after evicting cached
-        states, skips this boundary: its bit is cleared in the returned
-        track mask, so the forward writes no track state and the keep slot
-        still holds the checkpoint at mamba_last_track_seqlen.
+        A req that still gets no slot after eviction has its bit cleared in the
+        returned track mask: no track state is written, and the keep slot keeps
+        the checkpoint at mamba_last_track_seqlen.
         """
         track_mask_cpu = track_mask_cpu.clone()
         rows = []

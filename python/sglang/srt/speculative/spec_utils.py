@@ -1174,8 +1174,7 @@ def mask_rows_without_track_slot(
     mamba_track_indices: torch.Tensor, mamba_steps_to_track: torch.Tensor
 ) -> torch.Tensor:
     """A row with no track destination (-1: freed, or a lazy crossing that got
-    no slot) commits no snapshot even when it crosses, so a backend never sees
-    a crossing with nowhere to write."""
+    no slot) commits no snapshot even when it crosses."""
     return torch.where(
         mamba_track_indices >= 0,
         mamba_steps_to_track,

@@ -289,9 +289,8 @@ def alloc_tracking_slots(
 ) -> list[bool]:
     """Give each (req, position) candidate a lazy tracking slot; one bool each.
 
-    A shortfall evicts cached states from the tree once (locked nodes are never
-    evicted); a candidate that still gets no slot is False, and its boundary
-    writes no snapshot.
+    A shortfall evicts cached states from the tree once; a candidate that still
+    gets no slot is False, and its boundary writes no snapshot.
     """
     if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
         return [False] * len(candidates)

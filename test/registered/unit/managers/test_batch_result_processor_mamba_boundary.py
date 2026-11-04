@@ -256,9 +256,8 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
 
 
 class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
-    """A lazy boundary first evicts one cached state for its second tracking
-    slot; if it still gets none it skips its snapshot: nothing writes the keep
-    slot, which still holds mamba_last_track_seqlen."""
+    """A lazy boundary evicts for its second slot first; if it still gets none
+    it skips its snapshot and the keep slot is never written."""
 
     @staticmethod
     def _make_lazy_batch(took: bool) -> tuple[Req, ScheduleBatch]:
@@ -280,26 +279,30 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         )
         return req, batch
 
+    @staticmethod
+    def _prepare_decode(batch: ScheduleBatch) -> None:
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer_lazy",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=torch.tensor([3], dtype=torch.int64),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+            ),
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+        ):
+            batch.prepare_for_decode()
+
     def test_decode_boundary_clears_its_track_mask_bit(self):
         for took in (True, False):
             with self.subTest(took=took):
                 req, batch = self._make_lazy_batch(took)
-                with (
-                    get_context().override_server_args(
-                        mamba_radix_cache_strategy="extra_buffer_lazy",
-                        mamba_track_interval=TRACK_INTERVAL,
-                        _mamba_cache_chunk_size=TRACK_INTERVAL,
-                    ),
-                    patch(
-                        "sglang.srt.managers.schedule_batch.alloc_for_decode",
-                        return_value=torch.tensor([3], dtype=torch.int64),
-                    ),
-                    patch(
-                        "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
-                    ),
-                    patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
-                ):
-                    batch.prepare_for_decode()
+                self._prepare_decode(batch)
                 self.assertEqual(batch.mamba_track_mask_cpu, [took])
                 self.assertEqual(batch.mamba_track_mask.tolist(), [took])
                 self.assertEqual(req.kv.mamba_next_track_idx, 1 if took else 0)
@@ -343,22 +346,7 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                     batch.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
                     self.assertEqual(batch.mamba_lazy_spec_track_positions_cpu, [1])
                 else:
-                    with (
-                        get_context().override_server_args(
-                            mamba_radix_cache_strategy="extra_buffer_lazy",
-                            mamba_track_interval=TRACK_INTERVAL,
-                            _mamba_cache_chunk_size=TRACK_INTERVAL,
-                        ),
-                        patch(
-                            "sglang.srt.managers.schedule_batch.alloc_for_decode",
-                            return_value=torch.tensor([3], dtype=torch.int64),
-                        ),
-                        patch(
-                            "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
-                        ),
-                        patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
-                    ):
-                        batch.prepare_for_decode()
+                    self._prepare_decode(batch)
                     self.assertEqual(batch.mamba_track_mask_cpu, [True])
                     self.assertEqual(req.kv.mamba_next_track_idx, 1)
                 self.assertEqual(evicted, [1])
