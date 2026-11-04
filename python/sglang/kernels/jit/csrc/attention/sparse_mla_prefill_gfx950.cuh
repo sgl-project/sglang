@@ -7,6 +7,10 @@
 // QK runs as S^T = K Q^T and PV as O^T = V^T P^T so that every lane owns one head
 // (lane % 16): softmax stats, P and the output accumulator never change lanes.
 // fp8 converts are exact (unit scale); group scales go onto the QK partial and onto P.
+//
+// kSplit (decode / verify batches too small to fill the GPU one row per CTA): grid.y CTAs share
+// a row, each over a contiguous range of its key tiles, and leave the unnormalized output, the
+// running max and the row sum in fp32 for sparse_mla_split_combine_kernel.
 #pragma once
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
@@ -52,6 +56,11 @@ struct Params {
   int topk;
   float qk_scale;  // sm_scale * log2(e)
   int store_lse;
+  // kSplit: [T, splits, H, 512] fp32 partial outputs and [T, splits, H] fp32 (max, sum), log2
+  float* part_acc;
+  float* part_m;
+  float* part_l;
+  int tiles_per_split;
 };
 
 SGL_DEVICE bf16x8 cvt_fp8x8(intx2 v) {
@@ -96,8 +105,9 @@ SGL_DEVICE float xsum16(float x) {
 
 // kStages tiles of KV rows live in LDS; wave w fetches rows [8w, 8w + 8) of each tile with
 // LDS DMA (lanes 0..40 move one 16-B chunk each), addressed from wave-uniform indices.
-template <int kStages>
+template <int kStages, bool kSplit>
 __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Params p) {
+  static_assert(kStages >= 2 && kStages <= 4, "vmcnt waits are written for 2..4 stages");
   __shared__ __attribute__((aligned(16))) uint8_t s_kv[kStages][kTileBytes];
   __shared__ __attribute__((aligned(16))) float s_mask[kStages][kKeys];  // 0 or -inf per key
   __shared__ floatx4 s_red[kWaves][2][64];
@@ -118,7 +128,13 @@ __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Para
   const int l = tid & 63;
   const int n = l & 15;  // head
   const int g = l >> 4;
-  const int ntiles = (p.topk + kKeys - 1) / kKeys;
+  // this CTA's key tiles: [j0, j0 + ntiles)
+  int j0 = 0;
+  int ntiles = (p.topk + kKeys - 1) / kKeys;
+  if constexpr (kSplit) {
+    j0 = static_cast<int>(blockIdx.y) * p.tiles_per_split;
+    ntiles = max(0, min(ntiles - j0, p.tiles_per_split));
+  }
   const int32_t* idx_row = p.idx + static_cast<int64_t>(t) * p.topk;
 
   // Q^T as the QK B operand: col = head n, k = dims (g * 8 + j) of each 32-dim step.
@@ -140,7 +156,7 @@ __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Para
   // Branch-free (clamped address, then masked) so no load result merges at a join, which
   // would make the compiler wait for every outstanding load.
   auto load_idx = [&](int j) -> int {
-    const int k = j * kKeys + kRowsPerWave * w + (l & 7);
+    const int k = (j0 + j) * kKeys + kRowsPerWave * w + (l & 7);
     const int v = idx_row[min(k, p.topk - 1)];
     return k < p.topk ? v : -1;
   };
@@ -198,8 +214,10 @@ __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Para
     if (j + kStages - 2 < ntiles) {
       if constexpr (kStages == 2)
         asm volatile("s_waitcnt vmcnt(1)" ::: "memory");
-      else
+      else if constexpr (kStages == 3)
         asm volatile("s_waitcnt vmcnt(10)" ::: "memory");
+      else
+        asm volatile("s_waitcnt vmcnt(19)" ::: "memory");
     } else {
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
@@ -295,6 +313,18 @@ __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Para
 
   const float l_tot = xsum16(xsum32(l_i));
   if (!head_ok) return;
+  if constexpr (kSplit) {
+    const int64_t ps = (static_cast<int64_t>(t) * gridDim.y + blockIdx.y) * p.H + n;
+    float* ap = p.part_acc + ps * kDv + w * 128 + g * 4;
+#pragma unroll
+    for (int nb = 0; nb < 8; ++nb)
+      *reinterpret_cast<floatx4*>(ap + nb * 16) = acc[nb];
+    if (w == 0 && g == 0) {
+      p.part_m[ps] = m_i;
+      p.part_l[ps] = l_tot;
+    }
+    return;
+  }
   const float inv = l_tot > 0.0f ? 1.0f / l_tot : 0.0f;
   __bf16* op = p.out + (static_cast<int64_t>(t) * p.H + n) * kDv + w * 128 + g * 4;
 #pragma unroll
@@ -309,6 +339,38 @@ __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Para
   }
   if (p.store_lse && w == 0 && g == 0)
     p.lse[static_cast<int64_t>(t) * p.H + n] = l_tot > 0.0f ? (m_i + log2f(l_tot)) * 0.6931471805599453f : -INFINITY;
+}
+
+// out[t, h] = bf16(sum_s acc_s 2^(m_s - M) / sum_s l_s 2^(m_s - M)), M = max_s m_s: one block
+// per (row, head), thread i owning output dims [4i, 4i + 4), so the S partial loads of a head
+// are two dependent round trips rather than 2H.
+__global__ __launch_bounds__(128) void sparse_mla_split_combine_kernel(const Params p, int splits) {
+  const int t = blockIdx.x / p.H;
+  const int n = blockIdx.x - t * p.H;
+  const int d = threadIdx.x * 4;
+  const int64_t base = static_cast<int64_t>(t) * splits * p.H + n;
+  float m = -INFINITY;
+  for (int s = 0; s < splits; ++s)
+    m = fmaxf(m, p.part_m[base + s * p.H]);
+  const float m_use = m == -INFINITY ? 0.0f : m;
+  float l = 0.0f;
+  floatx4 o = {0, 0, 0, 0};
+  for (int s = 0; s < splits; ++s) {
+    const int64_t ps = base + s * p.H;
+    const float scale = __builtin_amdgcn_exp2f(p.part_m[ps] - m_use);
+    l += p.part_l[ps] * scale;
+    o += *reinterpret_cast<const floatx4*>(p.part_acc + ps * kDv + d) * scale;
+  }
+  const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+  typedef __bf16 bf16x4 __attribute__((ext_vector_type(4)));
+  const bf16x4 r = {
+      static_cast<__bf16>(o[0] * inv),
+      static_cast<__bf16>(o[1] * inv),
+      static_cast<__bf16>(o[2] * inv),
+      static_cast<__bf16>(o[3] * inv)};
+  *reinterpret_cast<bf16x4*>(p.out + (static_cast<int64_t>(t) * p.H + n) * kDv + d) = r;
+  if (p.store_lse && threadIdx.x == 0)
+    p.lse[static_cast<int64_t>(t) * p.H + n] = l > 0.0f ? (m + log2f(l)) * 0.6931471805599453f : -INFINITY;
 }
 
 }  // namespace sparse_mla_prefill_gfx950
@@ -358,7 +420,69 @@ struct SparseMlaPrefillGfx950Kernel {
     p.topk = static_cast<int>(indices.size(1));
     p.qk_scale = static_cast<float>(sm_scale * 1.4426950408889634);
     p.store_lse = static_cast<int>(store_lse);
-    LaunchKernel(static_cast<uint32_t>(T), k::kThreads, q_nope.device())(k::sparse_mla_prefill_kernel<kStages>, p);
+    LaunchKernel(static_cast<uint32_t>(T), k::kThreads, q_nope.device())(
+        k::sparse_mla_prefill_kernel<kStages, false>, p);
+  }
+
+  // The same attention with each row's key tiles split over `splits` CTAs, then combined
+  // through part_acc [T, splits, H, 512] / part_ml [2, T, splits, H] fp32 workspaces.
+  static void run_split(
+      const tvm::ffi::TensorView q_nope,
+      const tvm::ffi::TensorView q_rope,
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView indices,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView lse,
+      const tvm::ffi::TensorView part_acc,
+      const tvm::ffi::TensorView part_ml,
+      const double sm_scale,
+      const int64_t store_lse,
+      const int64_t splits) {
+    using namespace host;
+    namespace k = sparse_mla_prefill_gfx950;
+    const int64_t T = q_nope.size(0);
+    const int64_t H = q_nope.size(1);
+    RuntimeCheck(H >= 1 && H <= 16, "1..16 heads");
+    RuntimeCheck(q_nope.size(2) == 512 && q_nope.stride(2) == 1, "q_nope [T, H, 512]");
+    RuntimeCheck(q_rope.size(2) == 64 && q_rope.stride(2) == 1, "q_rope [T, H, 64]");
+    RuntimeCheck(
+        q_nope.stride(0) % 8 == 0 && q_nope.stride(1) % 8 == 0 && q_rope.stride(0) % 8 == 0 &&
+            q_rope.stride(1) % 8 == 0,
+        "q strides must keep 16-B alignment");
+    RuntimeCheck(kv.size(-1) == k::kRow && kv.stride(0) == k::kRow, "kv [N, 656] bytes");
+    RuntimeCheck(indices.size(0) == T && indices.stride(1) == 1 && indices.stride(0) == indices.size(1), "indices");
+    RuntimeCheck(indices.size(1) >= 1, "topk must be at least 1");
+    RuntimeCheck(out.stride(1) == 512 && out.stride(0) == H * 512 && lse.stride(0) == H, "out / lse dense");
+    RuntimeCheck(splits >= 1, "at least one split");
+    RuntimeCheck(part_acc.numel() >= T * splits * H * 512 && part_ml.numel() >= 2 * T * splits * H, "workspace");
+    if (T == 0) return;
+    k::Params p{};
+    p.q_nope = static_cast<const __bf16*>(q_nope.data_ptr());
+    p.q_rope = static_cast<const __bf16*>(q_rope.data_ptr());
+    p.kv = static_cast<const uint8_t*>(kv.data_ptr());
+    p.idx = static_cast<const int32_t*>(indices.data_ptr());
+    RuntimeCheck(kv.size(0) * k::kRow <= 0x7fffffffLL, "KV pool must fit a 31-bit buffer offset");
+    p.kv_bytes = static_cast<uint32_t>(kv.size(0) * k::kRow);
+    p.out = static_cast<__bf16*>(out.data_ptr());
+    p.lse = static_cast<float*>(lse.data_ptr());
+    p.sqn_t = q_nope.stride(0);
+    p.sqn_h = q_nope.stride(1);
+    p.sqr_t = q_rope.stride(0);
+    p.sqr_h = q_rope.stride(1);
+    p.H = static_cast<int>(H);
+    p.topk = static_cast<int>(indices.size(1));
+    p.qk_scale = static_cast<float>(sm_scale * 1.4426950408889634);
+    p.store_lse = static_cast<int>(store_lse);
+    const int ntiles = (p.topk + k::kKeys - 1) / k::kKeys;
+    p.tiles_per_split = (ntiles + static_cast<int>(splits) - 1) / static_cast<int>(splits);
+    p.part_acc = static_cast<float*>(part_acc.data_ptr());
+    p.part_m = static_cast<float*>(part_ml.data_ptr());
+    p.part_l = p.part_m + T * splits * H;
+    const DLDevice dev = q_nope.device();
+    LaunchKernel(dim3(static_cast<uint32_t>(T), static_cast<uint32_t>(splits)), k::kThreads, dev)(
+        k::sparse_mla_prefill_kernel<kStages, true>, p);
+    LaunchKernel(static_cast<uint32_t>(T * H), 128, dev)(
+        k::sparse_mla_split_combine_kernel, p, static_cast<int>(splits));
   }
 };
 

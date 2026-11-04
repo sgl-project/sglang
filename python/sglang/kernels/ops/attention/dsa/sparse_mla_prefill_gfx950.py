@@ -26,7 +26,10 @@ def _jit_module(stages: int) -> Module:
         "sparse_mla_prefill_gfx950",
         *args,
         cuda_files=["attention/sparse_mla_prefill_gfx950.cuh"],
-        cuda_wrappers=[("run", f"SparseMlaPrefillGfx950Kernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"SparseMlaPrefillGfx950Kernel<{args}>::run"),
+            ("run_split", f"SparseMlaPrefillGfx950Kernel<{args}>::run_split"),
+        ],
     )
 
 
@@ -73,5 +76,62 @@ def sparse_mla_prefill_gfx950(
     lse = torch.empty(seq, H, device=q_nope.device, dtype=torch.float32)
     _jit_module(stages).run(
         q_nope, q_rope, kv_rows, idx, out, lse, float(sm_scale), int(return_lse)
+    )
+    return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
+
+
+def sparse_mla_decode_splits(rows: int) -> int:
+    """CTAs per row for sparse_mla_split_gfx950 on a decode / verify batch of ``rows`` query
+    rows (top-2048, 12 heads, MI355X, 2 stages; us at rows 6 / 24 / 48 / 96 / 192 / 288:
+    S16 17.9 / 24.0 / 30.3, S8 18.5 / 20.6 / 26.2 / 32.0 / 53.4, S4 36.6 / 47.5 / 71.1,
+    vs the Triton split-K 22.8 / 41.0 / 66.1 / 115 / 231 / 453)."""
+    if rows <= 6:
+        return 16
+    if rows <= 128:
+        return 8
+    if rows <= 512:
+        return 4
+    return 2
+
+
+def sparse_mla_split_gfx950(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    splits: int,
+    d_v: int = 512,
+    return_lse: bool = False,
+    stages: int = 2,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """sparse_mla_prefill_gfx950 with each row's top-k split over ``splits`` CTAs and an
+    fp32 log-sum-exp combine: for decode / verify batches too small to fill the GPU at
+    one CTA per row. Returns [1, T, H, 512] bf16 and, with return_lse, the [T, H] fp32
+    natural-log LSE."""
+    seq, H, _ = q_nope.shape
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    if idx.dtype != torch.int32:
+        idx = idx.to(torch.int32)
+    idx = idx.contiguous()
+    kv_rows = kv.view(torch.uint8).reshape(kv.shape[0], _ROW_BYTES)
+    out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+    lse = torch.empty(seq, H, device=q_nope.device, dtype=torch.float32)
+    part_acc = torch.empty(
+        seq, splits, H, d_v, device=q_nope.device, dtype=torch.float32
+    )
+    part_ml = torch.empty(2, seq, splits, H, device=q_nope.device, dtype=torch.float32)
+    _jit_module(stages).run_split(
+        q_nope,
+        q_rope,
+        kv_rows,
+        idx,
+        out,
+        lse,
+        part_acc,
+        part_ml,
+        float(sm_scale),
+        int(return_lse),
+        splits,
     )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
