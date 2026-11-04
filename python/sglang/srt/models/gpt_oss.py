@@ -257,7 +257,6 @@ class GptOssSparseMoeBlock(nn.Module):
         scheme = getattr(self.experts, "scheme", None)
         if (
             envs.SGLANG_GFX1250_W4A8_BYPASS_TOPK.get()
-            and _is_hip
             and is_gfx1250_supported()
             and getattr(scheme, "routes_from_router_logits", False)
             and get_moe_a2a_backend().is_none()
