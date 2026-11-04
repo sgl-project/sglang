@@ -57,6 +57,7 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -81,6 +82,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -115,6 +117,8 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
     get_lora,
     get_mm,
     get_parallel,
@@ -147,6 +151,11 @@ _MHC_POST_MULT_VALUE = 2.0
 # hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
 # 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+
+# SM90, hidden=4096, 64 heads of width 128, torch BF16 GEMMs. Splitting the
+# first projection lets the two-stage gate chain overlap QKV. Wider batches
+# retain the merged GEMM: TP4 gains shrink after 32, TP8 regresses at 16.
+_KDA_PROJ_OVERLAP_MAX_TOKENS = {4: 32, 8: 15}
 
 
 @torch.compile
@@ -396,6 +405,7 @@ class Glm5NextLinearAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         prefix: str = "",
         reduce_results: bool = False,
+        alt_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -594,6 +604,28 @@ class Glm5NextLinearAttention(nn.Module):
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
+        self._proj_stream = None
+        self._proj_overlap_max_tokens = 0
+        if (
+            _is_cuda
+            and _device_sm == 90
+            and alt_stream is not None
+            and self.do_fuse_qkvbfg
+            and (self.hidden_size, self.num_heads, self.head_dim) == (4096, 64, 128)
+            and envs.SGLANG_GLM5_KDA_PROJ_OVERLAP.get()
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not get_flags().capture.enable_torch_compile
+            and not get_exec().overlap.enable_two_batch_overlap
+            and not get_exec().overlap.enable_single_batch_overlap
+            and not get_exec().graph.debug_cuda_graph
+        ):
+            self._proj_overlap_max_tokens = _KDA_PROJ_OVERLAP_MAX_TOKENS.get(
+                head_shard_size, 0
+            )
+            if self._proj_overlap_max_tokens:
+                self._proj_stream = alt_stream
+                self._proj_events = (torch.cuda.Event(), torch.cuda.Event())
+
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -618,6 +650,24 @@ class Glm5NextLinearAttention(nn.Module):
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
+        if (
+            self._proj_stream is not None
+            # Includes eager capture warmup, which initializes the aux cuBLAS handle.
+            and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
+            and 0 < hidden_states.shape[0] <= self._proj_overlap_max_tokens
+            and hidden_states.is_cuda
+            and (
+                forward_batch is None
+                or forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and hidden_states.dtype == torch.bfloat16
+            and self.fused_qkvbfg_a_proj.weight.dtype == torch.bfloat16
+            and get_bf16_gemm_backend().value in ("auto", "torch")
+        ):
+            return self._forward_qkvbfg_overlap(hidden_states)
+
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
@@ -632,6 +682,32 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate,
             g_proj_states,
         )
+
+    def _forward_qkvbfg_overlap(self, hidden_states: torch.Tensor):
+        # Slice the live parameter on each call: checkpoint loading and weight
+        # updates keep their existing ownership, with no duplicate parameters.
+        weight = self.fused_qkvbfg_a_proj.weight
+        qkv_size, beta_size, fg_size = self.split_sizes
+        start, done = self._proj_events
+        current_stream = torch.cuda.current_stream()
+        start.record(current_stream)
+        # Submit the small chain first so both of its GEMMs can hide behind QKV.
+        # This path is restricted to torch/cuBLAS, whose workspaces are stream-local.
+        with torch.cuda.stream(self._proj_stream):
+            self._proj_stream.wait_event(start)
+            bfg = F.linear(hidden_states, weight[qkv_size:])
+            beta, fg = bfg.split([beta_size, fg_size], dim=-1)
+            forget_gate, g_proj_states = self.fused_fg_b_proj(
+                fg.view(-1, 2, self.head_dim).transpose(0, 1)
+            )
+            done.record(self._proj_stream)
+        qkv = F.linear(hidden_states, weight[:qkv_size])
+        current_stream.wait_event(done)
+        if not torch.cuda.is_current_stream_capturing():
+            # Capture warmup is eager; the main stream consumes these allocations.
+            bfg.record_stream(current_stream)
+            forget_gate.record_stream(current_stream)
+        return qkv, beta, forget_gate, g_proj_states
 
     def forward(
         self,
@@ -712,6 +788,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 rms_norm_eps=config.rms_norm_eps,
                 reduce_results=False,
+                alt_stream=alt_stream,
             )
         else:
             self.self_attn = DeepseekV2AttentionMLA(
