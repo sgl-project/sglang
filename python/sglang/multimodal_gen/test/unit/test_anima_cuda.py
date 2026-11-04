@@ -83,7 +83,9 @@ def test_transformer_matches_cosmos(dtype, batch_size, monkeypatch):
     expected = reference(x, t.to(dtype) / 1000, context, padding_mask=padding).sample
     with (
         set_forward_context(current_timestep=0, attn_metadata=None),
-        patch.object(anima, "residual_gate_add", wraps=anima.residual_gate_add) as fused,
+        patch.object(
+            anima, "residual_gate_add", wraps=anima.residual_gate_add
+        ) as fused,
     ):
         actual = model(x, context, t)
         assert fused.call_count == 0
