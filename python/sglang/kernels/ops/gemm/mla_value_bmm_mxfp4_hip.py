@@ -41,10 +41,6 @@ _MXFP4_QUANT_BLOCK_SIZE_TL = tl.constexpr(_MXFP4_QUANT_BLOCK_SIZE)
             args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0
             and args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0
         ),
-        "GRID_MN": lambda args: (
-            triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-            * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
-        ),
     }
 )
 @triton.jit
@@ -77,7 +73,6 @@ def _batched_gemm_a16wfp4_flatten_mxfp4_quant_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Batched A16W4 GEMM with a flattened MXFP4 output epilogue."""
@@ -90,7 +85,8 @@ def _batched_gemm_a16wfp4_flatten_mxfp4_quant_kernel(
     tl.static_assert(NUM_KSPLIT == 1)
     tl.static_assert(BLOCK_SIZE_N % _MXFP4_QUANT_BLOCK_SIZE_TL == 0)
 
-    remap_xcd(pid, GRID_MN)
+    # Runtime grid size, as in AITER: a constexpr would compile one binary per batch size.
+    remap_xcd(pid, num_pid_m * num_pid_n)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
     stride_ab = tl.cast(stride_ab, tl.int64)
@@ -127,11 +123,16 @@ def _batched_gemm_a16wfp4_flatten_mxfp4_quant_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     num_k_iter: tl.constexpr = tl.cdiv(SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2)
     for k in range(0, num_k_iter):
-        b_scales = tl.load(b_scale_ptrs)
         if EVEN_K:
+            b_scales = tl.load(b_scale_ptrs)
             a_bf16 = tl.load(a_ptrs)
             b = tl.load(b_ptrs, cache_modifier=cache_modifier)
         else:
+            # As in AITER: OOB e8m0 scale bytes may be 0xFF (NaN); read them as 127 (2^0).
+            scale_mask = offs_ks[None, :] < (
+                2 * K // scale_group_size - k * (BLOCK_SIZE_K // scale_group_size)
+            )
+            b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
             logical_k = 2 * K
             a_bf16 = tl.load(
                 a_ptrs,

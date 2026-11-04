@@ -301,7 +301,6 @@ def _can_fuse_rocm_mla_value_mxfp4_quant(
         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
         and not is_kv_b_lora_active(attn)
         and attn.w_vc.dtype == torch.uint8
-        and attn.w_scale_v is not None
         and attn.o_proj.weight.dtype == torch.uint8
         and attn.kv_lora_rank == 512
         and attn.v_head_dim == 128
@@ -315,6 +314,7 @@ def rocm_absorb_v_bmm(
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
     # TODO(haishaw): add bmm_fp8 to ROCm
+    fuse_value_quant = False
     if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8:
         x = attn_output.transpose(0, 1)
         w_vc = attn.w_vc.transpose(-2, -1)
@@ -408,7 +408,8 @@ def rocm_absorb_v_bmm(
                 _absorb_weight_bf16(attn.w_vc, attn.w_scale),
             )
 
-    if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8 and fuse_value_quant:
+    if fuse_value_quant:
+        # The fused GEMM already emitted the flattened MXFP4 o_proj input.
         pass
     elif _bmm_buf is not None:
         # _bmm_buf is already (batch, heads, dim) contiguous
