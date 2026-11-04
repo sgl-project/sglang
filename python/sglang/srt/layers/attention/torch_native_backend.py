@@ -31,6 +31,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         )
         # full->SWA translated out_cache_loc, computed once per forward
         self.swa_out_cache_loc = None
+        # This batch's req_to_token rows in SWA ids, translated on first use
+        self._swa_req_to_token = None
 
     @staticmethod
     def _make_sliding_window_mask(
@@ -55,6 +57,34 @@ class TorchNativeAttnBackend(AttentionBackend):
             )
         else:
             self.swa_out_cache_loc = None
+        self._swa_req_to_token = None
+
+    def _kv_indices(self, layer: RadixAttention, forward_batch: ForwardBatch):
+        """The table and row indices that address ``layer``'s KV for this batch.
+
+        ``req_to_token`` holds full-pool ids, and a sliding-window layer's KV
+        lives in the SWA sub-pool, which writes at ``swa_out_cache_loc``. Its
+        reads take the same translation, as rows of a compacted table.
+        """
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+        if (
+            not self.use_sliding_window_kv_pool
+            or layer.is_cross_attention
+            or self.kv_layers.route(layer.layer_id).sub_pool
+            != IdSpaceKind.SLIDING_WINDOW
+        ):
+            return req_to_token, req_pool_indices
+        if self._swa_req_to_token is None:
+            kv_lens = forward_batch.seq_lens
+            if forward_batch.encoder_lens is not None:
+                kv_lens = kv_lens + forward_batch.encoder_lens
+            rows = req_to_token[req_pool_indices, : int(kv_lens.max())]
+            self._swa_req_to_token = (
+                self.runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, rows),
+                torch.arange(rows.shape[0], device=rows.device),
+            )
+        return self._swa_req_to_token
 
     def _run_sdpa_forward_extend(
         self,
@@ -307,13 +337,14 @@ class TorchNativeAttnBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
+        req_to_token, req_pool_indices = self._kv_indices(layer, forward_batch)
         self._run_sdpa_forward_extend(
             q_,
             o_,
             self.kv_layers.read(layer.layer_id).key(),
             self.kv_layers.read(layer.layer_id).value(),
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
+            req_to_token,
+            req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
@@ -371,13 +402,14 @@ class TorchNativeAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        req_to_token, req_pool_indices = self._kv_indices(layer, forward_batch)
         self._run_sdpa_forward_decode(
             q_,
             o_,
             self.kv_layers.read(layer.layer_id).key(),
             self.kv_layers.read(layer.layer_id).value(),
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
+            req_to_token,
+            req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.encoder_lens,
             scaling=layer.scaling,
