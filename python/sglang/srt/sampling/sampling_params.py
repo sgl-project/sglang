@@ -137,6 +137,15 @@ def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> No
     sampling_params["custom_params"] = custom_params
 
 
+def normalize_sample_count(n: Optional[int]) -> int:
+    """Resolve the default and validate n before parallel request expansion."""
+    if n is None:
+        return 1
+    if type(n) is not int or n < 1:
+        raise ValueError(f"n must be a positive integer, got {n!r}.")
+    return n
+
+
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
@@ -220,7 +229,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.min_new_tokens = (
             self.min_new_tokens if self.min_new_tokens is not None else 0
         )
-        self.n = self.n if self.n is not None else 1
+        self.n = normalize_sample_count(self.n)
         self.ignore_eos = self.ignore_eos if self.ignore_eos is not None else False
         self.skip_special_tokens = (
             self.skip_special_tokens if self.skip_special_tokens is not None else True
