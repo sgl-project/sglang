@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
     init_dcp_pack_buffers,
 )
+from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.runtime_context import get_context
@@ -18,6 +19,36 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+def _plan(*, src, dst, page_size, dcp_size, dcp_rank, **kwargs):
+    return build_dcp_token_transfer_plan(
+        np.asarray(src, dtype=np.int32),
+        np.asarray(dst, dtype=np.int32),
+        physical_page_size=page_size,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        **kwargs,
+    )
+
+
+class TestDcpCollapsedDraftPlan(CustomTestCase):
+    def test_collapsed_draft_takes_the_target_rows(self):
+        # Same geometry as test_one_virtual_page_explicit_rows; rank 2 owns
+        # positions 2 and 6 -> src rows 4, 8 -> local rows 14, 15 on page 7.
+        plan = _plan(
+            src=[5, 2, 11, 4],
+            dst=[7],
+            page_size=2,
+            dcp_size=4,
+            dcp_rank=2,
+            num_kv_tokens=8,
+            draft_rows_collapsed=True,
+        )
+        self.assertEqual(plan.target_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.target_dst_token_indices.tolist(), [14, 15])
+        self.assertEqual(plan.draft_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.draft_dst_token_indices.tolist(), [14, 15])
 
 
 class TestDcpCachedPrefixSend(CustomTestCase):
@@ -30,7 +61,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             num_draft_entries=0,
             page_size=page_size,
             gpu_id=0,
-            state_types=[StateType.MAMBA],
+            state_types=[StateType.MAMBA, StateType.DSA],
         )
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
@@ -128,6 +159,10 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     all(c.kwargs["state_indices"] is None for c in calls[:-1])
                 )
                 self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
+                np.testing.assert_array_equal(
+                    calls[-1].kwargs["state_indices"][1],
+                    np.arange(prefix // page_size, 33),
+                )
 
 
 class TestDcpPackBufferBytes(CustomTestCase):
@@ -217,6 +252,7 @@ class TestTryDcpPack(CustomTestCase):
             dst_dcp_rank=1, dst_dcp_size=2, dcp_token_item_lens=[item_len]
         )
         with (
+            patch("sglang.srt.disaggregation.common.dcp_pack.torch.cuda.set_device"),
             patch(
                 "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
                 return_value=nullcontext(),

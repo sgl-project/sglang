@@ -785,6 +785,31 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
 
+    def test_breakable_captured_kda_waits_for_last_host_loaded_layer(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        counter.complete(0, 0)
+        counter.complete(0, 1)
+        runner = self._runner(counter, is_full_backend=False)
+        runner.use_captured_attn_metadata = True
+        runner.model_runner.attn_backend = SimpleNamespace(linear_attn_backend=object())
+        entered = threading.Event()
+
+        def replay_wait():
+            entered.set()
+            runner._wait_for_layer_loads()
+
+        waiter = threading.Thread(target=replay_wait, daemon=True)
+        waiter.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            waiter.join(timeout=0.2)
+            self.assertTrue(waiter.is_alive())
+        finally:
+            counter.complete(0, 2)
+            waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
     def test_replay_without_a_layer_transfer_counter(self):
         self._runner(None)._wait_for_layer_loads()
 

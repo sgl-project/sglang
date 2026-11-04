@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import unicodedata
 import uuid
@@ -228,10 +229,25 @@ class UsageInfo(BaseModel):
     # The OpenAI location of reasoning_tokens; set only when there are some.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Absent unless a surface fills it (K3 does, per its stream spec), so
+        # every other model's usage object keeps its historical shape.
+        if data.get("completion_tokens_details") is None:
+            data.pop("completion_tokens_details", None)
+        return data
+
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
+    # None means "unset": fall back to the server default. An explicit false
+    # must be able to suppress the summary frame even when the server default
+    # turns it on, which a False default cannot express.
+    include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
+    # K3 API extension: attach choices[].internal_content[].token_ids to
+    # every increment frame — the raw token ids behind that increment.
+    include_internal_content: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -642,6 +658,12 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
+    @field_validator("image_url", mode="before")
+    @classmethod
+    def _accept_bare_url(cls, value: Any) -> Any:
+        # Some clients send "image_url": "<url>" instead of {"url": "<url>"}.
+        return {"url": value} if isinstance(value, str) else value
+
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
@@ -735,6 +757,18 @@ class FunctionResponse(BaseModel):
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # K3 streaming format: continuation chunks must not carry a name key, not
+        # even null; the arguments key must always be present.
+        # Non-streaming responses always set name, so they are unaffected.
+        data = handler(self)
+        if data.get("name") is None:
+            data.pop("name", None)
+        if data.get("arguments") is None:
+            data["arguments"] = ""
+        return data
+
 
 class ToolCall(BaseModel):
     """Tool call response."""
@@ -743,6 +777,19 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Streaming continuation chunks (id is None) may only carry index +
+        # function.arguments; id/type must not appear, not even null.
+        # First chunks and non-streaming responses (id set) keep every field.
+        data = handler(self)
+        if data.get("id") is None:
+            data.pop("id", None)
+            data.pop("type", None)
+        if data.get("index") is None:
+            data.pop("index", None)
+        return data
 
 
 _GenericMessageRole = Literal[
@@ -894,6 +941,40 @@ ReasoningEffortType = Optional[
 ]
 
 
+# Dynamic tools may only be declared in a system (or its developer alias)
+# message. The K3 name shape is stricter than OpenAI's
+# ``^[a-zA-Z0-9_-]+$``: a leading digit is rejected, and the ceiling is 256.
+_DYNAMIC_TOOL_ROLES = ("system", "developer")
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_TOOL_NAME_MAX_LEN = 256
+
+
+class ThinkingParam(BaseModel):
+    """K3-style thinking control, as Kimi K3 and compatible surfaces send it.
+
+    ``type`` gates reasoning and ``effort`` outranks ``reasoning_effort``.
+
+    ``keep`` selects how much earlier reasoning is replayed; "all" is the only
+    mode implemented here, and any other value is normalized to it rather than
+    rejected. A deployment is expected to force "all" this way -- rejecting the
+    request would fail one the reference service answers. ``adaptive`` is
+    accepted as an alias for enabled so an Anthropic-shaped value reaching this
+    surface does not 400.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Optional[Literal["enabled", "disabled", "adaptive"]] = None
+    # Accepted and normalized to "all"; see the class docstring.
+    keep: Optional[str] = None
+    effort: ReasoningEffortType = None
+
+    @property
+    def enabled(self) -> bool:
+        """Absent or "adaptive" both mean reasoning is on; only "disabled" is off."""
+        return self.type != "disabled"
+
+
 def _has_message_level_tools(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
@@ -986,8 +1067,12 @@ class ChatCompletionRequest(PDRoutingFields):
     )
     thinking: Optional[Any] = Field(
         default=None,
-        description="Thinking config such as {'type': 'adaptive'}; read only by "
-        "models whose chat template defines a thinking mode, ignored otherwise.",
+        description="Thinking control. K3 form: {type: enabled|disabled|adaptive, "
+        "keep: all, effort: low|high|max}; 'effort' takes precedence over "
+        "reasoning_effort, 'type: disabled' turns reasoning off, 'keep' is "
+        "normalized to 'all'. Other models whose chat template defines a thinking "
+        "mode read it as a plain dict (e.g. {'type': 'adaptive'}). Kept as a dict; "
+        "the K3 serving path validates it against ThinkingParam.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -1067,22 +1152,108 @@ class ChatCompletionRequest(PDRoutingFields):
         "repetition_penalty": 1.0,
     }
 
+    # Streaming created timestamp: set once per request by the serving layer
+    # and reused for every frame (the K3 streaming format requires it constant;
+    # computing it per frame drifts across second boundaries on long streams).
+    _stream_created_ts: Optional[int] = None
+    # Wire-level response id, derived once from the first engine event. With
+    # n>1 the engine assigns a separate rid per sampled choice, so deriving it
+    # per frame would break the constant-id contract.
+    _stream_wire_id: Optional[str] = None
+    # Whether the client sent tool_choice: set_tool_choice_default fills in
+    # "none" for a request without tools, which the K3 encoder must not render
+    # as an explicit tool_choice=none.
+    _tool_choice_explicit: bool = False
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
+    def set_tool_choice_default(cls, values, handler):
+        if not isinstance(values, dict):
+            return handler(values)
+        explicit = values.get("tool_choice") is not None
+        if not explicit:
             if values.get("tools") is None and not _has_message_level_tools(
                 values.get("messages")
             ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        request = handler(values)
+        request._tool_choice_explicit = explicit
+        return request
+
+    # Dynamic tools are declared in a system message that carries no content;
+    # every other placement is a client error, and the model would never see the
+    # tool. Runs "before" because pydantic drops an unknown `tools` key on a user
+    # message, leaving an "after" validator nothing to reject.
+    @model_validator(mode="before")
+    @classmethod
+    def validate_message_level_tools(cls, values):
+        messages = values.get("messages") if isinstance(values, dict) else None
+        if not isinstance(messages, list):
+            return values
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            tools = message.get("tools")
+            if not tools:
+                continue
+            role = message.get("role")
+            role = role.lower() if isinstance(role, str) else role
+            if role == "root":
+                # A root message's tools follow its own (MiniMax-M3) contract,
+                # content included; the K3 dynamic-tool rules below do not apply.
+                continue
+            if role not in _DYNAMIC_TOOL_ROLES:
+                raise ValueError(
+                    f"messages[{index}]: message-level 'tools' are only valid on a "
+                    f"system or developer message, not {role!r}"
+                )
+            if message.get("content"):
+                raise ValueError(
+                    f"messages[{index}]: a message declaring 'tools' must not also "
+                    "carry content"
+                )
+            if not isinstance(tools, list):
+                raise ValueError(f"messages[{index}]: 'tools' must be a list")
+            for tool_index, tool in enumerate(tools):
+                cls._validate_dynamic_tool(index, tool_index, tool)
         return values
+
+    @classmethod
+    def _validate_dynamic_tool(cls, index: int, tool_index: int, tool: Any) -> None:
+        where = f"messages[{index}].tools[{tool_index}]"
+        if not isinstance(tool, dict):
+            raise ValueError(f"{where}: must be an object")
+        # `type` has a default on the Tool model, so an omitted or bogus value
+        # would otherwise be accepted and silently treated as a function.
+        tool_type = tool.get("type")
+        if tool_type != "function":
+            raise ValueError(
+                f"{where}: 'type' must be 'function'"
+                + (" (missing)" if tool_type is None else f", got {tool_type!r}")
+            )
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise ValueError(f"{where}: 'function' is required")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{where}: 'function.name' is required")
+        if len(name) > _TOOL_NAME_MAX_LEN:
+            raise ValueError(
+                f"{where}: 'function.name' must be at most "
+                f"{_TOOL_NAME_MAX_LEN} characters, got {len(name)}"
+            )
+        if not _TOOL_NAME_RE.match(name):
+            raise ValueError(
+                f"{where}: 'function.name' must start with a letter or underscore "
+                f"and contain only letters, digits, '_' or '-'; got {name!r}"
+            )
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
@@ -1134,9 +1305,26 @@ class ChatCompletionRequest(PDRoutingFields):
             if enabled:
                 thinking = True
 
+        # thinking.effort outranks reasoning.effort and the top-level field.
+        # chat_template_kwargs stays above all three: the renderers only fill
+        # thinking_effort when the caller has not set it themselves.
+        thinking_type = None
+        thinking_config = values.get("thinking")
+        if isinstance(thinking_config, dict):
+            thinking_effort = thinking_config.get("effort")
+            if thinking_effort is not None:
+                values["reasoning_effort"] = thinking_effort
+            thinking_type = thinking_config.get("type")
+
         effort = values.get("reasoning_effort")
         if effort is not None:
             thinking = effort != "none"
+        if thinking_type is not None:
+            thinking = thinking_type != "disabled"
+        elif thinking_config is not None and thinking is None:
+            # A thinking object with no explicit type still means "reasoning on",
+            # but never contradicts an effort that already resolved it.
+            thinking = True
 
         if thinking is not None:
             ctk = values.get("chat_template_kwargs")
@@ -1265,13 +1453,27 @@ class ChatCompletionRequest(PDRoutingFields):
                 self.tool_choice == "required"
                 or isinstance(self.tool_choice, ToolChoice)
             ):
-                raise ValueError(
-                    "tool_choice 'required' or a named tool cannot be combined with "
-                    "response_format, regex, or ebnf: the tool-call constraint and the "
-                    "output constraint cannot both be honored."
+                if self.regex or self.ebnf:
+                    raise ValueError(
+                        "tool_choice 'required' or a named tool cannot be combined "
+                        "with regex or ebnf: the tool-call constraint and the "
+                        "output constraint cannot both be honored."
+                    )
+                # A forced tool call produces a tool_calls message with no
+                # content, so a response_format constraint has nothing left to
+                # constrain — honor the tool call (OpenAI behavior).
+                logger.warning(
+                    "tool_choice forces a tool call; ignoring response_format "
+                    "for this request."
                 )
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
+                sampling_params.pop("json_schema", None)
+                sampling_params.pop("structural_tag", None)
+                has_existing_constraints = False
+            else:
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
+        if tool_call_constraint and not has_existing_constraints:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
@@ -1360,10 +1562,13 @@ class DeltaMessage(BaseModel):
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
+        # Never emit null fields in streaming deltas (OpenAI behavior and a hard
+        # K3 streaming rule): key presence is the client's state signal —
+        # reasoning_content must not be null, the end frame must be {},
+        # and increment frames must not mix in unrelated null keys. The
+        # first frame sets content="" explicitly, so it keeps its key.
         data = handler(self)
-        if self.hidden_states is None:
-            data.pop("hidden_states", None)
-        return data
+        return {k: v for k, v in data.items() if v is not None}
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
@@ -1372,14 +1577,30 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            # K3 API extensions; "abort" is mapped onto
+            # server_interrupted on the K3 wire.
+            "unexpected_state",
+            "malformed_byte_sequence",
+            "engine_overloaded",
+            "server_interrupted",
+            "repeat",
+            "unknown",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    internal_content: Optional[List[Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.internal_content is None:
+            data.pop("internal_content", None)
         if self.delta.tool_calls is None:
             data["delta"].pop("tool_calls", None)
         return data

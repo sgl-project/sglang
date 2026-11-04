@@ -44,7 +44,13 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::
     const std::optional<at::Tensor>& extra_topk_length,
     int d_v,
     float sm_scale,
-    const std::optional<std::string>& kv_format);
+    const std::optional<std::string>& kv_format,
+    int64_t heads_per_group);
+
+int64_t sparse_decode_num_sm_parts(int64_t b, int64_t s_q, int64_t h_q);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+flashmla_token_pack_prepare(const at::Tensor& q, const std::optional<at::Tensor>& q_rope, const at::Tensor& indices);
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd(
     const at::Tensor& q,
@@ -59,7 +65,8 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
     const std::optional<at::Tensor>& extra_topk_length,
     int64_t d_v,
     double sm_scale,
-    const std::optional<std::string>& kv_format) {
+    const std::optional<std::string>& kv_format,
+    int64_t heads_per_group) {
   return sparse_attn_decode_interface(
       q,
       kv,
@@ -73,7 +80,8 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       extra_topk_length,
       static_cast<int>(d_v),
       static_cast<float>(sm_scale),
-      kv_format);
+      kv_format,
+      heads_per_group);
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
@@ -129,8 +137,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
-      "Tensor? extra_topk_length, int d_v, float sm_scale, str? kv_format=None) -> (Tensor, Tensor, Tensor?, Tensor?)");
+      "Tensor? extra_topk_length, int d_v, float sm_scale, str? kv_format=None, int heads_per_group=0) "
+      "-> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
+
+  m.def("sparse_decode_num_sm_parts(int b, int s_q, int h_q) -> int", &sparse_decode_num_sm_parts);
+
+  m.def(
+      "flashmla_token_pack_prepare(Tensor(a) q, Tensor? q_rope, Tensor indices) "
+      "-> (Tensor(a), Tensor, Tensor)");
+  m.impl("flashmla_token_pack_prepare", torch::kCUDA, &flashmla_token_pack_prepare);
 
   m.def(
       "dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

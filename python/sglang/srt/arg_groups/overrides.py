@@ -45,6 +45,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _invoke_provider,
     _register_for,
     attention_backends_of,
+    decode_state_free_radix_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
@@ -269,7 +270,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
+        mamba_extra_buffer_of(cfg)
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 
@@ -370,6 +371,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -427,6 +429,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
@@ -490,10 +493,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     """Default DSA KV-cache dtype before resolving split attention backends."""
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -506,6 +510,9 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             )
             return {"kv_cache_dtype": "bfloat16"}
         return {}
+
+    if kimi_k31:
+        return _kimi_k31_kv_cache_dtype(view)
 
     import torch
 
@@ -558,6 +565,12 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
+    # The SM100/SM103 check is check_prims_ts_sparse_mla_support, at backend init.
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+        raise ValueError(
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
+        )
+
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
         raise ValueError(
@@ -603,10 +616,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     HiSparse settings take precedence when enabled.
     """
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -640,6 +654,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         and kv_cache_dtype == "fp8_e4m3"
         and not get_platform().is_hip
     )
+
+    if kimi_k31:
+        return _kimi_k31_dsa_backends(view)
 
     if getattr(hf_config, "learnable_sink", False):
         backend = "flashmla_sparse"
@@ -741,6 +758,67 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     return declared
 
 
+# Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
+_KIMI_K31_DSA_BACKEND = "flashmla_kv"
+# Opt-in: raw FP8 KV (scale 1.0) and FP8 q, so numerics differ from the reference.
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
+
+
+def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
+    if get_platform().is_hip:
+        raise ValueError("Kimi-K3.1 DSA requires CUDA (FlashMLA / DeepGEMM).")
+    if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+        raise ValueError(
+            "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
+            f"fp8_ds_mla format); got {view.kv_cache_dtype!r}."
+        )
+    if view.kv_cache_dtype != "fp8_e4m3":
+        logger.warning("Setting KV cache dtype to fp8_e4m3 for Kimi-K3.1.")
+        return {"kv_cache_dtype": "fp8_e4m3"}
+    return {}
+
+
+def _kimi_k31_dsa_backends(view: Any) -> dict:
+    fields = ("dsa_prefill_backend", "dsa_decode_backend")
+    for field in fields:
+        value = getattr(view, field)
+        if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
+            option = "--" + field.replace("_", "-")
+            raise ValueError(
+                f"Kimi-K3.1 supports {option} {' / '.join(_KIMI_K31_DSA_BACKENDS)}; "
+                f"got {value!r}."
+            )
+    # Both phases read one KV pool (and PD peers exchange it), so an unset
+    # phase follows the set one.
+    chosen = {getattr(view, f) for f in fields} - {None}
+    if len(chosen) > 1:
+        raise ValueError(
+            "Kimi-K3.1 needs the same --dsa-prefill-backend and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
+            f"{view.dsa_decode_backend!r}."
+        )
+    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
+        )
+    if backend in ("trtllm", "prims_ts"):
+        logger.warning(
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    declared = {f: backend for f in fields if getattr(view, f) is None}
+    logger.warning(
+        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
+    )
+    return declared
+
+
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
@@ -756,6 +834,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
+        "KimiK31ForConditionalGeneration",
     }
 )
 

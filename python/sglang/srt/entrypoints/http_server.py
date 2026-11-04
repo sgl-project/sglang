@@ -575,6 +575,19 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
     )
 
 
+def _kimi_k3_chat_error_response(
+    request: Request, message: str, err_type: str, status_code: int
+) -> Optional[ORJSONResponse]:
+    """K3 chat errors raised before the handler runs, in the handler's envelope."""
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path != "/v1/chat/completions":
+        return None
+    chat = request.app.state.openai_serving_chat
+    if chat.chat_encoding_spec != "kimi_k3":
+        return None
+    return chat.create_error_response(message, err_type, status_code)
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
@@ -621,6 +634,12 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         return ORJSONResponse(
             content={"error": nested_error}, status_code=exc.status_code
         )
+
+    k3_error = _kimi_k3_chat_error_response(
+        request, str(exc.detail), str(exc.status_code), exc.status_code
+    )
+    if k3_error is not None:
+        return k3_error
 
     error = ErrorResponse(
         object="error",
@@ -679,6 +698,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "code": HTTPStatus.BAD_REQUEST.value,
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    k3_error = _kimi_k3_chat_error_response(
+        request, message, "BadRequest", HTTPStatus.BAD_REQUEST.value
+    )
+    if k3_error is not None:
+        return k3_error
 
     err = ErrorResponse(
         message=message,
@@ -2299,7 +2324,8 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
+        or "KimiK31ForConditionalGeneration" in architectures
+        or model_info.get("model_type") in ("kimi_k3", "kimi_k31")
     ):
         logger.info(
             "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "

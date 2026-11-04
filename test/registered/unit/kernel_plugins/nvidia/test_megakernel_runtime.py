@@ -70,12 +70,16 @@ class TestMegakernelRuntime(CustomTestCase):
         registry.register(architecture=ARCH, path="_fakes:SPEC")
         publish(server_args(enable_nvidia_megakernel=True), role="test")
         self.addCleanup(reset_context)
-        # the running forward's view reads its attention backend, which tests lack
+        # the running forward's view and the hybrid step's finish read its attention
+        # backend, which tests lack
         view_patch = patch.object(
             MegakernelBinding, "forward_view", return_value="view"
         )
         view_patch.start()
         self.addCleanup(view_patch.stop)
+        finish_patch = patch.object(MegakernelBinding, "finish_step")
+        finish_patch.start()
+        self.addCleanup(finish_patch.stop)
 
     def _install_spec(self, spec, **kw):
         with patch.object(binding, "find_spec", return_value=(spec, "")):

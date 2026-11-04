@@ -70,7 +70,6 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
@@ -128,6 +127,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         linear_fp8_config: Optional[Any] = None,
+        linear_quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -140,6 +140,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+        self.linear_quant_config = linear_quant_config or linear_fp8_config
 
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
@@ -189,10 +190,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            # If linear_fp8_config is set, use FP8 for linear layers
-            # This allows mixed quantization: experts with int4, linear layers with fp8
-            if self.linear_fp8_config is not None:
-                return Fp8LinearMethod(self.linear_fp8_config)
+            # Dense layers can use a separate scheme from the routed experts.
+            if self.linear_quant_config is not None:
+                return self.linear_quant_config.get_quant_method(layer, prefix)
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -313,6 +313,20 @@ class CompressedTensorsConfig(QuantizationConfig):
                 weight_block_size=fp8_cfg.get("weight_block_size"),
             )
 
+        linear_quant_config = None
+        if "linear_quant_config" in config:
+            if linear_fp8_config is not None:
+                raise ValueError("Specify only one dense linear quantization config")
+            linear_cfg = config["linear_quant_config"]
+            if linear_cfg.get("quant_method") != "mxfp4_online":
+                raise ValueError("linear_quant_config currently supports mxfp4_online")
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+
+            linear_quant_config = Mxfp4Config(
+                ignored_layers=linear_cfg.get("ignored_layers"),
+                enable_online_linear=True,
+            )
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -323,6 +337,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             config=config,
             packed_modules_mapping=packed_modules_mapping,
             linear_fp8_config=linear_fp8_config,
+            linear_quant_config=linear_quant_config,
         )
 
     @classmethod

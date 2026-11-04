@@ -677,6 +677,7 @@ class TestFusedDraftDecision(CustomTestCase):
             is_multi_layer_eagle=False, sliding_window_size=None
         )
         cfg.kv_cache_dtype = host_kv_dtype
+        cfg.dflash_draft_rows_dcp_collapsed = False
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,

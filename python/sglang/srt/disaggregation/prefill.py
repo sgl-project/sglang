@@ -81,7 +81,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
-    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -99,7 +98,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -1563,6 +1564,33 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
+        sender = req.disagg_kv_sender
+        async_indices = (
+            # Only Mooncake's worker consumes the async host snapshots under
+            # indices_event. Other backends keep synchronous .cpu().numpy().
+            getattr(sender, "supports_host_tensor_indices", False)
+            and get_disagg().disaggregation_transfer_backend == "mooncake"
+            # KV-sharded sends filter host values before enqueueing them.
+            # Preserve the existing CP transfer compatibility gate as well.
+            and getattr(sender.kv_mgr, "kv_shard_size", 1) == 1
+            and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
+            )
+        )
+
+        def _host_indices(indices):
+            if async_indices:
+                # NumPy retains the pinned tensor storage without reading it.
+                # The transfer worker waits on indices_event before consuming
+                # either KV pages or state indices. Resolve mappings here so
+                # PP and pending-bootstrap sends use the same readback path.
+                return async_d2h(indices).numpy()
+            return indices.cpu().numpy()
+
+        def _page_indices(indices):
+            return _host_indices(indices[::page_size] // page_size)
+
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -1576,13 +1604,13 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.kv.req_pool_idx
-                        ]
+                    _host_indices(
+                        self.req_to_token_pool.translate_mamba_indices(
+                            self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                                req.kv.req_pool_idx
+                            ]
+                        )
                     )
-                    .cpu()
-                    .numpy()
                 ]
 
             def _swa_payload():
@@ -1609,13 +1637,13 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return _page_indices(window_kv_indices_swa)
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full, page_size)
+                return _page_indices(kv_indices_full)
 
             def _minimax_payload():
                 return minimax_index_transfer_pages(
@@ -1629,12 +1657,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
                 # still being restored point at no page yet: send only the
                 # suffix, positionally matching decode's _dsa_pages_payload.
-                return suffix_page_indices(
-                    self.req_to_token_pool.req_to_token,
-                    req.kv.req_pool_idx,
-                    req.disagg_decode_prefix_len,
-                    seq_len,
-                    page_size,
+                return _page_indices(
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
+                    ]
                 )
 
             def _dsa_tail_payload():
@@ -1668,6 +1694,12 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _draft_ring_payload():
+                ring = get_draft_kv_ring()
+                if ring is None:
+                    return None
+                return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)
+
             def _request_row_payload():
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
@@ -1684,6 +1716,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
+                StateType.DRAFT_RING: _draft_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
@@ -1741,22 +1774,12 @@ class SchedulerDisaggregationPrefillMixin:
                     raw_kv_indices
                 )
             )
-            sender = req.disagg_kv_sender
             indices_event = None
-            if getattr(sender, "supports_host_tensor_indices", False) and not (
-                sender.kv_mgr.enable_all_cp_ranks_for_transfer
-                and not get_parallel().enable_dsa_cache_layer_split
-            ):
+            if async_indices:
                 # The schedule stream may wait on the in-flight forward; move the
                 # D2H wait to the transfer worker so scheduling can continue.
                 page_indices_dev = kv_indices[::page_size] // page_size
-                page_indices = torch.empty(
-                    page_indices_dev.shape,
-                    dtype=page_indices_dev.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                page_indices.copy_(page_indices_dev, non_blocking=True)
+                page_indices = async_d2h(page_indices_dev)
                 indices_event = torch.cuda.Event()
                 indices_event.record(torch.cuda.current_stream())
             else:

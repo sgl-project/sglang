@@ -734,6 +734,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_mla_mamba_maps_kv_pages_and_state_slots(self):
         from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
         from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
@@ -777,8 +778,11 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 patch.object(
                     linker_pool_assembler,
                     "get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                    return_value=SimpleNamespace(
+                        attn_dcp_size=dcp_size, attn_dcp_rank=1
+                    ),
                 ),
+                patch.object(MLATokenToKVPool, "rows_are_dcp_collapsed", new=True),
             ):
                 return resolve_hybrid_device_pool_group(
                     kvcache=kvcache,
@@ -798,8 +802,21 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
         self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
 
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
-            resolve(dcp_size=2)
+        dsa = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        dsa.page_size = dsa.index_page_size = 1
+        dsa.kv_buffer = kvcache.full_kv_pool.kv_buffer
+        dsa.index_key_cache = SimpleNamespace(
+            buffer=[torch.zeros((4, 3), dtype=torch.uint8) for _ in range(2)]
+        )
+        kvcache.full_kv_pool = dsa
+        group = resolve(dcp_size=2)
+        for name in (PoolName.KV, PoolName.INDEXER):
+            entry = group.entry_map[name]
+            self.assertTrue(entry.dcp_sharded, name)
+            locations = entry.prepare_locations(
+                entry.translate_indices(torch.tensor([4, 5]))
+            )
+            self.assertEqual(locations, [2], name)
         params.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()

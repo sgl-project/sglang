@@ -58,6 +58,10 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
+    # Whether extend metadata covers the rows MLP sync pads the batch to, so
+    # attention takes the padded queries rather than only the real rows.
+    plans_padded_extend_rows: bool = False
+
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None

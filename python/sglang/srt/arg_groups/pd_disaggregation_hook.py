@@ -364,6 +364,7 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiVLForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",

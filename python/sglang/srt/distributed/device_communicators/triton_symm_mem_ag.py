@@ -476,7 +476,8 @@ class MultimemAllGatherer:
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
-            # nodes. Check world_size first so a TP=1 gatherer short-circuits
+            # nodes. Multicast spans nodes of one NVLink clique (MNNVL), so a
+            # cross-node group keeps multimem there. Check world_size first so a TP=1 gatherer short-circuits
             # before reading the parallel config (which may be unpublished on
             # offline paths). On a single node every TP rank is co-located, so skip the
             # in_the_same_node_as() all-reduce, which can segfault under some
@@ -486,11 +487,16 @@ class MultimemAllGatherer:
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
             ):
-                logger.warning(
-                    "multimem all-gather disabled because the TP group spans "
-                    "across nodes."
+                from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+                    is_one_nvlink_clique,
                 )
-                self._state = None
+
+                if not is_one_nvlink_clique(tp_group.cpu_group, tp_group.device):
+                    logger.warning(
+                        "multimem all-gather disabled because the TP group spans "
+                        "nodes outside one NVLink clique."
+                    )
+                    self._state = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state

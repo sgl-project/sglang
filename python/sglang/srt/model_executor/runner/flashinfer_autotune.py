@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
@@ -41,6 +42,8 @@ from sglang.srt.utils import empty_context, log_info_on_rank0
 from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
+    from flashinfer.autotuner import AutoTuner
+
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
@@ -286,6 +289,36 @@ def _drop_diverged_autotune_cache(
     cache_path.unlink(missing_ok=True)
 
 
+# Tactics ranked offline on real routing, in FlashInfer's autotune cache format,
+# for ops whose synthetic tuning probe picks a slower tactic. A file applies when
+# its GPU and FlashInfer version match; its keys carry the op shapes.
+_BUNDLED_TACTICS_DIR = Path(__file__).with_name("flashinfer_tactics")
+
+
+def _apply_autotune_overrides(tuner: AutoTuner, env: dict[str, str]) -> None:
+    """Load the bundled tactic files that match ``env`` over the cached ones."""
+    for path in sorted(_BUNDLED_TACTICS_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            logger.warning("FlashInfer autotune: skipping unreadable %s", path)
+            continue
+        file_meta = data.get("_metadata", {})
+        if any(file_meta.get(k) != env.get(k) for k in ("gpu", "flashinfer_version")):
+            continue
+        keys = {k for k in data if not k.startswith("_")}
+        tuner.load_configs(str(path))
+        # In-process tuning winners are consulted before file configs; drop them
+        # (AutoTuner internals of the FlashInfer version pinned in pyproject).
+        winners = tuner._winner_cache()
+        for cache_key in [k for k in winners if k.file_key in keys]:
+            del winners[cache_key]
+        log_info_on_rank0(
+            logger,
+            f"FlashInfer autotune: {len(keys)} tactics overridden from {path.name}",
+        )
+
+
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     from flashinfer import autotune_v2
@@ -297,10 +330,15 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     cache_path = flashinfer_autotune_cache_path(mr)
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
     reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
+    env = _collect_metadata()
+    # Kimi-K3.1 serves a cache hit without re-tuning and applies its bundled
+    # tactics over the tuned ones.
+    model_config = getattr(mr, "model_config", None)
+    kimi_k31 = model_config is not None and is_kimi_k31(model_config.hf_config)
     if reuse_cache:
         autotune_cache = cache_path
         if sync_group is not None:
-            _drop_diverged_autotune_cache(cache_path, sync_group, _collect_metadata())
+            _drop_diverged_autotune_cache(cache_path, sync_group, env)
         logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -330,6 +368,26 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
+            if kimi_k31:
+                # Deterministic restarts: run the warmup outside tuning mode so
+                # every op takes its cached tactic.
+                _apply_autotune_overrides(tuner, env)
+                # AutoTuner internals, as above: shapes that missed the cache
+                misses_before = len(tuner._logged_cache_miss_oor)
+                with autotune_dummy_run_mode(run_lm_head=run_lm_head):
+                    yield
+                if len(tuner._logged_cache_miss_oor) > misses_before:
+                    # Shapes outside the cached range ran the fallback tactic;
+                    # re-tune from scratch on the next start.
+                    logger.warning(
+                        "FlashInfer autotune cache %s does not cover all shapes; "
+                        "removing it so the next start re-tunes.",
+                        autotune_cache,
+                    )
+                    autotune_cache.unlink(missing_ok=True)
+                torch.cuda.current_stream().wait_stream(mr.forward_stream)
+                logger.info("FlashInfer autotune skipped: reused cached tactics.")
+                return
         mega_context = empty_context()
         if (
             get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
@@ -365,6 +423,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             yield
         if reuse_cache:
             tuner.save_configs(str(autotune_cache))
+        if kimi_k31:
+            _apply_autotune_overrides(tuner, env)
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 

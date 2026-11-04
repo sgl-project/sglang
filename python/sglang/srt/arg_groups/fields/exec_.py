@@ -302,7 +302,8 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -315,8 +316,22 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
+            resolvable=True,
+        ),
+    ] = None
+    enable_flashmla_prefill_token_packing: A[
+        Optional[bool],
+        Arg(
+            help="Pack adjacent Kimi-K3.1 prefill tokens into one FlashMLA query tile. "
+            "Requires SM100/SM103, FP8 V32 KV cache and at most 32 heads per TP rank. "
+            "Supports DCP prefill after KV gathering, without separate prefill CP. "
+            "Disabled during deterministic inference. On by default for Kimi-K3.1 "
+            "(it only reorders the sparse-key sum); use "
+            "--no-enable-flashmla-prefill-token-packing to disable.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),
     ] = None
@@ -344,7 +359,8 @@ class ExecKernel(msgspec.Struct):
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -356,6 +372,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
@@ -478,6 +495,11 @@ class ExecMamba(msgspec.Struct):
         fn="sglang.srt.arg_groups.model_override_base.mamba_extra_buffer_of",
         doc="Whether the hybrid-mamba radix cache keeps its extra state "
         "buffer: the radix cache is on and the strategy asks for one.",
+    )
+    decode_state_free_radix = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.decode_state_free_radix_of",
+        doc="Whether a PD decode server's radix cache holds FULL KV only and "
+        "each request keeps its own single Mamba state slot.",
     )
     enable_mamba_extra_buffer_lazy = Derived(
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",

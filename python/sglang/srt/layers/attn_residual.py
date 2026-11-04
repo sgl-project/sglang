@@ -142,12 +142,16 @@ def _score_kernel(
     for h0 in tl.static_range(0, H, BLOCK_H):
         offs_h = h0 + tl.arange(0, BLOCK_H)
         if j < NVB:
-            v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
-                tl.float32
-            )
+            v = tl.load(
+                bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h,
+                mask=offs_h < H,
+                other=0,
+            ).to(tl.float32)
         else:
-            v = tl.load(prefix_ptr + pid_t * stride_pm + offs_h).to(tl.float32)
-        cw = tl.load(cw_ptr + offs_h)
+            v = tl.load(
+                prefix_ptr + pid_t * stride_pm + offs_h, mask=offs_h < H, other=0
+            ).to(tl.float32)
+        cw = tl.load(cw_ptr + offs_h, mask=offs_h < H, other=0)
         sumsq += tl.sum(v * v)
         dotv += tl.sum(v * cw)
     rrms = 1.0 / tl.sqrt(sumsq / H + eps)
@@ -160,7 +164,7 @@ def _combine_kernel(
     bank_ptr,
     scores_ptr,  # [T, MAX_ROWS] fp32
     out_ptr,  # [T, H]
-    NVB,
+    NVB: tl.constexpr,
     stride_pm,
     stride_bm,
     stride_bb,
@@ -191,7 +195,7 @@ def _combine_kernel(
     # Weighted sum for this H chunk
     offs_h = h0 + tl.arange(0, BLOCK_H)
     acc = tl.zeros([BLOCK_H], tl.float32)
-    for j in range(0, NVB + 1):
+    for j in tl.static_range(0, NVB + 1):
         if j < NVB:
             v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
                 tl.float32
@@ -244,7 +248,7 @@ def _mix_fused(
         bank.stride(1),
         scores.stride(0),
         H=H,
-        BLOCK_H=_BLOCK_H,
+        BLOCK_H=min(triton.next_power_of_2(H), 8192),
         num_warps=8,
     )
 

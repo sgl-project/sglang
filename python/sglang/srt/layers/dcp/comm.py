@@ -20,12 +20,14 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import logging
 from typing import Optional
 
 import torch
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     CPTritonContext,
+    DcpDirectAllToAll,
     _lse_pack_dim,
     correct_attn_out,
     dcp_lse_combine_triton,
@@ -35,9 +37,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
@@ -173,12 +177,32 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
         )
     else:
         parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
+    # Reorder large byte-packed rows with word loads after the collective,
+    # keeping every rank's wire dtype/count unchanged.
+    reorder_dtype = None
+    if (
+        get_platform().is_sm100
+        and kv_a.dtype == torch.uint8
+        and gathered_kv_a.numel() >= 64 * 1024 * 1024
+        and kv_a.shape[-1] % 4 == 0
+    ):
+        reorder_dtype = torch.int64 if kv_a.shape[-1] % 8 == 0 else torch.int32
+    row_shape = kv_a.shape
+    if reorder_dtype is not None:
+        # The destination is freshly allocated, contiguous and aligned, even
+        # when a rank's input rows are empty or have an unusual storage offset.
+        # Reinterpret only after the collective so all ranks keep its original
+        # dtype/count, including heterogeneous devices that take the byte path.
+        gathered_kv_a = gathered_kv_a.view(reorder_dtype)
+        row_shape = (kv_a.shape[0], *gathered_kv_a.shape[1:])
     gathered_kv_a = (
-        gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
+        gathered_kv_a.reshape((dcp_world_size,) + row_shape)
         .transpose(0, 1)
-        .reshape(-1, *kv_a.shape[1:])
+        .reshape(-1, *row_shape[1:])
     )
-    return gathered_kv_a
+    return (
+        gathered_kv_a.view(kv_a.dtype) if reorder_dtype is not None else gathered_kv_a
+    )
 
 
 def all_gather_kv_cache_for_mha_chunk_extend(
@@ -468,7 +492,76 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
+        "direct": DcpDirectAllToAll(cp_group),
     }
+
+
+_PUSH_COMBINE_COMM = None
+
+
+def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
+    """Allocate the push plane of the one-kernel DCP reduce (see
+    dcp_push_combine_reduce). Call once per process before CUDA-graph capture."""
+    global _PUSH_COMBINE_COMM
+    from sglang.srt.environ import envs
+
+    if _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
+        return
+    if not envs.SGLANG_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
+        return
+    from sglang.kernels.ops.attention import dcp_push_combine as pc
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    slot_bytes = (
+        envs.SGLANG_DCP_PUSH_COMBINE_MAX_ROWS.get()
+        * (num_heads // cp_group.world_size)
+        * pc.SLOT_BYTES_PER_ROW
+    )
+    comm = CustomAllReduceV2(
+        cp_group.cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+        max_pull_size=0,
+        max_push_size=slot_bytes,
+    )
+    if comm.disabled:
+        logger.warning(
+            "DCP push-combine: CustomAllReduceV2 unavailable, keeping the a2a reduce"
+        )
+        return
+    pc.register_comm(comm.obj)
+    _PUSH_COMBINE_COMM = comm
+
+
+def dcp_push_combine_fits(rows: int) -> bool:
+    """Whether the push plane is set up and takes ``rows`` (batch x this rank's
+    heads) of 128-wide partials."""
+    from sglang.kernels.ops.attention import dcp_push_combine as pc
+
+    return (
+        _PUSH_COMBINE_COMM is not None
+        and rows * pc.SLOT_BYTES_PER_ROW <= _PUSH_COMBINE_COMM.max_push_size
+    )
+
+
+def dcp_push_combine_reduce(
+    v: torch.Tensor,
+    lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+) -> Optional[torch.Tensor]:
+    """The DCP reduce of 128-wide head partials ``v`` [B, H, 128] as one push +
+    combine kernel; returns this rank's heads [B, H / N * 128], or None when the
+    push plane is not set up or too small for ``B`` rows."""
+    from sglang.kernels.ops.attention import dcp_push_combine as pc
+
+    n = cp_group.world_size
+    if v.shape[-1] != pc.HEAD_DIM or not dcp_push_combine_fits(
+        v.shape[0] * (v.shape[1] // n)
+    ):
+        return None
+    return pc.dcp_push_combine(n, v, lse, is_lse_base_on_e=is_lse_base_on_e)
 
 
 def dcp_a2a_lse_reduce(
@@ -555,6 +648,10 @@ def _dcp_fi_a2a_lse_reduce(
         "fi_a2a workspace not initialized — call init_fi_a2a_workspace(dcp_group) "
         "at model-runner init (before CUDA graph capture)."
     )
+
+    direct = state["direct"](cp_attn_out, cp_attn_lse)
+    if direct is not None:
+        return dcp_lse_combine_triton(*direct, is_lse_base_on_e=is_lse_base_on_e)[0]
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape

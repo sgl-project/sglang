@@ -54,6 +54,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[list[bool]] = None,
+        kv_scale_pow2: bool = False,
         host_to_device_ratio: int = 2,
     ):
         super().__init__(
@@ -75,6 +76,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             tail_extra_slots=tail_extra_slots,
             max_running_requests=max_running_requests,
             skip_topk_layers=skip_topk_layers,
+            kv_scale_pow2=kv_scale_pow2,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
         self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)

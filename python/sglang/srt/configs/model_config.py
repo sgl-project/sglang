@@ -207,6 +207,9 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "KimiK31ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+            "KimiK3LinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -223,6 +226,7 @@ def is_glm_moe_dsa(config) -> bool:
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
 
@@ -416,6 +420,19 @@ def resolve_spec_hidden_size(
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
     return hc_hidden_size, hc_hidden_size
+
+
+def is_kimi_k31(config) -> bool:
+    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
+    return (
+        _hf_arch(config)
+        in (
+            "KimiK31ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+            "KimiK3LinearForCausalLM",
+        )
+        and _hf_attr(config, "index_topk") is not None
+    )
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
@@ -1331,17 +1348,16 @@ class ModelConfig:
     def _derive_model_shapes(self):
         from sglang.srt.configs.dots3 import Dots3Config
 
-        is_dflash_mla_draft = False
+        self.is_dflash_mla_draft = False
+        # Only DFlash-family draft checkpoints carry a dflash_config.
         if getattr(self.hf_config, "dflash_config", None):
             from sglang.srt.speculative.dflash_utils import (
-                parse_dflash_draft_config,
+                is_dflash_mla_draft_config,
                 validate_dflash_mla_draft_config,
             )
 
-            is_dflash_mla_draft = parse_dflash_draft_config(
-                draft_hf_config=self.hf_config
-            ).is_mla
-            if is_dflash_mla_draft:
+            self.is_dflash_mla_draft = is_dflash_mla_draft_config(self.hf_config)
+            if self.is_dflash_mla_draft:
                 # Validate before the generic defaults below fill missing fields.
                 validate_dflash_mla_draft_config(self.hf_config)
 
@@ -1379,7 +1395,7 @@ class ModelConfig:
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
-            is_dflash_mla_draft
+            self.is_dflash_mla_draft
             or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
@@ -1420,8 +1436,9 @@ class ModelConfig:
             else:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim
-            if is_dflash_mla_draft:
-                # Sliding draft layers share the latent rows, not a GQA head_dim.
+            if self.is_dflash_mla_draft:
+                # Sliding draft layers share the full layers' latent rows; the
+                # template's GQA head_dim would size a separate triton buffer.
                 self.swa_v_head_dim = self.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
@@ -1482,6 +1499,7 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -1490,6 +1508,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
             # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
@@ -2528,6 +2549,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "MuseGlimmerForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",

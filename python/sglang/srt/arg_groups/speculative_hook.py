@@ -22,9 +22,6 @@ from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.dspark_components.dspark_config import (
-        DSparkDraftConfig,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +164,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         cfg.disaggregation_mode == "decode"
         and cfg.disaggregation_decode_enable_radix_cache
-        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+        and cfg.speculative_algorithm
+        not in (None, "DFLASH", "DSPARK", "EAGLE", "EAGLE3")
     ):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -319,9 +317,12 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
+        # A pipelined PD prefill keeps the draft on its last stage, which
+        # materializes the prompt's draft KV for the decode.
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; decode and "
+            "non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -437,6 +438,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
+    _resolve_dflash_mla_draft_window(server_args)
+    _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -757,6 +760,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "--speculative-draft-model-path."
             )
 
+    _keep_mla_dspark_draft_off_trtllm_mha(server_args)
+
     if cfg.speculative_num_steps is None:
         declare_resolution(
             server_args,
@@ -805,8 +810,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "gamma resolution. Error: %s",
             e,
         )
-    if draft_config is not None:
-        _publish_dspark_mla_draft_backend(server_args, draft_config)
 
     gamma: Optional[int] = None
     if cfg.speculative_dspark_block_size is not None:
@@ -888,33 +891,36 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
-def _keep_mla_draft_off_trtllm_mha(
-    draft_backend: Optional[str], *, is_mla: bool
-) -> Optional[str]:
-    # trtllm_mha serves only MHA/GQA layers and implies CUDA.
-    if is_mla and draft_backend == "trtllm_mha":
-        logger.warning("MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
-        return "flashinfer"
-    return draft_backend
+def _load_draft_hf_config(cfg):
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    return get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
 
 
-def _publish_dspark_mla_draft_backend(
-    server_args: ServerArgs, draft_config: DSparkDraftConfig
-) -> None:
+def _keep_mla_dspark_draft_off_trtllm_mha(server_args: ServerArgs) -> None:
+    """trtllm_mha serves only MHA/GQA layers, so an MLA DSpark draft falls back."""
     cfg = resolving_view(server_args)
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
-    mla_backend = _keep_mla_draft_off_trtllm_mha(
-        draft_backend, is_mla=draft_config.is_mla
+    if draft_backend != "trtllm_mha":
+        return
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+
+    if not is_dflash_mla_draft_config(_load_draft_hf_config(cfg)):
+        return
+    # trtllm_mha implies CUDA, where flashinfer serves MLA drafts.
+    logger.warning("DSpark MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
+    declare_resolution(
+        server_args,
+        "_handle_dspark",
+        speculative_draft_attention_backend="flashinfer",
     )
-    if mla_backend != draft_backend:
-        # Declared at launch so the KV planners see the backend the draft runs.
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            speculative_draft_attention_backend=mla_backend,
-        )
 
 
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
@@ -923,6 +929,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+    from sglang.srt.speculative.draft_worker_common import (
+        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    )
+
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
@@ -932,6 +943,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             return current_platform.supports_speculative_draft_attention_backend(
                 "DFLASH", backend
             )
+        if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+            # These serve only MLA layers: a draft verify window through the
+            # target's MLA decode kernels (DCP owner rows under DCP).
+            return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
         return backend in supported_draft_backends
 
     def get_fallback_backend() -> str:
@@ -977,18 +992,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.speculative.dflash_utils import (
-            get_dflash_layer_types,
-            parse_dflash_draft_config,
-        )
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
 
-        draft_hf_config = get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
-        )
+        draft_hf_config = _load_draft_hf_config(cfg)
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )
@@ -1000,18 +1006,17 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        draft_backend = _keep_mla_draft_off_trtllm_mha(
-            draft_backend,
-            is_mla=parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla,
-        )
-        if draft_backend == "trtllm_mha" and not (all_sliding or all_causal):
+        # trtllm_mha serves only MHA/GQA layers.
+        if is_dflash_mla_draft_config(draft_hf_config) or not (
+            all_sliding or all_causal
+        ):
             fallback_backend = get_fallback_backend()
             # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
             if not current_platform.is_out_of_tree() and get_platform().is_sm100:
                 fallback_backend = "fa4"
             logger.warning(
-                "DFLASH only enables 'trtllm_mha' when all layers use sliding "
-                "attention or the draft is explicitly causal; got "
+                "DFLASH only enables 'trtllm_mha' for non-MLA drafts whose "
+                "layers all use sliding attention or are explicitly causal; got "
                 "layer_types=%r, is_causal=%r. "
                 "Falling back to '%s'.",
                 layer_types,
@@ -1019,6 +1024,16 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
+    elif draft_backend == "tokenspeed_mla" and not is_dflash_mla_draft_config(
+        _load_draft_hf_config(cfg)
+    ):
+        fallback_backend = get_fallback_backend()
+        logger.warning(
+            "DFLASH only enables 'tokenspeed_mla' for MLA drafts. "
+            "Falling back to '%s'.",
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -1026,6 +1041,77 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         "_resolve_dflash_draft_attention_backend",
         speculative_draft_attention_backend=draft_backend,
     )
+
+
+def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
+    """Keep the compact draft table (``--speculative-draft-window-size``) off
+    the MLA-only draft backends where it cannot be read; see
+    ``resolve_mla_draft_compact_window``. Runs after the draft backend is final."""
+    from sglang.srt.speculative.dflash_utils import (
+        is_dflash_mla_draft_config,
+        resolve_mla_draft_compact_window,
+    )
+    from sglang.srt.speculative.draft_worker_common import (
+        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    )
+
+    cfg = resolving_view(server_args)
+    window_size = cfg.speculative_draft_window_size
+    if window_size is None:
+        return
+    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        return
+    draft_hf_config = _load_draft_hf_config(cfg)
+    if not is_dflash_mla_draft_config(draft_hf_config):
+        return
+    kept = resolve_mla_draft_compact_window(
+        draft_hf_config,
+        window_size=int(window_size),
+        dcp_size=cfg.dcp_size,
+        # Unresolved (None) here means the default page size of 1.
+        page_size=cfg.page_size or 1,
+        megakernel=bool(cfg.enable_nvidia_megakernel),
+    )
+    if kept is None:
+        logger.warning(
+            "DFLASH: --speculative-draft-window-size %d is dropped on %s: every "
+            "draft layer is sliding_attention and the backend applies that window "
+            "itself over the full request table.",
+            int(window_size),
+            cfg.speculative_draft_attention_backend,
+        )
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_mla_draft_window",
+            speculative_draft_window_size=None,
+        )
+
+
+def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
+    """Settle SGLANG_DFLASH_DRAFT_KV_RING once, before any worker starts, so
+    every process agrees, including PP stages that own no draft: they still
+    register the ring's PD state slots. Runs after the draft backend and the
+    compact window are final."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        draft_kv_ring_unsupported_reason,
+    )
+
+    flag = envs.SGLANG_DFLASH_DRAFT_KV_RING
+    if not flag.get():
+        return
+    cfg = resolving_view(server_args)
+    reason = draft_kv_ring_unsupported_reason(
+        _load_draft_hf_config(cfg),
+        draft_backend=cfg.speculative_draft_attention_backend,
+        draft_window_size=cfg.speculative_draft_window_size,
+    )
+    if reason is None:
+        logger.info("DFLASH draft KV ring: on.")
+        return
+    if flag.is_set():
+        raise ValueError(f"SGLANG_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+    logger.info("DFLASH draft KV ring: off, %s.", reason)
+    flag.set(False)
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:

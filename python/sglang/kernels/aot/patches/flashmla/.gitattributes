@@ -1,0 +1,2 @@
+# Context-only blank lines are part of the unified-diff format.
+*.patch -whitespace

@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_kimi_k31,
     is_minimax_sparse,
 )
 from sglang.srt.distributed.utils import get_pp_indices
@@ -66,7 +67,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     select_dsv4_kv_layout,
 )
-from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
+from sglang.srt.mem_cache.draft_kv_budget import (
+    resolve_dflash_draft_cell_size,
+    resolve_dflash_draft_rows_dcp_collapsed,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -316,6 +320,30 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     unified_total_bytes: Optional[int] = None
 
 
+def mla_draft_rows_are_dcp_collapsed(
+    *,
+    model_config: ModelConfig,
+    use_mla_backend: bool,
+    has_mambaish_state: bool,
+    is_hybrid_swa: bool,
+    kv_cache_dtype: torch.dtype,
+) -> bool:
+    """Whether a draft with this geometry keeps DCP-collapsed (physical) MLA rows;
+    see KVCacheConfigurator.draft_mla_rows_are_physical. Shared with the target's
+    pool budget, which must not charge such a draft per widened location."""
+    return (
+        get_parallel().attn_dcp_size > 1
+        and use_mla_backend
+        and not has_mambaish_state
+        and not is_hybrid_swa
+        and not is_deepseek_dsa(model_config.hf_config)
+        and not is_deepseek_v4(model_config.hf_config)
+        and not is_float4_e2m1fn_x2(kv_cache_dtype)
+        and not current_platform.is_out_of_tree()
+        and get_exec().kernel.attention_backend != "ascend"
+    )
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -345,6 +373,9 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_parallel_layout: DraftParallelLayout | None = None
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
+    # The DFLASH draft pool keeps DCP-collapsed MLA rows (one per target row),
+    # so the target's budget charges it per row, not per widened location.
+    dflash_draft_rows_dcp_collapsed: bool = field(init=False, default=False)
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
@@ -377,6 +408,11 @@ class KVCacheConfigurator:
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
             )
+            self.dflash_draft_rows_dcp_collapsed = (
+                resolve_dflash_draft_rows_dcp_collapsed(
+                    draft_model_config=aux.draft_model_config
+                )
+            )
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
@@ -408,8 +444,8 @@ class KVCacheConfigurator:
         # SWA allocators never widen under DCP.
         if self.is_hybrid_swa:
             return max_total_num_tokens
-        # Target rows widen into attn_dcp_size ids; draft sizes already carry
-        # loc_space_scale.
+        # Target rows widen into attn_dcp_size ids; a draft that spans the
+        # widened space carries that widening in its own size (loc_space_scale).
         return (
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
@@ -512,12 +548,37 @@ class KVCacheConfigurator:
             unified_memory_pool=pools.unified_memory_pool,
         )
 
+    @property
+    def draft_mla_rows_are_physical(self) -> bool:
+        """Whether the draft's MLA rows are DCP-collapsed like the target's.
+
+        True only for the plain MLA draft pool built by ``_build_mla_kv_pool``:
+        under DCP it writes and reads owner rows at ``loc // dcp_size``
+        (MLATokenToKVPool._scatter_mla_rows, the DCP page table), so it spans
+        and pages the same physical row space as the target. An MHA draft keeps
+        raw widened locs (masked_set_kv_buffer_kernel) and stays logical.
+        """
+        return (
+            self.is_draft_worker
+            and get_parallel().attn_dcp_size > 1
+            and mla_draft_rows_are_dcp_collapsed(
+                model_config=self.model_config,
+                use_mla_backend=self.use_mla_backend,
+                has_mambaish_state=self.mambaish_config is not None,
+                is_hybrid_swa=self.is_hybrid_swa,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+        )
+
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
-    #    span and page that space; the sharded target translates and stays per-rank.
+    #    span and page that space; a DCP-collapsed draft and the sharded target
+    #    translate and stay per-rank.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
+        if self.draft_mla_rows_are_physical:
+            return 1
         dcp_size = get_parallel().attn_dcp_size
         return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
 
@@ -534,8 +595,9 @@ class KVCacheConfigurator:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        # Draft pools are replicated, not DCP-sharded, yet consume the shared
-        # allocator's virtual locs in [0, max_total * dcp_size) untranslated.
+        # A replicated draft pool consumes the shared allocator's virtual locs
+        # in [0, max_total * dcp_size) untranslated; a DCP-collapsed one only
+        # ever addresses the owner rows, so its sizes stay physical.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale
         if full_max_total_num_tokens is not None:
@@ -710,8 +772,21 @@ class KVCacheConfigurator:
                 draft_virtual_id_space = (
                     (draft_virtual_id_space + page - 1) // page * page
                 )
+                if self.draft_mla_rows_are_physical:
+                    # Owner rows carry one widened id each, so the pool keeps a
+                    # dcp_size-th of the space it is addressed in.
+                    dcp_size = get_parallel().attn_dcp_size
+                    widened_page = page * dcp_size
+                    widened = (
+                        (draft_virtual_id_space + widened_page - 1)
+                        // widened_page
+                        * widened_page
+                    )
+                    draft_pool_size = widened // dcp_size
+                else:
+                    draft_pool_size = draft_virtual_id_space
                 size_overrides = {
-                    "max_total_num_tokens": draft_virtual_id_space,
+                    "max_total_num_tokens": draft_pool_size,
                 }
                 if (
                     isinstance(
@@ -726,10 +801,14 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
-            elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+            elif (
+                isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator)
+                and not self._uses_dflash_draft_kv_ring()
+            ):
                 # HiSparse's target allocator hands out logical IDs from its
                 # host-expanded address space. Draft KV is direct-indexed by
                 # those shared IDs, so its GPU pool must span the same space.
+                # A DFLASH draft KV ring is addressed by ring rows instead.
                 draft_virtual_id_space = token_to_kv_pool_allocator.size_full
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
@@ -738,6 +817,28 @@ class KVCacheConfigurator:
                 sizes = msgspec.structs.replace(
                     sizes, max_total_num_tokens=draft_virtual_id_space
                 )
+
+        if self._uses_dflash_draft_kv_ring() and req_to_token_pool is not None:
+            from sglang.srt.speculative.dflash_draft_ring import (
+                draft_kv_ring_pool_rows,
+                draft_kv_ring_rows_per_req,
+                draft_kv_ring_window_left,
+            )
+
+            # The draft keeps a per-request ring of rows, not one per target slot.
+            rows_per_req = draft_kv_ring_rows_per_req(
+                window_left=draft_kv_ring_window_left(self.model_config.hf_config),
+                block_size=int(get_spec().speculative_num_draft_tokens),
+                dcp_size=get_parallel().attn_dcp_size,
+            )
+            sizes = msgspec.structs.replace(
+                sizes,
+                max_total_num_tokens=draft_kv_ring_pool_rows(
+                    req_pool_rows=req_to_token_pool.req_to_token.shape[0],
+                    rows_per_req=rows_per_req,
+                    page_size=max(int(self.pool_page_size or 1), 1),
+                ),
+            )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -789,10 +890,16 @@ class KVCacheConfigurator:
                 )
 
         if draft_virtual_id_space is not None:
-            assert token_to_kv_pool.size >= draft_virtual_id_space, (
+            # The allocator's ids are widened, so compare in that same space.
+            pool_logical_size = (
+                token_to_kv_pool.size
+                * get_parallel().attn_dcp_size
+                // self.loc_space_scale
+            )
+            assert pool_logical_size >= draft_virtual_id_space, (
                 "draft token_to_kv_pool smaller than the shared unified "
                 f"allocator's virtual-id space: pool size="
-                f"{token_to_kv_pool.size} < "
+                f"{pool_logical_size} < "
                 f"virtual_id_space={draft_virtual_id_space}; "
                 "verify-window writes at high virtual ids would go out of "
                 "bounds."
@@ -2394,6 +2501,7 @@ class KVCacheConfigurator:
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
+            kv_scale_pow2=is_kimi_k31(self.model_config.hf_config),
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -2639,6 +2747,7 @@ class KVCacheConfigurator:
                     index_kpool_compress=get_dsa_index_kpool_compress(
                         self.model_config.hf_config
                     ),
+                    kv_scale_pow2=is_kimi_k31(self.model_config.hf_config),
                     skip_topk_layers=(
                         None
                         if self.is_draft_worker
@@ -2661,6 +2770,20 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
+        if (
+            get_memory().enable_hisparse
+            and not self.is_draft_worker
+            and extra_args.get("use_dsa")
+        ):
+            reject_out_of_tree_path(
+                current_platform, subsystem="the HiSparse DSA KV pool"
+            )
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            full_pool_class = HiSparseDSATokenToKVPool
+            extra_args["host_to_device_ratio"] = (
+                parse_hisparse_config().host_to_device_ratio
+            )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -2710,6 +2833,13 @@ class KVCacheConfigurator:
             **extra_args,
         )
         return token_to_kv_pool
+
+    def _uses_dflash_draft_kv_ring(self) -> bool:
+        if not (self.is_draft_worker and self.spec_algorithm.is_dflash()):
+            return False
+        from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
+
+        return draft_kv_ring_enabled()
 
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
@@ -3060,7 +3190,9 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        if get_memory().disable_radix_cache:
+        # A state-free decode tree holds no state: one slot per request, as
+        # without a radix cache.
+        if get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix:
             return 1
 
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
@@ -3324,9 +3456,10 @@ class KVCacheConfigurator:
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             get_memory().disable_radix_cache
-            and get_schedule().max_running_requests is not None
-        ):
-            # Use explicitly set max_running_requests when radix cache is disabled
+            # a state-free decode tree caches no Mamba state either
+            or get_exec().mamba.decode_state_free_radix
+        ) and get_schedule().max_running_requests is not None:
+            # Use explicitly set max_running_requests when no tree holds states
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=max(
@@ -3422,21 +3555,26 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
-    # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
-    # backend for the local role determines the local pool layout; the
+    # TRTLLM and Prims-TS use the raw MLA KV layout. In disaggregated serving
+    # only the backend for the local role determines the local pool layout; the
     # inactive role may legitimately have a different default backend.
+    from sglang.srt.layers.attention.dsa_backend import uses_raw_fp8_dsa_kv_layout
+
     disaggregation_mode = get_disagg().disaggregation_mode
     if disaggregation_mode == "decode":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_decode_backend == "trtllm"
-    elif disaggregation_mode == "prefill":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_prefill_backend == "trtllm"
-    else:
-        uses_trtllm_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend == "trtllm"
-            or get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
+            get_exec().kernel.dsa_decode_backend
         )
+    elif disaggregation_mode == "prefill":
+        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
+            get_exec().kernel.dsa_prefill_backend
+        )
+    else:
+        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
+            get_exec().kernel.dsa_prefill_backend
+        ) or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
 
-    if uses_trtllm_kv_layout:
+    if uses_raw_fp8_kv_layout:
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:

@@ -32,6 +32,7 @@ def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
     manager._num_shards = 1
+    manager.state_item_lens_sums = [16, 64]
     manager.transfer_queues = [queue.Queue()]
     manager._transfer_queues = manager.transfer_queues
     with get_context().override_server_args(dp_size=1, enable_trace=False):
@@ -109,6 +110,7 @@ class TestCommonSenderLifecycle(unittest.TestCase):
                 self.assertEqual(last.num_kv_tokens, 100)
                 self.assertEqual(sender._transfer_num_kv_indices, 4)
                 self.assertEqual(sender._transfer_num_state_indices, 2)
+                self.assertEqual(sender._transfer_state_bytes, 2 * 16)
 
     def test_mori_consumes_early_event_once_and_skips_cp_replicated_state(self):
         sender, manager, chunks = make_sender(self.mori_manager)

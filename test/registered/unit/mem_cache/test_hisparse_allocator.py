@@ -362,6 +362,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 
         manager = object.__new__(MooncakeKVManager)
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
         manager.kv_args = SimpleNamespace(
             kv_data_ptrs=[1000, 2000, 3000],
             kv_item_lens=[100, 100, 100],
@@ -411,6 +413,16 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         np.testing.assert_array_equal(info.dst_kv_indices, host_pages)
         np.testing.assert_array_equal(info.dst_device_kv_indices, device_pages)
+
+
+class TestHiSparseRetraction(CustomTestCase):
+    def test_retraction_rebootstraps_instead_of_host_backup(self):
+        """A retracted HiSparse decode request is recomputed by the prefill;
+        the allocator cannot take a host copy of its KV."""
+        from sglang.srt.mem_cache.common import retraction_needs_rebootstrap
+
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        self.assertTrue(retraction_needs_rebootstrap(allocator))
 
 
 if __name__ == "__main__":

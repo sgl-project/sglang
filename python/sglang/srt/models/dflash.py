@@ -12,12 +12,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.communication import sp_collective
+from sglang.kernels.ops.speculative.dflash import (
+    dflash_grouped_conv,
+    selector_walk_triton,
+)
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -31,7 +36,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -46,8 +51,9 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
-    get_dflash_layer_types,
+    get_dflash_layer_attention_params,
     is_dense_head_weight,
+    is_dflash_mla_draft_config,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
@@ -59,6 +65,7 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
 
 try:
     from flashinfer import top_k as _flashinfer_top_k
@@ -107,6 +114,85 @@ def _project_candidate_logits(
     return logits
 
 
+# Symmetric-buffer name of the fused candidate all-gather's output.
+_CANDIDATE_AG_BUFFER = "dflash_candidate_ag"
+# None: not probed yet.
+_CANDIDATE_AG_READY: Optional[bool] = None
+
+
+def _candidate_ag_ready(group) -> bool:
+    """Whether the direct all-gather can run on ``group``; registers its comm once."""
+    global _CANDIDATE_AG_READY
+    if _CANDIDATE_AG_READY is None:
+        _CANDIDATE_AG_READY = _probe_candidate_ag(group)
+    return _CANDIDATE_AG_READY
+
+
+def _probe_candidate_ag(group) -> bool:
+    # The kernel barriers on k3_ar_fusion's communicator, so only the TP group works.
+    if (
+        not envs.SGLANG_OPT_DFLASH_FUSED_CANDIDATE_AG.get()
+        or not k3_ar_fusion.enabled()
+        or group is not get_parallel().tp_group
+    ):
+        return False
+
+    try:
+        sp_collective.register_comm(group.ca_comm.obj)
+    except AssertionError:
+        logger.warning(
+            "DFLASH fused candidate all-gather: another communicator owns "
+            "TP%d; using NCCL.",
+            group.world_size,
+        )
+        return False
+    logger.info(
+        "DFLASH fused candidate all-gather enabled (TP%d, one direct multicast "
+        "all-gather of the top-k values and ids)",
+        group.world_size,
+    )
+    return True
+
+
+def _fused_candidate_all_gather(
+    group, vals: torch.Tensor, global_ids: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """[N, K] vals/ids -> [N, tp*K] fp32 vals, int32 ids, rank-major; None for NCCL."""
+    if not _candidate_ag_ready(group):
+        return None
+
+    rows, k = vals.shape
+    tp = group.world_size
+    # Each rank's [N, 2K] int32 shard must be whole 16 B vectors.
+    if (rows * k) % 2 or rows > k3_ar_fusion._max_buffer_rows():
+        return None
+    payload = torch.empty((rows, 2 * k), dtype=torch.int32, device=vals.device)
+    payload[:, :k].view(torch.float32).copy_(vals)
+    # Global ids stay below the vocabulary size, so int32 carries them exactly.
+    payload[:, k:].copy_(global_ids)
+    # The kernel copies raw 16 B vectors; bf16 is only its host-side dtype check.
+    out = k3_ar_fusion.symm_buffer(
+        _CANDIDATE_AG_BUFFER,
+        rows,
+        tp * 4 * k,
+        torch.bfloat16,
+        group_name=group.cpu_group.group_name,
+    )
+    sp_collective.all_gather_direct(
+        tp,
+        payload.view(torch.bfloat16),
+        out,
+        output_mc_ptr=k3_ar_fusion.get_mc_ptr(out),
+        # One CTA covers the few hundred bytes each rank sends.
+        tuning=sp_collective.Tuning(num_blocks=1, block_size=128),
+    )
+    # [tp, N, 2K] rank-major -> [N, tp, 2K]; reshape copies each half contiguous.
+    gathered = out.view(torch.int32).view(tp, rows, 2 * k).transpose(0, 1)
+    gathered_vals = gathered[..., :k].view(torch.float32).reshape(rows, tp * k)
+    gathered_ids = gathered[..., k:].reshape(rows, tp * k)
+    return gathered_vals, gathered_ids
+
+
 def candidate_topk(
     hidden: torch.Tensor,
     lm_head: nn.Module,
@@ -130,7 +216,16 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    tp = get_parallel().tp_size == 1
+    # Gather over the group the head is vocab-sharded on: under DP attention with
+    # --enable-dp-lm-head that is the attention-TP group, whose ranks share this
+    # DP rank's tokens (the full TP group mixes other DP ranks' rows).
+    parallel = get_parallel()
+    group = (
+        parallel.attn_tp_group
+        if getattr(lm_head, "use_attn_tp_group", False)
+        else parallel.tp_group
+    )
+    tp = group.world_size == 1
     num_org = (
         int(lm_head.org_vocab_size)
         if tp
@@ -147,51 +242,16 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered = _fused_candidate_all_gather(group, vals, global_ids)
+    if gathered is not None:
+        gathered_vals, gathered_ids = gathered
+    else:
+        gathered_vals = group.all_gather(vals.float(), dim=-1)
+        gathered_ids = group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
-        lse = torch.logsumexp(
-            tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
-        )
+        lse = torch.logsumexp(group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1)
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
-
-
-def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
-    """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = config.get_text_config()
-    is_causal = getattr(text_config, "is_causal", None)
-    if is_causal is None:
-        return default
-    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
-
-
-def _get_dflash_layer_attention_params(
-    config, layer_id: int
-) -> Tuple[int, AttentionType]:
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
-    if layer_id >= len(layer_types):
-        raise ValueError(
-            "DFLASH config.layer_types must contain one entry per draft layer. "
-            f"Got {len(layer_types)} entries, layer_id={layer_id}."
-        )
-
-    layer_type = layer_types[layer_id]
-    if layer_type == "full_attention":
-        return -1, _get_dflash_attention_type(
-            config, default=AttentionType.ENCODER_ONLY
-        )
-    if layer_type == "sliding_attention":
-        sliding_window_size = get_dflash_attention_sliding_window_size(config)
-        assert sliding_window_size is not None
-        return sliding_window_size, _get_dflash_attention_type(
-            config, default=AttentionType.DECODER
-        )
-    raise ValueError(
-        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
-    )
 
 
 _ROPE_DIM_SUPERSEDED_KEYS = frozenset(
@@ -290,7 +350,7 @@ class DFlashAttention(nn.Module):
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
         )
-        self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
+        self.sliding_window_size, self.attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
         draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
@@ -470,31 +530,23 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashMLAAttention(DeepseekV2AttentionMLA):
+    """SpecForge MLA draft attention served by the target's absorbed MLA path.
+
+    SpecForge exports DeepSeek's MLA parameter names and RoPE conventions, so
+    only the DFlash layer causality, context-KV writes and loading differ.
+    """
+
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
     ) -> None:
         if quant_config is not None:
             raise ValueError("DFLASH mla drafts require unquantized draft weights.")
-        if get_parallel().attn_dcp_size > 1:
-            # The draft pool is not DCP-sharded, but the target MLA layer
-            # would gather across DCP ranks.
-            raise ValueError("DFLASH mla drafts do not support --dcp-size > 1.")
-        sliding_window_size, attn_type = _get_dflash_layer_attention_params(
+        # Under DCP the draft pool keeps DCP owner rows like the target's
+        # (KVCacheConfigurator.draft_mla_rows_are_physical), so the layer runs
+        # the target's DCP decode path: gathered q, rank-local KV, LSE merge.
+        sliding_window_size, attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
-        if sliding_window_size > -1:
-            from sglang.srt.speculative.draft_worker_common import (
-                resolve_draft_worker_attention_backend,
-            )
-
-            # The other MLA backends ignore a layer's sliding window.
-            draft_attention_backend = resolve_draft_worker_attention_backend()
-            if draft_attention_backend != "triton":
-                raise ValueError(
-                    "DFLASH mla sliding_attention layers require "
-                    "--speculative-draft-attention-backend triton, "
-                    f"got {draft_attention_backend!r}."
-                )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
             "rope_type", rope_scaling.get("type")
@@ -524,21 +576,20 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             self.fused_qkv_a_proj_with_mqa.weight.weight_loader = (
                 self._load_fused_a_proj_shard
             )
+        kv_b_proj_loader = self.kv_b_proj.weight.weight_loader
+
+        def load_kv_b_proj(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+            kv_b_proj_loader(param, loaded_weight)
+            self.absorb_kv_b_proj()
+
+        self.kv_b_proj.weight.weight_loader = load_kv_b_proj
 
     def _load_fused_a_proj_shard(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        shard_id: Optional[int] = None,
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int
     ) -> None:
-        # None is the already-fused weight, as for stacked linear loaders.
-        rows = (
-            param.data
-            if shard_id is None
-            else param.data.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
-            )[shard_id]
-        )
+        rows = param.data.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+        )[shard_id]
         if rows.shape != loaded_weight.shape:
             raise ValueError(
                 f"DFLASH mla fused a_proj shard {shard_id} expects "
@@ -547,6 +598,7 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         rows.copy_(loaded_weight)
 
     def absorb_kv_b_proj(self) -> None:
+        """Split kv_b_proj into the per-head w_kc / w_vc the absorbed forward reads."""
         w_kc, w_vc = self.kv_b_proj.weight.unflatten(
             0, (-1, self.qk_nope_head_dim + self.v_head_dim)
         ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
@@ -560,10 +612,13 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         get_attn_tp_context().set_attn_inputs(
             AttentionInputs(hidden_states, forward_batch, self.prepare_qkv_latent)
+        )
+        # Sized for the fp8 bmm scales, which unquantized drafts never take.
+        zero_allocator = BumpAllocator(
+            buffer_size=2, dtype=torch.float32, device=hidden_states.device
         )
         output = super().forward(
             positions=positions,
@@ -577,7 +632,8 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
     def project_context_kv(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Normalized latent and rotated k_pe of context tokens, each [n, 1, dim]."""
+        """Cache rows of target-context tokens: normalized latent and rotated k_pe,
+        each [n, 1, dim]."""
         if self.q_lora_rank is None:
             latent, _ = self.kv_a_proj_with_mqa(hidden_states)
         else:
@@ -600,7 +656,8 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
-        """With cache_loc_2d, writes only each request's first commit_lens rows."""
+        """Write this layer's rows for target-context tokens; with cache_loc_2d,
+        only each request's first commit_lens rows."""
         k_nope, k_pe = self.project_context_kv(positions, hidden_states)
         if cache_loc_2d is None:
             pool.set_mla_kv_buffer(
@@ -709,6 +766,15 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        if hidden_states.is_cuda and hidden_states.dim() == 2:
+            return dflash_grouped_conv(
+                hidden_states,
+                delta,
+                self.base_kernel[side],
+                self.block_size,
+                self.group_size,
+                self.taps,
+            )
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.
         torch._dynamo.mark_static(hidden_states, 1)
@@ -744,7 +810,6 @@ class DFlashDecoderLayer(nn.Module):
         self,
         config,
         layer_id: int,
-        attention_cls: type[nn.Module],
         attention_conv: Optional[DFlashGroupedConv] = None,
         mlp_conv: Optional[DFlashGroupedConv] = None,
         quant_config=None,
@@ -757,6 +822,13 @@ class DFlashDecoderLayer(nn.Module):
         norm_cls = GemmaRMSNorm if getattr(config, "use_gemma_norm", False) else RMSNorm
         self.input_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
         attention_prefix = f"{prefix}.self_attn" if prefix else ""
+        attention_cls = self.attention_cls
+        if is_dflash_mla_draft_config(config):
+            if attention_cls is not DFlashAttention:
+                raise ValueError(
+                    f"{type(self).__name__} does not support mla draft attention."
+                )
+            attention_cls = DFlashMLAAttention
         self.self_attn = attention_cls(
             config=config,
             layer_id=layer_id,
@@ -778,7 +850,6 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        **attn_kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.numel() == 0:
             # Keep return types consistent for upstream callers.
@@ -801,7 +872,6 @@ class DFlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            **attn_kwargs,
         )
         if attention_kernel is not None:
             attn_out = self.attention_conv.finish(attn_out, attention_kernel)
@@ -832,6 +902,8 @@ class DFlashDraftModel(nn.Module):
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
+    # `project_target_hidden` gathers a TP-split `fc` (SGLANG_OPT_DFLASH_TP_AUX_FC).
+    supports_fc_tp_split = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -843,21 +915,14 @@ class DFlashDraftModel(nn.Module):
         self.rms_norm_eps = rms_norm_eps
         use_gemma_norm = bool(getattr(config, "use_gemma_norm", False))
         norm_cls = GemmaRMSNorm if use_gemma_norm else RMSNorm
-        if use_gemma_norm:
-            # Fused context KV materialization assumes ordinary RMSNorm weights.
+        if use_gemma_norm or is_dflash_mla_draft_config(config):
+            # Fused context KV materialization assumes ordinary RMSNorm weights,
+            # and an MLA draft has no fused qkv_proj to slice (context KV goes
+            # through project_context_kv()).
             self.supports_fused_context_kv = False
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
         )
-        attention_cls = self.decoder_layer_cls.attention_cls
-        if draft_config.is_mla:
-            if attention_cls is not DFlashAttention:
-                raise ValueError(
-                    f"{type(self).__name__} does not support mla draft attention."
-                )
-            attention_cls = DFlashMLAAttention
-            # No fused qkv_proj to slice.
-            self.supports_fused_context_kv = False
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
@@ -888,7 +953,6 @@ class DFlashDraftModel(nn.Module):
                 self.decoder_layer_cls(
                     config=config,
                     layer_id=i,
-                    attention_cls=attention_cls,
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
@@ -918,6 +982,8 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
+        # [start, end) fc output columns this rank computes; None = replicated fc.
+        self.fc_tp_columns = self._fc_tp_columns(hidden_size)
         if self.quantizable:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
@@ -926,6 +992,18 @@ class DFlashDraftModel(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=fc_prefix,
+            )
+        elif self.fc_tp_columns is not None:
+            start, end = self.fc_tp_columns
+            self.fc = nn.Linear(
+                self.num_context_features * hidden_size, end - start, bias=False
+            )
+            logger.info(
+                "DFLASH aux fc split across TP: columns [%d, %d) of %d "
+                "(SGLANG_OPT_DFLASH_TP_AUX_FC)",
+                start,
+                end,
+                hidden_size,
             )
         else:
             self.fc = nn.Linear(
@@ -1001,7 +1079,34 @@ class DFlashDraftModel(nn.Module):
         projected = self.fc(target_hidden)
         if self.quantizable:
             projected = projected[0]
-        return self.hidden_norm(projected)
+        elif self.fc_tp_columns is not None:
+            projected = self._gather_fc_columns(projected)
+        ctx_hidden = self.hidden_norm(projected)
+        return ctx_hidden
+
+    def _fc_tp_columns(self, hidden_size: int) -> Optional[Tuple[int, int]]:
+        parallel = get_parallel()
+        if (
+            not envs.SGLANG_OPT_DFLASH_TP_AUX_FC.get()
+            or not self.supports_fc_tp_split
+            or self.quantizable
+            or parallel.tp_size == 1
+            or hidden_size % parallel.tp_size != 0
+            # An attention-owning draft runs under a narrowed TP group (draft_tp_context).
+            or parallel.attn_dp_enabled
+            or parallel.attn_cp_size > 1
+        ):
+            return None
+        width = hidden_size // parallel.tp_size
+        return parallel.tp_rank * width, (parallel.tp_rank + 1) * width
+
+    def _gather_fc_columns(self, local: torch.Tensor) -> torch.Tensor:
+        # Each element is one rank's value plus zeros, so the all-reduce gathers
+        # exactly (a -0.0 comes back as +0.0).
+        start, end = self.fc_tp_columns
+        full = local.new_zeros(local.shape[0], int(self.config.hidden_size))
+        full[:, start:end] = local
+        return get_parallel().tp_group.all_reduce(full)
 
     @torch.no_grad()
     def forward(
@@ -1025,18 +1130,10 @@ class DFlashDraftModel(nn.Module):
                 )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
-        attn_kwargs = {}
-        if self.draft_config.is_mla:
-            # Two fp8 bmm scales per layer, as in DeepseekV2Model.
-            attn_kwargs["zero_allocator"] = BumpAllocator(
-                buffer_size=2 * len(self.layers),
-                dtype=torch.float32,
-                device=hidden_states.device,
-            )
 
         for layer in self.layers:
             hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual, **attn_kwargs
+                positions, hidden_states, forward_batch, residual
             )
 
         if hidden_states.numel() != 0:
@@ -1129,6 +1226,16 @@ class DFlashDraftModel(nn.Module):
                             getattr(param, "pack_factor", None) is None
                             and tuple(loaded_weight.shape) == tuple(param.shape)
                         )
+                    elif self.fc_tp_columns is not None:
+                        expected_shape = (
+                            int(self.config.hidden_size),
+                            int(self.num_context_features * self.config.hidden_size),
+                        )
+                        loaded_shape = tuple(loaded_weight.shape)
+                        shape_matches = loaded_shape == expected_shape
+                        if shape_matches:
+                            start, end = self.fc_tp_columns
+                            loaded_weight = loaded_weight[start:end]
                     else:
                         expected_shape = tuple(param.shape)
                         loaded_shape = tuple(loaded_weight.shape)
@@ -1166,13 +1273,6 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH Domino checkpoint is missing required projector weights: "
                     f"{sorted(missing)}."
                 )
-        self.post_load_weights()
-
-    def post_load_weights(self) -> None:
-        """Loaders that bypass load_weights call this directly."""
-        for layer in self.layers:
-            if isinstance(layer.self_attn, DFlashMLAAttention):
-                layer.self_attn.absorb_kv_b_proj()
 
 
 class DFlashLagunaAttention(DFlashAttention):
@@ -1235,6 +1335,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 
     decoder_layer_cls = DFlashLagunaDecoderLayer
     supports_fused_context_kv = False
+    # Its own `project_target_hidden` reads the whole `fc` output.
+    supports_fc_tp_split = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)

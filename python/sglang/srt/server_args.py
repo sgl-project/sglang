@@ -573,7 +573,11 @@ def resolve_encoder_transfer_backend(
 ) -> str:
     if backend != "auto":
         return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+    if (
+        model_arch
+        in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
+        and tp_size > 1
+    ):
         return "zmq_to_tokenizer"
     return "zmq_to_scheduler"
 

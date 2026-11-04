@@ -343,9 +343,14 @@ class BaseRunner(ABC):
         ):
             return
 
-        from sglang.srt.layers.dcp import init_fi_a2a_workspace
+        from sglang.srt.layers.dcp import init_dcp_push_combine, init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+        if get_parallel().dcp_replicate_q_proj:
+            init_dcp_push_combine(
+                get_parallel().dcp_group,
+                self.model_runner.model_config.num_attention_heads,
+            )
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.

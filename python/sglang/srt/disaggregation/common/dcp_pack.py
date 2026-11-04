@@ -71,6 +71,9 @@ def try_pack_dcp_src(
         return None
 
     pack = pack_buffer.buffer.narrow(0, pack_offset_bytes, required)
+    # Transfer worker threads start on device 0: leaving torch.cuda.stream()
+    # would restore it and create a stray context on GPU 0 in every rank.
+    torch.cuda.set_device(pack.device)
     row_indices = torch.as_tensor(
         src_token_indices, device=pack.device, dtype=torch.int64
     )
@@ -89,6 +92,21 @@ def try_pack_dcp_src(
         packed_ptrs.append(base + offset)
         offset += n * int(item_len)
     return packed_ptrs, np.arange(n, dtype=np.int64)
+
+
+def dsa_index_k_item_lens(kv_args) -> List[int]:
+    """Page bytes of the DSA index-K buffers a PD DCP relayout moves token by
+    token, or [] when the pool has none it can move that way."""
+    if getattr(kv_args, "dsa_index_k_token_bytes", None) is None:
+        return []
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    return [
+        item_len
+        for state_type, item_lens in zip(kv_args.state_types, kv_args.state_item_lens)
+        if state_type == StateType.DSA
+        for item_len in item_lens
+    ]
 
 
 def init_dcp_pack_buffers(
@@ -122,6 +140,11 @@ def init_dcp_pack_buffers(
     size_bytes = dcp_pack_buffer_bytes(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
+    # DSA index-K moves with the target KV rows (see dsa_index_k_dcp_entries).
+    index_k_token_bytes = sum(
+        item_len // kv_args.page_size for item_len in dsa_index_k_item_lens(kv_args)
+    )
+    size_bytes += dcp_size * -(-max_tokens // dcp_size) * index_k_token_bytes
     gpu_id = kv_args.gpu_id
     device = f"{device_type}:{gpu_id}"
     custom_mem_pool, _ = _get_custom_mem_pool(device)

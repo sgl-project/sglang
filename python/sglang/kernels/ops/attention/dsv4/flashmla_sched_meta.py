@@ -35,6 +35,8 @@ def flashmla_sched_meta(
     fixed_overhead_num_blocks: int,
     topk: int,
     extra_topk: int = 0,
+    parallel: bool = False,
+    windowed: bool = False,
 ) -> None:
     """Fill FlashMLA's split-KV tile-scheduler metadata in place.
 
@@ -55,6 +57,13 @@ def flashmla_sched_meta(
         fixed_overhead_num_blocks: the implementation's per-request overhead.
         topk: the sparse top-k, or -1 for a dense model.
         extra_topk: the extra cache's top-k, 0 when there is none.
+        parallel: compute the partition walk in parallel when the sparse
+            schedule's tables fit in shared memory (otherwise, and for a dense
+            schedule, the serial walk runs). Both give the same schedule.
+        windowed: for a sparse schedule, cut the requests' costs into equal
+            windows instead of walking the partitions: not FlashMLA's schedule,
+            but a valid one with the same bound on the costliest partition,
+            computed in a few microseconds instead of tens.
     """
     _jit_flashmla_sched_meta_module().flashmla_sched_meta(
         tile_scheduler_metadata,
@@ -66,4 +75,6 @@ def flashmla_sched_meta(
         fixed_overhead_num_blocks,
         topk,
         extra_topk,
+        parallel,
+        windowed,
     )

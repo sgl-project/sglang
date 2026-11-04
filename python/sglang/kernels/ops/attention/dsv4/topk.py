@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
+    get_jit_cuda_arch,
     is_arch_support_pdl,
     is_hip_runtime,
     load_jit,
@@ -29,15 +30,15 @@ def _jit_topk_v1_module():
 
 
 @cache_once
-def _jit_topk_v2_module():
+def _jit_topk_v2_module(stable_ties: bool = False):
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
     )
 
-    args = make_cpp_args(is_arch_support_pdl())
+    args = make_cpp_args(is_arch_support_pdl(), stable_ties)
+    extra_cuda_cflags = [f"-DSGL_TOPK_STABLE_TIES={int(stable_ties)}"]
     # Enable each cluster path only when its occupancy probe reports capacity.
-    extra_cuda_cflags = []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         for cluster_size, occupancy in ((8, 2), (16, 1)):
             try:
@@ -53,19 +54,26 @@ def _jit_topk_v2_module():
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_transform_candidates", f"{kernel}::transform_candidates"),
+        ("topk_transform_candidates_dcp", f"{kernel}::transform_candidates_dcp"),
+        ("topk_transform_packed", f"{kernel}::transform_packed"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
     ]
-    if is_hip_runtime():
-        # transform_packed only exists under USE_ROCM, see topk_v2.cuh
-        wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
         *args,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
+    )
+
+
+def _topk_v2_module(stable_ties: bool):
+    # one cache entry per variant, whichever way callers spell the default
+    return (
+        _jit_topk_v2_module(stable_ties=True) if stable_ties else _jit_topk_v2_module()
     )
 
 
@@ -176,6 +184,7 @@ def topk_transform_ragged_v2(
     out_offsets: torch.Tensor,
     out_indices: torch.Tensor,
     row_starts: Optional[torch.Tensor] = None,
+    stable_ties: bool = False,
 ) -> None:
     """Ragged (prefill) fused top-k for a contiguous-KV score matrix.
 
@@ -202,8 +211,86 @@ def topk_transform_ragged_v2(
             row_starts,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _topk_v2_module(stable_ties)
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+
+
+def topk_transform_candidates_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    out_candidates: torch.Tensor,
+    world: int,
+    rank: int,
+    row_starts: Optional[torch.Tensor] = None,
+    stable_ties: bool = False,
+    cluster_floor: Optional[int] = None,
+    page_bits: int = 0,
+    overflow_rows: Optional[torch.Tensor] = None,
+    coarse_bits: int = 10,
+    cluster_size: Optional[int] = None,
+) -> None:
+    """Ragged top-k emitting candidates for a distributed top-k merge.
+
+    Row ``i`` selects the top-k of ``scores[i, ks : ks + seq_lens[i]]`` (``ks
+    = row_starts[i]``, 0 when omitted) exactly as :func:`topk_transform_ragged_v2`
+    does, and writes ``out_candidates[i]`` (``[topk, 2]`` int32) = (fp32 score
+    bits, ``position * world + rank``) per selected position, ``(0, -1)``
+    padded. Local position ``l`` of rank ``rank`` is global position
+    ``l * world + rank`` under decode context parallelism. With ``page_bits`` b,
+    pages of ``2**b`` tokens interleave instead:
+    ``((l >> b) * world + rank) << b | (l & (2**b - 1))``.
+
+    ``cluster_floor`` (no ``row_starts``) splits rows longer than it across a cluster;
+    the selection stays exact. ``overflow_rows`` (int32 [1]) counts rows redone past the
+    tie buffer; ``coarse_bits`` (10 / 11 / 12) is the cluster pass's coarse bin width.
+    ``cluster_size`` selects the DCP decode path, where ``page_bits``, ``overflow_rows``
+    and ``coarse_bits`` do not apply.
+
+    NOTE: ``scores`` is written in place as for the ragged entry point.
+    """
+    module = _topk_v2_module(stable_ties)
+    if cluster_size is not None:
+        module.topk_transform_candidates_dcp(
+            scores,
+            seq_lens,
+            row_starts,
+            out_candidates,
+            world,
+            rank,
+            int(cluster_size),
+            0 if cluster_floor is None else int(cluster_floor),
+        )
+        return
+    module.topk_transform_candidates(
+        scores,
+        seq_lens,
+        row_starts,
+        out_candidates,
+        world,
+        rank,
+        -1 if cluster_floor is None else int(cluster_floor),
+        int(page_bits),
+        overflow_rows,
+        int(coarse_bits),
+    )
+
+
+def candidates_cluster_size(rows: int) -> int:
+    if rows <= 0 or is_hip_runtime() or get_jit_cuda_arch().major not in (9, 10):
+        return 0
+    from sglang.kernels.jit.utils.occupancy import (
+        NoSchedulableClustersError,
+        get_max_active_clusters,
+    )
+
+    for size in (4, 2):
+        try:
+            if rows <= get_max_active_clusters(size, occupancy=1):
+                return size
+        except NoSchedulableClustersError:
+            continue
+    return 0
 
 
 def topk_transform_paged_v2(
@@ -214,6 +301,8 @@ def topk_transform_paged_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    *,
+    stable_ties: bool = False,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -235,6 +324,11 @@ def topk_transform_paged_v2(
     come from :func:`plan_topk_v2` over the same `seq_lens` values.
     A length of 0 is the valid way to express "no tokens": the row takes the
     trivial path and the output is guaranteed to be all -1.
+
+    Among scores equal to the k-th largest, which fill the last slots is
+    arbitrary, unless ``stable_ties``: then the smallest indices do (the merge
+    of the DSA decode context-parallel top-k relies on it). The same holds for
+    the candidates and packed entry points.
     """
     if is_xpu():
         if out_raw_indices is not None:
@@ -256,7 +350,7 @@ def topk_transform_paged_v2(
             metadata,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _topk_v2_module(stable_ties)
     module.topk_transform_paged(
         scores,
         seq_lens,
@@ -341,6 +435,7 @@ def topk_transform_packed_v2(
     *,
     row_starts: torch.Tensor,
     row_to_batch: Optional[torch.Tensor] = None,
+    stable_ties: bool = False,
 ) -> None:
     """Packed (DSA extend prefill) fused top-k + page-table transform.
 
@@ -361,13 +456,8 @@ def topk_transform_packed_v2(
     invalid for that row and the buffer must have no other consumer, so do not
     pass a view with overlapping rows.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
-
-    ROCm only: the kernel is compiled under ``USE_ROCM`` so that CUDA and XPU
-    builds are untouched. Nothing in it is AMD-specific -- no non-ROCm caller
-    produces this layout today.
     """
-    assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
-    module = _jit_topk_v2_module()
+    module = _topk_v2_module(stable_ties)
     module.topk_transform_packed(
         scores,
         seq_lens,

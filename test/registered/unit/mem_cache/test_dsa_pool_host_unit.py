@@ -54,8 +54,11 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         ]
         return torch.cat(parts, dim=0)
 
-    def _run_device_to_host_indexer_copy(self, io_backend: str):
+    def _run_indexer_round_trip(
+        self, io_backend: str, dcp_size: int = 1, dcp_rank: int = 0
+    ):
         page_size = 1 if is_hip() else 64
+        logical_page_size = page_size * dcp_size
         layer_num = 2
         size = page_size * 4
 
@@ -80,7 +83,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
                 host_to_device_ratio=2.0,
                 host_size=0,
-                page_size=page_size,
+                page_size=logical_page_size,
                 layout="layer_first",
                 pin_memory=pin_memory,
                 device="cpu",
@@ -100,6 +103,8 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                     else device_pool.layer_num
                 ),
                 layer_shard_enabled=device_pool.layer_shard_enabled,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
             )
             indexer_host = DSAIndexerPoolHost(
                 decl=make_dsa_indexer_pool_decl(device_pool),
@@ -130,11 +135,11 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             dtype=torch.int64,
         )
         device_indices = self._token_indices_for_pages(
-            device_pages, page_size, device="cuda"
+            device_pages, logical_page_size, device="cuda"
         )
         host_indices = self._token_indices_for_pages(
             host_pages,
-            page_size,
+            logical_page_size,
             device="cuda" if io_backend == "kernel" else "cpu",
         )
 
@@ -164,6 +169,39 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
 
+        expected_index_k = [
+            device_pool.index_k_with_scale_buffer[layer_id][device_pages].clone()
+            for layer_id in range(layer_num)
+        ]
+        expected_kv = [
+            device_pool.kv_buffer[layer_id].clone() for layer_id in range(layer_num)
+        ]
+        for layer_id in range(layer_num):
+            device_pool.index_k_with_scale_buffer[layer_id][device_pages] = 0
+            device_pool.kv_buffer[layer_id].zero_()
+            mla_host.load_to_device_per_layer(
+                device_pool, host_indices, device_indices, layer_id, io_backend
+            )
+            indexer_host.load_to_device_per_layer(
+                device_pool, host_indices, device_indices, layer_id, io_backend
+            )
+        torch.cuda.synchronize()
+        for layer_id in range(layer_num):
+            self.assertTrue(
+                torch.equal(
+                    device_pool.index_k_with_scale_buffer[layer_id][device_pages],
+                    expected_index_k[layer_id],
+                )
+            )
+            for device_page in device_pages.tolist():
+                rows = slice(device_page * page_size, (device_page + 1) * page_size)
+                self.assertTrue(
+                    torch.equal(
+                        device_pool.kv_buffer[layer_id][rows],
+                        expected_kv[layer_id][rows],
+                    )
+                )
+
     @unittest.skipIf(
         is_hip(),
         '`io_backend="kernel"` path in MLATokenToKVPoolHost.backup_from_device_all_layer '
@@ -171,7 +209,18 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         "The other 62 tests in this file pass on AMD.",
     )
     def test_device_to_host_indexer_kernel(self):
-        self._run_device_to_host_indexer_copy(io_backend="kernel")
+        self._run_indexer_round_trip(io_backend="kernel")
+
+    @unittest.skipIf(
+        is_hip(),
+        "HIP DSA pools use 1-token pages; DCP HiCache is wired for CUDA only.",
+    )
+    def test_dcp_indexer_kernel(self):
+        for dcp_rank in (0, 3):
+            with self.subTest(dcp_rank=dcp_rank):
+                self._run_indexer_round_trip(
+                    io_backend="kernel", dcp_size=4, dcp_rank=dcp_rank
+                )
 
     @unittest.skipIf(
         is_hip(),
@@ -180,7 +229,18 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         "(seen on pr-test-amd-rocm720). The rest of this file passes on AMD.",
     )
     def test_device_to_host_indexer_direct(self):
-        self._run_device_to_host_indexer_copy(io_backend="direct")
+        self._run_indexer_round_trip(io_backend="direct")
+
+    @unittest.skipIf(
+        is_hip(),
+        "HIP DSA pools use 1-token pages; DCP HiCache is wired for CUDA only.",
+    )
+    def test_dcp_indexer_direct(self):
+        for dcp_rank in (0, 3):
+            with self.subTest(dcp_rank=dcp_rank):
+                self._run_indexer_round_trip(
+                    io_backend="direct", dcp_size=4, dcp_rank=dcp_rank
+                )
 
 
 if __name__ == "__main__":

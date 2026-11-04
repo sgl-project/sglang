@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlparse
 import pybase64
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -432,7 +433,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             return value, None
 
         if value.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = envs.SGLANG_MEDIA_URL_TIMEOUT.get()
             content = download_remote_media(value, timeout=timeout)
             suffix = os.path.splitext(urlparse(value).path)[1] or ".mp4"
             temp_path = self._write_video_bytes_to_tempfile(content, suffix=suffix)

@@ -18,19 +18,14 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_loader.loader import post_load_weights
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
-    parse_dflash_draft_config,
+    is_dflash_mla_draft_config,
 )
-from sglang.srt.speculative.dspark_components.dspark_config import (
-    parse_dspark_draft_config,
-)
-from sglang.srt.utils import BumpAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
@@ -182,18 +177,13 @@ def _serve_block(attn, ctx_hidden, ctx_positions, hidden, positions):
             attn.kv_b_proj, "forward", side_effect=AssertionError("expanded K/V")
         ),
     ):
-        allocator = BumpAllocator(buffer_size=2, dtype=torch.float32, device="cpu")
-        return attn(positions, hidden, batch, zero_allocator=allocator)
+        return attn(positions, hidden, batch)
 
 
 class TestDFlashMLA(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
-        # CPU CI does not enable the CPU engine; keep RoPE on the native path.
-        self.enterContext(
-            patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
-        )
         # The CPU RoPE factory serves only DeepSeek YaRN; the tensors stay on CPU.
         publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
@@ -204,14 +194,11 @@ class TestDFlashMLA(CustomTestCase):
             {"attention_modes": ["mla"] * 2},
         ):
             config = {"num_hidden_layers": 2, "dflash_config": dflash_config}
-            self.assertTrue(parse_dflash_draft_config(draft_hf_config=config).is_mla)
-            # The DSpark launch hook reads it from DSpark's own parse.
-            self.assertTrue(parse_dspark_draft_config(draft_hf_config=config).is_mla)
-        config = {"num_hidden_layers": 2}
-        self.assertFalse(parse_dflash_draft_config(draft_hf_config=config).is_mla)
+            self.assertTrue(is_dflash_mla_draft_config(config))
+        self.assertFalse(is_dflash_mla_draft_config({"num_hidden_layers": 2}))
         with self.assertRaisesRegex(ValueError, "mix mla"):
-            parse_dflash_draft_config(
-                draft_hf_config={
+            is_dflash_mla_draft_config(
+                {
                     "num_hidden_layers": 2,
                     "dflash_config": {"attention_modes": ["mla", "gqa"]},
                 }
@@ -238,17 +225,7 @@ class TestDFlashMLA(CustomTestCase):
                 (KV_LORA + ROPE) * 2,
             )
 
-    def test_every_load_path_absorbs_kv_b_proj(self):
-        """Split and fused checkpoints, and loaders that bypass load_weights,
-        all leave the w_kc / w_vc the absorbed forward reads."""
-
-        def assert_absorbed(attn):
-            w_kc, w_vc = attn.kv_b_proj.weight.view(HEADS, NOPE + VDIM, KV_LORA).split(
-                [NOPE, VDIM], dim=1
-            )
-            torch.testing.assert_close(attn.w_kc, w_kc, rtol=0, atol=0)
-            torch.testing.assert_close(attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0)
-
+    def test_specforge_checkpoint_loads_and_absorbs(self):
         for q_lora_rank, q_keys in SPECFORGE_KEYS.items():
             with self.subTest(q_lora_rank=q_lora_rank):
                 model = DFlashDraftModel(Qwen3Config(**_export_fields(q_lora_rank)))
@@ -266,40 +243,15 @@ class TestDFlashMLA(CustomTestCase):
                     torch.testing.assert_close(
                         param, checkpoint[f"layers.0.self_attn.{name}"], rtol=0, atol=0
                     )
-                assert_absorbed(attn)
-
-                fused = {
-                    f"layers.0.self_attn.{name}": torch.randn_like(param)
-                    for name, param in attn.named_parameters()
-                }
-                model.load_weights(fused.items())
-                for name, param in attn.named_parameters():
-                    torch.testing.assert_close(
-                        param, fused[f"layers.0.self_attn.{name}"], rtol=0, atol=0
-                    )
-                assert_absorbed(attn)
-
-                with torch.no_grad():
-                    attn.kv_b_proj.weight.normal_()
-                post_load_weights(model)
-                assert_absorbed(attn)
-
-    def test_sliding_layers_require_triton(self):
-        """Only triton applies an MLA layer's sliding window; the other MLA
-        backends would silently attend over the full context."""
-        config = Qwen3Config(
-            **_export_fields(),
-            layer_types=["sliding_attention"],
-            use_sliding_window=True,
-            sliding_window=4,
-        )
-        resolve = "sglang.srt.speculative.draft_worker_common.resolve_draft_worker_attention_backend"
-        with patch(resolve, return_value="flashinfer"):
-            with self.assertRaisesRegex(ValueError, "require .* triton"):
-                DFlashMLAAttention(config, layer_id=0)
-        with patch(resolve, return_value="triton"):
-            attn = DFlashMLAAttention(config, layer_id=0)
-        self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
+                w_kc, w_vc = (
+                    checkpoint["layers.0.self_attn.kv_b_proj.weight"]
+                    .view(HEADS, NOPE + VDIM, KV_LORA)
+                    .split([NOPE, VDIM], dim=1)
+                )
+                torch.testing.assert_close(attn.w_kc, w_kc, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0
+                )
 
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
@@ -337,35 +289,6 @@ class TestDFlashMLA(CustomTestCase):
                     attn, ctx_hidden, ctx_positions, hidden, positions
                 )
                 torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
-
-    def test_prefix_valid_write_skips_rows_past_commit_lens(self):
-        """Rows past commit_lens are not written anywhere, slot 0 included,
-        like the MHA pool's prefix-valid write."""
-        # CUDA runs the Triton write kernel, other platforms its naive twin.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        pool = MLATokenToKVPool(
-            size=15,
-            page_size=1,
-            dtype=torch.bfloat16,
-            kv_lora_rank=KV_LORA,
-            qk_rope_head_dim=ROPE,
-            layer_num=1,
-            device=device,
-            enable_memory_saver=False,
-        )
-        pool.kv_buffer[0].fill_(7)
-        latent = torch.randn(6, 1, KV_LORA, dtype=torch.bfloat16, device=device)
-        rope = torch.randn(6, 1, ROPE, dtype=torch.bfloat16, device=device)
-        pool.set_mla_kv_buffer_prefix_valid(
-            SimpleNamespace(layer_id=0),
-            torch.tensor([[3, 4, 5], [8, 9, 10]], device=device),
-            torch.tensor([2, 1], dtype=torch.int32, device=device),
-            latent,
-            rope,
-        )
-        expected = torch.full_like(pool.kv_buffer[0], 7)
-        expected[[3, 4, 8]] = torch.cat((latent, rope), dim=-1)[[0, 1, 3]]
-        torch.testing.assert_close(pool.kv_buffer[0], expected, rtol=0, atol=0)
 
     def test_dspark_commits_verify_rows_through_mla_layer(self):
         """DSpark's fused context-KV paths slice a qkv_proj; an MLA draft must commit

@@ -10,6 +10,7 @@ from transformers.models.auto.processing_auto import (
 )
 
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -148,7 +149,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
             executor = self.cpu_executor
-            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            timeout = envs.SGLANG_MEDIA_URL_TIMEOUT.get()
             deadline = loop.time() + timeout
             try:
                 # ProcessPoolExecutor.submit() can itself block after a worker

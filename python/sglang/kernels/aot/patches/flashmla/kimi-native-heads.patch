@@ -1,0 +1,674 @@
+diff --git a/csrc/api/sparse_decode.cpp b/csrc/api/sparse_decode.cpp
+index 36955a4..8e58fdb 100644
+--- a/csrc/api/sparse_decode.cpp
++++ b/csrc/api/sparse_decode.cpp
+@@ -1,4 +1,5 @@
+ #include "common.h"
++#include "sparse_decode_sched.h"
+ 
+ #include "kernels/params.h"
+ 
+@@ -48,7 +49,7 @@ class DecodeImplBase : public ImplBase<
+     DecodeFeatures
+ > {
+ public:
+-    virtual DecodeImplMeta get_meta(int h_q, int s_q) = 0;
++    virtual DecodeImplMeta get_meta(int b, int h_q, int s_q) = 0;
+ };
+ 
+ class Decode_Sm90_Impl : public DecodeImplBase {
+@@ -67,7 +68,7 @@ class Decode_Sm90_Impl : public DecodeImplBase {
+     )
+ 
+ public:
+-    DecodeImplMeta get_meta(int h_q, int s_q) override {
++    DecodeImplMeta get_meta(int b, int h_q, int s_q) override {
+         Arch arch = Arch();
+         return {
+             std::max(arch.num_sms / s_q / (h_q/64), 1),
+@@ -86,9 +87,11 @@ protected:
+     }
+ };
+ 
++// Any h_q in [1, 128]: one launch with one CTA per block of 64 heads (blockIdx.z), padding rows are not stored
+ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
+     DECLARE_SUPPORTED_FEATURES(
+         DecodeFeatures::HEAD_64,
++        DecodeFeatures::HEAD_128,
+         DecodeFeatures::HEAD_DIM_512,
+         DecodeFeatures::HEAD_DIM_576,
+         DecodeFeatures::V32_KVCACHE_FORMAT,
+@@ -105,10 +108,10 @@ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
+                                              KVFormatPair<ModelType::V41>, KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+ 
+ public:
+-    DecodeImplMeta get_meta(int h_q, int s_q) override {
++    DecodeImplMeta get_meta(int b, int h_q, int s_q) override {
+         Arch arch = Arch();
+         return {
+-            std::max(arch.num_sms / s_q, 1),
++            sm100_sparse_decode_num_sm_parts(arch.num_sms, b, s_q, h_q),
+             5,
+             64
+         };
+@@ -118,7 +121,7 @@ protected:
+     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
+             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
+-                TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
++                TORCH_CHECK(params.h_q >= 1 && params.h_q <= 128, "Unsupported h_q: ", params.h_q);
+                 using sm100::decode::sparse::head64::Config;
+                 sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(params);
+             }));
+@@ -127,57 +130,6 @@ protected:
+ };
+ 
+ 
+-// An implementation that calls the head64 kernel twice to process head128
+-// Necessary for running V3.2 shape (i.e. h = 128, d_qk = 576) on SM100f
+-class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
+-    DECLARE_SUPPORTED_FEATURES(
+-        DecodeFeatures::HEAD_128,
+-        DecodeFeatures::HEAD_DIM_512,
+-        DecodeFeatures::HEAD_DIM_576,
+-        DecodeFeatures::V32_KVCACHE_FORMAT,
+-        DecodeFeatures::V32_NO_ROPE_KVCACHE_FORMAT,
+-        DecodeFeatures::V4_KVCACHE_FORMAT,
+-        DecodeFeatures::ATTN_SINK,
+-        DecodeFeatures::TOPK_LENGTH,
+-        DecodeFeatures::EXTRA_KVCACHE,
+-        DecodeFeatures::EXTRA_TOPK_LENGTH
+-    )
+-    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V32>, KVFormatPair<ModelType::V32_NO_ROPE>, KVFormatPair<ModelType::V4>>;
+-
+-public:
+-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+-        Arch arch = Arch();
+-        return {
+-            std::max(arch.num_sms / s_q, 1),
+-            5,
+-            64
+-        };
+-    }
+-
+-protected:
+-    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+-        dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
+-            DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
+-                for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
+-                    SparseAttnDecodeParams cur_params = params;
+-                    cur_params.q += start_head_idx * params.stride_q_h_q;
+-                    if (cur_params.attn_sink) {
+-                        cur_params.attn_sink += start_head_idx;
+-                    }
+-                    cur_params.lse += start_head_idx;
+-                    cur_params.out += start_head_idx * params.stride_o_h_q;
+-                    if (cur_params.enable_split_kv) {
+-                        cur_params.lse_accum += start_head_idx;
+-                        cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+-                    }
+-                    cur_params.h_q = 64;
+-                    using sm100::decode::sparse::head64::Config;
+-                    sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(cur_params);
+-                }
+-            }));
+-        });
+-    }
+-};
+ 
+ 
+ class Decode_Sm100_Head128_Impl : public DecodeImplBase {
+@@ -196,7 +148,7 @@ class Decode_Sm100_Head128_Impl : public DecodeImplBase {
+                                              KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+ 
+ public:
+-    DecodeImplMeta get_meta(int h_q, int s_q) override {
++    DecodeImplMeta get_meta(int b, int h_q, int s_q) override {
+         Arch arch = Arch();
+         return {
+             std::max(arch.num_sms / s_q / 2, 1),
+@@ -238,7 +190,9 @@ sparse_attn_decode_interface(
+     // Names the format of `kv` ("V32", "V32_NO_ROPE", "V4", "V41"). Only needed to disambiguate V3.2-no-RoPE from V4.1,
+     // which have the same d_qk and bytes per token; when omitted the format is detected from the shape and 528 B per
+     // token means V4.1, as in upstream FlashMLA.
+-    const std::optional<std::string> &kv_format
++    const std::optional<std::string> &kv_format,
++    // > 0: token packing, see SparseAttnDecodeParams::heads_per_group
++    int64_t heads_per_group
+ ) {
+     using bf16 = cutlass::bfloat16_t;
+ 
+@@ -370,9 +324,9 @@ sparse_attn_decode_interface(
+     at::Tensor lse = torch::empty({b, s_q, h_q}, opts.dtype(at::kFloat));
+ 
+     std::vector<DecodeFeatures> features;
+-    if (h_q == 64) {
++    if (arch.is_sm100f() ? (h_q >= 1 && h_q <= 64) : h_q == 64) {
+         features.push_back(DecodeFeatures::HEAD_64);
+-    } else if (h_q == 128) {
++    } else if (arch.is_sm100f() ? (h_q > 64 && h_q <= 128) : h_q == 128) {
+         features.push_back(DecodeFeatures::HEAD_128);
+     } else {
+         TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+@@ -412,20 +366,22 @@ sparse_attn_decode_interface(
+         }
+     }
+ 
++    TORCH_CHECK(heads_per_group >= 0, "heads_per_group must be >= 0");
++    if (heads_per_group > 0) {
++        TORCH_CHECK(arch.is_sm100f() && h_q <= 64 && model_type == ModelType::V32 && !have_extra_kcache,
++                    "token packing (heads_per_group > 0) needs SM100, h_q <= 64, V32 kv and no extra kv");
++        TORCH_CHECK(h_q <= heads_per_group * SPARSE_DECODE_MAX_GROUPS, "h_q exceeds ", SPARSE_DECODE_MAX_GROUPS,
++                    " groups of heads_per_group heads");
++    }
++
+     DecodeImplBase* impl;
+     if (arch.is_sm100f()) {
+-        if (h_q == 64) {
+-            impl = new Decode_Sm100_Head64_Impl();
+-        } else if (h_q == 128) {
+-            if (d_qk == 576 || model_type == ModelType::V32_NO_ROPE) {
+-                impl = new Decode_Sm100_Head64x2_Impl();
+-            } else if (d_qk == 512) {
+-                impl = new Decode_Sm100_Head128_Impl();
+-            } else {
+-                TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+-            }
++        // The native head128 kernel covers d_qk == 512 with exactly 128 heads; every other h_q <= 128 runs the head64
++        // kernel once over ceil(h_q/64) head blocks (this used to be two sequential head64 launches for h_q == 128)
++        if (h_q == 128 && d_qk == 512 && model_type != ModelType::V32_NO_ROPE) {
++            impl = new Decode_Sm100_Head128_Impl();
+         } else {
+-            TORCH_CHECK(false, "Unsupported h_q: ", h_q);
++            impl = new Decode_Sm100_Head64_Impl();
+         }
+     } else if (arch.is_sm90a()) {
+         impl = new Decode_Sm90_Impl();
+@@ -433,7 +389,7 @@ sparse_attn_decode_interface(
+         TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
+     }
+ 
+-    DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
++    DecodeImplMeta impl_meta = impl->get_meta(b, h_q, s_q);
+ 
+     SparseAttnDecodeParams params = {
+         b, s_q, h_q, h_kv, d_qk, d_v,
+@@ -468,6 +424,7 @@ sparse_attn_decode_interface(
+ 
+         enable_split_kv,
+     };
++    params.heads_per_group = (int)heads_per_group;
+ 
+     at::Tensor o_accum, lse_accum;
+     if (enable_split_kv) {
+@@ -561,6 +518,6 @@ void register_sparse_decode(pybind11::module_& m) {
+         pybind11::arg("tile_scheduler_metadata"), pybind11::arg("num_splits"),
+         pybind11::arg("extra_kv"), pybind11::arg("extra_indices"), pybind11::arg("extra_topk_length"),
+         pybind11::arg("d_v"), pybind11::arg("sm_scale"),
+-        pybind11::arg("kv_format") = pybind11::none());
++        pybind11::arg("kv_format") = pybind11::none(), pybind11::arg("heads_per_group") = 0);
+ }
+ #endif
+diff --git a/csrc/api/sparse_decode_sched.h b/csrc/api/sparse_decode_sched.h
+new file mode 100644
+index 0000000..c269999
+--- /dev/null
++++ b/csrc/api/sparse_decode_sched.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdlib>
++
++// Split-KV partitions (CTAs per head block) of the SM100 head64 sparse decode kernel, shared by its tile scheduler
++// metadata (get_mla_decoding_metadata, FlashMLASchedMeta) and the kernel launch so that they always agree.
++//
++// With more than one block of 64 heads, the SMs are divided among the head blocks while the requests alone cannot
++// fill the divided partitions (b < num_sms / s_q / head_blocks); this avoids a second wave of CTAs. With more
++// requests the greedy schedule over fewer partitions can split requests needlessly, so the undivided schedule (the
++// one the old two-launch path used) is kept. FLASHMLA_DIVIDE_PARTS=0/1 forces either.
++inline int sm100_sparse_decode_num_sm_parts(int num_sms, int b, int s_q, int h_q) {
++    const int head_blocks = (h_q + 63) / 64;
++    const int parts = std::max(num_sms / s_q, 1);
++    const int divided = std::max(parts / head_blocks, 1);
++    const char* env = std::getenv("FLASHMLA_DIVIDE_PARTS");
++    const bool divide = env != nullptr ? env[0] == '1' : (head_blocks > 1 && b < divided);
++    return divide ? divided : parts;
++}
+diff --git a/csrc/kernels/params.h b/csrc/kernels/params.h
+index c0078d1..5ed080a 100644
+--- a/csrc/kernels/params.h
++++ b/csrc/kernels/params.h
+@@ -106,8 +106,17 @@ struct SparseAttnDecodeParams {
+     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
+     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
+     int num_sm_parts;
++
++    // Token packing (SM100 head64, V3.2 only): each q "token" holds several real tokens' heads, heads_per_group rows
++    // each, and an index carries in bits 26..30 which of those tokens attend to it (see SPARSE_DECODE_GROUP_SHIFT).
++    // 0 disables it.
++    int heads_per_group;
+ };
+ 
++// Bit position of the token-group bits in a packed index; the slot itself must stay below 1 << 26
++static constexpr int SPARSE_DECODE_GROUP_SHIFT = 26;
++static constexpr int SPARSE_DECODE_MAX_GROUPS = 5;
++
+ struct CombineParams {
+     int b, s_q, h_q, d_v;
+ 
+diff --git a/csrc/kernels/sm100/decode/sparse/head64/config.h b/csrc/kernels/sm100/decode/sparse/head64/config.h
+index 49f8302..38ca6ef 100644
+--- a/csrc/kernels/sm100/decode/sparse/head64/config.h
++++ b/csrc/kernels/sm100/decode/sparse/head64/config.h
+@@ -33,7 +33,7 @@ enum NamedBarriers : uint32_t {
+ template<Config CONFIG>
+ struct KernelTemplate {
+ 
+-static constexpr uint32_t B_H = 64;   // Head block size. This kernel only supports h_q == B_H
++static constexpr uint32_t B_H = 64;   // Head block size. One CTA per block of B_H heads (h_q <= 2*B_H)
+ static constexpr bool ENABLE_SPLITKV = CONFIG.ENABLE_SPLITKV;
+ 
+ using OrigKVFormat = KVCacheFormat<CONFIG.MODEL_TYPE>;         // Format of `kv`
+@@ -208,7 +208,8 @@ struct SharedMemoryPlan {
+         array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+     } s_p;
+     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
+-    char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
++    // Per key-validity bits of a block; with token packing one row of bits per token group (row group 0 otherwise)
++    alignas(8) char is_token_valid[NUM_INDEX_BUFS][SPARSE_DECODE_MAX_GROUPS][B_TOPK/8];
+     int tma_coord[NUM_INDEX_BUFS][B_TOPK];
+     CUTE_ALIGNAS(16) uint8_t scales[NUM_INDEX_BUFS][B_TOPK][SCALE_SMEM_STRIDE];   // bf16 (V3.2), ue8m0 (fp8) or e4m3 (fp4), see KVBlockDequantizer
+     array_aligned<uint32_t, 1> tmem_start_addr;
+diff --git a/csrc/kernels/sm100/decode/sparse/head64/kernel.cuh b/csrc/kernels/sm100/decode/sparse/head64/kernel.cuh
+index c4f1474..b6a73c4 100644
+--- a/csrc/kernels/sm100/decode/sparse/head64/kernel.cuh
++++ b/csrc/kernels/sm100/decode/sparse/head64/kernel.cuh
+@@ -1,7 +1,8 @@
+ /*
+-Sparse MLA Decoding — SM100, h_q == 64
++Sparse MLA Decoding — SM100, h_q <= 128 in blocks of 64 heads
+ 
+-Decoding kernel for h_q == 64 heads. Uses FP8 KV cache with dequantization,
++Decoding kernel for h_q <= 128 heads: blockIdx.z selects a block of 64 heads, rows past h_q are padding (zero-filled
++on load, not stored). Uses FP8 KV cache with dequantization,
+ UTCMMA/TMEM architecture, and TMA for data transfers. Supports split-KV partitioning
+ for large topk values. Config defines per-model-type dimensions (V3.2: d_qk=576,
+ V4: d_qk=512, RoPE bf16, tile_size=64; V4.1: d_qk=512, RoPE fp8, tile_size=32).
+@@ -44,6 +45,7 @@ KernelTemplate<CONFIG>
+     const int idx_in_warpgroup = threadIdx.x % 128;
+     const int warp_idx = cutlass::canonical_warp_idx_sync();
+     const int lane_idx = threadIdx.x % 32;
++    const int head_off = blockIdx.z * B_H;   // First head of this CTA's head block
+ 
+     extern __shared__ char wksp_buf[];
+     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
+@@ -180,9 +182,12 @@ KernelTemplate<CONFIG>
+ 
+         // NOTE Padding rows (idx%B_H >= h_q) must not read
+         // attn_sink (OOB); their output is discarded anyway.
+-        float attn_sink = (params.attn_sink == nullptr || idx_in_warpgroup%B_H >= params.h_q)
+-            ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%B_H)) * CUDART_L2E_F;
++        float attn_sink = (params.attn_sink == nullptr || head_off + idx_in_warpgroup%B_H >= params.h_q)
++            ? -CUDART_INF_F : __ldg((float*)params.attn_sink + head_off + (idx_in_warpgroup%B_H)) * CUDART_L2E_F;
+         constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
++        // Token packing: this thread's row belongs to token group (head / heads_per_group)
++        const int row_group = params.heads_per_group > 0
++            ? min((head_off + idx_in_warpgroup%B_H) / params.heads_per_group, SPARSE_DECODE_MAX_GROUPS-1) : 0;
+         
+         run_main_loop([&](const MainLoopArgs &args) {
+             cute::tma_store_wait<0>();
+@@ -208,7 +213,7 @@ KernelTemplate<CONFIG>
+                     false
+                 >(
+                     tmem_cols::P,
+-                    plan.is_token_valid[rs.index_buf_idx],
++                    plan.is_token_valid[rs.index_buf_idx][row_group],
+                     warp_idx, lane_idx,
+                     [&]() {},
+                     plan.s_p.p_exchange_buf,
+@@ -294,15 +299,16 @@ KernelTemplate<CONFIG>
+             li += plan.rowwise_max_buf[idx_in_warpgroup^64];
+ 
+             // Store li
+-            if (idx_in_warpgroup < params.h_q) {
++            // Threads B_H..127 hold duplicates of rows 0..B_H-1; only the first B_H store, and only real heads
++            if (idx_in_warpgroup < B_H && head_off + idx_in_warpgroup < params.h_q) {
+                 if (args.is_no_split) {
+                     float cur_lse = fma(mi, CUDART_LN2_F, logf(li));
+                     cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
+-                    float* gSoftmaxLse = (float*)params.lse + args.batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q + idx_in_warpgroup;
++                    float* gSoftmaxLse = (float*)params.lse + args.batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q + head_off + idx_in_warpgroup;
+                     *gSoftmaxLse = cur_lse;
+                 } else {
+                     float cur_lse = log2f(li) + mi;
+-                    float* gSoftmaxLseAccum = (float*)params.lse_accum + args.n_split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + idx_in_warpgroup;
++                    float* gSoftmaxLseAccum = (float*)params.lse_accum + args.n_split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + head_off + idx_in_warpgroup;
+                     *gSoftmaxLseAccum = cur_lse;
+                 }
+             }
+@@ -320,7 +326,7 @@ KernelTemplate<CONFIG>
+                 Tensor tma_gO = flat_divide(
+                     tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx, args.batch_idx),
+                     Shape<Int<B_H>, Int<64>>{}
+-                )(_, _, _0{}, _);
++                )(_, _, blockIdx.z, _);
+                 auto thr_tma = tma_params.tma_O.get_slice(_0{});
+                 Tensor tma_sO = flat_divide(
+                     sO,
+@@ -388,10 +394,10 @@ KernelTemplate<CONFIG>
+                     CUTE_UNROLL
+                     for (int local_row = 0; local_row < B_H/4; ++local_row) {
+                         int smem_row = local_row*4 + warp_idx;
+-                        if (smem_row < params.h_q) {    // Don't write padding rows (o_accum only has h_q rows)
++                        if (head_off + smem_row < params.h_q) {    // Don't write padding rows (o_accum only has h_q rows)
+                             SM90_BULK_COPY_S2G::copy(
+                                 &sO(smem_row, _0{}),
+-                                (float*)params.o_accum + args.n_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + smem_row*params.stride_o_accum_h_q,
++                                (float*)params.o_accum + args.n_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (head_off + smem_row)*params.stride_o_accum_h_q,
+                                 D_V*sizeof(float)
+                             );
+                         }
+@@ -417,7 +423,11 @@ KernelTemplate<CONFIG>
+                 }
+                 // Issue Q (SW128) G->S
+                 {
+-                    Tensor gQ = tma_params.tma_Q_SW128.get_tma_tensor(tma_params.shape_Q_SW128)(_, _, s_q_idx, args.batch_idx);
++                    Tensor gQ = local_tile(
++                        tma_params.tma_Q_SW128.get_tma_tensor(tma_params.shape_Q_SW128)(_, _, s_q_idx, args.batch_idx),
++                        Shape<Int<B_H>, Int<D_Q_SW128>>{},
++                        make_coord(blockIdx.z, _0{})
++                    );
+                     Tensor sQ = make_tensor(make_smem_ptr(plan.u.qo.q.data()), SmemLayoutQ_SW128{});
+                     ku::launch_tma_copy(
+                         tma_params.tma_Q_SW128,
+@@ -434,7 +444,7 @@ KernelTemplate<CONFIG>
+                         (uint64_t*)&plan.bar_q_tma,
+                         (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
+                         plan.u.qo.q_sw64,
+-                        0, 0, 0,
++                        0, head_off, 0,
+                         s_q_idx, args.batch_idx
+                     );
+                 }
+@@ -568,7 +578,8 @@ KernelTemplate<CONFIG>
+         } else if (warp_idx == 5 && elect_one_sync()) {
+             // Raw (quantized) KV retrieval warp
+             run_main_loop([&](const MainLoopArgs &args) {
+-                plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
++                // raw_quant never overlaps Q (see the static_assert in SharedMemoryPlan), only the O buffers of the previous
++                // batch, so the gathers need not wait for Q's UTCCP; starting them early shortens each CTA's first block
+                 plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
+                 for_each_kv_block<OrigKVFormat, ExtraKVFormat>(args.start_block_idx, args.end_block_idx, args.num_orig_kv_blocks, [&]<typename F>(int block_idx, bool is_extra_block) {
+                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
+@@ -668,6 +679,13 @@ KernelTemplate<CONFIG>
+                 };
+                 auto process_one_block = [&](int block_idx, int2 my_indices, auto is_extra_block_t) {
+                     static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
++                    // Token packing: bits 26..30 of a valid index say which token groups attend to it
++                    int group_bits[2] = {0, 0};
++                    if (params.heads_per_group > 0) {
++                        constexpr int SLOT_MASK = (1 << SPARSE_DECODE_GROUP_SHIFT) - 1;
++                        if (my_indices.x != -1) { group_bits[0] = (unsigned)my_indices.x >> SPARSE_DECODE_GROUP_SHIFT; my_indices.x &= SLOT_MASK; }
++                        if (my_indices.y != -1) { group_bits[1] = (unsigned)my_indices.y >> SPARSE_DECODE_GROUP_SHIFT; my_indices.y &= SLOT_MASK; }
++                    }
+                     using F = std::conditional_t<IS_EXTRA_BLOCK, ExtraKVFormat, OrigKVFormat>;
+                     int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
+                     int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
+@@ -730,8 +748,21 @@ KernelTemplate<CONFIG>
+                             copy_bytes<F::NUM_SCALES_EACH_TOKEN * F::SCALE_SMEM_BYTES>(plan.scales[rs.index_buf_idx][lane_idx*2 + i], scales[i]);
+                     }
+                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
+-                    if (lane_idx%4 == 0)
+-                        plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
++                    if (params.heads_per_group == 0) {
++                        if (lane_idx%4 == 0)
++                            plan.is_token_valid[rs.index_buf_idx][0][lane_idx/4] = valid_mask;
++                    } else {
++                        // valid_mask holds this lane-quad's 8 keys; keep, per group, the keys that group attends to
++                        char my_valid = (valid_mask >> (lane_idx%4*2)) & 3;
++                        CUTE_UNROLL
++                        for (int g = 0; g < SPARSE_DECODE_MAX_GROUPS; ++g) {
++                            char m = (my_valid & ((group_bits[0] >> g & 1) | (group_bits[1] >> g & 1) << 1)) << (lane_idx%4*2);
++                            m |= __shfl_xor_sync(0xFFFFFFFF, m, 0x1);
++                            m |= __shfl_xor_sync(0xFFFFFFFF, m, 0x2);
++                            if (lane_idx%4 == 0)
++                                plan.is_token_valid[rs.index_buf_idx][g][lane_idx/4] = m;
++                        }
++                    }
+                     
+                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].arrive();
+                     rs.update();
+@@ -815,15 +846,15 @@ template<Config CONFIG>
+ void KernelTemplate<CONFIG>::run(const SparseAttnDecodeParams &params) {
+     KU_ASSERT(params.topk % B_TOPK == 0, "topk (%d) mod B_TOPK (%d) must be 0", params.topk, B_TOPK);
+     KU_ASSERT(params.extra_topk % B_TOPK == 0, "extra_topk (%d) mod B_TOPK (%d) must be 0", params.extra_topk, B_TOPK);
+-    KU_ASSERT(params.h_q == 64);
++    KU_ASSERT(params.h_q >= 1 && params.h_q <= 2*B_H);
+     KU_ASSERT(params.h_kv == 1);
+     KU_ASSERT(params.d_qk == D_Q);
+     KU_ASSERT(params.d_v == D_V);
+     KU_ASSERT(params.model_type == OrigKVFormat::MODEL_TYPE && params.extra_model_type == ExtraKVFormat::MODEL_TYPE);
+ 
+-    // NOTE The head dim of the gmem shape is h_q while the smem box covers
+-    // B_H rows, so TMA zero-fills rows [h_q, B_H) on load (Q), and drops them on
+-    // store (O). Same for tensor_map_q_sw64 below.
++    // NOTE The head dim of the gmem shape is h_q while each CTA's smem box covers
++    // B_H rows starting at blockIdx.z*B_H, so TMA zero-fills rows past h_q on load (Q),
++    // and drops them on store (O). Same for tensor_map_q_sw64 below.
+     auto shape_Q_SW128 = make_shape(params.h_q, D_Q, params.s_q, params.b);
+     auto tma_Q_SW128 = cute::make_tma_copy(
+         SM90_TMA_LOAD{},
+@@ -898,7 +929,7 @@ void KernelTemplate<CONFIG>::run(const SparseAttnDecodeParams &params) {
+     
+     
+     // NOTE Don't use PDL because of potential compiler bugs!
+-    mla_kernel<<<dim3(params.s_q, ENABLE_SPLITKV ? params.num_sm_parts : params.b, 1), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, tma_params );
++    mla_kernel<<<dim3(params.s_q, ENABLE_SPLITKV ? params.num_sm_parts : params.b, ku::ceil_div(params.h_q, (int)B_H)), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, tma_params );
+     KU_CHECK_KERNEL_LAUNCH();
+ 
+ }
+diff --git a/csrc/kernels/smxx/decode/combine/combine.cu b/csrc/kernels/smxx/decode/combine/combine.cu
+index 7bd34da..bd8df14 100644
+--- a/csrc/kernels/smxx/decode/combine/combine.cu
++++ b/csrc/kernels/smxx/decode/combine/combine.cu
+@@ -1,5 +1,7 @@
+ #include "combine.h"
+ 
++#include <cstdlib>
++
+ #include <math_constants.h>
+ #include <cute/tensor.hpp>
+ #include <cutlass/cutlass.h>
+@@ -15,7 +17,8 @@ using namespace cute;
+ 
+ namespace smxx::decode {
+ 
+-template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
++// U > 1 keeps the loads of U splits in flight instead of one, for requests with many splits (see the launcher)
++template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS, int U>
+ __global__ void __launch_bounds__(NUM_THREADS)
+ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
+     // grid_shape: [batch_size*s_q, 1, h_q/BLOCK_SIZE_M]
+@@ -62,10 +65,15 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
+     static_assert(HEAD_DIM_V % (32*4) == 0);
+     constexpr int ELEMS_PER_THREAD = HEAD_DIM_V / (32*4);
+     float* oaccum_ptr = params.o_accum + start_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (h_block_idx*BLOCK_SIZE_M + warp_idx)*params.stride_o_accum_h_q;
+-    float4 datas[ELEMS_PER_THREAD];
++    float4 datas[U][ELEMS_PER_THREAD];
+     CUTLASS_PRAGMA_UNROLL
+-    for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+-        datas[i] = *(float4*)(oaccum_ptr + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
++    for (int u = 0; u < U; ++u) {
++        if (u < my_num_splits) {
++            CUTLASS_PRAGMA_UNROLL
++            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
++                datas[u][i] = *(float4*)(oaccum_ptr + u*params.stride_o_accum_split + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
++            }
++        }
+     }
+ 
+     // Warp #i gathers LseAccum for seq #i
+@@ -127,21 +135,32 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
+         for (int i = 0; i < ELEMS_PER_THREAD; ++i)
+             result[i] = {0.0f, 0.0f, 0.0f, 0.0f};
+ 
++        // Splits are accumulated in order, U at a time. All U loads of the next group are issued together after the
++        // current group is accumulated (interleaving each load with the accumulation it follows kept them from
++        // overlapping: measured no gain over U = 1)
+         #pragma unroll 1
+-        for (int split = 0; split < my_num_splits; ++split) {
+-            float lse_scale = smem_buf[warp_idx][split];
+-            // if (lse_scale != 0.f) {
++        for (int split0 = 0; split0 < my_num_splits; split0 += U) {
+             CUTLASS_PRAGMA_UNROLL
+-            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+-                result[i].x += lse_scale * datas[i].x;
+-                result[i].y += lse_scale * datas[i].y;
+-                result[i].z += lse_scale * datas[i].z;
+-                result[i].w += lse_scale * datas[i].w;
+-                if (split != my_num_splits-1) {
+-                    datas[i] = *(float4*)(oaccum_ptr + (split+1)*params.stride_o_accum_split + lane_idx*4 + i*128);
++            for (int u = 0; u < U; ++u) {
++                if (split0 + u < my_num_splits) {
++                    float lse_scale = smem_buf[warp_idx][split0 + u];
++                    CUTLASS_PRAGMA_UNROLL
++                    for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
++                        result[i].x += lse_scale * datas[u][i].x;
++                        result[i].y += lse_scale * datas[u][i].y;
++                        result[i].z += lse_scale * datas[u][i].z;
++                        result[i].w += lse_scale * datas[u][i].w;
++                    }
++                }
++            }
++            CUTLASS_PRAGMA_UNROLL
++            for (int u = 0; u < U; ++u) {
++                if (split0 + U + u < my_num_splits) {
++                    CUTLASS_PRAGMA_UNROLL
++                    for (int i = 0; i < ELEMS_PER_THREAD; ++i)
++                        datas[u][i] = *(float4*)(oaccum_ptr + (split0 + U + u)*params.stride_o_accum_split + lane_idx*4 + i*128);
+                 }
+             }
+-            // }
+         }
+         
+         const int h_q_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
+@@ -198,26 +217,37 @@ template<typename ElementT>
+ void run_flash_mla_combine_kernel(CombineParams &params) {
+     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
+     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
+-    MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
+-        constexpr int BLOCK_SIZE_M = 8;
+-        constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
+-        constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
+-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
+-        CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+-        // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
+-        cudaLaunchAttribute attribute[1];
+-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+-        cudaLaunchConfig_t combine_kernel_config = {
+-            dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+-            dim3(NUM_THREADS, 1, 1),
+-            0,
+-            params.stream,
+-            attribute,
+-            1
+-        };
+-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+-    });
++    // Unrolling pays off only when requests have many splits (small batch, ~num_sm_parts / b splits each); with one
++    // or two splits per request the extra registers make it slower. FLASHMLA_COMBINE_UNROLL=1/4 forces either.
++    const char* env = std::getenv("FLASHMLA_COMBINE_UNROLL");
++    const bool unroll = env != nullptr ? std::atoi(env) > 1 : params.b * params.s_q * 4 <= params.num_sm_parts;
++    auto launch = [&]<int U>() {
++        MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
++            constexpr int BLOCK_SIZE_M = 8;
++            constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
++            constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
++            auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS, U>;
++            CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++            // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
++            cudaLaunchAttribute attribute[1];
++            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++            attribute[0].val.programmaticStreamSerializationAllowed = 1;
++            cudaLaunchConfig_t combine_kernel_config = {
++                dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
++                dim3(NUM_THREADS, 1, 1),
++                0,
++                params.stream,
++                attribute,
++                1
++            };
++            CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
++        });
++    };
++    if (unroll) {
++        launch.template operator()<4>();
++    } else {
++        launch.template operator()<1>();
++    }
+     CHECK_CUDA_KERNEL_LAUNCH();
+ }
+ 
+diff --git a/csrc/python_api.cpp b/csrc/python_api.cpp
+index 17c633d..067594b 100644
+--- a/csrc/python_api.cpp
++++ b/csrc/python_api.cpp
+@@ -11,6 +11,7 @@
+ #include <cutlass/fast_math.h>
+ 
+ #include "api/common.h"
++#include "api/sparse_decode_sched.h"
+ #include "kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
+ 
+ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+@@ -40,7 +41,8 @@ sparse_attn_decode_interface(
+     const std::optional<at::Tensor> &extra_topk_length,
+     int d_v,
+     float sm_scale,
+-    const std::optional<std::string> &kv_format
++    const std::optional<std::string> &kv_format,
++    int64_t heads_per_group
+ );
+ 
+ std::vector<at::Tensor> sparse_attn_prefill_interface(
+@@ -92,8 +94,8 @@ std::vector<at::Tensor> get_mla_decoding_metadata(
+     int num_sm_parts;
+     if (topk_int.has_value()) {
+         if (arch.is_sm100f()) {
+-            // sm100 sparse kernels use a larger split count envelope.
+-            num_sm_parts = std::max(arch.num_sms / s_q, 1);
++            // Must match the decode kernel's partitions, see sm100_sparse_decode_num_sm_parts
++            num_sm_parts = sm100_sparse_decode_num_sm_parts(arch.num_sms, batch_size, s_q, num_heads_q);
+         } else {
+             const int heads_per_64 = std::max(1, num_heads_q / 64);
+             num_sm_parts = std::max(arch.num_sms / s_q / heads_per_64, 1);
+@@ -131,6 +133,17 @@ std::vector<at::Tensor> get_mla_decoding_metadata(
+     return {tile_scheduler_metadata, num_splits};
+ }
+ 
++// Number of rows of the tile scheduler metadata the sparse decode kernel expects for (b, s_q, h_q), for callers
++// that fill the schedule themselves (FlashMLASchedMeta with precomputed tensors)
++int64_t sparse_decode_num_sm_parts(const int64_t b, const int64_t s_q, const int64_t h_q) {
++    TORCH_CHECK(b > 0 && s_q > 0 && h_q > 0, "b, s_q and h_q must be positive");
++    Arch arch;
++    if (arch.is_sm100f()) {
++        return sm100_sparse_decode_num_sm_parts(arch.num_sms, (int)b, (int)s_q, (int)h_q);
++    }
++    return std::max(arch.num_sms / (int)s_q / std::max(1, (int)h_q / 64), 1);
++}
++
+ std::vector<at::Tensor> fwd_kvcache_mla(
+     at::Tensor& q,
+     const at::Tensor& kcache,
+@@ -169,7 +182,8 @@ std::vector<at::Tensor> fwd_kvcache_mla(
+             extra_topk_length,
+             head_size_v_int,
+             softmax_scale_float,
+-            std::nullopt);
++            std::nullopt,
++            0);
+         return {std::get<0>(result), std::get<1>(result)};
+     }
+ 

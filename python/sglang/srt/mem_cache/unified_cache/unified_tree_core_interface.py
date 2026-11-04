@@ -218,6 +218,12 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def node_hit_count(self, node_id: NodeId) -> int:
+        """The node's accumulated match count, which write-through compares with
+        ``write_through_threshold``."""
+        ...
+
+    @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...
@@ -506,6 +512,12 @@ class UnifiedTreeCoreInterface(ABC):
     def supports_fast_match_prefix(self) -> bool:
         """Whether matching every waiting request is cheap enough for scheduling."""
         return False
+
+    def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Tokens that match_prefix would report as cached for ``key``, computed
+        without changing the tree: no node split, LRU refresh or access-time
+        update. None when the tree core does not support it."""
+        return None
 
     @property
     @abstractmethod

@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -46,7 +47,7 @@ def pcg_dsa_indexer_prefill_split(
     x_s: Optional[torch.Tensor] = None,
     x_bf16: Optional[torch.Tensor] = None,
 ) -> None:
-    # Default in-graph indexer path for non-CP prefill: runs the whole indexer
+    # In-graph prefill indexer (also interleave CP under BCG): runs the indexer
     # (q/k proj, head gate, k-cache store, topk) as one eager split op. PCG calls
     # this as a split op; BCG uses the explicit eager wrapper below.
     #
@@ -74,13 +75,39 @@ def pcg_dsa_indexer_prefill_split(
     metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
     extend_num_tokens = forward_batch.extend_num_tokens
+    cp = is_interleave_extend(forward_batch)
+    query_tokens = extend_num_tokens
+    logical_tokens = extend_num_tokens
+    if cp:
+        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
+
+        query_tokens, logical_tokens = cp_interleave_indexer_rows(forward_batch)
+        parts = x if isinstance(x, tuple) else (x,)
+        if not 0 <= logical_tokens <= query_tokens or any(
+            query_tokens > part.shape[0] for part in parts
+        ):
+            raise ValueError("Invalid CP indexer live rows")
+        if query_tokens > q_lora.shape[0] or query_tokens > positions.shape[0]:
+            raise ValueError("CP indexer input rows do not cover the live shard")
+        x = (
+            tuple(part[:query_tokens] for part in parts)
+            if isinstance(x, tuple)
+            else x[:query_tokens]
+        )
+        q_lora, positions = q_lora[:query_tokens], positions[:query_tokens]
+        extend_num_tokens = forward_batch.attn_cp_metadata.total_seq_lens
+        if extend_num_tokens > forward_batch.out_cache_loc.shape[0]:
+            raise ValueError(
+                "CP indexer cache locations do not cover live global tokens"
+            )
+        topk_result.fill_(-1)
     # Empty buffer encodes return_indices=False for graph dispatch.
     return_indices = topk_result.numel() != 0
     k_only = not return_indices or (
         indexer._should_skip_logits_computation(forward_batch)
         and not indexer.dsa_enable_prefill_cp
     )
-    if k_only:
+    if k_only and not cp:
         indexer._forward_cuda_k_only(
             x,
             positions,
@@ -95,7 +122,7 @@ def pcg_dsa_indexer_prefill_split(
         return
 
     # Same fused Q/K writer as the eager ROCm path, sliced to the unpadded count.
-    if indexer._aiter_fused_fp8_active(forward_batch):
+    if not cp and indexer._aiter_fused_fp8_active(forward_batch):
         q_fp8, weights = indexer._aiter_fused_fp8_prepare_and_store(
             x,
             q_lora,
@@ -118,7 +145,7 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    if indexer.use_dsa_indexer_fusion:
+    if not cp and indexer.use_dsa_indexer_fusion:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
             q_lora,
@@ -140,16 +167,32 @@ def pcg_dsa_indexer_prefill_split(
         )
         return
 
-    query, key, _ = indexer._get_q_k_bf16(
+    query, key, weights_raw = indexer._get_q_k_bf16(
         q_lora,
         x,
         positions,
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
-    # Reuse the compiled head-gate util shared with the eager path.
-    weights = indexer._get_logits_head_gate(x, q_scale)
+    if (
+        _is_cuda
+        and indexer.bf16_head_gate
+        and indexer.skip_rope
+        and indexer.head_dim == indexer.block_size == 128
+    ):
+        from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
+
+        gate = indexer._weights_proj_bf16_in_fp32_out(x)
+        q_fp8, weights = indexer_q_quant_head_gate(
+            query, gate, indexer.softmax_scale, indexer.scale_fmt
+        )
+    else:
+        q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+        weights = (
+            indexer._scale_head_gates(weights_raw, q_scale)
+            if indexer.use_dsa_indexer_fusion
+            else indexer._get_logits_head_gate(x, q_scale)
+        )
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
@@ -160,15 +203,27 @@ def pcg_dsa_indexer_prefill_split(
         act_quant=act_quant,
         out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
     )
+    if not return_indices:
+        return
     indexer._get_topk_ragged(
         False,
         forward_batch,
         layer_id,
-        q_fp8[:extend_num_tokens],
+        q_fp8[:query_tokens],
         weights,
         metadata,
         topk_result,
     )
+    if cp:
+        topk_result[logical_tokens:].fill_(-1)
 
 
-bcg_dsa_indexer_prefill_split = eager_on_graph(True)(pcg_dsa_indexer_prefill_split)
+def _dsa_indexer_prefill_capture_stub(
+    layer_id, x, q_lora, positions, topk_result, **kwargs
+):
+    topk_result.fill_(-1)
+
+
+bcg_dsa_indexer_prefill_split = eager_on_graph(
+    on_capture=_dsa_indexer_prefill_capture_stub
+)(pcg_dsa_indexer_prefill_split)

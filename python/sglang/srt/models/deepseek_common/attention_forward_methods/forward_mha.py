@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_backend import uses_raw_fp8_dsa_kv_layout
 from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dcp import (
@@ -16,6 +17,7 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -259,8 +261,10 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_exec().kernel.dsa_decode_backend == "trtllm"
-                    or not get_exec().kernel.dsa_prefill_backend == "trtllm"
+                    not uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
+                    or not uses_raw_fp8_dsa_kv_layout(
+                        get_exec().kernel.dsa_prefill_backend
+                    )
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
@@ -688,6 +692,16 @@ class DeepseekMHAForwardMixin:
             return kv_a, k_pe
 
         kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(self.attn_mha.layer_id)
+        if dsa_shards_index_k():
+            # K3.1 DCP: page_table_1_flattened holds widened slots spread over
+            # the DCP ranks: gather every rank's rows first; they come back in
+            # the order of page_table_1_flattened.
+            kv_cache_fp8 = backend.dcp_gather_kv_cache(
+                kv_cache_fp8, forward_batch, backend.forward_metadata
+            )
+            kv_indices = torch.arange(
+                kv_indices.shape[0], dtype=kv_indices.dtype, device=kv_indices.device
+            )
 
         kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 

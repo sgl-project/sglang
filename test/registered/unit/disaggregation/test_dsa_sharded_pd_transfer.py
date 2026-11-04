@@ -41,6 +41,7 @@ def _manager(rank, size, sources, destinations):
         state_layer_ids=[[]],
         prefill_start_layer=0,
     )
+    mgr.state_item_lens_sums = [sum(comp) for comp in mgr.kv_args.state_item_lens]
     mgr.blocks = []
 
     def copy_blocks(session, blocks):
@@ -178,6 +179,7 @@ class TestDSAShardedPDTransfer(CustomTestCase):
         sender._transfer_metric = KVTransferMetric()
         sender._transfer_num_kv_indices = 0
         sender._transfer_num_state_indices = 0
+        sender._transfer_state_bytes = 0
         full_pages = np.array([3, 6, 4, 9, 12], dtype=np.int32)
         with patch(
             "sglang.srt.disaggregation.common.conn.get_parallel",

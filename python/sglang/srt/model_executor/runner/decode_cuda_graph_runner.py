@@ -37,12 +37,17 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.kernels.ops.memory.small_copy import try_small_copy
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_verify_variants
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    megakernel_can_run_graph,
+    megakernel_tensor_graph_variants,
+    megakernel_verify_variants,
+)
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
@@ -260,6 +265,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _restage_skip = False
     _staged_inputs = None
     _draft_glue_logged = 0
+    _batched_small_copy = False
 
     dllm_input_preparation = None
     dllm_attention = None
@@ -383,6 +389,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )
+        )
+
+        self.attention_graph_variants = megakernel_tensor_graph_variants(
+            self.model_runner.model, self.attention_graph_variants
         )
 
         if (
@@ -580,6 +590,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # SGLANG_Q35MF_MKH_N3B: a pre-planned replay skips copying input_ids and
         # positions again when the full load_batch copied them (_restage_is_redundant)
         self._restage_skip = envs.SGLANG_Q35MF_MKH_N3B.get()
+        self._batched_small_copy = envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
         self._staged_inputs: Optional[tuple] = None
         # The DSpark draft runner's prep has no host-fed plan, so the guard above does
         # not apply where its backend says so.
@@ -806,12 +817,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
-        DP rank drafts independently with no cross-DP collective, so its
-        hand-built batches carry no dp-global metadata and must key graphs by
-        local batch size. Everything else keeps the dp-global padding path."""
+        """The DSpark dense draft and the DFLASH draft run attn-TP-local
+        (draft_tp_context): each DP rank drafts independently with no cross-DP
+        collective, so their hand-built batches carry no dp-global metadata and
+        must key graphs by local batch size. Everything else keeps the
+        dp-global padding path."""
         if not model_runner.is_draft_worker:
             return False
+        if model_runner.spec_algorithm.is_dflash():
+            return True
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -875,6 +889,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if not megakernel_can_run_graph(self.model_runner.model, forward_batch):
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -1978,6 +1994,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         # The plan-time load (or the early stage it took) filled these from the very
         # same tensors.
+        if (
+            prefilled is None
+            and self._batched_small_copy
+            and try_small_copy(
+                [
+                    self.buffers.input_ids[: self.raw_num_token],
+                    self.buffers.positions[: self.raw_num_token],
+                ],
+                [forward_batch.input_ids, forward_batch.positions],
+            )
+        ):
+            return
         if prefilled is None or forward_batch.input_ids is not prefilled[0]:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
         if prefilled is None or forward_batch.positions is not prefilled[1]:

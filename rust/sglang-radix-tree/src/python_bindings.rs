@@ -1069,6 +1069,15 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().match_full_device_prefix(key, namespace))
             }
 
+            /// Read-only match length: no split, LRU refresh or access-tick update.
+            fn peek_prefix_len(&self, py: Python<'_>, params: &MatchParamsBinding) -> usize {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let key = key.as_ref();
+                let namespace =
+                    KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+                py.detach(|| self.core().peek_prefix_len(key, namespace))
+            }
+
             fn swa_tombstone_ranges(
                 &self,
                 py: Python<'_>,
@@ -1812,6 +1821,12 @@ macro_rules! tree_core_methods {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 py.detach(|| self.core().node_backuped(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// The node's accumulated match count.
+            fn node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
+                py.detach(|| self.core().node_hit_count(node_id))
                     .map_err(node_access_error)
             }
 
@@ -2776,6 +2791,11 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| Ok(self.inner.match_full_device_prefix(py, params)))
             }
 
+            /// Read-only match length: no split, LRU refresh or access-tick update.
+            fn peek_prefix_len(&self, py: Python<'_>, params: &MatchParamsBinding) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.peek_prefix_len(py, params)))
+            }
+
             fn swa_tombstone_ranges(
                 &self,
                 py: Python<'_>,
@@ -3233,6 +3253,11 @@ macro_rules! tree_core_binding {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
+            }
+
+            /// The node's accumulated match count.
+            fn node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
+                catch_native_panic(|| self.inner.node_hit_count(py, node_id))
             }
 
             /// Whether the node is a (default or named) root.
