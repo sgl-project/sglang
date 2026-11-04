@@ -1129,7 +1129,24 @@ def generate_glm_grammar(
             )
         else:
             if accommodate_chat_template:
-                ebnf_lines.append('thinking_block ::= ""')
+                # Some GLM chat templates (e.g. GLM-5.3-Flash) ignore the
+                # enable_thinking kwarg and always render the think-start
+                # token, so the model may already be inside a thinking block
+                # the grammar cannot see. An empty thinking_block bans
+                # end-of-thinking and traps the model there until the token
+                # limit (issue #48336). Allow an optional, possibly empty
+                # thinking block instead: templates that honor
+                # enable_thinking render no think-start and the model goes
+                # straight to the answer; templates that ignore it can close
+                # their reasoning normally.
+                ebnf_lines.append(
+                    rf'thinking_block ::= ( thinking_block_content "{special_tokens.end_of_thinking}" )?'
+                )
+                ebnf_lines.extend(
+                    _glm_any_string_exclude(
+                        "thinking_block_content", thinking_exclusions
+                    )
+                )
             else:
                 ebnf_lines.append(
                     rf'thinking_block ::= "{special_tokens.end_of_thinking}"'
