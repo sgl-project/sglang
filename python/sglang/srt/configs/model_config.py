@@ -2469,6 +2469,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Gemma2ForSequenceClassification" in model_architectures
         or "EmbeddingGemma2Model" in model_architectures
         or "Lfm2BidirectionalModel" in model_architectures
+        or "LayaForDecision" in model_architectures
     ):
         return False
     else:
