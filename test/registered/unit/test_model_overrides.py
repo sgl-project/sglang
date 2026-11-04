@@ -3285,6 +3285,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
+                attention_backend=None,
+                decode_attention_backend=None,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -3394,7 +3396,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_mamba_radix_cache_resolution_sail_paths(self):
-        """The FlashKDA extra-buffer allowance is SAIL-only."""
+        """FlashMLA's page-64 snap is platform-independent; the FlashKDA
+        extra-buffer allowance is SAIL-only."""
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
             _mamba_radix_cache_resolution,
@@ -3407,10 +3410,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 disable_radix_cache=False,
                 mamba_radix_cache_strategy="auto",
-                disable_overlap_schedule=False,
+                disable_overlap_schedule=True,
                 page_size=1,
                 linear_attn_backend="flashkda",
                 linear_attn_prefill_backend=None,
+                attention_backend=None,
+                decode_attention_backend="flashmla",
             )
             defaults.update(kw)
             return ResolvedView(
@@ -3419,8 +3424,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             )
 
-        # Off SAIL the FlashKDA backend is not an extra-buffer backend, so the
-        # strategy falls back to no_buffer even with overlap enabled.
+        # FlashMLA decode means the cache is paged even though this pass still
+        # sees page_size 1; off SAIL the FlashKDA backend is not an extra-buffer
+        # backend, so the strategy still resolves to no_buffer.
         self.assertFalse(
             supports_mamba_cache_extra_buffer(
                 SimpleNamespace(linear_attn_backend="flashkda"), kimi_k3
@@ -3430,8 +3436,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _mamba_radix_cache_resolution(_view())["mamba_radix_cache_strategy"],
             "no_buffer",
         )
-        # On SAIL FlashKDA prefill still snapshot-writes tracked states through
-        # Triton, so the ping-pong extra buffer is usable.
+        # The paging decision itself does not depend on the platform: the same
+        # FlashMLA decode view gets the extra buffer on the triton backend.
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view(linear_attn_backend="triton"))[
+                "mamba_radix_cache_strategy"
+            ],
+            "extra_buffer",
+        )
+        # On SAIL both allowances apply: FlashKDA prefill still snapshot-writes
+        # tracked states through Triton, and the FlashMLA decode backend means
+        # real paging even though this pass still sees page_size 1.
         with patch.object(
             overrides_module,
             "get_platform",

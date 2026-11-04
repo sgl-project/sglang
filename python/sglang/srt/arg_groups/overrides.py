@@ -477,7 +477,13 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        wants_paging = (
+            (view.page_size is not None and view.page_size > 1)
+            # FlashMLA snaps page_size to 64 later in the pass chain, so a
+            # page-1 request still lands on a paged cache.
+            or view.attention_backend == "flashmla"
+            or view.decode_attention_backend == "flashmla"
+        )
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, hf_config
         ):
