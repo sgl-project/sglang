@@ -134,7 +134,7 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     swa_attention_layer_ids: Optional[list[int]] = None
     full_attention_layer_ids: Optional[list[int]] = None
     # Owns the single block at layer_id == draft_model_idx, not a [start, end) slice.
-    is_hybrid_swa_mtp_draft: bool = False
+    draft_owns_its_depth: bool = False
 
 
 def resolve_layer_indices(
@@ -158,15 +158,14 @@ def resolve_layer_indices(
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
-    is_hybrid_swa_mtp_draft = (
+    draft_owns_its_depth = (
         is_draft_worker
         and draft_model_idx is not None
-        and model_config.is_hybrid_swa
         and getattr(model, "mtp_layer_id_is_depth", False)
     )
     owned_layers = (
         range(draft_model_idx, draft_model_idx + 1)
-        if is_hybrid_swa_mtp_draft
+        if draft_owns_its_depth
         else range(pp_range.start_layer, pp_range.end_layer)
     )
     swa_attention_layer_ids, full_attention_layer_ids = (
@@ -181,7 +180,7 @@ def resolve_layer_indices(
         num_effective_layers=num_effective_layers,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
-        is_hybrid_swa_mtp_draft=is_hybrid_swa_mtp_draft,
+        draft_owns_its_depth=draft_owns_its_depth,
     )
 
 

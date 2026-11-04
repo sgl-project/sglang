@@ -37,8 +37,8 @@ from sglang.srt.lora.utils import auto_detect_lora_target_modules
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=56, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=51, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=120, suite="extra-a-test-1-gpu-large-amd")
 
 BASE_MODEL = "Qwen/Qwen3-8B"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-8B"

@@ -4,13 +4,18 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+
+
+def _plain_id_spaces():
+    """A static pool's one token sub-pool, indexed by its own ids."""
+    return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
@@ -29,10 +34,10 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         # translated block table and the strided one this test covers, so the
         # source has to be real; the stub pools disable translation, which is
         # the static-pool view the assertions below are written against.
-        backend.kv_index_translator = KVIndexTranslator(
+        backend.runner_ids = RunnerIds(
             req_to_token=backend.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=backend.page_size,
             device="cpu",
         )
@@ -61,10 +66,10 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         )
         # A real source over the stub pool: the probe disables it, giving the
         # backend the strict passthrough view it now reads its tables from.
-        backend.kv_index_translator = KVIndexTranslator(
+        backend.runner_ids = RunnerIds(
             req_to_token=backend.req_to_token_pool.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device="cpu",
         )
@@ -131,7 +136,7 @@ class TestDraftExtendInGraph(CustomTestCase):
 
     def _run(self, *, translating):
         b = FlashAttentionBackend.__new__(FlashAttentionBackend)
-        b.kv_index_translator = SimpleNamespace(is_translating=translating)
+        b.runner_ids = SimpleNamespace(is_translating=translating)
         b.draft_extend_metadata = {}  # any metadata access raises KeyError
         fb = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2, batch_size=2)
         b.init_forward_metadata_in_graph(fb)
@@ -177,15 +182,15 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         full[0] = 0
         swa = torch.arange(24, device=device, dtype=torch.int32)
         swa[7] = -1
-        translator = KVIndexTranslator.__new__(KVIndexTranslator)
-        translator._spaces = {
+        runner_ids = RunnerIds.__new__(RunnerIds)
+        runner_ids._spaces = {
             IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
         }
         if use_swa:
-            translator._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
+            runner_ids._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
                 key="swa", read_v2p=swa
             )
-        b.kv_index_translator = translator
+        b.runner_ids = runner_ids
         b.target_verify_metadata = {
             "cache_seqlens": torch.zeros(bs, dtype=torch.int32, device=device),
             "cu_seqlens_k": torch.zeros(bs + 1, dtype=torch.int32, device=device),

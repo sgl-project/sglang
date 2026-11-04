@@ -69,6 +69,12 @@ The default `flow_shift` is `3.0` for T2I, `10.0` for non-Edge video and all act
 
 ## 3. Serve Cosmos3
 
+For Intel Xeon CPU deployment, use `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` with the selected Cosmos3 checkpoint.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path nvidia/Cosmos3-Nano --port 30010
+```
+
 Serve `Cosmos3-Nano` directly from the Hugging Face model ID:
 
 ```bash Command

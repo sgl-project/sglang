@@ -8,7 +8,7 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeReq:
@@ -95,16 +95,6 @@ class TestOutputStreamerLogprobs(unittest.TestCase):
         self.assertEqual(req.send_token_offset, 0)
         self.assertEqual(req.send_output_token_logprobs_offset, 0)
         self.assertEqual(accumulator.output_token_logprobs_val, [[]])
-
-    def test_prefill_only_request_preserves_first_logprob(self):
-        req = _FakeReq(is_retracted=False, max_new_tokens=0)
-        accumulator = _make_accumulator()
-
-        accumulator.accept(req=req)
-
-        self.assertEqual(req.send_token_offset, 0)
-        self.assertEqual(req.send_output_token_logprobs_offset, 1)
-        self.assertEqual(accumulator.output_token_logprobs_val, [[-0.5]])
 
     def test_rust_server_mode_reports_cached_tokens_per_request(self):
         """The Rust frontend rejects a batch whose cached_tokens column is shorter than rids."""

@@ -7,7 +7,7 @@ Python emitters of sglang-api-codegen are held to one contract.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import json
 import unittest
@@ -131,8 +131,7 @@ class TestGenerateRequest(CustomTestCase):
             {
                 "text": "hi",
                 "priority": 3,
-                "session_id": "s",
-                "custom_logit_processor": "x",
+                "conversation_id": "ignored",
             }
         )
         self.assertEqual(req.text, "hi")

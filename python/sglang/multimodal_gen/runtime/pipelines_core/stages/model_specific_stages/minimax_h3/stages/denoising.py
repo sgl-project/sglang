@@ -5,6 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
@@ -778,6 +779,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            if model.final_layer._pdd_heads is not None:
+                initial_video, initial_audio = _scale_pdd_initial_noise(
+                    ctx, positive, initial_video, initial_audio
+                )
             rollout_ctx = None
             if getattr(batch, "rollout", False):
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
@@ -1049,30 +1054,31 @@ def _maybe_prepare_vsa_h3_step_metadata(
     latent_shape: tuple[int, int, int],
     server_args: ServerArgs,
     device: torch.device,
+    native_layout: bool = True,
 ) -> Callable[[int], Any] | None:
     """Per-step VSA-H3 metadata builder over the request-static packed layout,
-    or None off the VSA path."""
+    or None off the VSA path.
+
+    Ref2VA regions are read from the native packed layout's stream_layout;
+    ``native_layout=False`` marks a layout serialized by ComfyUI, whose
+    stream_layout does not tell reference images from reference videos."""
     model._resolve_attention_backend_once()
     if (
         model._resolved_attention_backend
         is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
     ):
         return None
-    if is_ref2va:
+    if is_ref2va and not native_layout:
         raise NotImplementedError(
-            "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
-            "reference-block layout is not tiled yet. Use --attention-backend "
-            "fa for ref2va."
+            "VSA-H3 tiles Ref2VA references on SGLang's native packed layout; "
+            "a ComfyUI-serialized Ref2VA layout is not tiled. Use "
+            "--attention-backend fa for it."
         )
-
     config = server_args.attention_backend_config or {}
-    tile_size = int(config.get("vsa_tile_size", 64))
-    if tile_size != 64:
-        raise ValueError(
-            "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
-            f"geometry; got vsa_tile_size={tile_size}."
-        )
-    default_sparsity = server_args.pipeline_config.vsa_sparsity
+    pipeline_config = server_args.pipeline_config
+    tile_size = int(config.get("vsa_tile_size", pipeline_config.vsa_tile_size))
+    ref_keep_rate = config.get("vsa_ref_keep_rate", pipeline_config.vsa_ref_keep_rate)
+    default_sparsity = pipeline_config.vsa_sparsity
     sparsity = float(
         config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
     )
@@ -1089,6 +1095,9 @@ def _maybe_prepare_vsa_h3_step_metadata(
     cond_rows = int(packed["img_pos"].numel()) - video_rows
     audio_rows = int(packed["audio_pos"].numel())
     patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+    packed_segments = (
+        _ref2va_vsa_segments(packed, latent_shape, patch_size) if is_ref2va else None
+    )
 
     from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
         VideoSparseAttentionH3MetadataBuilder,
@@ -1107,9 +1116,42 @@ def _maybe_prepare_vsa_h3_step_metadata(
             exempt=mode == "exempt",
             dense_layers=dense_layers,
             dense_first_n_steps=dense_first_n_steps,
+            packed_segments=packed_segments,
+            tile_size=tile_size,
+            ref_keep_rate=None if ref_keep_rate is None else float(ref_keep_rate),
         )
 
     return build
+
+
+def _ref2va_vsa_segments(
+    packed: Mapping[str, Any],
+    latent_shape: tuple[int, int, int],
+    patch_size: tuple[int, int, int],
+) -> tuple[int | tuple[int, int, int], ...]:
+    """Ref2VA packed order as VSA-H3 segments: text, keyframes, then each
+    reference (images and audio dense, videos as their own token-grid
+    regions), target audio, and the generated video's token grid last."""
+    layout = packed["stream_layout"]
+    shapes = layout["cond_image_shapes"]
+    roles = layout["cond_image_roles"]
+    audio_lens = layout["cond_audio_stream_lens"]
+    reference_visual_rows = sum(math.prod(shape) for shape in shapes)
+    cond_rows = int(packed["img_pos"].numel()) - int(packed["update_mask"].sum())
+    segments: list[int | tuple[int, int, int]] = [
+        int(packed["text_pos"].numel()),
+        cond_rows - reference_visual_rows,
+    ]
+    for kind, index in layout["cond_event_orders"]:
+        if kind == "audio":
+            segments.append(int(audio_lens[index]))
+        elif roles[index] == "independent_cube":
+            segments.append(tuple(int(v) for v in shapes[index]))
+        else:
+            segments.append(math.prod(shapes[index]))
+    segments.append(int(packed["audio_pos"].numel()) - sum(audio_lens))
+    segments.append(tuple(int(n) // int(p) for n, p in zip(latent_shape, patch_size)))
+    return tuple(segments)
 
 
 def _build_packed_layout(
@@ -1264,6 +1306,22 @@ def _expand_initial_rows(
         )
         full_audio[positive.audio_update_mask] = initial_audio
         initial_audio = full_audio
+    return initial_video, initial_audio
+
+
+def _scale_pdd_initial_noise(
+    ctx: _FullLoopContext,
+    positive: Any,
+    initial_video: torch.Tensor,
+    initial_audio: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Start PDD targets at the first node's noise level, as the students are
+    trained (``sigma_0 * eps``); condition rows stay as they are. A no-op on
+    grids that start at sigma 1."""
+    initial_video = initial_video.clone()
+    initial_audio = initial_audio.clone()
+    initial_video[positive.video_target_slice] *= float(ctx.sigmas["video"][0])
+    initial_audio[positive.audio_target_slice] *= float(ctx.sigmas["audio"][0])
     return initial_video, initial_audio
 
 

@@ -257,6 +257,25 @@ def _gather_modulation_shards(
     return gathered[:num_img], gathered[num_img:]
 
 
+@functools.lru_cache(maxsize=8)
+def _text_image_varlen_meta(
+    txt_seq_lens: tuple[int, ...],
+    txt_len: int,
+    image_seq_len: int,
+    device: torch.device,
+) -> dict:
+    """Varlen metadata for [valid text prefix, image] rows; the forward hands out copies.
+
+    It depends only on these lengths, and building it uploads them from pageable
+    memory, which would block the host on every step of a batched request.
+    """
+    return build_varlen_mask_meta_from_ranges(
+        [[(0, n), (txt_len, txt_len + image_seq_len)] for n in txt_seq_lens],
+        max_seqlen=txt_len + image_seq_len,
+        device=device,
+    )
+
+
 def _safe_tensor_version(tensor: torch.Tensor) -> Optional[int]:
     """Read a tensor version counter without rejecting inference tensors."""
     return None if tensor.is_inference() else tensor._version
@@ -2485,15 +2504,13 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # (the mask is built from it), so the varlen metadata can be
                 # assembled host-side; the mask-based builder costs a GPU
                 # nonzero plus a device sync on every denoising step.
-                txt_len = encoder_hidden_states.shape[1]
-                block_attention_kwargs["attn_mask_meta"] = (
-                    build_varlen_mask_meta_from_ranges(
-                        [
-                            [(0, int(n)), (txt_len, txt_len + image_seq_len)]
-                            for n in txt_seq_lens
-                        ],
-                        max_seqlen=txt_len + image_seq_len,
-                        device=hidden_states.device,
+                # a fresh dict per forward: attention may memoize into it
+                block_attention_kwargs["attn_mask_meta"] = dict(
+                    _text_image_varlen_meta(
+                        tuple(int(n) for n in txt_seq_lens),
+                        encoder_hidden_states.shape[1],
+                        image_seq_len,
+                        hidden_states.device,
                     )
                 )
             else:

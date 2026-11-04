@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import (
     Annotated,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -36,6 +37,7 @@ from typing import (
     runtime_checkable,
 )
 
+import msgspec
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
@@ -52,12 +54,16 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
 )
+from openai.types.responses.response_function_tool_call_param import (
+    ResponseFunctionToolCallParam,
+)
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     field_serializer,
     field_validator,
@@ -207,6 +213,12 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """Details about completion tokens."""
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -214,6 +226,8 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    # The OpenAI location of reasoning_tokens; set only when there are some.
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class StreamOptions(BaseModel):
@@ -594,7 +608,13 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    max_long_side_pixel: Optional[int] = None
     content_hash: Optional[str] = None
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _default_detail_is_auto(cls, value: Any) -> Any:
+        return "auto" if value == "default" else value
 
     @field_validator("content_hash")
     @classmethod
@@ -612,6 +632,7 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     max_frames: Optional[int] = Field(default=None, gt=0)
     max_tokens_per_frame: Optional[int] = Field(default=None, gt=0)
     max_image_tokens: Optional[int] = Field(default=None, gt=0)
+    max_long_side_pixel: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -727,7 +748,7 @@ class ToolCall(BaseModel):
 
 
 _GenericMessageRole = Literal[
-    "system", "assistant", "tool", "function", "developer", "latest_reminder"
+    "system", "assistant", "tool", "function", "developer", "latest_reminder", "root"
 ]
 _GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
 
@@ -743,6 +764,8 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # DeepSeek API prefix completion: continue this final assistant message.
+    prefix: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -792,14 +815,31 @@ class Function(BaseModel):
     description: Optional[str] = Field(default=None, examples=[None])
     name: str
     parameters: Optional[object] = None
-    strict: bool = False
+    strict: Optional[bool] = None
     defer_loading: Optional[bool] = None
+    key_order: List[str] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_key_order(cls, data):
+        if isinstance(data, dict):
+            data = dict(data)
+            data["key_order"] = list(data.keys())
+        return data
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
+        # Chat templates render the tool schema as given; do not inject fields
+        # the client left out or reorder the ones it sent.
         data = handler(self)
         if self.defer_loading is None:
             data.pop("defer_loading", None)
+        if self.strict is None:
+            data.pop("strict", None)
+        order = self.key_order
+        if order:
+            rest = [k for k in data if k not in order]
+            data = {k: data[k] for k in order + rest if k in data}
         return data
 
 
@@ -836,9 +876,10 @@ class ToolChoice(BaseModel):
 
 
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+# none/minimal/low/medium/high/xhigh/max, plus DeepSeek's ultra. Used as-is by
+# /v1/responses.
 ReasoningEffortTier = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"
 ]
 # The typed /v1/responses stream events validate against OpenAI's narrower
 # ``Reasoning.effort``; echoing a tier outside this set kills the stream.
@@ -861,13 +902,20 @@ def _has_message_level_tools(messages: Any) -> bool:
     return any(
         isinstance(message, dict)
         and isinstance(message.get("role"), str)
-        and message["role"].lower() in ("system", "developer")
+        and message["role"].lower() in ("root", "system", "developer")
         and bool(message.get("tools"))
         for message in messages
     )
 
 
 class ChatCompletionRequest(PDRoutingFields):
+    _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_json_response_format: bool = PrivateAttr(default=False)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
+    _format_add_special_tokens: bool = PrivateAttr(default=False)
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -900,6 +948,10 @@ class ChatCompletionRequest(PDRoutingFields):
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # Set by /v1/responses when the request has namespace tools: the chat template
+    # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
+    # drives tool-call parsing.
+    _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
@@ -924,7 +976,7 @@ class ChatCompletionRequest(PDRoutingFields):
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max') or a "
         "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -933,6 +985,11 @@ class ChatCompletionRequest(PDRoutingFields):
         "'max' is an sglang extension to the OpenAI schema for "
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
+    )
+    thinking: Optional[Any] = Field(
+        default=None,
+        description="Thinking config such as {'type': 'adaptive'}; read only by "
+        "models whose chat template defines a thinking mode, ignored otherwise.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -1054,6 +1111,7 @@ class ChatCompletionRequest(PDRoutingFields):
                 "medium",
                 "high",
                 "xhigh",
+                "ultra",
                 "max",
             }:
                 values["reasoning_effort"] = effort
@@ -1705,6 +1763,14 @@ class TokenizeRequest(BaseModel):
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+    add_generation_prompt: Optional[bool] = Field(
+        default=None,
+        description=(
+            "With messages: render them as given, passing this to the chat template, "
+            "and encode with add_special_tokens (default false). Omitted, messages are "
+            "rendered as for a chat completion."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_tokenize_input(self) -> TokenizeRequest:
@@ -1720,7 +1786,14 @@ class TokenizeRequest(BaseModel):
         extra = getattr(self, "__pydantic_extra__", None)
         if extra:
             data.update(extra)
-        return ChatCompletionRequest.model_validate(data)
+        request = ChatCompletionRequest.model_validate(data)
+        if self.add_generation_prompt is not None:
+            request._format_add_generation_prompt = self.add_generation_prompt
+            request._format_add_special_tokens = (
+                "add_special_tokens" in self.model_fields_set
+                and self.add_special_tokens
+            )
+        return request
 
 
 class TokenizeResponse(BaseModel):
@@ -1769,7 +1842,7 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
         "Accepts the OpenAI string tiers "
-        "('none','minimal','low','medium','high','xhigh','max').",
+        "('none','minimal','low','medium','high','xhigh','ultra','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
@@ -1788,6 +1861,7 @@ RESPONSE_TOOL_TYPES = Literal[
     "image_generation",
     "computer_use_preview",
     "local_shell",
+    "shell",
     "mcp",
     "custom",
     "namespace",
@@ -1798,6 +1872,8 @@ RESPONSE_TOOL_TYPES = Literal[
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
+    model_config = ConfigDict(extra="allow")
+
     type: RESPONSE_TOOL_TYPES = Field(description="Type of tool to enable")
     name: Optional[str] = None
     description: Optional[str] = None
@@ -1805,6 +1881,7 @@ class ResponseTool(BaseModel):
     strict: bool = False
     # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
+    defer_loading: Optional[bool] = None
     # Input format of a ``custom`` tool: {"type": "text"} or
     # {"type": "grammar", "syntax": ..., "definition": ...}.
     format: Optional[Dict[str, Any]] = None
@@ -1816,8 +1893,21 @@ class ResponseTool(BaseModel):
         return self
 
 
+class ResponseToolState(msgspec.Struct, frozen=True):
+    """Public tool metadata and name mappings for one translated request."""
+
+    public_tools: list[ResponseTool] | None = None
+    public_choice: str | dict[str, Any] | None = None
+    names: dict[str, dict[str, str]] = {}
+
+
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
     phase: Optional[Literal["commentary", "final_answer"]]
+
+
+class ResponseFunctionCallInputParam(ResponseFunctionToolCallParam, total=False):
+    # Set when the call targets a member of a ``namespace`` tool.
+    namespace: str
 
 
 class ResponseOutputMessage(OpenAIResponseOutputMessage):
@@ -1826,6 +1916,7 @@ class ResponseOutputMessage(OpenAIResponseOutputMessage):
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputMessageParam,
+    ResponseFunctionCallInputParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",
@@ -1835,6 +1926,12 @@ ResponseInputOutputItem: TypeAlias = Union[
 
 class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
+
+    _tool_state: ResponseToolState = PrivateAttr(default_factory=ResponseToolState)
+    _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_json_response_format: bool = PrivateAttr(default=False)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
@@ -1850,9 +1947,10 @@ class ResponsesRequest(PDRoutingFields):
             ]
         ]
     ] = None
-    # Accept dict-shaped items as the loose arm; downstream normalization
-    # handles replayed shapes that don't satisfy every openai TypedDict.
-    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
+    # Preserve JSON input for downstream validation; SDK TypedDicts discard extra fields.
+    input: Union[str, List[Dict[str, Any]], List[ResponseInputOutputItem]] = Field(
+        union_mode="left_to_right"
+    )
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -2028,7 +2126,10 @@ class ResponsesRequest(PDRoutingFields):
             "name"
         )
         if tool_choice.get("type") in ("function", "custom") and name:
-            return {"type": "function", "name": name}
+            choice = {"type": tool_choice["type"], "name": name}
+            if "namespace" in tool_choice:
+                choice["namespace"] = tool_choice["namespace"]
+            return choice
         return "auto"
 
     def to_sampling_params(
@@ -2264,6 +2365,7 @@ class ResponsesResponse(BaseModel):
                 {"format": {"type": "text"}} if _is_text_only(output) else None
             )
 
+        tool_state = request._tool_state
         return cls(
             id=request.request_id,
             created_at=created_time,
@@ -2276,8 +2378,16 @@ class ResponsesResponse(BaseModel):
                 if request.parallel_tool_calls is not None
                 else True
             ),
-            tool_choice=request.effective_tool_choice(),
-            tools=request.tools,
+            tool_choice=(
+                tool_state.public_choice
+                if tool_state.public_choice is not None
+                else request.effective_tool_choice()
+            ),
+            tools=(
+                tool_state.public_tools
+                if tool_state.public_tools is not None
+                else request.tools
+            ),
             # fields for parity with v1/responses
             error=None,
             incomplete_details=(
@@ -2305,6 +2415,20 @@ class ResponsesResponse(BaseModel):
         )
 
 
+class ResponsesLifecycleEvent(BaseModel):
+    """Response lifecycle event using SGLang's public response schema."""
+
+    type: Literal[
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ]
+    response: ResponsesResponse
+    sequence_number: int = -1
+
+
 class RequestResponseMetadata(BaseModel):
     """Metadata for request/response tracking."""
 
@@ -2325,6 +2449,14 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # The tool-call constraint is the response template's own grammar.
+    template_tool_call_grammar: bool = False
+    # Derives the tool-call constraint for output that starts the assistant
+    # message, so that only a prompt ending at the message start pays for it.
+    message_start_tool_call_constraint: Optional[
+        Callable[[], Optional[ToolCallConstraint]]
+    ] = None
+    uses_response_template: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):
@@ -2344,6 +2476,7 @@ class ResponseReasoningTextContent(BaseModel):
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputMessageParam,
+    ResponseFunctionCallInputParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",

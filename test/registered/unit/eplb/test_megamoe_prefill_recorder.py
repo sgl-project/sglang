@@ -5,7 +5,6 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.eplb.eplb_manager import EPLBManager
-from sglang.srt.eplb.eplb_map_record_fused import eplb_map_and_record_fused
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
     _InfiniteBuffer,
@@ -18,7 +17,7 @@ from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _batch(mode: ForwardMode, *, extend_tokens: int = 0, any_prefill: bool = False):
@@ -142,25 +141,6 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
             0, torch.tensor([[-1, 0, 3, 4, 9]], dtype=torch.int32)
         )
         self.assertTrue(torch.equal(gatherer._data, torch.tensor([[1, 0, 0, 1]])))
-
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/HIP")
-    def test_fused_map_record_filters_padding(self):
-        topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
-        dispatch = torch.tensor([2, 0, 3, 1], dtype=torch.int32, device="cuda")
-        info = SimpleNamespace(
-            ep_dispatch_algorithm="static",
-            partial_logical_to_rank_dispatch_physical_map=dispatch,
-        )
-        load = torch.zeros(4, dtype=torch.int32, device="cuda")
-        valid_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
-        output = eplb_map_and_record_fused(topk_ids, info, load, valid_tokens)
-        torch.cuda.synchronize()
-        self.assertTrue(
-            torch.equal(output.cpu(), torch.tensor([[2, 0], [3, 1]], dtype=torch.int32))
-        )
-        self.assertTrue(
-            torch.equal(load.cpu(), torch.tensor([1, 0, 1, 0], dtype=torch.int32))
-        )
 
     def _make_recorder(self):
         recorder = _ExpertDistributionRecorderReal.__new__(

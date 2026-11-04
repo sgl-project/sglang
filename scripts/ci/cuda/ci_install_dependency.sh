@@ -400,11 +400,22 @@ setup_cargo_cache() {
         mkdir -p "${CARGO_TARGET_DIR}"
     fi
 
+    # Cargo checks path crates by mtime and all runners share one checkout path,
+    # so rebuild them unless this target dir was built from the same rust/ tree.
+    CARGO_TREE_STAMP="${CARGO_TARGET_DIR}/.rust-tree"
+    CARGO_TREE_KEY="$(git -C "${REPO_ROOT}" rev-parse HEAD:rust 2>/dev/null || true)"
+    if [ -z "${CARGO_TREE_KEY}" ] || [ "$(cat "${CARGO_TREE_STAMP}" 2>/dev/null)" != "${CARGO_TREE_KEY}" ]; then
+        git -C "${REPO_ROOT}" ls-files -z rust | (cd "${REPO_ROOT}" && xargs -0 touch)
+    fi
+    rm -f "${CARGO_TREE_STAMP}"
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
 release_cargo_cache_lock() {
     if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
+        # Only reached after a successful build.
+        [ -z "${CARGO_TREE_KEY:-}" ] || echo "${CARGO_TREE_KEY}" > "${CARGO_TREE_STAMP}"
         flock --unlock 9
         exec 9>&-
         CARGO_TARGET_LOCK_HELD=0
@@ -679,7 +690,7 @@ install_sglang_kernel() {
         else
             WHEEL_ARCH="x86_64"
         fi
-        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
+        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp311-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
         if [ -z "$KERNEL_WHL" ]; then
             echo "ERROR: No matching sgl-kernel wheel found in python/sglang/kernels/aot/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
             ls -alh python/sglang/kernels/aot/dist/

@@ -303,6 +303,9 @@ KV heads: Qwen3.5 models, or models with at most `tp_size / dcp_size` KV heads.
 Unsupported features are refused at startup. If startup fails with
 `UR_RESULT_ERROR_OUT_OF_RESOURCES`, lower `--mem-fraction-static`.
 
+With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
+kernel runs only on CUDA, so KV is transferred per token instead.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights

@@ -110,6 +110,16 @@ def handle_pd_role_switch(
                 safe_to_restore=True,
             )
 
+    if recv_req.prepare_only:
+        # The tokenizer checks every DP worker before allowing any teardown.
+        return PdRoleSwitchReqOutput(
+            success=True,
+            message="ready",
+            old_role=old_role,
+            new_role=new_role,
+            safe_to_restore=True,
+        )
+
     scheduler._pd_role_switch_in_progress = True
     try:
         # Teardown + role flip + rebuild are one logical atomic step. If any of

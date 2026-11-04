@@ -162,6 +162,8 @@ SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the
 
 HiCache encapsulates all read, write, and query operations on L3 backends within the `class HiCacheStorage(ABC)`, exposing a set of simple and consistent interfaces. This design supports a wide range of L3 storage backends and allows users to select the one that best fits their specific use cases.
 
+When a backend is attached, HiCache hands it the host memory pools in a fixed order: `register_mem_pool_host` receives the anchor pool first, then every pool of the host pool group (Mamba state, indexer, SWA, draft sidecars, ...) arrives through `register_mem_host_pool_v2`, and `on_host_pools_registered` fires exactly once when this initial burst is over. Pools attached dynamically later still arrive through `register_mem_host_pool_v2` alone. Backends that talk to an external service whose instance specification must be complete up front (e.g. a remote cache manager) should finalize it inside `on_host_pools_registered`; raising there fails the attach.
+
 - **Mooncake**: Mooncake is a high-performance caching system for LLM inference that leverages RDMA and multi-NIC resources to enable zero-copy, ultra-fast data transfers. Try Mooncake [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/mooncake_store).
 
 - **DeepSeek 3FS (HF3FS)**: HF3FS is a Kubernetes-native distributed storage solution with operator-based deployment. Try HF3FS [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/hf3fs).
@@ -173,6 +175,14 @@ HiCache encapsulates all read, write, and query operations on L3 backends within
 - **HiCacheFile**: A simple file-based storage backend for demonstration purposes.
 
 Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
+
+### External KV Router Integration
+
+HiCache is not only consumed inside SGLang. An external KV-aware router placed in front of the engines can also query the same L3 data to route requests to the instance that can reuse the most KV cache. Such a router must rebuild the exact object keys the backend uses, which for Mooncake is `{key_prefix}_{page_hash}{suffix}`. The suffix depends on the model's pool layout, the parallelism layout, and the resolved `--page-size`, so the engine exposes its layout instead of letting each router derive the naming itself.
+
+The Mooncake backend describes the physical KV primary, SWA/Mamba components, and registered sidecars; it excludes logical KV anchors with no buffer. Suffixes come from the write-path key builders. KV uses `all_pages`; SWA uses `trailing_pages` with its component's `full_window_pages`, and Mamba uses one trailing page. Sidecars retain their own hit policy and derive a trailing window from their index-source component.
+
+The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout generator. In `/server_info`, the outer `hicache_object_layout` field contains `{enabled, backend, page_size, hicache_object_layout: {pools, key_prefix, is_mla_backend, pp_rank, pp_size}}`; pool entries contain `pool`, `suffixes`, `hit_policy`, and optionally `trailing_pages`. External lookup is enabled only for rank-replicated/MLA pools, including DeepSeek V4 compressed MLA. With pipeline parallelism each stage stores objects under its own `pp_rank` suffix, so the layout lists the pools of every stage and reports `pp_rank: null`; a layout that cannot cover all `pp_size` stages (for example when some stages run on other nodes) is unavailable. MHA or rank-sharded auxiliary pools, missing window metadata, unavailable Mooncake, and inconsistent scheduler replies also return `enabled: false` with a `reason`. Consumers must not register L3 in that case; an absent outer field indicates an older engine and permits legacy fallback. Ordinary DP and Ray startup retain and check scheduler replies rather than selecting the first layout.
 
 ## Related Parameters
 

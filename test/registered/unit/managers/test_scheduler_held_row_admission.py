@@ -15,7 +15,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 NUM_ROWS = 4
 
@@ -78,7 +78,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = None
+        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -88,6 +88,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.dllm_config = None
         s.enable_lora = False
         s.disaggregation_mode = disaggregation_mode
+        s.disagg_prefill_bootstrap_queue = None
         s.enable_hicache_storage = False
         s.enable_lmcache = False
         s.truncation_align_size = None

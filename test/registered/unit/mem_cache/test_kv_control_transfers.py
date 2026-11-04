@@ -24,13 +24,30 @@ from sglang.srt.managers.kv_control.service import KVControlService, ServiceConf
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.l2_transfer import TransferCompletion
-from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 FULL = ComponentType.FULL
+
+
+class HostRegistration:
+    """CPU stand-in for the CUDA driver, with paired registration ownership."""
+
+    def __init__(self):
+        self.live = {}
+
+    def cudaHostRegister(self, ptr, size, flags):
+        assert ptr not in self.live, "Host range registered twice"
+        self.live[ptr] = size
+        return 0
+
+    def cudaHostUnregister(self, ptr):
+        assert ptr in self.live, "Unregistering an unowned host range"
+        del self.live[ptr]
+        return 0
 
 
 class Fence:
@@ -197,8 +214,13 @@ def hicache(case, config=None, *, storage=False, namespace_keys=False):
         **storage_args,
     )
     scope.install()
-    parallel = get_parallel().override(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+    parallel = get_parallel().override(
+        tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_dcp_rank=0
+    )
     parallel.__enter__()
+    registrations = HostRegistration()
+    driver = patch.object(torch.cuda, "cudart", return_value=registrations)
+    driver.start()
     try:
         cache, _ = case.make(
             session=False, config=config.cache_config(), limits=config.limits
@@ -209,13 +231,17 @@ def hicache(case, config=None, *, storage=False, namespace_keys=False):
             req_to_token_pool=cache.req_to_token_pool,
             token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
             page_size=1,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
             kv_control_config=config.cache_config(),
         )
-        with patch.object(host_memory, "_cuda_host_register"):
-            cache.init_hicache(get_server_args(), params)
+        cache.init_hicache(get_server_args(), params)
+        host_pool = cache.host_pool_group.anchor_entry.host_pool
+        registered = host_pool.pin_memory
         if storage:
-            cache.host_pool_group.anchor_entry.host_pool.pin_memory = False
+            # File I/O uses CPU staging tensors; only the backing pool is
+            # registered with the simulated driver. Restore its ownership flag
+            # before destroy so real cleanup releases those registrations.
+            host_pool.pin_memory = False
         atexit.unregister(cache.shutdown)
         dma = ControlledDMA()
         cache.cache_controller.l2_transfer_engine = dma
@@ -239,8 +265,11 @@ def hicache(case, config=None, *, storage=False, namespace_keys=False):
             service.progress()
             if storage:
                 cache._storage_attachment.shutdown()
+            host_pool.pin_memory = registered
             cache.release_host_resources()
+            assert not registrations.live, "Host registrations leaked during teardown"
     finally:
+        driver.stop()
         parallel.__exit__(None, None, None)
         scope.restore()
 

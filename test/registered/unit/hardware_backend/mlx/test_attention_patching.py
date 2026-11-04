@@ -55,7 +55,9 @@ if _HAS_MLX:
     )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from sglang.test.tree_slots import tree_slots_of
 
 
 def _set_runner_cache_layout(
@@ -969,6 +971,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 
@@ -1009,6 +1012,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 
@@ -1049,6 +1053,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 
@@ -1086,6 +1091,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 

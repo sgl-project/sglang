@@ -1122,6 +1122,9 @@ def test_controller_tensorcast_factory_and_host_pool_group_use_v1_anchor(
         def register_mem_pool_host(self, pool: HostKVCache) -> None:
             self.registered.append(pool)
 
+        def on_host_pools_registered(self) -> None:
+            pass
+
     backend = FakeStorageBackend()
 
     def create_backend(

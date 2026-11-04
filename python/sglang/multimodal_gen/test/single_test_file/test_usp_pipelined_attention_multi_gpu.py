@@ -84,6 +84,28 @@ def _worker() -> int:
             failures.append(label)
         ran.append(label)
 
+    def filled(label, layer, q, k, v):
+        """q/k written into the exchange blocks by fill_all (copies here) must give
+        the sequential exchange's bits."""
+
+        def fill_all(blocks, part):
+            rows = (q, k)[part][0]
+            for head_start, head_count, *dst in blocks:
+                dst[part].copy_(rows[:, head_start : head_start + head_count])
+
+        outs = []
+        for groups, call in (
+            (0, lambda: layer(q, k, v)),
+            (2, lambda: layer.forward_qk_filled(q, k, v, fill_all)),
+        ):
+            envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = groups
+            with torch.inference_mode(), set_forward_context(0, None, None):
+                outs.append(call())
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = -1
+        if outs[1] is None or not torch.equal(outs[0], outs[1]):
+            failures.append(label)
+        ran.append(label)
+
     for backend in backends:
         try:
             layer = USPAttention(
@@ -105,6 +127,8 @@ def _worker() -> int:
         for batch in (1, 2):
             q, k, v = (shard(batch, s_local, heads, 10 + i) for i in range(3))
             both(f"{name} dense b{batch}", lambda: layer(q, k, v))
+            if batch == 1:
+                filled(f"{name} q/k filled exchange", layer, q, k, v)
 
             rep = [replicated(batch, n_rep, heads, 20 + i) for i in range(3)]
             joined = [torch.cat([r, t], dim=1) for r, t in zip(rep, (q, k, v))]
@@ -134,6 +158,13 @@ def _worker() -> int:
                 f"{name} gathered key mask b{batch}",
                 lambda: layer(q, k, v, attn_mask=key_mask),
             )
+        if name == "DYNAMIC_CUDNN_SDPA" and torch.cuda.get_device_capability()[0] >= 10:
+            # FA4 in place of cuDNN: every group attends straight into the output rows
+            layer.attn_impl._use_cudnn_sdpa = lambda *args: False
+            q, k, v = (shard(1, s_local, heads, 60 + i) for i in range(3))
+            both(f"{name} FA4 into dense b1", lambda: layer(q, k, v))
+            filled(f"{name} FA4 into q/k filled exchange", layer, q, k, v)
+            del layer.attn_impl._use_cudnn_sdpa
         gqa = USPAttention(
             num_heads=heads,
             head_size=dim,

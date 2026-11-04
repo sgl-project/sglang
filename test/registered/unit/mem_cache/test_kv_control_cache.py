@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -197,13 +198,14 @@ class KVCacheTestCase(CustomTestCase):
                 need_sort=False,
                 **kwargs,
             )
+        allocator.state = req.state
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=req,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=4,
-            tree_components=components,
+            tree_slots=tree_slots_of(components, window=4, checkpoint_interval=64),
             enable_session_radix_cache=session,
             tree_core_backend=backend,
             kv_control_config=config or CacheControlConfig(namespace="ns")

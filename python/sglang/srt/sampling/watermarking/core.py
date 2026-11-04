@@ -22,23 +22,27 @@ if TYPE_CHECKING:
 _MASK32 = 0xFFFFFFFF
 _UINT32_SCALE = float(1 << 32)
 
+WATERMARK_SECRET_FIELD_NAMES = frozenset(
+    {"watermark_key", "watermark_key_b", "watermark_config"}
+)
+WATERMARK_CONTAINER_FIELD_NAMES = frozenset(
+    {"watermark", "sampling_params", "preferred_sampling_params"}
+)
+_SCALAR_TYPES = frozenset({int, float, str, bool, bytes, type(None)})
+
 
 def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         result = copy.copy(value)
         for field in dataclasses.fields(value):
             item = getattr(value, field.name)
-            if field.name in {"watermark_key", "watermark_key_b", "watermark_config"}:
+            if field.name in WATERMARK_SECRET_FIELD_NAMES:
                 object.__setattr__(
                     result,
                     field.name,
                     "<redacted>" if item is not None else None,
                 )
-            elif field.name in {
-                "watermark",
-                "sampling_params",
-                "preferred_sampling_params",
-            }:
+            elif field.name in WATERMARK_CONTAINER_FIELD_NAMES:
                 object.__setattr__(
                     result,
                     field.name,
@@ -64,13 +68,9 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         replacements = {}
         for field in msgspec.structs.fields(value):
             item = getattr(value, field.name)
-            if field.name in {"watermark_key", "watermark_key_b", "watermark_config"}:
+            if field.name in WATERMARK_SECRET_FIELD_NAMES:
                 replacements[field.name] = "<redacted>" if item is not None else None
-            elif field.name in {
-                "watermark",
-                "sampling_params",
-                "preferred_sampling_params",
-            }:
+            elif field.name in WATERMARK_CONTAINER_FIELD_NAMES:
                 replacements[field.name] = redact_watermark_secrets(
                     item, in_watermark_config=field.name == "watermark"
                 )
@@ -81,7 +81,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         return {
             key: (
                 "<redacted>"
-                if key in {"watermark_key", "watermark_key_b", "watermark_config"}
+                if key in WATERMARK_SECRET_FIELD_NAMES
                 or (in_watermark_config and key in {"key", "key_b"})
                 else redact_watermark_secrets(
                     item,
@@ -90,16 +90,20 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             )
             for key, item in value.items()
         }
-    if isinstance(value, list):
-        return [
-            redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
+    if isinstance(value, (list, tuple)):
+        # Secrets only sit under dict keys or struct/dataclass fields, so a
+        # sequence of plain scalars can never contain one.
+        if _SCALAR_TYPES.issuperset(map(type, value)):
+            # The dump path pickles the result on a worker thread, so a
+            # mutable list must be copied; tuples are safe to alias.
+            return list(value) if isinstance(value, list) else value
+        redacted = [
+            item
+            if type(item) in _SCALAR_TYPES
+            else redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
             for item in value
         ]
-    if isinstance(value, tuple):
-        return tuple(
-            redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
-            for item in value
-        )
+        return redacted if isinstance(value, list) else tuple(redacted)
     return value
 
 

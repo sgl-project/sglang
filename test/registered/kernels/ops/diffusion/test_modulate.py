@@ -11,6 +11,7 @@ import sys
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
@@ -29,6 +30,9 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_scale_shift_per_token,
     timestep_embedding,
     try_fused_scaled_residual_add_exact,
+)
+from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
+    fuse_scale_shift_kernel_blc_opt,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -133,6 +137,52 @@ def test_scale_shift_4d_matches_torch(shape, num_frames, dtype, scale_constant):
     actual = fuse_scale_shift_kernel(x, scale, shift, scale_constant)
 
     torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+# Wan's MulAdd (fp32 gate) and its LayerNorm modulation (fp32 scale/shift).
+SCALE_SHIFT_3D_CASES = [(1, 37, 5120), (2, 9, 1536), (1, 5, 3072), (1, 3, 96)]
+
+
+@pytest.mark.parametrize("shape", SCALE_SHIFT_3D_CASES)
+@pytest.mark.parametrize("scale_constant", [0, 1])
+def test_scale_shift_3d_tiling_is_bit_exact(shape, scale_constant):
+    """The row tiling gives the bytes of the 128x128 tile it replaced."""
+    batch, seq_len, hidden = shape
+    x = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+    scale = torch.randn((1, 1, hidden), device=DEVICE, dtype=torch.float32)
+    shift = torch.randn_like(x)
+    actual = fuse_scale_shift_kernel(x, scale, shift, scale_constant)
+
+    expected = torch.empty_like(x)
+    scale_exp = scale.expand(batch, seq_len, hidden)
+    fuse_scale_shift_kernel_blc_opt[
+        (triton.cdiv(seq_len, 128), triton.cdiv(hidden, 128), batch)
+    ](
+        x,
+        shift,
+        scale_exp,
+        scale_constant,
+        expected,
+        batch,
+        seq_len,
+        hidden,
+        *x.stride(),
+        *shift.stride(),
+        *scale_exp.stride(),
+        SCALE_IS_SCALAR=False,
+        SHIFT_IS_SCALAR=False,
+        BLOCK_L=128,
+        BLOCK_C=128,
+        num_warps=4,
+        num_stages=2,
+    )
+    assert torch.equal(actual, expected)
+    torch.testing.assert_close(
+        actual.float(),
+        x.float() * (scale_constant + scale) + shift.float(),
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 # ---------------------------------------------------------------------------

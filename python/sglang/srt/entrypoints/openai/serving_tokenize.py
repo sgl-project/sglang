@@ -97,6 +97,22 @@ class OpenAIServingTokenize(OpenAIServingBase):
         validation_error = self.chat_serving._validate_request(chat_request)
         if validation_error:
             raise ValueError(validation_error)
+        if chat_request._format_add_generation_prompt is not None:
+            if (
+                self.chat_serving.template_manager.chat_template_name is not None
+                or self.chat_serving.chat_encoding_spec is not None
+            ):
+                raise ValueError(
+                    "add_generation_prompt is supported only with a Jinja chat template."
+                )
+            if (
+                chat_request.continue_final_message
+                and not chat_request._format_add_generation_prompt
+            ):
+                raise ValueError(
+                    "continue_final_message needs add_generation_prompt to open the "
+                    "assistant turn."
+                )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self.chat_serving._process_messages(

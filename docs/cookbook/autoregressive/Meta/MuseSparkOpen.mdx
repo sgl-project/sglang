@@ -48,6 +48,445 @@ import { agentx } from "/src/snippets/agentx/meta-models/muse-spark-open.jsx";
 
 <AgentX data={agentx} />
 
+### GB300 deployments measured with Artificial Analysis AgentPerf
+
+Five aggregated Dynamo + SGLang deployments on GB300, measured with the [Artificial Analysis AgentPerf](https://github.com/ArtificialAnalysis/agentperf-client) coding-agent workload. Together they span the trade-off from the lowest per-user latency (concurrency 1) to the highest throughput per GPU (concurrency 160), ordered from low latency to high throughput. Each one starts from the Artificial Analysis SGLang submission for this model and changes only flags, environment variables and parallelism.
+
+- **Container image.** `lmsysorg/sglang:dev-muse-spark-open@sha256:8cfc5a72cb296771f5f8a4a4688cb6d05685610a830cbb616fa4ab0eb7bb2b0a` with the Dynamo wheels added: `pip install --no-deps ai-dynamo==1.6.0.dev20261019 ai-dynamo-runtime==1.6.0.dev20261019`.
+- **Router.** One Dynamo frontend with the KV-aware router. Session affinity keeps requests that carry the same `X-Dynamo-Session-ID` header on one worker; the AgentPerf client sends one ID per agent session.
+- **Checkpoints.** `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` with the DFlash2 draft `RadixArk/Muse-Spark-Open-DFlash2` (8 draft tokens, FP8 KV cache).
+- **HiCache.** `--hicache-size` is the host tier in GB per rank; scale it to your host memory.
+- **Two-node deployments.** The TP8·EP8 worker spans two GB300 trays (4 GPUs each) over multi-node NVLink: run the worker command on both nodes, with `NODE_RANK` 0 on the first.
+
+<AccordionGroup>
+  <Accordion title="Agg TP8·EP8 (2 nodes), lowest latency · 8 GPUs · concurrency 1">
+  <Tabs sync={false}>
+    <Tab title="Env Vars">
+```bash
+export ETCD_IP=<node running etcd>
+export AGG_HEAD_IP=<first node of the worker>
+export NODE_RANK=<0 on the first node, 1 on the second>
+```
+    </Tab>
+    <Tab title="etcd">
+```bash
+etcd \
+  --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://$ETCD_IP:2379
+```
+    </Tab>
+    <Tab title="Dynamo frontend">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export DYN_ROUTER_QUEUE_THRESHOLD=None
+export DYN_ROUTER_TEMPERATURE=0
+export DYN_TOKENIZER=fastokens
+export DYN_TOKENIZER_CACHE=1
+export DYN_TOKENIZER_CACHE_BYTES=8000000000
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+
+python3 -m dynamo.frontend \
+  --http-port 8000 \
+  --router-mode kv \
+  --router-session-affinity-ttl-secs 14400 \
+  --active-decode-blocks-threshold None \
+  --active-prefill-tokens-threshold None \
+  --active-prefill-tokens-threshold-frac None
+```
+    </Tab>
+    <Tab title="SGLang worker (run on each of the 2 nodes)">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+export NCCL_CUMEM_ENABLE=1
+export NCCL_MNNVL_ENABLE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+
+python3 -m dynamo.sglang \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --dist-init-addr $AGG_HEAD_IP:20000 \
+  --nnodes 2 \
+  --node-rank $NODE_RANK \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --request-plane tcp \
+  --dyn-reasoning-parser muse \
+  --dyn-tool-call-parser muse \
+  --expert-parallel-size 8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-running-requests 32 \
+  --mem-fraction-static 0.85 \
+  --mm-feature-transport cpu \
+  --moe-runner-backend flashinfer_trtllm \
+  --quantization modelopt_fp4 \
+  --reasoning-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-num-draft-tokens 8 \
+  --swa-full-tokens-ratio 0.1 \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+    </Tab>
+  </Tabs>
+  </Accordion>
+  <Accordion title="Agg TP8·EP8 (2 nodes), low latency · 8 GPUs · concurrency 4">
+  <Tabs sync={false}>
+    <Tab title="Env Vars">
+```bash
+export ETCD_IP=<node running etcd>
+export AGG_HEAD_IP=<first node of the worker>
+export NODE_RANK=<0 on the first node, 1 on the second>
+```
+    </Tab>
+    <Tab title="etcd">
+```bash
+etcd \
+  --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://$ETCD_IP:2379
+```
+    </Tab>
+    <Tab title="Dynamo frontend">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export DYN_ROUTER_QUEUE_THRESHOLD=None
+export DYN_ROUTER_TEMPERATURE=0
+export DYN_TOKENIZER=fastokens
+export DYN_TOKENIZER_CACHE=1
+export DYN_TOKENIZER_CACHE_BYTES=8000000000
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+
+python3 -m dynamo.frontend \
+  --http-port 8000 \
+  --router-mode kv \
+  --router-session-affinity-ttl-secs 14400 \
+  --active-decode-blocks-threshold None \
+  --active-prefill-tokens-threshold None \
+  --active-prefill-tokens-threshold-frac None
+```
+    </Tab>
+    <Tab title="SGLang worker (run on each of the 2 nodes)">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+export NCCL_CUMEM_ENABLE=1
+export NCCL_MNNVL_ENABLE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+
+python3 -m dynamo.sglang \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --dist-init-addr $AGG_HEAD_IP:20000 \
+  --nnodes 2 \
+  --node-rank $NODE_RANK \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --request-plane tcp \
+  --dyn-reasoning-parser muse \
+  --dyn-tool-call-parser muse \
+  --expert-parallel-size 8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-running-requests 32 \
+  --mem-fraction-static 0.85 \
+  --mm-feature-transport cpu \
+  --moe-runner-backend flashinfer_trtllm \
+  --quantization modelopt_fp4 \
+  --reasoning-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-num-draft-tokens 8 \
+  --swa-full-tokens-ratio 0.1 \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+    </Tab>
+  </Tabs>
+  </Accordion>
+  <Accordion title="Agg TP4·EP4, balanced · 4 GPUs · concurrency 16">
+  <Tabs sync={false}>
+    <Tab title="Env Vars">
+```bash
+export ETCD_IP=<node running etcd>
+export AGG_HEAD_IP=<first node of the worker>
+```
+    </Tab>
+    <Tab title="etcd">
+```bash
+etcd \
+  --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://$ETCD_IP:2379
+```
+    </Tab>
+    <Tab title="Dynamo frontend">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export DYN_ROUTER_QUEUE_THRESHOLD=None
+export DYN_ROUTER_TEMPERATURE=0
+export DYN_TOKENIZER=fastokens
+export DYN_TOKENIZER_CACHE=1
+export DYN_TOKENIZER_CACHE_BYTES=8000000000
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+
+python3 -m dynamo.frontend \
+  --http-port 8000 \
+  --router-mode kv \
+  --router-session-affinity-ttl-secs 14400 \
+  --active-decode-blocks-threshold None \
+  --active-prefill-tokens-threshold None \
+  --active-prefill-tokens-threshold-frac None
+```
+    </Tab>
+    <Tab title="SGLang worker">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+export NCCL_CUMEM_ENABLE=1
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+
+python3 -m dynamo.sglang \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --request-plane tcp \
+  --dyn-reasoning-parser muse \
+  --dyn-tool-call-parser muse \
+  --enable-layernorm-sp \
+  --enable-megamoe-for-layernorm-sp \
+  --expert-parallel-size 4 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-running-requests 32 \
+  --mem-fraction-static 0.85 \
+  --mm-feature-transport cpu \
+  --moe-runner-backend flashinfer_trtllm \
+  --prefill-decode-interval 64 \
+  --quantization modelopt_fp4 \
+  --reasoning-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-num-draft-tokens 8 \
+  --swa-full-tokens-ratio 0.1 \
+  --tensor-parallel-size 4 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+    </Tab>
+  </Tabs>
+  </Accordion>
+  <Accordion title="Agg TP4·EP4, high throughput · 4 GPUs · concurrency 64">
+  <Tabs sync={false}>
+    <Tab title="Env Vars">
+```bash
+export ETCD_IP=<node running etcd>
+export AGG_HEAD_IP=<first node of the worker>
+```
+    </Tab>
+    <Tab title="etcd">
+```bash
+etcd \
+  --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://$ETCD_IP:2379
+```
+    </Tab>
+    <Tab title="Dynamo frontend">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export DYN_ROUTER_QUEUE_THRESHOLD=None
+export DYN_ROUTER_TEMPERATURE=0
+export DYN_TOKENIZER=fastokens
+export DYN_TOKENIZER_CACHE=1
+export DYN_TOKENIZER_CACHE_BYTES=8000000000
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+
+python3 -m dynamo.frontend \
+  --http-port 8000 \
+  --router-mode kv \
+  --router-session-affinity-ttl-secs 14400 \
+  --active-decode-blocks-threshold None \
+  --active-prefill-tokens-threshold None \
+  --active-prefill-tokens-threshold-frac None
+```
+    </Tab>
+    <Tab title="SGLang worker">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+export NCCL_CUMEM_ENABLE=1
+export SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+
+python3 -m dynamo.sglang \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --request-plane tcp \
+  --cuda-graph-max-bs-decode 64 \
+  --dyn-reasoning-parser muse \
+  --dyn-tool-call-parser muse \
+  --enable-layernorm-sp \
+  --enable-megamoe-for-layernorm-sp \
+  --expert-parallel-size 4 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-running-requests 64 \
+  --mem-fraction-static 0.85 \
+  --mm-feature-transport cpu \
+  --moe-runner-backend flashinfer_trtllm \
+  --prefill-decode-interval 24 \
+  --quantization modelopt_fp4 \
+  --reasoning-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-num-draft-tokens 8 \
+  --swa-full-tokens-ratio 0.15 \
+  --tensor-parallel-size 4 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+    </Tab>
+  </Tabs>
+  </Accordion>
+  <Accordion title="Agg TP4·EP4 + HiCache, max throughput · 4 GPUs · concurrency 160">
+  <Tabs sync={false}>
+    <Tab title="Env Vars">
+```bash
+export ETCD_IP=<node running etcd>
+export AGG_HEAD_IP=<first node of the worker>
+```
+    </Tab>
+    <Tab title="etcd">
+```bash
+etcd \
+  --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://$ETCD_IP:2379
+```
+    </Tab>
+    <Tab title="Dynamo frontend">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export DYN_ROUTER_QUEUE_THRESHOLD=None
+export DYN_ROUTER_TEMPERATURE=0
+export DYN_TOKENIZER=fastokens
+export DYN_TOKENIZER_CACHE=1
+export DYN_TOKENIZER_CACHE_BYTES=8000000000
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+
+python3 -m dynamo.frontend \
+  --http-port 8000 \
+  --router-mode kv \
+  --router-session-affinity-ttl-secs 14400 \
+  --active-decode-blocks-threshold None \
+  --active-prefill-tokens-threshold None \
+  --active-prefill-tokens-threshold-frac None
+```
+    </Tab>
+    <Tab title="SGLang worker">
+```bash
+export DYN_REQUEST_PLANE=tcp
+export ETCD_ENDPOINTS=http://$ETCD_IP:2379
+export NCCL_CUMEM_ENABLE=1
+export SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+
+python3 -m dynamo.sglang \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --request-plane tcp \
+  --cuda-graph-max-bs-decode 176 \
+  --dyn-reasoning-parser muse \
+  --dyn-tool-call-parser muse \
+  --enable-hierarchical-cache \
+  --enable-layernorm-sp \
+  --enable-megamoe-for-layernorm-sp \
+  --expert-parallel-size 4 \
+  --hicache-size 120 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-running-requests 176 \
+  --mem-fraction-static 0.9 \
+  --mm-feature-transport cpu \
+  --moe-runner-backend flashinfer_trtllm \
+  --prefill-decode-interval 6 \
+  --quantization modelopt_fp4 \
+  --reasoning-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-num-draft-tokens 8 \
+  --swa-full-tokens-ratio 0.15 \
+  --tensor-parallel-size 4 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+    </Tab>
+  </Tabs>
+  </Accordion>
+</AccordionGroup>
+
+### MI355X deployment measured with SemiAnalysis InferenceX
+
+TP8·EP8 with DFlash V2 on 8× MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) at concurrency 1–64.
+
+- **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-1020`.
+- **HiCache.** At concurrency 16 and above, add the HiCache flags below. `--hicache-size` is the host tier in GB per rank, so 253 GB needs about 2 TB of host memory across the eight ranks.
+
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+MUSE_MOE_BACKEND=flydsl \
+python -m sglang.launch_server \
+  --model-path amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
+  --tp-size 8 \
+  --ep-size 8 \
+  --attention-backend aiter \
+  --page-size 16 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 128 \
+  --swa-full-tokens-ratio 0.2 \
+  --prefill-decode-interval 20 \
+  --scheduler-recv-interval 20 \
+  --tokenizer-worker-num 4 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-draft-attention-backend triton \
+  --speculative-num-draft-tokens 8 \
+  --speculative-draft-window-size 2048 \
+  --reasoning-parser muse \
+  --tool-call-parser muse \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash HiCache (concurrency 16 and above)
+  --enable-hierarchical-cache \
+  --hicache-size 253 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first
+```
+
 ## 1. Model introduction
 
 This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B checkpoints:

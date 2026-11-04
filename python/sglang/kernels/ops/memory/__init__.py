@@ -61,6 +61,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="memory.small_field_copy",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.memory.small_field_copy:small_field_copy",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="memory.row_compact_bf16",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.row_compact:row_compact_bf16",

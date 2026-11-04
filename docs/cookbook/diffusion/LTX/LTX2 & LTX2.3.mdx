@@ -75,7 +75,7 @@ Other deployment flags:
 - `--lora-weight-name`: Select the exact safetensors file when the LoRA repository contains multiple weight files.
 
 <Note>
-For native LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path. LTX-2 still applies the distilled LoRA during the stage switch, so `--ltx2-two-stage-device-mode` is mainly an LTX-2.3 optimization. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
+For LTX-2 and LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path: stage 2 runs a second DiT with the distilled LoRA merged in, and it is the default on GPUs with at least 130 GiB. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
 </Note>
 
 ### 3.3 Fast multi-GPU presets
@@ -94,6 +94,8 @@ For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism.
 Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `original`.
 
 On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding latency matters and you have enough memory.
+
+On GPUs with at least 130 GiB (H200, B200, B300), `LTX2TwoStagePipeline` serving turns on breakable CUDA graphs by default when the DiTs stay resident (LTX-2.3: `resident` mode). Warmup captures the default 768x512, 121-frame request; other resolutions or frame counts run eager, so pass `--warmup-resolutions` and `--warmup-num-frames` for the shape you serve (the OpenAI video API defaults to 4 seconds, which LTX rounds to 89 frames). Pass `--enable-breakable-cuda-graph false` to run eager.
 
 #### 3.3.1 Two GPUs
 

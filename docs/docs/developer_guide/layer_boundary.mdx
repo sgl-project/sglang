@@ -207,7 +207,7 @@ When the final read is more than a norm, pass it to `make_layers(final_read=...)
 
 This is a non-pipeline stack fragment. Pipeline reception uses the first boundary's `from_pp(tensors, forward_batch)` to reconstruct a stream; the sender uses `residual_batch.to_pp()`. A stream the producer already wrote travels as `hidden_states` alone and arrives written: MHC's expanded streams, and the output of an FFN on its own rows (its attention-TP slice, or an unpadded batch's rows), which writes it at its exit before a pipeline handoff. The receiver knows this from the producer's declaration, not from which tensors arrive, since a captured CUDA graph's input buffers hold every key. `to_pp()` completes every sum the output owes before transport, a declared one too: the pipeline sends each tensor as one slice per attention-TP rank and gathers the slices back on the next rank, which reassembles only a tensor every attention-TP rank holds alike. The receiving stage's entry then takes the path for a sum already completed, which it binds beside the one for a sum its own producer leaves.
 
-A terminal FFN normally completes its output before the final norm. The exception is a MoE finalize handoff. When the stage's fusion provider can defer the finalize at the terminal layer (for CuteDSL, `install_cutedsl_fusion(..., terminal_finalize=True)`), the exit may leave a `DeferredFinalize` for the final norm. Pass the handle straight to `residual_batch.final_norm(hidden_states, forward_batch, self.norm, finalize_norm=service)`, where `service` is the object `install_cutedsl_fusion()` returned; its `finalize(handoff, residual, gamma)` fuses finalize, all-reduce, residual add, and norm. The fused path reads `layernorm.gemma_weight`, so it currently expects a `GemmaRMSNorm` final norm. Without `finalize_norm`, `final_norm()` first completes the handoff unfused, and `capture` is then allowed. With `finalize_norm`, `final_norm()` rejects `capture` when a handoff arrives. Calling `complete_output()` first runs the producer's unfused finalize, and `snapshot()` raises on a handoff. See `python/sglang/srt/models/qwen3_5.py`.
+A terminal FFN normally completes its output before the final norm. The exception is a MoE finalize handoff. When the stage's fusion provider can defer the finalize at the terminal layer (for CuteDSL, `install_cutedsl_fusion(..., terminal_finalize=True)`), the exit may leave a `DeferredFinalize` for the final norm. Pass the handle straight to `residual_batch.final_norm(hidden_states, forward_batch, self.norm, finalize_norm=service)`, where `service` is the object `install_cutedsl_fusion()` returned; its `finalize(handoff, residual, gamma)` fuses finalize, all-reduce, residual add, and norm. The fused path reads `layernorm.gemma_weight`, so it currently expects a `GemmaRMSNorm` final norm. Without `finalize_norm`, `final_norm()` first completes the handoff unfused. With it, `finalize()` also returns the updated residual, which `capture` receives as a borrowed value. Calling `complete_output()` first runs the producer's unfused finalize, and `snapshot()` raises on a handoff. See `python/sglang/srt/models/qwen3_5.py`.
 
 `model_forward_stages()` in `python/sglang/srt/batch_overlap/two_batch_overlap.py` gives each TBO microbatch its own stream: it splits with `ResidualStream.from_handoff()` and merges the results afterwards. Do not share one mutable stream between interleaved microbatches or hold an `exit()` scope open across a TBO yield point.
 
@@ -224,7 +224,7 @@ Choose the access method according to what the consumer needs:
 | Attention `boundary.prepare(..., capture_gathered=collector)` | Captures the same updated residual on the attention's compute-input rows, after its input gather |
 | `boundary.capture_output()` | Preserves its explicit capture convention: completes dynamic work on the main contribution, but snapshots a statically declared sum on a copy; returns both updated handle and snapshot |
 | `residual_batch.add_to_output(..., extra)` | Completes the contribution before adding extra once, keeping the residual update pending |
-| `residual_batch.final_norm(..., capture=collector.capture)` | Final norm and capture of its updated residual |
+| `residual_batch.final_norm(..., capture=collector.capture)` | Final norm and capture of its updated residual, including a fused finalize handoff |
 
 Snapshots currently require a plain residual update. Producer-specific finalize handoffs need an explicit main-output capture adapter.
 
@@ -308,18 +308,24 @@ Paths in this table are relative to `python/sglang/srt/layers/layer_boundary/`.
 | `contracts.py` | Resolved input/output contracts, edge declarations, batch variants, and bound step records |
 | `layout.py` | Token axes, layouts, named sum groups, and topology/batch facts |
 | `construction.py` | Build a `StagePlan` and select its batch variant |
-| `boundary.py` | Select and bind producer/consumer boundary operations from contracts |
+| `boundary.py` | Select and bind producer/consumer boundary operations from contracts; for prefill CP, one `CpMoves` (`contracts.py`) pairs the FFN-input gather, the take-back of a complete output, and, where there is one, the reduce-scatter that completes a sum |
 | `prepare.py` | Execute completion, update, read, and input movement in the selected order |
 | `ops.py` | Collective and token-row movement primitives |
 | `stage.py` | Model-facing `StageBoundary` methods |
 | `exit.py` | Select output completion and publish scoped compute flags |
 | `output.py` | Unreduced outputs, deferred finalizes and output transforms |
+| `facts.py` | What binding keeps of a stage it does not run (`facts_of()`): a stack's neighbours on other pipeline ranks and a bound stage's producer |
+| `row_transport.py` | Row transports that run a stage's compute on token rows other than its residual's (`RowTransport`, `ComputeTransport`) |
 | `residual/__init__.py` | `ResidualUpdate`/`ResidualReadout` protocols and `LayerResidualOps` |
 | `residual/stream.py` | Per-forward state and ownership of outstanding work |
 | `residual/batch.py` | Model-stack entry, final norm, pipeline-parallel (PP) transport, snapshots, and extra contributions |
 | `residual/access.py` | Tensor access and materialization helpers |
 | `residual/add_norm.py`, `residual/mhc.py` | Plain add/norm and MHC read/update implementations |
-| `adapters/` | Attention input, CP, TBO, branches, and LoRA integration |
+| `residual/ihc.py`, `residual/gated.py` | Gated and gated-injection hyper-connection read/update implementations |
+| `residual/post_norm.py` | Post-norm residual: each stage's output is normalized before it is added |
+| `residual/attn_bank.py` | A residual read that aggregates a bank of residual snapshots |
+| `residual/short_conv.py` | Deferred channelwise convolution followed by residual add and normalization |
+| `adapters/` | Attention input, TBO, branches, and LoRA integration |
 | `fusions/` | Consumer all-reduce fusion and CuteDSL integration |
 
 Models normally use factories, `StageBoundary`, and `residual.batch`. Keep row arithmetic, process-group selection, and calls such as `token_axis_sizes()` inside the boundary implementation.
@@ -363,7 +369,6 @@ Producer GEMM plus reduce-scatter fusion is not a generic implemented API here. 
 ### Special adapters
 
 - **Attention/DeepSeek Sparse Attention (DSA) adapters:** retain `AttnTpContext` and its input-scattered/latent-input hooks. They are not a general asynchronous dependency scheduler.
-- **CP adapters:** pair gather, return-to-local-rows, and eligible reduce-scatter operations using the same token mapping.
 - **LoRA adapter:** publishes the selected compute input's rows for LoRA execution.
 - **TBO and branch adapters:** manage layer exits and entries that cannot be represented as a normal sequential prepare call.
 

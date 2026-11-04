@@ -76,3 +76,4 @@ pinned sinks, global sinks, or dynamically growing caches.
 - Benchmark a representative session length. Short clips may not exercise cold-cache packing and can hide both its memory benefit and packing overhead.
 - Treat sequence parallelism as model-specific. Follow the model cookbook and the [Sequence Parallelism](./ring_sp_performance) guide instead of assuming one mesh is best for every realtime pipeline.
 - Realtime WebSocket clients must send an initialization message before control events. The exact MessagePack schema and output encoding are documented in each model cookbook.
+- Each server process admits one active realtime generation session. Idle connections and invalid initialization messages do not reserve that slot. If an initialized session cannot obtain the slot within one second, the server sends an error and closes its WebSocket with code `1008`.

@@ -872,11 +872,13 @@ class CausalDecodeQueue:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         try:
-            self.stream.synchronize()
-        finally:
             self.vae.reset_causal_decode_state()
             if exc_type is not None:
                 self.outputs.clear()
+        finally:
+            # Drain last: freeing pinned outputs records host-allocator events
+            # on this stream, so they must land before the final sync.
+            self.stream.synchronize()
 
     def _denormalize(self, latents: torch.Tensor) -> torch.Tensor:
         return denormalize_vae_latents(latents, self._mean, self._std)

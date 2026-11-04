@@ -22,6 +22,8 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
+    CompressedTensorsW4A16Mxfp4,
+    CompressedTensorsW4A16Mxfp4MoE,
     CompressedTensorsW4A16Nvfp4MoE,
 )
 from sglang.srt.utils.common import (
@@ -32,6 +34,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
+    make_mxfp4_weight_and_ref,
     make_nvfp4_weight_and_ref,
 )
 
@@ -68,24 +71,31 @@ def _make_weight(fmt, rows, cols, dtype):
         )
         # compressed-tensors stores the global scale as a divisor.
         return fp4, scales, (1 / global_scale).item(), ref
-    raise ValueError(fmt)
+    # E8M0 exponents, no global scale. The packed bytes do not depend on the
+    # activation dtype, and the helper builds its reference in bf16 only.
+    fp4, scales, ref = make_mxfp4_weight_and_ref(
+        rows, cols, torch.bfloat16, group_size=32
+    )
+    return fp4, scales, None, ref.to(dtype)
 
 
-def _build_linear(fmt, dtype, w4a4):
+def _build_linear(fmt, dtype, w4a4, size_n=SIZE_N):
     """A w4a4 checkpoint is served weight-only; its activation quantization is
     dropped, not applied, so it must match the a16 numbers."""
     if fmt == "nvfp4":
         scheme = CompressedTensorsW4A16Fp4(has_input_global_scale=w4a4)
+    else:
+        scheme = CompressedTensorsW4A16Mxfp4(has_input_activations=w4a4)
     layer = torch.nn.Module()
     scheme.create_weights(
         layer=layer,
-        output_partition_sizes=[SIZE_N],
+        output_partition_sizes=[size_n],
         input_size_per_partition=SIZE_K,
         params_dtype=dtype,
         weight_loader=lambda *args, **kwargs: None,
     )
     layer.to("cuda")
-    fp4, scales, divisor, ref = _make_weight(fmt, SIZE_N, SIZE_K, dtype)
+    fp4, scales, divisor, ref = _make_weight(fmt, size_n, SIZE_K, dtype)
     layer.weight_packed.data.copy_(fp4)
     layer.weight_scale.data.copy_(scales)
     if divisor is not None:
@@ -100,6 +110,9 @@ LINEAR_CASES = [
     ("nvfp4", torch.float16, True),
     ("nvfp4", torch.bfloat16, False),
     ("nvfp4", torch.bfloat16, True),
+    # MXFP4 Marlin decodes E8M0 scales for bf16 only.
+    ("mxfp4", torch.bfloat16, False),
+    ("mxfp4", torch.bfloat16, True),
 ]
 
 
@@ -116,6 +129,55 @@ def test_linear_matches_dequant_reference(fmt, dtype, w4a4):
     assert torch.isfinite(out).all()
     rel = _rel_err(out, x @ weight_ref.T)
     assert rel < 0.02, f"relative error {rel:.4f} too large"
+
+
+@requires_fp4_marlin
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4"])
+# 192 is Marlin-aligned; 160 is padded to 192 at load and cropped after the GEMM.
+@pytest.mark.parametrize("size_n", [SIZE_N, 160])
+def test_marlin_linear_bias(fmt, size_n):
+    """The bias is added after the GEMM, so it must stay in logical channel
+    order and length: permuting or padding it misplaces it per channel. The
+    bias left on the layer is also what a linear with skip_bias_add returns
+    to its caller, so it must come back unchanged."""
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    scheme, layer, weight_ref = _build_linear(fmt, dtype, False, size_n=size_n)
+    # A per-channel ramp: any reordering of the bias shows up as a mismatch.
+    bias = torch.arange(size_n, dtype=dtype, device="cuda") / size_n
+    layer.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
+    scheme.process_weights_after_loading(layer)
+    assert layer.bias.shape == (size_n,)
+    torch.testing.assert_close(layer.bias, bias, rtol=0, atol=0)
+
+    def forward(x):
+        # Bias added by the scheme, as a linear without skip_bias_add calls it,
+        # and bias skipped and returned, as with skip_bias_add; the caller adds it.
+        return (
+            scheme.apply_weights(layer, x, layer.bias),
+            scheme.apply_weights(layer, x, None) + layer.bias,
+        )
+
+    # With zero input the output is exactly the bias, channel by channel.
+    zero = torch.zeros((SIZE_M, SIZE_K), dtype=dtype, device="cuda")
+    for actual in forward(zero):
+        torch.testing.assert_close(actual, bias.expand_as(actual), rtol=0, atol=0)
+
+    x = torch.randn((2, SIZE_M, SIZE_K), dtype=dtype, device="cuda") / 10
+    expected = x @ weight_ref.T + bias
+    for actual in forward(x):
+        assert actual.shape == (2, SIZE_M, size_n)
+        rel = _rel_err(actual, expected)
+        assert rel < 0.02, f"relative error {rel:.4f} too large"
+
+
+@requires_fp4_marlin
+def test_mxfp4_linear_rejects_fp16():
+    """No fp16 MXFP4 kernel is instantiated, and dispatch would fall through to
+    a no-op returning garbage, so loading must fail instead."""
+    scheme, layer, _ = _build_linear("mxfp4", torch.float16, False)
+    with pytest.raises(RuntimeError, match="BF16"):
+        scheme.process_weights_after_loading(layer)
 
 
 @pytest.mark.skipif(
@@ -179,7 +241,11 @@ def _build_moe(fmt, is_gated, activation, dtype):
     )
     layer = torch.nn.Module()
     layer.moe_runner_config = config
-    scheme = CompressedTensorsW4A16Nvfp4MoE()
+    scheme = (
+        CompressedTensorsW4A16Nvfp4MoE()
+        if fmt == "nvfp4"
+        else CompressedTensorsW4A16Mxfp4MoE()
+    )
     scheme.create_weights(
         layer=layer,
         num_experts=NUM_EXPERTS,
@@ -229,7 +295,7 @@ def _moe_reference(x, w13, w2, topk_weights, topk_ids, is_gated, activation):
 
 
 @requires_fp4_marlin
-@pytest.mark.parametrize("fmt", ["nvfp4"])
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4"])
 @pytest.mark.parametrize(
     "is_gated,activation", [(True, "silu"), (False, "relu2"), (False, "silu")]
 )

@@ -127,7 +127,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 post_warmup_hook()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
-        captured_fn = eager_on_graph(forward_fn) if self._debug_eager else forward_fn
         size = shape_key.size
         if self._shared_output_buffer is None:
             capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
@@ -138,21 +137,34 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             self._shared_output_buffer = self._alloc_full_buffer(
                 warmup_out, capacity_rows
             )
+        buffer = self._shared_output_buffer
         with (
             graph_pool_capture_scope(),
             BreakableCUDAGraphCapture(
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
-                barrier_fn=self._tp_group.barrier,
             ),
         ):
             self._precarve.mint()
-            out = captured_fn()
-            out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            if self._debug_eager:
+                # The whole forward runs as one eager break that writes the
+                # output buffer.
+                # The warmup ran the same forward, so its output gives the
+                # captured rows.
+                out_rows = self._output_rows(warmup_out, size)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+                @eager_on_graph
+                def forward_into_buffer(output_buffer: Any) -> None:
+                    self._copy_output_to_buffer(forward_fn(), output_buffer, out_rows)
+
+                forward_into_buffer(buffer)
+            else:
+                out = forward_fn()
+                out_rows = self._output_rows(out, size)
+                self._copy_output_to_buffer(out, buffer, out_rows)
+
+        stored = self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.

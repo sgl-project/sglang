@@ -12,6 +12,10 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
     from sglang.multimodal_gen.runtime.pipelines_core import Req
 
+# Req.extra key for what models keep for one denoising loop (Wan's text K/V): the denoising
+# stage drops it when the loop ends; the leading "_" keeps it out of request transfers
+DENOISING_LOOP_STATE = "_denoising_loop_state"
+
 
 @dataclass
 class ForwardContext:

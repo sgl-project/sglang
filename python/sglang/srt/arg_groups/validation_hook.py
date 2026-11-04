@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    declare_resolution,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -657,6 +658,8 @@ def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+    if cfg.prefill_decode_interval_min_bs < 0:
+        raise ValueError("--prefill-decode-interval-min-bs must be non-negative.")
 
 
 def default_unset_prefill_decode_interval(server_args: Any):
@@ -686,6 +689,68 @@ def validate_sampling_mask_max_tokens(server_args: Any):
             "--sampling-mask-max-tokens must be positive "
             f"(got {cfg.sampling_mask_max_tokens})."
         )
+
+
+_AUX_HIDDEN_STATE_CAPTURE_METHODS = ("EAGLE3", "DFLASH", "DSPARK")
+
+
+def handle_aux_hidden_state_capture(server_args: Any):
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
+
+    Must run before anything reads speculative_algorithm: with the flag, that
+    argument only names the capture convention and is reset to None here, so
+    the speculative stack stays off.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_return_aux_hidden_states:
+        if cfg.return_aux_hidden_state_layer_ids is not None:
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids requires "
+                "--enable-return-aux-hidden-states."
+            )
+        return
+    method = (cfg.speculative_algorithm or "").upper()
+    if method not in _AUX_HIDDEN_STATE_CAPTURE_METHODS:
+        raise ValueError(
+            "--enable-return-aux-hidden-states needs --speculative-algorithm "
+            "EAGLE3, DFLASH or DSPARK to name the capture convention, got "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_draft_model_path is not None:
+        raise ValueError(
+            "--enable-return-aux-hidden-states captures without a draft; drop "
+            "--speculative-draft-model-path."
+        )
+    if cfg.pp_size != 1:
+        raise ValueError(
+            "--enable-return-aux-hidden-states only supports pp_size == 1: the "
+            "capture hooks only see the layers on the last pipeline rank."
+        )
+    layer_ids = cfg.return_aux_hidden_state_layer_ids
+    if method != "EAGLE3" and not layer_ids:
+        raise ValueError(
+            f"--enable-return-aux-hidden-states with {method} requires "
+            "--return-aux-hidden-state-layer-ids."
+        )
+    if layer_ids is not None:
+        if len(layer_ids) == 0:
+            raise ValueError("--return-aux-hidden-state-layer-ids must not be empty.")
+        if any(layer_id < 0 for layer_id in layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must be non-negative, got "
+                f"{list(layer_ids)}."
+            )
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must not repeat a layer, got "
+                f"{list(layer_ids)}."
+            )
+    declare_resolution(
+        server_args,
+        "_handle_aux_hidden_state_capture",
+        speculative_algorithm=None,
+        aux_hidden_state_capture=method.lower(),
+    )
 
 
 def check_two_batch_overlap(server_args: Any):

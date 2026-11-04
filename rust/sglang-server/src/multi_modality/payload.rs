@@ -95,14 +95,21 @@ fn collect_media(
 
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
-/// on the fixed MM worker pool (see `core::prefetch`). `data:` and bare
-/// base64 are pure CPU and stay on the worker. Lives next to [`image_source`]
-/// so the prefetch walk and the parse walk cannot drift.
+/// on the fixed MM worker pool (see `core::prefetch`). That is every absolute
+/// path and every `scheme://` URI, so a scheme no fetcher serves is rejected
+/// there instead of being decoded as base64. `data:` and bare base64 are pure
+/// CPU and stay on the worker. Lives next to [`image_source`] so the prefetch
+/// walk and the parse walk cannot drift.
 pub fn is_io_source(src: &str) -> bool {
-    src.starts_with("http://")
-        || src.starts_with("https://")
-        || src.starts_with("file://")
-        || src.starts_with('/')
+    // A bounded scan of the scheme alone: an inline payload can be megabytes
+    // of base64, and this runs on the async API workers.
+    const MAX_SCHEME_LEN: usize = 32;
+    let scheme_len = src
+        .bytes()
+        .take(MAX_SCHEME_LEN)
+        .take_while(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        .count();
+    src.starts_with('/') || (scheme_len > 0 && src[scheme_len..].starts_with("://"))
 }
 
 /// The I/O-backed sources of one modality's items, in item order.
@@ -211,8 +218,9 @@ mod tests {
         );
     }
 
-    /// I/O-backed sources (URLs, file paths) take their prefetched bytes in walk
-    /// order; one left unfetched errors, so no I/O can reach an MM worker.
+    /// I/O-backed sources (URLs of any scheme, file paths) take their
+    /// prefetched bytes in walk order; one left unfetched errors, so no I/O
+    /// can reach an MM worker.
     #[test]
     fn io_sources_use_prefetched_bytes() {
         let image = vec![
@@ -222,11 +230,29 @@ mod tests {
                 url: "/mnt/nfs/y.png".into(),
                 hints: MediaHints::default(),
             },
+            src("s3://bucket/z.png"),
         ];
-        assert_eq!(io_sources(&image), vec!["http://a/x.png", "/mnt/nfs/y.png"]);
+        assert_eq!(
+            io_sources(&image),
+            vec!["http://a/x.png", "/mnt/nfs/y.png", "s3://bucket/z.png"]
+        );
+        for source in ["file:///x.png", "https://a/x", "custom+v1.x-y://z"] {
+            assert!(is_io_source(source), "{source}");
+        }
+        // Bare base64 has no ':', and a data URL's prefix is no scheme.
+        for source in ["aGk=", "data:text/plain,a://b", "://x", "a b://c"] {
+            assert!(!is_io_source(source), "{source}");
+        }
+        // Only a bounded prefix is scanned, so a long scheme-alphabet run is
+        // inline data however it ends.
+        assert!(!is_io_source(&format!("{}://x", "A".repeat(64))));
 
         let mut work = image_work(image.clone());
-        work.prefetched = vec![Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
+        work.prefetched = vec![
+            Bytes::from_static(b"aa"),
+            Bytes::from_static(b"bb"),
+            Bytes::from_static(b"cc"),
+        ];
         let input = to_mm_input(IDS.to_vec(), work).unwrap();
         let as_bytes = |i: usize| match &input.images[i] {
             ImageSource::Bytes(b) => b.as_slice(),
@@ -234,6 +260,7 @@ mod tests {
         };
         assert_eq!(as_bytes(0), b"aa");
         assert_eq!(as_bytes(2), b"bb");
+        assert_eq!(as_bytes(3), b"cc");
         assert!(matches!(&input.images[1], ImageSource::String(_)));
 
         let err = to_mm_input(IDS.to_vec(), image_work(image)).err().unwrap();

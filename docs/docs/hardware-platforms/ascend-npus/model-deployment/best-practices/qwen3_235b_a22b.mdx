@@ -11,6 +11,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 </Note>
 
 <Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
 The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
 </Warning>
 

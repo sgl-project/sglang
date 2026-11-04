@@ -360,24 +360,28 @@ class HunyuanImage3AR(PipelineStage):
                 sin = tp_group.broadcast(sin, src=0)
         return attention_mask, (cos, sin)
 
+    @staticmethod
+    def _mask_positions(
+        mask: torch.Tensor, bsz: int, seqlen: int, device: torch.device
+    ) -> torch.Tensor:
+        """Sequence positions of the mask's set entries, one row per sample.
+
+        The masks are request-constant; masked_select sizes its output on the
+        host, so the denoising loop takes these positions once instead of per step.
+        """
+        index = torch.arange(seqlen, device=device).unsqueeze(0).expand(bsz, -1)
+        return index.masked_select(mask.bool()).reshape(bsz, -1)
+
     def _instantiate_vae_tokens_first_step(
         self,
         hidden_states: torch.Tensor,
         images: torch.Tensor,
         timesteps: torch.Tensor,
-        image_mask: torch.Tensor,
+        image_scatter_index: torch.Tensor,
     ) -> torch.Tensor:
-        bsz, seqlen, n_embd = hidden_states.shape
+        n_embd = hidden_states.shape[-1]
         t_emb = self.ar_model.time_embed(timesteps)
         image_seq, token_h, token_w = self.ar_model.patch_embed(images, t_emb)
-        image_scatter_index = (
-            torch.arange(seqlen, device=hidden_states.device)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-        )
-        image_scatter_index = image_scatter_index.masked_select(
-            image_mask.bool()
-        ).reshape(bsz, -1)
         hidden_states.scatter_(
             dim=1,
             index=image_scatter_index.unsqueeze(-1).expand(-1, -1, n_embd),
@@ -437,15 +441,15 @@ class HunyuanImage3AR(PipelineStage):
         self,
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
-        image_mask: torch.Tensor,
+        image_index: torch.Tensor,
         token_h: int,
         token_w: int,
     ) -> torch.Tensor:
         n_embd = hidden_states.size(-1)
         t_emb = self.ar_model.time_embed_2(timesteps)
 
-        image_output = hidden_states.masked_select(
-            image_mask.unsqueeze(-1).bool()
+        image_output = hidden_states.gather(
+            1, image_index.unsqueeze(-1).expand(-1, -1, n_embd)
         ).reshape(-1, token_h * token_w, n_embd)
 
         return self.ar_model.final_layer(image_output, t_emb, token_h, token_w)
@@ -1253,13 +1257,25 @@ class HunyuanImage3AR(PipelineStage):
                 )
 
         num_image_tokens = token_h * token_w
+        # request-constant positions and device copies, taken once for all steps
+        seq_len = tok["seq_len"]
+        image_index = self._mask_positions(
+            image_mask, actual_batch_size, seq_len, device
+        )
+        if timestep_index is not None and timestep_index.dtype == torch.bool:
+            timestep_index = self._mask_positions(
+                timestep_index, actual_batch_size, seq_len, device
+            )
+        if all_cond_t is not None:
+            all_cond_t = all_cond_t.to(device)
+        timesteps_device = timesteps.to(device)
 
         for step_idx, t in enumerate(self.progress_bar(timesteps, batch=head)):
             latent_model_input = scheduler.scale_model_input(latents, t)
             if do_cfg:
                 latent_model_input = torch.cat([latent_model_input] * cfg_factor, dim=0)
             latent_bs = latent_model_input.shape[0]
-            t_expand = t.repeat(latent_bs).to(device)
+            t_expand = timesteps_device[step_idx].repeat(latent_bs)
 
             with (
                 torch.autocast(
@@ -1279,7 +1295,7 @@ class HunyuanImage3AR(PipelineStage):
                     hidden_states,
                     latent_model_input,
                     t_expand,
-                    image_mask,
+                    image_index,
                 )
                 if timestep_index is not None:
                     hidden_states = self._instantiate_timestep_tokens(
@@ -1337,7 +1353,7 @@ class HunyuanImage3AR(PipelineStage):
                             )
                         hidden_states = self._instantiate_timestep_tokens(
                             hidden_states,
-                            all_cond_t.to(hidden_states.device),
+                            all_cond_t,
                             cond_ts_index,
                         )
 
@@ -1380,7 +1396,7 @@ class HunyuanImage3AR(PipelineStage):
                 pred = self._extract_diffusion_pred(
                     backbone_out,
                     t_expand,
-                    image_mask,
+                    image_index,
                     token_h,
                     token_w,
                 )

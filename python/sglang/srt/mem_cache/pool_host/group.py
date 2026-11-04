@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
@@ -26,6 +26,9 @@ class PoolEntry:
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
+    # Controller ids -> the device pool's rows, for a sub-pool whose ids map
+    # through its allocator (`KVStorage.host_ids`); None when they index it.
+    device_translate: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
 class HostPoolGroup:
@@ -112,7 +115,7 @@ class HostPoolGroup:
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
             for pool in pools:
                 dense_mha = (
-                    isinstance(pool, MHATokenToKVPool)
+                    isinstance(pool, MHAKVView)
                     and pool.kv_cache_layout == "nhd"
                     and pool.v_head_dim == pool.head_dim
                 )
@@ -178,13 +181,16 @@ class HostPoolGroup:
         *,
         pool: PoolName | None = None,
         reclaim: Callable[[int], Any] | None = None,
+        start_owner: int | None = None,
     ) -> torch.Tensor | None:
         """Allocate from one pool, optionally reclaiming once before retrying."""
         host_pool = self.get_entry(pool).host_pool
-        indices = host_pool.alloc(need_size)
+        # Only KV-sharded host pools take start_owner.
+        kwargs = {} if start_owner is None else {"start_owner": start_owner}
+        indices = host_pool.alloc(need_size, **kwargs)
         if indices is None and reclaim is not None:
             reclaim(need_size)
-            indices = host_pool.alloc(need_size)
+            indices = host_pool.alloc(need_size, **kwargs)
         return indices
 
     def free(self, indices: torch.Tensor, *, pool: PoolName | None = None) -> int:

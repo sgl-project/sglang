@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.bridges.mova_dual_tower import (
+    rope_cos_sin_cache,
+)
 
 # Both audio and video DiT use the same sinusoidal_embedding_1d function
 # Import from mova_video_dit where it's defined (mova_audio_dit re-exports it)
@@ -69,6 +72,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
+    temporary_module_fp32_dtype,
+    temporary_modules_fp32_dtype,
 )
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -164,6 +171,9 @@ class MOVADenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self._cache_dit_enabled = False
         self._torch_compiled = False
+        # _rope_freqs memo: the key it was built for and its RoPE tables
+        self._rope_freqs_cache_key = None
+        self._rope_freqs_cache = None
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -464,6 +474,8 @@ class MOVADenoisingStage(PipelineStage):
 
         boundary_ratio = server_args.pipeline_config.boundary_ratio
         total_steps = paired_timesteps.shape[0]
+        # device copy of the host schedule, uploaded once; the host one drives steps
+        paired_timesteps_device = paired_timesteps.to(device=get_local_torch_device())
         cfg_rank = get_classifier_free_guidance_rank()
         enable_cfg_parallel = server_args.enable_cfg_parallel
 
@@ -486,19 +498,17 @@ class MOVADenoisingStage(PipelineStage):
                     record_as_step=True,
                 ):
                     pair_t = paired_timesteps[idx_step]
+                    pair_t_device = paired_timesteps_device[idx_step].unsqueeze(-1)
                     if getattr(pair_t, "shape", None) == (2,):
                         timestep, audio_timestep = pair_t
+                        timestep_device, audio_timestep_device = pair_t_device
                     else:
                         timestep = pair_t
                         audio_timestep = pair_t
+                        timestep_device = audio_timestep_device = pair_t_device
 
                     cur_visual_dit = self._select_visual_dit(
                         timestep.item(), boundary_ratio, server_args, scheduler
-                    )
-
-                    timestep = timestep.unsqueeze(0).to(device=get_local_torch_device())
-                    audio_timestep = audio_timestep.unsqueeze(0).to(
-                        device=get_local_torch_device()
                     )
 
                     attn_metadata = self._build_attn_metadata(
@@ -512,8 +522,8 @@ class MOVADenoisingStage(PipelineStage):
                             batch.audio_latents,
                             y,
                             batch.prompt_embeds[0],
-                            timestep,
-                            audio_timestep,
+                            timestep_device,
+                            audio_timestep_device,
                             batch.fps,
                             idx_step,
                             attn_metadata,
@@ -528,8 +538,8 @@ class MOVADenoisingStage(PipelineStage):
                                     batch.audio_latents,
                                     y,
                                     batch.prompt_embeds[0],
-                                    timestep,
-                                    audio_timestep,
+                                    timestep_device,
+                                    audio_timestep_device,
                                     batch.fps,
                                     idx_step,
                                     attn_metadata,
@@ -544,8 +554,8 @@ class MOVADenoisingStage(PipelineStage):
                                     batch.audio_latents,
                                     y,
                                     batch.negative_prompt_embeds[0],
-                                    timestep,
-                                    audio_timestep,
+                                    timestep_device,
+                                    audio_timestep_device,
                                     batch.fps,
                                     idx_step,
                                     attn_metadata,
@@ -558,8 +568,8 @@ class MOVADenoisingStage(PipelineStage):
                                 batch.audio_latents,
                                 y,
                                 batch.prompt_embeds[0],
-                                timestep,
-                                audio_timestep,
+                                timestep_device,
+                                audio_timestep_device,
                                 batch.fps,
                                 idx_step,
                                 attn_metadata,
@@ -571,70 +581,70 @@ class MOVADenoisingStage(PipelineStage):
                                 batch.audio_latents,
                                 y,
                                 batch.negative_prompt_embeds[0],
-                                timestep,
-                                audio_timestep,
+                                timestep_device,
+                                audio_timestep_device,
                                 batch.fps,
                                 idx_step,
                                 attn_metadata,
                                 batch,
                             )
 
-                            visual_noise_pred = self._cfg_combine(
-                                pos[0] if pos[0] is not None else neg[0],
-                                neg[0] if neg[0] is not None else pos[0],
-                                batch.guidance_scale,
+                        visual_noise_pred = self._cfg_combine(
+                            pos[0] if pos[0] is not None else neg[0],
+                            neg[0] if neg[0] is not None else pos[0],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+                        audio_noise_pred = self._cfg_combine(
+                            pos[1] if pos[1] is not None else neg[1],
+                            neg[1] if neg[1] is not None else pos[1],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+
+                        if batch.guidance_rescale > 0.0:
+                            visual_noise_pred = self._apply_guidance_rescale(
+                                visual_noise_pred,
+                                pos[0] if pos[0] is not None else None,
+                                batch.guidance_rescale,
                                 cfg_rank,
                                 enable_cfg_parallel,
                             )
-                            audio_noise_pred = self._cfg_combine(
-                                pos[1] if pos[1] is not None else neg[1],
-                                neg[1] if neg[1] is not None else pos[1],
-                                batch.guidance_scale,
+                            audio_noise_pred = self._apply_guidance_rescale(
+                                audio_noise_pred,
+                                pos[1] if pos[1] is not None else None,
+                                batch.guidance_rescale,
                                 cfg_rank,
                                 enable_cfg_parallel,
                             )
 
-                            if batch.guidance_rescale > 0.0:
-                                visual_noise_pred = self._apply_guidance_rescale(
-                                    visual_noise_pred,
-                                    pos[0] if pos[0] is not None else None,
-                                    batch.guidance_rescale,
-                                    cfg_rank,
-                                    enable_cfg_parallel,
-                                )
-                                audio_noise_pred = self._apply_guidance_rescale(
-                                    audio_noise_pred,
-                                    pos[1] if pos[1] is not None else None,
-                                    batch.guidance_rescale,
-                                    cfg_rank,
-                                    enable_cfg_parallel,
-                                )
-
-                        if idx_step + 1 < total_steps:
-                            next_pair_t = paired_timesteps[idx_step + 1]
-                            if getattr(next_pair_t, "shape", None) == (2,):
-                                next_timestep, next_audio_timestep = next_pair_t
-                            else:
-                                next_timestep = next_pair_t
-                                next_audio_timestep = next_pair_t
+                    if idx_step + 1 < total_steps:
+                        next_pair_t = paired_timesteps[idx_step + 1]
+                        if getattr(next_pair_t, "shape", None) == (2,):
+                            next_timestep, next_audio_timestep = next_pair_t
                         else:
-                            next_timestep = None
-                            next_audio_timestep = None
+                            next_timestep = next_pair_t
+                            next_audio_timestep = next_pair_t
+                    else:
+                        next_timestep = None
+                        next_audio_timestep = None
 
-                        batch.latents = scheduler.step_from_to(
-                            visual_noise_pred,
-                            timestep,
-                            next_timestep,
-                            batch.latents,
-                            **extra_step_kwargs,
-                        )
-                        batch.audio_latents = scheduler.step_from_to(
-                            audio_noise_pred,
-                            audio_timestep,
-                            next_audio_timestep,
-                            batch.audio_latents,
-                            **extra_step_kwargs,
-                        )
+                    batch.latents = scheduler.step_from_to(
+                        visual_noise_pred,
+                        timestep,
+                        next_timestep,
+                        batch.latents,
+                        **extra_step_kwargs,
+                    )
+                    batch.audio_latents = scheduler.step_from_to(
+                        audio_noise_pred,
+                        audio_timestep,
+                        next_audio_timestep,
+                        batch.audio_latents,
+                        **extra_step_kwargs,
+                    )
 
                     if progress_bar is not None:
                         progress_bar.update()
@@ -642,6 +652,8 @@ class MOVADenoisingStage(PipelineStage):
                         self.step_profile()
 
         self._finish_active_component_use()
+        # the tables are request-sized; free them before decoding
+        self._rope_freqs_cache_key = self._rope_freqs_cache = None
 
         return batch
 
@@ -656,6 +668,101 @@ class MOVADenoisingStage(PipelineStage):
     ) -> torch.Tensor:
         """Gather an SP-sharded tensor and trim the tail padding."""
         return gather_seq(x, shard.orig_len, dim=dim)
+
+    def _rope_freqs(
+        self,
+        visual_dit,
+        grid_size: tuple[int, int, int],
+        audio_len: int,
+        video_fps: float,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """SP-sharded RoPE tables: (visual, audio) self-attention, (visual, audio) bridge.
+
+        They depend only on the request's shape and fps, so they are built once and
+        reused by every step: per forward, the self-attention tables were uploaded
+        with blocking copies and every bridge layer rebuilt its cos/sin caches
+        """
+        key = (visual_dit, grid_size, audio_len, video_fps, dtype, device)
+        if key == self._rope_freqs_cache_key:
+            return self._rope_freqs_cache
+        t, h, w = grid_size
+        f = audio_len
+
+        # Build visual freqs for full sequence
+        visual_dit._init_freqs()
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            visual_freqs = tuple(
+                freq.to(device=device, dtype=torch.complex64)
+                for freq in visual_dit.freqs
+            )
+        else:
+            visual_freqs = tuple(freq.to(device) for freq in visual_dit.freqs)
+        visual_freqs = torch.cat(
+            [
+                visual_freqs[0][:t].view(t, 1, 1, -1).expand(t, h, w, -1),
+                visual_freqs[1][:h].view(1, h, 1, -1).expand(t, h, w, -1),
+                visual_freqs[2][:w].view(1, 1, w, -1).expand(t, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(t * h * w, 1, -1)
+
+        # Build audio freqs for full sequence
+        self.audio_dit._init_freqs()
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            audio_freqs = tuple(
+                freq.to(device=device, dtype=torch.complex64)
+                for freq in self.audio_dit.freqs
+            )
+        else:
+            audio_freqs = tuple(freq.to(device) for freq in self.audio_dit.freqs)
+        audio_freqs = torch.cat(
+            [
+                audio_freqs[0][:f].view(f, -1).expand(f, -1),
+                audio_freqs[1][:f].view(f, -1).expand(f, -1),
+                audio_freqs[2][:f].view(f, -1).expand(f, -1),
+            ],
+            dim=-1,
+        ).reshape(f, 1, -1)
+
+        # Shard freqs to match local sequence length
+        visual_freqs, _ = self._shard_sequence_for_sp(visual_freqs, dim=0)
+        audio_freqs, _ = self._shard_sequence_for_sp(audio_freqs, dim=0)
+
+        visual_bridge_freqs, audio_bridge_freqs = (
+            self.dual_tower_bridge.build_aligned_freqs(
+                video_fps=video_fps,
+                grid_size=grid_size,
+                audio_steps=audio_len,
+                device=device,
+                dtype=dtype,
+            )
+        )
+        if visual_bridge_freqs is not None:
+            visual_bridge_freqs = rope_cos_sin_cache(
+                [
+                    self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
+                    for rope_cos_sin in visual_bridge_freqs
+                ]
+            )
+        if audio_bridge_freqs is not None:
+            audio_bridge_freqs = rope_cos_sin_cache(
+                [
+                    self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
+                    for rope_cos_sin in audio_bridge_freqs
+                ]
+            )
+        self._rope_freqs_cache_key = key
+        self._rope_freqs_cache = (
+            visual_freqs,
+            audio_freqs,
+            visual_bridge_freqs,
+            audio_bridge_freqs,
+        )
+        return self._rope_freqs_cache
 
     def inference_single_step(
         self,
@@ -681,9 +788,23 @@ class MOVADenoisingStage(PipelineStage):
 
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
-        with torch.autocast(
-            device_type=current_platform.device_type, dtype=torch.float32
-        ):
+
+        # See [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
+        autocast_ctx = (
+            torch.autocast(
+                device_type=current_platform.device_type, dtype=torch.float32
+            )
+            if current_platform.device_type != "cpu"
+            else temporary_modules_fp32_dtype(
+                [
+                    visual_dit.time_embedding,
+                    visual_dit.time_projection,
+                    self.audio_dit.time_embedding,
+                    self.audio_dit.time_projection,
+                ]
+            )
+        )
+        with autocast_ctx:
             visual_t = visual_dit.time_embedding(
                 video_sinusoidal_embedding_1d(visual_dit.freq_dim, timestep)
             )
@@ -713,63 +834,19 @@ class MOVADenoisingStage(PipelineStage):
         # Patchify visual latents
         visual_x, (t, h, w) = visual_dit.patchify(visual_x)
         grid_size = (t, h, w)
-        full_visual_seq_len = t * h * w
-
-        # Build visual freqs for full sequence
-        visual_dit._init_freqs()
-        if _is_npu:
-            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
-            visual_freqs = tuple(
-                freq.to(device=visual_x.device, dtype=torch.complex64)
-                for freq in visual_dit.freqs
-            )
-        else:
-            visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
-        visual_freqs = (
-            torch.cat(
-                [
-                    visual_freqs[0][:t].view(t, 1, 1, -1).expand(t, h, w, -1),
-                    visual_freqs[1][:h].view(1, h, 1, -1).expand(t, h, w, -1),
-                    visual_freqs[2][:w].view(1, 1, w, -1).expand(t, h, w, -1),
-                ],
-                dim=-1,
-            )
-            .reshape(full_visual_seq_len, 1, -1)
-            .to(visual_x.device)
-        )
 
         # Patchify audio latents
         audio_x, (f,) = self.audio_dit.patchify(audio_x, None)
-        full_audio_seq_len = f
 
-        # Build audio freqs for full sequence
-        self.audio_dit._init_freqs()
-        if _is_npu:
-            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
-            audio_freqs = tuple(
-                freq.to(device=audio_x.device, dtype=torch.complex64)
-                for freq in self.audio_dit.freqs
+        visual_freqs, audio_freqs, visual_bridge_freqs, audio_bridge_freqs = (
+            self._rope_freqs(
+                visual_dit, grid_size, f, video_fps, visual_x.dtype, visual_x.device
             )
-        else:
-            audio_freqs = tuple(
-                freq.to(audio_x.device) for freq in self.audio_dit.freqs
-            )
-        audio_freqs = torch.cat(
-            [
-                audio_freqs[0][:f].view(f, -1).expand(f, -1),
-                audio_freqs[1][:f].view(f, -1).expand(f, -1),
-                audio_freqs[2][:f].view(f, -1).expand(f, -1),
-            ],
-            dim=-1,
-        ).reshape(full_audio_seq_len, 1, -1)
+        )
 
         # Shard sequences for SP
         visual_x, visual_shard = self._shard_sequence_for_sp(visual_x, dim=1)
         audio_x, audio_shard = self._shard_sequence_for_sp(audio_x, dim=1)
-
-        # Shard freqs to match local sequence length
-        visual_freqs, _ = self._shard_sequence_for_sp(visual_freqs, dim=0)
-        audio_freqs, _ = self._shard_sequence_for_sp(audio_freqs, dim=0)
 
         # Tail-pad meta so self-attention excludes SP padding (built once per
         # step, shared by every block).
@@ -789,10 +866,9 @@ class MOVADenoisingStage(PipelineStage):
             audio_t_mod=audio_t_mod,
             visual_freqs=visual_freqs,
             audio_freqs=audio_freqs,
+            visual_bridge_freqs=visual_bridge_freqs,
+            audio_bridge_freqs=audio_bridge_freqs,
             grid_size=grid_size,
-            video_fps=video_fps,
-            full_visual_seq_len=full_visual_seq_len,
-            full_audio_seq_len=full_audio_seq_len,
             visual_attn_meta=visual_attn_meta,
             audio_attn_meta=audio_attn_meta,
         )
@@ -820,10 +896,9 @@ class MOVADenoisingStage(PipelineStage):
         audio_t_mod: torch.Tensor,
         visual_freqs: torch.Tensor,
         audio_freqs: torch.Tensor,
+        visual_bridge_freqs: torch.Tensor | None,
+        audio_bridge_freqs: torch.Tensor | None,
         grid_size: tuple[int, int, int],
-        video_fps: float,
-        full_visual_seq_len: int,
-        full_audio_seq_len: int,
         condition_scale: float | None = 1.0,
         a2v_condition_scale: float | None = None,
         v2a_condition_scale: float | None = None,
@@ -841,33 +916,11 @@ class MOVADenoisingStage(PipelineStage):
         - Cross-modal attention (dual_tower_bridge) uses LocalAttention (no SP communication)
 
         Args:
-            full_visual_seq_len: Full visual sequence length before SP sharding
-            full_audio_seq_len: Full audio sequence length before SP sharding
+            visual_bridge_freqs: bridge RoPE cos_sin_cache of the visual sequence
+            audio_bridge_freqs: bridge RoPE cos_sin_cache of the audio sequence
         """
         min_layers = min(len(visual_dit.blocks), len(self.audio_dit.blocks))
         visual_layers = len(visual_dit.blocks)
-
-        # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
-        # When SP > 1, we rebuild freqs inside the loop after gathering full sequences
-        visual_rope_cos_sin, audio_rope_cos_sin = (
-            self.dual_tower_bridge.build_aligned_freqs(
-                video_fps=video_fps,
-                grid_size=grid_size,
-                audio_steps=full_audio_seq_len,
-                device=visual_x.device,
-                dtype=visual_x.dtype,
-            )
-        )
-        if visual_rope_cos_sin is not None:
-            visual_rope_cos_sin = [
-                self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
-                for rope_cos_sin in visual_rope_cos_sin
-            ]
-        if audio_rope_cos_sin is not None:
-            audio_rope_cos_sin = [
-                self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
-                for rope_cos_sin in audio_rope_cos_sin
-            ]
 
         for layer_idx in range(min_layers):
             visual_block = visual_dit.blocks[layer_idx]
@@ -881,8 +934,8 @@ class MOVADenoisingStage(PipelineStage):
                     layer_idx,
                     visual_x,
                     audio_x,
-                    x_freqs=visual_rope_cos_sin,
-                    y_freqs=audio_rope_cos_sin,
+                    x_freqs=visual_bridge_freqs,
+                    y_freqs=audio_bridge_freqs,
                     a2v_condition_scale=a2v_condition_scale,
                     v2a_condition_scale=v2a_condition_scale,
                     condition_scale=condition_scale,
@@ -984,10 +1037,21 @@ class MOVADecodingStage(PipelineStage):
         ) as audio_vae:
             assert audio_vae is not None
             self.audio_vae = audio_vae
-            with torch.autocast(
-                device_type=current_platform.device_type, dtype=torch.float32
-            ):
-                audio = self.audio_vae.decode(batch.audio_latents)
+            # See [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
+            audio_latents = (
+                batch.audio_latents.float()
+                if current_platform.device_type == "cpu"
+                else batch.audio_latents
+            )
+            autocast_ctx = (
+                torch.autocast(
+                    device_type=current_platform.device_type, dtype=torch.float32
+                )
+                if current_platform.device_type != "cpu"
+                else temporary_module_fp32_dtype(self.audio_vae)
+            )
+            with autocast_ctx:
+                audio = self.audio_vae.decode(audio_latents)
         output_batch = OutputBatch(
             output=video,
             audio=audio,

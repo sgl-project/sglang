@@ -80,9 +80,10 @@ def alias_members_prompt_kv(
     req_to_token[dst_rows, :prompt_len] = req_to_token[leader_row, :prompt_len]
 
 
-def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> None:
-    """Release the decode-suffix KV plus the member row slots. Idempotent; must
-    run while the leader's kv info still carries the lockstep allocated length."""
+def free_member_rows(group, storage) -> None:
+    """Release the decode-suffix KV plus the member row slots through the KV
+    storage. Idempotent; must run while the leader's kv info still carries the
+    lockstep allocated length."""
     if group.member_rows is None:
         return
     leader = group.leader
@@ -91,11 +92,11 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
     if end > start:
         # The rewind below is required: without it the leader's own per-Req
         # release frees this decode region a second time.
-        slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
-        token_to_kv_pool_allocator.free(slots.flatten().unique())
+        slots = storage.requests.req_to_token[group.all_rows, start:end]
+        storage.free_tokens(slots.flatten().unique())
         leader.kv.kv_committed_len = start
         leader.kv.kv_allocated_len = start
-    req_to_token_pool.free_rows(group.member_rows_cpu.tolist())
+    storage.release_rows(group.member_rows_cpu.tolist())
     group.member_rows = None
     group.member_rows_cpu = None
     group.all_rows = None

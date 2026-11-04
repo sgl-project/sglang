@@ -365,6 +365,35 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_with_pin_memory_xpu(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    """`alloc_with_pin_memory`, failing on a null pinned buffer.
+
+    torch-xpu returns `data_ptr() == 0` from a failed pinned allocation instead of
+    raising; an empty tensor has a null pointer on every backend and is fine.
+    """
+    buffer = alloc_with_pin_memory(
+        dims=dims,
+        dtype=dtype,
+        device=device,
+        pin_memory=pin_memory,
+        allocator=allocator,
+    )
+    if pin_memory and buffer.numel() > 0 and buffer.data_ptr() == 0:
+        n_bytes = buffer.numel() * buffer.element_size()
+        raise RuntimeError(
+            f"Pinned host memory allocation of {n_bytes / (1024**3):.1f} GiB "
+            f"({n_bytes} bytes) returned a null pointer"
+        )
+    return buffer
+
+
 @lru_cache(maxsize=1)
 def _resolve_device_accessible_ptr_fn():
     try:
@@ -426,6 +455,6 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
-        "xpu": alloc_with_pin_memory,
+        "xpu": alloc_with_pin_memory_xpu,
     },
 )

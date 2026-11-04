@@ -366,26 +366,37 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
-    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
+    if _graph_may_capture_collectives(server_args):
         _disable_nccl_graph_buffer_registration(
-            "the graph-captured TP LM-head all-to-all can deadlock with "
+            "graph replay of captured cross-rank collectives can hang with "
             "registered buffers"
         )
-    if _graph_pool_is_pausable(server_args):
-        _disable_nccl_graph_buffer_registration(
-            "graph replay can hang once torch_memory_saver resume remaps the "
-            "graph pool, leaving the capture-time registrations on released pages"
-        )
 
 
-def _graph_pool_is_pausable(server_args: Any) -> bool:
-    """Whether CUDA graphs are captured into torch_memory_saver memory, which
-    release/resume of the `cuda_graph` tag remaps to new physical pages at the
-    same virtual addresses."""
-    return bool(
-        resolving_view(server_args).enable_memory_saver
-        and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-    )
+def _graph_may_capture_collectives(server_args: Any) -> bool:
+    """Whether any captured CUDA graph can hold a cross-rank collective.
+
+    Conservative workaround, root cause still open: multi-node TP16 decode
+    replay hangs with NCCL_GRAPH_REGISTER on even with the TP LM-head
+    all-to-all and the pausable graph pool both off, and stops hanging once
+    the registration is off. Graph-pool address reuse is the suspected
+    trigger, not a confirmed mechanism, so the guard keys on any multi-rank
+    capture rather than on the feature flags that first exposed it. Checking
+    every phase also keeps the prefill-into-pausable-pool case the old pool
+    guard covered.
+
+    Errs toward True. Later passes can still narrow cuda_graph_config. On the
+    reproducing deployment, a single 10-minute run showed no throughput
+    difference with the registration off; other deployment shapes are
+    unmeasured.
+    """
+    view = resolving_view(server_args)
+    if max(view.tp_size, view.ep_size, view.dp_size) <= 1:
+        return False
+    config = view.cuda_graph_config
+    if config is None:
+        return True
+    return any(config[phase].backend != Backend.DISABLED for phase in Phase.ALL)
 
 
 def _disable_nccl_graph_buffer_registration(reason: str) -> None:

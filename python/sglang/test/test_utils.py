@@ -2152,12 +2152,24 @@ def _visible_gpu_indices(pynvml) -> List[int]:
 
 def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
     self_pid = os.getpid()
+    reserved_by_uuid = {}
+    if torch.cuda.is_initialized():
+        reserved_by_uuid = {
+            str(torch.cuda.get_device_properties(device).uuid).removeprefix(
+                "GPU-"
+            ): torch.cuda.memory_reserved(device)
+            for device in range(torch.cuda.device_count())
+        }
     reports = []
     for index in gpu_indices:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
         used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
         if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
             continue
+        # NVML reports host PIDs, which may differ from our container PID
+        self_used = reserved_by_uuid.get(
+            pynvml.nvmlDeviceGetUUID(handle).removeprefix("GPU-"), 0
+        )
         try:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
         except pynvml.NVMLError:
@@ -2165,11 +2177,10 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
         if procs is not None:
             # Discount our own usage: the caching allocator retains memory
             # across test classes, and waiting on ourselves never succeeds.
-            self_used = sum(
-                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            self_used = max(
+                self_used,
+                sum(proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid),
             )
-            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
-                continue
             proc_info = ", ".join(
                 f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
                 for proc in procs
@@ -2180,6 +2191,8 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
             )
         else:
             proc_info = ""
+        if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
         reports.append(
             f"GPU {index} uses {_format_gib(used_bytes)}"
             f" ({proc_info or 'no compute processes found'})"
@@ -2385,6 +2398,9 @@ def enter_scope(test_case, scope):
 
 
 class CustomTestCase(unittest.TestCase):
+    # Fault-injection tests must inspect the failure after their server exits.
+    expect_server_exit = False
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
@@ -2417,6 +2433,9 @@ class CustomTestCase(unittest.TestCase):
         cls.setUpClass = classmethod(safe_setUpClass)
 
     def _callTestMethod(self, method):
+        if self.expect_server_exit:
+            # Retrying would reuse the server that the test intentionally stopped.
+            return super()._callTestMethod(method)
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
             max_retry = 1 if is_in_ci() else 0

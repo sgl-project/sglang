@@ -274,6 +274,9 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
     ):
         self.kernel.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
 

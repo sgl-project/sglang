@@ -1,17 +1,25 @@
 import itertools
 import sys
+from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
@@ -20,7 +28,7 @@ from sglang.test.test_marlin_utils import (
     marlin_quantize,
 )
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=720, stage="extra-a", runner_config="1-gpu-large")
 
 
 def _has_aot_moe_wna16_marlin_gemm() -> bool:
@@ -894,6 +902,722 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
             rtol=0.03,
             atol=reference.float().square().mean().sqrt().item() * 0.002,
         )
+
+
+def _marlin_inactive_weights(experts, output_size, input_size, quant_type):
+    tensors = _setup_moe_weights(
+        min(experts, 8), output_size, input_size, quant_type, 128, False, torch.bfloat16
+    )
+    result = []
+    for tensor in tensors:
+        if tensor is None:
+            result.append(None)
+            continue
+        tensor = tensor.repeat((experts // tensor.shape[0],) + (1,) * (tensor.ndim - 1))
+        # A leading poisoned record makes negative expert indexing observable
+        # without reading outside an allocation during the failing regression.
+        storage = tensor.new_empty((experts + 1, *tensor.shape[1:]))
+        storage[0].fill_(float("nan") if tensor.is_floating_point() else 0)
+        storage[1:].copy_(tensor)
+        result.append(storage[1:])
+    return result
+
+
+@pytest.mark.parametrize(
+    "rows,experts,intermediate",
+    [(1, 8, 128), (4, 128, 128), (16, 8, 256), (64, 128, 128)],
+)
+@pytest.mark.parametrize(
+    "quant_type,num_bits",
+    [(scalar_types.uint4b8, 4), (scalar_types.uint8b128, 8), (scalar_types.uint4, 4)],
+)
+def test_fused_marlin_moe_inactive_routes(
+    rows, experts, intermediate, quant_type, num_bits
+):
+    """EP1 padded graph rows contribute zero through Marlin and its shared caches."""
+    _check_marlin_inactive_routes(rows, experts, intermediate, quant_type, num_bits)
+
+
+def test_stock_marlin_lora_inactive_routes():
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Stock Marlin LoRA requires SM90 or newer")
+    _check_marlin_inactive_routes(4, 8, 128, scalar_types.uint4b8, 4, "stock_lora")
+
+
+def test_factored_marlin_lora_inactive_routes():
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Experimental Marlin LoRA requires SM90 or newer")
+    _check_marlin_inactive_routes(4, 8, 128, scalar_types.uint4b8, 4, "factored_lora")
+
+
+def _check_marlin_inactive_routes(
+    rows, experts, intermediate, quant_type, num_bits, runner_kind="fused"
+):
+    torch.manual_seed(43)
+    hidden, topk = 256, 2
+    with get_context().override_server_args(
+        model_path="dummy",
+        device="cuda",
+        moe_runner_backend="auto",
+        ep_dispatch_algorithm=None,
+        enable_eplb=False,
+        enable_waterfill=False,
+    ):
+        flags = get_flags().moe
+        flag_values = {name: getattr(flags, name) for name in flags.__struct_fields__}
+        flag_values["in_speculative_scope"] = False
+        with (
+            flags.override(**flag_values),
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                attn_cp_size=1,
+                tp_group=None,
+            ),
+        ):
+            initialize_moe_config()
+            x = torch.randn((rows, hidden), device="cuda", dtype=torch.bfloat16)
+            logits = torch.randn((rows, experts), device="cuda", dtype=torch.float32)
+            w1_ref, w1, s1, z1, g1, p1 = _marlin_inactive_weights(
+                experts, 2 * intermediate, hidden, quant_type
+            )
+            w2_ref, w2, s2, z2, g2, p2 = _marlin_inactive_weights(
+                experts, hidden, intermediate, quant_type
+            )
+            router = TopK(
+                top_k=topk,
+                layer_id=0,
+                renormalize=True,
+                output_format=TopKOutputFormat.STANDARD,
+                allow_routed_experts_capture=False,
+            )
+            router.bind_runner_backend(MoeRunnerBackend.MARLIN)
+            live = torch.tensor(rows, device="cuda", dtype=torch.int32)
+            batch = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=1,
+                input_ids=torch.arange(rows, device="cuda"),
+                req_pool_indices=torch.zeros(1, device="cuda", dtype=torch.int64),
+                seq_lens=torch.tensor([rows], device="cuda", dtype=torch.int32),
+                out_cache_loc=torch.arange(rows, device="cuda"),
+                seq_lens_sum=rows,
+                num_token_non_padded=live,
+            )
+            output = torch.full_like(x, float("nan"))
+            finite_logits = logits.clone()
+            hook_weights = []
+            if runner_kind != "fused":
+                from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+                from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+                from sglang.srt.layers.moe.token_dispatcher.standard import (
+                    StandardDispatchOutput,
+                )
+
+                config = MoeRunnerConfig(
+                    num_experts=experts,
+                    num_local_experts=experts,
+                    hidden_size=hidden,
+                    intermediate_size_per_partition=intermediate,
+                    top_k=topk,
+                    params_dtype=x.dtype,
+                    runner_backend=MoeRunnerBackend.MARLIN,
+                    inplace=False,
+                )
+                quant_info = MarlinMoeQuantInfo(
+                    w13_qweight=w1,
+                    w2_qweight=w2,
+                    w13_scales=s1,
+                    w2_scales=s2,
+                    w13_g_idx_sort_indices=p1,
+                    w2_g_idx_sort_indices=p2,
+                    weight_bits=num_bits,
+                    w13_g_idx=g1,
+                    w2_g_idx=g2,
+                    w13_qzeros=z1,
+                    w2_qzeros=z2,
+                )
+                if runner_kind == "stock_lora":
+                    from sglang.srt.lora.lora_moe_runner_marlin import (
+                        MarlinLoraRunnerCore,
+                    )
+                    from sglang.srt.lora.lora_moe_runners import LoRAHooks
+
+                    core = MarlinLoraRunnerCore(config)
+
+                    def after_down(activation, projected, weights, ids):
+                        hook_weights[:] = [weights, ids]
+
+                    hooks = LoRAHooks(after_down=after_down)
+                else:
+                    from sglang.srt.lora.marlin_lora_temp.moe_runner import (
+                        _use_shared_outer_factorization,
+                        fused_experts_experimental_sgl_marlin_lora,
+                    )
+
+                    # A zero adapter must preserve base output, including NaN-padded
+                    # routing weights consumed by the factored rank-sum reduction.
+                    rank = 8
+                    lora_info = SimpleNamespace(
+                        lora_use_virtual_experts=True,
+                        max_lora_rank=rank,
+                        has_active_lora=True,
+                        experts_shared_outer_loras=True,
+                        adapter_enabled=torch.ones(1, device="cuda", dtype=torch.int32),
+                        gate_up_lora_a_weights=x.new_zeros((1, 1, 2 * rank, hidden)),
+                        gate_up_lora_b_weights=x.new_zeros(
+                            (1, experts, 2 * intermediate, rank)
+                        ),
+                        down_lora_a_weights=x.new_zeros(
+                            (1, experts, rank, intermediate)
+                        ),
+                        down_lora_b_weights=x.new_zeros((1, 1, hidden, rank)),
+                        token_lora_mapping=torch.zeros(
+                            rows, device="cuda", dtype=torch.int32
+                        ),
+                    )
+                    assert _use_shared_outer_factorization(lora_info, rows, topk)
+
+            def run():
+                with forward_context(
+                    ForwardContext(attn_backend=None), forward_batch=batch
+                ):
+                    routing = router(x, logits)
+                    if runner_kind != "fused":
+                        dispatch = StandardDispatchOutput(x, None, routing)
+                        if runner_kind == "stock_lora":
+                            result = core.run_from_dispatch(
+                                dispatch, quant_info, config, hooks
+                            ).hidden_states
+                            assert hook_weights[0] is routing.topk_weights
+                            return result
+                        return fused_experts_experimental_sgl_marlin_lora(
+                            dispatch, quant_info, config, lora_info
+                        ).hidden_states
+                    return fused_marlin_moe(
+                        x,
+                        w1,
+                        w2,
+                        s1,
+                        s2,
+                        logits,
+                        routing.topk_weights,
+                        routing.topk_ids,
+                        g_idx1=g1,
+                        g_idx2=g2,
+                        sort_indices1=p1,
+                        sort_indices2=p2,
+                        w1_zeros=z1,
+                        w2_zeros=z2,
+                        num_bits=num_bits,
+                    )
+
+            weights, ids = torch.topk(torch.softmax(logits, dim=-1), topk)
+            weights /= weights.sum(dim=-1, keepdim=True)
+            gate_up = torch.einsum("mh,mtih->mti", x, w1_ref[ids])
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = torch.nn.functional.silu(gate) * up
+            projected = torch.einsum("mti,mthi->mth", activated, w2_ref[ids])
+            reference = (projected.float() * weights[:, :, None]).sum(1).to(x.dtype)
+            caller_module = {
+                "fused": "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe",
+                "stock_lora": "sglang.srt.lora.lora_moe_runner_marlin",
+                "factored_lora": "sglang.srt.lora.marlin_lora_temp.moe_runner",
+            }[runner_kind]
+            projections = []
+
+            def checked_marlin_gemm(*args, **kwargs):
+                # Built-in alignment certifies both projections, including padded
+                # graph rows; dropping either certificate restores the table scan.
+                assert kwargs.get("expert_ids_are_sorted", False)
+                projections.append(kwargs["mul_topk_weights"])
+                return moe_wna16_marlin_gemm(*args, **kwargs)
+
+            with (
+                patch.object(zero_copy_context, "get_moe_output", return_value=output),
+                patch(f"{caller_module}.moe_wna16_marlin_gemm", checked_marlin_gemm),
+            ):
+                for _ in range(3):
+                    run()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = run()
+                for count in (max(rows - 1, 0), rows, 0, min(rows, 2)):
+                    logits.copy_(finite_logits)
+                    logits[count:].fill_(float("nan"))
+                    live.fill_(count)
+                    actual.fill_(float("nan"))
+                    graph.replay()
+                    expected = reference.clone()
+                    expected[count:].zero_()
+                    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.02)
+                    assert torch.isfinite(actual).all()
+                    assert torch.count_nonzero(actual[count:]) == 0
+                    if hook_weights:
+                        weights, ids = hook_weights
+                        assert torch.isnan(weights[ids < 0]).all()
+            assert projections == [False, True] * 4
+
+
+@pytest.mark.parametrize("has_inactive_prefix_count", [False, True])
+def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
+    """Inactive-output policy honors sorted/EP routing and ignores unused tails."""
+    torch.manual_seed(57)
+    m, e, k, n, topk, block_m = 1, 8, 256, 256, 3, 8
+    w_ref, qweight, scales, zeros, g_idx, permutation = _marlin_inactive_weights(
+        e, n, k, scalar_types.uint4b8
+    )
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    routing_weights = torch.ones((m, topk), device="cuda", dtype=torch.float32)
+    workspace = torch.zeros(
+        torch.cuda.get_device_properties(x.device).multi_processor_count * 4,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    original_empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_floating_point():
+            tensor.fill_(float("nan"))
+        return tensor
+
+    cases = (
+        ("inactive-default", (-1, -1, -1), False, False, False),
+        ("inactive-sorted", (-1, -1, -1), True, False, False),
+        ("empty-sorted", (-1, -1, -1), True, False, False),
+        ("mixed-default", (-1, 0, 1), False, False, False),
+        ("mixed-sorted", (0, -1, 1), True, False, False),
+        ("mixed-scattered", (-1, 0, 1), False, True, False),
+        ("inactive-ep", (-1, -1, -1), False, False, True),
+        ("mixed-ep", (-1, 0, 1), False, True, True),
+        ("valid-default", (0, 1, 2), False, False, False),
+        ("valid-sorted", (0, 1, 2), True, False, False),
+    )
+    for case, route_ids, sorted_proof, scatter, is_ep in cases:
+        if has_inactive_prefix_count and not sorted_proof:
+            continue
+        ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
+        sorted_ids, expert_ids, num_post = moe_align_block_size(
+            ids,
+            block_m,
+            e,
+            return_inactive_prefix_count=has_inactive_prefix_count,
+        )
+        if scatter:
+            # Keep the matching token blocks, but move the inactive block to
+            # the middle so a first-ID shortcut without proof would be unsafe.
+            order = torch.tensor([1, 0, 2], device="cuda")
+            sorted_ids = sorted_ids.view(topk, block_m)[order].reshape(-1)
+            expert_ids = expert_ids[order]
+        elif case == "empty-sorted":
+            sorted_ids, expert_ids = sorted_ids[:0], expert_ids[:0]
+            num_post.zero_()
+        if case != "empty-sorted":
+            used_blocks = 1 if max(route_ids) < 0 else topk
+            if not scatter and route_ids[0] < 0:
+                # An empty inactive block guards against skipping only one;
+                # real routes stay unique, as the alignment producer guarantees.
+                empty_block = torch.full_like(sorted_ids[:block_m], topk)
+                sorted_ids = torch.cat(
+                    (empty_block, sorted_ids[: used_blocks * block_m])
+                )
+                expert_ids = torch.cat((expert_ids[:1], expert_ids[:used_blocks]))
+                num_post[0].add_(block_m)
+                if has_inactive_prefix_count:
+                    num_post[1].add_(1)
+                used_blocks += 1
+            # Only the published prefix is ordered. A binary search or scan
+            # over allocated capacity would miscount these extra negative IDs.
+            dirty_ids = torch.tensor(
+                [0, -1, e - 1, -1], device="cuda", dtype=torch.int32
+            )
+            expert_ids = torch.cat((expert_ids[:used_blocks], dirty_ids))
+            sorted_ids = torch.cat(
+                (
+                    sorted_ids[: used_blocks * block_m],
+                    torch.full((4 * block_m,), topk, device="cuda", dtype=torch.int32),
+                )
+            )
+
+        if not has_inactive_prefix_count and case == "valid-sorted":
+            # An allocated second word is not a producer certificate. The
+            # legacy path must ignore it and discover its own prefix.
+            num_post = torch.cat((num_post, torch.full_like(num_post, 0x3FFFFFFF)))
+
+        def gemm(*args, **kwargs):
+            kwargs["is_ep"] = is_ep
+            if has_inactive_prefix_count:
+                kwargs["has_inactive_prefix_count"] = True
+            if sorted_proof:
+                kwargs["expert_ids_are_sorted"] = True
+            return moe_wna16_marlin_gemm(*args, **kwargs)
+
+        # Omit the policy on default calls to guard caller-owned inactive rows.
+        for zero_inactive_output in (False, True):
+            project = (
+                partial(gemm, zero_inactive_output=True)
+                if zero_inactive_output
+                else gemm
+            )
+            caller_output = torch.full((m * topk, n), 3.0, device="cuda", dtype=x.dtype)
+            for output in (None, caller_output):
+                with patch.object(torch, "empty", side_effect=poisoned_empty):
+                    result = _run_single_gemm(
+                        project,
+                        x,
+                        output,
+                        qweight,
+                        scales,
+                        zeros,
+                        g_idx,
+                        permutation,
+                        workspace,
+                        sorted_ids,
+                        expert_ids,
+                        num_post,
+                        routing_weights,
+                        scalar_types.uint4b8,
+                        block_m,
+                        topk,
+                        m,
+                        n,
+                        k,
+                        False,
+                        True,
+                        True,
+                    )
+                expected = (
+                    torch.zeros_like(result)
+                    if output is None
+                    else torch.full_like(result, 3.0)
+                )
+                if zero_inactive_output and case != "empty-sorted":
+                    expected[ids.reshape(-1) < 0] = 0
+                for slot, expert in enumerate(route_ids):
+                    if expert >= 0:
+                        expected[slot] = (x[0].float() @ w_ref[expert].float().T).to(
+                            expected.dtype
+                        )
+                torch.testing.assert_close(result, expected, rtol=0.03, atol=0.02)
+                inactive = ids.reshape(-1) < 0
+                torch.testing.assert_close(
+                    result[inactive], expected[inactive], rtol=0, atol=0
+                )
+
+
+def test_marlin_lora_direct_inactive_routes():
+    """Direct LoRA projections overwrite inactive routes with finite zeros."""
+    from sglang.srt.lora.marlin_lora_temp.direct_decode import (
+        direct_decode_down_shrink,
+        direct_decode_gate_expand,
+    )
+
+    torch.manual_seed(51)
+    rows, topk, experts, intermediate, rank = 3, 6, 8, 384, 32
+    ids = torch.tensor(
+        [[0, 1, 2, 3, 4, 5], [-1, -1, -1, -1, -1, -1], [2, -1, 4, 5, -1, 7]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    slots = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    shared = torch.randn((rows, 2 * rank), device="cuda", dtype=torch.bfloat16)
+    gate_b = (
+        torch.randn(
+            (1, experts, 2 * intermediate, rank), device="cuda", dtype=torch.bfloat16
+        )
+        * 0.05
+    )
+    down_a = (
+        torch.randn(
+            (1, experts, rank, intermediate), device="cuda", dtype=torch.bfloat16
+        )
+        * 0.05
+    )
+    activation = torch.randn(
+        (rows * topk, intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    activation.view(rows, topk, intermediate)[ids < 0] = float("nan")
+    gate_output = torch.full(
+        (rows, topk, 2 * intermediate),
+        float("nan"),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    down_output = torch.full(
+        (rows, topk, rank), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    direct_decode_gate_expand(shared, gate_b, ids, slots, gate_output)
+    direct_decode_down_shrink(activation, down_a, ids, slots, down_output)
+    expected_gate = torch.zeros_like(gate_output)
+    expected_down = torch.zeros_like(down_output)
+    for token in range(rows):
+        for route in range(topk):
+            expert = int(ids[token, route])
+            if expert < 0:
+                continue
+            for half in range(2):
+                start = half * intermediate
+                expected_gate[token, route, start : start + intermediate] = (
+                    gate_b[0, expert, start : start + intermediate].float()
+                    @ shared[token, half * rank : (half + 1) * rank].float()
+                ).to(gate_output.dtype)
+            expected_down[token, route] = (
+                down_a[0, expert].float() @ activation[token * topk + route].float()
+            ).to(down_output.dtype)
+    torch.testing.assert_close(gate_output, expected_gate, rtol=0.03, atol=0.01)
+    torch.testing.assert_close(down_output, expected_down, rtol=0.03, atol=0.01)
+    assert torch.count_nonzero(gate_output[ids < 0]) == 0
+    assert torch.count_nonzero(down_output[ids < 0]) == 0
+
+    # A dense oracle for both real adapter slots keeps the selected projection
+    # independent of the kernels' inactive-address and payload masks.
+    finite_shared = torch.stack((shared, shared * 2))
+    finite_gate_b = torch.cat((gate_b, gate_b * 1.5))
+    finite_down_a = torch.cat((down_a, down_a * -0.75))
+    finite_activation = torch.randn_like(activation)
+    dense_gate = (
+        torch.einsum(
+            "smhr,sehir->smehi",
+            finite_shared.view(2, rows, 2, rank).float(),
+            finite_gate_b.view(2, experts, 2, intermediate, rank).float(),
+        )
+        .flatten(-2)
+        .to(gate_output.dtype)
+    )
+    dense_down = torch.einsum(
+        "mti,seri->smter",
+        finite_activation.view(rows, topk, intermediate).float(),
+        finite_down_a.float(),
+    ).to(down_output.dtype)
+    slot_shared = finite_shared.clone()
+    slot_gate_b = finite_gate_b.clone()
+    slot_down_a = finite_down_a.clone()
+    route_ids = torch.arange(topk, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    route_index = torch.arange(topk, device="cuda")
+    states = (
+        ("valid", (0, 1, 0), (1, 1)),
+        ("disabled", (0, 1, 0), (1, 0)),
+        ("missing-or-out-of-range", (0, -1, 2), (1, 1)),
+        ("zero", (0, 1, 0), (1, 1)),
+        ("recovery", (0, 1, 0), (1, 1)),
+    )
+    for enabled_dtype in (torch.bool, torch.int32, torch.int64):
+        # The optional metadata accepts a strided one-dimensional view.
+        enabled = torch.ones(4, device="cuda", dtype=enabled_dtype)[::2]
+
+        def project_enabled():
+            direct_decode_gate_expand(
+                slot_shared,
+                slot_gate_b,
+                ids,
+                slots,
+                gate_output,
+                adapter_enabled=enabled,
+            )
+            direct_decode_down_shrink(
+                activation,
+                slot_down_a,
+                ids,
+                slots,
+                down_output,
+                adapter_enabled=enabled,
+            )
+
+        ids.copy_(route_ids)
+        slots.copy_(torch.tensor(states[0][1], device="cuda", dtype=slots.dtype))
+        activation.copy_(finite_activation)
+        project_enabled()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            project_enabled()
+        for state, mapping, flags in states:
+            ids.copy_(route_ids)
+            slots.copy_(torch.tensor(mapping, device="cuda", dtype=slots.dtype))
+            enabled.copy_(torch.tensor(flags, device="cuda", dtype=enabled_dtype))
+            slot_shared.copy_(finite_shared)
+            slot_gate_b.copy_(finite_gate_b)
+            slot_down_a.copy_(finite_down_a)
+            activation.copy_(finite_activation)
+            if state == "disabled":
+                slot_shared[1].fill_(float("nan"))
+                slot_gate_b[1].fill_(float("nan"))
+                slot_down_a[1].fill_(float("nan"))
+                activation.view(rows, topk, intermediate)[1].fill_(float("nan"))
+            elif state == "missing-or-out-of-range":
+                slot_shared[:, 1:].fill_(float("nan"))
+                activation.view(rows, topk, intermediate)[1:].fill_(float("nan"))
+            elif state == "zero":
+                ids.fill_(-1)
+                slot_shared.fill_(float("nan"))
+                slot_gate_b.fill_(float("nan"))
+                slot_down_a.fill_(float("nan"))
+                activation.fill_(float("nan"))
+            gate_output.fill_(float("nan"))
+            down_output.fill_(float("nan"))
+            graph.replay()
+            expected_gate.zero_()
+            expected_down.zero_()
+            active_rows = []
+            if state != "zero":
+                for token, slot in enumerate(mapping):
+                    if 0 <= slot < len(flags) and flags[slot]:
+                        active_rows.append(token)
+                        expected_gate[token] = dense_gate[slot, token, route_index]
+                        expected_down[token] = dense_down[
+                            slot, token, route_index, route_index
+                        ]
+            torch.testing.assert_close(gate_output, expected_gate, rtol=0.03, atol=0.01)
+            torch.testing.assert_close(down_output, expected_down, rtol=0.03, atol=0.01)
+            assert torch.isfinite(gate_output).all()
+            assert torch.isfinite(down_output).all()
+            inactive_rows = [token for token in range(rows) if token not in active_rows]
+            assert torch.count_nonzero(gate_output[inactive_rows]) == 0
+            assert torch.count_nonzero(down_output[inactive_rows]) == 0
+            if active_rows:
+                # Slot zero is a loaded adapter and must remain a real projection.
+                assert 0 in active_rows
+                assert torch.count_nonzero(expected_gate[0]) > 0
+                assert torch.count_nonzero(expected_down[0]) > 0
+
+
+@pytest.mark.parametrize("use_expert_map", [False, True])
+@pytest.mark.parametrize("weight_first", [False, True])
+@pytest.mark.parametrize("fused_norm", [False, True])
+@pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
+def test_muse_marlin_inactive_routes(
+    fused_norm, hidden, intermediate, weight_first, use_expert_map
+):
+    """Muse finalization excludes undefined inactive projection rows and weights."""
+    from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
+    from sglang.srt.layers.muse_spark.muse_spark_layers import (
+        MuseSpark1xRMSNorm,
+        MuseSpark1xRMSNormWithInputScale,
+    )
+
+    torch.manual_seed(67)
+    rows, local_experts, topk = 4, 2, 2
+    dtype = torch.bfloat16
+    layer = MuseSpark1xFp4Experts.__new__(MuseSpark1xFp4Experts)
+    torch.nn.Module.__init__(layer)
+    layer.quant_config = SimpleNamespace(group_size=16)
+    layer.moe_runner_config = SimpleNamespace(is_gated=True)
+    layer.params_dtype = dtype
+    layer.intermediate_size_per_partition = intermediate
+    layer.num_local_experts = local_experts
+    layer.global_num_experts = 4 if use_expert_map else local_experts
+    layer._expert_map = (
+        torch.tensor([-1, -1, 0, 1], device="cuda", dtype=torch.int32)
+        if use_expert_map
+        else None
+    )
+    references = []
+    for prefix, n, k in (
+        ("w13", 2 * intermediate, hidden),
+        ("w2", hidden, intermediate),
+    ):
+        packed, scales, global_scales, refs = zip(
+            *[make_nvfp4_weight_and_ref(n, k, dtype) for _ in range(local_experts)]
+        )
+        for suffix, tensors in (
+            ("weight", packed),
+            ("weight_scale", scales),
+            ("weight_scale_2", global_scales),
+        ):
+            setattr(
+                layer,
+                f"{prefix}_{suffix}",
+                torch.nn.Parameter(torch.stack(tensors), requires_grad=False),
+            )
+        references.append(torch.stack(refs))
+    prepare_moe_nvfp4_layer_for_marlin(layer)
+    x = torch.randn((rows, hidden), device="cuda", dtype=dtype) / 20
+    ids = torch.tensor(
+        [[2, 3], [3, -1], [0, 2], [-1, -1]], device="cuda", dtype=torch.int32
+    )
+    local_ids = torch.tensor(
+        [[0, 1], [1, -1], [-1, 0], [-1, -1]], device="cuda", dtype=torch.int32
+    )
+    if not use_expert_map:
+        ids = local_ids.clone()
+    weights = torch.tensor(
+        [[0.25, 0.75], [0.5, 0.5], [0.25, 0.75], [0.5, 0.5]], device="cuda"
+    )
+    weights[local_ids < 0] = float("nan")
+    weights[-1, 0] = float("inf")
+    input_weights = weights.clone()
+    norm_class = (
+        MuseSpark1xRMSNormWithInputScale if weight_first else MuseSpark1xRMSNorm
+    )
+    norm = norm_class(hidden, eps=1e-6).to(device="cuda", dtype=dtype)
+    norm.weight.data.copy_(torch.linspace(0.5, 1.5, hidden, device="cuda", dtype=dtype))
+    layer._post_expert_norm = norm
+    layer._post_expert_norm_weight = norm.weight.detach() if fused_norm else None
+    layer._post_expert_norm_eps = norm.eps
+    layer._post_expert_norm_weight_first = weight_first
+
+    projection_buffers = []
+
+    def record_projection_buffer(a, c, *args, **kwargs):
+        assert kwargs["is_ep"] is use_expert_map
+        assert kwargs["has_inactive_prefix_count"] is (not use_expert_map)
+        count = args[10]
+        assert count.shape == ((1,) if use_expert_map else (2,))
+        assert count.dtype == torch.int32 and count.is_contiguous()
+        if not use_expert_map:
+            assert count.data_ptr() % 8 == 0
+        projection_buffers.append(c)
+        c.fill_(float("nan"))
+        c[local_ids.reshape(-1) < 0, 0] = float("inf")
+        return moe_wna16_marlin_gemm(a, c, *args, **kwargs)
+
+    with patch(
+        "sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm",
+        side_effect=record_projection_buffer,
+    ):
+        expert_output, mapped = layer._marlin_expert_outputs(x, weights, ids)
+        actual = layer._forward_marlin(x, weights, ids, norm)
+    for gate_up_buffer, down_buffer in zip(
+        projection_buffers[::2], projection_buffers[1::2]
+    ):
+        assert gate_up_buffer.data_ptr() == down_buffer.data_ptr()
+        assert down_buffer.untyped_storage().nbytes() == (
+            rows * topk * max(2 * intermediate, hidden) * x.element_size()
+        )
+    torch.testing.assert_close(mapped, local_ids, rtol=0, atol=0)
+    expected_experts = torch.zeros((rows, topk, hidden), device="cuda", dtype=dtype)
+    w13_ref, w2_ref = references
+    for row in range(rows):
+        for route in range(topk):
+            expert = int(local_ids[row, route])
+            if expert < 0:
+                continue
+            gate_up = x[row] @ w13_ref[expert].T
+            gate, up = gate_up.chunk(2)
+            activated = torch.nn.functional.silu(gate) * up
+            expected_experts[row, route] = activated @ w2_ref[expert].T
+    torch.testing.assert_close(
+        expert_output[local_ids >= 0],
+        expected_experts[local_ids >= 0],
+        rtol=0.05,
+        atol=0.25,
+    )
+    safe_weights = weights.masked_fill(local_ids < 0, 0.0)
+    expected = (
+        (norm(expected_experts).float() * safe_weights[..., None]).sum(1).to(dtype)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.25)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[-1]) == 0
+    torch.testing.assert_close(weights, input_weights, rtol=0, atol=0, equal_nan=True)
 
 
 if __name__ == "__main__":

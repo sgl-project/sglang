@@ -13,6 +13,7 @@ use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
 use crate::message::request::{MmData, Request, RequestKind};
 use crate::message::types::TokenIds;
+use crate::tokenizer_manager::to_scheduler::{Limits, fit_input};
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::error::Error;
 use crate::utils::fsm::Event;
@@ -59,14 +60,71 @@ pub struct MmProcessOutput {
     pub result: MmEncodedEntry,
 }
 
+/// The request a multimodal result belongs to (see [`MmProcessor::processed`]).
+#[derive(Clone, Copy, Debug)]
+pub struct MmRequestInfo<'a> {
+    /// The rid the client sent (or the minted one), not the scheduler's
+    /// uniquified rid.
+    pub rid: &'a str,
+    pub bootstrap_room: Option<i64>,
+}
+
+/// Client/server class of a media preparation failure, mirroring Python's
+/// loader contract: `ValueError` is a 400, any other exception a 500.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MediaError {
+    /// Bad input from the client (400).
+    #[error("{0}")]
+    Client(String),
+    /// A fault on the server side, e.g. a media backend that is down (500).
+    #[error("{0}")]
+    Server(String),
+}
+
 /// Multimodal processor shared by built-in and external implementations.
 /// Implementations run on the fixed Rust worker pool and must not retain
 /// request-scoped Python objects. `input_ids` arrive tokenized (the FSM runs
 /// `Tokenizing` before `Encoding` for a text prompt), so a processor never
 /// tokenizes: it expands placeholders in ids. `mm` is the request's media,
 /// owned.
+///
+/// The media hooks run earlier, during admission on the API runtime, before
+/// any media is fetched or the request reaches the worker pool.
 pub trait MmProcessor: Send + Sync {
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String>;
+
+    /// Reject a request's media before any of it is fetched, e.g. a modality
+    /// the served model cannot encode. `Err` is a client error (400). Runs on
+    /// an async worker, so it must not block.
+    fn check_media(&self, _mm: &MmData) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Fetch one I/O-backed source, charging its bytes to `budget`; runs on
+    /// the API runtime's blocking pool. `Ok(None)` leaves the source to the
+    /// built-in fetcher (`http(s)://`, `file://` and absolute paths), which
+    /// rejects every other URI scheme.
+    fn fetch_media(
+        &self,
+        _source: &str,
+        _modality: MmModality,
+        _budget: &crate::MediaByteBudget,
+    ) -> Result<Option<bytes::Bytes>, MediaError> {
+        Ok(None)
+    }
+
+    /// Finish item layout after caller hash overrides, before feature publication.
+    fn finalize(&self, _entry: &mut MmEncodedEntry) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Observe a request's final result, as the scheduler will receive it
+    /// (with the caller's `mm_hashes` applied, finalized, validated, and its
+    /// ids fitted to the context), on the worker before the request is queued
+    /// for the scheduler. Lets an implementation hand the result on without
+    /// waiting for the scheduler to drain the request. The default does
+    /// nothing.
+    fn processed(&self, _request: MmRequestInfo<'_>, _output: &MmProcessOutput) {}
 }
 
 struct QwenMmProcessor {
@@ -158,6 +216,9 @@ pub struct MmContext {
     /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
+    /// The intake limits, which fit the expanded ids to the context before
+    /// [`MmProcessor::processed`] sees them (`None`: left as processed).
+    pub limits: Option<Limits>,
 }
 
 impl MmContext {
@@ -166,6 +227,7 @@ impl MmContext {
         Ok(Self {
             processor: Arc::new(QwenMmProcessor::new(spec)?),
             feature_shm,
+            limits: None,
         })
     }
 
@@ -173,6 +235,14 @@ impl MmContext {
         Self {
             processor,
             feature_shm,
+            limits: None,
+        }
+    }
+
+    pub fn with_limits(self, limits: Limits) -> Self {
+        Self {
+            limits: Some(limits),
+            ..self
         }
     }
 }
@@ -255,6 +325,7 @@ fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>,
 /// the buffers to ride the ring; `Err` rejects the request back to the client.
 fn process(
     ctx: &MmContext,
+    request: MmRequestInfo<'_>,
     input_ids: TokenIds,
     mut mm: MmData,
 ) -> Result<(TokenIds, Vec<Buffer>), String> {
@@ -265,6 +336,18 @@ fn process(
         output.result.items.iter_mut().map(|item| &mut item.hash),
         &caller_hashes,
     );
+    ctx.processor.finalize(&mut output.result)?;
+    output.result.validate(output.input_ids.len())?;
+    // Intake fits the ids to the context (`check_total_tokens`) before the
+    // scheduler sees them; fit them first, so `processed` sees the same ids. A
+    // prompt intake will reject is not observed.
+    let fits = ctx
+        .limits
+        .as_ref()
+        .is_none_or(|limits| fit_input(&mut output.input_ids, limits).is_ok());
+    if fits {
+        ctx.processor.processed(request, &output);
+    }
     let buffers = make_buffers(output.result, ctx.feature_shm)?;
     Ok((output.input_ids, buffers))
 }
@@ -278,6 +361,8 @@ pub struct MmWiring {
     pub mm_rx: flume::Receiver<Request>,
     /// Back-channel for the workers' `Encoded` into the to-scheduler loop.
     pub tm_tx: flume::Sender<TmEvent>,
+    /// Intake's limits, for the pool's [`MmContext::with_limits`].
+    pub limits: Limits,
 }
 
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
@@ -318,7 +403,11 @@ impl Runnable for MmWorker {
                 // stays for the scheduler header; nothing reads `mm` after this.
                 let input_ids = g.input_ids.take().unwrap_or_default();
                 let mm = g.mm.take().map(|m| *m).unwrap_or_default();
-                match process(&self.ctx, input_ids, mm) {
+                let request = MmRequestInfo {
+                    rid: req.rid.client_facing(),
+                    bootstrap_room: g.bootstrap_room,
+                };
+                match process(&self.ctx, request, input_ids, mm) {
                     Ok((input_ids, buffers)) => {
                         tracing::debug!(rid = %req.rid, tokens = input_ids.len(), "mm: processed");
                         g.input_ids = Some(input_ids);
@@ -685,6 +774,11 @@ mod tests {
         );
     }
 
+    const NO_REQUEST: MmRequestInfo<'static> = MmRequestInfo {
+        rid: "r",
+        bootstrap_room: None,
+    };
+
     /// An external processor's result rides the same buffers: its tensor's
     /// dtype and shape are kept, the caller hash override applies, and the
     /// sidecar carries its scalar metadata.
@@ -701,7 +795,7 @@ mod tests {
             mm_hashes: vec!["2a".to_owned()],
             ..Default::default()
         };
-        let (input_ids, buffers) = process(&ctx, vec![1, 2], mm).unwrap();
+        let (input_ids, buffers) = process(&ctx, NO_REQUEST, vec![1, 2], mm).unwrap();
         assert_eq!(input_ids, [1, 2]);
         assert_eq!(find(&buffers, "mm.feature.0").unwrap().shape, [1]);
         assert!(find(&buffers, "mm.mrope").is_none());
@@ -709,6 +803,79 @@ mod tests {
         let text = format!("{meta}");
         assert!(text.contains("42"), "caller hash 0x2a applied: {text}");
         assert!(text.contains("clip_index"), "{text}");
+    }
+
+    /// Finalization sees the caller's hashes and is validated; `processed`
+    /// observes only a valid finalized result.
+    #[test]
+    fn finalization_runs_after_caller_hashes_and_is_validated() {
+        struct FinalizingProcessor {
+            final_end: u32,
+            processed: std::sync::Mutex<Vec<Vec<u64>>>,
+        }
+
+        impl MmProcessor for FinalizingProcessor {
+            fn process(&self, ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+                ExternalProcessor {
+                    shape: vec![1],
+                    offsets: vec![(0, 0)],
+                }
+                .process(ids, mm)
+            }
+
+            fn finalize(&self, entry: &mut MmEncodedEntry) -> Result<(), String> {
+                let parent_hash = entry.items[0].hash;
+                assert_eq!(parent_hash, 42);
+                entry.items[0].hash = parent_hash + 1;
+                entry.items.push(MmEncodedItem {
+                    modality: MmModality::Image,
+                    feature: Tensor {
+                        shape: vec![1],
+                        data: TensorData::F32(vec![2.0]),
+                    },
+                    hash: parent_hash + 2,
+                    offsets: vec![(1, self.final_end)],
+                    model_specific_data: BTreeMap::new(),
+                });
+                Ok(())
+            }
+
+            fn processed(&self, _request: MmRequestInfo<'_>, output: &MmProcessOutput) {
+                let hashes = output.result.items.iter().map(|item| item.hash).collect();
+                self.processed.lock().unwrap().push(hashes);
+            }
+        }
+
+        for final_end in [1, 2] {
+            let processor = Arc::new(FinalizingProcessor {
+                final_end,
+                processed: Default::default(),
+            });
+            let ctx = MmContext::with_processor(processor.clone(), false);
+            let result = process(
+                &ctx,
+                NO_REQUEST,
+                vec![1, 2],
+                MmData {
+                    mm_hashes: vec!["2a".to_owned()],
+                    ..Default::default()
+                },
+            );
+            let processed = processor.processed.lock().unwrap().clone();
+            if final_end == 2 {
+                assert!(result.is_err(), "finalized spans must be validated");
+                assert!(processed.is_empty(), "an invalid result is not observed");
+                continue;
+            }
+            assert_eq!(processed, [vec![43, 44]]);
+            let (ids, buffers) = result.expect("valid finalized items");
+            assert_eq!(ids, [1, 2]);
+            assert!(find(&buffers, "mm.feature.1").is_some());
+            let meta: serde_json::Value = rmpv::ext::from_value(decoded_meta(&buffers)).unwrap();
+            assert_eq!(meta["items"].as_array().unwrap().len(), 2);
+            assert_eq!(meta["items"][0]["hash"].as_u64(), Some(43));
+            assert_eq!(meta["items"][1]["hash"].as_u64(), Some(44));
+        }
     }
 
     /// Malformed results are rejected before any buffer exists, so nothing
@@ -723,7 +890,7 @@ mod tests {
         ] {
             let ctx =
                 MmContext::with_processor(Arc::new(ExternalProcessor { shape, offsets }), false);
-            assert!(process(&ctx, vec![1, 2], MmData::default()).is_err());
+            assert!(process(&ctx, NO_REQUEST, vec![1, 2], MmData::default()).is_err());
         }
     }
 
@@ -807,6 +974,96 @@ mod tests {
             "{:?}",
             req.state
         );
+    }
+
+    /// `processed` sees the result the scheduler gets -- the caller's hash
+    /// applied -- under the client's rid and the request's bootstrap room.
+    #[test]
+    fn processed_observes_the_final_result_with_request_identity() {
+        use std::sync::Mutex;
+
+        /// What `processed` saw, as `rid room ids hashes`.
+        #[derive(Default)]
+        struct Observing(Mutex<Vec<String>>);
+        impl MmProcessor for Observing {
+            fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+                ExternalProcessor {
+                    shape: vec![1],
+                    offsets: vec![(1, 1)],
+                }
+                .process(input_ids, mm)
+            }
+            fn processed(&self, request: MmRequestInfo<'_>, output: &MmProcessOutput) {
+                let hashes: Vec<u64> = output.result.items.iter().map(|item| item.hash).collect();
+                self.0.lock().unwrap().push(format!(
+                    "{} {:?} {:?} {hashes:?}",
+                    request.rid, request.bootstrap_room, output.input_ids
+                ));
+            }
+        }
+
+        let processor = Arc::new(Observing::default());
+        let ctx = Arc::new(MmContext::with_processor(processor.clone(), false));
+        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+        let (tm_tx, _tm_rx) = flume::unbounded::<TmEvent>();
+        let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
+        let mut req = encoding_req("unused", vec![1, 2]);
+        req.rid = crate::message::ids::Rid::from_client("client");
+        let RequestKind::Generate(g) = &mut req.kind else {
+            panic!("generate")
+        };
+        g.bootstrap_room = Some(9);
+        g.mm = Some(Box::new(MmData {
+            mm_hashes: vec!["2a".to_owned()],
+            ..Default::default()
+        }));
+        mm_tx.send(req).unwrap();
+        drop(mm_tx);
+        worker.join().unwrap();
+        assert_eq!(*processor.0.lock().unwrap(), ["client Some(9) [1, 2] [42]"]);
+    }
+
+    /// `processed` sees the ids intake forwards, fitted to the context as
+    /// `check_total_tokens` fits them: a 12-token prompt on an 8-token context
+    /// is truncated under `allow_auto_truncate` (a prefill with a smaller
+    /// context than its decode publishes its own 8 ids), and not observed when
+    /// intake will reject it.
+    #[test]
+    fn processed_sees_the_ids_fitted_to_the_context() {
+        use std::sync::Mutex;
+
+        struct Observing(Mutex<Vec<TokenIds>>);
+        impl MmProcessor for Observing {
+            fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+                ExternalProcessor {
+                    shape: vec![1],
+                    offsets: vec![(6, 9)],
+                }
+                .process(input_ids, mm)
+            }
+            fn processed(&self, _request: MmRequestInfo<'_>, output: &MmProcessOutput) {
+                self.0.lock().unwrap().push(output.input_ids.clone());
+            }
+        }
+
+        for (allow_auto_truncate, forwarded, observed) in [(true, 8, 1), (false, 12, 0)] {
+            let processor = Arc::new(Observing(Mutex::new(Vec::new())));
+            let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
+                skip_tokenizer_init: false,
+                vocab_size: 1000,
+                context_len: 8,
+                num_reserved_tokens: 0,
+                allow_auto_truncate,
+                enable_return_hidden_states: false,
+                default_priority: None,
+            });
+            let (input_ids, _) =
+                process(&ctx, NO_REQUEST, (0..12).collect(), MmData::default()).unwrap();
+            assert_eq!(input_ids, (0..forwarded).collect::<TokenIds>());
+            let seen = processor.0.lock().unwrap();
+            assert_eq!(seen.len(), observed);
+            assert!(seen.iter().all(|ids| *ids == input_ids));
+        }
     }
 
     /// A kind the pool cannot serve is returned `Failed`, never dropped:

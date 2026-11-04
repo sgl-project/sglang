@@ -178,7 +178,7 @@ def minimax_sparse_prefill(
         # the scratch gather reads pool slots without the HiSparse remap
         and loc_mapping is None
     ):
-        from .gluon_prefill import (
+        from sglang.kernels.ops.attention.minimax_sparse.prefill.gluon_prefill import (
             GluonPrefillUnavailableError,
             can_use_gluon_prefill,
             gluon_sparse_prefill,

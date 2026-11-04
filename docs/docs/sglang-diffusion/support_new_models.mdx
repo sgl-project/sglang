@@ -537,6 +537,15 @@ requires:
 
 See `wanvideo.py` and `qwen_image.py` for DiT TP/SP, `gemma_3.py` for encoder TP
 and offload, and `autoencoder_kl_qwenimage.py` or `ltx_2_vae.py` for VAE decode.
+
+For a projection over independently sharded inputs, such as concatenated
+attention and MLP outputs, use
+`RowParallelLinear(attn_dim + mlp_dim, out_dim, input_sizes=[attn_dim, mlp_dim])`.
+Pass each segment's **full, pre-TP width**. Each width must be divisible by TP,
+and the input must already contain the rank-local segments. The shared loader
+selects the matching checkpoint columns; do not replace parameter loaders in
+the model. Keep `input_sizes=None` for an ordinary contiguous input shard.
+
 The Diffusers backend is compatibility-first and does not need to meet this
 native integration contract.
 

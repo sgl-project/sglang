@@ -61,6 +61,8 @@ class KVArgs:
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
+    # KV byte layout both PD roles must share; None for pools with only one.
+    kv_layout: Optional[str] = None
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None

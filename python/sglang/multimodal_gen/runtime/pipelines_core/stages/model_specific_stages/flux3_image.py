@@ -498,6 +498,10 @@ def _cfg_scale(batch: Req, package_config) -> float | None:
 
 
 class Flux3ImageTextEncodeStage(PipelineStage):
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.PROMPT_ENCODER
+
     def __init__(self, text_encoder, package_config) -> None:
         super().__init__()
         self.text_encoder = text_encoder
@@ -551,11 +555,19 @@ class Flux3ImageTextEncodeStage(PipelineStage):
                 encoded = self.text_encoder.encode_batch(prompts)
         branches = 1 if self.package_config.dit.flow_map else 2
         for index, batch in enumerate(batches):
-            batch.flux3_text = encoded[index * branches : (index + 1) * branches]
+            batch.extra["flux3_text"] = encoded[
+                index * branches : (index + 1) * branches
+            ]
+            if not batch.image_path:
+                batch.extra.update(flux3_condition=None, flux3_crop=None)
         return batches
 
 
 class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.IMAGE_ENCODER
+
     def __init__(self, vae, package_config) -> None:
         super().__init__()
         self.vae = vae
@@ -580,14 +592,14 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
         pipeline_config = server_args.pipeline_config
         mode = _mode(batch, pipeline_config)
         # The padding of a single reference that the decoded image drops.
-        batch.flux3_crop = None
+        batch.extra["flux3_crop"] = None
         if mode == "t2i":
-            batch.flux3_condition = None
+            batch.extra["flux3_condition"] = None
             return batch
         references, reference_size, crop = load_references(_image_paths(batch))
         # As in the reference, an unset side takes the first reference's.
         explicit = batch.sampling_params._explicit_fields
-        width, height, batch.flux3_crop = output_size(
+        width, height, crop = output_size(
             batch.width if "width" in explicit else None,
             batch.height if "height" in explicit else None,
             reference_size,
@@ -595,6 +607,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
             tuple(self.package_config.sampler.size),
         )
         batch.width, batch.height = width, height
+        batch.extra["flux3_crop"] = crop
         with (
             self.use_declared_component(
                 component_name="vae",
@@ -604,7 +617,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
             use_vae_fast_path(self.vae, batch.quality != "exact"),
         ):
             with torch.inference_mode():
-                batch.flux3_condition = encode_references(
+                batch.extra["flux3_condition"] = encode_references(
                     self.vae,
                     references,
                     self.package_config.dit.image_rope_scale,
@@ -650,11 +663,11 @@ class Flux3ImageDenoiseStage(DenoisingStage):
         # The CFG pair, or the prompt alone for a flow map.
         samples = 1 if self.package_config.dit.flow_map else 2
         result.add_check(
-            "flux3_text", batch.flux3_text, lambda value: len(value) == samples
+            "flux3_text", batch.extra["flux3_text"], lambda value: len(value) == samples
         )
         result.add_check(
             "flux3_text[0]",
-            batch.flux3_text[0][0],
+            batch.extra["flux3_text"][0][0],
             [V.is_tensor, V.min_dims(2)],
         )
         return result
@@ -752,8 +765,8 @@ class Flux3ImageDenoiseStage(DenoisingStage):
         packed = pack(
             [
                 {
-                    TEXT: req.flux3_text[branch],
-                    "image_cond": req.flux3_condition,
+                    TEXT: req.extra["flux3_text"][branch],
+                    "image_cond": req.extra["flux3_condition"],
                     "image": image,
                 }
                 for branch in range(1 if flow_map else 2)
@@ -835,6 +848,11 @@ class Flux3ImageDenoiseStage(DenoisingStage):
         counts = [sum(image[0].shape[0] for image, _ in group) for group in images]
         for req, latent, group in zip(batches, latents.split(counts), images):
             req.latents, req.latent_ids = latent, group[0][1]
+            if server_args.disagg_role == RoleType.DENOISER:
+                # The decoder needs latents and crop, not the encoding payload.
+                req.extra.pop("flux3_text", None)
+                req.extra.pop("flux3_condition", None)
+                req.image_path = None
         return batches
 
 
@@ -878,7 +896,7 @@ class Flux3ImageDecodeStage(PipelineStage):
             with torch.inference_mode():
                 image = crop_output(
                     vae_decode(self.vae, batch.latents, batch.latent_ids, batched=True),
-                    batch.flux3_crop,
+                    batch.extra["flux3_crop"],
                 )
         return OutputBatch(output=self._to_display(image), metrics=batch.metrics)
 
@@ -907,7 +925,9 @@ class Flux3ImageDecodeStage(PipelineStage):
                 for (index, req), images in zip(group, decoded_groups):
                     outputs[index] = OutputBatch(
                         output=list(
-                            self._to_display(crop_output(images, req.flux3_crop))
+                            self._to_display(
+                                crop_output(images, req.extra["flux3_crop"])
+                            )
                         ),
                         metrics=req.metrics,
                     )

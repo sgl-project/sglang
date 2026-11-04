@@ -92,21 +92,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 prefill_attention_backend="trtllm_mla",
                 decode_attention_backend="cutedsl_mla",
             )
-        elif decode_backend == "tokenspeed_mla":
-            logger.info(
-                "Kimi-K3 DCP overrides attention backends: "
-                f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
-                "'tokenspeed_mla'."
-            )
-            logger.info(
-                "Kimi-K3 DCP with tokenspeed mla backend overrides KV cache dtype: "
-                f"{cfg.kv_cache_dtype!r} -> 'fp8_e4m3'."
-            )
-            overrides.update(
-                prefill_attention_backend="tokenspeed_mla",
-                decode_attention_backend="tokenspeed_mla",
-                kv_cache_dtype="fp8_e4m3",
-            )
         elif decode_backend == "aiter":
             _require_kimi_k3_aiter_gluon_dcp_support()
             # Override prefill backend to aiter by default
@@ -123,7 +108,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
+                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'aiter', got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
@@ -167,7 +152,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         # that still needs declaring -- else verify stays on the prefill backend,
         # whose host-side plan (flashinfer by default) forces a per-step D2H.
         _, backend = attention_backends_of(cfg)
-    if _dspark_verify_on_decode_backend(backend, q_len, cfg.kv_cache_dtype):
+    if _dspark_verify_on_decode_backend(backend, q_len):
         overrides["speculative_attention_mode"] = "decode"
         logger.info(
             "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
