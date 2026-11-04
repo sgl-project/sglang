@@ -2,6 +2,8 @@
 of a CUDA-graph launch (tokens at or beyond cu[B]); real tokens are still stored.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -107,3 +109,7 @@ def test_extend_prologue_skips_padded_tokens(num_pad):
     )
     assert torch.isfinite(k_buf[real_slots]).all()
     assert torch.isfinite(v_buf[real_slots]).all()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
