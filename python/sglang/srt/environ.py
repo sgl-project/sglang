@@ -1192,7 +1192,7 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
     # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
     # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
     # explicitly for performance after validating workload accuracy.
@@ -1721,11 +1721,12 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
-    # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
-    # it under live traffic isolates where ranks actually diverge. Comma
+    # Which speculative decisions rank 0 broadcasts to its TP group. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
-    SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    # The default syncs only the startup memory probes: ranks compute every per-step
+    # decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
+    SGLANG_SPEC_TP_SYNC = EnvStr("init")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
@@ -2054,9 +2055,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
-    # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
-    # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
-    # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
+    # Fuse inverse RoPE into wo_a activation quantization: CUDA UE8M0 JIT
+    # or ROCm gfx950 aiter inverse_rope_group_quant. Off by default;
+    # requires the corresponding FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.

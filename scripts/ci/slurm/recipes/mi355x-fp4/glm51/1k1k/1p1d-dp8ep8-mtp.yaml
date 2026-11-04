@@ -1,19 +1,12 @@
-# MI355X GLM-5.2 (MXFP4) 2-node 1P1D disaggregation recipe.
+# MI355X GLM-5.1 (MXFP4) 2-node 1P1D disaggregation recipe — DP8 + narrow EP8 + MTP.
 #
-# GLM-5.2 uses GlmMoeDsaForCausalLM (DeepSeek Sparse Attention). sglang
-# auto-selects the DSA attention backend for this architecture, so this recipe
-# leaves `attention_backend` unset (empty) and lets the server pick DSA. MXFP4
-# enables SGLANG_DSV4_FP4_EXPERTS in launch_mi355x.sh (driven by PRECISION),
-# same as the DeepSeek-V4 FP4 path.
-#
-# NOTE: the checkpoint on disk is amd/GLM-5.1-MXFP4 (only GLM MXFP4 build
-# currently mirrored on /it-share). model_path in nightly-configs.yaml points at
-# it; the recipe naming tracks the model line we are wiring CI for.
+# DSA attention is auto-selected (see 1p1d.yaml). DP-attention 8 + within-node
+# EP8 + built-in NextN MTP head (no external draft).
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
 #     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
-#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime` and `bench`.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, and `mtp`.
 
 resources:
   prefill_workers: 1
@@ -23,12 +16,12 @@ backend:
   sglang_config:
     prefill:
       tensor-parallel-size: 8
-      expert-parallel-size: 1
-      data-parallel-size: 1
+      expert-parallel-size: 8
+      data-parallel-size: 8
     decode:
       tensor-parallel-size: 8
-      expert-parallel-size: 1
-      data-parallel-size: 1
+      expert-parallel-size: 8
+      data-parallel-size: 8
 
 # Model-specific docker env + sglang server args (generic launcher path; keeps
 # GLM off the hardcoded DeepSeek-V4 parser branch in launch_mi355x.sh). DSA
@@ -46,7 +39,6 @@ model:
     - --disable-shared-experts-fusion
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260722
   # attention_backend intentionally unset: DSA is auto-selected for
   # GlmMoeDsaForCausalLM.
   # RoCE HCAs MORI uses for cross-node KV transfer.
@@ -62,15 +54,24 @@ runtime:
   chunked_prefill_size: 8192
   swa_full_tokens_ratio: 0.1
 
+# MTP / EAGLE speculative decoding (built-in NextN head from the base model).
+# Applied to both prefill and decode. No draft_model: the NextN head lives
+# in the base checkpoint.
+mtp:
+  enabled: true
+  num_steps: 3
+  eagle_topk: 1
+  num_draft_tokens: 4
+
 bench:
   # bench_serving --max-concurrency sweep; one result JSON per concurrency.
   concurrencies: [1, 8, 16, 32, 64, 128, 256]
   num_prompts_factor: 4      # num-prompts = concurrency * factor
   random_range_ratio: 1.0
 
-  # Correctness gate run through the PD path before the perf sweep
-  # (full GSM8K, 8-shot, accuracy > 0.91). A regression here fails the nightly
-  # even when throughput looks fine ("fast but wrong").
+  # Correctness gate run through the PD path before the perf sweep (full GSM8K,
+  # 8-shot, accuracy > 0.91). A regression here fails the nightly even when
+  # throughput looks fine ("fast but wrong").
   accuracy:
     enabled: true
     num_shots: 8
