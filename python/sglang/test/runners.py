@@ -109,10 +109,12 @@ def _get_sentence_transformer_embedding_model(
     model_path, torch_dtype, matryoshka_dim: Optional[int] = None
 ):
     from sentence_transformers import SentenceTransformer
+    from sentence_transformers import __version__ as sentence_transformers_version
     from sentence_transformers.util import is_sentence_transformer_model
 
     from sglang.srt.hf_transformers import _fix_v5_add_bos_eos_token
 
+    is_sentence_transformers_v6 = int(sentence_transformers_version.split(".")[0]) >= 6
     if is_sentence_transformer_model(model_path):
         model = SentenceTransformer(
             model_path,
@@ -129,7 +131,13 @@ def _get_sentence_transformer_embedding_model(
     else:  # if no pre-trained sentence-transformers model
         from sentence_transformers import models
 
-        word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        # Force causal attention as in the branch above; the kwarg was renamed in v6.
+        config_kwarg_name = (
+            "config_kwargs" if is_sentence_transformers_v6 else "config_args"
+        )
+        word_embedding_model = models.Transformer(
+            model_path, **{config_kwarg_name: {"is_causal": True}}
+        ).to(dtype=torch_dtype)
         # In transformers v5, composite configs (e.g. Qwen2VLConfig) may not
         # expose hidden_size at the top level.  Patch it from the text sub-config
         # so sentence_transformers' get_word_embedding_dimension() works.
@@ -148,6 +156,13 @@ def _get_sentence_transformer_embedding_model(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
         )
 
+    # sentence-transformers v6 renders plain text through the chat template; SGLang embeds raw text.
+    transformer = model[0]
+    if is_sentence_transformers_v6 and "message" in transformer.modality_config:
+        transformer.modality_config.pop("message")
+        transformer.input_formatter.supported_modalities = list(
+            transformer.modality_config
+        )
     return model.to(get_device())
 
 
