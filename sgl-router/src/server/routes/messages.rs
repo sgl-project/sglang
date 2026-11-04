@@ -20,7 +20,9 @@ use crate::protocol::anthropic::{
 use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::routes::chat::{chat_completions, MAX_CHAT_BODY_BYTES};
+use crate::server::routes::chat::{
+    chat_completions, enforce_minimax_m31_thinking, MAX_CHAT_BODY_BYTES,
+};
 use crate::server::routes::tokenize::tokenizer_for;
 
 /// Upstream replies are buffered up to the same cap as requests.
@@ -48,16 +50,21 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let converted = match parse(&body, true) {
+    let mut converted = match parse(&body, true) {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
-    let model = converted.echo.model;
-    if let Err(e) = tokenizer_for(&ctx, &model) {
+    let model = ctx.config.model.served_name(&converted.echo.model);
+    if let Err(e) = tokenizer_for(&ctx, model) {
         return adapt(e.into_response(), None).await;
     }
+    if ctx.tokenizers.is_minimax_m31(model) {
+        if let Err(e) = enforce_minimax_m31_thinking(&mut converted.chat) {
+            return adapt(e.into_response(), None).await;
+        }
+    }
     // No raw-text fallback: a count without template and tool overhead is wrong.
-    match ctx.tokenizers.encode_chat(&model, &converted.chat) {
+    match ctx.tokenizers.encode_chat(model, &converted.chat) {
         Some(ids) => axum::Json(serde_json::json!({"input_tokens": ids.len()})).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,

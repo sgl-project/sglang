@@ -1010,6 +1010,9 @@ class Envs:
     # is a diagnostic switch, not a supported off-ramp -- to actually stop
     # serving FP8, drop --quantization fp8.
     SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
+    # Kill-switch for the gfx115x row-stride pad on unquantized linear and lm_head
+    # weights (see maybe_pad_weight_for_gfx115). Speed only; outputs do not depend on it.
+    SGLANG_DISABLE_GFX115_WEIGHT_PADDING = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -1189,7 +1192,7 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
     # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
     # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
     # explicitly for performance after validating workload accuracy.
@@ -1457,6 +1460,8 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    SGLANG_ENABLE_FP8_BLOCK_GEMV = EnvBool(False)
+    SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT = EnvBool(False)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================
@@ -1555,6 +1560,7 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1717,11 +1723,12 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
-    # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
-    # it under live traffic isolates where ranks actually diverge. Comma
+    # Which speculative decisions rank 0 broadcasts to its TP group. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
-    SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    # The default syncs only the startup memory probes: ranks compute every per-step
+    # decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
+    SGLANG_SPEC_TP_SYNC = EnvStr("init")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
@@ -2050,9 +2057,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
-    # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
-    # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
-    # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
+    # Fuse inverse RoPE into wo_a activation quantization: CUDA UE8M0 JIT
+    # or ROCm gfx950 aiter inverse_rope_group_quant. Off by default;
+    # requires the corresponding FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
