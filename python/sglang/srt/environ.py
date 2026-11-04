@@ -1202,7 +1202,7 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
     # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
     # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
     # explicitly for performance after validating workload accuracy.
@@ -1462,6 +1462,8 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    SGLANG_ENABLE_FP8_BLOCK_GEMV = EnvBool(False)
+    SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT = EnvBool(False)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================
@@ -2059,9 +2061,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
-    # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
-    # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
-    # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
+    # Fuse inverse RoPE into wo_a activation quantization: CUDA UE8M0 JIT
+    # or ROCm gfx950 aiter inverse_rope_group_quant. Off by default;
+    # requires the corresponding FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.

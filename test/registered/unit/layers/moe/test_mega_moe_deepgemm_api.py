@@ -882,13 +882,18 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 tp_rank=0,
             ),
         ):
-            return fused_moe_layer_module.FusedMoE(
+            experts = fused_moe_layer_module.FusedMoE(
                 num_experts=2,
                 hidden_size=4,
                 intermediate_size=8,
                 layer_id=0,
                 quant_method=method,
             )
+
+        experts.w13_weight = torch.nn.Parameter(
+            torch.zeros(0, dtype=torch.uint8), requires_grad=False
+        )
+        return experts
 
     def _get_test_buffer(self, group):
         with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
