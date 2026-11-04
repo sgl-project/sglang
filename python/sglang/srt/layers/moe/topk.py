@@ -2216,7 +2216,11 @@ def biased_grouped_topk_gpu(
             ):
                 from sglang.srt.layers.moe import aiter_presort
 
-                if aiter_presort.enabled(route_logits):
+                # Simulated routing rewrites ids in place after the sort is
+                # registered, and AITER would still run the registered sort.
+                if not routing_simulation_enabled() and aiter_presort.enabled(
+                    route_logits
+                ):
                     return aiter_presort.route_and_register(
                         route_logits,
                         route_bias,

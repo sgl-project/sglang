@@ -280,11 +280,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   __shared__ int s_leader;
 
   if constexpr (kFuseSort) {
-    // Neither the pad values nor the cleared histogram depend on the routing,
-    // so they go out ahead of it. The pad stores then have the whole radix
-    // search to drain in, and the release at the arrival barrier finds little
-    // left to wait on. They stay in wave 0 for the reason given at that
-    // barrier.
+    // Routing-independent, so issued first to drain during the radix search;
+    // pads stay in wave 0, the only wave that releases at the arrival barrier.
     radix4_sort::reset_counts<EXPERTS, BLOCK>(sort_count);
     if (wid == 0)
       radix4_sort::pad_sorted_slice<static_cast<int>(kRadix4Wave)>(
@@ -515,17 +512,9 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   }
 
   if constexpr (kFuseSort) {
-    // The release the arrival counter needs is an L2 write-back and an
-    // invalidate, and a wave pays for the pair whether or not it stored
-    // anything, so every store that has to be ordered against the counter is
-    // kept inside wave 0: the ranking row is there already (tid >= TOPK never
-    // stored) and so is the padding slice. MoE output rows are cleared after
-    // the leader's sort: nothing in this launch reads them, they are disjoint
-    // from every buffer sort_subkernel touches, and putting the zero first
-    // would stall the leader's leading __syncthreads on the slowest store.
-    //
-    // A grid of one has no one to report to and reads back only what it wrote
-    // itself, which its own caches already hold, so it skips the pair outright.
+    // A release costs every wave an L2 write-back + invalidate, so all stores
+    // ordered against the counter (route row, pad slice) live in wave 0 only.
+    // A grid of one reads back only its own writes and skips the handshake.
     const bool alone = gridDim.x == 1;
     if (wid == 0) {
       if (alone) {
@@ -543,9 +532,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
       // The acquire that pairs with every other CTA's release: on a multi-XCD
       // part the leader's L2 may still hold stale lines of their out_i/out_w rows.
       if (!alone) __threadfence();
-      // Sort first: zeroing moe_buf has no reader in this launch and no
-      // overlap with the sort's inputs, so doing it beforehand would stall
-      // sort_subkernel's leading __syncthreads on the slowest row-zero store.
+      // moe_buf is zeroed after the sort: nothing here reads it, and zeroing
+      // first would stall sort_subkernel's first __syncthreads.
       radix4_sort::sort_subkernel<EXPERTS, TOPK, static_cast<int>(kRadix4SortBlockM), BLOCK>(
           sort_count,
           sort_cumsum,
@@ -679,6 +667,13 @@ struct RouteRadix4SortKernel {
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
+    // The kernel writes these without bounds checks; sizes mirror _sorted_capacity.
+    const int64_t routes = static_cast<int64_t>(M) * kRadix4TopK;
+    const int64_t active = routes < kRadix4NumExperts ? routes : kRadix4NumExperts;
+    const int64_t capacity =
+        (routes + active * (kRadix4SortBlockM - 1) + kRadix4SortBlockM - 1) / kRadix4SortBlockM * kRadix4SortBlockM;
+    RuntimeCheck(S_.unwrap() >= capacity, "sorted rows are shorter than the BM=16 sort capacity for M");
+    RuntimeCheck(reverse_sorted.size(0) >= routes, "reverse_sorted must hold M * topk entries");
 
     void* moe_ptr = nullptr;
     uint32_t moe_dim = 0;

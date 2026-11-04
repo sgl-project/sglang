@@ -77,9 +77,8 @@ SGL_DEVICE void pad_sorted_slice(
   }
 }
 
-/// Clear the histogram the last arriver will tally into. Every CTA clears its
-/// own copy before the arrival barrier, so whichever one turns out to be the
-/// leader finds it already zeroed instead of paying for it in the serial tail.
+/// Every CTA clears its histogram before the arrival barrier, so the leader
+/// does not pay for it in the serial tail.
 template <int NUM_EXPERTS, int THREADS_PER_CTA>
 SGL_DEVICE void reset_counts(int* __restrict__ count) {
   // Contiguous per thread rather than strided, so the four zeros are one LDS
@@ -121,11 +120,8 @@ count_tokens_per_expert(int* __restrict__ count, const int32_t* __restrict__ top
 template <int NUM_EXPERTS, int THREADS_PER_CTA, int SORT_MPB>
 SGL_DEVICE void
 parallel_cumsum(const int* __restrict__ count, int* __restrict__ cumsum, int32_t* __restrict__ sorted_expert_ids) {
-  // The standalone AITER sorter has 1024 threads and assigns one expert to a
-  // lane. Radix4 has 256 threads, so each lane scans a contiguous group of
-  // experts locally, then the block scans those group totals. Keeping expert
-  // groups contiguous is important: a strided assignment would not produce
-  // the expert-order prefix that GEMM dispatch consumes.
+  // Each of the 256 lanes scans a contiguous expert group, then the block scans
+  // group totals; contiguous groups keep the expert-order prefix GEMM consumes.
   constexpr int WAVE = 64;
   constexpr int N_WAVES = THREADS_PER_CTA / WAVE;
   constexpr int ITEMS_PER_THREAD = (NUM_EXPERTS + THREADS_PER_CTA - 1) / THREADS_PER_CTA;
@@ -153,19 +149,14 @@ parallel_cumsum(const int* __restrict__ count, int* __restrict__ cumsum, int32_t
   if (lane == WAVE - 1) wave_totals[wave] = wave_inclusive;
   __syncthreads();
 
-  // There are only N_WAVES totals, so every thread adding up the ones below its
-  // own wave is cheaper than a second scan followed by a second barrier -- the
-  // same trade the router makes for its block-wide OR and AND.
+  // Only N_WAVES totals: a serial sum is cheaper than a second scan + barrier.
   int wave_prefix = 0;
 #pragma unroll
   for (int w = 0; w < N_WAVES; ++w)
     wave_prefix += (w < wave) ? wave_totals[w] : 0;
   const int thread_prefix = wave_prefix + wave_inclusive - thread_total;
-  // The thread owns experts [tid * ITEMS, tid * ITEMS + ITEMS), so it also owns
-  // the BM blocks their padded ranges cover: the block ids it writes here are
-  // consecutive and its neighbours continue where it stops. Emitting them from
-  // the scan registers saves reading the prefix back out of LDS, and costs
-  // nothing for an expert no token picked, whose range is empty.
+  // The thread owns its experts' padded BM blocks, so it emits their expert ids
+  // straight from the scan registers instead of re-reading the prefix from LDS.
 #pragma unroll
   for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
     const int e = tid * ITEMS_PER_THREAD + i;
@@ -182,11 +173,7 @@ parallel_cumsum(const int* __restrict__ count, int* __restrict__ cumsum, int32_t
 }
 
 /// Write one winner into its expert's next free slot. `cursor` is the padded
-/// prefix itself, bumped in place: the prefix has already been published to
-/// `cumsum_tensor` and consumed for the expert ids, so an expert's next slot is
-/// exactly its running cursor and placement needs one LDS atomic rather than an
-/// atomic plus a read. Every slot no winner reaches already holds the pad token
-/// from pad_sorted_slice, which is why nothing fills the gaps afterwards.
+/// prefix, already published, bumped in place; unreached slots keep their pad.
 template <int TOPK, int SLOT_BITS>
 SGL_DEVICE void place_pair(
     int* __restrict__ cursor,
@@ -206,11 +193,8 @@ SGL_DEVICE void place_pair(
   reverse_sorted[pair] = sp;
 }
 
-/// Placement for a batch too wide to hold in registers, streamed a round at a
-/// time. A pair's expert has to come back from L2 before its slot can be
-/// claimed, so reading one pair, claiming, and going back for the next would put
-/// one round trip per pair end to end; the round's pairs are read up front
-/// instead, which leaves one round trip for the round.
+/// Placement for a batch too wide for registers, a round at a time; each
+/// round's pairs are loaded up front so it costs one L2 round trip, not one per pair.
 template <int NUM_EXPERTS, int TOPK, int THREADS_PER_CTA, int PAIRS_PER_ROUND, int SLOT_BITS>
 SGL_DEVICE void place_streamed(
     int* __restrict__ cursor,
@@ -248,13 +232,8 @@ SGL_DEVICE void place_streamed(
   }
 }
 
-/// The whole sort with the pairs held in registers across it. Counting and
-/// placement read the same pairs, and the arrival release invalidated this CU's
-/// L2 just before, so reading them twice means paying for the miss twice and
-/// paying for the second one where nothing can cover it -- the prefix scan
-/// stands between the two reads and would have covered it. Both weights and
-/// experts are fetched up front for the same reason. Only usable when one round
-/// covers the batch, which is what PAIRS_PER_ROUND is chosen for.
+/// The whole sort with the pairs held in registers, so counting and placement
+/// share one (post-invalidate) L2 read. Only for batches one round covers.
 template <int NUM_EXPERTS, int TOPK, int M_PER_BLOCK, int THREADS_PER_CTA, int PAIRS_PER_ROUND, int SLOT_BITS>
 SGL_DEVICE void sort_resident(
     int* __restrict__ count,
