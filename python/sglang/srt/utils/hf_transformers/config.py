@@ -92,9 +92,17 @@ def _resolve_text_sub_config(config) -> Optional[PretrainedConfig]:
 def _merged_rope_override(config, key: str, value):
     """Merge a rope override dict over the config's existing rope dict."""
     existing = getattr(config, key, None)
-    if isinstance(value, dict) and isinstance(existing, dict):
-        return {**existing, **value}
-    return value
+    if not isinstance(value, dict):
+        return value
+    if not isinstance(existing, dict):
+        return dict(value)
+    merged = {**existing, **value}
+    # "type" is the legacy alias of "rope_type": an override naming one sets
+    # the other, so the checkpoint's old type does not win.
+    for alias, other in (("rope_type", "type"), ("type", "rope_type")):
+        if alias in value and other in merged and other not in value:
+            merged[other] = value[alias]
+    return merged
 
 
 def _sub_config_for_override(config, key: str, value):

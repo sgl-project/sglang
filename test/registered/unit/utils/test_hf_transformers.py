@@ -1219,6 +1219,28 @@ class TestApplyModelOverrideArgs(CustomTestCase):
         apply_model_override_args(cfg, {"vision_config": {"hidden_size": 20}})
         self.assertEqual(cfg.vision_config, {"hidden_size": 20})
 
+    def test_legacy_type_alias_override_sets_rope_type(self):
+        # Older recipes (Qwen2.5's YaRN example) name the scaling type with the
+        # legacy "type" key; the checkpoint's "rope_type" must not win the merge.
+        model = self._qwen3_5_config_dir()
+        yarn = {k: v for k, v in self.YARN.items() if k != "rope_type"}
+        config = get_config(
+            model,
+            trust_remote_code=False,
+            model_override_args={"rope_scaling": {"type": "yarn", **yarn}},
+        )
+        _, params = get_rope_config(get_hf_text_config(config))
+        self.assertEqual(params["rope_type"], "yarn")
+        self.assertEqual(params["type"], "yarn")
+
+    def test_override_dict_is_not_shared_between_configs(self):
+        cfg, text_cfg = self._make_composite_config()
+        override = {"rope_parameters": dict(self.YARN)}
+        apply_model_override_args(cfg, override)
+        self.assertIsNot(cfg.rope_parameters, override["rope_parameters"])
+        self.assertIsNot(text_cfg.rope_parameters, override["rope_parameters"])
+        self.assertIsNot(cfg.rope_parameters, text_cfg.rope_parameters)
+
     def _qwen3_5_config_dir(self):
         try:
             from transformers import Qwen3_5Config
