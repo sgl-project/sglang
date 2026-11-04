@@ -753,6 +753,9 @@ class Envs:
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
+    # Shared-context attention kernel: "default", "split_kv" (prompt split across
+    # CTAs) or "stream_k" (persistent grid).
+    SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism

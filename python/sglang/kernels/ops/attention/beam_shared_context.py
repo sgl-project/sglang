@@ -11,13 +11,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Native Triton shared-context attention for wide beam decoding."""
+"""Native Triton shared-context attention for wide beam decoding.
+
+The online-softmax steps, the input checks and the SM count are shared with the
+opt-in split-KV and stream-K kernels (beam_shared_context_split_kv.py and
+beam_shared_context_stream_k.py).
+"""
 
 from __future__ import annotations
+
+import functools
 
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def empty_softmax_state(beam_mask, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr):
+    max_values = tl.where(beam_mask, -float("inf"), 0.0)
+    normalizers = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    return max_values, normalizers, accumulator
+
+
+@triton.jit
+def attend_prompt_block(
+    scores,
+    v_values,
+    max_values,
+    normalizers,
+    accumulator,
+    softmax_scale_log2,
+):
+    # Online softmax step over a block of prompt tokens; masked scores are -inf.
+    new_max = tl.maximum(max_values, tl.max(scores, axis=1))
+    previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
+    probabilities = tl.exp2((scores - new_max[:, None]) * softmax_scale_log2)
+    normalizers = normalizers * previous_scale + tl.sum(probabilities, axis=1)
+    accumulator = accumulator * previous_scale[:, None] + tl.dot(
+        probabilities.to(v_values.dtype),
+        v_values,
+    )
+    return new_max, normalizers, accumulator
+
+
+@triton.jit
+def attend_beam_token(
+    scores,
+    v_values,
+    max_values,
+    normalizers,
+    accumulator,
+    softmax_scale_log2,
+):
+    # Online softmax step over one decode token per beam; masked scores are -inf.
+    new_max = tl.maximum(max_values, scores)
+    previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
+    current_scale = tl.exp2((scores - new_max) * softmax_scale_log2)
+    normalizers = normalizers * previous_scale + current_scale
+    accumulator = (
+        accumulator * previous_scale[:, None]
+        + v_values.to(tl.float32) * current_scale[:, None]
+    )
+    return new_max, normalizers, accumulator
 
 
 @triton.jit
@@ -84,9 +141,9 @@ def _shared_context_attention_kernel(
     )
 
     negative_infinity = -float("inf")
-    max_values = tl.where(beam_mask, negative_infinity, 0.0)
-    normalizers = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    max_values, normalizers, accumulator = empty_softmax_state(
+        beam_mask, BLOCK_M, BLOCK_D
+    )
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
 
     context_start = tl.load(context_cu_seqlens + group)
@@ -128,16 +185,14 @@ def _shared_context_attention_kernel(
             scores,
             negative_infinity,
         )
-        block_max = tl.max(scores, axis=1)
-        new_max = tl.maximum(max_values, block_max)
-        previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
-        probabilities = tl.exp2((scores - new_max[:, None]) * softmax_scale_log2)
-        normalizers = normalizers * previous_scale + tl.sum(probabilities, axis=1)
-        accumulator = accumulator * previous_scale[:, None] + tl.dot(
-            probabilities.to(v_values.dtype),
+        max_values, normalizers, accumulator = attend_prompt_block(
+            scores,
             v_values,
+            max_values,
+            normalizers,
+            accumulator,
+            softmax_scale_log2,
         )
-        max_values = new_max
 
     decode_length = tl.load(decode_lens + group)
     for step in range(0, MAX_DECODE):
@@ -178,15 +233,14 @@ def _shared_context_attention_kernel(
             axis=1,
         )
         scores = tl.where(beam_mask & step_valid, scores, negative_infinity)
-
-        new_max = tl.maximum(max_values, scores)
-        previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
-        current_scale = tl.exp2((scores - new_max) * softmax_scale_log2)
-        normalizers = normalizers * previous_scale + current_scale
-        accumulator = (
-            accumulator * previous_scale[:, None] + v_values * current_scale[:, None]
+        max_values, normalizers, accumulator = attend_beam_token(
+            scores,
+            v_values,
+            max_values,
+            normalizers,
+            accumulator,
+            softmax_scale_log2,
         )
-        max_values = new_max
 
     result = accumulator / normalizers[:, None]
     output_offsets = (
@@ -199,6 +253,49 @@ def _shared_context_attention_kernel(
         result,
         mask=beam_mask[:, None] & dim_mask[None, :],
     )
+
+
+@functools.lru_cache(maxsize=None)
+def num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def check_shared_context_inputs(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
+    output: torch.Tensor | None,
+) -> torch.Tensor:
+    """Check the inputs every kernel reads; returns the output to write."""
+    if q.ndim != 3:
+        raise ValueError(f"Expected Q with 3 dimensions, got {q.shape}")
+    if k_buffer.ndim != 3 or v_buffer.shape != k_buffer.shape:
+        raise ValueError("K/V buffers must have matching [slots, heads, dim] shapes")
+
+    if row_indices.ndim != 2:
+        raise ValueError("Row indices must have shape [groups, beam_width]")
+    num_groups, beam_width = row_indices.shape
+    q_heads = q.shape[1]
+    kv_heads = k_buffer.shape[1]
+    if q_heads % kv_heads:
+        raise ValueError(f"Q heads {q_heads} must be divisible by KV heads {kv_heads}")
+    if decode_slots.shape[0] != num_groups:
+        raise ValueError("Decode slot groups must match grouped Q")
+    if decode_slots.shape[1] % beam_width:
+        raise ValueError("Decode slot capacity must be divisible by beam width")
+    if decode_lens.shape != (num_groups,):
+        raise ValueError("Decode lengths must contain one value per beam group")
+    if context_cu_seqlens.shape != (num_groups + 1,):
+        raise ValueError("Context offsets must contain one boundary per beam group")
+    if output is None:
+        return torch.empty_like(q)
+    if output.shape != q.shape:
+        raise ValueError("Output must match Q shape")
+    return output
 
 
 def shared_context_attention(
@@ -215,30 +312,19 @@ def shared_context_attention(
     softmax_scale: float,
 ) -> torch.Tensor:
     """Apply shared prompt and per-beam suffix attention in one Triton kernel."""
-    if q.ndim != 3:
-        raise ValueError(f"Expected Q with 3 dimensions, got {q.shape}")
-    if k_buffer.ndim != 3 or v_buffer.shape != k_buffer.shape:
-        raise ValueError("K/V buffers must have matching [slots, heads, dim] shapes")
-
-    if row_indices.ndim != 2:
-        raise ValueError("Row indices must have shape [groups, beam_width]")
+    output = check_shared_context_inputs(
+        q,
+        k_buffer,
+        v_buffer,
+        row_indices,
+        context_cu_seqlens,
+        decode_slots,
+        decode_lens,
+        output,
+    )
     num_groups, beam_width = row_indices.shape
     _, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]
-    if q_heads % kv_heads:
-        raise ValueError(f"Q heads {q_heads} must be divisible by KV heads {kv_heads}")
-    if decode_slots.shape[0] != num_groups:
-        raise ValueError("Decode slot groups must match grouped Q")
-    if decode_slots.shape[1] % beam_width:
-        raise ValueError("Decode slot capacity must be divisible by beam width")
-    if decode_lens.shape != (num_groups,):
-        raise ValueError("Decode lengths must contain one value per beam group")
-    if context_cu_seqlens.shape != (num_groups + 1,):
-        raise ValueError("Context offsets must contain one boundary per beam group")
-    if output is None:
-        output = torch.empty_like(q)
-    elif output.shape != q.shape:
-        raise ValueError("Output must match Q shape")
 
     high_group_count = num_groups >= 6
     block_m = 64 if high_group_count else 128
