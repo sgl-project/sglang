@@ -4,6 +4,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import importlib
+import os
 import sys
 import types
 import unittest
@@ -457,6 +459,78 @@ class TestDeepseekV4QuarkMapping(CustomTestCase):
         self.assertIsInstance(method, Fp8LinearMethod)
 
 
+def _stub(*args, **kwargs):
+    return None
+
+
+def _fake_aiter_shuffle_modules():
+    """The aiter modules the scheme imports at load, so this stays a CPU test."""
+    shuffle = types.ModuleType("aiter.ops.shuffle")
+    for name in (
+        "moe_shuffle_scale",
+        "moe_shuffle_weight",
+        "shuffle_scale_a16w4",
+        "shuffle_weight",
+        "shuffle_weight_a16w4",
+    ):
+        setattr(shuffle, name, _stub)
+    fp4_utils = types.ModuleType("aiter.utility.fp4_utils")
+    fp4_utils.e8m0_shuffle = _stub
+    triton_quant = types.ModuleType("aiter.ops.triton.quant")
+    triton_quant.dynamic_mxfp4_quant = _stub
+    return {
+        "aiter.ops.shuffle": shuffle,
+        "aiter.utility.fp4_utils": fp4_utils,
+        "aiter.ops.triton.quant": triton_quant,
+    }
+
+
+class TestQuarkMxfp4MoEShuffleImports(CustomTestCase):
+    """process_weights_after_loading's shuffle helpers must be bound wherever it
+    calls them, whatever SGLANG_USE_AITER says: e8m0_shuffle() on gfx95 and
+    moe_shuffle_scale()/moe_shuffle_weight() on gfx1250."""
+
+    def _reload_without_env(self, *, is_gfx95, is_gfx1250):
+        previous = os.environ.pop("SGLANG_USE_AITER", None)
+        arch = "gfx950" if is_gfx95 else "gfx1250" if is_gfx1250 else "gfx942"
+        try:
+            with (
+                patch.dict(sys.modules, _fake_aiter_shuffle_modules()),
+                patch("sglang.srt.utils.is_hip", lambda: True),
+                patch("sglang.srt.utils.is_gfx95_supported", lambda: is_gfx95),
+                patch("sglang.srt.utils.is_gfx1250_supported", lambda: is_gfx1250),
+                patch(
+                    "torch.cuda.get_device_properties",
+                    lambda _: SimpleNamespace(gcnArchName=arch),
+                ),
+            ):
+                return importlib.reload(quark_moe)
+        finally:
+            if previous is not None:
+                os.environ["SGLANG_USE_AITER"] = previous
+
+    def tearDown(self):
+        importlib.reload(quark_moe)
+
+    def test_gfx95_binds_the_scale_and_weight_shuffles(self):
+        reloaded = self._reload_without_env(is_gfx95=True, is_gfx1250=False)
+
+        self.assertTrue(reloaded._is_shuffle_moe_mxfp4)
+        self.assertTrue(hasattr(reloaded, "e8m0_shuffle"))
+        self.assertTrue(hasattr(reloaded, "shuffle_weight"))
+
+    def test_gfx1250_binds_the_n32k4_shuffles(self):
+        reloaded = self._reload_without_env(is_gfx95=False, is_gfx1250=True)
+
+        self.assertTrue(hasattr(reloaded, "moe_shuffle_scale"))
+        self.assertTrue(hasattr(reloaded, "moe_shuffle_weight"))
+
+    def test_other_hip_arches_still_follow_the_env_var(self):
+        reloaded = self._reload_without_env(is_gfx95=False, is_gfx1250=False)
+
+        self.assertFalse(reloaded._use_aiter)
+
+
 class _Runner:
     """Records the quant_info apply_weights() hands to the runner."""
 
@@ -632,6 +706,100 @@ _BLOCK_FP8_MOE_SPEC = {
     "output_tensors": None,
     "bias": None,
 }
+
+_MXFP8_LINEAR_SPEC = {
+    "weight": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_block",
+        "block_size": [1, 32],
+        "is_dynamic": False,
+        "scale_type": "float8_e8m0fnu",
+    },
+    "input_tensors": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": True,
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+
+class TestSharedExpertFusionGateDenseLeadingLayers(CustomTestCase):
+    """amd/MiniMax-M3.1-Flash-Quark-MXFP4 layout: the leading layers are dense
+    MLPs, the routed experts take the MXFP4 global spec, and every MoE layer
+    names its shared expert MXFP8 in layer_quant_config.
+
+    Layer 0 has neither routed nor shared experts, so both of its lookups fall
+    back to the global spec and agree. Fusing on that answer copies the MXFP8
+    shared expert into the packed MXFP4 slot, which fails at load.
+    """
+
+    _PREFIX = "language_model.model.layers"
+
+    def _config(
+        self,
+        shared_spec_by_layer,
+        prefix=_PREFIX,
+        num_hidden_layers=None,
+        num_nextn_predict_layers=0,
+    ) -> QuarkConfig:
+        config = _bare_config()
+        config.quant_config = {
+            "global_quant_config": deepcopy(_MXFP4_MOE_SPEC),
+            "layer_quant_config": {
+                f"{prefix}.0.self_attn.q_proj": deepcopy(_MXFP8_LINEAR_SPEC),
+                **{
+                    f"{prefix}.{layer}.mlp.shared_experts.{proj}": deepcopy(spec)
+                    for layer, spec in shared_spec_by_layer.items()
+                    for proj in ("gate_proj", "up_proj", "down_proj")
+                },
+            },
+            "layer_type_quant_config": {},
+        }
+        config.exclude_layers = []
+        config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        config.num_hidden_layers = num_hidden_layers
+        config.num_nextn_predict_layers = num_nextn_predict_layers
+        return config
+
+    def test_shared_expert_in_another_format_blocks_fusion(self):
+        shared = {3: _MXFP8_LINEAR_SPEC, 4: _MXFP8_LINEAR_SPEC}
+        for prefix in (self._PREFIX, "model.layers"):
+            with self.subTest(prefix=prefix):
+                config = self._config(shared, prefix=prefix)
+                self.assertFalse(config.can_fuse_shared_expert())
+
+    def test_shared_expert_in_the_routed_format_still_fuses(self):
+        config = self._config({3: _MXFP4_MOE_SPEC, 4: _MXFP4_MOE_SPEC})
+        self.assertTrue(config.can_fuse_shared_expert())
+
+    def test_one_mismatched_moe_layer_blocks_fusion_in_any_entry_order(self):
+        for shared in (
+            {3: _MXFP4_MOE_SPEC, 4: _MXFP8_LINEAR_SPEC},
+            {4: _MXFP8_LINEAR_SPEC, 3: _MXFP4_MOE_SPEC},
+        ):
+            with self.subTest(order=list(shared)):
+                self.assertFalse(self._config(shared).can_fuse_shared_expert())
+
+    def test_named_routed_experts_in_another_format_block_fusion(self):
+        config = self._config({})
+        config.quant_config["layer_quant_config"][f"{self._PREFIX}.3.mlp.experts"] = (
+            deepcopy(_FP8_MOE_SPEC)
+        )
+        self.assertFalse(config.can_fuse_shared_expert())
+
+    def test_a_draft_layer_does_not_answer_for_the_target(self):
+        # The NextN layer appended after the decoder keeps its shared expert
+        # MXFP8; the target's own MoE layer matches its routed experts.
+        config = self._config(
+            {4: _MXFP8_LINEAR_SPEC, 3: _MXFP4_MOE_SPEC},
+            prefix="model.layers",
+            num_hidden_layers=4,
+            num_nextn_predict_layers=1,
+        )
+        self.assertTrue(config.can_fuse_shared_expert())
 
 
 class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):

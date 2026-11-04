@@ -41,12 +41,12 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -708,7 +708,14 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        self._set_visual_token_mask(input_ids, forward_batch)
+        # Skip on decode/text-only batches: per-step mask allocs exhaust XPU memory.
+        if not forward_batch.forward_mode.is_decode() and (
+            forward_batch.contains_image_inputs()
+            or forward_batch.contains_video_inputs()
+        ):
+            self._set_visual_token_mask(input_ids, forward_batch)
+        else:
+            self.visual_token_mask = None
 
         assert input_ids.numel() == positions.shape[-1], (
             f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"

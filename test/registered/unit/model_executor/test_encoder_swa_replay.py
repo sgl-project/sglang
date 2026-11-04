@@ -20,12 +20,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4AttnMetadata,
     late_layer_whole_extend,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.mm_utils import pad_mm_tokens
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -38,12 +35,10 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     drop_folded_rows,
     folded_replay_rows,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -252,7 +247,8 @@ class TestFoldedExtendRows(CustomTestCase):
         ]
         self.assertEqual(sum(logprob_rows), fx.batch.global_num_tokens_for_logprob[0])
         # Full hidden states of the folded forward reduce to the scheduled rows.
-        out = SimpleNamespace(
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
             hidden_states=fb.input_ids[:, None].float(),
             hidden_states_token_indices=None,
         )
@@ -350,7 +346,8 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             device=torch.device("cpu"),
         )
         self.assertEqual(tail_lens, [40, 128, 84])
-        out = SimpleNamespace(
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
             hidden_states=fb.input_ids[token_indices][:, None].float(),
             hidden_states_token_indices=token_indices,
         )
@@ -389,7 +386,8 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             whole_extend=whole,
         )
         self.assertEqual(tail_lens, [40, 158, 84])
-        out = SimpleNamespace(
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
             hidden_states=fb.input_ids[token_indices][:, None].float(),
             hidden_states_token_indices=token_indices,
         )
@@ -642,7 +640,8 @@ class TestFoldMlpSync(CustomTestCase):
         torch.testing.assert_close(fb.input_ids[:282], fx.folded.batch.input_ids)
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [17])
         # Hidden states of the padded forward still reduce to the scheduled rows.
-        out = SimpleNamespace(
+        out = LogitsProcessorOutput(
+            next_token_logits=None,
             hidden_states=fb.input_ids[:, None].float(),
             hidden_states_token_indices=None,
         )
