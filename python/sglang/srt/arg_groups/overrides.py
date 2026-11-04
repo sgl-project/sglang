@@ -501,7 +501,10 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        # The backend page-size snaps run later in the pass chain, so a page-1
+        # request on e.g. FlashMLA still lands on a paged cache.
+        page_size = _backend_snapped_page_size(view)
+        wants_paging = page_size is not None and page_size > 1
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, hf_config
         ):
@@ -1405,24 +1408,23 @@ def _attention_backend_default(view: Any) -> dict:
     return {}
 
 
-@register_post_process
-def _mla_backend_page_constraints(view: Any) -> dict:
-    """Resolve MLA/TRTLLM page-size constraints, chaining adjustments on the local value."""
+def _backend_snapped_page_size(
+    view: Any, warn: Callable[[str], None] = lambda _: None
+) -> Optional[int]:
+    """The page size _mla_backend_page_constraints settles on for the chosen backends."""
     page_size = view.page_size
     if (
         view.attention_backend == "flashmla"
         or view.decode_attention_backend == "flashmla"
     ):
-        logger.warning(
-            "FlashMLA only supports a page_size of 64, change page_size to 64."
-        )
+        warn("FlashMLA only supports a page_size of 64, change page_size to 64.")
         page_size = 64
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
     ):
         if page_size not in [32, 64]:
-            logger.warning(
+            warn(
                 f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {page_size} to 64."
             )
             page_size = 64
@@ -1432,7 +1434,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         or view.prefill_attention_backend == "cutedsl_mla"
     ):
         if page_size not in [32, 64]:
-            logger.warning(
+            warn(
                 f"CuteDSL MLA only supports page_size of 32 or 64, changing page_size from {page_size} to 64."
             )
             page_size = 64
@@ -1446,7 +1448,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         # >= 0.6.12), which require GQA and equal QK/V head dims — validated at
         # TRTLLMHAAttnBackend init where the model config is known.
         if page_size not in [16, 32, 64, 128]:
-            logger.warning(
+            warn(
                 f"TensorRT-LLM MHA only supports page_size of 16, 32, 64 or 128, changing page_size from {page_size} to 64."
             )
             page_size = 64
@@ -1456,10 +1458,17 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         or view.prefill_attention_backend == "hpc_ops"
     ):
         if page_size != 64:
-            logger.warning(
+            warn(
                 f"HPC-Ops attention only supports a page_size of 64, changing page_size from {page_size} to 64."
             )
             page_size = 64
+    return page_size
+
+
+@register_post_process
+def _mla_backend_page_constraints(view: Any) -> dict:
+    """Resolve MLA/TRTLLM page-size constraints, chaining adjustments on the local value."""
+    page_size = _backend_snapped_page_size(view, warn=logger.warning)
     if page_size != view.page_size:
         return {"page_size": page_size}
     return {}
