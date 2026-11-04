@@ -1000,8 +1000,13 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         if hasattr(layer, "w13_qweight"):
             del layer.w13_qweight
 
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"quant_type": "gguf"})
+        # GGUF keeps full (non-intermediate-sharded) expert weights, so the
+        # Ascend finalize has to all-gather the hidden dim on its own.
+        from sglang.srt.hardware_backend.npu.moe import (
+            standard_dispatch as ascend_dispatch,
+        )
+
+        ascend_dispatch.set_finalize_all_gather(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

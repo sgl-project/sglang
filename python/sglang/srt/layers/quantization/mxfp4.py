@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.runtime_context import (
     get_exec,
@@ -152,6 +153,12 @@ def _aiter_situ_uses_gu_interleaved_weights() -> bool:
     a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
     a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false")
     return a8w4 or not a4w4
+
+
+def _aiter_situ_uses_a8w4() -> bool:
+    """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
+    gfx1250 overrides it with fp4 activations."""
+    return is_gfx95_supported() and get_bool_env_var("AITER_SITUV2_A8W4", "false")
 
 
 def _get_flashinfer_mxfp4_device_permute_indices(
@@ -310,10 +317,12 @@ class Mxfp4Config(QuantizationConfig):
         self,
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
+        enable_online_linear: bool = False,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
+        self.enable_online_linear = enable_online_linear
 
     @classmethod
     def from_config(cls, config):
@@ -359,7 +368,6 @@ class Mxfp4Config(QuantizationConfig):
 
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
             if self.ignored_layers and is_layer_skipped(
@@ -368,6 +376,8 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            elif self.enable_online_linear:
+                return Mxfp4OnlineLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
@@ -382,6 +392,67 @@ class Mxfp4Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class Mxfp4OnlineLinearMethod(UnquantizedLinearMethod):
+    """Load BF16 weights into MXFP4 and quantize activations per token/block."""
+
+    def __init__(self):
+        if (
+            _is_hip
+            or not torch.cuda.is_available()
+            or not (10, 0) <= get_device_capability() < (11, 0)
+        ):
+            raise ValueError("Online MXFP4 linear requires a CUDA Blackwell GPU")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        import deep_gemm
+        from deep_gemm.utils import per_token_cast_to_fp4
+
+        n, k = layer.weight.shape
+        if layer.weight.dtype != torch.bfloat16 or k % 128:
+            raise ValueError(
+                "Online MXFP4 linear requires BF16 weights and K % 128 == 0"
+            )
+        weight, scale = per_token_cast_to_fp4(
+            layer.weight.data, use_ue8m0=True, gran_k=32
+        )
+        scale = deep_gemm.transform_sf_into_required_layout(scale, n, k, (1, 32))
+        layer.weight.data = weight
+        layer.register_parameter("weight_scale", Parameter(scale, requires_grad=False))
+
+    def apply(self, layer, x, bias=None):
+        import deep_gemm
+        from flashinfer.quantization.fp4_quantization import SfLayout, mxfp4_quantize
+
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        m, k = x.shape
+        result = x.new_empty((m, layer.weight.shape[0]))
+        if m:
+            if x.dtype != torch.bfloat16:
+                raise ValueError("Online MXFP4 linear requires BF16 activations")
+            packed, scale = mxfp4_quantize(
+                x, backend="cuda", sfLayout=SfLayout.layout_linear
+            )
+            scale = scale.view(m, k // 32).view(torch.int32)
+            # TMA needs a 16-byte aligned leading dimension, including M=1.
+            if m % 4:
+                scale = torch.nn.functional.pad(scale, (0, 0, 0, (-m) % 4))
+            scale = scale.T.contiguous().T[:m]
+            deep_gemm.fp4_gemm_nt(
+                (packed.view(torch.int8), scale),
+                (layer.weight, layer.weight_scale),
+                result,
+                recipe=(1, 1, 32),
+                disable_ue8m0_cast=True,
+            )
+        if bias is not None:
+            result.add_(bias)
+        return result.view(*shape[:-1], layer.weight.shape[0])
+
+    def apply_into(self, layer, x, output, bias=None):
+        return output.copy_(self.apply(layer, x, bias))
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):

@@ -552,6 +552,12 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "engram_config",
+    "moe_ascend_ops_config",
+    # Kimi-K3.1 additions, appended to keep existing positional slots
+    "pp_min_chunked_prefill_size",
+    "pp_chunk_overhead_tokens",
+    "enable_flashmla_prefill_token_packing",
     # sglang-miles fields follow every upstream slot so upstream positions stay fixed.
     "enable_prefill_only_deterministic_inference",
     "true_on_policy_contract",

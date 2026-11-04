@@ -325,7 +325,8 @@ class CommonKVManager(BaseKVManager):
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        # Per state component: bytes one of its indices moves (summed over layers).
+        self.state_item_lens_sums = [sum(comp) for comp in args.state_item_lens]
         self.is_mla_backend = is_mla_backend
         # Per-sender fan-out of a KV copy onto N decode destinations
         # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
@@ -549,7 +550,10 @@ class CommonKVManager(BaseKVManager):
         )
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        draft_rows_collapsed: bool = False,
     ) -> List[int]:
         page_size = self.kv_args.page_size
         num_draft = self.kv_args.num_draft_entries
@@ -566,8 +570,9 @@ class CommonKVManager(BaseKVManager):
         for i, dst_item_len in enumerate(dst_page_item_lens):
             if dst_item_len is None:
                 continue
+            is_draft_entry = i >= num_entries - num_draft
             dst_page_scale = page_size * (
-                dst_dcp_size if i >= num_entries - num_draft else 1
+                dst_dcp_size if is_draft_entry and not draft_rows_collapsed else 1
             )
             if dst_item_len // dst_page_scale != src_token_lens[i]:
                 raise RuntimeError(
@@ -2122,6 +2127,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self._transfer_state_bytes = 0
         self._transfer_start_time: Optional[float] = None
         self._early_send_wait_event: Optional[object] = None
         self.trace_ctx = TraceNullContext()
@@ -2237,9 +2243,7 @@ class CommonKVSender(BaseKVSender):
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
-        )
+        total_bytes += self._transfer_state_bytes
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
@@ -2252,9 +2256,15 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
+            # Components index different units (a request slot, one row per
+            # page), so each count is priced by its own component's item lens.
+            for component, component_indices in enumerate(state_indices):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
+                    self._transfer_state_bytes += (
+                        len(component_indices)
+                        * self.kv_mgr.state_item_lens_sums[component]
+                    )
 
     def _prepare_send_indices(
         self,
@@ -2458,11 +2468,10 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
+        self.kv_mgr.conclude_failure(
+            bootstrap_room=self.bootstrap_room,
+            failure_reason="Aborted by AbortReq.",
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()

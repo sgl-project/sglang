@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+    from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -79,6 +81,17 @@ def duplicate_prefix_tail_to_draft_branches(
     """
     if topk <= 1:
         return
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().dcp_enabled and isinstance(token_to_kv_pool, MLATokenToKVPool):
+        # This copy addresses slots raw; DCP MLA rows are owner-only at
+        # loc // dcp_size, so it would place the tail page in rows the draft
+        # never reads.
+        raise NotImplementedError(
+            "duplicate_prefix_tail_to_draft_branches does not support an MLA "
+            "draft under DCP; run with --speculative-eagle-topk 1."
+        )
     bs = rows.shape[0]
     page_off = torch.arange(page_size, device=rows.device, dtype=torch.int64)
     branches = torch.arange(1, topk, device=rows.device, dtype=torch.int64).view(
@@ -560,6 +573,9 @@ def run_eagle_verify(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
+    simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -659,6 +675,42 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
+    kvcache = token_to_kv_pool_allocator.get_kvcache()
+    clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
+    # SGLang's post-verify graphs when they are on, for a batch they can replay;
+    # they skip the c128 cleanup below, so not for a KV pool that needs it.
+    post = (
+        None
+        if post_verify_graphs is None or clears_c128
+        else post_verify_graphs.run(
+            batch=batch,
+            verify_input=verify_input,
+            logits_output=logits_output,
+            can_run_cuda_graph=can_run_cuda_graph,
+            max_top_k=uno_target_max_top_k,
+        )
+    )
+    if post is not None:
+        predict, accept_lens, accept_index, new_seq_lens, bonus_tokens = post[:5]
+        if batch.return_logprob:
+            compute_spec_logprobs(
+                batch, logits_output, predict, accept_index=accept_index
+            )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=predict,
+            can_run_cuda_graph=can_run_cuda_graph,
+            speculative_num_draft_tokens=num_draft_tokens,
+            next_draft_input=EagleDraftInput(bonus_tokens=bonus_tokens),
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            new_seq_lens=new_seq_lens,
+            routed_experts_output=forward_batch_output.routed_experts_output,
+            indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
+            prepared_draft_extend_inputs=post[5],
+        )
+
     # Generate vocab mask for constrained decoding
     grammar_mask = None
     if batch.has_grammar:
@@ -689,6 +741,8 @@ def run_eagle_verify(
             or target_worker.model_runner.attn_backend.verify_mask.mode
             == TreeMaskMode.FULL_MASK
         ),
+        simulated_acc_len_rng=simulated_acc_len_rng,
+        sparse_bonus_argmax=sparse_bonus_argmax,
     )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
@@ -719,13 +773,8 @@ def run_eagle_verify(
             batch=batch,
             accept_indices=accept_index,
         )
-    clear_unaccepted_c128 = getattr(
-        token_to_kv_pool_allocator.get_kvcache(),
-        "clear_unaccepted_c128_draft_states",
-        None,
-    )
-    if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
-        clear_unaccepted_c128(
+    if clears_c128 and not batch.forward_mode.is_idle():
+        kvcache.clear_unaccepted_c128_draft_states(
             batch.req_pool_indices,
             batch.seq_lens,
             accept_lens,

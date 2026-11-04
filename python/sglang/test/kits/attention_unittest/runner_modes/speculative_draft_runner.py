@@ -180,6 +180,7 @@ class _EagleDraftWorkerHarness:
         self.model_config = fixture.runner.model_config
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
+        self.megakernel = None
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
         # draft_forward's topk=1 fast path reads these prealloc buffers (built

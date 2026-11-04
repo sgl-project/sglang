@@ -29,6 +29,10 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
+# Draft backends that serve only MLA layers; DFLASH takes them for MLA drafts.
+DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
+
+
 def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:
     """The attention backend `build_draft_tp_worker` gives a draft worker when
     the caller names none, from the published leaves.
@@ -46,8 +50,15 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
+        # tokenspeed_mla serves only MLA layers, so a draft gets it only when
+        # it is named explicitly.
+        if draft_backend == "tokenspeed_mla":
+            draft_backend = None
     if draft_backend is None:
         return platform_fallback
+    if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        # MLA-only backends: the DFLASH hook admits them for MLA drafts only.
+        return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
         if algo_label is not None:

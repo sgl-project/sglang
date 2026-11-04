@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 KV_ITEM_LENS_SUM = 100
-STATE_ITEM_LENS_SUM = 7
+STATE_ITEM_LENS_SUMS = [7]
 
 
 def _room(fan_out):
@@ -40,7 +40,7 @@ def _make_kv_mgr(is_mla_backend):
     mgr = CommonKVManager.__new__(CommonKVManager)
     mgr.is_mla_backend = is_mla_backend
     mgr.kv_item_lens_sum = KV_ITEM_LENS_SUM
-    mgr.state_item_lens_sum = STATE_ITEM_LENS_SUM
+    mgr.state_item_lens_sums = STATE_ITEM_LENS_SUMS
     mgr._kv_replica_factor = None if is_mla_backend else 1
     return mgr
 
@@ -65,6 +65,7 @@ def _make_sender(kv_mgr):
     sender._transfer_metric = KVTransferMetric()
     sender._transfer_num_kv_indices = 0
     sender._transfer_num_state_indices = 0
+    sender._transfer_state_bytes = 0
     sender.kv_mgr = kv_mgr
     return sender
 
@@ -81,7 +82,23 @@ class TestKVTransferReplicaMetric(CustomTestCase):
         sender._record_transfer_indices(
             np.arange(8, dtype=np.int32), [np.arange(5, dtype=np.int32)]
         )
-        expected = (8 * KV_ITEM_LENS_SUM + 5 * STATE_ITEM_LENS_SUM) * 4
+        expected = (8 * KV_ITEM_LENS_SUM + 5 * STATE_ITEM_LENS_SUMS[0]) * 4
+        self.assertEqual(sender.get_transfer_metric().transfer_total_bytes, expected)
+
+    def test_state_components_are_priced_by_their_own_item_lens(self):
+        # A hybrid DSA pool ships a per-request linear-attention state slot and
+        # a per-page index row on the state channel. One slot must not be priced
+        # by the index rows, nor each index row by the whole slot.
+        mgr = _make_kv_mgr(is_mla_backend=False)
+        slot_bytes, index_page_bytes = 50_000_000, 8_448
+        mgr.state_item_lens_sums = [slot_bytes, index_page_bytes]
+        sender = _make_sender(mgr)
+
+        sender._record_transfer_indices(
+            np.arange(1300, dtype=np.int32),
+            [np.array([3], dtype=np.int32), np.arange(1300, dtype=np.int32)],
+        )
+        expected = 1300 * KV_ITEM_LENS_SUM + slot_bytes + 1300 * index_page_bytes
         self.assertEqual(sender.get_transfer_metric().transfer_total_bytes, expected)
 
 

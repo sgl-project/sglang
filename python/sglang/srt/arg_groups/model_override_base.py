@@ -257,8 +257,26 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
     return cfg.startup_weight_load_mode == "overlap"
 
 
+def decode_state_free_radix_of(cfg: Any) -> bool:
+    """Whether a PD decode server's radix cache holds FULL KV only (no Mamba
+    state), see SGLANG_DECODE_STATE_FREE_RADIX. Read by hybrid-SSM paths only."""
+    from sglang.srt.environ import envs
+
+    # getattr: model overrides also run on partial configs (e.g. golden tests)
+    # that carry no PD fields; those are not PD decode servers.
+    return (
+        getattr(cfg, "disaggregation_mode", None) == "decode"
+        and bool(cfg.disaggregation_decode_enable_radix_cache)
+        and cfg.disable_radix_cache is False
+        and envs.SGLANG_DECODE_STATE_FREE_RADIX.get()
+    )
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
+    if decode_state_free_radix_of(cfg):
+        # The tree caches no state, so there is nothing to track checkpoints for.
+        return False
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",

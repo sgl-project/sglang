@@ -28,10 +28,18 @@ PHYSICAL = 690240
 CONTEXT = 1048576
 
 
-def make_configurator(*, is_hybrid_swa=False, is_draft_worker=False):
+def make_configurator(
+    *, is_hybrid_swa=False, is_draft_worker=False, use_mla_backend=False
+):
     configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
     configurator.is_hybrid_swa = is_hybrid_swa
     configurator.is_draft_worker = is_draft_worker
+    # Read by draft_mla_rows_are_physical: a plain MLA draft (no mamba / DSA /
+    # V4 / FP4) under DCP keeps physical rows.
+    configurator.use_mla_backend = use_mla_backend
+    configurator.mambaish_config = None
+    configurator.model_config = NS(hf_config=NS(architectures=["TestForCausalLM"]))
+    configurator.kv_cache_dtype = torch.bfloat16
     return configurator
 
 
@@ -140,9 +148,14 @@ class TestDcpLogicalCapacity(CustomTestCase):
         self.assertGreater(runner.token_to_kv_pool_allocator.size, 64 * 8)
         self.assertEqual(runner.logical_max_total_num_tokens, 64 * 8)
 
-        # Draft sizes already carry loc_space_scale; SWA never widens.
+        # An MHA draft's size already carries loc_space_scale; an MLA draft
+        # keeps physical rows and widens like the target. SWA never widens.
         runner.kv_cache_configurator = make_configurator(is_draft_worker=True)
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
+        runner.kv_cache_configurator = make_configurator(
+            is_draft_worker=True, use_mla_backend=True
+        )
+        self.assertEqual(runner.logical_max_total_num_tokens, 64 * 8)
         runner.is_hybrid_swa = True
         runner.kv_cache_configurator = make_configurator(is_hybrid_swa=True)
         runner.full_max_total_num_tokens = 32

@@ -36,6 +36,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
+    topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -568,9 +569,6 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
-@pytest.mark.skipif(
-    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
-)
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "extend_lens",
@@ -641,9 +639,6 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
         _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
 
 
-@pytest.mark.skipif(
-    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
-)
 @pytest.mark.parametrize("residue", [1, 2, 3])
 @pytest.mark.parametrize("boundary", [8192, 16384])
 @torch.inference_mode()
@@ -704,6 +699,190 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
             continue
         ref = torch.topk(window, k, sorted=False).indices.tolist()
         _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+
+
+@pytest.mark.skipif(is_hip(), reason="ROCm split path keeps its own tie merge")
+@pytest.mark.parametrize("num_ties", [129, 700, 1500])
+@pytest.mark.parametrize("seq", [5000, 12000, 40000, 131072])
+@pytest.mark.parametrize("path", ["paged", "ragged", "packed"])
+@torch.inference_mode()
+def test_topk_v2_ties_by_index(path: str, seq: int, num_ties: int) -> None:
+    """With stable_ties, equal scores at the cut resolve to the smallest
+    indices, as a stable sort would, also past the 128 ties the warp paths
+    handle. A run of
+    ``num_ties`` equal scores straddles the k-th place of each row; it stays
+    below the 2048-candidate tie buffer, past which the choice among the
+    candidates of the threshold bin is not defined."""
+    k, batch = 2048, 2
+    g = torch.Generator(device="cuda").manual_seed(seq + num_ties)
+    scores = torch.randn(batch, seq, generator=g, device="cuda")
+    for row in range(batch):
+        cut = scores[row].topk(k - num_ties // 2).values[-1].item()
+        tied = torch.randperm(seq, generator=g, device="cuda")[:num_ties]
+        scores[row, tied] = cut
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    out = torch.full((batch, k), -2, dtype=torch.int32, device="cuda")
+    zeros = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    if path == "paged":
+        plan = _plan(seq_lens)
+        topk_transform_paged_v2(
+            scores.clone(), seq_lens, None, out, PAGE_SIZE, plan, stable_ties=True
+        )
+    elif path == "ragged":
+        topk_transform_ragged_v2(
+            scores.clone(),
+            seq_lens,
+            out_offsets=zeros,
+            out_indices=out,
+            stable_ties=True,
+        )
+    else:
+        identity = torch.arange(-(-seq // PAGE_SIZE), dtype=torch.int32, device="cuda")
+        topk_transform_packed_v2(
+            scores.clone(),
+            seq_lens,
+            identity.expand(batch, -1).contiguous(),
+            out,
+            PAGE_SIZE,
+            row_starts=zeros,
+            stable_ties=True,
+        )
+    for row in range(batch):
+        expected = torch.sort(-scores[row], stable=True).indices[:k].sort().values
+        actual = out[row].long().sort().values
+        assert torch.equal(actual, expected), f"row {row}: tie order not stable"
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA candidate epilogue")
+@pytest.mark.parametrize("seq", [100, 2048, 5000, 12000, 40000])
+@pytest.mark.parametrize("with_row_starts", [False, True])
+@torch.inference_mode()
+def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> None:
+    """The candidate epilogue selects what the ragged kernel selects and emits
+    (score bits, position * world + rank), (0, -1) padded."""
+    k, batch, world, rank = 2048, 3, 8, 5
+    g = torch.Generator(device="cuda").manual_seed(seq)
+    width = seq + 16
+    scores = torch.randn(batch, width, generator=g, device="cuda")
+    scores[:, 7:400] = scores[:, 7:8]  # ties across the window
+    seq_lens = torch.tensor(
+        [seq, max(seq // 3, 1), 1], dtype=torch.int32, device="cuda"
+    )
+    starts = (
+        torch.tensor([0, 5, 13], dtype=torch.int32, device="cuda")
+        if with_row_starts
+        else None
+    )
+    ragged = torch.empty(batch, k, dtype=torch.int32, device="cuda")
+    topk_transform_ragged_v2(
+        scores.clone(),
+        seq_lens,
+        out_offsets=torch.zeros(batch, dtype=torch.int32, device="cuda"),
+        out_indices=ragged,
+        row_starts=starts,
+        stable_ties=True,
+    )
+    cand = torch.empty(batch, k, 2, dtype=torch.int32, device="cuda")
+    topk_transform_candidates_v2(
+        scores.clone(),
+        seq_lens,
+        out_candidates=cand,
+        world=world,
+        rank=rank,
+        row_starts=starts,
+        stable_ties=True,
+    )
+    # Output slot order is not part of either contract; compare the sets.
+    for row in range(batch):
+        start = 0 if starts is None else int(starts[row])
+        idx = ragged[row].long()
+        idx = idx[idx >= 0].sort().values
+        pos = cand[row, :, 1].long()
+        valid = pos >= 0
+        assert torch.equal(pos[valid].sort().values, idx * world + rank)
+        local = (pos[valid] - rank) // world
+        want_bits = scores[row, start + local].view(torch.int32)
+        assert torch.equal(cand[row, valid, 0], want_bits)
+        assert bool((cand[row, ~valid, 0] == 0).all())
+
+
+def _candidate_sets(scores, seq_lens, k, world, rank, **kwargs):
+    cand = torch.full(
+        (scores.shape[0], k, 2), -7, dtype=torch.int32, device=scores.device
+    )
+    topk_transform_candidates_v2(
+        scores.clone(),
+        seq_lens,
+        out_candidates=cand,
+        world=world,
+        rank=rank,
+        stable_ties=True,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+    return cand
+
+
+@pytest.mark.skipif(
+    is_hip()
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="CUDA cluster candidate top-k (sm90 / sm100)",
+)
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@pytest.mark.parametrize("dist", ["randn", "ties", "dense_top"] + NARROW_DISTRIBUTIONS)
+@torch.inference_mode()
+def test_topk_v2_candidates_cluster_matches_one_block(
+    dist: str, cluster_size: int
+) -> None:
+    k, world, rank = 2048, 8, 3
+    lens = [65536, 40000, 16385, 12000, 8193, 4097, 2049, 2048, 100, 0]
+    width = max(lens) + 64
+    torch.manual_seed(len(dist) * 31 + cluster_size)
+    if dist == "randn":
+        scores = torch.randn(len(lens), width, device="cuda")
+    elif dist == "ties":
+        scores = torch.randint(0, 200, (len(lens), width), device="cuda").float() / 8
+    elif dist == "dense_top":
+        scores = 10 + 0.3 * torch.randn(len(lens), width, device="cuda")
+    else:
+        scores = _single_bin_scores(dist, len(lens), width, "cuda")
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    ref = _candidate_sets(scores, seq_lens, k, world, rank)
+    for floor in (0, 16384):
+        got = _candidate_sets(
+            scores,
+            seq_lens,
+            k,
+            world,
+            rank,
+            cluster_size=cluster_size,
+            cluster_floor=floor,
+        )
+        for row, n in enumerate(lens):
+            msg = (dist, floor, row, n)
+            got_pos, got_order = got[row, :, 1].sort()
+            valid = got_pos >= 0
+            assert int(valid.sum()) == min(n, k), msg
+            local = (got_pos[valid] - rank) // world
+            assert bool((local >= 0).all() and (local < n).all()), msg
+            assert local.unique().numel() == local.numel(), msg
+            assert torch.equal(
+                got[row, got_order[valid], 0],
+                scores[row, local.long()].view(torch.int32),
+            ), msg
+            assert bool((got[row, got_order[~valid], 0] == 0).all()), msg
+            if n == 0:
+                continue
+            want = scores[row, :n].topk(min(n, k)).values
+            kth_copies = int((scores[row, :n] == want[-1]).sum())
+            if n > k and kth_copies > k:
+                assert torch.equal(
+                    scores[row, local.long()].sort(descending=True).values, want
+                ), msg
+            else:
+                want_pos, _ = ref[row, :, 1].sort()
+                assert torch.equal(got_pos, want_pos), msg
 
 
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")

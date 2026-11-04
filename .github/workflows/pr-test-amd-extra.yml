@@ -127,7 +127,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
-      require-run-ci-extra: true
+      require-label: run-ci-extra
     secrets: inherit
 
   # =============================================== extra-a (1-gpu-small) ===============================================

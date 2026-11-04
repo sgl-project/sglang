@@ -33,9 +33,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.n
     NomasLatentSession,
     NomasSegmentCondition,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 # The framework's parallel linears resolve the TP group at construction.
 pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
+
+# On ROCm, Inductor's fused kernels are not bitwise equal to eager, and the
+# dynamic-shape create_block_mask compile fails, so these checks are CUDA-only.
+is_nvidia_cuda = torch.cuda.is_available() and current_platform.is_cuda()
 
 
 def tiny_model(device="cpu", backend="sdpa"):
@@ -120,7 +125,7 @@ def test_shared_modulation_and_residual_preserve_rounding(tokens, dtype):
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernels need CUDA")
+@pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
 @torch.inference_mode()
 def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
     from sglang.multimodal_gen.runtime.models.dits import nomas_layers as layers
@@ -150,7 +155,7 @@ def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
     assert torch.equal(fused, layers.modulate(x, shift, scale).to(torch.bfloat16))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernels need CUDA")
+@pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
 @torch.inference_mode()
 def test_pixelumm_fused_norm_and_swiglu_are_bitwise_exact():
     from sglang.multimodal_gen.runtime.models.vaes import nomas as vae
@@ -385,7 +390,7 @@ def test_registration_cli_routing_and_full_parameter_count():
     assert sum(p.numel() for p in model.parameters()) == 8_553_434_592
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA FlexAttention")
+@pytest.mark.skipif(not is_nvidia_cuda, reason="CUDA FlexAttention")
 @torch.inference_mode()
 def test_growing_history_across_twelve_segments():
     # Exercise more distinct history lengths than Dynamo's default recompile

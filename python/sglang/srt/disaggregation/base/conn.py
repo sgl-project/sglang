@@ -28,6 +28,10 @@ class StateType(str, enum.Enum):
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
+    # DFLASH draft KV ring: one item per ring row, the request's last window in
+    # position order; row 0 marks a position the sending or receiving rank does
+    # not own under DCP.
+    DRAFT_RING = "draft_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
     # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
@@ -94,6 +98,9 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # Decode side: its draft pool stores DCP owner rows, so PD transfer maps
+    # the draft like the target instead of raw widened rows.
+    draft_rows_dcp_collapsed: bool = False
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.

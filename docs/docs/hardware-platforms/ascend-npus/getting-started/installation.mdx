@@ -295,31 +295,25 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`) if you need the latest development changes. CANN 9.1.0 has no stable image yet, so use the daily build tag for now.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`) if you need the latest development changes.
 
-Validated release builds are also published as `cann9.1.0-<device>-B<NN>` tags (e.g., `cann9.1.0-950-B080`). The exact component versions inside each release image are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.1.0-950-B100` entry for the 950PR/DT Series.
+CANN 9.1.0 has no stable release yet, so use a validated build for now. The `cann9.1.0-<device>-B<NN>` tags (e.g., `cann9.1.0-a3-B105`, `cann9.1.0-950-B105`) are validated builds rather than stable releases; they stand in until a stable release is published. The exact component versions inside each build are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.1.0-950-B105` entry for the 950PR/DT Series.
 
-{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tags `main-cann9.1.0-a3` / `main-cann9.1.0-950`. Once the stable image is published, switch back to the stable release tag. */}
+{/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
 </Tip>
 
 <Tabs>
   <Tab title="Ascend A3 Series">
 
 ```bash Command
-# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
-# daily build tag. Once the stable image is published, switch back to the
-# stable release tag.
-docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 ```
 
   </Tab>
   <Tab title="Ascend 950PR/DT Series">
 
 ```bash Command
-# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
-# daily build tag. Once the stable image is published, switch back to the
-# stable release tag.
-docker pull quay.io/ascend/sglang:main-cann9.1.0-950
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
 ```
 
   </Tab>

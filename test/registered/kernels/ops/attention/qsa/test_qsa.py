@@ -2106,8 +2106,9 @@ def _qsa_float_reference(case, q, indices, row_requests):
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("prefix_lens", [(200, 75), (0, 75)])
+@pytest.mark.parametrize("prefetch", [False, True])
 def test_qsa_cp_extend_reads_cached_prefix_in_place(
-    monkeypatch, cache_dtype, rank, prefix_lens
+    monkeypatch, cache_dtype, rank, prefix_lens, prefetch
 ):
     """Prefill CP with a cached prefix attends this rank's zigzag rows straight
     off the pool (the gathered new tokens are stored first); with bf16 K/V it
@@ -2155,8 +2156,24 @@ def test_qsa_cp_extend_reads_cached_prefix_in_place(
     local_k = case.new_k[local_rows]
     local_v = case.new_v[local_rows]
 
+    side_stream = qsa_backend_module.get_stream("qsa_cp_kv")
+    release_waits = []
+    wait_stream = torch.cuda.Stream.wait_stream
+
+    def track_wait(stream, other):
+        if stream == side_stream:
+            release_waits.append(other)
+        return wait_stream(stream, other)
+
+    monkeypatch.setattr(torch.cuda.Stream, "wait_stream", track_wait)
+
     def run(save_kv_cache):
-        return QwenSparseAttnBackend._forward_extend_cp(
+        if prefetch:
+            case.backend.prefetch_cp_kv(
+                case.layer, local_k.flatten(1), local_v.flatten(1), batch
+            )
+        release_waits.clear()
+        output = QwenSparseAttnBackend._forward_extend_cp(
             case.backend,
             q.flatten(1),
             local_k.flatten(1),
@@ -2166,6 +2183,9 @@ def test_qsa_cp_extend_reads_cached_prefix_in_place(
             indices,
             save_kv_cache,
         )
+        assert case.backend._cp_kv_pending is None
+        assert release_waits == ([torch.cuda.current_stream()] if prefetch else [])
+        return output
 
     actual = run(save_kv_cache=True)
     expected = _qsa_float_reference(case, q, indices, requests.tolist())

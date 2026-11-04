@@ -17,6 +17,7 @@ from typing import Literal, Optional
 
 import torch
 
+from sglang.kernels.ops.moe.eplb_map_record import eplb_map_and_record
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.runtime_context import get_exec
 
@@ -103,6 +104,20 @@ def topk_ids_logical_to_physical(
             )
         return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+
+
+def topk_ids_logical_to_physical_and_record(
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    load_buffer: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if info is not None and info.ep_dispatch_algorithm != "static":
+        return None
+    dispatch = (
+        info.partial_logical_to_rank_dispatch_physical_map if info is not None else None
+    )
+    return eplb_map_and_record(topk_ids, dispatch, load_buffer, num_token_non_padded)
 
 
 def _topk_ids_logical_to_physical_static(

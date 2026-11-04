@@ -12,7 +12,11 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _info(temps):
-    return types.SimpleNamespace(temperatures=torch.tensor(temps, device="cuda"))
+    return types.SimpleNamespace(
+        temperatures=torch.tensor(temps, device="cuda"),
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+    )
 
 
 class TestSimulatedBonus(unittest.TestCase):

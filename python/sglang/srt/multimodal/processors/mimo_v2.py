@@ -4,7 +4,6 @@ import asyncio
 import base64
 import copy
 import math
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -471,7 +470,7 @@ class MiMoProcessor:
         if isinstance(path_or_data, str) and path_or_data.startswith(
             ("http://", "https://")
         ):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = envs.SGLANG_MEDIA_URL_TIMEOUT.get()
             path_or_data = download_remote_media(path_or_data, timeout=timeout)
 
         if isinstance(path_or_data, bytes):

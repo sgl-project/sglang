@@ -23,6 +23,9 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_cast_triton as set_mla_kv_buffer_cast_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_dcp_sharded_triton as set_mla_kv_buffer_dcp_sharded_triton,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (

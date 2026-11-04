@@ -51,6 +51,10 @@ def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "Kimi-K3 does not support --enable-prefill-cp yet (Kimi-K3.1 does)."
+        )
     if cfg.dcp_size > 1:
         overrides = {}
         if cfg.enable_symm_mem:
@@ -74,11 +78,11 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"not validated under DCP (got {ragged_mode.value!r})."
                 )
 
-            # DSPARK target-verify + draft-extend must run on the decode
-            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
-            # signature (causal_seqs / cp_world / cp_rank). The default
-            # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
-            # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
+        if cfg.speculative_algorithm in ("DSPARK", "EAGLE3"):
+            # Target-verify + draft-extend must run on the decode (cutedsl_mla)
+            # backend, whose _run_decode_kernel implements the DCP signature
+            # (causal_seqs / cp_world / cp_rank). The default "prefill" routes
+            # them to trtllm_mla, which refuses DCP with q_len > 1.
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(cfg)
@@ -111,12 +115,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'aiter', got {decode_backend!r}."
             )
 
-        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
-            "a2a",
-            "fi_a2a",
-        ):
-            logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
-            overrides["dcp_replicate_q_proj"] = True
+        overrides.update(_dcp_replicate_q_proj_default(cfg, "Kimi-K3"))
         return overrides
 
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103)):
@@ -169,7 +168,96 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-@_register_for("KimiK3ForConditionalGeneration")
+@_register_for("KimiK31ForConditionalGeneration")
+def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    overrides = {}
+    if cfg.dcp_size > 1:
+        overrides.update(_kimi_k31_dcp_overrides(cfg))
+    if cfg.enable_unified_memory:
+        raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
+    overrides.update(_kimi_k31_lossless_defaults(cfg))
+    return overrides
+
+
+def _kimi_k31_lossless_defaults(cfg: Any) -> dict:
+    """Turn on Kimi-K3.1 optimizations that keep model precision unless set:
+    FlashMLA prefill token packing only reorders the sparse-key sum, is
+    self-gated to the layouts it supports and stays off in deterministic mode."""
+    overrides = {}
+    if cfg.enable_flashmla_prefill_token_packing is None:
+        overrides["enable_flashmla_prefill_token_packing"] = True
+    if overrides:
+        logger.info(f"Kimi-K3.1 enables lossless defaults: {overrides}")
+    return overrides
+
+
+def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
+    """DCP shards the MLA KV and the index-K cache by token; the indexer merges
+    a global top-k and the DSA attention (flashmla_kv or trtllm) merges partials
+    by LSE."""
+    dcp = cfg.dcp_size
+    if dcp & (dcp - 1) or cfg.tp_size % dcp:
+        raise ValueError(
+            f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
+            f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
+        )
+    unsupported = {
+        "speculative decoding other than DSPARK and DFLASH": cfg.speculative_algorithm
+        not in (None, "DSPARK", "DFLASH"),
+        # A DFLASH MLA draft attends over DCP owner rows on the draft-verify
+        # path, which only cute-dsl MLA serves with a global causal bound.
+        "a DFLASH draft attention backend other than cutedsl_mla": (
+            cfg.speculative_algorithm == "DFLASH"
+            and cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla")
+        ),
+        # Mooncake moves a DCP-1 prefill's KV row by row and a same-DCP
+        # prefill's page by page, and raises on any other DCP pair.
+        "PD over a transfer backend other than Mooncake": (
+            cfg.disaggregation_mode in ("prefill", "decode")
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ),
+        "HiSparse": cfg.enable_hisparse,
+        "prefill context parallel": cfg.enable_prefill_cp
+        or (cfg.attn_cp_size or 1) > 1,
+    }
+    rejected = [name for name, on in unsupported.items() if on]
+    if rejected:
+        raise ValueError(f"Kimi-K3.1 DCP does not support {', '.join(rejected)} yet.")
+    overrides = _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
+    if cfg.speculative_algorithm == "DFLASH":
+        overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
+        # Target verify runs on the DSA decode impl, which merges the per-rank
+        # partials by LSE.
+        overrides["speculative_attention_mode"] = "decode"
+    if cfg.speculative_algorithm == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static; "
+                f"compact/cap-accept are not validated under DCP (got {ragged_mode.value!r})."
+            )
+        # Target verify runs on the DSA decode impl, which merges
+        # the per-rank partials by LSE, as for Kimi-K3 DCP + DSPARK.
+        overrides["speculative_attention_mode"] = "decode"
+    return overrides
+
+
+def _dcp_replicate_q_proj_default(cfg: Any, model: str) -> dict:
+    # With an all-to-all merge, project full-head q locally (bf16 attention
+    # weights) instead of all-gathering it every layer.
+    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
+        logger.info(f"{model} DCP enables replicated Q projection by default.")
+        return {"dcp_replicate_q_proj": True}
+    return {}
+
+
+@_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode

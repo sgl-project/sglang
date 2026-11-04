@@ -523,10 +523,17 @@ class MultimemAllGatherer:
         if tp_group.world_size <= 1:
             return None
         if self._tp_group_spans_nodes(tp_group):
-            logger.warning(
-                "multimem all-gather disabled because the TP group spans across nodes."
+            from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+                is_one_nvlink_clique,
             )
-            return None
+
+            # Multicast spans nodes of one NVLink clique (MNNVL).
+            if not is_one_nvlink_clique(tp_group.cpu_group, tp_group.device):
+                logger.warning(
+                    "multimem all-gather disabled because the TP group spans "
+                    "nodes outside one NVLink clique."
+                )
+                return None
         try:
             state = create_state(
                 group=tp_group.device_group,

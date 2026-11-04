@@ -1197,6 +1197,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
         self.kv_index_translator = full_attn_backend.kv_index_translator
+        # Full-attention layers reach the full backend through this one.
+        self.plans_padded_extend_rows = full_attn_backend.plans_padded_extend_rows
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens

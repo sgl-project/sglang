@@ -1,0 +1,505 @@
+name: Build Kimi-K3.1 Image
+
+# Overlay a branch of this fork onto a sglang image and push it to ECR, for amd64
+# (B200/B300) and arm64 (GB200/GB300), each built natively on its own runner and
+# published as one multi-arch tag.
+#
+# The image recipe is the built source's own docker/ directory:
+# Full: docker/k31.Dockerfile on the nightly (the same file used for manual builds).
+#   It runs when there is no previous build, the previous build is not an ancestor
+#   of ref, the nightly base moved, the overlay layer count hit its cap, or
+#   full_rebuild is set (~35 min).
+# Incremental (default): docker/k31-incremental.Dockerfile on the branch's previous
+#   build for that architecture (k31-<ref>-latest-<arch>), applying only the commits
+#   since that build, so a Python-only change adds one small layer and takes seconds.
+#   It reinstalls when dependency pins or Rust extensions change, and rebuilds
+#   flashmla_ops / the FlashInfer DynBlock modules when their inputs changed.
+# Both run docker/k31-image/verify_image.py, which fails the build if the Rust
+# TreeCore, flashmla_ops or the DynBlock modules fell back.
+
+on:
+  push:
+    branches: [dev]
+    paths-ignore: ["docs/**", "test/**", "**.md"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit of this repo to build"
+        required: true
+        default: dev
+      base_tag:
+        description: "lmsysorg/sglang tag for a full build. Empty = newest nightly-dev-YYYYMMDD-<sha> whose commit is an ancestor of ref"
+        required: false
+        default: ""
+      full_rebuild:
+        description: "Rebuild from the nightly instead of the previous build"
+        type: boolean
+        required: false
+        default: false
+      platforms:
+        description: "Architectures to build and publish"
+        type: choice
+        options: [both, amd64, arm64]
+        default: both
+
+concurrency:
+  group: k31-image-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # -eo pipefail: a failed curl or docker call fails the step, not just its pipe.
+    shell: bash
+
+env:
+  REGISTRY: 976589843892.dkr.ecr.us-west-2.amazonaws.com
+  REPOSITORY: radixark/sglang-ext
+  # Incremental builds stack one layer each; past this a full build flattens them.
+  MAX_OVERLAY_LAYERS: 20
+  # Parallel nvcc jobs for flashmla_ops: 12 peaks at ~23 GB on the 16-vCPU / 30 GB runners.
+  FLASHMLA_JOBS: 12
+
+jobs:
+  # Resolve the source commit and the nightly base once, so every architecture
+  # builds the same tree.
+  plan:
+    if: github.repository == 'radixark/sglang-k31'
+    runs-on: [self-hosted, k31-docker-build]
+    outputs:
+      ref: ${{ steps.plan.outputs.ref }}
+      ref_slug: ${{ steps.plan.outputs.ref_slug }}
+      src_sha: ${{ steps.plan.outputs.src_sha }}
+      nightly_image: ${{ steps.plan.outputs.nightly_image }}
+      nightly_sha: ${{ steps.plan.outputs.nightly_sha }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve source, nightly and architectures
+        id: plan
+        env:
+          # Inject via env so a crafted input cannot break out of the script.
+          REF: ${{ inputs.ref || github.ref_name }}
+          BASE_TAG: ${{ inputs.base_tag }}
+          PLATFORMS: ${{ inputs.platforms || 'both' }}
+        run: |
+          # Whole-string checks: a '^...$' regex anchors per line, so a
+          # multi-line value would pass and inject extra output lines.
+          case "${REF}" in
+            ""|-*|*[!a-zA-Z0-9._/-]*) echo "::error::ref is not a valid git ref"; exit 1 ;;
+          esac
+          case "${BASE_TAG}" in
+            "") ;;
+            [!a-zA-Z0-9_]*|*[!a-zA-Z0-9._-]*) echo "::error::base_tag is not a valid Docker tag"; exit 1 ;;
+          esac
+          AMD64='{"arch":"amd64","runner":"k31-docker-build"}'
+          ARM64='{"arch":"arm64","runner":"k31-docker-build-arm64"}'
+          case "${PLATFORMS}" in
+            both) MATRIX="[${AMD64},${ARM64}]" ;;
+            amd64) MATRIX="[${AMD64}]" ;;
+            arm64) MATRIX="[${ARM64}]" ;;
+            *) echo "::error::unsupported platforms '${PLATFORMS}'"; exit 1 ;;
+          esac
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          SRC_SHA=$(git rev-parse --verify -q "origin/${REF}^{commit}" || git rev-parse --verify -q "${REF}^{commit}") || {
+            echo "::error::Cannot resolve ref '${REF}'"; exit 1; }
+
+          # Nightly base: the newest nightly whose commit ref is built on, so the
+          # full patch is a plain diff. Tags look like nightly-dev-20261010-961bcf48.
+          NIGHTLY_TAG="${BASE_TAG}"
+          if [ -z "${NIGHTLY_TAG}" ]; then
+            curl -fsSL "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags?page_size=100&ordering=last_updated&name=nightly-dev-2" \
+              | python3 -c 'import json, re, sys
+          tags = [t["name"] for t in json.load(sys.stdin)["results"]]
+          tags = [t for t in tags if re.fullmatch(r"nightly-dev-\d{8}-[0-9a-f]{8}", t)]
+          print("\n".join(sorted(tags, reverse=True)))' > /tmp/k31-nightly-tags-${GITHUB_RUN_ID}
+            while read -r tag; do
+              sha=$(git rev-parse --verify -q "${tag##*-}^{commit}") || continue
+              if git merge-base --is-ancestor "${sha}" "${SRC_SHA}"; then
+                NIGHTLY_TAG="${tag}"
+                break
+              fi
+            done < /tmp/k31-nightly-tags-${GITHUB_RUN_ID}
+            rm -f /tmp/k31-nightly-tags-${GITHUB_RUN_ID}
+            if [ -z "${NIGHTLY_TAG}" ]; then
+              echo "::error::No recent nightly-dev image is built from an ancestor of ${SRC_SHA}; pass base_tag"
+              exit 1
+            fi
+          fi
+          # The digest of the multi-arch index: each build picks its platform from it.
+          NIGHTLY_DIGEST=$(docker buildx imagetools inspect "lmsysorg/sglang:${NIGHTLY_TAG}" --format '{{json .Manifest}}' \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])')
+          NIGHTLY_IMAGE="lmsysorg/sglang:${NIGHTLY_TAG}@${NIGHTLY_DIGEST}"
+
+          # Nightly tags end in the commit, which saves pulling ~15 GB here; the
+          # Dockerfile asserts it against the image's HEAD. Other tags: read the image.
+          NIGHTLY_SHA=""
+          case "${NIGHTLY_TAG}" in
+            nightly-dev-[0-9]*-[0-9a-f]*)
+              NIGHTLY_SHA=$(git rev-parse --verify -q "${NIGHTLY_TAG##*-}^{commit}" || true) ;;
+          esac
+          if [ -z "${NIGHTLY_SHA}" ]; then
+            # --entrypoint skips the CUDA banner, which would otherwise land in stdout.
+            NIGHTLY_SHA=$(docker run --rm --pull always --entrypoint git "${NIGHTLY_IMAGE}" \
+              -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null | tail -n 1)
+            docker image rm "${NIGHTLY_IMAGE}" || true
+          fi
+          case "${NIGHTLY_SHA}" in *[!0-9a-f]*) NIGHTLY_SHA="" ;; esac
+          [ "${#NIGHTLY_SHA}" -eq 40 ] || { echo "::error::Cannot read the commit of ${NIGHTLY_IMAGE}"; exit 1; }
+          if ! git cat-file -e "${NIGHTLY_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags https://github.com/sgl-project/sglang.git "${NIGHTLY_SHA}"
+          fi
+          if ! git merge-base --is-ancestor "${NIGHTLY_SHA}" "${SRC_SHA}"; then
+            echo "::error::Nightly commit ${NIGHTLY_SHA} is not an ancestor of ${REF} (${SRC_SHA}); pick an older base_tag"
+            exit 1
+          fi
+
+          {
+            echo "ref=${REF}"
+            echo "ref_slug=$(echo "${REF}" | tr '/' '-')"
+            echo "src_sha=${SRC_SHA}"
+            echo "nightly_image=${NIGHTLY_IMAGE}"
+            echo "nightly_sha=${NIGHTLY_SHA}"
+            echo "matrix=${MATRIX}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source ${REF} = ${SRC_SHA}; nightly ${NIGHTLY_IMAGE} = ${NIGHTLY_SHA}; architectures ${MATRIX}"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    env:
+      ARCH: ${{ matrix.arch }}
+      REF: ${{ needs.plan.outputs.ref }}
+      REF_SLUG: ${{ needs.plan.outputs.ref_slug }}
+      SRC_SHA: ${{ needs.plan.outputs.src_sha }}
+      NIGHTLY_IMAGE: ${{ needs.plan.outputs.nightly_image }}
+      NIGHTLY_SHA: ${{ needs.plan.outputs.nightly_sha }}
+      BASE_TAG: ${{ inputs.base_tag }}
+      FULL_REBUILD: ${{ inputs.full_rebuild || false }}
+    steps:
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Login to ECR
+        run: |
+          # The runner holds an IAM Identity Center login (profile k31-ecr), which
+          # refreshes the role credentials until the SSO session expires.
+          if ! PASSWORD=$(aws ecr get-login-password --profile k31-ecr --region us-west-2); then
+            echo "::error::The SSO session on this runner has expired. On the runner run" \
+              "'aws sso login --sso-session radixark --use-device-code --no-browser'" \
+              "and approve the printed link, then re-run this workflow."
+            exit 1
+          fi
+          docker login --username AWS --password-stdin "${REGISTRY}" <<< "${PASSWORD}"
+
+      - name: Resolve parent image
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ARCH_LATEST="${REGISTRY}/${REPOSITORY}:k31-${REF_SLUG}-latest-${ARCH}"
+          LATEST="${REGISTRY}/${REPOSITORY}:k31-${REF_SLUG}-latest"
+
+          # Previous build of this ref for this architecture: its labels say what it
+          # contains. Read from the manifest, no pull. Builds from before per-arch
+          # tags are found through the multi-arch tag.
+          MODE=full
+          PREV_SRC="" PREV_DIGEST="" PREV_NIGHTLY="" PREV_LAYERS=0 PREV_FLASHMLA_TREE="" PREV_FI_DYNBLOCK=""
+          PREV_FOUND=0
+          for candidate in "${ARCH_LATEST}" "${LATEST}"; do
+            if PREV_JSON=$(docker buildx imagetools inspect "${candidate}" --format '{{json .}}' 2>/dev/null) \
+                && PREV_VARS=$(python3 docker/k31-image/image_info.py "${ARCH}" <<< "${PREV_JSON}"); then
+              eval "${PREV_VARS}"
+              PREV_FOUND=1
+              echo "Previous ${ARCH} build: ${candidate}"
+              break
+            fi
+          done
+          if [ "${FULL_REBUILD}" = true ]; then
+            REASON="full_rebuild requested"
+          elif [ -n "${BASE_TAG}" ]; then
+            REASON="base_tag given"
+          elif [ "${PREV_FOUND}" = 0 ]; then
+            REASON="no previous ${ARCH} build of ${REF}"
+          else
+            case "${PREV_LAYERS}" in ""|*[!0-9]*) PREV_LAYERS=1 ;; esac
+            if [ "${PREV_NIGHTLY}" != "${NIGHTLY_IMAGE}" ]; then
+              REASON="nightly base moved: ${PREV_NIGHTLY} -> ${NIGHTLY_IMAGE}"
+            elif ! git cat-file -e "${PREV_SRC}^{commit}" 2>/dev/null; then
+              REASON="previous build's commit '${PREV_SRC}' is unknown"
+            elif ! git merge-base --is-ancestor "${PREV_SRC}" "${SRC_SHA}"; then
+              REASON="previous build ${PREV_SRC:0:8} is not an ancestor of ${SRC_SHA:0:8}"
+            elif [ "${PREV_LAYERS}" -ge "${MAX_OVERLAY_LAYERS}" ]; then
+              REASON="${PREV_LAYERS} overlay layers reached the cap of ${MAX_OVERLAY_LAYERS}"
+            elif git diff --quiet "${PREV_SRC}" "${SRC_SHA}"; then
+              # publish accepts it: same tree as the source commit
+              MODE=none
+              REASON="the previous ${ARCH} build (${PREV_SRC:0:8}) already has this tree"
+            else
+              MODE=incremental
+              REASON="on top of ${PREV_SRC:0:8} (${PREV_LAYERS} overlay layers)"
+            fi
+          fi
+
+          if [ "${MODE}" = incremental ]; then
+            PARENT_IMAGE="${REGISTRY}/${REPOSITORY}@${PREV_DIGEST}"
+            FROM_SHA="${PREV_SRC}"
+            LAYERS=$((PREV_LAYERS + 1))
+          else
+            PARENT_IMAGE="${NIGHTLY_IMAGE}"
+            FROM_SHA="${NIGHTLY_SHA}"
+            LAYERS=1
+          fi
+
+          {
+            echo "ARCH_LATEST=${ARCH_LATEST}"
+            echo "MODE=${MODE}"
+            echo "REASON=${REASON}"
+            echo "PARENT_IMAGE=${PARENT_IMAGE}"
+            echo "FROM_SHA=${FROM_SHA}"
+            echo "LAYERS=${LAYERS}"
+            echo "PREV_FLASHMLA_TREE=${PREV_FLASHMLA_TREE}"
+            echo "PREV_FI_DYNBLOCK=${PREV_FI_DYNBLOCK}"
+            echo "AOT_TREE=$(git rev-parse "${SRC_SHA}:python/sglang/kernels/aot")"
+          } >> "$GITHUB_ENV"
+          echo "${ARCH} mode: ${MODE} (${REASON})"
+          echo "Parent: ${PARENT_IMAGE} = ${FROM_SHA}"
+
+      - name: Prepare build context
+        if: env.MODE != 'none'
+        run: |
+          # Per-run paths: runs for different refs can share this runner.
+          WORK="/tmp/k31-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}"
+          rm -rf "${WORK}"
+          mkdir -p "${WORK}"
+          echo "WORK=${WORK}" >> "$GITHUB_ENV"
+          # The image recipe is the source's own docker/ directory.
+          git cat-file -e "${SRC_SHA}:docker/k31.Dockerfile" \
+            || { echo "::error::${SRC_SHA:0:8} has no docker/k31.Dockerfile"; exit 1; }
+          FI_DYNBLOCK_KEY=$(git show "${SRC_SHA}:docker/k31-image/patch_flashinfer.py" \
+            "${SRC_SHA}:docker/k31-image/build_flashinfer_dynblock.py" | sha256sum | cut -c1-16)
+          echo "FI_DYNBLOCK_KEY=${FI_DYNBLOCK_KEY}" >> "$GITHUB_ENV"
+          PATCH_STAT=$(git diff --shortstat "${FROM_SHA}" "${SRC_SHA}" | xargs)
+          echo "PATCH_STAT=${PATCH_STAT}" >> "$GITHUB_ENV"
+
+          if [ "${MODE}" = full ]; then
+            # docker/k31.Dockerfile on a one-commit clone of the source (it needs .git for the
+            # package version; the full history would add ~800 MB to the image).
+            git config uploadpack.allowAnySHA1InWant true
+            git init -q "${WORK}/src"
+            git -C "${WORK}/src" fetch -q --depth 1 "file://${GITHUB_WORKSPACE}" "${SRC_SHA}"
+            git -C "${WORK}/src" checkout -q --detach FETCH_HEAD
+            {
+              echo "CONTEXT=${WORK}/src"
+              echo "DOCKERFILE=${WORK}/src/docker/k31.Dockerfile"
+              echo "RECIPE=docker/k31.Dockerfile"
+              # k31.Dockerfile always reinstalls and builds both.
+              echo "REINSTALL=1"
+              echo "BUILD_FLASHMLA=1"
+              echo "BUILD_FI_DYNBLOCK=1"
+            } >> "$GITHUB_ENV"
+          else
+            # docker/k31-incremental.Dockerfile on the patch since the parent's source commit.
+            mkdir -p "${WORK}/ctx"
+            git diff --binary "${FROM_SHA}" "${SRC_SHA}" > "${WORK}/ctx/merged.patch"
+            # Syntax check list: the changed sglang sources only.
+            git diff --name-only --diff-filter=AMR "${FROM_SHA}" "${SRC_SHA}" -- 'python/*.py' \
+              > "${WORK}/ctx/changed_py.txt"
+            git archive "${SRC_SHA}" docker/k31-image | tar -x --strip-components=1 -C "${WORK}/ctx"
+            git show "${SRC_SHA}:docker/k31-incremental.Dockerfile" > "${WORK}/ctx/Dockerfile"
+
+            # A dependency pin or a Rust extension of the sglang package changed:
+            # reinstall, which fetches the new wheels and rebuilds the extensions.
+            if git diff --quiet "${FROM_SHA}" "${SRC_SHA}" -- python/pyproject.toml python/setup.py rust; then
+              REINSTALL=0
+            else
+              REINSTALL=1
+            fi
+            # A reinstall may replace sgl-kernel and flashinfer with the PyPI wheels, so it forces
+            # both builds; otherwise each runs when its inputs differ from the parent's.
+            BUILD_FLASHMLA=0
+            if [ "${REINSTALL}" = 1 ] || [ "${PREV_FLASHMLA_TREE}" != "${AOT_TREE}" ]; then BUILD_FLASHMLA=1; fi
+            BUILD_FI_DYNBLOCK=0
+            if [ "${REINSTALL}" = 1 ] || [ "${PREV_FI_DYNBLOCK}" != "${FI_DYNBLOCK_KEY}" ]; then BUILD_FI_DYNBLOCK=1; fi
+            {
+              echo "CONTEXT=${WORK}/ctx"
+              echo "DOCKERFILE=${WORK}/ctx/Dockerfile"
+              echo "RECIPE=docker/k31-incremental.Dockerfile"
+              echo "REINSTALL=${REINSTALL}"
+              echo "BUILD_FLASHMLA=${BUILD_FLASHMLA}"
+              echo "BUILD_FI_DYNBLOCK=${BUILD_FI_DYNBLOCK}"
+            } >> "$GITHUB_ENV"
+            echo "reinstall=${REINSTALL}" \
+              "flashmla_ops=${BUILD_FLASHMLA} (aot tree ${AOT_TREE:0:10}, parent's ${PREV_FLASHMLA_TREE:0:10})" \
+              "dynblock=${BUILD_FI_DYNBLOCK} (key ${FI_DYNBLOCK_KEY}, parent's ${PREV_FI_DYNBLOCK})"
+          fi
+
+          if ! git diff --quiet "${FROM_SHA}" "${SRC_SHA}" -- python/sglang/kernels/aot; then
+            echo "::notice::python/sglang/kernels/aot changed: only the flashmla_ops target is rebuilt;" \
+              "other sgl-kernel ops stay at the base image's PyPI build"
+          fi
+          # Compiled parts that no step rebuilds keep the base's binaries.
+          NOT_REBUILT_PATHS="sgl-kernel experimental/sgl-router"
+          NOT_REBUILT=$(git diff --name-only "${FROM_SHA}" "${SRC_SHA}" -- ${NOT_REBUILT_PATHS} | wc -l | tr -d ' ')
+          echo "NOT_REBUILT=${NOT_REBUILT}" >> "$GITHUB_ENV"
+          if [ "${NOT_REBUILT}" -gt 0 ]; then
+            echo "::warning::${NOT_REBUILT} files changed since the parent are NOT rebuilt:"
+            git diff --name-only "${FROM_SHA}" "${SRC_SHA}" -- ${NOT_REBUILT_PATHS}
+          fi
+
+      - name: Set up Docker Buildx
+        if: env.MODE != 'none'
+        run: |
+          # One long-lived builder, so its store keeps the base image layers
+          # between runs (a builder per run would re-pull ~15 GB every time).
+          docker buildx inspect k31-builder >/dev/null 2>&1 \
+            || docker buildx create --name k31-builder --driver docker-container
+          docker buildx inspect --bootstrap k31-builder >/dev/null
+
+      - name: Build and push image
+        if: env.MODE != 'none'
+        run: |
+          ARCH_IMAGE="${REGISTRY}/${REPOSITORY}:k31-${REF_SLUG}-$(date -u +%Y%m%d)-${SRC_SHA:0:8}-${ARCH}"
+          echo "ARCH_IMAGE=${ARCH_IMAGE}" >> "$GITHUB_ENV"
+          # Full builds use docker/k31.Dockerfile (BASE_IMAGE), incremental ones
+          # docker/k31-incremental.Dockerfile (the rest); each ignores the other's args.
+          # One plain manifest per architecture (no provenance index), merged by publish.
+          docker buildx build \
+            --builder k31-builder \
+            --platform "linux/${ARCH}" \
+            --provenance=false \
+            --no-cache \
+            -f "${DOCKERFILE}" \
+            --build-arg BASE_IMAGE="${NIGHTLY_IMAGE}" \
+            --build-arg PARENT_IMAGE="${PARENT_IMAGE}" \
+            --build-arg FROM_SHA="${FROM_SHA}" \
+            --build-arg SRC_SHA="${SRC_SHA}" \
+            --build-arg REINSTALL="${REINSTALL}" \
+            --build-arg BUILD_FLASHMLA="${BUILD_FLASHMLA}" \
+            --build-arg FLASHMLA_JOBS="${FLASHMLA_JOBS}" \
+            --build-arg BUILD_FI_DYNBLOCK="${BUILD_FI_DYNBLOCK}" \
+            --label ai.radixark.base.image="${PARENT_IMAGE}" \
+            --label ai.radixark.nightly.image="${NIGHTLY_IMAGE}" \
+            --label ai.radixark.base.sglang_commit="${NIGHTLY_SHA}" \
+            --label ai.radixark.overlay.layers="${LAYERS}" \
+            --label ai.radixark.flashmla.tree="${AOT_TREE}" \
+            --label ai.radixark.flashinfer.dynblock="${FI_DYNBLOCK_KEY}" \
+            --label ai.radixark.source.repo="${GITHUB_REPOSITORY}" \
+            --label ai.radixark.source.ref="${REF}" \
+            --label ai.radixark.source.commit="${SRC_SHA}" \
+            -t "${ARCH_IMAGE}" \
+            -t "${ARCH_LATEST}" \
+            --push \
+            "${CONTEXT}"
+
+      - name: Write summary
+        run: |
+          {
+            if [ "${MODE}" = none ]; then
+              echo "### ${ARCH}: nothing to build"
+              echo "- ${REASON}"
+              exit 0
+            fi
+            echo "### ${ARCH}: built \`${ARCH_IMAGE}\`"
+            echo "- **Also tagged:** \`${ARCH_LATEST}\`"
+            echo "- **Source:** \`${REF}\` @ \`${SRC_SHA}\`"
+            echo "- **Mode:** ${MODE} (${REASON}), \`${RECIPE}\` of the source"
+            echo "- **Parent image:** \`${PARENT_IMAGE}\` (commit \`${FROM_SHA}\`)"
+            echo "- **Nightly base:** \`${NIGHTLY_IMAGE}\`"
+            echo "- **Overlay layers:** ${LAYERS} / ${MAX_OVERLAY_LAYERS}"
+            echo "- **Patch:** ${PATCH_STAT}"
+            echo "- **Reinstalled (deps + Rust extensions):** ${REINSTALL}"
+            echo "- **Built flashmla_ops:** ${BUILD_FLASHMLA} (aot tree \`${AOT_TREE:0:10}\`)"
+            echo "- **Rebuilt flashinfer DynBlock modules:** ${BUILD_FI_DYNBLOCK} (key \`${FI_DYNBLOCK_KEY}\`)"
+            echo "- **Changed files not rebuilt (sgl-kernel outside FlashMLA, router, docker):** ${NOT_REBUILT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up
+        if: always()
+        run: |
+          # Per-run paths are never reclaimed by a later run, so drop them here.
+          rm -rf "/tmp/k31-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}"
+          docker buildx prune --builder k31-builder --filter "until=72h" -f || true
+
+  # Combine the per-architecture images into the multi-arch tags, once every
+  # architecture holds the source tree.
+  publish:
+    needs: [plan, build]
+    runs-on: [self-hosted, k31-docker-build]
+    env:
+      REF_SLUG: ${{ needs.plan.outputs.ref_slug }}
+      SRC_SHA: ${{ needs.plan.outputs.src_sha }}
+      MATRIX: ${{ needs.plan.outputs.matrix }}
+    steps:
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Login to ECR
+        run: |
+          if ! PASSWORD=$(aws ecr get-login-password --profile k31-ecr --region us-west-2); then
+            echo "::error::The SSO session on this runner has expired. On the runner run" \
+              "'aws sso login --sso-session radixark --use-device-code --no-browser'" \
+              "and approve the printed link, then re-run this workflow."
+            exit 1
+          fi
+          docker login --username AWS --password-stdin "${REGISTRY}" <<< "${PASSWORD}"
+
+      - name: Publish multi-arch tags
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          IMAGE="${REGISTRY}/${REPOSITORY}:k31-${REF_SLUG}-$(date -u +%Y%m%d)-${SRC_SHA:0:8}"
+          LATEST="${REGISTRY}/${REPOSITORY}:k31-${REF_SLUG}-latest"
+          SOURCES=()
+          for ARCH in $(python3 -c 'import json, sys; print(" ".join(e["arch"] for e in json.loads(sys.argv[1])))' "${MATRIX}"); do
+            PREV_FOUND=0
+            for candidate in "${REGISTRY}/${REPOSITORY}:k31-${REF_SLUG}-latest-${ARCH}" "${LATEST}"; do
+              if PREV_JSON=$(docker buildx imagetools inspect "${candidate}" --format '{{json .}}' 2>/dev/null) \
+                  && PREV_VARS=$(python3 docker/k31-image/image_info.py "${ARCH}" <<< "${PREV_JSON}"); then
+                eval "${PREV_VARS}"
+                PREV_FOUND=1
+                break
+              fi
+            done
+            if [ "${PREV_FOUND}" = 0 ]; then
+              echo "::error::no ${ARCH} image of ${REF_SLUG} to publish"
+              exit 1
+            fi
+            # Same tree as the source commit (a no-op build keeps an older commit's image).
+            if ! git cat-file -e "${PREV_SRC}^{commit}" 2>/dev/null || ! git diff --quiet "${PREV_SRC}" "${SRC_SHA}"; then
+              echo "::error::the ${ARCH} image (${PREV_SRC:0:8}) does not hold ${SRC_SHA:0:8}"
+              exit 1
+            fi
+            echo "${ARCH}: ${REGISTRY}/${REPOSITORY}@${PREV_DIGEST} (${PREV_SRC:0:8})"
+            SOURCES+=("${REGISTRY}/${REPOSITORY}@${PREV_DIGEST}")
+          done
+          docker buildx imagetools create -t "${IMAGE}" -t "${LATEST}" "${SOURCES[@]}"
+          docker buildx imagetools inspect "${IMAGE}"
+          {
+            echo "### Published \`${IMAGE}\`"
+            echo "- **Also tagged:** \`${LATEST}\`"
+            echo "- **Source:** \`${SRC_SHA}\`"
+            echo "- **Architectures:** ${#SOURCES[@]}"
+            printf -- '- `%s`\n' "${SOURCES[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"

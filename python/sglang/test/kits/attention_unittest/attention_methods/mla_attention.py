@@ -163,6 +163,7 @@ class TinyMLAModelConfig:
         context_len: int,
     ):
         self.attention_arch = AttentionArch.MLA
+        self.is_dflash_mla_draft = False
         self.context_len = context_len
         self.hidden_size = hidden_size
         self.num_attention_heads = num_heads

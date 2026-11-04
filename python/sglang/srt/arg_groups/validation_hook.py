@@ -121,12 +121,14 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm == "DSPARK":
+    if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
         assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+            f"Pipeline parallel {cfg.speculative_algorithm} requires "
+            "disaggregation-mode=prefill"
         )
         assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
-            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+            f"SGLANG_ENABLE_PP_SPEC does not support {cfg.speculative_algorithm} "
+            "PD prefill"
         )
     elif cfg.speculative_algorithm is not None:
         assert (
@@ -183,6 +185,19 @@ def check_server_args(server_args: Any):
     assert cfg.pp_max_micro_batch_size is None or cfg.pp_max_micro_batch_size >= 1, (
         "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
         f"Got: {cfg.pp_max_micro_batch_size}"
+    )
+    assert (
+        cfg.pp_min_chunked_prefill_size is None or cfg.pp_min_chunked_prefill_size >= 1
+    ), (
+        "--pp-min-chunked-prefill-size must be a positive integer. "
+        f"Got: {cfg.pp_min_chunked_prefill_size}"
+    )
+    assert cfg.pp_chunk_overhead_tokens is None or (
+        cfg.pp_chunk_overhead_tokens >= 1
+        and cfg.pp_min_chunked_prefill_size is not None
+    ), (
+        "--pp-chunk-overhead-tokens must be a positive integer and needs "
+        f"--pp-min-chunked-prefill-size. Got: {cfg.pp_chunk_overhead_tokens}"
     )
 
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (

@@ -18,6 +18,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.flint import FlintConfig
 from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
@@ -42,7 +43,7 @@ from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.configs.k2_horizon import K2HorizonConfig, XllmConfig
-from sglang.srt.configs.kimi_k3 import KimiK3Config
+from sglang.srt.configs.kimi_k3 import KimiK3Config, KimiK31Config
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
@@ -128,6 +129,7 @@ __all__ = [
     "Glm5NextTextConfig",
     "KimiLinearConfig",
     "KimiK3Config",
+    "KimiK31Config",
     "KimiK25Config",
     "LagunaConfig",
     "Qwen3NextConfig",
@@ -139,6 +141,7 @@ __all__ = [
     "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
     "IQuestQ1Config",
+    "FlintConfig",
     "IQuestQ1MTPConfig",
     "InternS2MobiusConfig",
     "InternS2MobiusTextConfig",

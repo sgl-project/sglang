@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
+    decode_state_free_radix_of,
     mamba_cache_chunk_size,
     mamba_extra_buffer_of,
     model_config_of,
@@ -239,6 +240,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
@@ -276,6 +278,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
+        "KimiK31ForConditionalGeneration",
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -1072,7 +1075,9 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
-    else:
+    elif not decode_state_free_radix_of(view):
+        # A state-free decode tree caches no state, so neither the extra buffer
+        # nor no_buffer's page-1 / non-overlap requirements apply.
         validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 

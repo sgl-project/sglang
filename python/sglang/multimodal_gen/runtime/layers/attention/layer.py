@@ -2441,7 +2441,7 @@ def _make_breakable_attention_forward(forward_method):
     """Wrap a DiT attention module's ``forward`` so it becomes a breakable
     CUDA graph (BCG) break point.
 
-    During BCG capture the whole attention forward runs eagerly between
+    At every BCG replay the whole attention forward runs eagerly between
     captured graph segments -- the sequence-parallel all-to-all collectives,
     varlen packing, and dynamic/sparse attention kernels that live here
     cannot (or should not) be captured into a static CUDA graph. The outputs

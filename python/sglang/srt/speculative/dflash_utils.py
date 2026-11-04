@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
@@ -25,6 +26,7 @@ from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+_DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +130,22 @@ def dflash_draft_cell_size_per_token(
     """Exact bytes/token of the DFLASH draft KV pool."""
     if draft_num_layers <= 0:
         return 0
+    from sglang.srt.configs.model_config import AttentionArch
+
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    if getattr(draft_model_config, "attention_arch", None) == AttentionArch.MLA:
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        # The compressed latent is replicated across TP ranks, not expanded
+        # into per-head K/V or sharded with the query heads.
+        kv_dim = calculate_mla_kv_cache_dim(
+            model_config=draft_model_config, kv_cache_dtype=draft_kv_cache_dtype
+        )
+        return int(kv_dim * int(draft_num_layers) * dtype_size)
     num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
     kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
-    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
     return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
@@ -514,6 +529,204 @@ def _parse_optional_int(
         comparator = "positive" if int(min_value) == 1 else f">= {int(min_value)}"
         raise ValueError(f"{field_name} must be {comparator}, got {parsed}.")
     return parsed
+
+
+def get_dflash_attention_modes(draft_hf_config: Any) -> Tuple[str, ...]:
+    """One attention mode per draft layer.
+
+    SpecForge exports the scalar ``dflash_config.attention_mode``; per-layer
+    ``attention_modes`` lists come from forks that mix modes. Default is gqa.
+    """
+    dflash_cfg = _get_dflash_config(draft_hf_config)
+    num_hidden_layers = _parse_optional_int(
+        _cfg_get(_get_text_config(draft_hf_config), "num_hidden_layers", None),
+        field_name="DFLASH draft num_hidden_layers",
+        min_value=1,
+    )
+    if num_hidden_layers is None:
+        raise ValueError("DFLASH attention modes require config.num_hidden_layers.")
+    if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
+        raise ValueError(
+            "DFLASH dflash_config sets both attention_mode and attention_modes; "
+            "set only one."
+        )
+
+    raw_modes = dflash_cfg.get("attention_modes")
+    if raw_modes is None:
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")] * num_hidden_layers
+    elif not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != (
+        num_hidden_layers
+    ):
+        raise ValueError(
+            "DFLASH dflash_config.attention_modes must list one mode per draft "
+            f"layer (num_hidden_layers={num_hidden_layers}), got {raw_modes!r}."
+        )
+
+    modes = tuple(str(mode).lower() for mode in raw_modes)
+    unsupported = set(modes) - _DFLASH_ATTENTION_MODES
+    if unsupported:
+        raise ValueError(
+            f"DFLASH draft attention mode(s) {sorted(unsupported)} are not "
+            f"supported; expected one of {sorted(_DFLASH_ATTENTION_MODES)}."
+        )
+    return modes
+
+
+def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
+    modes = get_dflash_attention_modes(draft_hf_config)
+    if "mla" not in modes:
+        return False
+    # The draft KV pool has a single per-layer row layout.
+    if any(mode != "mla" for mode in modes):
+        raise ValueError(
+            "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
+            f"got attention modes {list(modes)}."
+        )
+    return True
+
+
+# The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
+_DFLASH_MLA_ROPE_TYPES = frozenset({"default", "yarn", "deepseek_yarn"})
+
+
+def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
+    """Reject MLA draft settings the target's DeepSeek MLA layer cannot serve."""
+    text_config = _get_text_config(draft_hf_config)
+    required = ("kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
+    missing = [name for name in required if _cfg_get(text_config, name) is None]
+    if missing:
+        raise ValueError(f"DFLASH mla draft config is missing {missing}.")
+    if _cfg_get(text_config, "attention_bias", False):
+        raise ValueError("DFLASH mla drafts do not support attention_bias.")
+    draft_cfg = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    if draft_cfg.attention_sink_bias or draft_cfg.attention_value_scale is not None:
+        raise ValueError(
+            "DFLASH mla drafts support neither attention_sink_bias nor "
+            "attention_value_scale."
+        )
+    rope = (
+        _cfg_get(text_config, "rope_parameters")
+        or _cfg_get(text_config, "rope_scaling")
+        or {}
+    )
+    rope_type = rope.get("rope_type", rope.get("type", "default"))
+    if rope_type not in _DFLASH_MLA_ROPE_TYPES:
+        raise ValueError(
+            f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
+            f"got {rope_type!r}."
+        )
+
+
+def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+    """Honor explicit causality while preserving legacy layer defaults."""
+    text_config = config.get_text_config()
+    is_causal = getattr(text_config, "is_causal", None)
+    if is_causal is None:
+        return default
+    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
+
+
+def get_dflash_layer_attention_params(
+    config, layer_id: int
+) -> Tuple[int, AttentionType]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return -1, AttentionType.ENCODER_ONLY
+    if layer_id >= len(layer_types):
+        raise ValueError(
+            "DFLASH config.layer_types must contain one entry per draft layer. "
+            f"Got {len(layer_types)} entries, layer_id={layer_id}."
+        )
+
+    layer_type = layer_types[layer_id]
+    if layer_type == "full_attention":
+        return -1, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
+        )
+    if layer_type == "sliding_attention":
+        sliding_window_size = get_dflash_attention_sliding_window_size(config)
+        assert sliding_window_size is not None
+        return sliding_window_size, _get_dflash_attention_type(
+            config, default=AttentionType.DECODER
+        )
+    raise ValueError(
+        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
+    )
+
+
+def is_dflash_mla_draft_causal(
+    draft_hf_config: Any, allow_sliding_window: bool = False
+) -> bool:
+    """The one causality of an MLA draft, for backends that fix it when they
+    plan a batch. ``allow_sliding_window``: the backend applies the window of
+    sliding_attention layers itself (trtllm_mla / cutedsl_mla)."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if (
+        not allow_sliding_window
+        and layer_types is not None
+        and "sliding_attention" in layer_types
+    ):
+        raise ValueError(
+            "DFLASH mla sliding_attention layers require "
+            "--speculative-draft-attention-backend triton, trtllm_mla or cutedsl_mla."
+        )
+    _, attn_type = get_dflash_layer_attention_params(draft_hf_config, layer_id=0)
+    return attn_type == AttentionType.DECODER
+
+
+def resolve_mla_draft_compact_window(
+    draft_hf_config: Any, *, window_size: Optional[int], dcp_size: int
+) -> Optional[int]:
+    """The ``--speculative-draft-window-size`` an MLA draft keeps on trtllm_mla
+    or cutedsl_mla, or None to serve the draft without the compact table.
+
+    These backends read the draft's ``req_to_token`` rows as the target lays
+    them out, by absolute position: a sliding_attention layer lists each query
+    row's window keys at positions ``[p - window_left, p]``
+    (``mla_window_sparse_indices``), and under DCP the page table walks pages of
+    ``page_size * dcp_size`` positions from position 0
+    (``create_mla_kv_page_table_for_dcp``). The compact draft table holds the
+    window starting at row 0 instead, so neither path can read it.
+
+    - Every layer slides and the compact window covers each query row's window
+      (``window_left <= window_size``): the compact table changes nothing the
+      draft attends to, so it is dropped. Triton over the compact table and the
+      native window over the full table both attend ``[p - window_left, p]``.
+    - Mixed full and sliding layers, or a native window wider than the compact
+      one: the compact table narrows what some layer attends, which these
+      backends cannot reproduce, so this is rejected.
+    - No sliding layer: the compact table works without DCP (its rows start on
+      a page boundary) and is kept; under DCP it is rejected.
+    """
+    if window_size is None:
+        return None
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if layer_types is not None and "sliding_attention" in layer_types:
+        if any(layer_type != "sliding_attention" for layer_type in layer_types):
+            raise ValueError(
+                "--speculative-draft-window-size with an MLA draft that mixes "
+                "full and sliding_attention layers is not supported on trtllm_mla "
+                "or cutedsl_mla: the compact draft table would narrow the full "
+                f"layers, and the native window cannot read it (layer_types="
+                f"{list(layer_types)})."
+            )
+        window_left = get_dflash_attention_sliding_window_size(draft_hf_config)
+        if window_left > window_size:
+            raise ValueError(
+                f"--speculative-draft-window-size {window_size} is narrower than "
+                f"the draft's own sliding window (window_left={window_left}); "
+                "trtllm_mla and cutedsl_mla apply the draft's window and cannot "
+                "narrow it. Use a window size >= window_left or drop the flag."
+            )
+        return None
+    if dcp_size > 1:
+        raise ValueError(
+            "--speculative-draft-window-size with a full-attention MLA draft is "
+            "not supported under --dcp-size > 1: the compact draft table starts "
+            "on a page boundary, but the DCP page table walks pages of "
+            f"page_size * dcp_size positions (dcp_size={dcp_size})."
+        )
+    return window_size
 
 
 @dataclass(frozen=True)

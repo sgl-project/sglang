@@ -37,6 +37,26 @@ class TransferKVChunk:
     indices_event: Optional[object] = None
 
 
+def bind_thread_to_device(gpu_id: int) -> None:
+    """Make ``gpu_id`` the calling thread's current device.
+
+    New threads default to device 0; binding keeps a transfer worker's device
+    calls on this rank's GPU instead of opening a context on device 0.
+    """
+    from sglang.srt.platforms import current_platform
+
+    try:
+        current_platform.set_device(current_platform.get_device(gpu_id))
+    except NotImplementedError:
+        pass
+
+
+def run_on_device(gpu_id: int, fn, *args) -> None:
+    """Thread target: bind the thread to ``gpu_id``, then run ``fn(*args)``."""
+    bind_thread_to_device(gpu_id)
+    fn(*args)
+
+
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
     if not buffers:
         return b""
@@ -160,7 +180,15 @@ def build_dcp_token_transfer_plan(
     src_page_offset: int = 0,
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
+    draft_rows_collapsed: bool = False,
 ) -> DCPTokenTransferPlan:
+    """Rows to copy for one decode DCP rank.
+
+    The target lands on owner rows (``loc // dcp_size``, physical page). The
+    draft lands on raw widened rows (virtual page) unless the decode's draft
+    pool is DCP-collapsed too (``draft_rows_collapsed``, an MLA draft), in
+    which case it takes the target mapping.
+    """
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
     virtual_page_size = physical_page_size * dcp_size
@@ -194,5 +222,9 @@ def build_dcp_token_transfer_plan(
     )
     target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
     target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
+    if draft_rows_collapsed:
+        return DCPTokenTransferPlan(
+            target_src, target_dst, target_src.copy(), target_dst.copy()
+        )
     draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)

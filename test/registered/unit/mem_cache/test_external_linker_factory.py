@@ -126,6 +126,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
                 unified_cache_external_linker_backend=backend,
                 unified_cache_external_linker_config=config,
                 disable_radix_cache=True,
+                pp_size=2,
             )
             with (
                 self.subTest(backend=backend, config=config),
@@ -188,6 +189,8 @@ class TestExternalLinkerConfig(unittest.TestCase):
             {"enable_linker_mla_dedup": True},
             {"disable_radix_cache": True},
             {"radix_cache_backend": "custom"},
+            {"pp_size": 2},
+            {"pp_size": 4},
         ):
             fields = dict(
                 model_path="dummy",

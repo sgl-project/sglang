@@ -75,6 +75,8 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(worker, _sampling_info(), folded=False)
     assert not _eligible(worker, _sampling_info(), grammar=True)
     assert not _eligible(worker, _sampling_info(), sim_bonus=_sampling_info())
+    info = _sampling_info()
+    assert _eligible(worker, info, sim_bonus=info)
     assert not _eligible(_worker(enabled=False), _sampling_info())
     assert not _eligible(_worker(mode="compact"), _sampling_info())
 

@@ -486,6 +486,11 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def linear_attn_tp_rank() -> int:
+    """This rank's index in ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
+
+
 def draft_attn_parallel_group() -> str:
     """The group an attention-owning draft uses, resolved in the target scope.
 
@@ -569,6 +574,7 @@ class MoeFlags(_FlagGroupBase):
     speculative_a2a_backend: Any = None
     deepep_mode: Any = None
     deepep_config: str | None = None
+    moe_ascend_ops_config: Any = None
     tbo_enabled: bool | None = None
     sbo_enabled: bool | None = None
     tbo_token_distribution_threshold: float | None = None

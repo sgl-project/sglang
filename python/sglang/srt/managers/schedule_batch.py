@@ -971,6 +971,11 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+    # Finish event of a restore whose host-to-device copy may still be writing
+    # this row's pages (unified cache); a host-received request joins a decode
+    # batch once it has completed on every rank that shares the request (under PP,
+    # admission waits for it), and freeing the row waits for it.
+    restore_done_event: Optional[Any] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
@@ -1184,6 +1189,8 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Owned by Scheduler.defer_response until its completion is retired.
+        self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
@@ -1236,6 +1243,10 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # Uncached tokens seen by the last prefix match, kept while the request
+        # waits so --pp-min-chunked-prefill-size does not re-match it every
+        # step. None until matched; reset on retraction.
+        self.pp_uncached_hint: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
@@ -2061,6 +2072,7 @@ class Req(ReqDllmMixin):
         self.kv.cache_inserted_len = 0
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
+        self.pp_uncached_hint = None
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None

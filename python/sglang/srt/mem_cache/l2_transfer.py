@@ -56,12 +56,30 @@ class L2TransferEngine:
         self.io_backend = io_backend
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
+        # Index preparation runs here, never queued behind earlier copies: the
+        # direct backend reads the device indices back on the host.
+        self.index_stream = device_module.Stream()
+        # Set inside `on_current_stream`: host-to-device submissions then run on
+        # the caller's current stream instead of the engine's streams.
+        self._h2d_on_current_stream = False
+
+    @contextmanager
+    def on_current_stream(self):
+        """Run host-to-device submissions made inside the block on the caller's
+        current stream, index preparation included, in order with the caller's
+        other work there; the engine's own streams stay idle."""
+        previous = self._h2d_on_current_stream
+        self._h2d_on_current_stream = True
+        try:
+            yield
+        finally:
+            self._h2d_on_current_stream = previous
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
         """Resolve controller IDs into this pool's device-buffer indices.
 
-        Call on the transfer stream after the producer event. The host-transfer
+        Call on the index stream after the producer event. The host-transfer
         move gate prevents relocation until the transfer completes.
         """
         # Mamba state pools do not inherit KVCache's default attributes.
@@ -109,17 +127,27 @@ class L2TransferEngine:
         for domain in domains:
             domain.acquire_layout()
         finish_recorded = False
+        own_stream = stream in (self.host_to_device_stream, self.device_to_host_stream)
+        # A caller's stream prepares indices in order with its own copies.
+        index_stream = self.index_stream if own_stream else stream
         try:
-            with device_module.stream(stream):
-                # Index preparation can read producer-owned device indices.
-                start_event.wait(stream)
+            with device_module.stream(index_stream):
+                # Index preparation can read producer-owned device indices. On its
+                # own stream, a host read of them waits only for their producer,
+                # never for copies queued earlier on the transfer stream.
+                start_event.wait(index_stream)
                 prepared = self._prepare_transfers(transfers)
+                prepared_event = device_module.Event()
+                prepared_event.record()
+            with device_module.stream(stream):
+                prepared_event.wait(stream)
                 ack_start.record()
                 yield prepared, completion
                 ack_finish.record()
                 finish_recorded = True
                 self._record_stream(transfers + prepared, stream)
         except Exception:
+            index_stream.synchronize()
             stream.synchronize()
             raise
         finally:
@@ -150,9 +178,15 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
-        with self._submission(
-            transfers, self.host_to_device_stream, "host_to_device", start_event
-        ) as (transfers, completion):
+        stream = (
+            device_module.current_stream()
+            if self._h2d_on_current_stream
+            else self.host_to_device_stream
+        )
+        with self._submission(transfers, stream, "host_to_device", start_event) as (
+            transfers,
+            completion,
+        ):
             primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):

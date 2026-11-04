@@ -102,6 +102,7 @@ ATTENTION_BACKEND_CHOICES = [
 # earlier when its per-layer attention requirements are not met.
 DRAFT_ATTENTION_BACKEND_CHOICES = [
     "flashinfer",
+    "tokenspeed_mla",
     "fa3",
     "fa4",
     "triton",

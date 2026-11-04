@@ -120,7 +120,9 @@ class LayerWiseLoadCounter:
             return True
         # Wait before dropping the entry: the load thread still completes the
         # layers the forward never waited on through it.
-        landed = all(future.exception() is None for future in futures)
+        # Do not short-circuit after an error: later layers may still be writing.
+        errors = [future.exception() for future in futures]
+        landed = all(error is None for error in errors)
         del self.futures[index]
         return landed
 
@@ -145,6 +147,8 @@ class UnifiedCacheLinker(ABC):
     # The stream the forward writes the device pools on; None when the current
     # stream is the pages' only writer.
     forward_stream: Optional[torch.cuda.Stream] = None
+    # Log each request's load time and bytes.
+    log_load_timing: bool = False
 
     def record_offload_ready(self) -> list[torch.cuda.Event]:
         """Record the events an offload waits on before it reads device pages.
@@ -283,6 +287,17 @@ class UnifiedCacheLinkerWrapper:
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
 
+    def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer]:
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return []
+            transfers.append(transfer)
+        return transfers
+
     @property
     def layer_done_counter(self) -> object:
         return self.cache_linker.layer_done_counter
@@ -304,17 +319,9 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             return result
 
-        lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
-            if transfer is None:
-                return result
-            lookup_transfers.append(transfer)
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
-
-        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        lookup_transfers = self._lookup_transfers(tail_hashes)
+        if not lookup_transfers:
+            return result
         hit_pages = self._sync_restorable_prefix(
             self.cache_linker.lookup(req.rid, lookup_transfers),
             num_pages=len(tail_hashes),
@@ -322,6 +329,7 @@ class UnifiedCacheLinkerWrapper:
         )
         if hit_pages == 0:
             return result
+        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
         hit_tokens = hit_pages * page
 
         swa_transfer = by_pool.get(PoolName.SWA)
@@ -587,6 +595,11 @@ class UnifiedCacheLinkerWrapper:
         for rid in rids:
             self.private_load_indices.pop(rid, None)
         if landed.item():
+            logger.info(
+                "External linker stage load completed: requests=%d rids=%s",
+                len(rids),
+                rids,
+            )
             return []
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids

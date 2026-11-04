@@ -71,6 +71,7 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
     if nemotron and cfg.attn_cp_size > 1:
@@ -212,17 +213,32 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    if size < 1 or attn_tp_size % size != 0:
+    # Interleave PCP gives the FFN equal padded token-row shards after its
+    # residual/norm readout. Shared experts can gather those rows across CP
+    # as well as attention TP, then reduce-scatter to the original shards.
+    # A subgroup must still fit inside one attention-DP replica / PP stage.
+    replica_size = attn_tp_size * view.attn_cp_size
+    if size < 1 or replica_size % size != 0:
         raise ValueError(
             f"--shared-experts-tp-size ({size}) must be a positive divisor "
-            f"of attention TP size ({attn_tp_size})."
+            f"of attention replica size ({replica_size}, attention TP x CP)."
+        )
+    if attn_tp_size % size != 0 and not (
+        cfg.enable_prefill_cp and cfg.cp_strategy == "interleave"
+    ):
+        raise ValueError(
+            "Shared-expert TP across CP ranks requires --enable-prefill-cp "
+            "with --cp-strategy interleave (equal padded token-row shards)."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",

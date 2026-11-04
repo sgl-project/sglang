@@ -41,6 +41,12 @@
 #include <cooperative_groups.h>
 #endif
 
+// 1: the large-tie radix select resolves equal scores to the smallest indices
+// (built only into the module the DSA decode context-parallel merge uses)
+#ifndef SGL_TOPK_STABLE_TIES
+#define SGL_TOPK_STABLE_TIES 0
+#endif
+
 namespace sglang {
 
 namespace device::topk {
@@ -191,6 +197,7 @@ struct TopKConfig {
   static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
   // tie candidates owned per thread in the strided handle_tie loops
   static constexpr uint32_t kTieItems = kMaxNumTie / kBlockSize;
+  static constexpr bool kStableTies = SGL_TOPK_STABLE_TIES;
   static_assert(kMaxNumTie >= kMaxTopK && kMaxNumTie % kBlockSize == 0 && kBlockSize % kNumWarps == 0);
 
   struct TieHandleSmem {
@@ -336,7 +343,11 @@ struct TopKConfig {
 
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
-  /// num_ties <= kItems * kBlockSize.
+  /// num_ties <= kItems * kBlockSize. Rounds 0-3 select on the score; equal
+  /// scores at the k-th place fill the last slots arbitrarily, unless
+  /// kStableTies: then, while they still outnumber the free slots, rounds 4-7
+  /// select on the inverted index, so they resolve to the smallest indices (the
+  /// `is_greater` order of the small-tie paths).
   template <uint32_t kItems>
   SGL_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
@@ -368,17 +379,19 @@ struct TopKConfig {
     __syncthreads();
     uint32_t total_active = num_ties;
 
+    constexpr int kRounds = kStableTies ? 8 : 4;
 #pragma unroll
-    for (int round = 0; round < 4; round++) {
-      const uint32_t shift = 24 - round * 8;
+    for (int round = 0; round < kRounds; round++) {
+      const uint32_t shift = 24 - (round % 4) * 8;
       const auto hist_idx = round % 2;
       const auto histogram = smem->histogram[hist_idx];
+      const auto radix_key = [&](uint32_t i) { return round < 4 ? key[i] : ~idx[i]; };
 
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
-        if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
+        if (active[i]) atomicAdd(&histogram[(radix_key(i) >> shift) & 0xFFu], 1);
       }
-      if (round < 3 && tx < kRadixSize) {
+      if (round < kRounds - 1 && tx < kRadixSize) {
         smem->histogram[hist_idx ^ 1][tx] = 0;
       }
       __syncthreads();
@@ -403,26 +416,29 @@ struct TopKConfig {
       __syncthreads();
 
       const auto [threshold_bin, above_count, equal_count] = smem->match;
-      if (round < 3) total_active = equal_count;
+      total_active = equal_count;
       topk_remain -= above_count;
+      // Stable: once the whole threshold bin fits, take it (round 7 always ends
+      // here since indices are unique). Otherwise round 3 takes it as is.
+      const bool last = kStableTies ? equal_count == topk_remain : round == kRounds - 1;
 
       // 4. Scatter
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
         if (!active[i]) continue;
-        const uint32_t bin = (key[i] >> shift) & 0xFFu;
+        const uint32_t bin = (radix_key(i) >> shift) & 0xFFu;
         if (bin > threshold_bin) {
           write_pos[i] = atomicAdd(&smem->counter, 1);
           active[i] = false;
         } else if (bin < threshold_bin) {
           active[i] = false;
-        } else if (round == 3) {
+        } else if (last) {
           write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
         }
-        // my_bin == thr && round < 3: stay active for next round
+        // my_bin == thr && !last: stay active for next round
       }
 
-      if (round == 3 || topk_remain == 0) break;
+      if (last || topk_remain == 0) break;
     }
 
 #pragma unroll

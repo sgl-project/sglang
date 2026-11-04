@@ -67,6 +67,10 @@ def _static_accept_tail_kernel(
         targets = tl.load(target_ptr + row * T + offs, mask=in_draft, other=-2)
         eq = (drafts == targets) & in_draft
         num_correct = tl.min(tl.where(eq, BLOCK_T, offs), 0)
+    if HAS_SIM:
+        correct = tl.load(sim_ptr).to(tl.int32)
+    else:
+        correct = num_correct.to(tl.int32)
     if HAS_PARTS:
         # _simulated_bonus_row_select_kernel's reduction.
         s = tl.arange(0, NSPLIT)
@@ -77,11 +81,7 @@ def _static_accept_tail_kernel(
     elif HAS_BONUS_IN:
         bonus = tl.load(bonus_in_ptr + row).to(tl.int64)
     else:
-        bonus = tl.load(target_ptr + row * T + num_correct).to(tl.int64)
-    if HAS_SIM:
-        correct = tl.load(sim_ptr).to(tl.int32)
-    else:
-        correct = num_correct.to(tl.int32)
+        bonus = tl.load(target_ptr + row * T + correct).to(tl.int64)
     commit = correct + 1
     new_seq = tl.load(seq_lens_ptr + row) + commit
     tl.store(correct_out_ptr + row, correct)
@@ -218,6 +218,10 @@ def static_accept_tail_torch(
         matches = (candidates[:, 1:] == target[:, :gamma]).to(torch.int32)
         num_correct = matches.cumprod(dim=1).sum(dim=1).to(torch.int32)
     rows = torch.arange(bs, device=candidates.device)
+    if simulated_correct_len is not None:
+        correct = simulated_correct_len.repeat(bs).to(torch.int32)
+    else:
+        correct = num_correct
     if bonus_parts is not None:
         part_val, part_idx, vocab = bonus_parts
         bonus = simulated_bonus_select_partials(
@@ -226,11 +230,7 @@ def static_accept_tail_torch(
     elif bonus_in is not None:
         bonus = bonus_in[:bs].to(torch.int64)
     else:
-        bonus = target[rows, num_correct.long()].to(torch.int64)
-    if simulated_correct_len is not None:
-        correct = simulated_correct_len.repeat(bs).to(torch.int32)
-    else:
-        correct = num_correct
+        bonus = target[rows, correct.long()].to(torch.int64)
     commit = correct + 1
     new_seq = seq_lens[:bs] + commit.to(seq_lens.dtype)
     correct_len_out[:bs].copy_(correct)

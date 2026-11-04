@@ -1,7 +1,7 @@
 import unittest
 from array import array
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -20,7 +20,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    match_kv_cache,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -339,6 +343,52 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
 
 
 class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
+    def test_peek_prefix_len_is_read_only(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page = self.cfg.page_size
+        seq_a = self._make_seq(1, 3)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        # Diverges inside the inserted node: match_prefix would split it here.
+        probe = seq_a[: 2 * page] + self._make_seq(5000, 1)
+        if cache.peek_prefix_len(RadixKey(array("q", probe))) is None:
+            self.skipTest("tree core has no read-only probe")
+
+        def snapshot():
+            core = cache.tree_core
+            nodes = sorted(
+                (
+                    node_id,
+                    core.get_parent_node_id(node_id),
+                    core.get_node_key_length(node_id),
+                    core.get_node_hit_count(node_id),
+                )
+                for node_id in core.get_all_node_ids()
+            )
+            lrus = [
+                core.get_component_device_lru_node_ids(ct)
+                for ct in self.cfg.components
+                if ct != ComponentType.FULL
+            ]
+            return nodes, lrus
+
+        before = snapshot()
+        peeked = [
+            cache.peek_prefix_len(RadixKey(array("q", t)))
+            for t in (probe, seq_a, seq_a[:page], self._make_seq(9000, 2))
+        ]
+        self.assertEqual(snapshot(), before)
+
+        for tokens, got in zip(
+            (probe, seq_a, seq_a[:page], self._make_seq(9000, 2)), peeked
+        ):
+            m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+            expected = m.device_prefix_len + m.host_hit_length
+            if self.cfg.has_swa:
+                # A split point may satisfy the SWA window; peek never counts it.
+                self.assertLessEqual(got, expected)
+            else:
+                self.assertEqual(got, expected)
+
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -792,6 +842,84 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         m = match_prefix(cache, seq_long)
         self.assertEqual(m.device_prefix_len, 0)
+        cache.sanity_check()
+
+    def _full_kv_only_match(self, backend, force_miss=False):
+        """Insert shared + A, then match shared + B FULL-KV-only: the cached
+        Mamba state sits at the end of shared + A only."""
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg, tree_core_backend=backend
+        )
+        self.assertTrue(cache.supports_full_kv_only_match())
+        shared = self._make_seq(1, 2)
+        self._insert(
+            cache, allocator, req_to_token_pool, shared + self._make_seq(500, 1)
+        )
+        req = self._make_req(req_to_token_pool)
+        token_ids = array("q", shared + self._make_seq(900, 1))
+        self.assertEqual(match_kv_cache(req, cache, token_ids).device_prefix_len, 0)
+        with envs.SGLANG_RADIX_FORCE_MISS.override(force_miss):
+            m = match_kv_cache(req, cache, token_ids, full_kv_only=True)
+        return cache, req, shared, m
+
+    @requires_mamba
+    def test_full_kv_only_match_passes_mamba_boundary(self):
+        """A PD decode receives the final Mamba state from prefill, so its hit
+        is the FULL-KV prefix even where the tree holds no Mamba state."""
+        for backend in ("python", "rust"):
+            with self.subTest(backend=backend):
+                cache, req, shared, m = self._full_kv_only_match(backend)
+                self.assertEqual(m.device_prefix_len, len(shared))
+                self.assertEqual(req.prefix_len, len(shared))
+                self.assertEqual(req.last_node, m.last_device_node)
+                self.assertIsNone(m.mamba_branching_seqlen)
+                self.assertIsNone(req.kv.mamba_cow_src_index)
+                self.assertEqual(len(cache.prefix_device_indices(req)), len(shared))
+
+                evictable = cache.full_evictable_size()
+                lock = cache.lock(m.last_device_node)
+                self.assertEqual(cache.full_evictable_size(), evictable - len(shared))
+                cache.unlock(lock)
+                self.assertEqual(cache.full_evictable_size(), evictable)
+                cache.sanity_check()
+
+    @requires_mamba
+    def test_full_kv_only_match_honors_force_miss(self):
+        for backend in ("python", "rust"):
+            with self.subTest(backend=backend):
+                cache, req, _, m = self._full_kv_only_match(backend, force_miss=True)
+                self.assertEqual(m.device_prefix_len, 0)
+                self.assertEqual(req.prefix_len, 0)
+                cache.sanity_check()
+
+    @requires_mamba
+    def test_decode_prefix_match_uses_full_kv(self):
+        """The PD decode admission match reports the FULL-KV hit as the prefix
+        it asks prefill to skip, and locks it."""
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        shared = self._make_seq(1, 2)
+        self._insert(
+            cache, allocator, req_to_token_pool, shared + self._make_seq(500, 1)
+        )
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", shared + self._make_seq(900, 1))
+        queue = SimpleNamespace(
+            tree_cache=cache,
+            scheduler=SimpleNamespace(enable_decode_hicache=False),
+            _uses_swa_tail_prealloc=lambda: False,
+        )
+        queue._build_decode_prefix_match = MethodType(
+            DecodePreallocQueue._build_decode_prefix_match, queue
+        )
+        evictable = cache.full_evictable_size()
+        match = DecodePreallocQueue._match_prefix_and_lock(queue, req)
+        self.assertEqual(match.l1_prefix_len, len(shared))
+        self.assertEqual(match.decode_prefix_len, len(shared))
+        self.assertEqual(cache.full_evictable_size(), evictable - len(shared))
+        cache.unlock(req.lock)
+        self.assertEqual(cache.full_evictable_size(), evictable)
         cache.sanity_check()
 
     @requires_mamba

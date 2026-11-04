@@ -1,5 +1,5 @@
-"""HunyuanImage-3 denoising steps: tensor-parallel input broadcasts and the
-host work each step skips."""
+"""HunyuanImage-3 denoising: tensor-parallel input broadcasts, per-step host
+work, the MoE block and the timestep schedule."""
 
 import math
 import unittest
@@ -8,7 +8,13 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.models.dits import hunyuan_image3_utils
+from sglang.multimodal_gen.runtime.models.dits import (
+    hunyuan_image3,
+    hunyuan_image3_utils,
+)
+from sglang.multimodal_gen.runtime.pipelines.hunyuan_image3 import (
+    HunyuanImage3Pipeline,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3 import (
     ar_stage,
 )
@@ -144,6 +150,44 @@ class TestHunyuanImage3DenoiseStep(CustomTestCase):
                 stage._extract_diffusion_pred(hidden, t, index, token_h, token_w),
             )
         torch.testing.assert_close(actual, (scattered, extracted), atol=0, rtol=0)
+
+
+class TestHunyuanImage3MoEAndSchedule(CustomTestCase):
+    def test_shared_mlp_sees_layer_input_when_experts_run_in_place(self):
+        """The CUDA FusedMoE kernel overwrites its input with the expert
+        output; the shared MLP must still see the layer input."""
+        block = hunyuan_image3.HunYuanSparseMoeBlock.__new__(
+            hunyuan_image3.HunYuanSparseMoeBlock
+        )
+        torch.nn.Module.__init__(block)
+
+        def experts_in_place(x, topk_output):
+            out = x * 10
+            x.copy_(out)
+            return out
+
+        block.gate = lambda x: (torch.zeros(x.shape[0], 2), None)
+        block.topk = lambda x, logits: None
+        block.experts = experts_in_place
+        block.shared_mlp = lambda x: x.clone()
+        x = torch.randn(4, 8)
+
+        out = block(x.clone())
+
+        torch.testing.assert_close(out, 11 * x)
+
+    def test_timesteps_follow_official_schedule(self):
+        """Official FlowMatchDiscreteScheduler: t_i = 1000 * shift(1 - i / N)
+        for i < N, with shift(s) = k * s / (1 + (k - 1) * s)."""
+        shift, steps = 3.0, 10
+        scheduler = HunyuanImage3Pipeline._build_scheduler(shift)
+        scheduler.set_timesteps(steps)
+
+        sigmas = torch.linspace(1, 0, steps + 1)[:-1]
+        expected = 1000 * shift * sigmas / (1 + (shift - 1) * sigmas)
+        torch.testing.assert_close(
+            scheduler.timesteps.float().cpu(), expected, rtol=0, atol=1e-3
+        )
 
 
 if __name__ == "__main__":

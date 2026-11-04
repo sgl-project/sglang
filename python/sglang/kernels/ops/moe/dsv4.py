@@ -37,10 +37,17 @@ def _jit_hash_topk_module():
 
 @cache_once
 def _jit_mega_moe_pre_dispatch_module(
-    quant_group_size: int, write_shared_sf: bool, copy_topk: bool = True
+    quant_group_size: int,
+    write_shared_sf: bool,
+    copy_topk: bool = True,
+    mask_padding: bool = False,
 ):
     args = make_cpp_args(
-        quant_group_size, is_arch_support_pdl(), write_shared_sf, copy_topk
+        quant_group_size,
+        is_arch_support_pdl(),
+        write_shared_sf,
+        copy_topk,
+        mask_padding,
     )
     return load_jit(
         make_name("mega_moe_pre_dispatch"),
@@ -132,12 +139,16 @@ def mega_moe_pre_dispatch(
     shared_x_sf: Optional[torch.Tensor] = None,
     shared_block_m: int = 0,
     copy_topk: bool = True,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> None:
     if x.shape[0] == 0 and x.stride(0) != x.shape[1]:
         x = x.new_empty(x.shape)
     # shared_block_m must match the consuming MoE's paged scale layout
     module = _jit_mega_moe_pre_dispatch_module(
-        quant_group_size, shared_x_sf is not None, copy_topk
+        quant_group_size,
+        shared_x_sf is not None,
+        copy_topk,
+        num_token_non_padded is not None,
     )
     module.run(
         x,
@@ -149,6 +160,7 @@ def mega_moe_pre_dispatch(
         buf_topk_weights,
         shared_x_sf,
         shared_block_m,
+        num_token_non_padded,
     )
 
 

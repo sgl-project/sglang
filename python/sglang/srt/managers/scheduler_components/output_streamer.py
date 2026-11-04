@@ -78,6 +78,8 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    # Set when the scheduler first defers a response; see deferred_output.
+    defer_outputs: bool = False
     is_multimodal_gen: bool = False
     _test_stream_output_count: int = 0
 
@@ -140,6 +142,9 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.defer_outputs:
+            # The scheduler releases held requests after their work completes.
+            reqs = [req for req in reqs if not req.defer_output]
         if self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
@@ -495,7 +500,9 @@ class _GenerationStreamAccumulator:
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
-        self.reasoning_tokens.append(req.reasoning_tokens)
+        # A verified token block can extend past the stop position. Report
+        # reasoning usage only within the same prefix as completion usage.
+        self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
         self.cached_tokens.append(req.cached_tokens)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.

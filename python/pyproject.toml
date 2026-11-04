@@ -62,6 +62,7 @@ dependencies = [
   "packaging",
   "partial_json_parser",
   "pillow",
+  "pillow-heif",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",

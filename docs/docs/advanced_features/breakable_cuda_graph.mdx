@@ -30,15 +30,20 @@ This mode is intended for debugging only — it eliminates the performance benef
 
 ### Selective Graph Breaks in Model Code
 
-For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During CUDA graph capture, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
+For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During replay, these functions run eagerly between captured graph segments. Outside a breakable CUDA graph, they run as plain calls.
 
 ```python
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
 
 @eager_on_graph
-def my_dynamic_op(x):
+def my_dynamic_op(x, out):
     # This op is incompatible with CUDA graph capture
-    return some_dynamic_operation(x)
+    out.copy_(some_dynamic_operation(x))
+
+def forward(self, x):
+    out = torch.empty_like(x)
+    my_dynamic_op(x, out)
+    return out
 ```
 
 You can also insert a bare graph break (no computation) using the `break_graph()` helper:
@@ -103,9 +108,9 @@ Begin capture (segment 1)
   ... graphable ops ...
   @eager_on_graph function encountered:
     1. End current capture segment
-    2. Run the function eagerly (allocates output tensors)
-    3. Record the function for later replay
-    4. Begin new capture segment
+    2. Record the function for later replay without running it; an optional
+       on_capture runs host setup that later segments read
+    3. Begin new capture segment
   ... more graphable ops ...
 End capture (segment N)
 ```
@@ -123,15 +128,11 @@ For each segment i:
 Launch final CUDA graph segment
 ```
 
-The non-graph functions are re-invoked with the same tensor references as capture time. Since these references point to the CUDA graph's static input/output buffers, they see updated values on each replay.
+The non-graph functions are invoked with the same tensor references as capture time. Since these references point to the CUDA graph's static input/output buffers, they see updated values on each replay.
 
-### Output Writeback
+### Outputs
 
-When a non-graph function produces output during replay, the result must be written back into the same tensor buffers that downstream graph segments reference. The mechanism handles:
-
-- **Plain tensors**: In-place `copy_()` into the original buffer.
-- **Structured outputs** (dataclasses, objects with tensor attributes): Tensor fields are copied in-place; non-tensor fields are replaced.
-- **Dicts of tensors**: Tensor values are copied in-place; non-tensor values are replaced.
+A non-graph function writes its results into buffers its caller allocated before the break, so the downstream graph segments read the same addresses at every replay. Host-side results go into a holder object the caller owns. A function that returns a value fails with an assertion. Every captured shape is warmed up before capture, so lazy setup (JIT compilation, buffers sized by the first run) happens outside capture.
 
 ### Stream Fork/Join Tracking
 

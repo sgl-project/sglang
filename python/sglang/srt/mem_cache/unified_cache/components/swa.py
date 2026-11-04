@@ -481,9 +481,12 @@ class SWAComponent(TreeComponent):
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
-        window_start = params.get_evicted_seqlen(self.component_type)
-        if self._independent:
-            window_start = max(window_start, params.prev_prefix_len)
+        # Never recover below the request's protected prefix: the incoming row
+        # there holds the node's own canonical ids, so a lower window cursor
+        # would free pages the node keeps (mirrors the Rust core).
+        window_start = max(
+            params.get_evicted_seqlen(self.component_type), params.prev_prefix_len
+        )
         consumed_from = prefix_len
         for fragment, start, end in self._segments(
             node=node, start=total_prefix_len, end=total_prefix_len + prefix_len

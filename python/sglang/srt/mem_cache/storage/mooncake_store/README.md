@@ -43,6 +43,46 @@ ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
 Use matching model settings. KV format and host layout are not yet in the keys;
 use different `extra_backend_tag` values when these differ.
 
+### GPU staging capacity
+
+For Linker deployments using a transport that stages GPU data through host memory
+(such as TCP), set `local_buffer_size` in the SGLang Mooncake JSON configuration or
+storage extra configuration. The value is a non-negative byte count and defaults
+to 16 MiB. Size it for concurrent reads and writes, including large recurrent
+state objects. This is per-client transient memory, separate from the shared
+`global_segment_size`; include both in the host memory budget.
+
+### Direct Linker with PCP and RDMA
+
+The direct Linker requires `--pp-size 1`; pipeline parallelism is not supported.
+For K31's hybrid DSA/KDA pools, interleave PCP keeps complete DSA KV and
+indexer pages on each GPU. The direct Linker shares these objects across
+replicated PCP and attention-TP ranks, with one writer per shared pool.
+Every rank reads the shared objects into its own GPU buffers. KDA state keeps
+rank-specific objects; replicated MLA draft pools also share across attention-TP
+ranks. This deduplicates L3 storage, not GPU allocations.
+Use a distinct `extra_backend_tag` for each model/draft revision, dtype, page
+layout and parallel topology; the shared keys do not enable cross-topology reuse.
+
+Native Mooncake range GETs can issue RDMA READs from remote host segments
+directly into registered GPU buffers. To keep this L3 engine independent of a
+PD NVLink engine, set `SGLANG_HICACHE_MOONCAKE_REUSE_TE=0` and
+`MC_MS_AUTO_DISC=0`, choose `protocol: "rdma"` and explicit `device_name` HCAs,
+and set `global_segment_size: 0` on Prefill consumers. Retain a small
+`local_buffer_size` (the default 16 MiB) for the Store's bytes-based startup
+check. Direct Linker KV reads use registered GPU pointers and do not stage
+through this buffer.
+Run separate host providers on both Prefill and Decode nodes; Decode does not
+need a Linker client. Unset `MC_FORCE_TCP` entirely.
+
+The native SDK and GPU allocation must support GPU memory registration. On
+DMA-BUF deployments without `nvidia-peermem`, use `WITH_NVIDIA_PEERMEM=0`.
+Choose the platform's working GID. On isolated NIC rails with matching HCA
+names, `MC_ENABLE_DEST_DEVICE_AFFINITY=1` keeps remote host reads on the same
+rail; GPU-location HCA peer affinity does not cover host source segments.
+Verify an actual remote-host-to-GPU read before serving;
+successful host registration alone does not establish GPUDirect RDMA support.
+
 ## Install Mooncake
 
 **Method 1: with pip**

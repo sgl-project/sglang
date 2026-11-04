@@ -70,6 +70,9 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Hit the deepest FULL-KV prefix even past the last cached Mamba state, for
+    # a caller that receives the request's Mamba state elsewhere (PD decode).
+    full_kv_only: bool = False
 
 
 @dataclasses.dataclass
@@ -449,6 +452,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Cached tokens for ``key`` without changing cache state (no split,
+        LRU or access-time update); None when unsupported."""
+        return None
+
     def touch_prefix(self, key: RadixKey) -> None:
         """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
         never allocates, loads, or queries external tiers."""
@@ -717,6 +725,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def supports_mamba(self) -> bool:
+        return False
+
+    def supports_full_kv_only_match(self) -> bool:
+        """Whether `MatchPrefixParams.full_kv_only` is honored."""
         return False
 
     def release_session(self, session_id: str) -> None:

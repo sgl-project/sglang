@@ -218,6 +218,7 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "Qwen3_5MoeForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     }
 
 

@@ -46,8 +46,18 @@ jobs:
             partition_id: 1
             partition_size: 2
             part: 2/2
+          # The 8-GPU suite grew to ~6.5 h of estimated test time and no longer
+          # finishes in the step timeout; split it the same way.
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi35x-gpu-8
+            partition_id: 0
+            partition_size: 2
+            part: 1/2
+          - suite: nightly-stage-c-8-gpu-mi350
+            runner: linux-mi35x-gpu-8
+            partition_id: 1
+            partition_size: 2
+            part: 2/2
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code

@@ -684,6 +684,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         model_runner = SimpleNamespace(
             device="cuda",
             tp_size=1,
+            model=SimpleNamespace(),
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16, vocab_size=8, hf_config=SimpleNamespace()
             ),
@@ -698,6 +699,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
             seed_dsa_topk_from_draft_extend=False,
             mtp_model_runner=lambda step: model_runner,
+            megakernel=None,
         )
         runtime = SimpleNamespace(
             mamba=SimpleNamespace(enable_mamba_extra_buffer=tracking),
@@ -801,6 +803,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
             else eagle.EAGLEDraftExtendCudaGraphRunner
         )
         runner = cls.__new__(cls)
+        runner.megakernel = None
+        runner.megakernel_served = frozenset()
         runner.buffers = buffers
         runner.captured_req_width = 4
         runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2

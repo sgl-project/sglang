@@ -83,6 +83,7 @@ def make_xqa_backend(monkeypatch):
             device="cpu",
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
+            is_draft_worker=False,
         )
         return TRTLLMHAAttnBackend(runner)
 

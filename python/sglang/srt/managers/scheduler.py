@@ -118,6 +118,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -222,6 +223,7 @@ from sglang.srt.managers.schedule_batch import (
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -301,6 +303,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
+    peek_uncached_tokens,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
@@ -337,6 +340,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
@@ -450,6 +454,11 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+# Load-sized PP chunks shrink only after this many sizing steps per stage of
+# lower load (see Scheduler._pp_hold_chunk).
+_PP_DIP_STEPS_PER_STAGE = 4
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -467,6 +476,8 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # Allocate per instance only when a consumer first defers a response.
+    _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
 
     def __init__(
         self,
@@ -1390,6 +1401,25 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        self.pp_min_chunked_prefill_size = None
+        if (
+            get_schedule().pp_min_chunked_prefill_size is not None
+            and get_parallel().pp_size > 1
+            and self.chunked_prefill_size is not None
+        ):
+            self.pp_min_chunked_prefill_size = min(
+                get_schedule().pp_min_chunked_prefill_size, self.chunked_prefill_size
+            )
+        self.pp_chunk_overhead_tokens = (
+            get_schedule().pp_chunk_overhead_tokens
+            if self.pp_min_chunked_prefill_size is not None
+            else None
+        )
+        # Uncached tokens pending when this step's chunk was sized (load rule).
+        self._pp_pending_tokens = 0
+        # Load rule: the size held through a dip, and the steps the dip has lasted.
+        self._pp_held_chunk = 0
+        self._pp_dip_steps = 0
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -1410,6 +1440,136 @@ class Scheduler(
         )
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
+
+    def _pp_chunk_size_for_pending(self, chunk: int) -> int:
+        """Use the small prefill chunk unless a pending request has at least a
+        full chunk of uncached tokens. Small chunks keep a batch with few new
+        tokens spread over every pipeline stage, while a long prefill keeps the
+        full chunk: every chunk rereads its whole prefix in the indexer.
+
+        Waiting requests are read from their pp_uncached_hint, so a request is
+        probed about once while it waits instead of on every step. Only a
+        request without a hint, or a hint of a full chunk (its prefix may have
+        been cached since), is probed again. The probe is read-only: it never
+        splits a node or refreshes LRU. The admission loop refreshes the hints
+        and restores the full chunk if a stale hint hid a long request (see
+        _pp_restore_full_chunk). Every PP rank sees the same queue and tree, so
+        all ranks pick the same size.
+
+        With --pp-chunk-overhead-tokens the size follows the total pending
+        uncached tokens instead (see _pp_chunk_size_for_load)."""
+        if self.pp_chunk_overhead_tokens is not None:
+            return self._pp_chunk_size_for_load(chunk)
+        req = self.chunked_req
+        if req is not None and req.seqlen - req.prefix_len >= chunk:
+            return chunk
+        # The policy matched every waiting request this step: read those results.
+        matched = self.policy.waiting_queue_prefix_matched(self.waiting_queue)
+        for req in self.waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]:
+            uncached = req.pp_uncached_hint
+            if matched:
+                uncached = self._pp_record_uncached(req)
+            elif uncached is None or uncached >= chunk:
+                # Sizing a chunk must not change cache state.
+                uncached = peek_uncached_tokens(req, self.tree_cache)
+                if uncached is None:
+                    return chunk
+                req.pp_uncached_hint = uncached
+            if uncached >= chunk:
+                return chunk
+        return self.pp_min_chunked_prefill_size
+
+    def _pp_chunk_size_for_load(self, full_chunk: int) -> int:
+        """Size the chunk from U, the uncached tokens of the chunked request and
+        the waiting requests. Chunk C costs about overhead + C, so U takes
+        (U / C + pp - 1) * (overhead + C) through the pipeline: a light load
+        wants small chunks to fill every stage, a heavy one larger chunks to
+        pay the per-chunk overhead (MoE weights reread, launches) less often.
+        The pipeline fills and drains at the pace of its largest chunk, so a
+        request keeps the size its whole prefill was given: the chunked
+        request counts the uncached tokens it was admitted with, not just its
+        rest. Hints are read as in the binary rule; the sum stops once it
+        reaches the full chunk."""
+        cap = self._pp_min_pending_for(full_chunk)
+        pending = 0
+        req = self.chunked_req
+        if req is not None:
+            pending = max(req.seqlen - req.prefix_len, req.pp_uncached_hint or 0)
+        matched = self.policy.waiting_queue_prefix_matched(self.waiting_queue)
+        for req in self.waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]:
+            if pending >= cap:
+                break
+            uncached = req.pp_uncached_hint
+            if matched:
+                uncached = self._pp_record_uncached(req)
+            elif uncached is None or uncached >= self.pp_min_chunked_prefill_size:
+                # Sizing a chunk must not change cache state.
+                uncached = peek_uncached_tokens(req, self.tree_cache)
+                if uncached is None:
+                    return full_chunk
+                req.pp_uncached_hint = uncached
+            pending += uncached
+        self._pp_pending_tokens = pending
+        return self._pp_hold_chunk(self._pp_load_chunk(pending, full_chunk), full_chunk)
+
+    def _pp_hold_chunk(self, chunk: int, full_chunk: int) -> int:
+        """Grow at once, shrink only after the load stayed lower for
+        _PP_DIP_STEPS_PER_STAGE * pp_size sizing steps. A steady concurrent
+        load dips whenever one prefill ends before the client's next request
+        arrives; switching sizes there mixes chunks, and a pipeline runs at
+        the pace of its largest chunk while paying the overhead of every
+        small one. Steps, unlike time, advance alike on every PP rank."""
+        if chunk >= self._pp_held_chunk:
+            self._pp_held_chunk, self._pp_dip_steps = chunk, 0
+        else:
+            self._pp_dip_steps += 1
+            if self._pp_dip_steps > _PP_DIP_STEPS_PER_STAGE * get_parallel().pp_size:
+                self._pp_held_chunk, self._pp_dip_steps = chunk, 0
+        return min(self._pp_held_chunk, full_chunk)
+
+    def _pp_load_chunk(self, pending: int, full_chunk: int) -> int:
+        """Double the small chunk while the doubled one gets pending through
+        the pipeline faster, i.e. pending * overhead >= 2 * (pp - 1) * C^2."""
+        chunk = self.pp_min_chunked_prefill_size
+        while chunk * 2 <= full_chunk and pending >= self._pp_min_pending_for(
+            chunk * 2
+        ):
+            chunk *= 2
+        return chunk
+
+    def _pp_min_pending_for(self, chunk: int) -> int:
+        """Pending uncached tokens from which chunk beats chunk / 2."""
+        half = chunk // 2
+        stages = get_parallel().pp_size - 1
+        return -(-2 * stages * half * half // self.pp_chunk_overhead_tokens)
+
+    @staticmethod
+    def _pp_record_uncached(req: Req) -> int:
+        """Store the uncached tokens of req's latest prefix match as its hint."""
+        req.pp_uncached_hint = max(1, req.seqlen - req.num_matched_prefix_tokens)
+        return req.pp_uncached_hint
+
+    def _pp_restore_full_chunk(
+        self, req: Req, adder: PrefillAdder, chunk: int, full_chunk: int
+    ) -> int:
+        """Called after the admission loop matched req. Refresh its hint and,
+        if it needs a full chunk that a stale hint shrank away, give the rest
+        of this batch the full chunk, as a fresh match would have. Return the
+        batch's chunk size. Under the load rule, a hint that undercounted adds
+        the difference to the pending load and the chunk is resized from it."""
+        hint = req.pp_uncached_hint
+        uncached = self._pp_record_uncached(req)
+        if self.pp_chunk_overhead_tokens is None:
+            target = full_chunk if uncached >= full_chunk else chunk
+        else:
+            self._pp_pending_tokens += max(0, uncached - (hint or 0))
+            target = self._pp_load_chunk(self._pp_pending_tokens, full_chunk)
+            if target > chunk:
+                self._pp_held_chunk, self._pp_dip_steps = target, 0
+        if target > chunk and adder.rem_chunk_tokens is not None:
+            adder.rem_chunk_tokens += target - chunk
+            return target
+        return chunk
 
     def _should_defer_prefill(self, running_batch: ScheduleBatch) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -1548,6 +1708,7 @@ class Scheduler(
         draft_token_to_kv_pool = (
             self.draft_worker.primary_draft_kv_pool
             if self.draft_worker is not None
+            and not (self.spec_algorithm.is_dflash() and draft_kv_ring_enabled())
             else None
         )
 
@@ -2671,6 +2832,63 @@ class Scheduler(
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
         return SchedulerOutputStreamer
 
+    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
+        """Hold a finished response until completion; see deferred_output."""
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            raise ValueError("deferred responses do not support PD disaggregation")
+        if not req.finished() or req.finished_output:
+            raise ValueError("only finished, unstreamed responses can be deferred")
+        if self._deferred_responses is None:
+            self._deferred_responses = {}
+        if req.rid in self._deferred_responses:
+            raise ValueError(f"response {req.rid!r} is already deferred")
+        self._deferred_responses[req.rid] = (req, completion)
+        req.defer_output = True
+        self.output_streamer.defer_outputs = True
+
+    def stream_released_deferred_outputs(self) -> None:
+        ready = []
+        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
+            if not completion.done():
+                continue
+            del self._deferred_responses[rid]
+            req.defer_output = False
+            try:
+                completion.result()
+            except Exception as exc:
+                logger.exception("Deferred response failed for %s", rid)
+                self._abort_deferred_response(
+                    req, FINISH_ABORT(str(exc), status_code=500).to_json()
+                )
+            else:
+                ready.append(req)
+        if ready:
+            self.output_streamer.stream_output(
+                ready, any(req.return_logprob for req in ready)
+            )
+
+    def has_pending_deferred_outputs(self) -> bool:
+        return bool(self._deferred_responses)
+
+    def _abort_deferred_response(
+        self, req: Req, finished_reason: Optional[FinishReasonDict]
+    ) -> None:
+        req.defer_output = False
+        req.finished_output = True
+        self.send_abort_output(
+            _make_abort_req(req, finished_reason=finished_reason), req
+        )
+
+    def _abort_deferred_responses(self, recv_req: AbortReq) -> None:
+        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
+            if recv_req.abort_all or rid.startswith(recv_req.rid):
+                del self._deferred_responses[rid]
+                try:
+                    completion.cancel()
+                except Exception:
+                    logger.exception("Failed to cancel deferred work for %s", rid)
+                self._abort_deferred_response(req, recv_req.finished_reason)
+
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
             model_config=self.model_config,
@@ -3448,6 +3666,19 @@ class Scheduler(
             )
         self._prefetch_kvcache(req, storage_hit_end)
 
+    def _revert_unadmitted_mamba(self, req: Req) -> None:
+        # init_next_round_input() may stage a deferred Mamba COW/clear and take a
+        # slot before the request is left unadmitted. Drop both, so a later pass
+        # matches afresh instead of copying from a source evicted in between.
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        # A session holds its slot across requests; freeing it here double-frees.
+        if req.kv.holds_mamba and not getattr(req, "session", None):
+            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                req.kv.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.kv.mamba_pool_idx = None
+
     def _prefetch_after_device_hit_loss(self, req: Req) -> bool:
         """Re-query an L3 range newly exposed by queue-time device eviction."""
         previous_match_len = req.storage_prefetch_last_match_len
@@ -3478,7 +3709,7 @@ class Scheduler(
         return True
 
     def retire_unadmitted_request(self, req: Req) -> None:
-        """Finish a request the disaggregation queues rejected at their door."""
+        """Finish an intake rejection before it enters an admission queue."""
         # `create_req` marks a streaming session in-flight, and the pre-abort
         # detach lives in `StreamingSession.find_active_slot`, which only runs
         # while scheduling; a session left in-flight rejects every later request.
@@ -4155,6 +4386,11 @@ class Scheduler(
             self.waiting_queue,
             running_batch,
             processed_tokens=self.processed_tokens_counter,
+            bootstrap_queue=(
+                self.disagg_prefill_bootstrap_queue.queue
+                if self.disagg_prefill_bootstrap_queue is not None
+                else []
+            ),
         )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -4170,6 +4406,10 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        pp_full_chunk = None
+        if self.pp_min_chunked_prefill_size is not None:
+            pp_full_chunk = chunked_prefill_size
+            chunked_prefill_size = self._pp_chunk_size_for_pending(chunked_prefill_size)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4283,14 +4523,20 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if pp_full_chunk is not None:
+                chunked_prefill_size = self._pp_restore_full_chunk(
+                    req, adder, chunked_prefill_size, pp_full_chunk
+                )
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                self._revert_unadmitted_mamba(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
+                    self._revert_unadmitted_mamba(req)
                     continue
             res = adder.add_one_req(
                 req,
@@ -4313,15 +4559,7 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
+                    self._revert_unadmitted_mamba(req)
                 break
 
         if mamba_allocator is not None:
@@ -5022,7 +5260,10 @@ class Scheduler(
         logits_output = result.logits_output
         if (
             logits_output is None
-            or logits_output.auxiliary_device_output is None
+            or (
+                logits_output.auxiliary_device_output is None
+                and result.forward_auxiliary_output is None
+            )
             or result.auxiliary_host_output is not None
         ):
             return
@@ -5101,6 +5342,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if self._deferred_responses:
+            self.stream_released_deferred_outputs()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5266,6 +5509,8 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
+        if self._deferred_responses:
+            self.stream_released_deferred_outputs()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5290,9 +5535,11 @@ class Scheduler(
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
+                or self._deferred_responses
             ):
-                # Storage and transfer workers need the GIL between I/O calls.
-                # Singleton PD polls no longer yield through a collective.
+                # Storage, transfer, and deferred-output workers need the GIL
+                # between I/O calls. Singleton PD polls no longer yield through
+                # a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
@@ -5349,11 +5596,19 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
+        if self.has_pending_deferred_outputs():
+            # Held responses are released by polling, not by a socket event:
+            # keep polling, and yield the GIL to the completion's worker.
+            time.sleep(0)
+        else:
+            # sleep until next event
+            self.maybe_sleep_on_idle()
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self._deferred_responses:
+            self.stream_released_deferred_outputs()
+            time.sleep(0)
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
@@ -5672,6 +5927,7 @@ class Scheduler(
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
             *([self.chunked_req] if self.chunked_req is not None else []),
+            *(req for req, _ in (self._deferred_responses or {}).values()),
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -5701,6 +5957,8 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
+        if self._deferred_responses:
+            self._abort_deferred_responses(recv_req)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

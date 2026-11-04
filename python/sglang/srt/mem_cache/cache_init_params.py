@@ -44,6 +44,10 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
+    # The tree holds no Mamba state (a state-free PD decode tree, see
+    # SGLANG_DECODE_STATE_FREE_RADIX); the cache only frees each request's own
+    # state slot when the request leaves.
+    request_mamba_only: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1

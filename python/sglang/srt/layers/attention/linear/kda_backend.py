@@ -737,6 +737,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
+        if (
+            self.kernel_dispatcher.extend_kernel.wants_int64_query_start_loc
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self.forward_metadata.query_start_loc_i64 = (
+                self.forward_metadata.query_start_loc.to(torch.int64)
+            )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1052,7 +1059,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # MTP / speculative-decode verify is a multi-token-per-seq path with
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():
-            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+            physical_num_tokens = mixed_qkv.shape[0]
+            logical_num_tokens = physical_num_tokens
+            if forward_batch.spec_info.ragged_verify_layout is None:
+                # MoE may append token padding that is not a complete verify
+                # sequence. Keep it out of convolution and state updates.
+                logical_num_tokens = (
+                    self.forward_metadata.query_start_loc.shape[0] - 1
+                ) * forward_batch.spec_info.draft_token_num
+                mixed_qkv = mixed_qkv[:logical_num_tokens]
+                a = a[:, :logical_num_tokens]
+                b = b[:, :logical_num_tokens]
+            core_attn_out = self._forward_target_verify(
+                layer, forward_batch, mixed_qkv, a, b
+            )
+            if logical_num_tokens < physical_num_tokens:
+                pad = core_attn_out.new_zeros(
+                    (1, physical_num_tokens - logical_num_tokens)
+                    + tuple(core_attn_out.shape[2:])
+                )
+                core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+            return core_attn_out
 
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
@@ -1152,6 +1179,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            query_start_loc_i64=self.forward_metadata.query_start_loc_i64,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
@@ -1276,7 +1304,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
             forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
             self.req_to_token_pool.size,
         )
 
@@ -1738,9 +1766,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
-        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        # Only per-token scratch grows with the verify window; the staged
+        # recurrent state is independent of its length.
+        if not 2 <= draft_token_num <= 16:
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False

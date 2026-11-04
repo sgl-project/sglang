@@ -55,6 +55,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -400,6 +401,38 @@ class TestPrepareServerArgs(CustomTestCase):
                 16384
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+
+    def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                tp_size=2,
+                attn_dp_size=2,
+            )
+            per_rank_chunked_prefill_size = 8192
+            declare_resolution(
+                args,
+                "test_data_parallelism",
+                chunked_prefill_size=per_rank_chunked_prefill_size,
+            )
+
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                per_rank_chunked_prefill_size
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                per_rank_chunked_prefill_size // 2
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, f"required_per_rank={per_rank_chunked_prefill_size}"
+                ):
+                    validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
     def test_megamoe_token_budget_gate_by_arch_and_nvfp4(self):
         from sglang.srt.arg_groups.mega_moe_hook import mega_moe_needs_token_budget
@@ -2832,6 +2865,61 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
 
+class TestAscendOpsArgs(CustomTestCase):
+    def test_ascend_ops_rejected_by_waterfill_without_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            enable_waterfill=True,
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+            handle_a2a_moe(server_args)
+
+    def test_ascend_ops_rejected_by_waterfill_with_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            moe_ascend_ops_config="{}",
+            enable_waterfill=True,
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+            handle_a2a_moe(server_args)
+
+    def test_ascend_ops_speculative_draft_requires_npu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            speculative_moe_a2a_backend="ascend_ops",
+        )
+        with self.assertRaisesRegex(ValueError, "only supported on NPU"):
+            handle_a2a_moe(server_args)
+
+    # Protects the target/draft backend invariant required by the shared
+    # Ascend Ops configuration and communication groups.
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
+    def test_ascend_ops_requires_matching_target_and_draft_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            speculative_moe_a2a_backend="deepep",
+        )
+        self.assertEqual(
+            resolve_ascend_ops_speculative_draft(server_args),
+            {"speculative_moe_a2a_backend": "ascend_ops"},
+        )
+
+    # Protects the inverse invariant: a non-Ascend main backend cannot use
+    # Ascend Ops only for the speculative draft model.
+    def test_non_ascend_ops_rejects_ascend_ops_draft_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            speculative_moe_a2a_backend="ascend_ops",
+        )
+        with self.assertRaisesRegex(AssertionError, "cannot be ascend_ops"):
+            resolve_ascend_ops_speculative_draft(server_args)
+
+
 class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
@@ -3005,6 +3093,21 @@ class TestPipelineParallelCompat(CustomTestCase):
                 check_pipeline_parallel_compat(
                     self._cfg(speculative_algorithm="DSPARK")
                 )
+
+    def test_dflash_pd_prefill_is_allowed(self):
+        # The draft lives on the last stage and materializes the prompt's
+        # draft KV for the decode.
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DFLASH"))
+
+    def test_dflash_is_rejected_outside_pd_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(AssertionError, "DFLASH.*prefill"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="DFLASH", disaggregation_mode=mode
+                        )
+                    )
 
     def test_eagle_is_allowed_on_prefill(self):
         check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))

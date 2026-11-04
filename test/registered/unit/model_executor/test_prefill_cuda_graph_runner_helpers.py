@@ -168,7 +168,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             positions=None,
             forward_batch=batch,
         )
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         x = torch.full((8, 2), 3, dtype=torch.int32)
         with (
             patch.object(
@@ -202,7 +202,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             global_num_token_non_padded_cpu=None,
         )
         context = SimpleNamespace(forward_batch=batch)
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         pool = Mock(get_mamba_indices=lambda indices: indices)
         cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
         with (
@@ -226,9 +226,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                         ngram_eos_token_id=None,
                         holder=holder,
                     )
-                else:
-                    for replay in capture.cuda_graph._break_fns:
-                        replay()
+                    self.assertIsNone(holder.batch)
+                for replay in capture.cuda_graph._break_fns:
+                    replay()
                 self.assertEqual(holder.batch.req_indices.tolist(), expected)
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
@@ -249,6 +249,43 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                     ),
                     expected,
                 )
+
+    def test_cp_pp_replay_clears_previous_larger_shard(self):
+        # A graph reads its whole CP-local bucket, even when the next PP
+        # message carries fewer rows or omits an auxiliary field.
+        buffers = SimpleNamespace(
+            pp_proxy_tensors={
+                "hidden_states": torch.full((8, 2), 41.0),
+                "residual": torch.full((8, 3, 2), 42.0),
+                "dspark_hidden_states": torch.full((8, 4), 43.0),
+            }
+        )
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.buffers = buffers
+        runner.prefill_cp_bcg_input = SimpleNamespace(bucket_local_tokens={8: 4})
+        for rows in (4, 1):
+            with self.subTest(received_rows=rows):
+                received = PPProxyTensors(
+                    {"hidden_states": torch.full((rows, 2), float(rows))}
+                )
+                if rows == 4:
+                    for name in ("residual", "dspark_hidden_states"):
+                        received.tensors[name] = torch.full_like(
+                            buffers.pp_proxy_tensors[name][:rows], 7.0
+                        )
+                for name, value in received.tensors.items():
+                    buffers.pp_proxy_tensors[name][:rows].copy_(value)
+                runner._zero_stale_cp_pp_proxy_rows(received, 8)
+                replay_input = buffers.pp_proxy_tensors["hidden_states"][:4]
+                torch.testing.assert_close(replay_input[:rows], received["hidden_states"])
+                self.assertTrue(torch.all(replay_input[rows:] == 0))
+                for name in ("residual", "dspark_hidden_states"):
+                    expected = 7.0 if rows == 4 else 0.0
+                    self.assertTrue(
+                        torch.all(buffers.pp_proxy_tensors[name][:4] == expected)
+                    )
+        # Clearing a local graph bucket must not modify unrelated capacity.
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["hidden_states"][4:] == 41))
 
     def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()

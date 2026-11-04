@@ -1,4 +1,4 @@
-"""Interleave BCG adapter for GLM-5.3 Flash text prefills.
+"""Interleave BCG adapter for hybrid DSA/KDA text prefills.
 
 Keep full-sequence KPool positions separate from the local DSA positions.
 Graph row capacity is fixed while live token counts and prefix state can change.
@@ -55,12 +55,7 @@ def _indexer_with_kv(
     output[logical:].fill_(-1)
 
 
-def _capture_stub(indexer, x, q_lora, positions, output, layer_id, kv_local, kv_output):
-    output.fill_(-1)
-    kv_output.zero_()
-
-
-bcg_indexer_with_kv = eager_on_graph(True, capture_stub=_capture_stub)(_indexer_with_kv)
+bcg_indexer_with_kv = eager_on_graph(True)(_indexer_with_kv)
 
 
 class InterleaveCPBCGInput(PrefillCPBCGInput):
@@ -85,12 +80,28 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
     @staticmethod
     def supports(server_args):
         cfg = resolving_view(server_args)
+        view = resolved_view(server_args)
+        architectures = model_config_of(server_args).hf_config.architectures
+        is_kimi_k31 = "KimiK31ForConditionalGeneration" in architectures
+        # MegaMoE EP over the CP group: each rank owns its CP shard's rows.
+        # Pipeline stages exchange CP-local rows (see execute_prefill_cp_bcg).
+        kimi_ep = (
+            is_kimi_k31
+            and view.ep_size == cfg.tp_size == view.attn_cp_size
+            and view.moe_a2a_backend == "megamoe"
+            and cfg.moe_dp_size == 1
+        )
         return (
             cfg.dp_size == 1
-            and cfg.ep_size == 1
-            and resolved_view(server_args).attn_cp_size > 1
-            and "Glm5NextForConditionalGeneration"
-            in model_config_of(server_args).hf_config.architectures
+            and (cfg.pp_size == 1 or is_kimi_k31)
+            and (view.ep_size == 1 or kimi_ep)
+            and view.attn_cp_size > 1
+            and bool(
+                {
+                    "Glm5NextForConditionalGeneration",
+                    "KimiK31ForConditionalGeneration",
+                }.intersection(architectures)
+            )
         )
 
     def _max_local_tokens(self, extend_seq_lens):

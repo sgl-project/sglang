@@ -315,9 +315,14 @@ def ensure_mamba_capacity(
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = req_to_token_pool.mamba_allocator
-    supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+    # Only a tree that holds Mamba states can give slots back.
+    tree_holds_mamba = (
+        tree_cache is not None
+        and tree_cache.supports_mamba()
+        and not getattr(tree_cache, "request_mamba_only", False)
+    )
     available = allocator.schedulable_available_size()
-    if available < needed and supports_mamba:
+    if available < needed and tree_holds_mamba:
         tree_cache.evict_for_alloc(
             EvictParams(num_tokens=0, mamba_num=needed - available)
         )

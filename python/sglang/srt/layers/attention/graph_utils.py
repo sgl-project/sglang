@@ -148,9 +148,12 @@ def padded_extend_real_tokens(
 ) -> Optional[int]:
     """The number of real rows of an extend batch that MLP sync padded to a multiple of
     attention TP, whose attention metadata covers only those rows; None for a
-    batch without such padding. Target verify plans its padded rows itself."""
+    batch without such padding. Target verify, and a backend whose extend
+    metadata covers the padded rows (DSA), plan the padded rows themselves."""
     mode = forward_batch.forward_mode
     if not mode.is_extend() or mode.is_target_verify():
+        return None
+    if get_attn_backend().plans_padded_extend_rows:
         return None
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens is None or not 0 < real_num_tokens < q.shape[0]:

@@ -5,10 +5,13 @@ With SGLANG_K3_SP_ATTN_RES the bank and the stream stay on each rank's shard
 across SP-MoE layers."""
 
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import test_attn_bank_residual_ops as bank_fixture
 import test_declared_decoder_boundary as fixture
+import torch
 from torch import nn
 
 from sglang.srt.environ import envs
@@ -16,6 +19,8 @@ from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.layer_boundary import BatchVariant, layer_stack
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input, keep_output
+from sglang.srt.layers.layer_boundary.residual import attn_bank
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
@@ -33,7 +38,21 @@ CONFIG = SimpleNamespace(
     first_k_dense_replace=1,
     moe_layer_freq=1,
     routed_expert_hidden_size=2,
+    is_kda_layer=lambda layer_idx: False,
 )
+
+
+@contextmanager
+def k3_planning(parallel, **options):
+    """fixture.planning, also for the parallel layout K3's own declaration
+    code reads (prefill CP, pipeline width)."""
+    if not hasattr(parallel, "pp_size"):
+        parallel.pp_size = 1
+    with (
+        fixture.planning(parallel, **options),
+        patch.object(kimi_k3, "get_parallel", lambda: parallel),
+    ):
+        yield
 
 
 def moe_layer(*, bank, sp_moe, all_reduce_fusion):
@@ -85,7 +104,7 @@ def declare(layers, *, sp_moe, carries=False, config=CONFIG):
         patch.object(kimi_k3, "_shards_moe_rows", return_value=sp_moe),
         patch.object(kimi_k3, "_carries_bank_slices", return_value=carries),
         envs.SGLANG_K3_SP_ATTN_RES.override(carries),
-        fixture.planning(
+        k3_planning(
             fixture.parallel_of(attn_dp=1, attn_tp=2),
             a2a=sp_moe,
             boundary_reduction="ar",
@@ -142,6 +161,75 @@ class TestKimiK3StageKernels(CustomTestCase):
 
 
 class TestKimiK3BankOnShards(CustomTestCase):
+    def test_dspark_captures_only_owned_bank_rows(self):
+        generator = torch.Generator().manual_seed(17)
+        hidden = torch.randn(4, bank_fixture.HIDDEN, generator=generator)
+        bank = AttnBank()
+        values = bank.open(hidden, 3).block_residual
+        values.normal_(generator=generator)
+        reference_bank = values.clone()
+        layers = [
+            SimpleNamespace(
+                self_attention_res_proj=layer.attn_proj,
+                self_attention_res_norm=layer.attn_score_norm,
+                prev_valid_blocks=(i + 1) // 2,
+            )
+            for i, layer in enumerate(bank_fixture.LAYER_LIST)
+        ]
+        model = SimpleNamespace(
+            layers=layers,
+            end_layer=5,
+            config=SimpleNamespace(attn_res_block_size=2),
+            attn_bank=bank,
+            output_attn_res_proj=bank_fixture.OUT_PROJ,
+            output_attn_res_norm=bank_fixture.OUT_SCORE_NORM,
+        )
+        # Before the first bank write, at a block boundary, and at the last
+        # layer, which uses the output-side weights instead of a next layer.
+        for tap in (-1, 0, 1, 3, 4):
+            proj, norm = (
+                (bank_fixture.OUT_PROJ, bank_fixture.OUT_SCORE_NORM)
+                if tap == 4
+                else (
+                    layers[tap + 1].self_attention_res_proj,
+                    layers[tap + 1].self_attention_res_norm,
+                )
+            )
+            # Keep the reference's CPU GEMM shape fixed across ranks; this
+            # test checks bank-row ownership, not batch-dependent BLAS rounding.
+            want = torch.cat(
+                [
+                    bank_fixture._mix(h, b, (tap + 2) // 2, proj, norm)
+                    for h, b in zip(hidden.chunk(2), reference_bank.chunk(2))
+                ]
+            )
+            for rank in (0, 1):
+                rows = slice(rank * 2, (rank + 1) * 2)
+                values.fill_(float("nan"))
+                values[rows].copy_(reference_bank[rows])
+                batch = SimpleNamespace()
+                local = residual_batch.set_written(hidden[rows], batch)
+
+                def gather(mixed, dim):
+                    self.assertEqual(dim, 0)
+                    torch.testing.assert_close(mixed, want[rows], rtol=0, atol=0)
+                    return want.clone()
+
+                parallel = SimpleNamespace(
+                    attn_tp_size=2,
+                    attn_tp_rank=rank,
+                    attn_tp_group=SimpleNamespace(all_gather=gather),
+                )
+                with (
+                    self.subTest(tap=tap, rank=rank),
+                    patch.object(attn_bank, "get_parallel", return_value=parallel),
+                    patch.object(kimi_k3, "get_parallel", return_value=parallel),
+                ):
+                    got = kimi_k3.KimiK3LinearModel._dspark_capture_stream(
+                        model, tap, local, batch
+                    )
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
     def stack(self, *, carries):
         layers = {
             idx: moe_layer(bank=True, sp_moe=True, all_reduce_fusion=False)
@@ -184,15 +272,17 @@ class TestKimiK3BankOnShards(CustomTestCase):
 
     def test_the_shard_mode_is_decided_at_construction(self):
         # A rank holds only its own rows of the bank: no pipeline rank after
-        # it, no draft model capturing the target's hidden states, and no
-        # dense layer after an MoE layer.
+        # it and no dense layer after an MoE layer. DSpark can capture by
+        # gathering the mixture; other aux-capture paths need the whole bank.
         cases = {
             (None, 1, 1): True,
             ("EAGLE", 1, 1): True,
             (None, 2, 1): False,
             ("EAGLE3", 1, 1): False,
             ("DFLASH", 1, 1): False,
-            ("DSPARK", 1, 1): False,
+            ("DSPARK", 1, 1): True,
+            ("DSPARK", 2, 1): False,
+            ("DSPARK", 1, 2): False,
             (None, 1, 2): False,
         }
         for (algorithm, pp_size, moe_layer_freq), carries in cases.items():

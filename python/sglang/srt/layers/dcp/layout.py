@@ -19,6 +19,28 @@ import torch
 
 from sglang.srt.runtime_context import get_parallel
 
+# Kimi-K3.1 shards the DSA index-K cache over the DCP ranks by token, like the
+# MLA KV, and merges a global top-k (attention/dsa/dsa_dcp_sharded.py); other
+# DSA models keep index-K replicated (attention/dsa/dsa_dcp.py).
+_dsa_shards_index_k = False
+
+
+def set_dsa_shards_index_k() -> None:
+    """Called by the Kimi-K3.1 DSA layers under DCP, before any pool or
+    attention backend is built."""
+    global _dsa_shards_index_k
+    _dsa_shards_index_k = True
+
+
+def dsa_shards_index_k() -> bool:
+    return _dsa_shards_index_k and get_parallel().attn_dcp_size > 1
+
+
+def dsa_index_k_page_tokens(page_size: int) -> int:
+    if dsa_shards_index_k():
+        return page_size * get_parallel().attn_dcp_size
+    return page_size
+
 
 def get_dcp_lens(
     lens: torch.Tensor,

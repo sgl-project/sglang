@@ -56,6 +56,7 @@ class TestTransferStartLayer(CustomTestCase):
 class _RecordingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    _validate_mla_kv_item_len = MooncakeKVManager._validate_mla_kv_item_len
 
     def __init__(self, *, prefill_start_layer: int, pp_size: int):
         self.is_mla_backend = False
@@ -146,6 +147,32 @@ class TestSingleRegionSWATransfer(CustomTestCase):
             )
         self.assertEqual(rc, 0)
         self.assertEqual(manager.blocks, [(1192, 2448, 128)])
+
+
+class TestMlaKvItemLenCheck(CustomTestCase):
+    """DSA flashmla_kv (656 B/token) and trtllm (576 B/token) pools must not
+    exchange KV: the raw MLA copy would silently misplace rows."""
+
+    def _manager(self, *, hybrid=True):
+        manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        manager.is_hybrid_mla_backend = hybrid
+        manager.kv_args.kv_item_lens = [64 * 656]
+        return manager
+
+    def test_mismatch_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "PD MLA KV layout mismatch"):
+            self._manager()._validate_mla_kv_item_len(64 * 576, None)
+
+    def test_match_and_unchecked_cases_pass(self):
+        self._manager()._validate_mla_kv_item_len(64 * 656, None)
+        # per-pool registration reports 0
+        self._manager()._validate_mla_kv_item_len(0, None)
+        # HiSparse host-backed destination
+        self._manager()._validate_mla_kv_item_len(
+            64 * 576, np.array([0], dtype=np.int32)
+        )
+        # non-MLA pools are sliced by heads elsewhere
+        self._manager(hybrid=False)._validate_mla_kv_item_len(64 * 576, None)
 
 
 class _RecordingAscendManager:

@@ -780,6 +780,15 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         )
 
+    def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
+        return self._binding.peek_prefix_len(
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+            )
+        )
+
     def inc_full_pin(self, node_id: NodeId) -> None:
         self._binding.inc_full_pin(node_id)
 

@@ -8,6 +8,8 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        # Preserve unified-diff context lines.
+        exclude: ^python/sglang/kernels/aot/patches/flashmla/
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
@@ -105,6 +107,12 @@ repos:
         entry: python3 scripts/lint/check_workflow_job_names.py
         language: system
         files: ^\.github/workflows/.*\.yml$
+        pass_filenames: false
+      - id: check-opt-in-ci-tiers
+        name: check opt-in CI tiers match the workflows that gate on them
+        entry: python3 scripts/lint/check_opt_in_ci_tiers.py
+        language: system
+        files: ^(\.github/workflows/.*\.yml|scripts/ci/opt_in_ci_tiers\.json|scripts/lint/check_opt_in_ci_tiers\.py)$
         pass_filenames: false
       - id: check-rust-ext-cache-prefix
         name: check rust-ext cache key prefix defaults match

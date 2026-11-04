@@ -22,7 +22,9 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp.layout import (
+    dsa_index_k_page_tokens,
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
@@ -138,6 +140,17 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
                 ),
                 kv,
             )
+
+
+class TestDsaIndexKPageTokens(CustomTestCase):
+    def test_replicated_or_no_dcp_keeps_the_pool_page(self):
+        for dcp_size, shards_index_k in ((8, False), (1, True)):
+            with self.subTest(dcp_size=dcp_size, shards_index_k=shards_index_k):
+                with (
+                    patch.object(dcp_layout, "_dsa_shards_index_k", shards_index_k),
+                    rc.get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    self.assertEqual(dsa_index_k_page_tokens(64), 64)
 
 
 class TestGetDcpLens(CustomTestCase):

@@ -1357,6 +1357,15 @@ _K3_FRONT_WARP_SPLITK = {
     32: (32, 6),
 }
 
+# (n, k) -> the largest m that takes TGV, registered by a model for shapes it
+# measured (register_tgv_win_shapes).
+_MODEL_TGV_WIN_SHAPES: dict[tuple[int, int], int] = {}
+
+
+def register_tgv_win_shapes(shapes: dict[tuple[int, int], int]) -> None:
+    """Route a model's dense-GEMM shapes ``(n, k)`` to TGV up to the given m."""
+    _MODEL_TGV_WIN_SHAPES.update(shapes)
+
 
 # MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
 _MUSE_SPARK_TGV_M_RANGES = {
@@ -1398,6 +1407,8 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     ):
         return True
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+        return True
+    if m <= _MODEL_TGV_WIN_SHAPES.get((n, k), 0):
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
