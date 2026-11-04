@@ -49,6 +49,38 @@ def enabled() -> bool:
     return envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
 
 
+_KERNELS = ("default", "split_kv", "stream_k")
+
+
+def selected_kernel() -> str:
+    kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
+    if kernel not in _KERNELS:
+        raise ValueError(
+            f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL is {kernel!r}, not one of {_KERNELS}"
+        )
+    return kernel
+
+
+def _attention_kernel(kernel: str):
+    if kernel == "split_kv":
+        from sglang.kernels.ops.attention.beam_shared_context_split_kv import (
+            shared_context_attention_split_kv,
+        )
+
+        return shared_context_attention_split_kv
+    if kernel == "stream_k":
+        from sglang.kernels.ops.attention.beam_shared_context_stream_k import (
+            shared_context_attention_stream_k,
+        )
+
+        return shared_context_attention_stream_k
+    from sglang.kernels.ops.attention.beam_shared_context import (
+        shared_context_attention,
+    )
+
+    return shared_context_attention
+
+
 def _positive_int(field) -> int:
     value = field.get()
     if value <= 0:
@@ -305,12 +337,9 @@ def forward(
     head_dim = layer.head_dim
     flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)
     output = torch.empty_like(flat_q)
-    from sglang.kernels.ops.attention.beam_shared_context import (
-        shared_context_attention,
-    )
-
+    attention = _attention_kernel(selected_kernel())
     for bucket in metadata.buckets:
-        shared_context_attention(
+        attention(
             flat_q,
             k_buffer,
             v_buffer,

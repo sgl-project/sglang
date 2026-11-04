@@ -732,6 +732,9 @@ class Envs:
     SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT = EnvInt(32768)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE = EnvInt(8)
+    # Shared-context attention kernel: "default", "split_kv" (prompt split across
+    # CTAs) or "stream_k" (persistent grid).
+    SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
