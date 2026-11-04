@@ -18,8 +18,8 @@ except ImportError:  # pragma: no cover
     sf = None
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    is_layerwise_offloaded_module,
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_component_precision_override,
+)
 
 logger = init_logger(__name__)
 V = StageValidators
@@ -60,6 +64,27 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
     @property
     def parallelism_type(self) -> StageParallelismType:
         return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # In forward's order: reference/motion (and pose) VAE encodes, wav2vec2, then T5.
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name,
+                "vae",
+                target_dtype=resolve_component_precision(server_args, "vae"),
+            ),
+            ComponentUse(stage_name, "audio_encoder"),
+            ComponentUse(
+                stage_name,
+                "text_encoder",
+                target_dtype=resolve_component_precision_override(
+                    server_args, "text_encoder"
+                ),
+            ),
+        ]
 
     def _get_single_path(self, value, field_name: str) -> str:
         if isinstance(value, list):
@@ -112,6 +137,9 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         *,
         server_args: ServerArgs,
     ) -> torch.Tensor:
+        self.begin_declared_component_use(
+            component_name="text_encoder", module=self.text_encoder
+        )
         if hasattr(self.text_encoder, "encode_prompt"):
             prompt_embeds = self.text_encoder.encode_prompt(
                 prompt,
@@ -132,13 +160,7 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         text_inputs = server_args.pipeline_config.tokenize_prompt(
             [processed_prompt], self.tokenizer, tok_kwargs
         )
-        # Layerwise offload keeps the vocab table on the host, so the first
-        # parameter reads "cpu" while the blocks run on the device.
-        if is_layerwise_offloaded_module(self.text_encoder):
-            encoder_device = get_local_torch_device()
-        else:
-            encoder_device = next(self.text_encoder.parameters()).device
-        text_inputs = text_inputs.to(encoder_device)
+        text_inputs = text_inputs.to(get_local_torch_device())
         outputs = self.text_encoder(
             input_ids=text_inputs["input_ids"],
             attention_mask=text_inputs.get("attention_mask"),
@@ -170,12 +192,8 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
     def _encode_video_to_latents(
         self, video: torch.Tensor, server_args: ServerArgs
     ) -> torch.Tensor:
-        vae_dtype = torch.float32
-        if server_args.pipeline_config.vae_precision == "bf16":
-            vae_dtype = torch.bfloat16
-        elif server_args.pipeline_config.vae_precision == "fp16":
-            vae_dtype = torch.float16
-        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
+        vae_dtype = resolve_component_precision(server_args, "vae")
+        self.begin_declared_component_use(component_name="vae", module=self.vae)
         video = video.to(device=get_local_torch_device(), dtype=vae_dtype)
         if hasattr(self.vae, "encode_video"):
             latents = self.vae.encode_video(video)
@@ -207,9 +225,9 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         return latents
 
     def _encode_audio(self, audio_path: str, infer_frames: int):
-        # Runs on the device either way; --audio-encoder-cpu-offload only parks it on the
-        # host between requests, as the VAE does.
-        self.audio_encoder = self.audio_encoder.to(get_local_torch_device())
+        self.begin_declared_component_use(
+            component_name="audio_encoder", module=self.audio_encoder
+        )
         return self.audio_encoder.encode_audio(
             audio_path,
             infer_frames=infer_frames,
@@ -389,8 +407,4 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             "drop_motion_frames": bool(self.transformer.drop_first_motion),
             "infer_frames": int(infer_frames),
         }
-        if server_args.vae_cpu_offload:
-            self.vae = self.vae.to("cpu")
-        if server_args.audio_encoder_cpu_offload:
-            self.audio_encoder = self.audio_encoder.to("cpu")
         return batch

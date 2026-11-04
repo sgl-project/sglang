@@ -481,7 +481,6 @@ class ServerArgs(DisaggServerArgsMixin):
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
-    audio_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
     use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
@@ -2924,11 +2923,6 @@ class ServerArgs(DisaggServerArgsMixin):
             "--image-encoder-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for image encoder. Enable if run out of memory.",
-        )
-        parser.add_argument(
-            "--audio-encoder-cpu-offload",
-            action=StoreBoolean,
-            help="Use CPU offload for audio encoder. Enable if run out of memory.",
         )
         parser.add_argument(
             "--vae-cpu-offload",

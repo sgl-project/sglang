@@ -13,9 +13,6 @@ class AudioEncoderLoader(ComponentLoader):
     component_names = ["audio_encoder"]
     expected_library = "transformers"
 
-    def should_offload(self, server_args, model_config=None):
-        return bool(server_args.audio_encoder_cpu_offload)
-
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
@@ -28,7 +25,14 @@ class AudioEncoderLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
         encoder_config = getattr(server_args.pipeline_config, "audio_encoder_config")
         encoder_config.update_model_arch(config)
-        target_device = self.target_device(self.should_offload(server_args))
+        # No layerwise hooks: record it before placing, so a layerwise "all" selection
+        # resolves this component to its non-layerwise placement instead of the host.
+        server_args.record_component_layerwise_capability(
+            component_name, supported=False
+        )
+        target_device = self.target_device(
+            server_args.should_start_component_on_cpu(component_name)
+        )
         return model_cls(
             config=encoder_config,
             component_model_path=component_model_path,

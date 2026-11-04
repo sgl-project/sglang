@@ -3,10 +3,13 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
+from transformers import Wav2Vec2Config, Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
 
 from sglang.multimodal_gen.runtime.models.encoders.wan_s2v_audio import (
     WanS2VAudioEncoder,
+    linear_interpolation,
 )
 
 LAYERS, DIM = 2, 4
@@ -52,3 +55,46 @@ def test_audio_bucket_of_empty_audio_is_all_zero():
     bucket, clips = _bucket(audio_frames=0, m=0)
     assert clips == 1 and bucket.shape == (81, LAYERS, DIM)
     assert not bucket.any()
+
+
+def test_audio_features_end_with_the_post_layernorm_encoder_output():
+    """With do_stable_layer_norm (the S2V checkpoint), the last stacked layer must be the
+    encoder output after its final LayerNorm; transformers >= 5.17 hands out hidden_states[-1]
+    before it, which swamps the DiT's layer mix and loses lip sync."""
+    torch.manual_seed(0)
+    config = Wav2Vec2Config(
+        vocab_size=8,
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        intermediate_size=32,
+        conv_dim=(8, 8),
+        conv_stride=(5, 2),
+        conv_kernel=(10, 3),
+        num_conv_pos_embeddings=16,
+        num_conv_pos_embedding_groups=2,
+        feat_extract_norm="layer",
+        do_stable_layer_norm=True,
+    )
+    model = Wav2Vec2ForCTC(config).eval()
+    waveform = np.random.default_rng(0).standard_normal(4000).astype(np.float32)
+    encoder = SimpleNamespace(
+        _load_audio=lambda _: (waveform, 16000),
+        processor=Wav2Vec2FeatureExtractor(),
+        model=model,
+        device=torch.device("cpu"),
+        video_rate=30,
+    )
+
+    with torch.no_grad():
+        feat = WanS2VAudioEncoder.extract_audio_feat(
+            encoder, "unused.wav", return_all_layers=True
+        )
+        input_values = encoder.processor(
+            waveform, sampling_rate=16000, return_tensors="pt"
+        ).input_values
+        post_norm = model.wav2vec2(input_values).last_hidden_state
+    expected_last = linear_interpolation(post_norm, input_fps=50, output_fps=30)
+
+    assert feat.shape[0] == config.num_hidden_layers + 1
+    torch.testing.assert_close(feat[-1:], expected_last)

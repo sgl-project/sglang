@@ -32,6 +32,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
+)
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
@@ -73,8 +76,8 @@ def _make_wan_s2v_text_encoder_config() -> T5Config:
     arch.relative_attention_num_buckets = 32
     arch.feed_forward_proj = "gated-gelu"
     arch.text_len = 512
-    # The S2V stage runs T5 where its weights are, i.e. on the host under
-    # text_encoder_cpu_offload.
+    # Keep the Wan reference T5 norm numerics: RMSNorm's kernel rounds differently,
+    # which changes S2V samples (~1.5 dB PSNR at the same seed).
     arch.reference_layer_norm = True
     arch.__post_init__()
     return config
@@ -543,6 +546,17 @@ class Wan2_2_S2V_14B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     task_type: ModelTaskType = ModelTaskType.S2V
     vae_stride = (4, 8, 8)
     max_area: int = 704 * 1024
+
+    def validate_server_args(self, server_args: Any) -> None:
+        super().validate_server_args(server_args)
+        # wav2vec2 has no layerwise hooks. Reject only an explicit choice; a layerwise
+        # "all" selection skips it via the capability the audio loader records.
+        if server_args.canonical_residency_mode("audio_encoder") == LAYERWISE_OFFLOAD:
+            raise ValueError(
+                "Wan2.2-S2V does not support layerwise offload for its audio encoder "
+                "(wav2vec2); use --component-residency audio_encoder=component-offload "
+                "(or resident / snapshot-offload)"
+            )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         z_dim = self.vae_config.arch_config.z_dim

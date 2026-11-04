@@ -1,46 +1,148 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wan2.2-S2V's before-denoising stage: audio placement, output rate, remote-input downloads."""
+"""Wan2.2-S2V before-denoising stage: residency, output rate, remote-input downloads."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_S2V_14B_Config
+from sglang.multimodal_gen.runtime.loader.component_loaders import (
+    audio_encoder_loader as audio_loader_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+    SNAPSHOT_OFFLOAD,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
     wan_s2v as stage_module,
 )
 
-DEVICE = torch.device("meta")  # stands in for the accelerator; never computed on
+
+def _stage():
+    stage = object.__new__(stage_module.WanS2VBeforeDenoisingStage)
+    stage._component_residency_manager = None
+    stage._registered_stage_name = None
+    return stage
 
 
-class _RecordingEncoder:
-    def __init__(self, device):
-        self.device = torch.device(device)
-        self.encoded_on = []
-
-    def to(self, device):
-        self.device = torch.device(device)
-        return self
+class _AudioEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
 
     def encode_audio(self, audio_path, *, infer_frames, fps, dtype, m):
-        self.encoded_on.append(self.device)
         return torch.zeros(1), 1
 
 
-def test_audio_encodes_on_the_device_after_being_parked_on_the_host():
-    """--audio-encoder-cpu-offload parks the encoder on the host after each request; the next
-    request must still encode on the device, not where it was parked."""
-    stage = object.__new__(stage_module.WanS2VBeforeDenoisingStage)
+def test_every_request_stages_the_audio_encoder_through_the_residency_manager():
+    """An offloaded audio encoder must be brought to the device by the shared residency
+    manager before every request's encode; request 2 once ran wav2vec2 on the host."""
+    encoder = _AudioEncoder()
+    stage = _stage()
     stage.transformer = SimpleNamespace(
         fps=16, param_dtype=torch.bfloat16, audio_sample_m=0
     )
-    stage.audio_encoder = _RecordingEncoder("cpu")  # as request 1's offload leaves it
-    with patch.object(stage_module, "get_local_torch_device", return_value=DEVICE):
+    stage.audio_encoder = encoder
+    args = SimpleNamespace(
+        pipeline_config=Wan2_2_S2V_14B_Config(),
+        component_precisions={},
+        enable_layerwise_nvtx_marker=False,
+        explicit_residency_mode=lambda _: None,
+    )
+    pipeline = SimpleNamespace(
+        modules={"audio_encoder": encoder},
+        _stage_name_mapping={"s2v": stage},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(pipeline, args)
+    strategy = Mock()
+    strategy.prefetch_for_use.return_value = False
+    manager.strategy_for = Mock(return_value=strategy)
+    stage.set_component_residency_manager(manager)
+    batch = SimpleNamespace(is_warmup=False)
+    for _ in range(2):
+        manager.begin_request([stage], batch, args)
+        manager.before_stage(stage, 0, batch, args)
+        manager.begin_stage()
         stage._encode_audio("talk.wav", infer_frames=81)
-        stage.audio_encoder = stage.audio_encoder.to("cpu")  # parked again
-        stage._encode_audio("talk.wav", infer_frames=81)
-    assert stage.audio_encoder.encoded_on == [DEVICE, DEVICE]
+        manager.end_stage()
+        manager.finish_request()
+    prepared = [call.args[0] for call in strategy.prepare_for_use.call_args_list]
+    assert prepared == [encoder, encoder]
+
+
+@pytest.mark.parametrize(
+    "explicit_mode, effective_mode, rejected",
+    [
+        (RESIDENT, RESIDENT, False),
+        (COMPONENT_OFFLOAD, COMPONENT_OFFLOAD, False),
+        (SNAPSHOT_OFFLOAD, SNAPSHOT_OFFLOAD, False),
+        (LAYERWISE_OFFLOAD, LAYERWISE_OFFLOAD, True),
+        # --layerwise-offload-components all: not aimed at the audio encoder
+        (None, LAYERWISE_OFFLOAD, False),
+    ],
+)
+def test_only_an_explicit_layerwise_audio_encoder_is_rejected(
+    explicit_mode, effective_mode, rejected
+):
+    """wav2vec2 has no layerwise hooks, so --component-residency audio_encoder=
+    layerwise-offload must fail at startup; a layerwise "all" selection must not."""
+    server_args = SimpleNamespace(
+        canonical_residency_mode=lambda name: (
+            explicit_mode if name == "audio_encoder" else None
+        ),
+        residency_mode=lambda name: (
+            effective_mode if name == "audio_encoder" else RESIDENT
+        ),
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="audio encoder"):
+            Wan2_2_S2V_14B_Config().validate_server_args(server_args)
+    else:
+        Wan2_2_S2V_14B_Config().validate_server_args(server_args)
+
+
+def test_audio_loader_records_no_layerwise_support_before_placing_the_encoder():
+    """A layerwise "all" selection resolves the audio encoder through its recorded
+    capability; recorded after placement, the encoder would start on the host."""
+    events = []
+    server_args = SimpleNamespace(
+        record_component_layerwise_capability=lambda name, *, supported: events.append(
+            ("capability", name, supported)
+        ),
+        should_start_component_on_cpu=lambda name: (
+            events.append(("place", name)) or False
+        ),
+        pipeline_config=SimpleNamespace(
+            audio_encoder_config=Mock(), audio_encoder_precision="fp32"
+        ),
+    )
+    with (
+        patch.object(
+            audio_loader_module,
+            "get_diffusers_component_config",
+            return_value={"_class_name": "WanS2VAudioEncoder"},
+        ),
+        patch.object(
+            audio_loader_module.ModelRegistry,
+            "resolve_model_cls",
+            return_value=(Mock(), None),
+        ),
+    ):
+        audio_loader_module.AudioEncoderLoader().load_customized(
+            "/unused", server_args, "audio_encoder"
+        )
+    assert events == [
+        ("capability", "audio_encoder", False),
+        ("place", "audio_encoder"),
+    ]
 
 
 class _StopAfterFps(Exception):
@@ -112,3 +214,4 @@ def test_retry_after_failed_download_gets_the_whole_file(tmp_path):
         )
     with open(path, "rb") as f:
         assert f.read() == b"RIFF-complete"
+

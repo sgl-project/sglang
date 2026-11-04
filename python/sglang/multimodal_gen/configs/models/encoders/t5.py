@@ -28,9 +28,8 @@ class T5ArchConfig(TextEncoderArchConfig):
     relative_attention_max_distance: int = 128
     dropout_rate: float = 0.1
     layer_norm_epsilon: float = 1e-6
-    # Plain-PyTorch T5 LayerNorm (the HF / Wan reference math) instead of sglang's
-    # RMSNorm. RMSNorm dispatches by platform, so its GPU kernels cannot take the
-    # CPU tensors of an encoder computed on the host (Wan2.2-S2V's stage does).
+    # Plain-PyTorch T5 LayerNorm (the HF / Wan reference math: fp32 statistics, cast
+    # to the weight dtype, then scale) instead of sglang's RMSNorm kernel.
     reference_layer_norm: bool = False
     initializer_factor: float = 1.0
     feed_forward_proj: str = "relu"
