@@ -7,7 +7,8 @@ export const MiMoV2FlashDeployment = () => {
       items: [
         { id: 'h200', label: 'H200', default: true },
         { id: 'h100', label: 'H100', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'ascend-a3', label: 'A3', default: false }
       ]
     },
     modelname: {
@@ -26,6 +27,14 @@ export const MiMoV2FlashDeployment = () => {
         { id: 'dp', label: 'DP Attention (DP 2)', default: true },
         { id: 'mtp', label: 'Multi-token Prediction (MTP)', default: true },
         { id: 'optimization', label: 'Performance Optimizations', default: true }
+      ]
+    },
+    topology: {
+      name: 'topology',
+      title: 'Topology',
+      type: 'checkbox',
+      items: [
+        { id: 'pd', label: 'PD Disaggregation', subtitle: '1 prefill + 1 decode + router', default: true, disabled: true }
       ]
     },
     reasoning: {
@@ -72,7 +81,20 @@ export const MiMoV2FlashDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware') {
+        // The A3 recipe is a fixed multi-node PD command; the strategy row is locked to it,
+        // and reasoning/tool-call parsers don't apply.
+        if (value === 'ascend-a3') {
+          next.strategy = options.strategy.items.filter(item => item.default).map(item => item.id);
+          next.reasoning = [];
+        } else if ((prev.reasoning || []).length === 0) {
+          next.reasoning = options.reasoning.items.filter(item => item.default).map(item => item.id);
+        }
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -86,14 +108,79 @@ export const MiMoV2FlashDeployment = () => {
     });
   };
 
+  // Ascend A3: validated 2-node PD-disaggregated deployment (1 prefill + 1 decode + router).
+  // Mirrors the official Ascend best practice for MiMo-V2-Flash W8A8 on A3.
+  const generateAscendA3Command = (strategyArray) => {
+    const eagleFlags = strategyArray.includes('mtp')
+      ? ' --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --enable-multi-layer-eagle'
+      : '';
+    const prefillDp = strategyArray.includes('dp') ? ' --dp-size 2' : '';
+    const decodeDp = strategyArray.includes('dp') ? ' --attn-dp-size 2 --enable-dp-lm-head' : '';
+
+    const lines = [
+      '# ============================================================',
+      '# Ascend A3 PD disaggregation: 1 prefill node + 1 decode node.',
+      '# Replace <prefill-ip>, <decode-ip>, <nic> and MODEL_PATH first.',
+      '# ============================================================',
+      '',
+      '# ---- Run on BOTH nodes: system tuning + environment ----',
+      'echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor',
+      'sysctl -w vm.swappiness=0',
+      'sysctl -w kernel.numa_balancing=0',
+      'sysctl -w kernel.sched_migration_cost_ns=50000',
+      '',
+      'source /usr/local/Ascend/ascend-toolkit/set_env.sh',
+      'source /usr/local/Ascend/nnal/atb/set_env.sh',
+      '',
+      'export ASCEND_USE_FIA=1',
+      'export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584',
+      'export DEEPEP_NORMAL_LONG_SEQ_ROUND=32',
+      'export DEEP_NORMAL_MODE_USE_INT8_QUANT=1',
+      'export HCCL_CONNECT_TIMEOUT=1800',
+      'export HCCL_OP_EXPANSION_MODE=AIV',
+      'export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True',
+      'export SGLANG_DEEPEP_BF16_DISPATCH=0',
+      'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600',
+      'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600',
+      'export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0',
+      'export SGLANG_SET_CPU_AFFINITY=1',
+      'export STREAMS_PER_DEVICE=32',
+      'export GLOO_SOCKET_IFNAME=<nic>',
+      'export HCCL_SOCKET_IFNAME=<nic>',
+      '# KV transfer store runs on the prefill node; the decode node must reach it',
+      'export ASCEND_MF_STORE_URL=tcp://<prefill-ip>:24670',
+      'MODEL_PATH=/path/to/MiMo-V2-Flash-W8A8',
+      '',
+      '# ---- Prefill node (A3, TP8 / DP2) ----',
+      'export DEEPEP_HCCL_BUFFSIZE=1024',
+      'export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32',
+      'export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1',
+      'sglang serve --model-path ${MODEL_PATH} --disaggregation-mode prefill --host <prefill-ip> --port 30000 --disaggregation-bootstrap-port 8998 --node-rank 0 --attention-backend ascend --device npu --tp-size 8 --nnodes 1 --chunked-prefill-size 8192 --trust-remote-code --max-running-requests 64 --mem-fraction-static 0.8 --swa-full-tokens-ratio 0.3 --disaggregation-transfer-backend ascend --disable-radix-cache --disable-cuda-graph --cuda-graph-backend-prefill=disabled' + prefillDp,
+      '',
+      '# ---- Decode node (A3, TP16) ----',
+      'export DEEPEP_HCCL_BUFFSIZE=800',
+      'export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128',
+      'sglang serve --model-path ${MODEL_PATH} --disaggregation-mode decode --host <decode-ip> --port 30000 --attention-backend ascend --device npu --tp-size 16 --nnodes 1 --trust-remote-code --max-running-requests 64 --mem-fraction-static 0.8 --swa-full-tokens-ratio 0.3 --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 --disaggregation-transfer-backend ascend --disable-radix-cache' + decodeDp + ' --moe-a2a-backend deepep --deepep-mode low_latency' + eagleFlags,
+      '',
+      '# ---- Router (any host that can reach both nodes) ----',
+      'python -m sglang_router.launch_router --pd-disaggregation --policy cache_aware --prefill http://<prefill-ip>:30000 8998 --decode http://<decode-ip>:30000 --host 0.0.0.0 --port 6688 --health-check-interval-secs 3600 --mini-lb',
+    ];
+    return lines.join('\n');
+  };
+
   // Generate command — mirrors sgl-cookbook's config.generateCommand(values) exactly
   const generateCommand = () => {
     const { hardware, strategy, reasoning } = values;
     const isMI355X = hardware === 'mi355x';
+    const isAscendA3 = hardware === 'ascend-a3';
 
     const modelPath = 'XiaomiMiMo/MiMo-V2-Flash';
     const strategyArray = Array.isArray(strategy) ? strategy : [];
     const reasoningArray = Array.isArray(reasoning) ? reasoning : [];
+
+    if (isAscendA3) {
+      return generateAscendA3Command(strategyArray);
+    }
 
     if (isMI355X && strategyArray.includes('mtp')) {
       return '# MI355X Speculative Decoding (EAGLE): Work In Progress\n'
@@ -154,14 +241,14 @@ export const MiMoV2FlashDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
+      {Object.entries(options).filter(([key]) => key !== 'topology' || values.hardware === 'ascend-a3').map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
             {option.type === 'checkbox' ? (
               option.items.map(item => {
                 const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.disabled;
+                const isDisabled = item.disabled || (values.hardware === 'ascend-a3' && (option.name === 'reasoning' || option.name === 'strategy'));
                 return (
                   <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
                     <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
