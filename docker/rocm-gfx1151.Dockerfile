@@ -15,7 +15,6 @@
 #     --ipc=host --shm-size 16g \
 #     -p 30000:30000 \
 #     -v ~/.cache/huggingface:/root/.cache/huggingface \
-#     -e SGLANG_USE_AITER=0 \
 #     sglang-rocm:gfx1151 \
 #     python3 -m sglang.launch_server --model-path <model> \
 #       --attention-backend triton --host 0.0.0.0
@@ -162,9 +161,12 @@ RUN git clone --recursive ${AITER_REPO} /sgl-workspace/aiter \
     && GPU_ARCHS=${GPU_ARCH} pip install --no-cache-dir --no-build-isolation \
          --config-settings editable_mode=compat -e .
 
-# Enable AITER for FLUX.3. For LLM serving on gfx1151, set SGLANG_USE_AITER=0
-# and pass --attention-backend triton to avoid unsupported CDNA kernels.
-ENV SGLANG_USE_AITER=1
+# aiter's compiled attention/MoE kernels are CDNA-only; keep sglang on the
+# Triton paths. ServerArgs defaults to aiter on ROCm, so callers must pass
+# `--attention-backend triton` until the RDNA default is fixed upstream.
+# This is load-bearing beyond attention: aiter's RMSNorm uses v_pk_mul_f32,
+# a CDNA-only instruction, and its CK attention templates assume wave64.
+ENV SGLANG_USE_AITER=0
 
 WORKDIR /sgl-workspace/sglang
 CMD ["/bin/bash"]
