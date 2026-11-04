@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 from sglang.srt.mem_cache.kv.layout.state import DraftStateView, MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
@@ -181,6 +182,7 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
         pool = DraftMHAView(
             arena=ctx.arena,
             host_spec=ctx.plan.sub_pool(ctx.owner).spec,
+            pool_name=PoolName(ctx.plan.sub_pool(ctx.owner).external.host_pool),
             layer_lanes=dict(zip(layers_by_host[ctx.owner], lanes_by_host[ctx.owner])),
             page_size=ctx.page_size,
         )
@@ -216,6 +218,7 @@ def routed_draft_pool(
         view = DraftMHAView(
             arena=arena,
             host_spec=plan.sub_pool(host).spec,
+            pool_name=PoolName(plan.sub_pool(host).external.host_pool),
             layer_lanes={
                 idx: layer_lanes[layer_id] for idx, layer_id in enumerate(layer_ids)
             },

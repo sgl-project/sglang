@@ -16,6 +16,7 @@ from sglang.srt.layers.attention import flashinfer_backend as fb
 from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.attention import trtllm_mha_backend as tm
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
@@ -97,6 +98,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             name: MHAView(
                 arena=buffer,
                 spec=buffer.spec(name),
+                pool_name=PoolName.SWA if name == "swa" else PoolName.KV,
                 page_size=1,
                 model_layer_ids=(layer_id,),
             )
@@ -592,6 +594,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             name: MHAView(
                 arena=buffer,
                 spec=buffer.spec(name),
+                pool_name=PoolName.SWA if name == "swa" else PoolName.KV,
                 page_size=1,
                 model_layer_ids=(layer_id,),
             )

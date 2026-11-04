@@ -18,6 +18,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import (
@@ -188,6 +189,7 @@ class TestDraftMHAView(unittest.TestCase):
         return DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
+            pool_name=PoolName.KV,
             layer_lanes={0: 0},
             page_size=self.PS,
         )
@@ -218,6 +220,7 @@ class TestDraftMHAView(unittest.TestCase):
         host = MHAView(
             arena=pool,
             spec=pool.spec("full"),
+            pool_name=PoolName.KV,
             page_size=self.PS,
             model_layer_ids=tuple(range(pool.spec("full").layer_num)),
         )
@@ -267,6 +270,7 @@ class TestDraftMHAView(unittest.TestCase):
         dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
+            pool_name=PoolName.KV,
             layer_lanes={0: 0},
             page_size=self.PS,
         )
@@ -531,6 +535,7 @@ class TestFusedMLAHost(unittest.TestCase):
         dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
+            pool_name=PoolName.KV,
             layer_lanes={0: 0},
             page_size=self.PS,
         )
@@ -551,6 +556,7 @@ class TestFusedMLAHost(unittest.TestCase):
         dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
+            pool_name=PoolName.KV,
             layer_lanes={0: 0},
             page_size=self.PS,
         )

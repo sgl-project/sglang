@@ -254,7 +254,11 @@ def plan_stand_in(arena: SpecArena, fused_draft=None) -> SimpleNamespace:
     """What draft binding reads of a plan, over a test arena's specs."""
     return SimpleNamespace(
         fused_draft=fused_draft,
-        sub_pool=lambda name: SimpleNamespace(spec=arena.spec(name)),
+        sub_pool=lambda name: SimpleNamespace(
+            spec=arena.spec(name),
+            # The FULL sub-pool mirrors to the KV host pool; others keep their name.
+            external=SimpleNamespace(host_pool="kv" if name == "full" else name),
+        ),
     )
 
 

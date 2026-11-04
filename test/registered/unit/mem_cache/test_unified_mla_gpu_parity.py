@@ -26,6 +26,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -87,6 +88,7 @@ def _make_pools(ps: int, n_tokens: int = 4096):
     unified = MLAView(
         arena=pool,
         spec=pool.spec("full"),
+        pool_name=PoolName.KV,
         kv_cache_dtype=_DTYPE,
         page_size=ps,
     )

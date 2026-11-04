@@ -36,6 +36,7 @@ from sglang.srt.utils.async_probe import maybe_detect_oob
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+    from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.kv.memory.arena import KVArena
 
 
@@ -176,6 +177,7 @@ class MLAView(MLAKVView):
         *,
         arena: "KVArena",
         spec: MLASubPoolSpec,
+        pool_name: "PoolName",
         kv_cache_dtype: torch.dtype,
         page_size: int,
     ):
@@ -185,6 +187,8 @@ class MLAView(MLAKVView):
         )
         self._arena = arena
         self._sub_pool_name = spec.name
+        # The host pool this view's sub-pool mirrors.
+        self.pool_name = pool_name
         self.kv_buffer = spec.views(arena)
         self.num_pages = arena.extent_entries(spec.name) // page_size
         self.page_bytes = page_size * spec.entry_bytes()
@@ -359,7 +363,6 @@ class MLAView(MLAKVView):
     def get_device_pool_infos(self) -> "tuple[DevicePoolInfo, ...]":
         """The view's buffers, as host assembly reads them."""
         from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MLABufferInfo
-        from sglang.srt.mem_cache.hicache_storage import PoolName
 
         info = MLABufferInfo(
             buffers=tuple(self.kv_buffer),
@@ -377,8 +380,8 @@ class MLAView(MLAKVView):
         )
         return (
             DevicePoolInfo(
-                pool_name=PoolName.KV,
-                indices_from_pool=PoolName.KV,
+                pool_name=self.pool_name,
+                indices_from_pool=self.pool_name,
                 layer_ids=self.model_layer_ids,
                 buffer_info=info,
             ),

@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
@@ -124,6 +125,7 @@ class TestPrefixValidFp8Pool(CustomTestCase):
                 pool = DraftMHAView(
                     arena=arena,
                     host_spec=host,
+                    pool_name=PoolName.KV,
                     layer_lanes={10: 1, 11: 0},
                     page_size=4,
                 )

@@ -1767,6 +1767,16 @@ def build_swa_draft_pools(
     return [spec], [entry]
 
 
+def _shares_kv_storage(draft: MHABufferInfo, target: MHABufferInfo) -> bool:
+    # Every view of an arena slices its one raw allocation.
+    if not draft.buffers.k or not target.buffers.k:
+        return False
+    return (
+        draft.buffers.k[0].untyped_storage().data_ptr()
+        == target.buffers.k[0].untyped_storage().data_ptr()
+    )
+
+
 def validate_fused_hicache_draft(
     *,
     target_config: Optional[KVCacheConfigurator] = None,
@@ -1791,12 +1801,15 @@ def validate_fused_hicache_draft(
         )
 
     if draft_device_pools is not None:
-        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
-
+        draft_infos = (
+            draft_device_pools[0].get_device_pool_infos()
+            if len(draft_device_pools) == 1
+            else ()
+        )
         if not (
-            len(draft_device_pools) == 1
-            and isinstance(draft_device_pools[0], DraftMHAView)
-            and draft_device_pools[0]._sub_pool_name == "full"
+            len(draft_infos) == 1
+            and draft_infos[0].pool_name == PoolName.KV
+            and isinstance(draft_infos[0].buffer_info, MHABufferInfo)
         ):
             raise NotImplementedError(
                 "HiCache fused draft KV requires a full-attention DFLASH draft."
@@ -1817,8 +1830,8 @@ def validate_fused_hicache_draft(
             "pools; the selected storage backend or host layout does not preserve "
             "the fused draft bytes."
         )
-    target = entries[PoolName.KV].device_pool
-    if draft_device_pools[0]._arena is not target._arena:
+    (target_info,) = entries[PoolName.KV].device_pool.get_device_pool_infos()
+    if not _shares_kv_storage(draft_infos[0].buffer_info, target_info.buffer_info):
         raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
 
 
@@ -1828,17 +1841,18 @@ def build_hicache_draft_sidecars(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
-    builder = (
-        build_swa_draft_pools
-        if draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
-        else build_full_draft_pools
-    )
+    names = {info.pool_name for info in draft_kv_pool.get_device_pool_infos()}
+    if PoolName.SWA in names:
+        builder = build_swa_draft_pools
+    elif PoolName.KV in names or draft_kv_pool.layer_router.wrapped_view() is not None:
+        # Hybrid linear drafts describe their KV through the wrapped child.
+        builder = build_full_draft_pools
+    else:
+        raise NotImplementedError(
+            "HiCache draft SWA sidecar requires a non-unified draft SWA pool."
+        )
     return builder(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,

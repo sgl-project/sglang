@@ -1,10 +1,13 @@
 import logging
 from typing import Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.memory_pool import (
@@ -225,6 +228,41 @@ class SWAKVPool(BaseSWAKVPool):
         return isinstance(self.full_kv_pool, MLATokenToKVPool) and isinstance(
             self.swa_kv_pool, MLATokenToKVPool
         )
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Both sides' buffers in model layer IDs, the window side named SWA."""
+        side_layer_ids = {False: {}, True: {}}
+        for layer_id, (index, is_swa_layer) in self.layers_mapping.items():
+            side_layer_ids[is_swa_layer][index] = layer_id
+        infos = []
+        for pool, is_swa_layer in (
+            (self.full_kv_pool, False),
+            (self.swa_kv_pool, True),
+        ):
+            for info in pool.get_device_pool_infos():
+                # MLA sides keep compact layer IDs; MHA sides already hold model IDs.
+                layer_ids = tuple(
+                    side_layer_ids[is_swa_layer][pool.model_layer_ids.index(layer)]
+                    for layer in info.layer_ids
+                )
+                if not is_swa_layer:
+                    infos.append(msgspec.structs.replace(info, layer_ids=layer_ids))
+                    continue
+                if info.pool_name != PoolName.KV:
+                    raise ValueError(
+                        f"SWA side reports {info.pool_name}; only window KV is supported"
+                    )
+                infos.append(
+                    msgspec.structs.replace(
+                        info,
+                        pool_name=PoolName.SWA,
+                        indices_from_pool=(
+                            PoolName.KV if self.swa_uses_full_indices else PoolName.SWA
+                        ),
+                        layer_ids=layer_ids,
+                    )
+                )
+        return tuple(infos)
 
     def get_contiguous_buf_infos(self):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (

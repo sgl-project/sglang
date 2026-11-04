@@ -20,6 +20,7 @@ Addressing law under test:
     t = page * page_size + slot      (the physical token id IS the kernel id)
 """
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import arena_of
 
@@ -329,6 +330,7 @@ def _make_pool_and_kv(ps, device=_DEV):
     return kv, MHAView(
         arena=kv,
         spec=kv.spec("full"),
+        pool_name=PoolName.KV,
         page_size=ps,
         model_layer_ids=tuple(range(kv.spec("full").layer_num)),
         enable_alt_stream=False,
@@ -421,6 +423,7 @@ class TestMHAView(CustomTestCase):
                 MHAView(
                     arena=arena,
                     spec=spec,
+                    pool_name=PoolName.KV,
                     page_size=ps,
                     model_layer_ids=(6, 7),
                     start_layer=6,
@@ -430,6 +433,7 @@ class TestMHAView(CustomTestCase):
                 DraftMHAView(
                     arena=arena,
                     host_spec=spec,
+                    pool_name=PoolName.KV,
                     page_size=ps,
                     layer_lanes={10: 1, 11: 0},
                 ),
