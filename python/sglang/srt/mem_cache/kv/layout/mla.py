@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.base import (
     SubPoolSpec,
@@ -26,10 +30,6 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_dense_views,
 )
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc, write_loc_is_physical
-from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton,
-)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
@@ -161,6 +161,10 @@ class MLAView(MLAKVView):
     post_capture_active = False
     host_capacity_tokens: Optional[int] = None
     host_capacity_bytes: Optional[int] = None
+    # Set by HiCache when it stages write-backs for this view.
+    hicache_write_back_staging: Optional[
+        torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
+    ] = None
     enable_custom_mem_pool = False
     custom_mem_pool = None
     allocation_label = None
@@ -379,12 +383,6 @@ class MLAView(MLAKVView):
                 buffer_info=info,
             ),
         )
-
-    def host_pool_decls(self):
-        """The host pool HiCache keeps for this view's buffers."""
-        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
-
-        return (make_kv_pool_decl(self),)
 
     def get_contiguous_buf_infos(self):
         """PD registration: one entry, the raw arena, addressed as

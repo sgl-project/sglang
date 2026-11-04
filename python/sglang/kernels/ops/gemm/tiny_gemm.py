@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -71,12 +72,6 @@ def _jit_tiny_gemm_module(
     )
 
 
-@cache_once
-def _get_num_sm() -> int:
-    device = torch.cuda.current_device()
-    return torch.cuda.get_device_properties(device).multi_processor_count
-
-
 def _n_gemm_block_threads(k: int) -> int:
     return k // _N_GEMM_ELEMS_PER_THREAD
 
@@ -115,7 +110,7 @@ def _default_n_gemm_n_split(n: int, k: int, max_m: int) -> int:
             " try lower max_m or align the N dimension"
         )
     # try to fit into 1 wave
-    sm_count = _get_num_sm()
+    sm_count = current_arch().num_sms
     for split in candidates:
         if n // split <= sm_count:
             return split
@@ -135,7 +130,7 @@ def _default_k_gemm_n_split(n: int, k: int) -> int:
     # try to fit into 1 wave
     if not candidates:
         raise RuntimeError(f"tiny_gemm: no valid n_split for N={n}, K={k}")
-    sm_count = _get_num_sm()
+    sm_count = current_arch().num_sms
     for d in candidates:
         if n // d <= sm_count:
             return d

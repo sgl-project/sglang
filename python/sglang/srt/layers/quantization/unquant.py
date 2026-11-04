@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -43,6 +44,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx115_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -69,6 +71,11 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
+_is_gfx115 = _is_hip and is_gfx115_supported()
+# AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
+# initialize_bf16_gemm_config sets this on gfx95 in deterministic mode and
+# unquantized layers then skip AITER.
+_skip_aiter_unquant = False
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -128,6 +135,8 @@ _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
+_hopper_bf16_tiny_gemv = None
+_use_hopper_bf16_tiny_gemv = None
 _splitk_tactic = None
 _run_splitk_dense = None
 _direct_default_tactic = None
@@ -223,6 +232,8 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (8, 3584, 2560): (64, 8, 2, 6),
     (8, 4096, 2560): (64, 8, 2, 6),
     (8, 4120, 2560): (64, 8, 2, 6),
+    # GB300: DFLASH draft candidate head (202048-vocab org shard), TP8.
+    (7, 25256, 8192): (64, 8, 1, 12),
 }
 
 # FlashInfer warp split-K (output_tile, token_tile, k_tile, stages, b_loader_warps),
@@ -267,6 +278,31 @@ _BF16_WARP_SPLITK_TUNED_TACTICS = {
     (2, 1024, 4096): (16, 8, 256, 16, 2),
     (24, 1024, 4096): (16, 16, 256, 10, 2),
     (32, 1024, 4096): (16, 16, 256, 10, 2),
+    # GB300, measured on the DFLASH draft of Muse Spark
+    (8, 2048, 8192): (16, 8, 256, 16, 2),
+    (16, 2048, 8192): (16, 16, 256, 13, 2),
+    (24, 2048, 8192): (16, 32, 256, 9, 2),
+    (32, 2048, 8192): (32, 16, 256, 8, 2),
+    # hidden 8192 / intermediate 28672 / 64q8kv heads (also Llama-3-70B-class) at TP4:
+    # gate_up, down, qkv; the qkv rows replace the split-K tactics above.
+    # Then the TP4 candidate head (202048-vocab org shard).
+    (8, 14336, 8192): (16, 8, 128, 12, 2),
+    (16, 14336, 8192): (32, 16, 256, 9, 2),
+    (8, 8192, 7168): (32, 8, 128, 10, 1),
+    (16, 8192, 7168): (32, 16, 256, 4, 2),
+    (8, 2560, 8192): (32, 8, 256, 11, 1),
+    (16, 2560, 8192): (32, 16, 256, 9, 1),
+    (7, 50512, 8192): (16, 8, 256, 9, 2),
+    (14, 50512, 8192): (16, 16, 256, 4, 2),
+    # Same model shapes at TP8: gate_up, down, qkv.
+    (8, 7168, 8192): (16, 8, 256, 6, 2),
+    (16, 7168, 8192): (16, 16, 256, 4, 2),
+    (8, 8192, 3584): (32, 8, 256, 5, 2),
+    (16, 8192, 3584): (32, 16, 128, 8, 1),
+    (8, 1280, 8192): (16, 8, 256, 11, 2),
+    (16, 1280, 8192): (16, 16, 256, 13, 2),
+    (24, 1280, 8192): (32, 8, 256, 9, 2),
+    (32, 1280, 8192): (32, 16, 256, 9, 2),
 }
 
 
@@ -305,6 +341,11 @@ def initialize_bf16_gemm_config() -> None:
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm
+    global _skip_aiter_unquant
+
+    _skip_aiter_unquant = (
+        _is_gfx95 and get_exec().deterministic.enable_deterministic_inference
+    )
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -321,6 +362,7 @@ def initialize_bf16_gemm_config() -> None:
             raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper) or SM12x")
 
         global _hopper_bf16_gemv, _use_hopper_bf16_gemv
+        global _hopper_bf16_tiny_gemv, _use_hopper_bf16_tiny_gemv
         from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
             hopper_bf16_gemv,
             use_hopper_bf16_gemv,
@@ -328,6 +370,15 @@ def initialize_bf16_gemm_config() -> None:
 
         _hopper_bf16_gemv = hopper_bf16_gemv
         _use_hopper_bf16_gemv = use_hopper_bf16_gemv
+
+        if get_platform().is_sm90:
+            from sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv import (
+                hopper_bf16_tiny_gemv,
+                use_hopper_bf16_tiny_gemv,
+            )
+
+            _hopper_bf16_tiny_gemv = hopper_bf16_tiny_gemv
+            _use_hopper_bf16_tiny_gemv = use_hopper_bf16_tiny_gemv
     elif backend.is_cutedsl():
         if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
@@ -381,6 +432,22 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
+def _use_bf16_tiny_gemv(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> bool:
+    return (
+        _use_hopper_bf16_tiny_gemv is not None
+        and bias is None
+        and x.is_cuda
+        and x.dtype == weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and _use_hopper_bf16_tiny_gemv(
+            x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+        )
+    )
+
+
 def _bf16_splitk_gemm_out(
     x_2d: torch.Tensor,
     weight: torch.Tensor,
@@ -429,6 +496,10 @@ def _bf16_gemm_dispatch_impl(
         m, weight.shape[0], weight.shape[1]
     ):
         output = _bf16_splitk_gemm(x, weight, bias)
+    elif _use_bf16_tiny_gemv(x, weight, bias):
+        output = _hopper_bf16_tiny_gemv(x.view(-1, x.shape[-1]), weight).view(
+            *x.shape[:-1], -1
+        )
     elif (
         _use_hopper_bf16_gemv is not None
         and bias is None
@@ -502,6 +573,101 @@ def get_bf16_gemm_backend() -> Bf16GemmBackend:
     return _BF16_GEMM_BACKEND
 
 
+# On gfx115x a weight row stride that is a multiple of 2 KiB puts the rows a skinny GEMM
+# reads together on the same L2/MALL channel; one 128 B cache line of pad spreads them.
+# Same rule as vLLM's cache_aliasing_pad_elems; measured on gfx1151.
+_GFX115_ALIASING_ROW_BYTES = 2048
+_GFX115_ROW_PAD_BYTES = 128
+# Only 16-bit weights were measured; fp32 (e.g. MoE router gates) is left alone.
+_GFX115_PADDED_DTYPES = (torch.bfloat16, torch.float16)
+# First load logs at INFO; weight updates (e.g. every RL sync) log at DEBUG.
+_gfx115_padding_logged = False
+
+
+def _gfx115_row_pad_elems(*, k: int, itemsize: int) -> int:
+    if (k * itemsize) % _GFX115_ALIASING_ROW_BYTES != 0:
+        return 0
+    return _GFX115_ROW_PAD_BYTES // itemsize
+
+
+def maybe_pad_weight_for_gfx115(weight: torch.Tensor) -> torch.Tensor:
+    """Return ``weight`` as a same-shape view with a non-aliasing row stride on gfx115x.
+
+    K is the tensor's own dim 1, so a tensor-parallel row shard is judged by its
+    slice, not the full checkpoint K. Non-contiguous weights, including ones
+    already padded, come back unchanged, which keeps a reload from padding twice.
+    """
+    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+        return weight
+    if weight.dim() != 2 or not weight.is_contiguous():
+        return weight
+    if weight.dtype not in _GFX115_PADDED_DTYPES:
+        return weight
+    pad = _gfx115_row_pad_elems(k=weight.shape[1], itemsize=weight.element_size())
+    if pad == 0:
+        return weight
+    return F.pad(weight, (0, pad))[:, :-pad]
+
+
+def finalize_gfx115_weight_padding(model: torch.nn.Module) -> None:
+    """Pad unquantized lm_head weights and log which linear and head shapes were padded.
+
+    Runs on the whole model because a tied head is often the input embedding module
+    itself (``lm_head = model.embed_tokens``), which its quant method cannot tell
+    apart from an untied input embedding; only the model's module names show it.
+    Also runs after every weight update; already-padded weights are skipped, so
+    storage pointers stay stable for CUDA graphs.
+    """
+    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+        return
+    for head in _unquantized_lm_heads(model):
+        head.weight.data = maybe_pad_weight_for_gfx115(head.weight.data)
+    _log_gfx115_padding(model)
+
+
+def _unquantized_lm_heads(model: torch.nn.Module):
+    # Imported here to avoid an import cycle; vocab_parallel_embedding imports this module.
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    seen = set()
+    # Heads named otherwise (e.g. embed_out) are not found; that costs speed only.
+    for name, module in model.named_modules(remove_duplicate=False):
+        is_head = isinstance(module, ParallelLMHead) or (
+            isinstance(module, VocabParallelEmbedding)
+            and name.rsplit(".", 1)[-1] == "lm_head"
+        )
+        if (
+            is_head
+            and isinstance(module.quant_method, UnquantizedEmbeddingMethod)
+            and id(module) not in seen
+        ):
+            seen.add(id(module))
+            yield module
+
+
+def _log_gfx115_padding(model: torch.nn.Module) -> None:
+    # Imported here to avoid an import cycle through sglang.srt.layers.quantization.
+    from sglang.srt.layers.linear import LinearBase
+
+    padded, skipped = collections.Counter(), collections.Counter()
+    weights = [
+        m.weight
+        for m in model.modules()
+        if isinstance(m, LinearBase)
+        and isinstance(m.quant_method, UnquantizedLinearMethod)
+    ] + [head.weight for head in _unquantized_lm_heads(model)]
+    for weight in weights:
+        is_padded = weight.dim() == 2 and weight.stride(0) > weight.shape[1]
+        (padded if is_padded else skipped)[tuple(weight.shape)] += 1
+    global _gfx115_padding_logged
+    log = logger.debug if _gfx115_padding_logged else logger.info
+    _gfx115_padding_logged = True
+    log("gfx115x weight padding: padded %s; skipped %s", dict(padded), dict(skipped))
+
+
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -568,6 +734,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        else:
+            layer.weight.data = maybe_pad_weight_for_gfx115(layer.weight.data)
 
     def apply(
         self,
@@ -589,7 +757,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
-        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+        elif (
+            _use_aiter
+            and not _skip_aiter_unquant
+            and type(layer.weight.data) is torch.Tensor
+        ):
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
@@ -769,6 +941,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
+        if _use_aiter and _skip_aiter_unquant and get_moe_runner_backend().is_aiter():
+            raise ValueError(
+                "--moe-runner-backend aiter is batch-size dependent and cannot be "
+                "combined with --enable-deterministic-inference on gfx95"
+            )
         self._cache_permute_indices = dict({})
         self.runner: Optional[MoeRunner] = None
         self._aiter_runner: Optional[MoeRunner] = None
@@ -852,6 +1029,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = (
             _use_aiter
+            and not _skip_aiter_unquant
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
@@ -917,6 +1095,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
+        from sglang.srt.layers.moe.gluon_backend import prepare_gluon_moe_weights
+
+        prepare_gluon_moe_weights(layer)
         return
 
     def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
@@ -1197,6 +1378,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self._aiter_runner: Optional[MoeRunner] = None
         if (
             _use_aiter
+            and not _skip_aiter_unquant
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()

@@ -299,9 +299,30 @@ class TestFactoryFunctions(CustomTestCase):
         finally:
             del os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"]
 
-    def test_should_use_zmq_multinode_dp_attention(self):
-        self._publish(attn_dp_size=2, nnodes=2)
-        self.assertTrue(should_use_zmq())
+    def test_should_use_zmq(self):
+        # (nnodes, attn_dp_size, Rust server, forced zmq) -> zmq. A Rust
+        # listener reads its own rank's slot from its own node's file, so
+        # multi-node DP attention needs no collector in Rust mode.
+        cases = {
+            (1, 2, False, False): False,
+            (1, 2, True, False): False,
+            (2, 1, False, False): False,
+            (2, 2, False, False): True,
+            (2, 2, True, False): False,
+            (2, 2, True, True): True,
+        }
+        for (nnodes, attn_dp_size, rust, forced), expected in cases.items():
+            with (
+                self.subTest(
+                    nnodes=nnodes, attn_dp_size=attn_dp_size, rust=rust, forced=forced
+                ),
+                get_context().override_server_args(
+                    nnodes=nnodes, attn_dp_size=attn_dp_size
+                ),
+                envs.SGLANG_RUST_SERVER.override(rust),
+                envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(forced),
+            ):
+                self.assertEqual(should_use_zmq(), expected)
 
 
 class TestZmqReaderOwner(CustomTestCase):
