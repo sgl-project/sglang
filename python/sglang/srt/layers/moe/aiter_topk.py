@@ -81,8 +81,9 @@ def try_select_experts(
         or has_per_rank_fused_shared_slots(n_shared)
         or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-        or envs.SGLANG_K3_RADIX4_TOPK.get()
         or envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
+        # TopK.forward_native (the torch.compile bs=1 route) keeps the ordinary path.
+        or config.torch_native
         or config.apply_routed_scaling_factor_on_output
         or config.num_expert_group is None
         or config.topk_group is None
@@ -94,6 +95,7 @@ def try_select_experts(
     # Lazy import because the common dispatcher imports this module.
     from sglang.srt.layers.moe.topk import (
         StandardTopKOutput,
+        aiter_grouped_topk_route_inputs,
         capture_routed_experts_if_allowed,
         get_global_expert_distribution_recorder,
     )
@@ -101,6 +103,18 @@ def try_select_experts(
     assert hidden_states.shape[0] == router_logits.shape[0]
     token, num_experts = router_logits.shape
     routed_k = config.top_k - n_shared
+    route_inputs = None
+    if envs.SGLANG_K3_RADIX4_TOPK.get():
+        from sglang.kernels.ops.moe import moe_route_radix4
+
+        route_inputs = aiter_grouped_topk_route_inputs(
+            router_logits, config.correction_bias
+        )
+        # The ordinary path routes these shapes with radix4, not AITER.
+        if moe_route_radix4.available() and moe_route_radix4.covered(
+            *route_inputs, routed_k, config.num_expert_group, config.topk_group
+        ):
+            return None
     shared_weight = config.fused_shared_experts_scaling_factor
     shared_weight = 1.0 if shared_weight is None else float(shared_weight)
     device = router_logits.device
@@ -126,13 +140,9 @@ def try_select_experts(
         return None
     routed_w = full_w[:token, :routed_k]
     routed_ids = full_ids[:token, :routed_k]
-    # Same kernel inputs as biased_grouped_topk_gpu: an fp32 bias routes in fp32.
-    if config.correction_bias.dtype == torch.float32:
-        route_logits = router_logits.to(torch.float32)
-        route_bias = config.correction_bias
-    else:
-        route_logits = router_logits
-        route_bias = config.correction_bias_for_dtype(router_logits.dtype)
+    route_logits, route_bias = route_inputs or aiter_grouped_topk_route_inputs(
+        router_logits, config.correction_bias
+    )
     # AITER honors the output row stride, leaving pre-filled shared columns intact.
     biased_grouped_topk(
         route_logits,

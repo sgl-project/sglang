@@ -1962,6 +1962,16 @@ def _biased_grouped_topk_postprocess(
     return topk_ids
 
 
+def aiter_grouped_topk_route_inputs(
+    gating_output: torch.Tensor, correction_bias: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Logits and bias for AITER biased_grouped_topk and radix4: an fp32 bias
+    routes in fp32, any other bias in the logits dtype."""
+    if correction_bias.dtype == torch.float32:
+        return gating_output.to(torch.float32), correction_bias
+    return gating_output, correction_bias.to(dtype=gating_output.dtype)
+
+
 def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -2112,12 +2122,9 @@ def biased_grouped_topk_gpu(
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
         # Preserve fp32 bias precision on both routers; dispatch must not change
         # a token's routing when its batch crosses the radix4 size limit.
-        if correction_bias.dtype == torch.float32:
-            route_logits = gating_output.to(torch.float32)
-            route_bias = correction_bias
-        else:
-            route_logits = gating_output
-            route_bias = correction_bias.to(dtype=gating_output.dtype)
+        route_logits, route_bias = aiter_grouped_topk_route_inputs(
+            gating_output, correction_bias
+        )
 
         if envs.SGLANG_K3_RADIX4_TOPK.get():
             from sglang.kernels.ops.moe import moe_route_radix4

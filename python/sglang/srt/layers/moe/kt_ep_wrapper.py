@@ -110,8 +110,8 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     Returns:
         Modified topk_ids tensor with CPU expert IDs masked as -1
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-    return topk_ids
+    # Out of place: topk_ids may be a persistent routing buffer (see aiter_topk.py).
+    return topk_ids.masked_fill(topk_ids >= num_gpu_experts, -1)
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):

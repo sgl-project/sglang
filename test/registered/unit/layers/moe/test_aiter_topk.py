@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.moe import moe_route_radix4
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import fused_append_shared_experts
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
@@ -313,11 +314,23 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         for setting in (
             envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
             envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
-            envs.SGLANG_K3_RADIX4_TOPK,
             envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK,
         ):
             with self.subTest(case=setting.name), setting.override(True):
                 self.assertIsNone(self._fuse(self._config()))
+
+        with self.subTest(case="radix4_covers_the_shape"):
+            with (
+                envs.SGLANG_K3_RADIX4_TOPK.override(True),
+                patch.object(moe_route_radix4, "available", return_value=True),
+                patch.object(moe_route_radix4, "covered", return_value=True),
+            ):
+                self.assertIsNone(self._fuse(self._config()))
+
+        with self.subTest(case="torch_native"):
+            config = self._config()
+            config.torch_native = True
+            self.assertIsNone(self._fuse(config))
 
         with self.subTest(case="config_unpublished"):
             reset_context()
@@ -325,6 +338,13 @@ class TestAiterSharedColumnsContract(CustomTestCase):
 
         self.assertEqual(self.fake_kernel.calls, [])
         self.assertEqual(_shared_column_buffers(), {})
+
+    def test_radix4_env_keeps_the_fusion_for_shapes_radix4_does_not_cover(self):
+        """SGLANG_K3_RADIX4_TOPK routes only Kimi-K3 shapes; other configs route
+        through AITER on the ordinary path too, so they keep the fusion."""
+        with envs.SGLANG_K3_RADIX4_TOPK.override(True):
+            self.assertIsNotNone(self._fuse(self._config()))
+        self.assertEqual(len(self.fake_kernel.calls), 1)
 
     def test_shared_columns_are_prefilled_and_survive_the_kernel(self):
         """The returned rows carry the routed kernel output plus the prefilled
