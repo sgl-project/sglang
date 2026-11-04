@@ -144,16 +144,22 @@ class BaseTopkCapturer:
         )
 
         self.host_cache = (
-            BaseHostCache(num_tokens, num_layers, topk_size, name=name, device=device)
+            BaseHostCache(
+                num_tokens=num_tokens,
+                num_layers=num_layers,
+                topk_size=topk_size,
+                name=name,
+                device=device,
+            )
             if allocate_caches
             else None
         )
         self.device_cache = (
             BaseDeviceCache(
-                max_batch_size,
-                num_layers,
-                self.device_topk_size,
-                device,
+                max_batch_size=max_batch_size,
+                num_layers=num_layers,
+                topk_size=self.device_topk_size,
+                device=device,
                 name=name,
             )
             if allocate_caches

@@ -25,8 +25,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 import msgspec
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_CATEGORIES,
     FORWARD_OVERLAP_NONE,
