@@ -533,6 +533,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
 
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.layers.attention import aiter_backend
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         model_config = SimpleNamespace(
             dtype=torch.bfloat16,
@@ -558,6 +559,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             token_to_kv_pool=kv_pool,
             token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: kv_pool),
             is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
             runner_ids=None,
             decode_attention_backend_str="aiter",
         )
