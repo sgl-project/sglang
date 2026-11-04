@@ -10,11 +10,8 @@ from torch import nn
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.runtime_context import get_parallel
@@ -33,6 +30,9 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
 )
 from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    _token_loc as _dsa_token_loc,
+)
 
 from ..attention_methods.dense_attention import (
     DEFAULT_DEVICE,
@@ -55,9 +55,6 @@ from ..attention_methods.dsa_attention import (
     DSA_SPARSE_INDEX_TOPK,
     DSA_SPARSE_RTOL,
     DSAAttentionCase,
-)
-from ..attention_methods.dsa_attention import _token_loc as _dsa_token_loc
-from ..attention_methods.dsa_attention import (
     build_dsa_sparse_attention_fixture,
 )
 from ..attention_methods.dsv4_attention import (
@@ -316,7 +313,6 @@ def _configure_runner_for_eagle_draft(
         "enable_cudagraph_gc": True,
         "enable_dp_lm_head": False,
         "enable_memory_saver": False,
-        "enable_pdmux": False,
         "enable_profile_cuda_graph": False,
         "enable_torch_compile": False,
         "enable_two_batch_overlap": False,

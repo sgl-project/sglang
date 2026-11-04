@@ -16,12 +16,9 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -137,7 +134,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Disable parent paths that don't apply.
         self.compile_bs = []
-        self.enable_pdmux = False
         self.record_nolora_graph = False
         self.is_dllm = False
 
@@ -164,6 +160,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         if self.enable_torch_compile:
             set_torch_compile_config()
+
+        self.backend = resolve_decode_backend(self)
 
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -308,8 +306,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.attention_variant_sizes = self.megakernel_served
 
-        self.backend = resolve_decode_backend(self)
-
         try:
             with model_capture_mode():
                 self.capture()
@@ -323,11 +319,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             return self.backend.replay(shape_key, forward_batch)
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
-    def _make_graph_key(
-        self, bs, stream_idx=None, variant_label=None, attention_variant=None
-    ):
+    def _make_graph_key(self, bs, variant_label=None, attention_variant=None):
         return ShapeKey(size=bs, attention_variant=attention_variant)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
@@ -373,7 +367,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size: int,
         forward: Callable,
-        stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
