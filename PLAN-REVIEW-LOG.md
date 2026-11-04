@@ -4720,3 +4720,7 @@ Reviewed real cold preservation/source allocator reclamation, public-only blocke
 ### P5 bounded session/branch state — independent review
 
 Integrated frozen branch/session/request targets, shared suffix material, explicit cleanup receipts and typed observation/query fences. Independent isolated-worktree and integrated-root crate proofs pass4 protocol+18 behavioral tests. Reviewed ownership/GC, version-domain separation, no pending-to-confirmed promotion, and session associations surviving physical removal. Existing provider remains authoritative; P6 host adapter still pending. Logs p5-parent-tests.log,p5-integrated-tests.log. Approved for commit.
+
+### P4c Mooncake protection owner — independent review
+
+Reviewed async single-writer actor, shared object aggregation, explicit backend_soft_pin contract, revision/tombstone fencing, conservative TTL and unknown-result recovery barriers. Independent worktree proof passed4 protocol+21 backend tests with real admin pin/unpin; integrated crate proof passed4 protocol+21 backend+18 state tests. One earlier rerun found the long-lived private seed key evicted under concurrent performance load(-704), so final proof seeds a fresh private key immediately before the real test and keeps its client alive through completion. This is an environment precondition failure, retained in parent logs, not interpreted as protection success. Logs /tmp/sglang-rfc-build/p4c-parent-tests.log and p4c-integrated-tests.log. P6 host wiring remains pending. Approved for commit.

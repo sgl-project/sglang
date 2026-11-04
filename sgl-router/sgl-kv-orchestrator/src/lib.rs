@@ -1,4 +1,5 @@
-//! Pure protocol and bounded logical state. No Router, network, storage, or PIN executor.
+//! Versioned KV protocol, bounded session associations, and backend protection.
+pub mod backend_protection;
 pub mod models;
 pub mod observations;
 pub mod protocol;
