@@ -2,12 +2,13 @@
 """Control protocol, bounded replay and task/request lifecycle."""
 
 import copy
+import json
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 
 import msgspec
 import pytest
-
 from sglang.srt.managers.kv_control import KVControl, LogicalIndex
 from sglang.srt.managers.kv_control.contracts import (
     Associate,
@@ -180,7 +181,7 @@ class TestKVControl(CustomTestCase):
             payload=opaque_payload,
         )
         invalid = action("set_priority", priority(value=True), action_id="bad")
-        unknown = action("pin", {}, action_id="unsupported")
+        unknown = action("future_action", {}, action_id="unsupported")
         assoc = action("associate", wire(association()))
         original = envelope(opaque, invalid, unknown, assoc)
         result = core.submit(original, core.context("router"))
@@ -243,7 +244,7 @@ class TestKVControl(CustomTestCase):
         contexts.append(core.context("other-router", binding_id="request/0"))
         refs = [submit(core, action(), context=ctx).results[0].ref for ctx in contexts]
         assert len({ref.operation_id for ref in refs}) == 3
-        assert all((submit(core, action(), context=ctx).replayed for ctx in contexts))
+        assert all(submit(core, action(), context=ctx).replayed for ctx in contexts)
         for field, value, code in [
             ("engine_id", "other", "wrong_engine"),
             ("engine_epoch", "old", "stale_epoch"),
@@ -465,7 +466,6 @@ class TestKVControl(CustomTestCase):
 
             def cancel(self, ref):
                 self.cancelled.add(ref.operation_id)
-                return None
 
         boundary = CancellationBoundary()
         core = KVControl("engine", "ns", enabled=True, executor=boundary)
@@ -594,6 +594,251 @@ class TestKVControl(CustomTestCase):
             and replay.acknowledged
             and (replay.summaries == ack.summaries)
         )
+
+
+class TestPublicKVProtocol(CustomTestCase):
+    fixtures = (
+        Path(__file__).resolve().parents[4] / "sgl-router/sgl-kv-orchestrator/fixtures"
+    )
+
+    def test_shared_schema_and_invalid_vectors(self):
+        from sglang.srt.managers.kv_control.contracts import (
+            ClaimState,
+            Demote,
+            Pin,
+            Prefetch,
+            PublicResult,
+            parse_action,
+        )
+
+        for name, schema in {
+            "prefetch": Prefetch,
+            "demote": Demote,
+            "pin": Pin,
+            "result": PublicResult,
+            "claim": ClaimState,
+        }.items():
+            self.assertEqual(
+                json.loads((self.fixtures / f"{name}.schema.json").read_text()),
+                wire(msgspec.json.schema(schema)),
+            )
+        for case in json.loads((self.fixtures / "actions.json").read_text()):
+            with self.subTest(case=case["name"]):
+                a = msgspec.convert(case["action"], type=KvHintAction)
+                if case["valid"]:
+                    parse_action(a)
+                else:
+                    with self.assertRaises(ControlError):
+                        parse_action(a)
+
+    def test_result_and_claim_vectors_remain_separate(self):
+        from sglang.srt.managers.kv_control.contracts import (
+            PublicResult,
+            ClaimState,
+            validated,
+        )
+
+        fixtures = json.loads((self.fixtures / "results.json").read_text())
+        for key, schema in (("results", PublicResult), ("claims", ClaimState)):
+            for value in fixtures[key]:
+                self.assertEqual(wire(validated(value, schema)), value)
+        self.assertTrue(fixtures["claims"][0]["tombstone"])
+        self.assertTrue(all(r["claim"] is None for r in fixtures["results"]))
+
+    def test_salt_vectors_and_raw_salt_normalization(self):
+        from sglang.srt.managers.kv_control.contracts import parse_action
+        from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
+        from sglang.srt.managers.kv_control.public import normalize_public
+
+        for case in json.loads((self.fixtures / "salt.json").read_text()):
+            self.assertEqual(
+                encode_cache_salt(case["namespace"], case["salt"]), case["encoded"]
+            )
+        a = self.public_action()
+        a.payload["target"]["compatibility"]["cache_salt"] = "raw"
+        self.assertEqual(
+            normalize_public(parse_action(a), self.caps()).target.cache_salt, "raw"
+        )
+        a.payload["target"]["compatibility"]["cache_salt"] = ""
+        self.assertIsNone(
+            normalize_public(parse_action(a), self.caps()).target.cache_salt
+        )
+
+    @classmethod
+    def public_action(cls):
+        case = json.loads((cls.fixtures / "actions.json").read_text())[0]
+        return msgspec.convert(case["action"], type=KvHintAction)
+
+    @staticmethod
+    def caps():
+        return {
+            "namespace": "ns",
+            "layout_id": "python:full:p4:w0",
+            "components": ("full",),
+            "actions": ("sglang.copy_to", "sglang.move_to"),
+            "cache_generation": 7,
+            "directions": {
+                "copy_to": (("storage", "host"), ("host", "gpu")),
+                "move_to": (("gpu", "host"),),
+                "storage_backend": "file",
+                "page_alignment": 4,
+            },
+        }
+
+    def owner(self):
+        executor = CompletionBoundary()
+        executor.capabilities = self.caps
+        clock = Clock()
+        return (
+            KVControl("engine", "ns", enabled=True, executor=executor, clock=clock),
+            executor,
+            clock,
+        )
+
+    def test_unsupported_capabilities_and_compatibility_never_dispatch(self):
+        from sglang.srt.managers.kv_control.public import public_capabilities
+
+        self.assertNotIn("sglang.pin", public_capabilities(self.caps())["actions"])
+        self.assertFalse(public_capabilities({})["actions"])
+        for field, value in (
+            ("namespace", "other"),
+            ("layout_id", "other"),
+            ("page_size", 2),
+            ("components", ["mamba"]),
+            ("hash_scheme", "other"),
+        ):
+            control, executor, _ = self.owner()
+            a = self.public_action()
+            a.payload["target"]["compatibility"][field] = value
+            result = control.submit(envelope(a), control.context("A")).results[0]
+            self.assertIn(result.status, (Status.UNSUPPORTED, Status.REJECTED))
+            self.assertEqual(executor.starts, 0)
+        for mutation in ("hash_only", "mooncake", "namespace", "pin"):
+            control, executor, _ = self.owner()
+            a = self.public_action()
+            if mutation == "hash_only":
+                a.payload["target"].pop("token_ids")
+            elif mutation == "mooncake":
+                a.payload["source"]["backend"] = "mooncake"
+            elif mutation == "namespace":
+                a.payload["source"]["backend_namespace"] = "shared"
+            else:
+                a = action(
+                    "pin",
+                    {
+                        "mode": "acquire",
+                        "target": a.payload["target"],
+                        "location": {"tier": "host"},
+                        "claim_id": "c",
+                        "revision": 1,
+                        "ttl_seconds": 10,
+                    },
+                )
+            result = control.submit(envelope(a), control.context("A")).results[0]
+            self.assertEqual(result.status, Status.UNSUPPORTED)
+            self.assertEqual(executor.starts, 0)
+            self.assertIsNone(result.public_result.claim)
+
+    def test_replay_versions_and_timeout_drain_keep_actual_progress(self):
+        control, executor, clock = self.owner()
+        a = self.public_action()
+        ctx = control.context("A")
+        submitted = control.submit(envelope(a), ctx)
+        ref = submitted.results[0].ref
+        self.assertFalse(submitted.results[0].public_result.ready_scope)
+        self.assertTrue(control.submit(envelope(a), ctx).replayed)
+        self.assertEqual(executor.starts, 1)
+        a.payload["timeout_ms"] = 10
+        with self.assertRaises(ControlError):
+            control.submit(envelope(a), ctx)
+        clock.now += 6
+        control.progress()
+        cancelling = control.registry.get(ref)
+        self.assertEqual(cancelling.status, Status.CANCELLING)
+        self.assertFalse(cancelling.update.quiescent)
+        self.assertFalse(cancelling.public_result.ready_scope)
+        executor.updates[ref.operation_id] = ExecutionUpdate(
+            status=Status.CANCELLED, quiescent=True
+        )
+        control.progress()
+        done = control.registry.get(ref)
+        self.assertTrue(done.update.quiescent)
+        self.assertGreater(
+            done.public_result.state_version, cancelling.public_result.state_version
+        )
+        self.assertEqual(done.public_result.outcome_sequence, done.sequence)
+
+    def test_attached_timeout_and_old_result_wire_contract(self):
+        control, executor, clock = self.owner()
+        a = self.public_action()
+        a.payload["target"] = "request_cached"
+        context = control.context("A", binding_id="request-incarnation")
+        ref = control.submit(envelope(a), context).results[0].ref
+        self.assertEqual(control.registry.get(ref).status, Status.QUEUED)
+        clock.now += 6
+        control.progress()
+        self.assertEqual(control.registry.get(ref).status, Status.CANCELLED)
+        control.request_event(context, "success", committed=tokens())
+        self.assertEqual(executor.starts, 0)
+        legacy = control.submit(
+            envelope(action("copy_to", movement()), message_id="legacy"),
+            control.context("A"),
+        )
+        self.assertNotIn("public_result", wire(legacy.results[0]))
+        self.assertEqual(wire(legacy.results[0])["update"]["status"], "running")
+
+    def test_missing_and_capacity_results_keep_scope_and_reason(self):
+        for status, field in (
+            (Status.MISSING, "missing_scope"),
+            (Status.DEFERRED, "blocked_scope"),
+        ):
+            control, executor, _ = self.owner()
+            executor.start = lambda work: ExecutionUpdate(
+                status=status, quiescent=True, code="test_boundary"
+            )
+            result = control.submit(
+                envelope(self.public_action()), control.context("A")
+            ).results[0]
+            scope = getattr(result.public_result, field)
+            self.assertEqual(len(scope), 1)
+            self.assertEqual(scope[0].coverage.end_token, 4)
+            self.assertEqual(scope[0].code, "test_boundary")
+            self.assertFalse(result.public_result.ready_scope)
+            self.assertFalse(result.public_result.accepted_scope)
+
+    def test_demote_projection_preservation_is_not_reclamation(self):
+        control, executor, _ = self.owner()
+        a = self.public_action()
+        a = action(
+            "demote",
+            dict(a.payload, source={"tier": "gpu"}, destination={"tier": "host"}),
+        )
+        ref = control.submit(envelope(a), control.context("A")).results[0].ref
+        coverage = TokenRange(start_token=0, end_token=4, component="full")
+        outcome = TargetOutcome(
+            coverage=coverage,
+            status=Status.PARTIAL,
+            location=Location(tier="host"),
+            completed_steps=("destination_ready",),
+            code="active_request_reference",
+        )
+        executor.updates[ref.operation_id] = ExecutionUpdate(
+            status=Status.PARTIAL,
+            quiescent=True,
+            completed_steps=("destination_ready",),
+            target_outcomes=(outcome,),
+        )
+        control.progress()
+        result = control.registry.get(ref)
+        public = result.public_result
+        self.assertEqual(public.ready_scope, (outcome,))
+        self.assertEqual(public.preserved_scope, (outcome,))
+        self.assertEqual(public.blocked_scope, (outcome,))
+        self.assertFalse(public.reclaimed_scope)
+        self.assertEqual(public.cache_generation, 7)
+        self.assertEqual(public.owner_epoch, ref.context.engine_epoch)
+        # Existing consumers still receive their original update and steps.
+        self.assertEqual(result.update.target_outcomes, (outcome,))
 
 
 if __name__ == "__main__":

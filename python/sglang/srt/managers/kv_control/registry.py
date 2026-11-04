@@ -13,7 +13,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     MAX_INTEGER,
     Acknowledgement,
@@ -25,11 +24,13 @@ from sglang.srt.managers.kv_control.contracts import (
     OperationRef,
     OperationResult,
     OutcomeSummary,
+    PublicResult,
     Status,
     Submission,
     Value,
     validated,
 )
+from sglang.srt.managers.kv_control.public import PUBLIC_ACTIONS, project_result
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 
 
@@ -350,7 +351,12 @@ class OperationRegistry:
             )
         self._sequence += 1
         result = msgspec.structs.replace(
-            current, sequence=self._sequence, update=update
+            current,
+            sequence=self._sequence,
+            update=update,
+            public_result=project_result(current, update, self._sequence)
+            if current.action_type in PUBLIC_ACTIONS
+            else current.public_result,
         )
         key = self._key(ref.context, ref.message_id)
         message = self._messages[key]
@@ -361,6 +367,19 @@ class OperationRegistry:
             message.expires_at = self._clock() + self.limits.retention_seconds
             heapq.heappush(self._expiry, (message.expires_at, self._sequence, key))
         return result
+
+    def set_public_scope(self, ref, requested, cache_generation):
+        current = self.get(ref)
+        public = PublicResult(
+            requested_scope=requested,
+            owner_epoch=ref.context.engine_epoch,
+            state_version=current.sequence,
+            outcome_sequence=current.sequence,
+            cache_generation=cache_generation,
+        )
+        self._messages[self._key(ref.context, ref.message_id)].results[
+            ref.action_id
+        ] = msgspec.structs.replace(current, public_result=public)
 
     def _validate_update(self, update):
         if len(update.derived_operations) > self.limits.max_actions or len(

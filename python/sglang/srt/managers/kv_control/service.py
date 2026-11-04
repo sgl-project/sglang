@@ -11,7 +11,6 @@ from dataclasses import replace
 from typing import Annotated
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     ControlContext,
     ControlError,
@@ -365,14 +364,17 @@ class KVControlService:
 
     def capabilities(self):
         from sglang.srt.managers.kv_control.key_namespace import SALT_ENCODING
+        from sglang.srt.managers.kv_control.public import public_capabilities
 
         registry = self.control.registry
+        executor = self.control.executor.capabilities()
         return dict(
             enabled=True,
+            public_protocol=public_capabilities(executor),
             engine_id=registry.engine_id,
             engine_epoch=registry.engine_epoch,
             namespace=registry.namespace,
-            executor=self.control.executor.capabilities(),
+            executor=executor,
             policies=tuple(p.name for p in self.config.policies),
             topology="single_owner",
             attached_caller_id="request",

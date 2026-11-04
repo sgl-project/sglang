@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     PROTOCOL_VERSION,
     Associate,
@@ -25,6 +24,8 @@ from sglang.srt.managers.kv_control.contracts import (
     MoveTo,
     OperationRef,
     OperationResult,
+    Pin,
+    Prefetch,
     Primitive,
     SetPriority,
     Signal,
@@ -37,6 +38,7 @@ from sglang.srt.managers.kv_control.contracts import (
     validated,
 )
 from sglang.srt.managers.kv_control.index import LogicalIndex, ResolvedTarget
+from sglang.srt.managers.kv_control.public import normalize_public, requested_outcomes
 from sglang.srt.managers.kv_control.registry import OperationRegistry, snapshot_envelope
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 
@@ -88,6 +90,7 @@ class _Pending:
     # Keep a bounded cause, never an exception/traceback retaining worker state.
     failure: tuple[str, str] | None = None
     origin: Literal["explicit", "policy"] = "explicit"
+    deadline: float | None = None
 
 
 class KVControl:
@@ -257,6 +260,7 @@ class KVControl:
         # Resolve every historical selector against the state at submission,
         # before any sibling can mutate the index. List order is no dependency API.
         prepared = []
+        public_payloads = {}
         for frozen in batch.actions:
             try:
                 if not self.enabled:
@@ -272,6 +276,21 @@ class KVControl:
                         "JSON numbers must be finite and within the exact integer bound",
                     )
                 scope = None
+                if isinstance(payload, (Prefetch, Pin)):
+                    public_payloads[frozen.action_id] = payload
+                    if (
+                        payload.target != "request_cached"
+                        and payload.target.namespace != context.namespace
+                    ):
+                        raise ControlError(
+                            "incompatible_namespace", "Target namespace differs"
+                        )
+                    if self.executor is None:
+                        raise ControlError(
+                            "unsupported", "No cache executor is installed"
+                        )
+                    describe = getattr(self.executor, "capabilities", None)
+                    payload = normalize_public(payload, describe() if describe else {})
                 if hasattr(payload, "target") and payload.target != "request_cached":
                     if payload.target.namespace != context.namespace:
                         raise ControlError(
@@ -335,9 +354,21 @@ class KVControl:
             if not isinstance(item, ControlError):
                 payload, scope = item
                 if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
+                    public = public_payloads.get(result.ref.action_id)
                     self._pending[result.ref.operation_id] = _Pending(
-                        result.ref, payload, scope
+                        result.ref,
+                        payload,
+                        scope,
+                        deadline=self._clock() + public.timeout_ms / 1000
+                        if public is not None and public.timeout_ms is not None
+                        else None,
                     )
+                    if public is not None:
+                        self.registry.set_public_scope(
+                            result.ref,
+                            requested_outcomes(scope) if scope is not None else (),
+                            self.executor.capabilities().get("cache_generation"),
+                        )
         for result, item in zip(submission.results, prepared):
             if self.registry.get(result.ref).status.terminal:
                 continue
@@ -503,6 +534,19 @@ class KVControl:
 
     def _start(self, pending):
         assert self.executor is not None and pending.target is not None
+        if pending.deadline is not None and self._clock() >= pending.deadline:
+            self.cancel(pending.ref)
+            return
+        current = self.registry.get(pending.ref)
+        if (
+            current.public_result is not None
+            and not current.public_result.requested_scope
+        ):
+            self.registry.set_public_scope(
+                pending.ref,
+                requested_outcomes(pending.target),
+                self.executor.capabilities().get("cache_generation"),
+            )
         if pending.origin == "explicit" and self.policy_runtime is not None:
             self.policy_runtime.before_explicit(pending.payload, pending.target)
         if (
@@ -868,6 +912,13 @@ class KVControl:
         # Rotate polled entries for bounded fair progress, including idle serving.
         for operation_id in tuple(self._pending):
             pending = self._pending[operation_id]
+            if pending.deadline is not None and self._clock() >= pending.deadline:
+                self.cancel(pending.ref)
+                if operation_id not in self._pending:
+                    results.append(self.registry.get(pending.ref))
+                    if len(results) >= limit:
+                        break
+                    continue
             if not pending.started:
                 continue
             self._pending.pop(operation_id)

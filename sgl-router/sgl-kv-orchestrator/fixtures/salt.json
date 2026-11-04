@@ -1,0 +1,32 @@
+[
+  {
+    "namespace": "ns",
+    "salt": null,
+    "encoded": "f06d7376b149ed3ad521a51027b5f1e9f956206090aa2aa70d278a0101c87eed"
+  },
+  {
+    "namespace": "ns",
+    "salt": "",
+    "encoded": "f06d7376b149ed3ad521a51027b5f1e9f956206090aa2aa70d278a0101c87eed"
+  },
+  {
+    "namespace": "ns",
+    "salt": "tenant",
+    "encoded": "dddf3db6cf3c0a983092769f0bc478164da6c2b01469cc218da5fd524bedb2f2"
+  },
+  {
+    "namespace": "权重😀",
+    "salt": "租户\u0000\"\\\n",
+    "encoded": "6cce2ac5ec408ea8460c4a7c6eff285b4f7126e0ba2024ac8f4047b5e52bf58b"
+  },
+  {
+    "namespace": "ns",
+    "salt": "é",
+    "encoded": "332501b2526ba1f80fadaf43a4d8d6da1a9160b5a9c05062b6ef7b246b2bfaf5"
+  },
+  {
+    "namespace": "ns",
+    "salt": "é",
+    "encoded": "07b718dbdd7012bc7e0073124c5254159f774db56c02452b8bffd851ab5f07c1"
+  }
+]

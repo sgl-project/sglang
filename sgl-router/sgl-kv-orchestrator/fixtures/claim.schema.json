@@ -1,0 +1,92 @@
+{
+  "$ref": "#/$defs/ClaimState",
+  "$defs": {
+    "ClaimState": {
+      "title": "ClaimState",
+      "description": "P4 transport hook, separate from operation completion; no claim executor.",
+      "type": "object",
+      "properties": {
+        "caller_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "task_incarnation": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "claim_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "state": {
+          "enum": [
+            "active",
+            "expired",
+            "invalidated",
+            "released",
+            "unknown"
+          ]
+        },
+        "owner_epoch": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "protection_version": {
+          "enum": [
+            "1.0"
+          ],
+          "default": "1.0"
+        },
+        "tombstone": {
+          "type": "boolean",
+          "default": false
+        },
+        "effective_protection": {
+          "anyOf": [
+            {
+              "enum": [
+                "backend_soft_pin",
+                "eviction_exclusion"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "remaining_ttl": {
+          "anyOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 31536000
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "caller_id",
+        "task_incarnation",
+        "claim_id",
+        "revision",
+        "state",
+        "owner_epoch"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

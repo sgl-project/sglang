@@ -1,0 +1,458 @@
+{
+  "$ref": "#/$defs/PublicResult",
+  "$defs": {
+    "PublicResult": {
+      "title": "PublicResult",
+      "description": "Cumulative observations, scoped by branch/component, never a residency lease.",
+      "type": "object",
+      "properties": {
+        "result_version": {
+          "enum": [
+            "1.0"
+          ],
+          "default": "1.0"
+        },
+        "requested_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "accepted_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "ready_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "ready_location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicLocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "preserved_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "reclaimed_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "missing_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "blocked_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "owner_epoch": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "state_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "outcome_sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "cache_generation": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source_observed_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "claim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClaimState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "owner_epoch",
+        "state_version",
+        "outcome_sequence"
+      ],
+      "additionalProperties": false
+    },
+    "TargetOutcome": {
+      "title": "TargetOutcome",
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/TokenRange"
+        },
+        "status": {
+          "$ref": "#/$defs/Status"
+        },
+        "branch_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
+        },
+        "content_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Location"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "completed_steps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "default": []
+        },
+        "code": {
+          "type": "string",
+          "default": ""
+        },
+        "reason": {
+          "type": "string",
+          "default": ""
+        },
+        "coverage_kind": {
+          "enum": [
+            "checkpoint",
+            "tokens",
+            "window"
+          ],
+          "default": "tokens"
+        },
+        "window_size": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "coverage",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "TokenRange": {
+      "title": "TokenRange",
+      "type": "object",
+      "properties": {
+        "start_token": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "end_token": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "component": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "start_token",
+        "end_token"
+      ],
+      "additionalProperties": false
+    },
+    "Status": {
+      "title": "Status",
+      "enum": [
+        "accepted",
+        "cancelled",
+        "cancelling",
+        "completed",
+        "deferred",
+        "failed",
+        "missing",
+        "partial",
+        "queued",
+        "received",
+        "rejected",
+        "running",
+        "unconsumed",
+        "unsupported"
+      ]
+    },
+    "Location": {
+      "title": "Location",
+      "type": "object",
+      "properties": {
+        "tier": {
+          "enum": [
+            "gpu",
+            "host",
+            "storage"
+          ]
+        },
+        "engine_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "tier"
+      ],
+      "additionalProperties": false
+    },
+    "PublicLocation": {
+      "title": "PublicLocation",
+      "type": "object",
+      "properties": {
+        "tier": {
+          "enum": [
+            "gpu",
+            "host",
+            "storage"
+          ]
+        },
+        "engine_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backend_namespace": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "tier"
+      ],
+      "additionalProperties": false
+    },
+    "ClaimState": {
+      "title": "ClaimState",
+      "description": "P4 transport hook, separate from operation completion; no claim executor.",
+      "type": "object",
+      "properties": {
+        "caller_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "task_incarnation": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "claim_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "state": {
+          "enum": [
+            "active",
+            "expired",
+            "invalidated",
+            "released",
+            "unknown"
+          ]
+        },
+        "owner_epoch": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "protection_version": {
+          "enum": [
+            "1.0"
+          ],
+          "default": "1.0"
+        },
+        "tombstone": {
+          "type": "boolean",
+          "default": false
+        },
+        "effective_protection": {
+          "anyOf": [
+            {
+              "enum": [
+                "backend_soft_pin",
+                "eviction_exclusion"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "remaining_ttl": {
+          "anyOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 31536000
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "caller_id",
+        "task_incarnation",
+        "claim_id",
+        "revision",
+        "state",
+        "owner_epoch"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

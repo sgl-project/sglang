@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [".", "sgl-kv-indexer"]
+members = [".", "sgl-kv-indexer", "sgl-kv-orchestrator"]
 
 [package]
 name = "sgl-router"

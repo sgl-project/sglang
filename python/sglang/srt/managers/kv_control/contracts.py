@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import math
+import re
 from enum import Enum
 from typing import Annotated, Literal, TypeAlias
 
 import msgspec
-
 from sglang.srt.managers.kv_hints import KvHintAction
 
 PROTOCOL_VERSION = "0.1"
@@ -148,6 +148,102 @@ class Location(Value):
     backend: Identifier | None = None
 
 
+# Event hashes are signed i64 decimal strings, never JSON numbers or storage keys.
+HASH_SCHEME = "sglang.sha256.u32le.i64.v1"
+RESULT_VERSION = "1.0"
+Hash64: TypeAlias = Annotated[
+    str, msgspec.Meta(pattern=r"^(0|-[1-9][0-9]*|[1-9][0-9]*)$", max_length=20)
+]
+TokenId: TypeAlias = Annotated[int, msgspec.Meta(ge=0, le=(1 << 32) - 1)]
+
+
+class PrefixCompatibility(Value):
+    namespace: Identifier
+    cache_salt: Annotated[str, msgspec.Meta(max_length=256)] | None
+    layout_id: Identifier
+    page_size: Annotated[int, msgspec.Meta(ge=1, le=256)]
+    components: Annotated[
+        tuple[Identifier, ...], msgspec.Meta(min_length=1, max_length=64)
+    ]
+    hash_scheme: Identifier
+
+
+class PrefixBlock(Value):
+    block_hash: Hash64
+    component: Identifier
+    start_token: Position
+    end_token: Position
+    dependency_start: Position = 0
+
+
+class PrefixTarget(Value, tag="prefix", tag_field="kind"):
+    compatibility: PrefixCompatibility
+    start_token: Position
+    end_token: Position
+    # Material always begins at token zero, including all ancestor dependencies.
+    token_ids: (
+        Annotated[tuple[TokenId, ...], msgspec.Meta(min_length=1, max_length=65536)]
+        | None
+    ) = None
+    blocks: Annotated[tuple[PrefixBlock, ...], msgspec.Meta(max_length=4096)] = ()
+
+    @property
+    def namespace(self):
+        return self.compatibility.namespace
+
+
+class PublicLocation(Value):
+    tier: Literal["gpu", "host", "storage"]
+    engine_id: Identifier | None = None
+    backend: Identifier | None = None
+    backend_namespace: Identifier | None = None
+
+
+PublicTarget: TypeAlias = Target | PrefixTarget
+
+
+class Prefetch(Value):
+    target: PublicTarget
+    source: PublicLocation
+    destination: PublicLocation
+    allow_partial: bool = False
+    timeout_ms: Annotated[int, msgspec.Meta(ge=1, le=86400000)] | None = None
+
+
+class Demote(Prefetch):
+    pass
+
+
+class Pin(Value):
+    mode: Literal["acquire", "renew", "release"]
+    target: PublicTarget
+    location: PublicLocation
+    claim_id: Identifier
+    revision: Position
+    ttl_seconds: Seconds | None = None
+    required_protection: Literal["eviction_exclusion", "backend_soft_pin"] = (
+        "eviction_exclusion"
+    )
+
+
+class ClaimState(Value):
+    """P4 transport hook, separate from operation completion; no claim executor."""
+
+    caller_id: Identifier
+    task_incarnation: Identifier
+    claim_id: Identifier
+    revision: Position
+    state: Literal["active", "released", "expired", "invalidated", "unknown"]
+    owner_epoch: Identifier
+    # A release tombstone fences late renewals without asserting live protection.
+    protection_version: Literal["1.0"] = "1.0"
+    tombstone: bool = False
+    effective_protection: Literal["eviction_exclusion", "backend_soft_pin"] | None = (
+        None
+    )
+    remaining_ttl: Seconds | None = None
+
+
 class SetPriority(Value):
     target: Target
     location: Location
@@ -205,7 +301,9 @@ class Signal(Value):
     resume_after_seconds: Seconds | None = None
 
 
-Payload: TypeAlias = Primitive | Associate | FinishTask | Signal
+Payload: TypeAlias = (
+    Primitive | Associate | FinishTask | Signal | Prefetch | Demote | Pin
+)
 
 
 class Status(str, Enum):
@@ -284,12 +382,33 @@ class ExecutionUpdate(Value):
     derived_operations: tuple[OperationRef, ...] = ()
 
 
-class OperationResult(Value):
+class PublicResult(Value, kw_only=True):
+    """Cumulative observations, scoped by branch/component, never a residency lease."""
+
+    result_version: Literal["1.0"] = RESULT_VERSION
+    requested_scope: tuple[TargetOutcome, ...] = ()
+    accepted_scope: tuple[TargetOutcome, ...] = ()
+    ready_scope: tuple[TargetOutcome, ...] = ()
+    ready_location: PublicLocation | None = None
+    preserved_scope: tuple[TargetOutcome, ...] = ()
+    reclaimed_scope: tuple[TargetOutcome, ...] = ()
+    missing_scope: tuple[TargetOutcome, ...] = ()
+    blocked_scope: tuple[TargetOutcome, ...] = ()
+    owner_epoch: Identifier
+    state_version: Position
+    outcome_sequence: Position
+    cache_generation: Position | None = None
+    source_observed_at: float | None = None
+    claim: ClaimState | None = None
+
+
+class OperationResult(Value, omit_defaults=True):
     ref: OperationRef
     action_type: Identifier
     action_version: Identifier
     sequence: Position
     update: ExecutionUpdate
+    public_result: PublicResult | None = None
 
     @property
     def status(self) -> Status:
@@ -326,7 +445,10 @@ def validated(value, schema):
         raise ControlError("invalid_payload", str(error)[:4096]) from error
 
 
-def validate_target(target: LogicalTarget) -> None:
+def validate_target(target: LogicalTarget | PrefixTarget) -> None:
+    if isinstance(target, PrefixTarget):
+        validate_prefix(target)
+        return
     if target.end_token is not None and target.end_token <= target.start_token:
         raise ControlError(
             "invalid_payload", "Token ranges must be nonempty and half-open"
@@ -378,6 +500,73 @@ def validate_target(target: LogicalTarget) -> None:
                 )
 
 
+def validate_prefix(target: PrefixTarget) -> None:
+    c = target.compatibility
+    if len(set(c.components)) != len(c.components):
+        raise ControlError("invalid_payload", "Components must be unique")
+    if not target.start_token < target.end_token or any(
+        x % c.page_size for x in (target.start_token, target.end_token)
+    ):
+        raise ControlError(
+            "invalid_payload", "Prefix boundaries must be nonempty and page aligned"
+        )
+    if target.token_ids is not None and len(target.token_ids) != target.end_token:
+        raise ControlError(
+            "invalid_payload", "Token material must cover exactly [0, end_token)"
+        )
+    previous = {}
+    for block in target.blocks:
+        if not re.fullmatch(r"0|-[1-9][0-9]*|[1-9][0-9]*", block.block_hash) or not -(
+            1 << 63
+        ) <= int(block.block_hash) < (1 << 63):
+            raise ControlError(
+                "invalid_payload", "Block hash must be a canonical decimal i64 string"
+            )
+        if (
+            block.component not in c.components
+            or not 0
+            <= block.dependency_start
+            <= block.start_token
+            < block.end_token
+            <= target.end_token
+            or block.end_token - block.start_token != c.page_size
+            or block.dependency_start % c.page_size
+            or block.start_token % c.page_size
+            or block.start_token < previous.get(block.component, 0)
+        ):
+            raise ControlError(
+                "invalid_payload", "Invalid ordered block/dependency descriptor"
+            )
+        previous[block.component] = block.end_token
+
+
+def validate_public(payload):
+    if isinstance(payload, Pin):
+        if (payload.mode == "release") != (payload.ttl_seconds is None):
+            raise ControlError(
+                "invalid_payload", "Acquire/renew require TTL; release must omit TTL"
+            )
+        if payload.ttl_seconds is not None and not math.isfinite(payload.ttl_seconds):
+            raise ControlError("invalid_payload", "TTL must be finite")
+        locations = (payload.location,)
+    else:
+        locations = (payload.source, payload.destination)
+        ranks = {"gpu": 0, "host": 1, "storage": 2}
+        src, dst = ranks[payload.source.tier], ranks[payload.destination.tier]
+        if (isinstance(payload, Demote) and src >= dst) or (
+            not isinstance(payload, Demote) and src <= dst
+        ):
+            raise ControlError("invalid_payload", "Invalid public transfer direction")
+    for location in locations:
+        if location.tier == "storage":
+            if location.engine_id is not None:
+                raise ControlError(
+                    "invalid_payload", "Storage locations cannot name an engine"
+                )
+        elif location.backend is not None or location.backend_namespace is not None:
+            raise ControlError("invalid_payload", "Engine tiers cannot name a backend")
+
+
 def parse_action(action: KvHintAction) -> Payload:
     """Interpret only native names; generic forwarding never calls this parser."""
     schemas = {
@@ -387,6 +576,9 @@ def parse_action(action: KvHintAction) -> Payload:
         "sglang.associate": Associate,
         "sglang.finish_task": FinishTask,
         "sglang.signal": Signal,
+        "sglang.prefetch": Prefetch,
+        "sglang.demote": Demote,
+        "sglang.pin": Pin,
     }
     schema = schemas.get(action.action_type)
     if schema is None or action.action_version != ACTION_VERSION:
@@ -394,6 +586,8 @@ def parse_action(action: KvHintAction) -> Payload:
     payload = validated(action.payload, schema)
     if hasattr(payload, "target") and payload.target != "request_cached":
         validate_target(payload.target)
+    if isinstance(payload, (Prefetch, Pin)):
+        validate_public(payload)
     if isinstance(payload, SetPriority):
         if payload.value is None:
             if payload.ttl_seconds is not None:

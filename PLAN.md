@@ -1,6 +1,6 @@
 # SGLang Session-Aware KV Cache Orchestrator 实现方案与实施计划
 
-日期：2026-11-04。状态：P0 已形成通过指定验证的未提交合并工作树，待 parent 审查；D1–D7 已采用为实施默认值。本文保留完整方案，P1–P9 均待实施；后续章节描述拟实现行为，不表示代码已经具备这些能力。
+日期：2026-11-04。状态：P0 已由 parent 提交为 `46ba2e84b9`；P1 协议与模型基础已实现并通过指定验证，工作树未提交，待 parent 审查。D1–D7 已采用。P2–P8 待实施，P9 为后续扩展；这些阶段的描述不表示当前代码已经具备相应能力。
 
 目标是在保留 `rfc-kvc` 引擎控制实现的基础上，接入 Router 侧的 session 编排，完成 `PREFETCH`、`DEMOTE`、`PIN`、Mooncake 执行适配及结果反馈。主要验证场景是：应用等待工具期间，将已存在于 Mooncake 的上下文准备到另一个 Engine 的 L2，并在恢复推理时实际复用。
 
@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | C1 | 在现有 `rfc-kvc` 基础上修改，保留提交历史并合入上游基线 | 采用 merge 整合；本计划不要求重写已有提交 |
 | C2 | Mooncake 为主要存储后端，file 用于测试 | 真实功能验收必须覆盖 Mooncake；file 和 mock 用于可控测试 |
-| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 当前任务仅执行 P0 合并、兼容修复和验证；按本任务明确限制保持未提交、不推送，由 parent 独立审查、测试和提交；未授权部署 |
+| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 当前任务执行 P1 协议与模型基础；按本任务明确限制保持未提交、不推送，由 parent 审查和提交；未授权部署 |
 
 ### 已采用的实施默认值 D1–D7
 
@@ -30,7 +30,7 @@
 | D6 | 旧控制动作保持兼容，新公开动作使用独立 action type | 保留现有测试和实验入口，Router 使用新动作 |
 | D7 | 会话图初期使用有界内存状态；重启后允许应用重报，未重建部分标为 unknown | 不承诺 session 元数据持久化或高可用；保护恢复有独立约束，见第 8 节 |
 
-协议字段、模块名和新增配置均为本文建议。P1 应将其收敛为跨语言 schema 与 fixtures，再开始依赖这些字段的实现。
+P1 已将公开动作字段固定为跨语言 schema 与 fixtures，精确字段见 `sgl-router/sgl-kv-orchestrator/README.md`。后续模块名和运行配置仍按对应阶段实施。
 
 ### 阅读时核对的基线
 
@@ -181,9 +181,9 @@ Router 的 `POST /v1/kv/control` 接收业务 selector 或明确 prefix，并负
 
 | Action type，拟新增 | payload 核心字段 | 语义 |
 | --- | --- | --- |
-| `sglang.prefetch` | target、source、destination、allow_partial、deadline | 准备目标 owner 的指定层；不隐含 PIN |
-| `sglang.demote` | target、source、destination、allow_partial、deadline | 冷层保存与源层回收属于同一操作的不同结果维度 |
-| `sglang.pin` | mode、target、location、claim_id、revision、ttl、required_protection | mode 为 acquire/renew/release；renew/release 复用 claim 身份 |
+| `sglang.prefetch` | target、source、destination、allow_partial、timeout_ms | 准备目标 owner 的指定层；不隐含 PIN |
+| `sglang.demote` | target、source、destination、allow_partial、timeout_ms | 冷层保存与源层回收属于同一操作的不同结果维度 |
+| `sglang.pin` | mode、target、location、claim_id、revision、ttl_seconds、required_protection | mode 为 acquire/renew/release；renew/release 复用 claim 身份 |
 
 拟新增 `PrefixTarget`，包含 `compatibility`、token 边界、可选 token material 与可选有序 block 描述。首轮将可执行目标规范化到既有 token-prefix 路径；未来的 hash-only 路径需独立声明。以下仅是 schema 草案，不能直接作为当前服务器的请求示例：
 
@@ -228,7 +228,7 @@ Router 的 `POST /v1/kv/control` 接收业务 selector 或明确 prefix，并负
 }
 ```
 
-示例的 page size、timeout 和名称仅说明字段，不是运行默认值。P1 需消除 `deadline` 与传输时长表达的歧义：建议调用方发送相对超时，执行 owner 转换为本地 monotonic deadline；不比较不同进程的 monotonic 数值。
+示例的 page size、timeout 和名称仅说明字段。P1 固定为可选相对超时 `timeout_ms`（1–86,400,000）；省略时不增加控制 deadline。执行 owner 转换为本地 monotonic deadline，到期发起取消并等待 drain；不比较不同进程的 monotonic 数值。精确 P1 示例及可执行的 file 后端路径见 crate README；上方 Mooncake 示例属于 P2 目标。
 
 请求附带 hints 与独立提交共用解析器和执行器。明确 prefix 可以立即进入异步控制队列。现有 `request_cached` 仍在请求成功完成并 checkpoint 后绑定，不能解释为下一轮请求到达前的已知输入。fan-out/sampling 使用独立 binding incarnation，避免复用 request ID 导致结果串联。
 
@@ -448,12 +448,12 @@ Router wire 与外部 bridge 当前忽略 session 信息，需要分别接入。
 
 ## 11. 实施阶段与依赖
 
-本任务只实施 P0。P1–P9 均待实施；不新增三动作、Router 编排、Mooncake 控制适配或 PIN。每阶段可以拆成多个 PR，但单个 PR 的 capabilities 不得提前宣称后续阶段的能力。
+本任务实施 P1。三动作 schema、PrefixTarget、结果投影、Rust 纯模型和跨语言 fixtures 已完成；新搬运动作仅复用已有执行路径。P2–P8 的物理功能与 Router 集成待实施，PIN 仅有 schema，执行返回 unsupported。P9 为后续扩展。Capabilities 仅公布当前执行器支持的路径。
 
 | 阶段 | 主要产物 | 依赖 | 退出条件 |
 | --- | --- | --- | --- |
 | P0 基线整合 | 固定 merge 基线、冲突记录、D1–D7 决策记录 | C1/C2 | 原有控制/搬运回归通过，Router/indexer 可构建 |
-| P1 协议与模型 | 三动作 schema、PrefixTarget、capabilities、结果、跨语言 fixtures、模块骨架 | P0 | Python/Rust 对有效与无效消息行为一致 |
+| P1 协议与模型（已实现，未提交） | 三动作 schema、PrefixTarget、capabilities、结果、跨语言 fixtures、Rust 纯模型 | P0 | Python 72 tests + 66 subtests；Rust 4 tests；locked Router/indexer check 通过 |
 | P2 后端与 PREFETCH | storage adapter、Mooncake 数据路径、独立 L3→L2、最小完成事件 | P1 | 无本地前缀、无推理请求也能准备真实 host cache |
 | P3 DEMOTE | 复用 native 回收，区分保存/回收，部分结果与阻塞原因 | P2 | 活跃引用和传输期间不误回收；真实释放可验证 |
 | P4 PIN | L2 registry、L3 protection owner、对象聚合、TTL/renew/release | P1/P2 | 共享保护、未知结果与过期处理通过专项测试 |
@@ -467,7 +467,7 @@ Router wire 与外部 bridge 当前忽略 session 信息，需要分别接入。
 
 保留 `rfc-kvc` 与固定上游快照的历史。合并后重点审查 Scheduler control hook、HiCache completion 路径、tree core/component API、storage attachment、weight lifecycle、request structs 和 KV publisher。不能用整体接受某一侧文件的方式丢掉已有引用与 namespace 约束。
 
-记录实际 HEAD、MERGE_HEAD 和测试环境，以待审查的合并工作树作为 P0 结果。当前任务执行 `git merge --no-commit --no-ff 4517a5ff1bbd1f944d6bde1819300ed14af7b698`，保持未提交、不推送，由 parent 审查并提交。
+P0 已记录 HEAD、MERGE_HEAD 和测试环境，执行固定上游快照的合并及验证。parent 审查后提交为 `46ba2e84b9`；原始合并记录保留在 `PLAN-REVIEW-LOG.md`。
 
 ### P1–P7 的提交边界
 
@@ -622,4 +622,4 @@ request metadata 的变更还涉及 [io_struct.py](/home/youwei/bzh/project/Toke
 | 能力限制 | 仍返回 unsupported 的路径、unknown 恢复边界 |
 | 后续依赖 | 未完成前不能宣布支持的能力 |
 
-当前进度：P0 合并工作树及验证证据见根目录 `PLAN-REVIEW-LOG.md`；P1–P9 均待实施。D1–D7 已采用为实施默认值。Mooncake 实际验证版本、实验硬件和 Agent/RL 接入框架待后续阶段记录。外部计划源文件保持不变。
+当前进度：P0 已提交，P1 实现及验证证据见根目录 `PLAN-REVIEW-LOG.md`。P1 未提交，待 parent 审查；P2–P8 待实施，P9 为后续扩展。D1–D7 已采用。精确 wire 契约见 `sgl-router/sgl-kv-orchestrator/README.md` 和 fixtures。Mooncake 实际验证版本、实验硬件和 Agent/RL 接入框架待后续阶段记录。外部计划源文件保持不变。

@@ -4421,3 +4421,108 @@ A	tools/sglang-simulator/test/test_train_latency_model.py
 ## Act 3 — Build: P0 independent review
 
 Primary-agent review verified the three conflict resolutions and both fixture changes. The production control, transfer, priority and weight-lifecycle implementations retain their pre-merge semantics. Independent six-file pytest: 62 passed, 25 subtests passed (28.68 s); independent locked Router/indexer cargo check passed on task-local Rust 1.99.1. Proof logs: /tmp/sglang-rfc-build/p0-parent-tests.log and p0-parent-router-check.log. P0 is approved for the merge commit under the user instruction to commit each tested feature. No Codex co-author is added.
+
+## Act 3 — Build: P1 protocol and model foundation (2026-11-04)
+
+Baseline: parent commit `46ba2e84b9`. Scope is P1 only; no commits, pushes,
+subdelegation, model pinning, Router runtime integration, or P2–P8 physical
+features. P9 remains a later expansion. D1–D7 remain adopted. Parent review and
+commit are pending.
+
+Python adds version-1.0 PREFETCH/DEMOTE/PIN schemas on envelope 0.1. PREFETCH and
+DEMOTE normalize to existing CopyTo/MoveTo only when the live executor advertises
+the direction/backend. PIN is validated but always unsupported; schema discovery
+is separate from executable capabilities. PrefixTarget validates bounded nested
+compatibility, aligned definite boundaries, token material, ordered page
+observations, dependencies, and canonical decimal-string i64 event hashes.
+Execution requires complete token material from zero and matching identity/layout;
+no truncated hash is used to reconstruct a storage key. Raw salt reaches the
+existing executor namespace transform unchanged. Unknown consumer actions and
+legacy action/target semantics remain intact.
+
+New public_result is absent on old action results. Its ready/preserved/reclaimed
+ranges derive from per-target publication/reclamation evidence, alongside
+requested/accepted/missing/blocked scopes, owner/cache/result versions and reason
+codes. Queued I/O and generic RUNNING do not establish readiness or scoped
+acceptance. Relative timeout requests cancellation; resource drain still governs
+quiescence. Claim state, protection version, revision and tombstone fields are
+separate schemas, with no claim executor or fake protection.
+
+The independent `sgl-kv-orchestrator` crate contains protocol parsing, shared
+checked-in JSON schemas, salt encoding, i64 string serialization, and pure
+session/branch/observation/placement/claim/budget models. It has no dependency on
+Router or indexer and no runtime integration. Cargo.lock adds only the new local
+package; all dependency versions were already present. Schema fixtures are drift
+checked against Python; action, result/claim and salt vectors run in both
+languages. Exact wire contract: `sgl-router/sgl-kv-orchestrator/README.md`.
+
+Validation used existing `.venv`, `PYTHONPATH=python`, and the user-provided
+cargo/rustup/cache environment. Tests remain in the existing registered CPU test
+files. New coverage includes invalid i64/bounds/dependencies/layouts, Unicode and
+null/empty salts, old selectors, no false capabilities, replay conflicts,
+attached and in-flight timeout cancellation, old result serialization, separate
+preservation/reclamation, and real CPU pool/file-store publication under
+controlled DMA. No GPU or live Mooncake claim is made. One inherited unknown
+native-action test used `sglang.pin` as a placeholder; it now uses
+`sglang.future_action`, with PIN covered explicitly by the new tests.
+
+Exact requested proof commands:
+
+```sh
+PYTHONPATH=python .venv/bin/python -m pytest -q --tb=short test/registered/unit/managers/test_kv_control.py test/registered/unit/managers/test_kv_policy.py test/registered/unit/mem_cache/test_kv_control_cache.py test/registered/unit/mem_cache/test_kv_control_service.py test/registered/unit/mem_cache/test_kv_control_transfers.py test/registered/unit/mem_cache/test_kv_policy_runtime.py
+cargo test --manifest-path sgl-router/Cargo.toml -p sgl-kv-orchestrator
+cargo check --locked --manifest-path sgl-router/Cargo.toml -p sgl-router -p sgl-kv-indexer
+```
+
+Proof logs: `/tmp/sglang-rfc-build/p1-python-tests.log`,
+`/tmp/sglang-rfc-build/p1-rust-test.log`,
+`/tmp/sglang-rfc-build/p1-router-check.log`. Relevant output:
+
+```text
+72 passed, 17 warnings, 66 subtests passed in 14.99s
+Rust: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+Rust doc tests: 0 passed; 0 failed
+Router/indexer: Finished `dev` profile [unoptimized + debuginfo]
+```
+
+Python warnings are dependency deprecations from the existing FlashInfer/CUTLASS
+installation. `cargo fmt` and `git diff --check` are clean. P1 uses the existing
+file and host/GPU executor contracts; Mooncake adapters (P2), expanded DEMOTE (P3),
+PIN execution (P4), Router graph/routing (P5/P6), recovery feedback (P7), and joint
+GPU/Mooncake acceptance (P8) remain pending. `source_observed_at` stays null until
+a physical observation source supplies it. Public outcomes are historical
+operation evidence, not permanent residency guarantees. `allow_partial=false`
+prevents requested clipping, without promising transactional physical I/O.
+
+P1 changed-file inventory (excluding temporary proof logs):
+
+```text
+PLAN-REVIEW-LOG.md
+PLAN.md
+python/sglang/srt/managers/kv_control/contracts.py
+python/sglang/srt/managers/kv_control/controller.py
+python/sglang/srt/managers/kv_control/public.py
+python/sglang/srt/managers/kv_control/registry.py
+python/sglang/srt/managers/kv_control/service.py
+sgl-router/Cargo.lock
+sgl-router/Cargo.toml
+sgl-router/sgl-kv-orchestrator/Cargo.toml
+sgl-router/sgl-kv-orchestrator/README.md
+sgl-router/sgl-kv-orchestrator/fixtures/actions.json
+sgl-router/sgl-kv-orchestrator/fixtures/claim.schema.json
+sgl-router/sgl-kv-orchestrator/fixtures/demote.schema.json
+sgl-router/sgl-kv-orchestrator/fixtures/pin.schema.json
+sgl-router/sgl-kv-orchestrator/fixtures/prefetch.schema.json
+sgl-router/sgl-kv-orchestrator/fixtures/result.schema.json
+sgl-router/sgl-kv-orchestrator/fixtures/results.json
+sgl-router/sgl-kv-orchestrator/fixtures/salt.json
+sgl-router/sgl-kv-orchestrator/src/lib.rs
+sgl-router/sgl-kv-orchestrator/src/models.rs
+sgl-router/sgl-kv-orchestrator/src/protocol.rs
+test/registered/unit/managers/test_kv_control.py
+test/registered/unit/mem_cache/test_kv_control_transfers.py
+```
+
+### P1 independent review and proof
+
+Reviewed public normalization, capability gating, timeout cancellation/drain, result projection, shared schemas and Rust validation. Independent Python proof: 72 passed, 66 subtests passed (13.55 s); independent locked Rust protocol proof: 4 passed. Source logs: /tmp/sglang-rfc-build/p1-parent-tests.log and p1-parent-rust.log. PIN remains unsupported until its executor is integrated. Public state_version currently orders operation evidence, not KV location-stream observations; P7 must attach an actual cache-state watermark before cross-stream reconciliation. P1 approved for commit.

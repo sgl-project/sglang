@@ -1,0 +1,126 @@
+{
+  "results": [
+    {
+      "result_version": "1.0",
+      "requested_scope": [],
+      "accepted_scope": [],
+      "ready_scope": [],
+      "ready_location": null,
+      "preserved_scope": [],
+      "reclaimed_scope": [],
+      "missing_scope": [],
+      "blocked_scope": [],
+      "owner_epoch": "epoch",
+      "state_version": 1,
+      "outcome_sequence": 1,
+      "cache_generation": null,
+      "source_observed_at": null,
+      "claim": null
+    },
+    {
+      "result_version": "1.0",
+      "requested_scope": [],
+      "accepted_scope": [],
+      "ready_scope": [
+        {
+          "coverage": {
+            "start_token": 0,
+            "end_token": 4,
+            "component": "full"
+          },
+          "status": "partial",
+          "branch_index": 0,
+          "content_id": null,
+          "location": {
+            "tier": "host",
+            "engine_id": null,
+            "backend": null
+          },
+          "completed_steps": [
+            "destination_ready"
+          ],
+          "code": "active_request_reference",
+          "reason": "",
+          "coverage_kind": "tokens",
+          "window_size": null
+        }
+      ],
+      "ready_location": {
+        "tier": "host",
+        "engine_id": null,
+        "backend": null,
+        "backend_namespace": null
+      },
+      "preserved_scope": [
+        {
+          "coverage": {
+            "start_token": 0,
+            "end_token": 4,
+            "component": "full"
+          },
+          "status": "partial",
+          "branch_index": 0,
+          "content_id": null,
+          "location": {
+            "tier": "host",
+            "engine_id": null,
+            "backend": null
+          },
+          "completed_steps": [
+            "destination_ready"
+          ],
+          "code": "active_request_reference",
+          "reason": "",
+          "coverage_kind": "tokens",
+          "window_size": null
+        }
+      ],
+      "reclaimed_scope": [],
+      "missing_scope": [],
+      "blocked_scope": [
+        {
+          "coverage": {
+            "start_token": 0,
+            "end_token": 4,
+            "component": "full"
+          },
+          "status": "partial",
+          "branch_index": 0,
+          "content_id": null,
+          "location": {
+            "tier": "host",
+            "engine_id": null,
+            "backend": null
+          },
+          "completed_steps": [
+            "destination_ready"
+          ],
+          "code": "active_request_reference",
+          "reason": "",
+          "coverage_kind": "tokens",
+          "window_size": null
+        }
+      ],
+      "owner_epoch": "epoch",
+      "state_version": 2,
+      "outcome_sequence": 2,
+      "cache_generation": 3,
+      "source_observed_at": null,
+      "claim": null
+    }
+  ],
+  "claims": [
+    {
+      "caller_id": "router",
+      "task_incarnation": "task-1",
+      "claim_id": "claim-1",
+      "revision": 3,
+      "state": "released",
+      "owner_epoch": "epoch",
+      "protection_version": "1.0",
+      "tombstone": true,
+      "effective_protection": null,
+      "remaining_ttl": null
+    }
+  ]
+}

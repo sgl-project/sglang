@@ -274,7 +274,81 @@ def hicache(case, config=None, *, storage=False, namespace_keys=False):
         scope.restore()
 
 
+def public_transfer(service, kind, source, destination, message):
+    from sglang.srt.managers.kv_control.contracts import HASH_SCHEME
+
+    caps = service.capabilities()["public_protocol"]
+    compatibility = msgspec.json.decode(msgspec.json.encode(caps["prefix"]))
+    compatibility.pop("token_material")
+    compatibility["cache_salt"] = None
+    assert compatibility["hash_scheme"] == HASH_SCHEME
+    return service.control.submit(
+        KvHintsEnvelope(
+            protocol_version="0.1",
+            message_id=message,
+            actions=[
+                KvHintAction(
+                    action_id="a",
+                    action_type="sglang." + kind,
+                    action_version="1.0",
+                    payload={
+                        "target": {
+                            "kind": "prefix",
+                            "compatibility": compatibility,
+                            "start_token": 0,
+                            "end_token": 4,
+                            "token_ids": [1, 2, 3, 4],
+                        },
+                        "source": {"tier": source},
+                        "destination": {"tier": destination},
+                        "timeout_ms": 5000,
+                    },
+                )
+            ],
+        ),
+        service.control.context("router"),
+    ).results[0]
+
+
 class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
+    def test_public_demote_then_prefetch_observe_actual_fences(self):
+        with hicache(self) as owner:
+            _, cache, service, dma = owner
+            node = seed(cache)
+            initial = cache.token_to_kv_pool_allocator.available_size()
+            result = public_transfer(service, "demote", "gpu", "host", "demote")
+            assert result.status == Status.RUNNING, result
+            assert not result.public_result.ready_scope
+            assert result.public_result.ready_location is None
+            assert not result.public_result.reclaimed_scope
+            assert node.component_data[FULL].value is not None
+            service.progress()
+            dma.finish()
+            service.progress()
+            done = current(service, result)
+            assert done.status == Status.COMPLETED, done
+            assert done.public_result.preserved_scope
+            assert done.public_result.reclaimed_scope
+            assert node.component_data[FULL].value is None
+            assert cache.token_to_kv_pool_allocator.available_size() == initial + 4
+            result = public_transfer(service, "prefetch", "host", "gpu", "prefetch")
+            assert result.status == Status.RUNNING, result
+            assert not result.public_result.ready_scope
+            service.progress()
+            dma.finish()
+            service.progress()
+            done = current(service, result)
+            assert done.status == Status.COMPLETED, done
+            assert done.public_result.ready_scope
+            assert done.public_result.ready_location.tier == "gpu"
+            assert not done.public_result.preserved_scope
+            assert not done.public_result.reclaimed_scope
+            cd = node.component_data[FULL]
+            pool = cache.token_to_kv_pool_allocator.get_kvcache()
+            assert torch.all(pool.k_buffer[0][cd.value] == 7)
+            assert cd.lock_ref == cd.host_lock_ref == 0
+            cache.sanity_check()
+
     def test_copy_waits_for_fence_preserves_bytes_and_pool_ownership(self):
         with hicache(self) as owner:
             _, cache, service, dma = owner
@@ -679,6 +753,29 @@ def assert_retired(cache, service):
 
 
 class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
+    def test_public_file_prefetch_registers_host_without_local_prefix(self):
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, dma = cold_prefix(owner)
+            caps = service.capabilities()["public_protocol"]
+            assert caps["storage_backend"] == "file"
+            assert "sglang.pin" not in caps["actions"]
+            result = public_transfer(
+                service, "prefetch", "storage", "host", "public-restore"
+            )
+            done = wait(service, result)
+            assert done.status == Status.COMPLETED, done
+            assert done.public_result.ready_scope
+            assert done.public_result.ready_location.tier == "host"
+            assert not dma.pending
+            for node, _, _, _ in prefix_path(cache, service):
+                cd = node.component_data[FULL]
+                host = cache.host_pool_group.anchor_entry.host_pool
+                assert cd.value is None
+                assert torch.all(host.k_buffer[0][cd.host_value] == 7)
+                assert torch.all(host.v_buffer[0][cd.host_value] == 8)
+                assert cd.lock_ref == cd.host_lock_ref == 0
+            assert_retired(cache, service)
+
     def test_restore_from_actual_file_without_resident_radix_nodes(self):
         with hicache(self, namespace_keys=True) as owner:
             destination = "gpu"
