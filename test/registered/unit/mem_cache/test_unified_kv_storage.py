@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
-from sglang.srt.mem_cache.hybrid_cache.host_pool_config import is_mla_pool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -199,12 +198,11 @@ class _Group:
 def _host_pool_recorders():
     """Host pool builders that record what they were asked for."""
 
-    def kv_host(*, kv_pool, page_size, use_mla=None, host_size=None, **kwargs):
+    def kv_host(*, kv_pool, page_size, host_size=None, **kwargs):
         return SimpleNamespace(
             kind="kv",
             device_pool=kv_pool,
             page_size=page_size,
-            use_mla=is_mla_pool(kv_pool) if use_mla is None else use_mla,
             host_size=host_size,
             drafts=tuple(kwargs.get("mtp_draft_device_pools", ())),
         )

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from sglang.api.v1.api_types import GenerateMetaInfo
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
@@ -26,7 +26,8 @@ from sglang.srt.managers.io_struct import (
     row_output_ids,
     unwrap_from_pickle,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
