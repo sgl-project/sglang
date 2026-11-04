@@ -62,7 +62,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
     deepgemm_mxfp8_input_flashinfer_min_rows,
-    deepgemm_mxfp8_scale_to_flashinfer,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     deepgemm_w8a8_mxfp8_linear_with_fallback,
     dense_mxscale_wanted,
@@ -1432,20 +1431,13 @@ class Fp8LinearMethod(LinearMethodBase):
             and not self.mxfp8_dense_backend.is_deep_gemm()
         ):
             # DeepGEMM-packed activation scales; see LinearBase.deepgemm_mxfp8_input.
-            min_rows = getattr(layer, "deepgemm_mxfp8_input_flashinfer_min_rows", None)
-            if (
-                min_rows is None
-                or x[0].shape[0] < min_rows
-                or _batch_invariant_or_deterministic()
-            ):
-                return deepgemm_w8a8_mxfp8_linear_with_fallback(
-                    x[0],
-                    layer.weight,
-                    layer.weight_scale_inv_deepgemm,
-                    input_scale=x[1],
-                    bias=bias,
-                )
-            x = (x[0], deepgemm_mxfp8_scale_to_flashinfer(x[1]))
+            return deepgemm_w8a8_mxfp8_linear_with_fallback(
+                x[0],
+                layer.weight,
+                layer.weight_scale_inv_deepgemm,
+                input_scale=x[1],
+                bias=bias,
+            )
         elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
             # A legacy (q, scale) block-fp8 pair keeps the block kernel.
             mxfp8_view = False

@@ -191,6 +191,11 @@ class HcReadCall(HcRead):
             hc=hc,
             accepts_mxfp8_deepgemm=self.attention
             and self.layer.self_attn.accepts_deepgemm_mxfp8_input(),
+            mxfp8_deepgemm_flashinfer_min_rows=(
+                self.layer.self_attn.deepgemm_mxfp8_flashinfer_min_rows()
+                if self.attention
+                else None
+            ),
             mega_moe_input=(
                 None
                 if self.attention

@@ -225,6 +225,7 @@ class NonCudaDecoderMixin:
                 accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
                 hc=self._next_layer.attn_hc,
                 accepts_mxfp8_deepgemm=self._next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
+                mxfp8_deepgemm_flashinfer_min_rows=self._next_layer.self_attn.deepgemm_mxfp8_flashinfer_min_rows(),
             )
 
     def forward(

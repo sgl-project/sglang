@@ -1,6 +1,6 @@
 """Explicit input layout for a linear consuming prequantized MXFP8 activations."""
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -51,3 +51,36 @@ def accepts_mxfp8_deepgemm_input(linear) -> bool:
         and weight.shape[0] % 64 == 0
         and weight.shape[1] % 128 == 0
     )
+
+
+def deepgemm_pair_takes_flashinfer(min_rows: Optional[int], rows: int) -> bool:
+    """Whether a DeepGEMM producer of ``rows`` writes FlashInfer's 128x4 scales for a
+    linear whose ``deepgemm_mxfp8_input_flashinfer_min_rows`` is ``min_rows``."""
+    if min_rows is None or rows < min_rows:
+        return False
+    from sglang.srt.layers.quantization.fp8 import _batch_invariant_or_deterministic
+
+    return not _batch_invariant_or_deterministic()
+
+
+def deepgemm_mxfp8_linear_input(
+    data: torch.Tensor, scale: torch.Tensor
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Mxfp8SwizzledInput]:
+    """A filled producer pair as a linear's input."""
+    if scale.dim() == 4:
+        return Mxfp8SwizzledInput(data, scale.view(torch.uint8).view(-1))
+    return data, scale
+
+
+def zero_deepgemm_mxfp8_scale_rows(scale: torch.Tensor, start: int) -> None:
+    """Zero the scales of rows ``start:`` in either producer scale layout."""
+    if scale.dim() != 4:
+        scale[start:].zero_()
+        return
+    tile, row = divmod(start, 128)
+    if row:
+        quarter, lane = divmod(row, 32)
+        scale[tile, :, lane:, quarter].zero_()
+        scale[tile, :, :, quarter + 1 :].zero_()
+        tile += 1
+    scale[tile:].zero_()
