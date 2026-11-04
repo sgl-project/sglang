@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-import sgl_kernel_npu
+import sgl_kernel_npu  # noqa: F401
 import torch
 import torch_npu
 
@@ -140,7 +140,7 @@ def test_pool_writer_to_packed_reader(qlen):
     sq = torch.tensor([qlen], device="npu", dtype=torch.int32)
     sk = torch.tensor([511], device="npu", dtype=torch.int32)
     table = torch.tensor([[1, 2, 3, 4]], device="npu", dtype=torch.int32)
-    actual = sgl_kernel_npu.quant_lightning_indexer_packed(
+    actual = torch.ops.npu.sgl_quant_lightning_indexer_packed(
         q, p.get_index_k_with_scale_buffer(0), w, qs, sq, sk, table, 256, 3
     )
     separate_k = torch.zeros(5, 128, 1, 128, device="npu", dtype=torch.uint8)
@@ -238,9 +238,9 @@ def test_actual_indexer_forward(prefill):
             ),
         ),
         patch.object(
-            sgl_kernel_npu,
-            "quant_lightning_indexer_packed",
-            wraps=sgl_kernel_npu.quant_lightning_indexer_packed,
+            torch.ops.npu,
+            "sgl_quant_lightning_indexer_packed",
+            wraps=torch.ops.npu.sgl_quant_lightning_indexer_packed,
         ) as reader,
     ):
         actual = mod.DSANPUIndexerMixin.forward_npu(
