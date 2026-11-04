@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.kernels.ops.moe.moe_sorting_small import K3SortPlan, k3_sort_plan
+from sglang.kernels.ops.moe.k3_sort_plan import K3SortPlan, k3_sort_plan
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (

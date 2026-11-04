@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.moe import k3_moe_epi
-from sglang.kernels.ops.moe.moe_sorting_small import K3SortPlan, k3_sort_plan
+from sglang.kernels.ops.moe.k3_sort_plan import K3SortPlan, k3_sort_plan
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 

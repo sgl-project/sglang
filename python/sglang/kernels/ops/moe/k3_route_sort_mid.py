@@ -35,7 +35,7 @@ A pair with routed weight exactly 0 gets scale byte 0, as aiter's fused quant do
 (ZERO_W_SCALE; aiter's M > 128 split path does not do this).
 
 The counts buffer must be all-zero before launch A; kernel B leaves it zeroed.
-If A runs and B does not (the MoE runner took another path), moe_sorting_small.K3SortPlan.finish re-zeroes it.
+If A runs and B does not (the MoE runner took another path), k3_sort_plan.K3SortPlan.finish re-zeroes it.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.k3_route_sort import _mx_e8m0, _mx_scale_col, _mx_scale_row
+from sglang.kernels.ops.moe.mx_scale_layout import mx_e8m0, mx_scale_col, mx_scale_row
 
 MID_MAX_TOKENS = 512  # kernel limit; dispatch cap is 128 tokens
 # aiter fused_dynamic_mx_quant_moe_sort uses its fused (zero-weight aware)
@@ -177,7 +177,7 @@ def _k3_mid_route_kernel(
         c0 = cc * QCHUNK
         x = tl.load(qx_ptr + t * stride_qx + c0 + offs_q).to(tl.float32)
         x2 = tl.reshape(x, (QCHUNK // 32, 32))
-        exp, scale = _mx_e8m0(x2)
+        exp, scale = mx_e8m0(x2)
         q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
         tl.store(
             qout_ptr + t * N_COLS + c0 + offs_q,
@@ -264,8 +264,8 @@ def _k3_mid_sort_kernel(
         val = tl.broadcast_to(ex[None, :], (TOPK, G_POW2))
         if ZERO_W_SCALE:
             val = tl.where(wk[:, None] == 0.0, 0, val)
-        base_sw = _mx_scale_row(dest, SCALEN_PAD)
-        sw = base_sw[:, None] + _mx_scale_col(offs_g)[None, :]
+        base_sw = mx_scale_row(dest, SCALEN_PAD)
+        sw = base_sw[:, None] + mx_scale_col(offs_g)[None, :]
         tl.store(qscale_ptr + sw, val.to(tl.uint8), mask=mg[None, :])
 
         if MOE_BUF_ZERO:

@@ -14,27 +14,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _mx_e8m0(x2):
-    # per-32 group e8m0 scale, rounded up as aiter does: (exponent byte, scale)
-    amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
-    bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
-    exp = (bits >> 23) & 0xFF
-    exp = tl.where((bits & 0x7FFFFF) != 0, exp + 1, exp)
-    return exp, (exp << 23).to(tl.float32, bitcast=True)
-
-
-@triton.jit
-def _mx_scale_row(dest, SCALEN_PAD: tl.constexpr):
-    # aiter mx_scale_shuffle_idx, row part
-    return (dest // 32) * (SCALEN_PAD * 32) + (dest % 16) * 4 + (dest % 32) // 16
-
-
-@triton.jit
-def _mx_scale_col(y):
-    # aiter mx_scale_shuffle_idx, column (group) part
-    return (y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2
+from sglang.kernels.ops.moe.mx_scale_layout import mx_e8m0, mx_scale_col, mx_scale_row
 
 
 @triton.jit
@@ -114,7 +94,7 @@ def _sort_quant_program(
     offs_q = tl.arange(0, QCHUNK)
     x = tl.load(qx_ptr + t * stride_qx + c0 + offs_q).to(tl.float32)
     x2 = tl.reshape(x, (QCHUNK // 32, 32))
-    exp, scale = _mx_e8m0(x2)
+    exp, scale = mx_e8m0(x2)
     q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
     tl.store(
         qout_ptr + t * N_COLS + c0 + offs_q,
@@ -127,8 +107,8 @@ def _sort_quant_program(
         )
     offs_g = tl.arange(0, QCHUNK // 32)
     y = c0 // 32 + offs_g
-    base_sw = _mx_scale_row(dest_k, SCALEN_PAD)
-    sw = base_sw[:, None] + _mx_scale_col(y)[None, :]
+    base_sw = mx_scale_row(dest_k, SCALEN_PAD)
+    sw = base_sw[:, None] + mx_scale_col(y)[None, :]
     tl.store(
         qscale_ptr + sw,
         tl.broadcast_to(exp[None, :], (TOPK, QCHUNK // 32)).to(tl.uint8),

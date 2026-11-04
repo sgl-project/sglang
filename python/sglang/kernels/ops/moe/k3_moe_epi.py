@@ -387,7 +387,7 @@ def norm_add3(
 #
 # The sort runs inside the aiter MoE runner (moe_sorting_small._run_small_sort),
 # so the model plans the shared GEMM for its top-k ids tensor
-# (moe_sorting_small.K3SortPlan.shared_gemm); the runner's sort call takes it and
+# (k3_sort_plan.K3SortPlan.shared_gemm); the runner's sort call takes it and
 # launches the combined kernel, and the plan runs an untaken GEMM standalone.
 # --------------------------------------------------------------------------
 
