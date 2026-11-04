@@ -1,10 +1,7 @@
 """ROCm coverage for the online MXFP4 Qwen3.5/3.8 GDN projections."""
 
 import itertools
-import sys
-import types
 import unittest
-from unittest import mock
 
 import torch
 
@@ -35,17 +32,6 @@ class TestBlockHadamard32(CustomTestCase):
             torch.set_default_dtype(default)
         torch.testing.assert_close(xh @ wh.T, x @ w.T, rtol=1e-4, atol=1e-4)
 
-    def test_falls_back_without_aiter_hadamard(self):
-        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
-            AiterMxfp4OnlineLinearMethod,
-        )
-
-        old_aiter = types.SimpleNamespace(per_1x32_f4_quant_hip=lambda x, shuffle: x)
-        with mock.patch.dict(sys.modules, {"aiter": old_aiter}):
-            method = AiterMxfp4OnlineLinearMethod(hadamard=True)
-        self.assertFalse(method.hadamard)
-        self.assertEqual(method.quant_kwargs, {})
-
 
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.version.hip and is_gfx95_supported(),
@@ -53,8 +39,6 @@ class TestBlockHadamard32(CustomTestCase):
 )
 class TestQwen35GdnOnlineMxfp4(CustomTestCase):
     def test_matches_dequantized_reference(self):
-        import inspect
-
         from aiter import per_1x32_f4_quant_hip
 
         from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
@@ -64,10 +48,7 @@ class TestQwen35GdnOnlineMxfp4(CustomTestCase):
             _dynamic_mxfp4_quant_orig,
         )
 
-        rotations = [False]
-        if "hadamard_rotate" in inspect.signature(per_1x32_f4_quant_hip).parameters:
-            rotations.append(True)
-        for (n, k), m, had in itertools.product(SHAPES, ROWS, rotations):
+        for (n, k), m, had in itertools.product(SHAPES, ROWS, (False, True)):
             with self.subTest(n=n, k=k, m=m, hadamard=had):
                 torch.manual_seed(m)
                 w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
