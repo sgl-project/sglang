@@ -127,7 +127,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     if req.grammar.current_token is None:
                         req.grammar.accept_token(req.output_ids[-1])
                 except ValueError as e:
-                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+                    from sglang.srt.managers.req_types import FINISH_ABORT
 
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
