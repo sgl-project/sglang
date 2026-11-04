@@ -96,6 +96,15 @@ class PlanningTests(unittest.TestCase):
             lb.cases_for_arm(args, material, {"id": "arm-b"})[0]["salt"],
         )
 
+    def test_reused_source_salts_are_shared_only_within_one_block(self):
+        args = args_for(reuse_published_sources=True)
+        material = [[1] * 64] * args.cases
+        first = lb.cases_for_arm(args, material, {"id": "a", "block": 0})
+        second = lb.cases_for_arm(args, material, {"id": "b", "block": 0})
+        later = lb.cases_for_arm(args, material, {"id": "a", "block": 1})
+        self.assertEqual(first, second)
+        self.assertNotEqual(first[0]["salt"], later[0]["salt"])
+
     def test_invalid_bounds_rejected(self):
         for changes in (
             {"arms": ["on_demand", "on_demand"]},
@@ -344,13 +353,83 @@ class LifecycleHTTPTests(unittest.TestCase):
         self.assertFalse(analyze(args.output)["verification"]["verified"])
 
     def prepare_source(self, case):
-        self.a.http.generate(lb.resume_prompt(case), case["salt"], 1, trial="source", seed=1)
+        self.a.http.generate(
+            lb.resume_prompt(case), case["salt"], 1, trial="source", seed=1
+        )
         lb.publish(
             self.a,
             self.a.target(case["prefix"], case["salt"]),
             len(case["prefix"]),
             "source",
         )
+
+    def test_three_arm_reuse_executes_64_source_pairs_once_per_block(self):
+        args = self.make_args(
+            cases=64, passes=1, blocks=2, tool_wait_s=0, reuse_published_sources=True
+        )
+        with (
+            patch.dict(os.environ, {args.router_control_key_env: self.state.bearer}),
+            patch.object(
+                lb, "parity", return_value={"fingerprint_b": {"context_length": 1024}}
+            ),
+            patch.object(
+                lb,
+                "build_tokens",
+                side_effect=lambda model, length, seed: ([seed % 100] * length, []),
+            ),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(lb.run(args), 0)
+        arms = json.loads(Path(args.output, "lifecycle-summary.json").read_text())[
+            "arms"
+        ]
+        self.assertEqual(sum(arm["completed"] for arm in arms), 64 * 3 * 2)
+        self.assertEqual(
+            sum(arm["source_generation_calls"] for arm in arms), 64 * 2 * 2
+        )
+        self.assertEqual(
+            sum(path == "/generate" for path, body in self.engines[0].requests),
+            64 * 2 * 2,
+        )
+        self.assertEqual(
+            sum(
+                path.startswith("/flush_cache")
+                for path, body in self.engines[0].requests
+            ),
+            2,
+        )
+        for block in range(2):
+            members = [arm for arm in arms if arm["block"] == block]
+            self.assertEqual(len({arm["source_publication_s"] for arm in members}), 1)
+            self.assertAlmostEqual(
+                sum(arm["source_publication_s"] for arm in members),
+                sum(arm["source_execution_wall_s"] for arm in members),
+            )
+            self.assertEqual(
+                sum(arm["source_reused_from"] is None for arm in members), 1
+            )
+            self.assertTrue(
+                all(
+                    arm["source_execution_wall_s"] == 0
+                    for arm in members
+                    if arm["source_reused_from"]
+                )
+            )
+        checked = analyze(args.output)
+        self.assertTrue(checked["acceptance_passed"], checked["verification"])
+        path = Path(args.output, "lifecycle-raw.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        reused = next(
+            record
+            for record in records
+            if record.get("kind") == "lifecycle_publication"
+            and record.get("reused_from")
+        )
+        self.assertTrue(reused["reference_only"])
+        self.assertNotIn("publication", reused)
+        reused["reused_from"] = reused["reused_from"].rsplit("-", 1)[0] + "-63"
+        path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+        self.assertFalse(analyze(args.output)["verification"]["verified"])
 
     def test_slow_control_cleanup_is_outside_generation_path_and_counted(self):
         args = self.make_args(via_router=True)

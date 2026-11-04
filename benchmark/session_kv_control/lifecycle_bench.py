@@ -192,7 +192,12 @@ def cases_for_arm(args, material, spec):
         leader = family * args.branches_per_family
         prefix = material[leader][:common] + tokens[common:]
         salt_index = 0 if args.salt_mode == "shared" else family
-        salt = "lifecycle-" + digest([args.run_id, spec["id"], salt_index])[:40]
+        salt_scope = (
+            f"block-{spec['block']}"
+            if getattr(args, "reuse_published_sources", False)
+            else spec["id"]
+        )
+        salt = "lifecycle-" + digest([args.run_id, salt_scope, salt_index])[:40]
         result.append(
             {
                 "id": index,
@@ -875,7 +880,7 @@ def run(args):
         }
         write_json(root / "lifecycle-manifest.json", manifest)
         journal.emit("lifecycle_manifest", **manifest)
-        arms, signatures = [], {}
+        arms, signatures, published = [], {}, {}
         for spec in schedule:
             cases = cases_for_arm(args, material, spec)
             working_set = logical_working_set(cases, args.page_size)
@@ -888,14 +893,34 @@ def run(args):
                     "deduplicated logical working set is smaller than declared host capacity"
                 )
             reset_started = time.monotonic()
-            for engine in (a, b):
+            previous = (
+                published.get(spec["block"]) if args.reuse_published_sources else None
+            )
+            for engine in (b,) if previous else (a, b):
                 flush_local(engine, spec["id"], args.timeout_s)
             reset_s = time.monotonic() - reset_started
             # Publication is sequential to keep source setup independent of the
             # bounded speculative-read pipeline under evaluation.
             source_started = time.monotonic()
+            source_records = {}
             for case in cases:
                 trial = spec["id"] + "-source-" + str(case["id"])
+                identity = {
+                    "id": trial,
+                    "case": case["id"],
+                    "prefix_sha256": digest(case["prefix"]),
+                    "cache_salt": case["salt"],
+                }
+                if previous:
+                    original = previous["records"][case["id"]]
+                    journal.emit(
+                        "lifecycle_publication",
+                        **identity,
+                        generation=original["generation"],
+                        reused_from=original["id"],
+                        reference_only=True,
+                    )
+                    continue
                 initial = a.http.generate(
                     resume_prompt(case),
                     case["salt"],
@@ -926,16 +951,48 @@ def run(args):
                     len(case["prefix"]),
                     trial,
                 )
-                journal.emit(
-                    "lifecycle_publication",
-                    id=trial,
-                    case=case["id"],
-                    generation=response,
-                    initial_generation=initial,
-                    initial_reference_equal=output_equal(initial, response),
-                    publication=publication,
-                )
-            source_s = time.monotonic() - source_started
+                record = {
+                    **identity,
+                    "generation": response,
+                    "initial_generation": initial,
+                    "initial_reference_equal": output_equal(initial, response),
+                    "publication": publication,
+                    "reused_from": None,
+                    "reference_only": False,
+                }
+                source_records[case["id"]] = record
+                journal.emit("lifecycle_publication", **record)
+            source_phase_s = time.monotonic() - source_started
+            actual_source_s = 0 if previous else source_phase_s
+            source_calls = 0 if previous else len(cases) * 2
+            if args.reuse_published_sources:
+                if not previous:
+                    published[spec["block"]] = {
+                        "arm": spec["id"],
+                        "wall_s": actual_source_s,
+                        "records": source_records,
+                    }
+                source_s = published[spec["block"]]["wall_s"] / len(args.arms)
+            else:
+                source_s = actual_source_s
+            source_phase = {
+                "source_generation_calls": source_calls,
+                "source_execution_wall_s": actual_source_s,
+                "source_phase_wall_s": source_phase_s,
+                "source_reused_from": previous["arm"] if previous else None,
+                "source_allocation_parts": len(args.arms)
+                if args.reuse_published_sources
+                else 1,
+                "source_allocation_definition": "equal share of measured common block setup"
+                if args.reuse_published_sources
+                else "measured per-arm setup",
+            }
+            journal.emit(
+                "lifecycle_source_phase",
+                id=spec["id"],
+                allocated_wall_s=source_s,
+                **source_phase,
+            )
             # Source A retains its natural GPU/host state. Destination B starts
             # cold and subsequently evicts naturally for the whole arm.
             controls = AsyncControls(
@@ -1005,7 +1062,7 @@ def run(args):
                 completed_monotonic=work_started + wall_s,
                 logical_working_set_tokens=working_set,
                 host_capacity_tokens=args.host_capacity_tokens,
-                source_generation_calls=len(cases) * 2,
+                **source_phase,
             )
             arm["server_before"] = before
             arm["costs_before"] = costs_before
@@ -1065,6 +1122,11 @@ def parser():
     cli.add_argument("--router-api-key-env")
     cli.add_argument("--via-router", action="store_true")
     cli.add_argument("--arms", type=lambda value: value.split(","), default=list(ARMS))
+    cli.add_argument(
+        "--reuse-published-sources",
+        action="store_true",
+        help="publish immutable source contexts once per block; allocate setup equally across arms",
+    )
     cli.add_argument("--concurrency", type=int, default=8)
     cli.add_argument("--cases", type=int, default=64)
     cli.add_argument("--passes", type=int, default=2)

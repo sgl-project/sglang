@@ -5014,3 +5014,9 @@ parent 独立 lifecycle/Router 工具 23 项通过，19.739s；Ruff 和 diff 检
 修正 core 中七项 Clippy 诊断：actor 大请求经 Box 传递，内部 mutation 元组增加私有类型别名，整数对齐检查使用 is_multiple_of。范围限定为三个文件，没有变更 wire schema、配置或调度语义。
 
 parent 阅读完整差异，并用仓库要求的精确 Rust 1.92.0 独立执行 core 全目标 Clippy（-D warnings）及 core 测试：49 项通过，另 1 项 live 后端测试按原配置忽略。日志：lifecycle-opt/core-clippy-parent.log、core-1.92-parent-tests.log。该 CPU 检查窗口单独记录，不作为正式性能样本。
+
+### O7 — 配对轮次的不可变源复用
+
+新增默认关闭的 reuse-published-sources：轮内共用 salt、源输出参考和一次实际发布，轮间重新隔离，后续组只重置目标 B。历史引用明确标记 reference_only，不伪造重复 RPC 或当前 L3 驻留。源 GPU 调用及执行墙钟按实际计数，公共准备成本等分进入完整作业口径；恢复请求数、输入和压力门槛保持原定义。L3 容量竞争与保护继承实验继续使用逐组发布。
+
+parent 审阅完整四文件差异，并独立复测 lifecycle/Router 工具 25 项通过，23.186s；格式和 selected Ruff 通过。新增 64-case、两轮、三组测试核对 256 次真实源调用与 384 次恢复、各组成本分摊及篡改来源检测。日志：lifecycle-opt/source-reuse-parent-tests.log。正在运行的原 C8 筛选沿用已加载的逐组发布代码。

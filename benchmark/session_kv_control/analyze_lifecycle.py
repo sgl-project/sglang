@@ -33,6 +33,7 @@ def analyze(directory):
     args = argparse.Namespace(**manifest["args"])
     expected = {item["id"]: item for lane in manifest["fixed_plan"] for item in lane}
     controls, references, publications, errors = {}, {}, set(), []
+    source_records, source_phases, source_calls = {}, {}, {}
     schedule = {spec["id"]: spec for spec in manifest["schedule"]}
     with open_text(root / "lifecycle-raw.jsonl") as source:
         for line in source:
@@ -51,8 +52,44 @@ def analyze(directory):
                 spec = schedule[arm_id]
                 key = (spec["block"], record["case"])
                 response = record["generation"]
+                origin = record.get("reused_from")
+                if origin:
+                    original = source_records.get(origin)
+                    if (
+                        not getattr(args, "reuse_published_sources", False)
+                        or original is None
+                        or original.get("reused_from")
+                        or not record.get("reference_only")
+                        or "publication" in record
+                        or "initial_generation" in record
+                        or any(
+                            record.get(field) != original.get(field)
+                            for field in ("case", "prefix_sha256", "cache_salt")
+                        )
+                        or schedule[origin.rsplit("-source-", 1)[0]]["block"]
+                        != spec["block"]
+                        or not output_equal(original["generation"], response)
+                    ):
+                        errors.append(
+                            "invalid reused source provenance: " + record["id"]
+                        )
+                elif getattr(args, "reuse_published_sources", False) and (
+                    record.get("reference_only")
+                    or not record.get("publication")
+                    or not record.get("initial_generation")
+                ):
+                    errors.append("missing actual source publication: " + record["id"])
+                source_records[record["id"]] = record
                 if not output_equal(references.setdefault(key, response), response):
                     errors.append("source output differs: " + record["id"])
+            elif record.get("kind") == "lifecycle_source_phase":
+                source_phases[record["id"]] = record
+            elif record.get("kind") == "generate" and record.get("origin") in (
+                "publication",
+                "publication_reference",
+            ):
+                arm_id = record["trial"].rsplit("-source-", 1)[0]
+                source_calls[arm_id] = source_calls.get(arm_id, 0) + 1
     expected_publications = {
         spec["id"] + "-source-" + str(case)
         for spec in manifest["schedule"]
@@ -73,6 +110,44 @@ def analyze(directory):
         if len(rows) != len(expected) or {row["id"] for row in rows} != set(expected):
             errors.append("task plan differs: " + spec["id"])
         cases = cases_for_arm(args, manifest["input_material"], spec)
+        if getattr(args, "reuse_published_sources", False):
+            phase = source_phases.get(spec["id"], {})
+            origin = phase.get("source_reused_from")
+            shared = source_phases.get(origin, phase)
+            expected_calls = 0 if origin else args.cases * 2
+            if (
+                not phase
+                or shared.get("source_reused_from")
+                or source_calls.get(spec["id"], 0) != expected_calls
+                or phase.get("source_generation_calls") != expected_calls
+                or (origin and phase.get("source_execution_wall_s") != 0)
+                or phase.get("source_allocation_parts") != len(args.arms)
+                or abs(
+                    recorded["source_publication_s"]
+                    - shared.get("source_execution_wall_s", -1) / len(args.arms)
+                )
+                > 1e-9
+                or any(
+                    recorded.get(key) != value
+                    for key, value in phase.items()
+                    if key
+                    not in ("kind", "id", "wall_time", "monotonic", "allocated_wall_s")
+                )
+            ):
+                errors.append(
+                    "source execution/allocation ledger differs: " + spec["id"]
+                )
+            for case in cases:
+                record = source_records.get(
+                    spec["id"] + "-source-" + str(case["id"]), {}
+                )
+                if (
+                    record.get("prefix_sha256") != digest(case["prefix"])
+                    or record.get("cache_salt") != case["salt"]
+                    or record.get("reused_from")
+                    != (origin + "-source-" + str(case["id"]) if origin else None)
+                ):
+                    errors.append("source scope/identity differs: " + spec["id"])
         for row in rows:
             planned = expected.get(row["id"])
             if planned is None:
