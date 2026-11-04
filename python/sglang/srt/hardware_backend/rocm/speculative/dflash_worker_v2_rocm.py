@@ -35,6 +35,13 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
         self._tail_graph_pool = None
         self._tail_graph_commit_buf: Optional[torch.Tensor] = None
 
+    def _build_prep_graph(self):
+        from sglang.srt.hardware_backend.rocm.speculative.dflash_prep_graph import (
+            DFlashPrepGraph,
+        )
+
+        return DFlashPrepGraph.maybe_build(self)
+
     def _replay_tail_graph(self, **kwargs) -> bool:
         return self._tail_graph_on and self._tail_graph_run(**kwargs)
 
@@ -116,7 +123,7 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
                     )
             except Exception:
                 logger.warning(
-                    "K3 DFlash tail graph capture failed for bs=%d; "
+                    "DFlash tail graph capture failed for bs=%d; "
                     "running the eager draft-KV tail for it.",
                     bs,
                     exc_info=True,

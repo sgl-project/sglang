@@ -718,8 +718,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._use_triton_compact_rebuild = supports_gpu_triton
         self._accept_bonus_buffers = _AcceptBonusBuffers()
         self._target_logits_processor = self._defer_target_verify_gather()
-        # K3 DFlash prep graph (built in init_cuda_graphs).
-        self._k3_prep_graph = None
+        # Draft-step prep graph (platform hook, built in init_cuda_graphs).
+        self._prep_graph = None
         self._init_tail_graph_state()
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
@@ -752,6 +752,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             and getattr(sampling_info, "logit_bias", None) is None
             and sampling_info.sampling_mask_batch_indices is None
         )
+
+    def _build_prep_graph(self):
+        return None
 
     def _init_tail_graph_state(self) -> None:
         pass
@@ -860,13 +863,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
-            self._k3_prep_graph = None
-            if capture_decode_cuda_graph:
-                from sglang.srt.hardware_backend.rocm.speculative.dflash_prep_graph import (
-                    K3DFlashPrepGraph,
-                )
-
-                self._k3_prep_graph = K3DFlashPrepGraph.maybe_build(self)
+            self._prep_graph = (
+                self._build_prep_graph() if capture_decode_cuda_graph else None
+            )
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -3000,12 +2999,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
-        k3_fast = None
-        if self._k3_prep_graph is not None:
-            k3_fast = self._k3_prep_graph.run(
+        prep_fast = None
+        if self._prep_graph is not None:
+            prep_fast = self._prep_graph.run(
                 batch=batch, draft_input=draft_input, bs=bs
             )
-        if k3_fast is not None:
+        if prep_fast is not None:
             (
                 block_ids,
                 positions,
@@ -3013,7 +3012,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d,
                 draft_next,
                 prefix_lens,
-            ) = k3_fast
+            ) = prep_fast
             iteration_ids = self._plan_block_kv_locs(
                 batch=batch,
                 draft_input=draft_input,

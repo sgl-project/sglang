@@ -39,7 +39,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-class K3DFlashPrepGraph:
+class DFlashPrepGraph:
     def __init__(self, worker) -> None:
         self.w = worker
         self.runner = worker.draft_model_runner.decode_cuda_graph_runner
@@ -49,7 +49,7 @@ class K3DFlashPrepGraph:
 
     # ------------------------------------------------------------------ build
     @classmethod
-    def maybe_build(cls, worker) -> Optional[K3DFlashPrepGraph]:
+    def maybe_build(cls, worker) -> Optional[DFlashPrepGraph]:
         from sglang.srt.runtime_context import get_parallel
         from sglang.srt.utils import is_hip
 
@@ -100,7 +100,7 @@ class K3DFlashPrepGraph:
             if int(getattr(runner, "captured_req_width", -1)) != int(worker.block_size):
                 reasons.append("captured_req_width != block_size")
         if reasons:
-            logger.warning("K3 DFlash prep graph off: %s", "; ".join(reasons))
+            logger.warning("DFlash prep graph off: %s", "; ".join(reasons))
             return None
         pg = cls(worker)
         pg.capture_all()
