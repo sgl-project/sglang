@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_sch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
@@ -161,6 +162,24 @@ class BaseSpecWorker(ABC):
     @property
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
         return self._hicache_draft_plan
+
+    @abstractmethod
+    def forward_batch_generation(
+        self,
+        batch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        """One speculative round for ``batch``: draft, verify, draft-extend.
+
+        The scheduler's non-overlap path always calls this with the
+        ``pp_proxy_tensors`` keyword (None unless pipeline parallelism is
+        active), so every concrete worker must accept it and forward it to
+        its target forward, or refuse pipeline parallelism explicitly.
+        Declaring it here keeps new workers from silently diverging on the
+        scheduler-facing signature (issue #40155).
+        """
 
     @property
     def draft_window_reaches(self) -> dict[str, int]:

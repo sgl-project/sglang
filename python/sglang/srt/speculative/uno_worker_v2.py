@@ -772,8 +772,18 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         del grammar_barrier
+        if pp_proxy_tensors is not None:
+            # UNO drives the target model runner directly and never goes
+            # through the TP-worker forward that forwards proxy tensors to
+            # the next pipeline stage, so a non-None proxy means pipeline
+            # parallelism is active and this worker cannot serve it. Fail
+            # loudly instead of silently dropping the inter-stage tensors.
+            raise NotImplementedError(
+                "UNO speculative decoding does not support pipeline parallel."
+            )
         self._validate_batch(batch)
 
         if batch.forward_mode == ForwardMode.EXTEND:
