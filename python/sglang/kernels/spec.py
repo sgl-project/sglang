@@ -202,19 +202,11 @@ CUDA_ONLY: FrozenSet[CapabilityRequirement] = frozenset({CapabilityRequirement.C
 
 def capabilities_satisfied(
     capabilities: Union[
-        FrozenSet[CapabilityRequirement],
-        Tuple[CapabilityRequirement, ...],
-        CapabilityRequirement,
+        FrozenSet[CapabilityRequirement], Tuple[CapabilityRequirement, ...]
     ],
     platform: PlatformInfo,
 ) -> bool:
-    """OR over ``capabilities`` (empty = unrestricted).
-
-    Accepts a set/tuple of requirements, or tolerates a single
-    :class:`CapabilityRequirement` (the pre-decouple API used one) by wrapping it.
-    """
-    if isinstance(capabilities, CapabilityRequirement):
-        capabilities = (capabilities,)
+    """OR over ``capabilities`` (empty = unrestricted)."""
     return (not capabilities) or any(c.is_satisfied_by(platform) for c in capabilities)
 
 

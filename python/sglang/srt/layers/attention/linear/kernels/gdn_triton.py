@@ -11,7 +11,7 @@ if not is_cpu():
         fused_recurrent_gated_delta_rule_packed_decode,
     )
     from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
-        fused_recurrent_gdn_replayssm_decode,
+        fused_recurrent_linear_replayssm_decode,
     )
     from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
@@ -99,7 +99,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
-            fused_recurrent_gdn_replayssm_decode(
+            fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,

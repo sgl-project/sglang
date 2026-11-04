@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import subprocess
 from typing import List
 
@@ -53,19 +52,13 @@ def _jit_cuda_version() -> tuple[int, ...]:
 
     The target has to match the compiler, not the toolkit PyTorch was built
     against: a cu130 wheel on a CUDA 12.8 toolkit would otherwise select
-    `sm_120f`, which nvcc 12.8 rejects. Resolve nvcc the way tvm-ffi does
-    (`CUDA_HOME` / `CUDA_PATH`, then `$PATH`, then `/usr/local/cuda`) and fall
-    back to `torch.version.cuda` when it cannot be probed.
+    `sm_120f`, which nvcc 12.8 rejects. Falls back to `torch.version.cuda` when
+    nvcc cannot be probed.
     """
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home is None:
-        nvcc_path = shutil.which("nvcc")
-        cuda_home = (
-            os.path.dirname(os.path.dirname(nvcc_path))
-            if nvcc_path is not None
-            else "/usr/local/cuda"
-        )
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    # toolchain imports this module at load time, so its import stays local.
+    from sglang.kernels.jit.utils.compile.toolchain import cuda_home
+
+    nvcc = os.path.join(cuda_home(), "bin", "nvcc")
     try:
         output = subprocess.check_output([nvcc, "--version"], text=True)
         match = re.search(r"release (\d+)\.(\d+)", output)
