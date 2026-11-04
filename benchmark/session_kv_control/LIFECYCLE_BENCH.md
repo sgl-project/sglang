@@ -64,3 +64,5 @@ python -W error::ResourceWarning -m unittest -v test_lifecycle_bench
 原始 HTTP/SSE/控制记录在 `lifecycle-raw.jsonl`，清单保存完整计划，每组 JSON 保存全部任务，summary 保存轮次配对。manifest、组结果和 summary 采用临时文件替换写入；结束时生成文件 SHA256。复算检查计划、输入摘要、源输出参考、固定输出数、异步控制记录和期末 drain 时间范围，不仅依赖已有 summary。返回 2 表示任务、输出、控制或时长门槛未通过；原始结果仍保留。
 
 正式归档应同时保存服务源码/dirty 状态、Router 配置的非秘密副本、模型身份、实际池容量、资源采样、Mooncake segment 状态、全部失败/退回与清理记录。`server_before/after` 保留可用的服务信息；物理 GET/PUT 成本必须使用实现提供的计数或独立观测，不从缓存命中 token 数换算为测得带宽。
+
+成本与资源复算使用 `analyze_lifecycle_costs.py --results CELL --resources resources.jsonl --process-resources process-resources.jsonl --output NEW_DIR`，输出 JSON 和配对 CSV。资源与进程参数可重复提供按时间排序的 `.jsonl/.gz` 分片；按实际 arm 边界筛选采样起点，有捕获时长时同时排除跨界采样；CPU 缺少结束时长时明确保留 capture_duration_unknown 和未知边界误差，不声称完整捕获。报告保留采样覆盖、缺口、进程身份变化和未知计数，CPU 不外推到未观测时间，GET bytes 表示寻址的 KV payload，wire bytes 保持未知。GPU 索引由 `--b-gpu-index` 指定，应与启动时的实际物理设备对应。准备就绪后发生 GPU+host 命中不足计为观测失效，不推断发生无效物理传输。该入口保留所有完成请求的时延和轮次配对，正确性账本仍由 `analyze_lifecycle.py` 核验。

@@ -5032,3 +5032,9 @@ C8 压力筛选三组 384 次恢复输出一致，生命周期组合组工作吞
 C16 首轮筛选出现六次工具观测异常：合法 scheduled Job 的 result 为 null，客户端统计 child status 时调用了 dict.get。恢复输出仍全部一致，控制最终均 quiescent；这些原始异常及该轮未通过验收的状态保留。
 
 修正为将未获得回执的 child status 记为 unknown，完整准备保持 false，消费后仍按原路径清理。parent 新增直接覆盖该真实边界的回归，独立 lifecycle 工具 18 项通过，14.824s；selected Ruff、格式及 diff 检查通过。日志：lifecycle-opt/null-receipt-parent-tests.log。正在执行的旧进程不改写，后续新进程采用修复。
+
+### O7 — 成本与资源离线复算
+
+新增独立 analyze_lifecycle_costs 入口，复用既有资源解析和轮次统计。按实际工作区间筛选资源采样，GPU 容量读取唯一 TP1 internal state，host/gpu 分配与活动 token 分开；CPU 仅按稳定 PID/create-time 区间计量，缺口、重启及捕获边界未知显式保留。存储增量需要同 epoch 的前后请求及完整响应证据，gauge 不差分，缺失/回退为 unknown；GET payload 与 wire bytes 分开。
+
+parent 阅读完整生产代码与测试差异，独立新增及既有分析 30 项通过，2.229s；覆盖缺失统计、计数重置、多池、PID 复用、坏记录、压缩分片、所有完成请求尾延迟与归档重放一致。日志：lifecycle-opt/lifecycle-costs-parent-tests.log。该工具只读离线证据，不改变运行负载或接受门槛。
