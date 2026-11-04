@@ -1101,6 +1101,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 is_shared_outer=experts_shared_outer_loras,
                 physical_rank=max_lora_rank,
             )
+            derived = self._moe_lora_runner.derived_base_weights
+            if derived is not None:
+                # The weight updater reads this before any online weight update.
+                self._derived_weight_cache_error = (
+                    "Online weight updates are not supported while the MoE LoRA "
+                    f"runner holds {derived} derived from the base weights; "
+                    "restart to change the base weights."
+                )
             # Keep dispatch, combine, and distributed reduction in the base layer.
             self._base_run_moe_core = base_layer.run_moe_core
             base_layer.run_moe_core = self._run_moe_core_with_lora

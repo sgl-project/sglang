@@ -454,7 +454,11 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+            # lora_marlin: Marlin tiles with the LoRA MoE runner on top.
+            if self.is_fp4_experts and (
+                get_moe_runner_backend().is_marlin()
+                or get_moe_runner_backend().is_lora_marlin()
+            ):
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
                 )
@@ -1885,6 +1889,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
+            # The LoRA MoE runner's vendors read MX scales as E8M0 bytes.
+            fp4_scale_dtype=(
+                torch.float8_e8m0fnu if get_moe_runner_backend().is_lora() else None
+            ),
             **extra_weight_attrs,
         )
 
@@ -2542,6 +2550,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                # The LoRA MoE runner packs the canonical scales itself.
+                or get_moe_runner_backend().is_lora()
             ):
                 # Match FlashInfer TRT-LLM MoE test contracts:
                 # 1) quantize in canonical (non-swizzled) scale layout, and
@@ -2569,6 +2579,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                or get_moe_runner_backend().is_lora()
             ):
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data

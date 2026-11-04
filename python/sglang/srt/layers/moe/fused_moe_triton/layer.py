@@ -106,15 +106,14 @@ _deferred_finalize_info_logged = False
 
 
 def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
+    # The LoRA MoE runner applies routed scaling in its own finalize.
+    if runner_backend is not None and runner_backend.is_lora():
+        return False
     return (
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            # Marlin, or the LoRA MoE runner on its Marlin NVFP4 vendor.
-            and (
-                runner_backend is None
-                or not (runner_backend.is_marlin() or runner_backend.is_lora_marlin())
-            )
+            and (runner_backend is None or not runner_backend.is_marlin())
         )
         or (
             runner_backend is not None

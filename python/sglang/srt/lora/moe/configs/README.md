@@ -12,8 +12,9 @@ Tables are process-cached; use a fresh server to evaluate an override.
 
 The file contains a tuned `domain`, ordered `scenarios`, and conservative
 `fallback` rows. Scenario selection matches adapter layout, phase, pool rank,
-resident expert count and quantization. Shapes outside the tuned domain use
-fallback rows. Row names are labels, not selectors.
+resident expert count, quantization family and base-GEMM vendor. Shapes
+outside the tuned domain use fallback rows. Row names are labels, not
+selectors.
 
 Each row declares:
 

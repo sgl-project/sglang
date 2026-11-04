@@ -171,7 +171,7 @@ def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: in
     from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
     from sglang.srt.lora.moe.runner import MoeLoraRunner
 
-    provider = select_provider_cls(base_gemm_rows, "bf16")(
+    provider = select_provider_cls(base_gemm_rows, "bf16", "cutedsl")(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
             w2_weight=gpu["w2_weight"],

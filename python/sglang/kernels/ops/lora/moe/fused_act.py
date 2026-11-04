@@ -18,6 +18,12 @@ from sglang.kernels.ops.lora.moe.activation import ActivationFn
 from sglang.kernels.ops.lora.moe.activation_delta import (
     apply_activation,
 )
+from sglang.kernels.ops.lora.moe.quant_blockscaled import (
+    BlockScaledRows,
+    act_quant_args,
+    quantize_tile,
+    store_quantized_rows,
+)
 
 
 @triton.jit
@@ -107,6 +113,13 @@ def _b_act_kernel(
     stride_qm,
     stride_qn,
     num_m_blocks,
+    act_q_ptr,  # block-scaled codes of the activation rows (QUANT_BLOCKSCALED)
+    act_s_ptr,  # their scale atoms
+    stride_q_row,
+    rows_per_slab,
+    row_atoms,
+    k_atoms,
+    global_scale,
     num_local_experts: tl.constexpr,
     top_k: tl.constexpr,
     width: tl.constexpr,
@@ -121,6 +134,12 @@ def _b_act_kernel(
     block_k: tl.constexpr,
     group_m: tl.constexpr,
     store_pair_act: tl.constexpr,
+    QUANT_BLOCKSCALED: tl.constexpr,
+    VEC: tl.constexpr,
+    ELEM_MAX: tl.constexpr,
+    ELEM_MAX_LOG2: tl.constexpr,
+    PACK_E2M1: tl.constexpr,
+    NVFP4: tl.constexpr,
 ):
     pid = tl.program_id(0)
     # Keep the tile count constexpr for grouped scheduling.
@@ -211,6 +230,34 @@ def _b_act_kernel(
         value,
         mask=base_valid[:, None] & w_mask[None, :],
     )
+    if QUANT_BLOCKSCALED:
+        # The down GEMM's input: quantize the BF16-rounded tile as the
+        # standalone row quantizer would.
+        codes, sf_bytes = quantize_tile(
+            tl.where(base_valid[:, None] & w_mask[None, :], value.to(tl.float32), 0.0),
+            global_scale,
+            VEC,
+            ELEM_MAX,
+            ELEM_MAX_LOG2,
+            PACK_E2M1,
+            NVFP4,
+        )
+        store_quantized_rows(
+            codes,
+            sf_bytes,
+            dst_rows,
+            base_valid,
+            pid_w * block_w,
+            width,
+            act_q_ptr,
+            stride_q_row,
+            act_s_ptr,
+            rows_per_slab,
+            row_atoms,
+            k_atoms,
+            VEC,
+            PACK_E2M1,
+        )
     if store_pair_act:
         # Invalid pairs must overwrite stale graph-buffer rows with zero.
         tl.store(
@@ -237,8 +284,13 @@ def fused_b_act(
     bridge_gateup: torch.Tensor,
     b_gate_up: torch.Tensor,
     bridge_top_k: int = 1,
+    act_quant: BlockScaledRows | None = None,
 ) -> None:
-    """Fuse LoRA-B and activation in either provider row layout."""
+    """Fuse LoRA-B and activation in either provider row layout.
+
+    ``act_quant`` also writes the activation as block-scaled rows for the
+    down GEMM; its scale groups must divide the column tile.
+    """
     ActivationFn.parse(activation)
     pairs = routing.num_rows
     if pairs == 0:
@@ -252,6 +304,11 @@ def fused_b_act(
     num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
     pair_target = act_pairs.view(-1, width) if act_pairs is not None else act_rows
     num_w_tiles = triton.cdiv(width, block_w)
+    if act_quant is not None:
+        assert act_quant.k == width and block_w % act_quant.sf_vec_size == 0
+    quant = act_quant_args(act_quant)
+    act_q = act_quant.data if act_quant is not None else act_rows
+    act_s = act_quant.scales if act_quant is not None else act_rows
     _b_act_kernel[(num_m_blocks * num_w_tiles,)](
         bridge_gateup,
         b_gate_up,
@@ -275,7 +332,9 @@ def fused_b_act(
         act_rows.stride(1),
         pair_target.stride(0),
         pair_target.stride(1),
-        num_m_blocks=num_m_blocks,
+        num_m_blocks,
+        act_q,
+        act_s,
         num_local_experts=num_local_experts,
         top_k=routing.width,
         width=width,
@@ -292,4 +351,5 @@ def fused_b_act(
         store_pair_act=act_pairs is not None,
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
+        **quant,
     )

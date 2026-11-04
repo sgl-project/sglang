@@ -509,6 +509,7 @@ class _PlanRowModel(pydantic.BaseModel):
     min_local_experts: int | None = None
     max_local_experts: int | None = None
     quant: list[str] | None = None
+    vendor: list[str] | None = None
     base_gemm_rows: Literal["expert_major", "route_major"]
     plan: _PlanSpecModel
     # Rank rules precede token buckets; an unbounded rule ends the ladder.
@@ -710,6 +711,7 @@ def resolve_plans(
     hidden_size: int,
     num_local_experts: int,
     quant_family: str,
+    vendor: str,
 ) -> dict[Phase, SelectedPlan]:
     table = _load_plans(architecture)
     layout_name = "shared" if is_shared_outer else "per_expert"
@@ -738,6 +740,7 @@ def resolve_plans(
                     or num_local_experts <= candidate.max_local_experts
                 )
                 and (candidate.quant is None or quant_family in candidate.quant)
+                and (candidate.vendor is None or vendor in candidate.vendor)
             ),
             None,
         )

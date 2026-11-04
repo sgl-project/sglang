@@ -124,6 +124,94 @@ def _fp8_kernel_class_for(device: torch.device):
     raise NotImplementedError(f"the FP8 grouped GEMM needs SM90+; device is sm{major}x")
 
 
+@cute.jit
+def _blockscaled_operand_mke(
+    t: cute.Tensor, ab_dtype: cutlass.Constexpr
+) -> cute.Tensor:
+    """View a physical (expert, rows, k_store) operand as logical (rows, k, expert).
+
+    FP4 pairs arrive packed in uint8 storage, so the K extent doubles.
+    """
+    if cutlass.const_expr(ab_dtype.width == 4):
+        shape, stride = t.layout.shape, t.layout.stride
+        return cute.make_tensor(
+            cute.recast_ptr(t.iterator, dtype=ab_dtype),
+            cute.make_layout(
+                (shape[1], shape[2] * 2, shape[0]),
+                stride=(stride[1] * 2, 1, stride[0] * 2),
+            ),
+        )
+    return cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 2, 0]))
+
+
+@cute.jit
+def _grouped_gemm_blockscaled_swap_ab(
+    gemm_op: cutlass.Constexpr,
+    a: cute.Tensor,  # physical routed input (expert, m_max, k_store)
+    b: cute.Tensor,  # physical weight (expert, n_out, k_store)
+    sf_tokens: cute.Tensor,  # flat uint8 scale atoms over (m_max, k, expert)
+    sf_weights: cute.Tensor,  # flat uint8 scale atoms over (n_out, k, expert)
+    c: cute.Tensor,  # physical output (expert, m_max, n_out) bf16
+    alpha: cute.Tensor,  # fp32 (expert, halves) epilogue scales; unread unless use_alpha
+    group_m: cute.Tensor,
+    direct_schedule: cute.Tensor,
+    schedule_tiles: cute.Tensor,
+    max_active_clusters: cutlass.Constexpr,
+    stream: cuda.CUstream,
+    epilogue_op: cutlass.Constexpr = lambda x: x,
+    ab_dtype: cutlass.Constexpr = cutlass.Float8E4M3FN,
+    sf_dtype: cutlass.Constexpr = cutlass.Float8E8M0FNU,
+    use_alpha: cutlass.Constexpr = False,
+    alpha_rows_per_half: cutlass.Constexpr = 1,
+):
+    # SFA follows weights (kernel A); SFB follows tokens (kernel B).
+    weight_mke = _blockscaled_operand_mke(b, ab_dtype)
+    token_nke = _blockscaled_operand_mke(a, ab_dtype)
+    output_mne = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[2, 1, 0]))
+    sfa_weights = cute.make_tensor(
+        cute.recast_ptr(sf_weights.iterator, dtype=sf_dtype), sf_weights.layout
+    )
+    sfb_tokens = cute.make_tensor(
+        cute.recast_ptr(sf_tokens.iterator, dtype=sf_dtype), sf_tokens.layout
+    )
+    gemm_op(
+        weight_mke,
+        token_nke,
+        sfa_weights,
+        sfb_tokens,
+        output_mne,
+        alpha,
+        group_m,
+        direct_schedule,
+        schedule_tiles,
+        max_active_clusters,
+        stream,
+        epilogue_op,
+        use_alpha,
+        alpha_rows_per_half,
+    )
+
+
+def _blockscaled_kernel_class_for(device: torch.device):
+    major, _minor = torch.cuda.get_device_capability(device)
+    if major == 10:
+        from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm100_blockscaled import (
+            GroupedGemmKernelSm100BlockScaled,
+        )
+
+        return GroupedGemmKernelSm100BlockScaled
+    raise NotImplementedError(
+        f"the block-scaled grouped GEMM needs the SM100 tcgen05 MMA; device is sm{major}x"
+    )
+
+
+def scale_atom_bytes(rows: int, k: int, sf_vec_size: int, experts: int = 1) -> int:
+    """Bytes of the tcgen05 scale-factor atoms covering (rows, k) per expert."""
+    row_atoms = -(-rows // 128)
+    k_atoms = -(-(k // sf_vec_size) // 4)
+    return experts * row_atoms * k_atoms * 512
+
+
 class GroupedGemmConfig(msgspec.Struct, frozen=True, kw_only=True):
     mma_tiler_mn: Tuple[int, int] = (64, 128)
     cluster_shape_mn: Tuple[int, int] = (1, 1)
@@ -144,6 +232,7 @@ class PreparedGroupedGemm(msgspec.Struct, kw_only=True):
     direct_schedule_owner: torch.Tensor
     schedule_tiles_owner: torch.Tensor
     stream: cuda.CUstream
+    alpha_owner: torch.Tensor | None = None
 
     def launch(self) -> None:
         self.compiled_fn(
@@ -175,6 +264,8 @@ def _compile_prepared(
     direct_schedule: torch.Tensor | None,
     schedule_tiles: torch.Tensor | None,
     device: torch.device,
+    kernel_kwargs: dict | None = None,
+    wrapper_constexprs: tuple = (),
 ) -> PreparedGroupedGemm:
     if direct_schedule is None:
         direct_schedule = torch.zeros((1,), device=device, dtype=torch.int64)
@@ -183,7 +274,7 @@ def _compile_prepared(
     direct_schedule_arg = as_dynamic_cute_tensor(direct_schedule, leading_dim=0)
     schedule_tiles_arg = as_dynamic_cute_tensor(schedule_tiles, leading_dim=0)
 
-    kernel_kwargs = {}
+    kernel_kwargs = dict(kernel_kwargs or {})
     if getattr(kernel_cls, "SUPPORTS_SINGLE_K_PIPELINE", False):
         # Compile the rolling pipeline only for single-K tiles to save registers.
         cta_tile_k = 32 * config.mma_inst_tile_k
@@ -222,6 +313,7 @@ def _compile_prepared(
         max_active_clusters,
         stream,
         lambda x: x,
+        *wrapper_constexprs,
     )
     return PreparedGroupedGemm(
         compiled_fn=compiled_fn,
@@ -368,3 +460,151 @@ def prepare_contiguous_fp8(
         schedule_tiles=schedule_tiles,
         device=a.device,
     )
+
+
+def _blockscaled_dtypes(ab_dtype: torch.dtype, sf_vec_size: int):
+    if ab_dtype == torch.float8_e4m3fn:
+        return cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+    if ab_dtype == torch.uint8:
+        return cutlass.Float4E2M1FN, (
+            cutlass.Float8E4M3FN if sf_vec_size == 16 else cutlass.Float8E8M0FNU
+        )
+    raise ValueError(
+        f"block-scaled operands are e4m3 or packed uint8 FP4, got {ab_dtype}"
+    )
+
+
+def _alpha_operand(
+    alpha: torch.Tensor | None,
+    experts: int,
+    device,
+    *,
+    rows: int,
+    rows_per_half: int,
+    config: GroupedGemmConfig,
+) -> tuple:
+    """(alpha operand, its owner, use_alpha) with a one-column dummy when unused.
+
+    The epilogue applies one alpha per output tile, chosen by the tile's first
+    row, so a half boundary must sit on a tile edge and every half needs a column.
+    """
+    if alpha is None:
+        alpha = torch.ones((experts, 1), dtype=torch.float32, device=device)
+        return as_dynamic_cute_tensor(alpha, leading_dim=1), alpha, False
+    assert alpha.dtype == torch.float32 and alpha.shape[0] == experts
+    tile_rows = config.mma_tiler_mn[0] // (2 if config.use_2cta_instrs else 1)
+    halves = -(-rows // rows_per_half)
+    if (halves > 1 and rows_per_half % tile_rows) or halves > alpha.shape[1]:
+        raise ValueError(
+            f"alpha changes every {rows_per_half} of {rows} output rows, which "
+            f"{tile_rows}-row output tiles with {alpha.shape[1]} alpha column(s) "
+            "cannot apply"
+        )
+    return as_dynamic_cute_tensor(alpha, leading_dim=1), alpha, True
+
+
+def prepare_masked_blockscaled(
+    a: torch.Tensor,  # [E, m_max, K] e4m3 or [E, m_max, K // 2] uint8 FP4 pairs
+    b: torch.Tensor,  # [E, N, K] or [E, N, K // 2] in the same element format
+    sf_tokens: torch.Tensor,  # uint8 atoms, scale_atom_bytes(m_max, K, vec, E)
+    sf_weights: torch.Tensor,  # uint8 atoms, scale_atom_bytes(N, K, vec, E)
+    c: torch.Tensor,
+    masked_m: torch.Tensor,
+    *,
+    config: GroupedGemmConfig,
+    sf_vec_size: int,
+    alpha: torch.Tensor | None = None,  # fp32 [E, halves] epilogue scales
+    alpha_rows_per_half: int = 1,
+    direct_schedule: torch.Tensor | None = None,
+    schedule_tiles: torch.Tensor | None = None,
+) -> PreparedGroupedGemm:
+    ab_dtype, sf_dtype = _blockscaled_dtypes(a.dtype, sf_vec_size)
+    experts, m_max, k_store = a.shape
+    n = b.shape[1]
+    k = k_store * (8 // ab_dtype.width)
+    alpha_arg, alpha_owner, use_alpha = _alpha_operand(
+        alpha,
+        experts,
+        a.device,
+        rows=n,
+        rows_per_half=alpha_rows_per_half,
+        config=config,
+    )
+    prepared = _compile_prepared(
+        kernel_cls=_blockscaled_kernel_class_for(a.device),
+        wrapper=_grouped_gemm_blockscaled_swap_ab,
+        ab_dtype=ab_dtype,
+        config=config,
+        contiguous_segments=False,
+        problem_shape=(n, m_max, k, experts),
+        operand_args=(
+            as_dynamic_cute_tensor(a, leading_dim=2),
+            as_dynamic_cute_tensor(b, leading_dim=2),
+            as_dynamic_cute_tensor(sf_tokens, leading_dim=0),
+            as_dynamic_cute_tensor(sf_weights, leading_dim=0),
+            as_dynamic_cute_tensor(c, leading_dim=2),
+            alpha_arg,
+        ),
+        group_m_arg=as_dynamic_cute_tensor(masked_m, leading_dim=0),
+        direct_schedule=direct_schedule,
+        schedule_tiles=schedule_tiles,
+        device=a.device,
+        kernel_kwargs=dict(sf_vec_size=sf_vec_size, sf_dtype=sf_dtype),
+        wrapper_constexprs=(ab_dtype, sf_dtype, use_alpha, alpha_rows_per_half),
+    )
+    prepared.alpha_owner = alpha_owner
+    return prepared
+
+
+def prepare_contiguous_blockscaled(
+    a: torch.Tensor,  # [M_ceil, K] e4m3 or [M_ceil, K // 2] uint8 FP4 pairs
+    b: torch.Tensor,
+    sf_tokens: torch.Tensor,  # uint8 atoms, scale_atom_bytes(M_ceil, K, vec)
+    sf_weights: torch.Tensor,
+    c: torch.Tensor,
+    seg_offsets: torch.Tensor,
+    *,
+    config: GroupedGemmConfig,
+    sf_vec_size: int,
+    alpha: torch.Tensor | None = None,
+    alpha_rows_per_half: int = 1,
+    direct_schedule: torch.Tensor | None = None,
+    schedule_tiles: torch.Tensor | None = None,
+) -> PreparedGroupedGemm:
+    """Use seg_offsets in the group_m slot to address flat expert segments."""
+    ab_dtype, sf_dtype = _blockscaled_dtypes(a.dtype, sf_vec_size)
+    m_ceil, k_store = a.shape
+    experts, n, _ = b.shape
+    k = k_store * (8 // ab_dtype.width)
+    alpha_arg, alpha_owner, use_alpha = _alpha_operand(
+        alpha,
+        experts,
+        a.device,
+        rows=n,
+        rows_per_half=alpha_rows_per_half,
+        config=config,
+    )
+    prepared = _compile_prepared(
+        kernel_cls=_blockscaled_kernel_class_for(a.device),
+        wrapper=_grouped_gemm_blockscaled_swap_ab,
+        ab_dtype=ab_dtype,
+        config=config,
+        contiguous_segments=True,
+        problem_shape=(n, m_ceil, k, experts),
+        operand_args=(
+            as_dynamic_cute_tensor(a.unsqueeze(0), leading_dim=2),
+            as_dynamic_cute_tensor(b, leading_dim=2),
+            as_dynamic_cute_tensor(sf_tokens, leading_dim=0),
+            as_dynamic_cute_tensor(sf_weights, leading_dim=0),
+            as_dynamic_cute_tensor(c.unsqueeze(0), leading_dim=2),
+            alpha_arg,
+        ),
+        group_m_arg=as_dynamic_cute_tensor(seg_offsets, leading_dim=0),
+        direct_schedule=direct_schedule,
+        schedule_tiles=schedule_tiles,
+        device=a.device,
+        kernel_kwargs=dict(sf_vec_size=sf_vec_size, sf_dtype=sf_dtype),
+        wrapper_constexprs=(ab_dtype, sf_dtype, use_alpha, alpha_rows_per_half),
+    )
+    prepared.alpha_owner = alpha_owner
+    return prepared

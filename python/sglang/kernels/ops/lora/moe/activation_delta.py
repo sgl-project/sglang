@@ -11,6 +11,12 @@ import triton.language as tl
 
 from sglang.kernels.ops.lora.moe.activation import ActivationFn
 from sglang.kernels.ops.lora.moe.fp8_quant import quantize_fp8_groups
+from sglang.kernels.ops.lora.moe.quant_blockscaled import (
+    BlockScaledRows,
+    act_quant_args,
+    quantize_tile,
+    store_quantized_rows,
+)
 
 
 @triton.jit
@@ -30,12 +36,17 @@ def _act_delta_kernel(
     delta_ptr,  # [num_tokens, top_k, slices * inter] [gate | up]
     act_out_ptr,  # [rows, inter] bf16, flat base rows
     act_lora_in_ptr,  # [num_tokens, top_k, inter] bf16
-    act_q_ptr,  # [rows, inter] fp8e4m3 (QUANT_GROUP > 0 only)
-    act_s_ptr,  # [rows, inter // QUANT_GROUP] fp32 row-major
+    act_q_ptr,  # [rows, inter] fp8e4m3 (QUANT_GROUP > 0), or block-scaled codes
+    act_s_ptr,  # [rows, inter // QUANT_GROUP] fp32 row-major, or scale atoms
     pair_to_row_ptr,  # [num_tokens * top_k] int32
     topk_ids_ptr,  # [num_tokens, top_k] (local ids; < 0 = invalid)
     num_local_experts,
     inter,
+    stride_q_row,  # block-scaled codes only
+    rows_per_slab,
+    row_atoms,
+    k_atoms,
+    global_scale,
     HAS_DELTA: tl.constexpr,
     NUM_SLICES: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
@@ -43,6 +54,12 @@ def _act_delta_kernel(
     INTERLEAVED: tl.constexpr,
     QUANT_GROUP: tl.constexpr,  # 0 disables the additional FP8 output.
     WHOLE_ROW: tl.constexpr,  # Match upstream's whole-row rounding.
+    QUANT_BLOCKSCALED: tl.constexpr,  # Block-scaled codes + scale atoms instead.
+    VEC: tl.constexpr,
+    ELEM_MAX: tl.constexpr,
+    ELEM_MAX_LOG2: tl.constexpr,
+    PACK_E2M1: tl.constexpr,
+    NVFP4: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pair_idx_int32 = tl.program_id(0)
@@ -100,7 +117,34 @@ def _act_delta_kernel(
         tl.store(
             lora_in_row + offs, lora_in.to(act_lora_in_ptr.dtype.element_ty), mask=mask
         )
-        if QUANT_GROUP > 0:
+        if QUANT_BLOCKSCALED:
+            # Quantize the BF16-rounded value, matching the unfused path.
+            codes, sf_bytes = quantize_tile(
+                tl.where(mask & valid, act_bf16.to(tl.float32), 0.0)[None, :],
+                global_scale,
+                VEC,
+                ELEM_MAX,
+                ELEM_MAX_LOG2,
+                PACK_E2M1,
+                NVFP4,
+            )
+            store_quantized_rows(
+                codes,
+                sf_bytes,
+                dst_row + tl.zeros((1,), tl.int64),
+                (tl.arange(0, 1) == 0) & valid,
+                start,
+                inter,
+                act_q_ptr,
+                stride_q_row,
+                act_s_ptr,
+                rows_per_slab,
+                row_atoms,
+                k_atoms,
+                VEC,
+                PACK_E2M1,
+            )
+        elif QUANT_GROUP > 0:
             # Quantize the BF16-rounded value, matching the unfused path.
             # Admission ensures each quantization group is fully valid or masked.
             QG: tl.constexpr = QUANT_GROUP if QUANT_GROUP > 0 else BLOCK_SIZE
@@ -136,9 +180,13 @@ def act_delta(
     gate_first: bool = True,
     interleaved: bool = False,
     activation: str = "silu",
-    act_quant: tuple[torch.Tensor, torch.Tensor, int] | None = None,
+    act_quant: tuple[torch.Tensor, torch.Tensor, int] | BlockScaledRows | None = None,
 ) -> None:
-    """Add pair-major LoRA deltas and activate either provider row layout."""
+    """Add pair-major LoRA deltas and activate either provider row layout.
+
+    ``act_quant`` also writes the activation as FP8 groups (fp8 rows, fp32
+    scales, group) or as block-scaled rows for the down GEMM.
+    """
     ActivationFn.parse(activation)
     num_pairs = topk_ids.numel()
     if num_pairs == 0:
@@ -147,7 +195,12 @@ def act_delta(
     act_out_rows = act_out_rows.view(-1, act_out_rows.shape[-1])
     inter = act_out_rows.shape[-1]
     num_slices = gateup_rows.shape[-1] // inter
-    if act_quant is not None:
+    blockscaled = act_quant_args(None)
+    if isinstance(act_quant, BlockScaledRows):
+        assert act_quant.k == inter and inter % 128 == 0
+        act_q, act_s, group = act_quant.data, act_quant.scales, 0
+        blockscaled = act_quant_args(act_quant)
+    elif act_quant is not None:
         act_q, act_s, group = act_quant
         assert inter % group == 0 and 512 % group == 0
     else:
@@ -171,4 +224,5 @@ def act_delta(
         QUANT_GROUP=group,
         WHOLE_ROW=inter == group,
         BLOCK_SIZE=512,
+        **blockscaled,
     )

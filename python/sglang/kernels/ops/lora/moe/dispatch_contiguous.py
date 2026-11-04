@@ -15,6 +15,11 @@ from sglang.kernels.ops.lora.moe.dispatch_checks import (
     check_source_rows,
 )
 from sglang.kernels.ops.lora.moe.fp8_quant import quantize_fp8_groups
+from sglang.kernels.ops.lora.moe.quant_blockscaled import (
+    BlockScaledRows,
+    quantize_tile,
+    store_quantized_rows,
+)
 
 PAIRS_PER_PROGRAM = 8
 
@@ -246,4 +251,89 @@ def dispatch_fill_rows_contiguous_fp8(
         K=k,
         GROUPS=k // 128,
         BLOCK_K=triton.next_power_of_2(k),
+    )
+
+
+@triton.jit
+def _fill_rows_contiguous_blockscaled_kernel(
+    input_ptr,  # bf16 [num_tokens, K] source rows
+    out_ptr,  # [m_pad_ceiling, K] E4M3 or [m_pad_ceiling, K // 2] E2M1 pairs
+    sf_ptr,  # uint8 scale atoms
+    topk_ids_ptr,  # [num_pairs]; < 0 = padding or EP-unrouted
+    pair_to_row_ptr,  # [num_pairs] int32 finalized compact rows
+    stride_out_row,
+    rows_per_slab,
+    row_atoms,
+    k_atoms,
+    global_scale,
+    TOPK: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    VEC: tl.constexpr,
+    ELEM_MAX: tl.constexpr,
+    ELEM_MAX_LOG2: tl.constexpr,
+    PACK_E2M1: tl.constexpr,
+    NVFP4: tl.constexpr,
+):
+    # Quantize each token once, then fan out to its routed destinations.
+    token = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_K)
+    x = tl.load(input_ptr + token.to(tl.int64) * K + offs, mask=offs < K, other=0.0)
+    codes, sf_bytes = quantize_tile(
+        x.to(tl.float32)[None, :],
+        global_scale,
+        VEC,
+        ELEM_MAX,
+        ELEM_MAX_LOG2,
+        PACK_E2M1,
+        NVFP4,
+    )
+    for j in range(TOPK):
+        pair = token * TOPK + j
+        expert = tl.load(topk_ids_ptr + pair)
+        if expert >= 0:
+            dst = tl.load(pair_to_row_ptr + pair).to(tl.int64)
+            store_quantized_rows(
+                codes,
+                sf_bytes,
+                dst + tl.zeros((1,), tl.int64),
+                tl.arange(0, 1) == 0,
+                0,
+                K,
+                out_ptr,
+                stride_out_row,
+                sf_ptr,
+                rows_per_slab,
+                row_atoms,
+                k_atoms,
+                VEC,
+                PACK_E2M1,
+            )
+
+
+def dispatch_fill_rows_contiguous_blockscaled(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    pair_to_row: torch.Tensor,
+    *,
+    rows_out: BlockScaledRows,
+) -> None:
+    """Quantize into block-scaled rows using the finalized pair_to_row map."""
+    num_tokens, k = hidden_states.shape
+    num_pairs = topk_ids.numel()
+    if num_pairs == 0:
+        return
+    check_source_rows(hidden_states, topk_ids, num_pairs // num_tokens)
+    assert k == rows_out.k and k % 128 == 0
+    _fill_rows_contiguous_blockscaled_kernel[(num_tokens,)](
+        hidden_states,
+        rows_out.data,
+        rows_out.scales,
+        topk_ids.view(-1),
+        pair_to_row,
+        TOPK=num_pairs // num_tokens,
+        K=k,
+        BLOCK_K=triton.next_power_of_2(k),
+        num_warps=4 if k <= 4096 else 8,
+        **rows_out.kernel_args(),
     )
