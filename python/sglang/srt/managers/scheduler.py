@@ -788,9 +788,11 @@ class Scheduler(
 
         self.init_deferred_responses()
 
-        self.init_batch_result_processor()
+        self.init_beam_coordinator()
 
         self.init_request_retirer()
+
+        self.init_batch_result_processor()
 
         self.init_internal_state()
 
@@ -2824,7 +2826,6 @@ class Scheduler(
         )
 
     def init_batch_result_processor(self) -> None:
-        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
@@ -2846,6 +2847,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
+            request_retirer=self.request_retirer,
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
             leave_prefill_launched=self.prefill_launched_reqs.leave,
