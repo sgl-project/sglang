@@ -152,8 +152,16 @@ class TestJsonSchemaConstraint(unittest.TestCase):
                 )
 
     def test_required_tool_choice_after_hoisting_nested_defs(self):
-        """Unused nested definitions that differ across tools must not make a
-        required-choice request conflict once hoisted; referenced ones still resolve."""
+        """Nested definitions no live schema reaches (unused, or referenced only by
+        unused ones) must not conflict across tools once hoisted; reached ones resolve."""
+
+        def unreached_defs(leaf_type):
+            return {
+                "Unused": {"type": leaf_type},
+                "Dormant": {"$ref": "#/$defs/Leaf"},
+                "Leaf": {"type": leaf_type},
+            }
+
         tools = [
             Tool(
                 type="function",
@@ -166,7 +174,7 @@ class TestJsonSchemaConstraint(unittest.TestCase):
                                 "$ref": "#/$defs/Used",
                                 "$defs": {
                                     "Used": {"type": "integer"},
-                                    "Unused": {"type": "string"},
+                                    **unreached_defs("string"),
                                 },
                             }
                         },
@@ -182,7 +190,7 @@ class TestJsonSchemaConstraint(unittest.TestCase):
                         "properties": {
                             "y": {
                                 "type": "integer",
-                                "$defs": {"Unused": {"type": "integer"}},
+                                "$defs": unreached_defs("integer"),
                             }
                         },
                     },

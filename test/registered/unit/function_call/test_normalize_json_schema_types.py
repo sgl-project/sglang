@@ -418,17 +418,26 @@ class TestHoistJsonSchemaDefs(CustomTestCase):
                     "properties": {
                         "w": {
                             "$ref": f"#/{key}/WaitFor",
-                            key: {"WaitFor": {"$ref": f"#/{key}/Delay"}},
+                            key: {
+                                "WaitFor": {"$ref": f"#/{key}/Delay"},
+                                "Local": {"$ref": f"#/{key}/Count"},
+                            },
                         },
-                        "d": {key: {"Delay": {"type": "string"}}},
-                        "local": {"$ref": f"#/properties/w/{key}/WaitFor"},
+                        "d": {
+                            key: {
+                                "Delay": {"type": "string"},
+                                "Count": {"type": "integer"},
+                            }
+                        },
+                        # Count is reachable only through this tool-local pointer.
+                        "local": {"$ref": f"#/properties/w/{key}/Local"},
                     },
                 }
                 hoist_json_schema_defs(schema)
                 validator = Draft202012Validator(schema)
-                self.assertTrue(validator.is_valid({"w": "ready", "local": "ready"}))
+                self.assertTrue(validator.is_valid({"w": "ready", "local": 1}))
                 self.assertFalse(validator.is_valid({"w": 1}))
-                self.assertFalse(validator.is_valid({"local": 1}))
+                self.assertFalse(validator.is_valid({"local": "1"}))
 
     def test_unrepairable_schemas_stay_untouched(self):
         cases = [

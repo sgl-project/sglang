@@ -176,6 +176,85 @@ def normalize_json_schema_types(schema: Any) -> None:
             normalize_json_schema_types(schema[key])
 
 
+# Only schema-bearing keywords hold subschemas; instance data such as
+# ``default`` or ``examples`` must never be read as definitions.
+_SUBSCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "dependentSchemas")
+_SUBSCHEMA_KEYWORDS = (
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "prefixItems",
+    "items",
+    "additionalProperties",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+)
+
+
+def _iter_subschemas(node: dict, *, with_definitions: bool) -> Iterable[Any]:
+    map_keywords = _SUBSCHEMA_MAP_KEYWORDS
+    if with_definitions:
+        map_keywords += ("$defs", "definitions")
+    for key in map_keywords:
+        nested = node.get(key)
+        if isinstance(nested, dict):
+            yield from nested.values()
+    for key in _SUBSCHEMA_KEYWORDS:
+        value = node.get(key)
+        if isinstance(value, list):
+            yield from value
+        elif value is not None:
+            yield value
+
+
+def _resolve_json_pointer(node: Any, parts: List[str]) -> Any:
+    for part in parts:
+        if isinstance(node, dict):
+            node = node.get(part)
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+
+def _reachable_definitions(
+    schema: dict, collected: Dict[str, Dict[str, Any]]
+) -> Dict[str, set]:
+    reached: Dict[str, set] = {key: set() for key in collected}
+    visited = set()
+    pending = [schema]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, list):
+            pending.extend(node)
+            continue
+        if not isinstance(node, dict) or id(node) in visited:
+            continue
+        visited.add(id(node))
+        pending.extend(_iter_subschemas(node, with_definitions=False))
+        ref = node.get("$ref")
+        if not (isinstance(ref, str) and ref.startswith("#/")):
+            continue
+        parts = [
+            part.replace("~1", "/").replace("~0", "~")
+            for part in unquote(ref[2:]).split("/")
+        ]
+        definitions = collected.get(parts[0], {})
+        if len(parts) > 1 and parts[1] in definitions:
+            reached[parts[0]].add(parts[1])
+            pending.append(_resolve_json_pointer(definitions[parts[1]], parts[2:]))
+        else:
+            pending.append(_resolve_json_pointer(schema, parts))
+    return reached
+
+
 def hoist_json_schema_defs(schema: Any) -> None:
     """Give root-relative ``$ref`` targets a root to resolve against when an
     embedded sub-schema (e.g. Pydantic ``model_json_schema()``) buried them."""
@@ -185,20 +264,12 @@ def hoist_json_schema_defs(schema: Any) -> None:
     if not keys:
         return
     collected: Dict[str, Dict[str, Any]] = {key: {} for key in keys}
-    referenced: Dict[str, set] = {key: set() for key in keys}
 
     def collect(node: Any) -> bool:
-        if isinstance(node, list):
-            return all(collect(item) for item in node)
         if not isinstance(node, dict):
             return True
         if node is not schema and ("$id" in node or "id" in node):
             return False
-        ref = node.get("$ref")
-        if isinstance(ref, str):
-            parts = unquote(ref).split("/")
-            if len(parts) > 2 and parts[0] == "#" and parts[1] in referenced:
-                referenced[parts[1]].add(parts[2].replace("~1", "/").replace("~0", "~"))
         for key in keys:
             nested = node.get(key)
             if isinstance(nested, dict):
@@ -206,51 +277,23 @@ def hoist_json_schema_defs(schema: Any) -> None:
                     if name in collected[key] and collected[key][name] != definition:
                         return False
                     collected[key][name] = definition
-        # Only schema-bearing keywords hold subschemas; instance data such as
-        # ``default`` or ``examples`` must never be read as definitions.
-        for key in (
-            "properties",
-            "patternProperties",
-            "$defs",
-            "definitions",
-            "dependentSchemas",
-        ):
-            nested = node.get(key)
-            if isinstance(nested, dict) and not all(
-                collect(value) for value in nested.values()
-            ):
-                return False
-        for key in (
-            "anyOf",
-            "oneOf",
-            "allOf",
-            "prefixItems",
-            "items",
-            "additionalProperties",
-            "not",
-            "if",
-            "then",
-            "else",
-            "contains",
-            "propertyNames",
-            "unevaluatedItems",
-            "unevaluatedProperties",
-        ):
-            if key in node and not collect(node[key]):
-                return False
-        return True
+        return all(
+            collect(child) for child in _iter_subschemas(node, with_definitions=True)
+        )
 
-    if collect(schema):
-        for key in keys:
-            # Unreferenced definitions stay nested; promoting them would collide
-            # with other tools' same-named definitions in the required-choice merge.
-            needed = {
-                name: definition
-                for name, definition in collected[key].items()
-                if name in referenced[key]
-            }
-            if needed:
-                schema[key] = deepcopy(needed)
+    if not collect(schema):
+        return
+    # Unreached definitions stay nested: promoted, they would collide with other
+    # tools' same-named definitions in the required-choice merge.
+    reached = _reachable_definitions(schema, collected)
+    for key in keys:
+        needed = {
+            name: definition
+            for name, definition in collected[key].items()
+            if name in reached[key]
+        }
+        if needed:
+            schema[key] = deepcopy(needed)
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
