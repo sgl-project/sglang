@@ -268,6 +268,18 @@ for _mod, _fn, _backend, _device in [
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,
     ),
+    (
+        "k3_draft_swa_verify",
+        "draft_swa_verify_fwd",
+        KernelBackend.TRITON,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "k3_draft_verify_metadata",
+        "fill_draft_verify_metadata",
+        KernelBackend.TRITON,
+        CapabilityRequirement.HIP,
+    ),
 ]:
     register_kernel(
         KernelSpec(
