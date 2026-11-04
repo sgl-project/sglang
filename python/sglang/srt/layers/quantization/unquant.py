@@ -775,11 +775,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU.
-        if (
-            _is_cpu
-            and _is_cpu_amx_available
-            and layer.moe_runner_config.activation != "relu2"
-        ):
+        if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             if hasattr(layer, "w13_weight_bias"):
                 layer.w13_weight_bias = Parameter(
@@ -1199,7 +1195,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         moe_runner_config = self.moe_runner_config
 
-        if use_intel_amx_backend(layer) and moe_runner_config.activation != "relu2":
+        if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output

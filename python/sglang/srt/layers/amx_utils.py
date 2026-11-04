@@ -143,12 +143,16 @@ def _amx_process_weight_after_loading(
 
     is_conv_weight = False
     if qweight_packed_method is None:
+        # Pre-validate all target weights first so packing is atomic per module:
+        # if any weight is unsupported, skip packing all of them.
+        prepared_weights = []
         for i, weight_name in enumerate(weight_names):
             weight_tensor = getattr(module, weight_name)
 
             if transpose_dims and transpose_dims[i]:
                 weight_tensor = weight_tensor.transpose(*transpose_dims[i])
             is_conv_weight = is_dim_conv_weight(weight_tensor)
+
             # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
             if (
                 (not dim_is_supported(weight_tensor))
@@ -161,6 +165,9 @@ def _amx_process_weight_after_loading(
                 module.use_intel_amx_backend = False
                 return
 
+            prepared_weights.append((weight_name, weight_tensor, is_conv_weight))
+
+        for weight_name, weight_tensor, is_conv_weight in prepared_weights:
             packed_weight = torch.nn.Parameter(
                 amx_process_weight_after_loading(weight_tensor, is_conv_weight),
                 requires_grad=False,
