@@ -1875,6 +1875,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     cfg = resolving_view(server_args)
+    remote_engram = cfg.enable_hi_engram == "remote"
+    if remote_engram and os.environ.get("NCCL_CUMEM_ENABLE") == "0":
+        raise ValueError(
+            "Remote HiCache Engram requires NCCL_CUMEM_ENABLE=1 for NCCL GIN"
+        )
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set
@@ -1901,7 +1906,7 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 to keep it off."
             )
         os.environ["NCCL_CUMEM_ENABLE"] = str(
-            int(cfg.enable_symm_mem or kv_shard_symmetric_scratch)
+            int(cfg.enable_symm_mem or kv_shard_symmetric_scratch or remote_engram)
         )
     if (
         "NCCL_NVLS_ENABLE" not in os.environ

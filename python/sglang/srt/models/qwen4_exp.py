@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.mem_cache.engram.embedding import HiCacheVocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -97,7 +98,11 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -621,10 +626,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         offload_embedding = bool(config.ple_offload_embedding)
+        if get_memory().enable_hi_engram is not None:
+            embedding_cls = HiCacheVocabParallelEmbedding
+        else:
+            embedding_cls = VocabParallelEmbedding
         # Offload only needs this embedding's metadata: build it on meta so the
         # shard is never allocated on the device.
         with torch.device("meta") if offload_embedding else nullcontext():
-            ngram_embedding = VocabParallelEmbedding(
+            engram_options = {}
+            if get_memory().enable_hi_engram is not None:
+                engram_options = dict(
+                    engram_head_bounds=(*head_offsets, total_vocab_size),
+                    engram_namespace=ngram_prefix,
+                )
+            ngram_embedding = embedding_cls(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
                 params_dtype=(
@@ -634,12 +649,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ),
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
+                **engram_options,
             )
         # weight_scale stays a real device tensor.
         ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
-        if offload_embedding:
+        if offload_embedding and get_memory().enable_hi_engram is None:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
@@ -2360,8 +2376,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         def copy_ple_rows_to_tp_embedding(
             emb, loaded_weight: torch.Tensor, row_start: int, row_end: int
         ) -> None:
-            tp_start = emb.shard_indices.org_vocab_start_index
-            tp_end = emb.shard_indices.org_vocab_end_index
+            tp_start = getattr(
+                emb, "storage_row_start", emb.shard_indices.org_vocab_start_index
+            )
+            tp_end = getattr(
+                emb, "storage_row_end", emb.shard_indices.org_vocab_end_index
+            )
             ov_start = max(row_start, tp_start)
             ov_end = min(row_end, tp_end)
             if ov_start < ov_end:

@@ -1106,3 +1106,30 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+
+class HiCacheEngramStorage(ABC):
+    """Storage for one immutable Engram byte-row table.
+
+    This is independent of the KV page/key interface. Models own row IDs,
+    dtypes, scales and collectives; the backend owns the table and its transfers.
+    Initialize after weight loading and warm up lookup before graph capture.
+    """
+
+    @abstractmethod
+    def initialize(self, rows: torch.Tensor) -> None:
+        """Copy a CPU uint8 [num_rows, row_bytes] matrix into owned storage."""
+
+    @abstractmethod
+    def lookup(self, ids: torch.Tensor) -> torch.Tensor:
+        """Return uint8 [*ids.shape, row_bytes] on the IDs' device.
+
+        IDs are int32/int64 table-local rows; -1 produces a zero row. CPU lookup
+        is synchronous; CUDA lookup is ordered on the caller's current stream
+        and supports graph replay after warmup. The caller orders cross-stream
+        consumers and keeps the table alive until GPU work and graphs finish.
+        """
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release storage after all lookups and captured graphs have finished."""
