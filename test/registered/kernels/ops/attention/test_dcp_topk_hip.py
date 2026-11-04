@@ -1,5 +1,6 @@
-"""HIP DCP top-2048 (dcp_topk_hip): each rank's local candidates, all-gathered
-rank-major and merged, must be exactly the global top-2048 positions as KV slots.
+"""HIP DCP top-2048 (dcp_topk_hip): each rank's local candidate scores, all-gathered
+rank-major, must yield exactly the global top-2048 positions as KV slots, each rank
+emitting its own winners and the ranks' outputs disjoint.
 
 Inputs are left as production leaves them: logits past a row's local length and
 gathered entries past a rank's share hold high-scoring garbage the kernels must skip.
@@ -63,12 +64,11 @@ def _slots(pos: torch.Tensor, table_row: torch.Tensor, span: int) -> torch.Tenso
 
 
 def _dcp_topk(scores, world, table, span):
-    """Every rank's local candidates, concatenated as all_gather(dim=0) returns
-    them, merged into [rows, TOPK] slots."""
+    """Every rank's local scores, concatenated as all_gather(dim=0) returns them, then
+    every rank's own winners, combined into [rows, TOPK] slots."""
     rows = len(scores)
     lens = torch.tensor([s.numel() for s in scores], dtype=torch.int32).cuda()
-    garbage_bits = torch.tensor(_GARBAGE).view(torch.int32).item()
-    gathered = []
+    gathered, positions = [], []
     for rank in range(world):
         local_lens = get_dcp_lens(lens, world, rank)
         width = int(local_lens.max()) + 64
@@ -77,15 +77,30 @@ def _dcp_topk(scores, world, table, span):
             # local position j is global position j * world + rank
             shard = s[rank::world]
             logits[i, : shard.numel()] = shard
-        candidates = dcp_local_candidates_hip(logits.cuda(), local_lens, world, rank)
+        local_scores, local_positions = dcp_local_candidates_hip(
+            logits.cuda(), local_lens, world, rank
+        )
         for i, n in enumerate(local_lens.tolist()):
             # prefix-only gathers leave the entries past a rank's share undefined
-            candidates[i, min(n, TOPK) :, 0] = garbage_bits
-            candidates[i, min(n, TOPK) :, 1] = rank
-        gathered.append(candidates)
-    out = torch.full((rows, TOPK), -7, dtype=torch.int32, device="cuda")
-    dcp_global_slots_hip(torch.cat(gathered), lens, table, out, span, world)
-    return out
+            local_scores[i, min(n, TOPK) :] = _GARBAGE
+        gathered.append(local_scores)
+        positions.append(local_positions)
+    gathered = torch.cat(gathered)
+    owned = []
+    for rank in range(world):
+        out = torch.full((rows, TOPK), -7, dtype=torch.int32, device="cuda")
+        dcp_global_slots_hip(
+            gathered, positions[rank], lens, table, out, span, world, rank
+        )
+        mine = out >= 0
+        # a widened slot's position is slot % span, which is rank-strided
+        assert bool((out[mine] % world == rank).all()), f"rank {rank}"
+        assert bool((out[~mine] == -1).all()), f"rank {rank}"
+        owned.append(out)
+    owned = torch.stack(owned)
+    num_owners = (owned >= 0).sum(dim=0)
+    assert int(num_owners.max()) <= 1, "two ranks emitted the same winner"
+    return owned.clamp(min=-1).max(dim=0).values, num_owners
 
 
 def _case(world, lengths, make_scores, seed):
@@ -110,10 +125,12 @@ def test_selects_the_global_topk_slots(world, kind, group):
     scores, table, span = _case(
         world, lengths, lambda n, g: _scores(kind, n, g), seed=world * 7 + len(group)
     )
-    out = _dcp_topk(scores, world, table, span).cpu()
-    table = table.cpu()
+    out, num_owners = _dcp_topk(scores, world, table, span)
+    out, num_owners, table = out.cpu(), num_owners.cpu(), table.cpu()
     for i, s in enumerate(scores):
         k = min(s.numel(), TOPK)
+        # every winner has exactly one owner
+        assert bool((num_owners[i, :k] == 1).all()), f"row {i}"
         want = _slots(torch.topk(s, k).indices, table[i], span)
         msg = f"row {i} len {s.numel()}"
         assert torch.equal(
@@ -126,7 +143,8 @@ def test_selects_the_global_topk_slots(world, kind, group):
 @pytest.mark.parametrize("world", [2, 8])
 def test_ties_at_the_threshold_resolve_deterministically(world):
     """Mostly exact-zero scores tie at both thresholds: a valid top-k, the same
-    one on every call (TP peers and graph replays must agree)."""
+    one on every call (TP peers and graph replays must agree), and every rank
+    resolves the global ties alike, so no tied winner is emitted twice or dropped."""
     n, num_positive = world * 17500, 300
 
     def make_scores(n, gen):
@@ -137,8 +155,8 @@ def test_ties_at_the_threshold_resolve_deterministically(world):
         return s
 
     scores, table, span = _case(world, [n, n // 3], make_scores, seed=world)
-    first = _dcp_topk(scores, world, table, span)
-    second = _dcp_topk(scores, world, table, span)
+    first, _ = _dcp_topk(scores, world, table, span)
+    second, _ = _dcp_topk(scores, world, table, span)
     assert torch.equal(first, second)
     first, table = first.cpu(), table.cpu()
     for i, s in enumerate(scores):

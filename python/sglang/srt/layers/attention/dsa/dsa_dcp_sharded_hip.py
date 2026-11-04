@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_hip import (
     dcp_local_candidates_hip,
     supports_dcp_topk_hip,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 
 @triton.jit
@@ -175,20 +175,29 @@ def dcp_global_topk(
     rows, topk = out.shape
     if all_gather is None:
         all_gather = partial(parallel.dcp_group.all_gather, dim=0)
-    fused = supports_dcp_topk_hip(topk, world)
-    if fused:
-        candidates = dcp_local_candidates_hip(
+    # indexer top-k capture needs every rank's slots
+    if supports_dcp_topk_hip(topk, world) and not (
+        get_exec().features.enable_return_indexer_topk
+    ):
+        # only the scores travel: every rank selects the same winners from them and
+        # emits its own, which is all dcp_localize_compact keeps
+        scores, positions = dcp_local_candidates_hip(
             logits, local_lens, world=world, rank=parallel.attn_dcp_rank
         )
-    else:
-        candidates = _local_candidates(logits, local_lens, topk)
+        return dcp_global_slots_hip(
+            all_gather(scores),
+            positions,
+            global_lens,
+            page_table,
+            out,
+            span=span,
+            world=world,
+            rank=parallel.attn_dcp_rank,
+        )
+    candidates = _local_candidates(logits, local_lens, topk)
     # AITER's custom all-gather takes float dtypes only; the int32 (score bits,
     # position) pairs travel bit-exact as float32, else they would go to RCCL.
     gathered = all_gather(candidates.view(torch.float32)).view(torch.int32)
-    if fused:
-        return dcp_global_slots_hip(
-            gathered, global_lens, page_table, out, span=span, world=world
-        )
     num_candidates = world * topk
     scores = torch.empty(
         (rows, num_candidates), dtype=torch.float32, device=logits.device

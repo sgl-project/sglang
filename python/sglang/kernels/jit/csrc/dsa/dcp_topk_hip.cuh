@@ -1,9 +1,11 @@
 // DCP sparse-attention top-2048 on AMD (wave64), one 1024-thread block per query row.
 //
-// Local: rank r's indexer logits row (only its first length entries are scores) -> its top-2048 as
-// (fp32 score bits, global position i * world + r) pairs, (0, -1) padded. Global: the all-gathered
-// pairs of every rank -> the top-2048 global positions mapped through the page table to KV slots.
-// The global top-k of the union is the top-k of the per-rank top-k sets, so both steps are exact.
+// Local: rank r's indexer logits row (only its first length entries are scores) -> its top-2048
+// fp32 scores, and their global positions i * world + r kept on the rank (-1 padded). Global: the
+// all-gathered scores of every rank -> the global top-2048, of which a rank emits only its own
+// winners, as KV slots through the page table. The global top-k of the union is the top-k of the
+// per-rank top-k sets, so both steps are exact; every rank selects over the same gathered scores
+// with the same tie order, so the ranks' winners are disjoint and together form that one set.
 //
 // Selection is an exact radix select on key - row_min (key = order-preserving uint32 of the score):
 // the digits start at the highest bit that varies within the row, so scores sharing an exponent
@@ -31,6 +33,8 @@ constexpr int kWaves = kThreads / 64;
 constexpr int kTopK = 2048;
 constexpr int kDigitBits = 11;
 constexpr int kBins = 1 << kDigitBits;
+// -inf: a padded score loses to every real one
+constexpr uint32_t kNegInfBits = 0xFF800000u;
 
 struct Smem {
   uint32_t hist[2][kBins];
@@ -284,13 +288,12 @@ struct RowKeys {
   }
 };
 
-// The gathered candidates of one row: kWorld ranks x kTopK (score bits, position) pairs.
+// The gathered scores of one row: kWorld ranks x kTopK.
 template <int kWorld>
 struct CandidateKeys {
   static constexpr int kPer = kWorld * kTopK / kThreads;
   static_assert(kPer <= 32, "validity is one 32-bit mask per thread");
   uint32_t key[kPer];
-  int32_t pos[kPer];
   uint32_t valid;
 
   template <class F>
@@ -307,18 +310,22 @@ __global__ __launch_bounds__(kThreads) void dcp_local_candidates_kernel(
     const float* __restrict__ logits,
     int64_t stride,
     const int32_t* __restrict__ lengths,
-    int2* __restrict__ out,
+    float* __restrict__ scores,
+    int32_t* __restrict__ positions,
     int world,
     int rank) {
   __shared__ Smem sm;
   const int64_t row = blockIdx.x;
-  int2* o = out + row * kTopK;
+  float* os = scores + row * kTopK;
+  int32_t* op = positions + row * kTopK;
   RowKeys<kPer> keys;
   keys.s = logits + row * stride;
   keys.n = lengths[row];
   if (keys.n <= kTopK) {
     for (int e = threadIdx.x; e < kTopK; e += kThreads) {
-      o[e] = e < keys.n ? make_int2(__float_as_int(keys.s[e]), e * world + rank) : make_int2(0, -1);
+      const bool in = e < keys.n;
+      os[e] = in ? keys.s[e] : __uint_as_float(kNegInfBits);
+      op[e] = in ? e * world + rank : -1;
     }
     return;
   }
@@ -330,14 +337,22 @@ __global__ __launch_bounds__(kThreads) void dcp_local_candidates_kernel(
       t,
       nvalid,
       sm,
-      [&](uint32_t e, uint32_t k, int i) { o[e] = make_int2(static_cast<int>(key_to_bits(k)), i * world + rank); },
-      [&](int e) { o[e] = make_int2(0, -1); });
+      [&](uint32_t e, uint32_t k, int i) {
+        os[e] = __uint_as_float(key_to_bits(k));
+        op[e] = i * world + rank;
+      },
+      [&](int e) {
+        os[e] = __uint_as_float(kNegInfBits);
+        op[e] = -1;
+      });
 }
 
 template <int kWorld>
 __global__ __launch_bounds__(kThreads) void dcp_global_slots_kernel(
-    const int2* __restrict__ gathered,
+    const float* __restrict__ gathered,
+    const int32_t* __restrict__ positions,
     int rows,
+    int rank,
     const int32_t* __restrict__ global_lens,
     const int32_t* __restrict__ page_table,
     int64_t page_table_stride,
@@ -358,19 +373,15 @@ __global__ __launch_bounds__(kThreads) void dcp_global_slots_kernel(
     // a rank holds positions r, r + world, ...; gathers leave entries past its count undefined
     const int n = min((len + kWorld - 1 - r) / kWorld, kTopK);
     keys.key[j] = 0;
-    keys.pos[j] = -1;
     if (e < n) {
-      const int2 v = gathered[(static_cast<int64_t>(r) * rows + row) * kTopK + e];
-      if (v.y >= 0) {
-        keys.key[j] = ordered_key(__int_as_float(v.x));
-        keys.pos[j] = v.y;
-        keys.valid |= 1u << j;
-      }
+      keys.key[j] = ordered_key(gathered[(static_cast<int64_t>(r) * rows + row) * kTopK + e]);
+      keys.valid |= 1u << j;
     }
   }
   uint32_t nvalid;
   const Threshold t = select_threshold(keys, nvalid, sm);
   const int32_t* pt = page_table + static_cast<int64_t>(row) * page_table_stride;
+  const int32_t* pos = positions + static_cast<int64_t>(row) * kTopK;
   int32_t* o = out + static_cast<int64_t>(row) * kTopK;
   emit_selected(
       keys,
@@ -378,8 +389,13 @@ __global__ __launch_bounds__(kThreads) void dcp_global_slots_kernel(
       nvalid,
       sm,
       [&](uint32_t e, uint32_t, int j) {
-        const int p = keys.pos[j];
-        o[e] = pt[p / span] * span + p % span;
+        const int c = j * kThreads + tid;
+        if (c / kTopK == rank) {
+          const int p = pos[c % kTopK];
+          o[e] = pt[p / span] * span + p % span;
+        } else {
+          o[e] = -1;
+        }
       },
       [&](int e) { o[e] = -1; });
 }
@@ -391,7 +407,8 @@ struct DcpLocalCandidatesHip {
   static void
   run(const tvm::ffi::TensorView logits,
       const tvm::ffi::TensorView lengths,
-      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView positions,
       const int64_t world,
       const int64_t rank) {
     using namespace host;
@@ -400,15 +417,19 @@ struct DcpLocalCandidatesHip {
     RuntimeCheck(logits.stride(1) == 1, "logits rows must be contiguous");
     RuntimeCheck(logits.size(0) >= rows, "one logits row per length");
     RuntimeCheck(
-        out.size(0) == rows && out.size(1) == kTopK && out.size(2) == 2 && out.is_contiguous(),
-        "out must be a dense [rows, 2048, 2]");
+        scores.size(0) == rows && scores.size(1) == kTopK && scores.is_contiguous(),
+        "scores must be a dense [rows, 2048]");
+    RuntimeCheck(
+        positions.size(0) == rows && positions.size(1) == kTopK && positions.is_contiguous(),
+        "positions must be a dense [rows, 2048]");
     if (rows == 0) return;
     LaunchKernel(static_cast<uint32_t>(rows), kThreads, logits.device())(
         dcp_local_candidates_kernel<kPer>,
         static_cast<const float*>(logits.data_ptr()),
         logits.stride(0),
         static_cast<const int32_t*>(lengths.data_ptr()),
-        static_cast<int2*>(out.data_ptr()),
+        static_cast<float*>(scores.data_ptr()),
+        static_cast<int32_t*>(positions.data_ptr()),
         static_cast<int>(world),
         static_cast<int>(rank));
   }
@@ -418,25 +439,32 @@ template <int kWorld>
 struct DcpGlobalSlotsHip {
   static void
   run(const tvm::ffi::TensorView gathered,
+      const tvm::ffi::TensorView positions,
       const tvm::ffi::TensorView global_lens,
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView out,
-      const int64_t span) {
+      const int64_t span,
+      const int64_t rank) {
     using namespace host;
     using namespace dcp_topk_hip_detail;
     const int64_t rows = out.size(0);
     RuntimeCheck(
-        gathered.size(0) == kWorld * rows && gathered.size(1) == kTopK && gathered.size(2) == 2 &&
-            gathered.is_contiguous(),
-        "gathered must be a dense rank-major [world * rows, 2048, 2]");
+        gathered.size(0) == kWorld * rows && gathered.size(1) == kTopK && gathered.is_contiguous(),
+        "gathered must be a dense rank-major [world * rows, 2048]");
+    RuntimeCheck(
+        positions.size(0) == rows && positions.size(1) == kTopK && positions.is_contiguous(),
+        "positions must be this rank's dense [rows, 2048]");
+    RuntimeCheck(rank >= 0 && rank < kWorld, "rank out of range");
     RuntimeCheck(global_lens.size(0) >= rows, "one length per row");
     RuntimeCheck(page_table.stride(1) == 1 && page_table.size(0) >= rows, "page table rows must be contiguous");
     RuntimeCheck(out.size(1) == kTopK && out.is_contiguous(), "out must be a dense [rows, 2048]");
     if (rows == 0) return;
     LaunchKernel(static_cast<uint32_t>(rows), kThreads, out.device())(
         dcp_global_slots_kernel<kWorld>,
-        static_cast<const int2*>(gathered.data_ptr()),
+        static_cast<const float*>(gathered.data_ptr()),
+        static_cast<const int32_t*>(positions.data_ptr()),
         static_cast<int>(rows),
+        static_cast<int>(rank),
         static_cast<const int32_t*>(global_lens.data_ptr()),
         static_cast<const int32_t*>(page_table.data_ptr()),
         page_table.stride(0),

@@ -450,8 +450,8 @@ def dcp_global_topk(
     every rank in one process). Every rank must call this with the same number
     of rows, also when it has no local keys.
 
-    With ``DcpTopKMerge`` the result holds only this rank's slots, which is all
-    ``dcp_localize_compact`` keeps.
+    With ``DcpTopKMerge``, and on ROCm without indexer top-k capture, the result
+    holds only this rank's slots, which is all ``dcp_localize_compact`` keeps.
     """
     parallel = get_parallel()
     rows = local_lens.shape[0]

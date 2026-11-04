@@ -1,7 +1,8 @@
 """DCP sparse-attention top-2048 on AMD (csrc/dsa/dcp_topk_hip.cuh).
 
-One launch picks a rank's local candidates and one merges every rank's into KV slots.
-Row lengths are read on the device, so the logits buffer may be wider than any row.
+One launch picks a rank's local candidates; after the scores alone are all-gathered, one picks
+the global top-2048 and keeps the rank's own winners as KV slots. Positions never leave the
+rank. Row lengths are read on the device, so the logits buffer may be wider than any row.
 """
 
 from __future__ import annotations
@@ -49,28 +50,36 @@ def supports_dcp_topk_hip(topk: int, world: int) -> bool:
 
 def dcp_local_candidates_hip(
     logits: torch.Tensor, local_lens: torch.Tensor, world: int, rank: int
-) -> torch.Tensor:
-    """[rows, 2048, 2] int32 (fp32 score bits, global position or -1) of the top-2048 of
-    logits[i, :local_lens[i]]; local position j is global position j * world + rank."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The top-2048 of logits[i, :local_lens[i]]: [rows, 2048] fp32 scores (-inf padded), to
+    all-gather, and their [rows, 2048] int32 global positions (-1 padded), kept on the rank.
+    Local position j is global position j * world + rank."""
     rows = local_lens.shape[0]
-    out = torch.empty((rows, TOPK, 2), dtype=torch.int32, device=logits.device)
+    scores = torch.empty((rows, TOPK), dtype=torch.float32, device=logits.device)
+    positions = torch.empty((rows, TOPK), dtype=torch.int32, device=logits.device)
     _local_module(_LOCAL_PER_THREAD).run(
-        logits, local_lens.to(torch.int32), out, world, rank
+        logits, local_lens.to(torch.int32), scores, positions, world, rank
     )
-    return out
+    return scores, positions
 
 
 def dcp_global_slots_hip(
     gathered: torch.Tensor,
+    positions: torch.Tensor,
     global_lens: torch.Tensor,
     page_table: torch.Tensor,
     out: torch.Tensor,
     span: int,
     world: int,
+    rank: int,
 ) -> torch.Tensor:
-    """Top-2048 per row of the rank-major [world * rows, 2048, 2] gathered candidates.
+    """This rank's share of the top-2048 per row of the rank-major [world * rows, 2048]
+    gathered scores, with ``positions`` this rank's from dcp_local_candidates_hip.
 
-    Written to out [rows, 2048] as slots page_table[p // span] * span + p % span,
-    -1 padded."""
-    _global_module(world).run(gathered, global_lens, page_table, out, span)
+    Written to out [rows, 2048] as slots page_table[p // span] * span + p % span where the
+    winner is this rank's, -1 elsewhere: every rank computes the same winner set, so the
+    ranks' outputs are disjoint and their union is the global top-k."""
+    _global_module(world).run(
+        gathered, positions, global_lens, page_table, out, span, rank
+    )
     return out
