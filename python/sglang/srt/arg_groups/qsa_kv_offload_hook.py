@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 def validate_qsa_kv_offload(server_args: ServerArgs) -> None:
     """Validate --enable-qsa-kv-offload constraints before the model loads."""
     cfg = resolving_view(server_args)
-    if cfg.enable_qsa_kv_offload:
+    if cfg.enable_qsa_kv_offload or cfg.qsa_kv_offload_draft:
         check_qsa_kv_offload_args(cfg, model_config_of(server_args).hf_config)
 
 
@@ -20,9 +20,14 @@ def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
     the full-attention K/V that addresses logical slots directly is refused."""
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
-    from sglang.srt.mem_cache.qsa_kv_offload import compute_offload_layout
+    from sglang.srt.mem_cache.qsa_kv_offload import (
+        compute_offload_layout,
+        draft_extra_columns,
+    )
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
+    if not cfg.enable_qsa_kv_offload:
+        raise ValueError("--qsa-kv-offload-draft needs --enable-qsa-kv-offload.")
     profile = parse_qsa_profile(hf_config)
     if profile is None:
         raise ValueError(
@@ -63,6 +68,13 @@ def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--enable-qsa-kv-offload does not support {flag}.")
+    if cfg.qsa_kv_offload_draft and not (
+        speculative and cfg.speculative_algorithm.upper() in ("EAGLE", "NEXTN")
+    ):
+        raise ValueError(
+            "--qsa-kv-offload-draft needs an MTP draft model "
+            "(--speculative-algorithm NEXTN or EAGLE)."
+        )
 
     graphs = cfg.cuda_graph_config
     torch_resolve = envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
@@ -76,7 +88,7 @@ def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
             "--enable-qsa-kv-offload gathers the prefill context from the host "
             "outside CUDA graphs; add --disable-prefill-cuda-graph."
         )
-    # The same layout checks the pool runs, before the weights load.
+    # The same layout checks the pools run, before the weights load.
     compute_offload_layout(
         compress_ratio=profile.compress_ratio,
         token_topk=profile.budget,
@@ -85,4 +97,12 @@ def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
         rows_per_request=(cfg.speculative_num_draft_tokens or 1) if speculative else 1,
         max_extend_tokens=max(cfg.chunked_prefill_size, cfg.max_prefill_tokens or 0),
         page_size=cfg.page_size,
+        extra_columns=(
+            draft_extra_columns(
+                compress_ratio=profile.compress_ratio,
+                speculative_num_steps=cfg.speculative_num_steps or 1,
+            )
+            if cfg.qsa_kv_offload_draft
+            else 0
+        ),
     )

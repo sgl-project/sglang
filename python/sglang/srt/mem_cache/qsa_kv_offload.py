@@ -57,6 +57,10 @@ class QSAKVOffloadLayout(msgspec.Struct, frozen=True):
     scratch_rows: int
     token_topk: int
     rows_per_request: int
+    # Selected columns of a query row past the expanded block top-k that may lie
+    # before the tail ring: the MTP draft's decode steps reuse the draft-extend
+    # selection plus the positions drafted since.
+    extra_columns: int = 0
 
     @property
     def region_rows(self) -> int:
@@ -84,12 +88,14 @@ def compute_offload_layout(
     rows_per_request: int,
     max_extend_tokens: int,
     page_size: int,
+    extra_columns: int = 0,
 ) -> QSAKVOffloadLayout:
     """Layout for ``num_request_slots`` request slots (``req_to_token`` rows).
 
     ``rows_per_request`` is the query rows of one request in a forward (the
     verify rows under speculative decoding, else 1); their selected blocks are
-    resolved together and must fit in the hot cache at once.
+    resolved together and must fit in the hot cache at once, as must one row's
+    blocks plus its ``extra_columns``.
     """
     if page_size % compress_ratio:
         raise ValueError(
@@ -101,12 +107,13 @@ def compute_offload_layout(
             "QSA K/V offload supports at most compress_ratio "
             f"({compress_ratio}) query rows per request, got {rows_per_request}"
         )
-    needed = rows_per_request * (token_topk // compress_ratio)
+    block_topk = token_topk // compress_ratio
+    needed = max(rows_per_request * block_topk, block_topk + extra_columns)
     if hot_blocks < needed:
         raise ValueError(
             f"--qsa-kv-offload-hot-blocks {hot_blocks} is below {needed}: "
-            f"{rows_per_request} query row(s) per request x "
-            f"{token_topk // compress_ratio} selected blocks must fit at once"
+            f"{rows_per_request} query row(s) per request x {block_topk} "
+            "selected blocks must fit at once"
         )
     # Page-aligned so the device pool size is a whole number of pages.
     scratch = max_extend_tokens + 2 * page_size
@@ -119,22 +126,39 @@ def compute_offload_layout(
         scratch_rows=scratch,
         token_topk=token_topk,
         rows_per_request=rows_per_request,
+        extra_columns=extra_columns,
     )
 
 
+def draft_extra_columns(*, compress_ratio: int, speculative_num_steps: int) -> int:
+    """``extra_columns`` of the MTP draft pool: the draft-extend capture's
+    uncompressed tail plus the tail of positions its decode steps append."""
+    return compress_ratio - 1 + speculative_num_steps + 1
+
+
 def offload_layout_from_config(
-    *, hf_config, num_request_slots: int, page_size: int
+    *, hf_config, num_request_slots: int, page_size: int, draft: bool = False
 ) -> QSAKVOffloadLayout:
-    """Layout from the resolved server configuration and the model's QSA profile."""
+    """Layout from the resolved server configuration and the model's QSA profile;
+    ``draft`` for the MTP draft model's pool."""
     from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.runtime_context import (
         get_memory,
         get_schedule,
+        get_spec,
         max_speculative_num_draft_tokens,
     )
 
     profile = parse_qsa_profile(hf_config)
     schedule = get_schedule()
+    extra_columns = (
+        draft_extra_columns(
+            compress_ratio=profile.compress_ratio,
+            speculative_num_steps=get_spec().speculative_num_steps or 1,
+        )
+        if draft
+        else 0
+    )
     return compute_offload_layout(
         compress_ratio=profile.compress_ratio,
         token_topk=profile.budget,
@@ -145,6 +169,7 @@ def offload_layout_from_config(
             schedule.chunked_prefill_size or 0, schedule.max_prefill_tokens or 0
         ),
         page_size=page_size,
+        extra_columns=extra_columns,
     )
 
 
@@ -382,13 +407,17 @@ class QSAKVHostOffload:
         mismatches, checks = self._verify_counts.tolist()
         if mismatches:
             raise RuntimeError(
-                f"QSA K/V offload verify: {mismatches} of {checks} checks differ "
-                "from the full pool"
+                f"QSA K/V offload verify ({self.num_layers}-layer pool): "
+                f"{mismatches} of {checks} checks differ from the full pool"
             )
         now = time.monotonic()
         if now - self._verify_logged >= 10:
             self._verify_logged = now
-            logger.info("QSA K/V offload verify: %d checks, 0 mismatches", checks)
+            logger.info(
+                "QSA K/V offload verify (%d-layer pool): %d checks, 0 mismatches",
+                self.num_layers,
+                checks,
+            )
 
     def destroy(self) -> None:
         """Unpin the host K/V (see HostKVCache.destroy). Idempotent."""
@@ -436,6 +465,7 @@ class QSAKVHostOffload:
                 host_k=self.host_k,
                 host_v=self.host_v,
                 max_rows_per_request=self.layout.rows_per_request,
+                max_extra_columns=self.layout.extra_columns,
             )
             return
         layers, hot, cr, dev = self.num_layers, self.hot_blocks, self.cr, self.device

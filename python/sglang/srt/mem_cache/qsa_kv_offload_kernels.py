@@ -9,7 +9,8 @@ synchronization, so decode and target-verify forwards can be captured:
      slot, or whose logical slots changed, are planned as host loads. A block
      re-entering the ring may be rewritten there, so its LRU copy turns stale.
   2. ``U``: the sorted unique complete blocks before ``b0`` the rows select, one
-     representative column per block (the one holding its first token).
+     representative column per block (the one holding its first token), plus
+     the blocks of any extra single-position columns (``XT``) before ``b0``.
   3. hits and misses; misses take the least recently used slots this forward
      does not read (an exact LRU list, double buffered). A hit whose rows were
      filled from logical slots ``req_to_token`` no longer maps to (radix dedup
@@ -72,6 +73,7 @@ def _resolve_kernel(
     CR: tl.constexpr,
     NRING: tl.constexpr,
     BH: tl.constexpr,
+    XT: tl.constexpr,
 ):
     g = tl.program_id(0)
     cols = tl.arange(0, BLOCK_W)
@@ -135,6 +137,20 @@ def _resolve_kernel(
     ).to(tl.int64)
     sq = tl.load(seq_ptr + g * Q + uq, mask=in_rows, other=0).to(tl.int64)
     rep = in_rows & (pos >= 0) & (pos < sq) & (pos % CR == 0) & (pos // CR < b0)
+    if XT > 0:
+        # The XT columns after the KB block groups of each row are single
+        # positions; those before the ring add their blocks.
+        tx = u - Q * KB
+        in_t = (tx >= 0) & (tx < Q * XT)
+        tq = tl.where(in_t, tx // XT, 0)
+        tj = tl.where(in_t, tx % XT, 0)
+        tpos = tl.load(
+            topk_ptr + (g * Q + tq) * stride_topk + KB * CR + tj, mask=in_t, other=-1
+        ).to(tl.int64)
+        tsq = tl.load(seq_ptr + g * Q + tq, mask=in_t, other=0).to(tl.int64)
+        trep = in_t & (tpos >= 0) & (tpos < tsq) & (tpos // CR < b0)
+        rep = rep | trep
+        pos = tl.where(trep, tpos, pos)
     ub = tl.sort(tl.where(rep, (pos // CR).to(tl.int32), _BIG))
     tl.store(uniq_ptr + g * BLOCK_U + u, ub)
     tl.debug_barrier()
@@ -354,6 +370,7 @@ class QSAKVFusedResolve:
         host_k: torch.Tensor,
         host_v: torch.Tensor,
         max_rows_per_request: int,
+        max_extra_columns: int = 0,
     ):
         device = dev_k[0].device
         row_bytes = dev_k[0][0].numel() * dev_k[0].element_size()
@@ -382,11 +399,13 @@ class QSAKVFusedResolve:
         self.step = torch.zeros(1, **i32)
         self.num_real = torch.zeros(1, **i32)
         self.errors = torch.zeros(1, dtype=torch.int64, device=device)
-        self.block_u = {
-            q: triton.next_power_of_2(q * self.block_topk)
-            for q in range(1, max_rows_per_request + 1)
-        }
-        max_u = max(self.block_u.values())
+        self.max_extra_columns = max_extra_columns
+        # The layout guarantees room for several plain rows or one row with
+        # extra columns, never both; resolve refuses the combination.
+        max_u = max(
+            self._block_u(rows_per_request=max_rows_per_request, extra_columns=0),
+            self._block_u(rows_per_request=1, extra_columns=max_extra_columns),
+        )
         self.plan_src = torch.zeros((nr, max_u, cr), dtype=torch.int64, device=device)
         self.plan_dst = torch.zeros((nr, max_u), dtype=torch.int64, device=device)
         self.plan_n = torch.zeros(nr, **i32)
@@ -395,6 +414,12 @@ class QSAKVFusedResolve:
         self.rplan_n = torch.zeros(nr, **i32)
         self.uniq = torch.zeros((nr, max_u), **i32)
         self.vic = torch.zeros((nr, max_u), **i32)
+
+    def _block_u(self, rows_per_request: int, extra_columns: int) -> int:
+        """Candidate entries of one request's needed-block set."""
+        return triton.next_power_of_2(
+            rows_per_request * (self.block_topk + extra_columns)
+        )
 
     def reset(self, req_pool_indices: torch.Tensor) -> None:
         idx = req_pool_indices.long()
@@ -424,7 +449,20 @@ class QSAKVFusedResolve:
         rows = torch.empty(
             (num_rows, width), dtype=torch.int32, device=positions.device
         )
-        block_u = self.block_u[rows_per_request]
+        # Columns past the expanded top-k and its in-ring partial block.
+        extra = width - self.block_topk * self.cr
+        extra = extra if extra > self.cr - 1 else 0
+        if extra and rows_per_request > 1:
+            raise ValueError(
+                "QSA K/V offload: extra selected columns are supported with one "
+                f"query row per request, got {rows_per_request}"
+            )
+        if extra > self.max_extra_columns:
+            raise ValueError(
+                f"QSA K/V offload: {width} selected columns per row, at most "
+                f"{self.block_topk * self.cr + self.max_extra_columns} supported"
+            )
+        block_u = self._block_u(rows_per_request=rows_per_request, extra_columns=extra)
         _resolve_kernel[(groups,)](
             positions,
             positions.stride(0),
@@ -466,6 +504,7 @@ class QSAKVFusedResolve:
             CR=self.cr,
             NRING=_RING,
             BH=1024,
+            XT=extra,
             num_warps=8,
         )
         _copy_plan_kernel[(groups, triton.cdiv(block_u, _PLAN_PER_PROGRAM))](

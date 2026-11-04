@@ -562,5 +562,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_qsa_kv_offload",
     "qsa_kv_offload_host_size",
     "qsa_kv_offload_hot_blocks",
+    "qsa_kv_offload_draft",
 )
 # fmt: on

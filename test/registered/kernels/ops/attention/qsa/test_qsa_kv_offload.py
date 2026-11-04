@@ -5,7 +5,8 @@ Each forward packs the selected K/V twice with the decode gather the QSA
 backend runs (``qwen_sparse_kv_extraction_compact_triton``): once from the full
 logical pool through ``req_to_token``, once from the offload's device rows
 through its per-forward row table. The packed scratch and valid counts must be
-bit-identical, under hot-cache eviction, radix remaps and chain verify.
+bit-identical, under hot-cache eviction, radix remaps and chain verify, and for
+the MTP draft's decode rows, whose extra columns may precede the tail ring.
 """
 
 import sys
@@ -22,23 +23,24 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 from sglang.srt.mem_cache.qsa_kv_offload import (
     QSAKVHostOffload,
     compute_offload_layout,
+    draft_extra_columns,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 CR, BLOCK_TOPK, HEADS, DIM, STRIDE = 4, 512, 2, 256, 2112
 TOPK = BLOCK_TOPK * CR + CR - 1
 
 
-def _packed(k, v, table, row_req, indices, lens, rows, packed_dtype):
+def _packed(k, v, table, row_req, indices, lens, rows, packed_dtype, width=TOPK):
     counts = torch.empty(rows, device="cuda", dtype=torch.int32)
     ok = torch.empty(rows * STRIDE, HEADS, DIM, device="cuda", dtype=packed_dtype)
     ov = torch.empty_like(ok)
     cu = torch.arange(rows + 1, device="cuda", dtype=torch.int32) * STRIDE
-    qwen_sparse_valid_counts_triton(lens, indices, counts, rows, TOPK)
+    qwen_sparse_valid_counts_triton(lens, indices, counts, rows, width)
     qwen_sparse_kv_extraction_compact_triton(
-        k, v, table, row_req, indices, lens, cu, ok, ov, rows, TOPK,
+        k, v, table, row_req, indices, lens, cu, ok, ov, rows, width,
         zero_fill_cols=STRIDE,
     )  # fmt: skip
     return counts, ok, ov
@@ -155,6 +157,120 @@ def test_offload_gather_matches_pool_gather(
             assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
         for req in range(1, requests + 1):  # accept between 1 and q tokens
             lengths[req] += int(torch.randint(1, q + 1, (1,)))
+    if offload.fused is not None:
+        assert int(offload.fused.errors) == 0
+
+
+@pytest.mark.parametrize("torch_resolve", [False, True])
+def test_draft_decode_rows_with_extra_columns(torch_resolve, request):
+    """MTP draft decode steps reuse the selection captured at an earlier
+    position (its expanded top-k and partial block) plus the positions drafted
+    since; once the step crosses a block boundary those columns precede the
+    tail ring and must resolve to rows holding exactly the pool's K/V."""
+    torch.manual_seed(13)
+    steps, requests, width, pool_size = 3, 4, 12288, 65536
+    extra = draft_extra_columns(compress_ratio=CR, speculative_num_steps=steps)
+    row_width = TOPK + steps + 1
+    layout = compute_offload_layout(
+        compress_ratio=CR,
+        token_topk=BLOCK_TOPK * CR,
+        hot_blocks=BLOCK_TOPK + extra,
+        num_request_slots=requests + 1,
+        rows_per_request=1,
+        max_extend_tokens=4096,
+        page_size=64,
+        extra_columns=extra,
+    )
+    shape = (layout.device_rows + 64, HEADS, DIM)
+    dev_k = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    dev_v = torch.zeros_like(dev_k)
+    with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
+        offload = QSAKVHostOffload(
+            layout=layout,
+            k_buffers=[dev_k],
+            v_buffers=[dev_v],
+            host_rows=pool_size + 64,
+        )
+    request.addfinalizer(offload.destroy)
+    pool_k = torch.randn(pool_size + 64, HEADS, DIM, device="cuda").bfloat16()
+    pool_v = torch.randn_like(pool_k)
+    req_to_token = torch.zeros((requests + 1, width), dtype=torch.int32, device="cuda")
+    free = (torch.randperm(pool_size, device="cuda") + 64).tolist()
+
+    def alloc(n):
+        nonlocal free
+        out, free = free[:n], free[n:]
+        return torch.tensor(out, dtype=torch.int64, device="cuda")
+
+    row_req = torch.arange(1, requests + 1, device="cuda")
+    lengths = torch.randint(3000, 9000, (requests,), device="cuda")
+    # Shorter than the top-k: the capture holds fewer than BLOCK_TOPK blocks.
+    lengths[0] = 1000
+    offload.begin_forward(req_to_token, row_req)
+    for i in range(requests):
+        slots = alloc(int(lengths[i]))
+        req_to_token[i + 1, : slots.numel()] = slots.int()
+        for start in range(0, slots.numel(), 4096):
+            chunk = slots[start : start + 4096]
+            rows = offload.extend_rows(chunk.numel())
+            dev_k[rows], dev_v[rows] = pool_k[chunk], pool_v[chunk]
+            offload.write_through(layer_idx=0, rows=rows, loc=chunk)
+
+    columns = torch.arange(row_width, device="cuda", dtype=torch.int32)
+    tail = torch.arange(steps + 1, device="cuda")
+    crossed = 0
+    for iteration in range(6):
+        # Draft extend: the capture at each request's newest position.
+        anchor = lengths - 1
+        blocks = torch.full(
+            (requests, BLOCK_TOPK), -1, device="cuda", dtype=torch.int32
+        )
+        for row in range(requests):
+            chosen = torch.randperm(int(anchor[row] + 1) // CR, device="cuda")
+            blocks[row, : min(BLOCK_TOPK, chosen.numel())] = chosen[:BLOCK_TOPK].int()
+        captured = expand_qsa_block_indices(
+            blocks, anchor, (anchor + 1).int(), CR, BLOCK_TOPK * CR
+        )
+        for step in range(steps):
+            qpos = lengths.clone()
+            loc = alloc(requests)
+            req_to_token[row_req, qpos] = loc.int()
+            pool_k[loc] = torch.randn(requests, HEADS, DIM, device="cuda").bfloat16()
+            lens = (qpos + 1).int()
+            drafted = (anchor + 1)[:, None] + tail
+            positions = torch.cat(
+                [captured, torch.where(drafted <= qpos[:, None], drafted, -1).int()],
+                dim=1,
+            ).contiguous()
+            crossed += int((qpos // CR != anchor // CR).sum())
+            offload.begin_forward(req_to_token)
+            offload.set_num_real(requests)
+            new_rows = offload.new_token_rows(row_seq_lens=lens, row_req=row_req)
+            dev_k[new_rows], dev_v[new_rows] = pool_k[loc], pool_v[loc]
+            offload.write_through(layer_idx=0, rows=new_rows, loc=loc)
+            rows = offload.resolve_rows(
+                layer_idx=0,
+                positions=positions,
+                row_seq_lens=lens,
+                row_req=row_req,
+                rows_per_request=1,
+            )
+            expected = _packed(
+                pool_k, pool_v, req_to_token, row_req.int(), positions, lens,
+                requests, torch.bfloat16, width=row_width,
+            )  # fmt: skip
+            actual = _packed(
+                dev_k, dev_v, rows, torch.arange(requests, device="cuda"),
+                torch.where(rows >= 0, columns, -1),
+                torch.full((requests,), row_width, device="cuda", dtype=torch.int32),
+                requests, torch.bfloat16, width=row_width,
+            )  # fmt: skip
+            for got, ref in zip(actual, expected):
+                assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+            lengths += 1
+        # The verify accepts a prefix of the drafts: rewind before the next round.
+        lengths -= torch.randint(0, steps, (requests,), device="cuda")
+    assert crossed > 0
     if offload.fused is not None:
         assert int(offload.fused.errors) == 0
 

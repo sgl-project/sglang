@@ -166,7 +166,8 @@ def forward_offloaded_attention(
     topk_indices: torch.Tensor,
     trtllm_decode,
 ) -> torch.Tensor:
-    """Decode / target verify over the offload's per-forward device-row table."""
+    """Decode, target verify and draft extend over the offload's per-forward
+    device-row table."""
     pool = backend.token_to_kv_pool
     offload = backend._kv_offload
     layer_idx = pool.full_attention_layer_index(layer.layer_id)

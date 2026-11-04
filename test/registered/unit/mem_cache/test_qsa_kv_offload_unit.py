@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.qsa_kv_offload import (
     QSAKVOffloadBudget,
     QSAKVOffloadLayout,
     compute_offload_layout,
+    draft_extra_columns,
     offload_table_bytes_per_slot,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -59,6 +60,25 @@ class TestOffloadLayout(CustomTestCase):
                 max_extend_tokens=1024,
                 page_size=64,
             )
+
+    def test_draft_extra_columns_need_room_in_one_rows_cache(self):
+        # Draft decode rows: 512 blocks + the capture's 3-token partial block
+        # + 4 drafted positions (3 steps) may all precede the tail ring.
+        extra = draft_extra_columns(compress_ratio=CR, speculative_num_steps=3)
+        self.assertEqual(extra, 7)
+        kwargs = dict(
+            compress_ratio=CR,
+            token_topk=2048,
+            num_request_slots=9,
+            rows_per_request=1,
+            max_extend_tokens=1024,
+            page_size=64,
+            extra_columns=extra,
+        )
+        layout = compute_offload_layout(hot_blocks=519, **kwargs)
+        self.assertEqual(layout.extra_columns, 7)
+        with self.assertRaisesRegex(ValueError, "below 519"):
+            compute_offload_layout(hot_blocks=518, **kwargs)
 
     def test_refuses_more_rows_than_compress_ratio(self):
         with self.assertRaisesRegex(ValueError, "query rows per request"):
@@ -162,6 +182,8 @@ def _offload_args(**overrides):
         prefill=SimpleNamespace(backend=Backend.DISABLED),
     )
     values = dict(
+        enable_qsa_kv_offload=True,
+        qsa_kv_offload_draft=False,
         qsa_kv_offload_host_size=40,
         qsa_kv_offload_hot_blocks=1024,
         max_running_requests=8,
@@ -181,10 +203,21 @@ def _offload_args(**overrides):
         speculative_algorithm=None,
         speculative_eagle_topk=None,
         speculative_num_draft_tokens=None,
+        speculative_num_steps=None,
         cuda_graph_config=graphs,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+_MTP_DRAFT = dict(
+    qsa_kv_offload_draft=True,
+    speculative_algorithm="NEXTN",
+    speculative_eagle_topk=1,
+    speculative_num_draft_tokens=4,
+    speculative_num_steps=3,
+    qsa_kv_offload_hot_blocks=2048,
+)
 
 
 class TestOffloadArgs(CustomTestCase):
@@ -211,6 +244,20 @@ class TestOffloadArgs(CustomTestCase):
             ),
             _QSA_HF_CONFIG,
         )
+        check_qsa_kv_offload_args(_offload_args(**_MTP_DRAFT), _QSA_HF_CONFIG)
+
+    def test_draft_refusals(self):
+        cases = {
+            "needs --enable-qsa-kv-offload": dict(enable_qsa_kv_offload=False),
+            "needs an MTP draft": dict(
+                speculative_algorithm=None, speculative_num_draft_tokens=None
+            ),
+            "is below 2048": dict(qsa_kv_offload_hot_blocks=1024),
+        }
+        for message, overrides in cases.items():
+            args = _offload_args(**{**_MTP_DRAFT, **overrides})
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                check_qsa_kv_offload_args(args, _QSA_HF_CONFIG)
 
     def test_refusals(self):
         cases = {
@@ -263,7 +310,14 @@ class _OffloadSim:
     """Logical K/V pool plus an offload, driven like the QSA backend drives it."""
 
     def __init__(
-        self, *, rows_per_request, seed, device="cpu", pin=False, hot_blocks=None
+        self,
+        *,
+        rows_per_request,
+        seed,
+        device="cpu",
+        pin=False,
+        hot_blocks=None,
+        draft_steps=0,
     ):
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
@@ -271,17 +325,24 @@ class _OffloadSim:
         self.layers, self.heads, self.dim = 2, 2, 8
         self.block_topk = 16
         self.q = rows_per_request
+        self.draft_steps = draft_steps
         self.slots = 6  # request slot 0 is padding
         self.width = 1024
         self.pool_size = 8192
+        extra = (
+            draft_extra_columns(compress_ratio=CR, speculative_num_steps=draft_steps)
+            if draft_steps
+            else 0
+        )
         self.layout = compute_offload_layout(
             compress_ratio=CR,
             token_topk=self.block_topk * CR,
-            hot_blocks=self.q * self.block_topk + 3,
+            hot_blocks=max(self.q * self.block_topk, self.block_topk + extra) + 3,
             num_request_slots=self.slots,
             rows_per_request=self.q,
             max_extend_tokens=self.width,
             page_size=64,
+            extra_columns=extra,
         )
         if hot_blocks is not None:  # below the minimum compute_offload_layout allows
             self.layout = QSAKVOffloadLayout(
@@ -353,15 +414,23 @@ class _OffloadSim:
             self.offload.host_v[layer][slots.cpu()] = self.ref_v[layer][slots].cpu()
 
     def positions(self, qpos):
-        """Expanded QSA selection of one query row (valid positions first)."""
+        """Expanded QSA selection of one query row (valid positions first). An
+        MTP draft decode row reuses the selection captured at an earlier
+        position and appends the positions drafted since."""
+        anchor = qpos
+        if self.draft_steps:
+            anchor -= self.rng.randrange(self.draft_steps + 1)
         out = [-1] * (self.block_topk * CR + CR - 1)
-        tail_start = (qpos + 1) // CR * CR
+        tail_start = (anchor + 1) // CR * CR
         blocks = self.rng.sample(
             range(tail_start // CR), min(self.block_topk, tail_start // CR)
         )
         chosen = [b * CR + i for b in blocks for i in range(CR)]
-        chosen += list(range(tail_start, qpos + 1))
+        chosen += list(range(tail_start, anchor + 1))
         out[: len(chosen)] = chosen
+        if self.draft_steps:
+            drafted = range(anchor + 1, anchor + self.draft_steps + 2)
+            out += [p if p <= qpos else -1 for p in drafted]
         return out
 
     def step(self):
@@ -405,8 +474,10 @@ class _OffloadSim:
 
 
 class TestOffloadResolve(CustomTestCase):
-    def _run(self, rows_per_request, seed):
-        sim = _OffloadSim(rows_per_request=rows_per_request, seed=seed)
+    def _run(self, rows_per_request, seed, draft_steps=0):
+        sim = _OffloadSim(
+            rows_per_request=rows_per_request, seed=seed, draft_steps=draft_steps
+        )
         for req in range(1, sim.slots):
             sim.extend(req, sim.rng.randrange(200, 400))
         for step in range(60):
@@ -418,6 +489,9 @@ class TestOffloadResolve(CustomTestCase):
 
     def test_decode(self):
         self._run(rows_per_request=1, seed=1)
+
+    def test_draft_decode_rows(self):
+        self._run(rows_per_request=1, seed=21, draft_steps=3)
 
     def test_chain_verify_with_rejections(self):
         for q in (2, 3, CR):

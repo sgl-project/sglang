@@ -809,7 +809,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         if self._kv_offload is not None:
             mode = forward_batch.forward_mode
             is_extend = mode == ForwardMode.EXTEND
-            if not (is_extend or mode.is_decode() or mode.is_target_verify()):
+            # The MTP draft's DRAFT_EXTEND_V2 is a fixed-width multi-row forward,
+            # resolved like a target verify.
+            if not (
+                is_extend or mode.is_decode() or self._is_speculative_paged_mode(mode)
+            ):
                 raise NotImplementedError(
                     f"QSA K/V offload does not support {mode.name} forwards"
                 )
@@ -2244,6 +2248,11 @@ class QwenSparseMultiStepDraftBackend:
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0
+        # Every step shares the draft pool's offload; the replay paths below
+        # do not all reach _replay_cuda_graph_metadata, which sets it.
+        offload = self.attn_backends[0]._kv_offload if self.attn_backends else None
+        if offload is not None:
+            offload.set_num_real(forward_batch.batch_size - num_padding)
         if forward_batch.seq_lens.is_cuda and self.attn_backends:
             from sglang.srt.layers.attention.qsa.graph_metadata import (
                 launch_draft_graph_metadata,

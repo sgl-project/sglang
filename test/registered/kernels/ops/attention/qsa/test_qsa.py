@@ -505,6 +505,8 @@ def test_qsa_mtp_cuda_graph_padding_stays_below_compression_boundary():
     backend, forward_batch, _ = _make_mtp_draft_batch(steps=4, seq_lens=(3, 1))
 
     class Recorder:
+        _kv_offload = None
+
         def __init__(self):
             self.capture_lengths = None
             self.replay_lengths = None

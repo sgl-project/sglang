@@ -360,15 +360,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         layout = offload_layout_from_config(
             hf_config=model_config.hf_config, num_request_slots=1, page_size=page_size
         )
+        offloaded_layers = num_layers
+        if get_memory().qsa_kv_offload_draft:
+            # The MTP draft pool has the same layout and per-layer K/V size (as
+            # the cell's draft share assumes), so its layers just add up.
+            draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
+            if draft_layers <= 0:
+                raise ValueError(
+                    "--qsa-kv-offload-draft needs an MTP draft model with QSA layers"
+                )
+            offloaded_layers += draft_layers
         return QSAKVOffloadBudget(
             offloaded_bytes_per_token=kv_heads
             * (model_config.head_dim + model_config.v_head_dim)
-            * num_layers
+            * offloaded_layers
             * torch._utils._element_size(kvc.kv_cache_dtype),
             region_rows=layout.region_rows,
             fixed_rows=layout.scratch_rows + page_size,
             table_bytes_per_slot=offload_table_bytes_per_slot(
-                num_layers=num_layers,
+                num_layers=offloaded_layers,
                 hot_blocks=layout.hot_blocks,
                 compress_ratio=layout.compress_ratio,
                 context_len=model_config.context_len + page_size,

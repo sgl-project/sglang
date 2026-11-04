@@ -2573,7 +2573,15 @@ class KVCacheConfigurator:
                 f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
                 "compressed QSA indexer (Qwen4-Exp); this model has none"
             )
+        offload = get_memory().enable_qsa_kv_offload and (
+            not self.is_draft_worker or get_memory().qsa_kv_offload_draft
+        )
         if qsa_profile is None:
+            if offload:
+                raise ValueError(
+                    "--enable-qsa-kv-offload sized this pool's K/V for the host, "
+                    "but the model has no compressed QSA indexer"
+                )
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
         else:
@@ -2586,7 +2594,7 @@ class KVCacheConfigurator:
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
             )
-            if get_memory().enable_qsa_kv_offload and not self.is_draft_worker:
+            if offload:
                 from sglang.srt.mem_cache.qsa_kv_offload import (
                     offload_layout_from_config,
                 )
@@ -2602,6 +2610,7 @@ class KVCacheConfigurator:
                     hf_config=self.model_config.hf_config,
                     num_request_slots=num_request_slots,
                     page_size=self.pool_page_size,
+                    draft=self.is_draft_worker,
                 )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
