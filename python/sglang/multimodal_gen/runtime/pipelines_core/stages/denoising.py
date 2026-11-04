@@ -38,7 +38,7 @@ from sglang.kernels.ops.diffusion import (
     QualityGatedFusion,
 )
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.base import STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     FluxPipelineConfig,
@@ -48,7 +48,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows,
     resolve_skip_softmax_params,
 )
-from sglang.multimodal_gen.configs.task_type import get_request_task_type
+from sglang.multimodal_gen.configs.task_type import ModelTaskType, get_request_task_type
 from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
 )

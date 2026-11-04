@@ -68,6 +68,8 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged_dsa,
 )
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
+from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
@@ -78,17 +80,15 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
-    GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    RadixAttention,
     unwrap_write_loc,
 )
-from sglang.srt.mem_cache.utils import get_mla_kv_buffer_triton
 from sglang.srt.utils import ceil_div, get_bool_env_var, is_cuda
 from sglang.srt.utils.common import ceil_align
 

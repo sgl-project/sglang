@@ -9,11 +9,13 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
-    Fp8GridActivation,
-    Mxfp8Activation,
     rmsnorm_fake_quant_row,
     rmsnorm_row_chunk,
     row_major_2d,
+)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_gfx95_supported, is_hip
