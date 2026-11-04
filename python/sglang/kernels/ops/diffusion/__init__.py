@@ -46,15 +46,9 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
-        "diffusion.pixel_norm_silu",
+        "diffusion.depthwise_conv3x3_bias_glu",
         KernelBackend.KDA,
-        "sglang.kernels.kda_kernels.pixel_norm_silu:pixel_norm_silu",
-        _CUDA,
-    ),
-    (
-        "diffusion.replicate_reflect_pad3d",
-        KernelBackend.KDA,
-        "sglang.kernels.kda_kernels.replicate_reflect_pad3d:replicate_reflect_pad3d",
+        "sglang.kernels.kda_kernels.sana_depthwise_glu_triton:fused_depthwise_conv3x3_bias_glu",
         _CUDA,
     ),
     (
@@ -490,6 +484,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.pixel_norm_silu",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.pixel_norm_silu:pixel_norm_silu",
+        _CUDA,
+    ),
+    (
         "diffusion.channel_rmsnorm_finish_silu",
         KernelBackend.JIT,
         "norm.channel_rmsnorm_finish_silu_jit:channel_rmsnorm_finish_silu",
@@ -646,6 +646,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.replicate_reflect_pad3d",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.replicate_reflect_pad3d:replicate_reflect_pad3d",
+        _CUDA,
+    ),
+    (
         "diffusion.nearest_upsample_nhwc",
         KernelBackend.TRITON,
         "layout.nearest_upsample_nhwc_triton:nearest_upsample_nhwc",
@@ -678,8 +684,6 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
-    "pixel_norm_silu": "sglang.kernels.kda_kernels.pixel_norm_silu",
-    "replicate_reflect_pad3d": "sglang.kernels.kda_kernels.replicate_reflect_pad3d",
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
@@ -726,6 +730,7 @@ _EXPORTS: dict[str, str] = {
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
+    "pixel_norm_silu": "sglang.kernels.kda_kernels.pixel_norm_silu",
     "channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "can_use_channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
     "channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
@@ -825,6 +830,7 @@ _EXPORTS: dict[str, str] = {
     # Activation-function fusions
     "fused_bias_glu": "activation.sana_conv_post_triton",
     "fused_bias_silu": "activation.sana_conv_post_triton",
+    "fused_depthwise_conv3x3_bias_glu": "sglang.kernels.kda_kernels.sana_depthwise_glu_triton",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_temporal_pad": "sglang.kernels.kda_kernels.silu_temporal_pad",
@@ -893,6 +899,7 @@ _EXPORTS: dict[str, str] = {
     "dup_up3d_add": "layout.wan_causal_cache_triton",
     "conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
     "can_use_conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
+    "replicate_reflect_pad3d": "sglang.kernels.kda_kernels.replicate_reflect_pad3d",
     "nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "can_use_nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",

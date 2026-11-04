@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 

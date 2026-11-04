@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
     _check_device_pools_present,
-    _DsaStrategy,
+    _KvStrategy,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
@@ -176,6 +176,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         hicache_mem_layout="layer_first",
                         hicache_write_policy="write_through",
                         hicache_io_backend="kernel",
+                        hicache_host_memory_mode="cache",
                         hicache_size=0,
                     )
                     group, _ = hybrid_pool_assembler.build_minimax_sparse_hicache_stack(
@@ -414,8 +415,6 @@ class TestMambaInfoRouting(CustomTestCase):
                                         full_kv_pool=kv,
                                         swa_kv_pool=kv,
                                         swa_layer_mapping={1: 0},
-                                        page_size=1,
-                                        tp_group=None,
                                     )
                                 )
                             else:
@@ -423,7 +422,6 @@ class TestMambaInfoRouting(CustomTestCase):
                                     hybrid_pool_assembler.build_hybrid_mamba_stack(
                                         **common,
                                         kv_pool=kv,
-                                        use_mla=False,
                                     )
                                 )
                         entry = group.entry_map[PoolName.MAMBA]
@@ -493,7 +491,13 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             size=800,
             start_layer=0,
             layer_shard_enabled=False,
-            get_device_pool_infos=lambda: (SimpleNamespace(buffer_info=object()),),
+            get_device_pool_infos=lambda: (
+                SimpleNamespace(
+                    pool_name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    buffer_info=object(),
+                ),
+            ),
         )
         draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
         draft_host_pool = SimpleNamespace(layer_num=1)
@@ -738,6 +742,16 @@ def _kv_pool_stub(*, layer_num: int, size: int = 4096):
     pool.qk_rope_head_dim = 64
     pool.kv_cache_dim = 576
     pool.layer_shard_enabled = False
+    pool.page_size = 64
+    pool.model_layer_ids = tuple(range(layer_num))
+    pool.kv_buffer = [
+        torch.empty((128, 1, 576), dtype=pool.store_dtype) for _ in range(layer_num)
+    ]
+    pool.data_ptrs = torch.tensor(
+        [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
+    )
+    pool.kv_scale_buffer = None
+    pool.dsa_kv_cache_store_fp8 = False
     return pool
 
 
@@ -962,7 +976,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 ),
             ),
         ):
-            result = _DsaStrategy().build(
+            result = _KvStrategy().build(
                 cache=None,
                 kvcache=pool,
                 params=_target_params((draft,)),
@@ -994,8 +1008,7 @@ class TestDeclaredStackStructure(CustomTestCase):
         )
 
     def test_plain_mla_target(self):
-        # A pool that declares KV only builds the anchor-only group the removed
-        # build_kv_only_stack built, packed draft included.
+        # A pool that declares KV only builds an anchor-only group, packed draft included.
         for drafts in (0, 1):
             with self.subTest(drafts=drafts):
                 pool = _kv_pool_stub(layer_num=3)
@@ -1090,7 +1103,7 @@ class TestKvHostPoolRow(CustomTestCase):
     store is wider than kv_lora_rank + qk_rope_head_dim) and refuses packed
     drafts whose KV rows differ from the target's."""
 
-    def _build(self, pool, drafts=()):
+    def _build(self, pool, drafts=(), host_cls=None):
         seen = {}
         for device_pool in (pool, *drafts):
             device_pool.model_layer_ids = tuple(range(device_pool.layer_num))
@@ -1118,7 +1131,9 @@ class TestKvHostPoolRow(CustomTestCase):
             return SimpleNamespace(layer_num=kwargs["target_layer_num"])
 
         with (
-            patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
+            patch.object(
+                hybrid_pool_assembler, "MLATokenToKVPoolHost", host_cls or fake_host
+            ),
             patch.object(
                 hybrid_pool_assembler,
                 "get_parallel",
@@ -1151,8 +1166,11 @@ class TestKvHostPoolRow(CustomTestCase):
         pool = _dsa_pool_stub(layer_num=2)
         draft = _dsa_pool_stub(layer_num=1)
         draft.store_dtype = torch.float8_e4m3fn
+        # The host rejects the draft before it allocates anything.
         with self.assertRaisesRegex(ValueError, "KV row"):
-            self._build(pool, (draft,))
+            self._build(
+                pool, (draft,), host_cls=hybrid_pool_assembler.MLATokenToKVPoolHost
+            )
         self._build(pool, (_dsa_pool_stub(layer_num=1),))
 
 
@@ -1261,7 +1279,6 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 start_layer=0,
                 load_cache_event=None,
                 storage_backend=None,
-                use_mla=True,
             )
 
         self.addCleanup(group.get_pool(PoolName.INDEXER).destroy)
@@ -1324,6 +1341,14 @@ class TestHostPoolPreflight(CustomTestCase):
                     for layers in (2, 1):
                         pool = object.__new__(MHATokenToKVPool)
                         pool.layer_num = layers
+                        pool.model_layer_ids = tuple(range(layers))
+                        pool.get_device_pool_infos = lambda: (
+                            SimpleNamespace(
+                                pool_name=PoolName.KV,
+                                indices_from_pool=PoolName.KV,
+                                buffer_info=object(),
+                            ),
+                        )
                         pool.layer_shard_enabled = False
                         pool.head_num = 1
                         pool.head_dim = pool.v_head_dim = 128
@@ -1347,21 +1372,19 @@ class TestHostPoolPreflight(CustomTestCase):
                 else:
                     self.assertEqual(config.sidecars, ())
 
-    def test_incompatible_packed_buffers_fail_before_allocation(self):
+    def test_incompatible_packed_index_fails_before_allocation(self):
         target = _dsa_pool_stub(layer_num=2)
-        bad_kv = _dsa_pool_stub(layer_num=1)
-        bad_kv.store_dtype = torch.float8_e4m3fn
         bad_index = _dsa_pool_stub(layer_num=1)
         # Same 132 bytes per row, different key/scale format.
         bad_index.index_head_dim = 132
         bad_index.quant_block_size = 256
-        for draft, error in ((bad_kv, "KV row"), (bad_index, "index key layout")):
+        for draft, error in ((bad_index, "index key layout"),):
             with (
                 self.subTest(error=error),
                 patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,
             ):
                 with self.assertRaisesRegex(ValueError, error):
-                    _DsaStrategy().build(
+                    _KvStrategy().build(
                         cache=None,
                         kvcache=target,
                         params=_target_params((draft,)),
@@ -1416,26 +1439,19 @@ class TestDeclaredPoolVerification(CustomTestCase):
     def _result_with(self, *names):
         group = SimpleNamespace(entry_map={n: object() for n in names})
         return StackBuildResult(
-            host_pool_group=group, cache_controller=None, component_host_pools={}
+            host_pool_group=group,
+            cache_controller=None,
+            component_host_pools={},
+            device_pool_names=(PoolName.KV, PoolName.INDEXER),
         )
 
-    def test_unmigrated_strategy_logs_missing_indexer(self):
-        pool = _dsa_pool_stub(layer_num=2)
-        with self.assertLogs(hybrid_pool_assembler.logger, level="ERROR") as logs:
-            _check_device_pools_present(
-                kvcache=pool,
-                result=self._result_with(PoolName.KV),
-                strategy=_SwaStrategy(),
-            )
-        self.assertIn("indexer", logs.output[0])
-
-    def test_migrated_strategy_raises_on_missing_indexer(self):
+    def test_missing_declared_indexer_raises(self):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertRaisesRegex(ValueError, "indexer"):
             _check_device_pools_present(
                 kvcache=pool,
                 result=self._result_with(PoolName.KV),
-                strategy=_DsaStrategy(),
+                strategy=_KvStrategy(),
             )
 
     def test_complete_stack_passes_silently(self):
@@ -1443,7 +1459,7 @@ class TestDeclaredPoolVerification(CustomTestCase):
         _check_device_pools_present(
             kvcache=pool,
             result=self._result_with(PoolName.KV, PoolName.INDEXER),
-            strategy=_DsaStrategy(),
+            strategy=_KvStrategy(),
         )
 
 
@@ -1474,7 +1490,6 @@ class TestTransferLayerSpan(CustomTestCase):
                 swa_kv_pool=MagicMock(),
                 full_layer_mapping=full_layer_mapping,
                 swa_layer_mapping=swa_layer_mapping,
-                use_mla=False,
             )
 
         self.assertEqual(
@@ -1904,7 +1919,6 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
                             swa_kv_pool=swa,
                             full_layer_mapping={0: 0, 2: 1},
                             swa_layer_mapping={1: 0},
-                            use_mla=False,
                             mtp_swa_full_device_pools=(first, second),
                             transfer_layer_id_max=3,
                         )
@@ -1936,40 +1950,44 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
 
 
 class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
-    """The full + window + state stack builds its controller and state host the
-    way the full + window and full + state stacks do."""
+    """Every stack builds its controller and state host the same way."""
 
-    def test_passes_the_attention_groups(self):
+    def test_controller_takes_groups_and_host_memory_mode(self):
+        """Stacks once dropped the attention groups or the host memory mode."""
         params = SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(
-                state=SimpleNamespace(pool=object())
-            ),
+            token_to_kv_pool_allocator=object(),
+            page_size=1,
             tp_cache_group=object(),
             pp_cache_group=object(),
             attn_cp_cache_group=object(),
             attn_tp_cache_group=object(),
         )
-        kvcache = SimpleNamespace(
-            layers_mapping={0: (0, False), 1: (0, True)},
-            start_layer=0,
-            full_kv_pool=object(),
-            swa_kv_pool=object(),
+        memory = SimpleNamespace(
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="buffer_only",
         )
-        with patch.object(
-            hybrid_pool_assembler,
-            "build_hybrid_mamba_swa_stack",
-            return_value=(MagicMock(), MagicMock()),
-        ) as build:
-            _MambaSwaStrategy().build(
-                cache=SimpleNamespace(page_size=1),
-                kvcache=kvcache,
+        with (
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "HybridCacheController") as ctor,
+        ):
+            hybrid_pool_assembler._build_cache_controller(
                 params=params,
-                server_args=None,
+                host_pool_group=object(),
+                transfer_layer_id_max=2,
                 load_cache_event=None,
+                storage_backend=None,
+                prefetch_threshold=256,
+                model_name=None,
+                storage_backend_extra_config=None,
+                enable_storage_metrics=False,
             )
-        kwargs = build.call_args.kwargs
+        kwargs = ctor.call_args.kwargs
+        self.assertIs(ctor.call_args.args[3], params.tp_cache_group)
         self.assertIs(kwargs["attn_cp_group"], params.attn_cp_cache_group)
         self.assertIs(kwargs["attn_tp_group"], params.attn_tp_cache_group)
+        self.assertIs(kwargs["pp_group"], params.pp_cache_group)
+        self.assertEqual(kwargs["host_memory_mode"], "buffer_only")
 
     def test_state_host_has_no_kv_split(self):
         for layout, expected in (
