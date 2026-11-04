@@ -357,6 +357,123 @@ class TestDecodeAttention(CustomTestCase):
                 kvcache_dtype=torch.float8_e4m3fn,
             )
 
+    def _test_decode_attention_swa_mapping_case(
+        self, B, H_Q, H_KV, D, D_V, seq_len, window_size
+    ):
+        max_tokens_full = 500
+        max_tokens_swa = 120
+        max_context_len = seq_len + 32
+
+        q = torch.randn(B, H_Q, D, dtype=torch.bfloat16)
+        k_buffer_swa = torch.randn(max_tokens_swa, H_KV, D, dtype=torch.bfloat16)
+        v_buffer_swa = torch.randn(max_tokens_swa, H_KV, D_V, dtype=torch.bfloat16)
+
+        # Poison slot 0 with NaN: valid swa_id allocations start at >= 1.
+        # Any unexpected access to expired or unmapped tokens (which clamp to 0)
+        # will read NaN and fail the test.
+        k_buffer_swa[0].fill_(float("nan"))
+        v_buffer_swa[0].fill_(float("nan"))
+
+        # Deliberately initialize mapping to an out-of-bounds sentinel (99999).
+        # Any access to expired tokens outside the window will trigger out-of-bounds
+        # if the kernel fails to respect kv_offset.
+        full_to_swa_mapping = torch.full((max_tokens_full,), 99999, dtype=torch.int64)
+
+        active_start = max(0, seq_len - window_size)
+        req_to_token_virtual = torch.zeros(B, max_context_len, dtype=torch.int64)
+        req_to_token_mapped = torch.zeros(B, max_context_len, dtype=torch.int64)
+
+        for b in range(B):
+            # Expired tokens outside the sliding window: assign virtual IDs with no valid SWA mapping
+            for pos in range(active_start):
+                v_id = pos + 1
+                req_to_token_virtual[b, pos] = v_id
+                req_to_token_mapped[b, pos] = 0
+
+            # Active window tokens: map to valid SWA slots
+            for pos in range(active_start, seq_len):
+                v_id = 200 + b * window_size + (pos - active_start)
+                swa_id = 1 + (b * window_size + (pos - active_start)) % (
+                    max_tokens_swa - 1
+                )
+                full_to_swa_mapping[v_id] = swa_id
+                req_to_token_virtual[b, pos] = v_id
+                req_to_token_mapped[b, pos] = swa_id
+
+        req_pool_indices = torch.arange(B, dtype=torch.int64)
+        seq_lens = torch.full((B,), seq_len, dtype=torch.int64)
+        num_kv_splits = 8
+
+        out1 = torch.empty(B, H_Q, D_V, dtype=torch.bfloat16)
+        attn_logits1 = torch.empty(B, H_Q, num_kv_splits, D_V + 1, dtype=torch.float32)
+        loc = torch.zeros(B, dtype=torch.int64)
+
+        torch.ops.sgl_kernel.decode_attention_cpu(
+            q,
+            k_buffer_swa,
+            v_buffer_swa,
+            1.0,
+            1.0,
+            out1,
+            None,
+            None,
+            loc,
+            attn_logits1,
+            req_to_token_virtual,
+            req_pool_indices,
+            seq_lens,
+            1.0 / (D**0.5),
+            0.0,
+            False,
+            window_size,
+            None,
+            None,
+            full_to_swa_mapping,
+        )
+
+        out2 = torch.empty(B, H_Q, D_V, dtype=torch.bfloat16)
+        attn_logits2 = torch.empty(B, H_Q, num_kv_splits, D_V + 1, dtype=torch.float32)
+
+        torch.ops.sgl_kernel.decode_attention_cpu(
+            q,
+            k_buffer_swa,
+            v_buffer_swa,
+            1.0,
+            1.0,
+            out2,
+            None,
+            None,
+            loc,
+            attn_logits2,
+            req_to_token_mapped,
+            req_pool_indices,
+            seq_lens,
+            1.0 / (D**0.5),
+            0.0,
+            False,
+            window_size,
+            None,
+            None,
+            None,
+        )
+
+        self.assertFalse(torch.isnan(out1).any(), "out1 contains NaN!")
+        self.assertTrue(torch.allclose(out1, out2, atol=1e-3, rtol=1e-3))
+
+    def test_decode_attention_swa_mapping(self):
+        # 1. GQA branch (H_Q != H_KV) with sliding window (seq_len > window_size)
+        self._test_decode_attention_swa_mapping_case(
+            B=2, H_Q=8, H_KV=2, D=64, D_V=64, seq_len=70, window_size=20
+        )
+        # 2. MHA branch (H_Q == H_KV) with sliding window
+        self._test_decode_attention_swa_mapping_case(
+            B=2, H_Q=4, H_KV=4, D=64, D_V=64, seq_len=70, window_size=20
+        )
+        # 3. Case where seq_len <= window_size (no tokens clipped)
+        self._test_decode_attention_swa_mapping_case(
+            B=2, H_Q=4, H_KV=2, D=64, D_V=64, seq_len=15, window_size=20
+        )
+
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")
 

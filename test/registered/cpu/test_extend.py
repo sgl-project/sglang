@@ -444,6 +444,125 @@ class TestExtendAttention(CustomTestCase):
             b_seq_len_extend=[37],
         )
 
+    def _test_extend_attention_swa_mapping_case(
+        self, B, H_Q, H_KV, D, D_V, seq_len_prefix, seq_len_extend, window_size
+    ):
+        total_tokens = sum(seq_len_extend)
+        seq_lens_list = [p + e for p, e in zip(seq_len_prefix, seq_len_extend)]
+        max_seq_len = max(seq_lens_list)
+        max_context_len = max_seq_len + 32
+        max_tokens_full = 1000
+        max_tokens_swa = 200
+
+        q = torch.randn(total_tokens, H_Q, D, dtype=torch.bfloat16)
+        k_buffer_swa = torch.randn(max_tokens_swa, H_KV, D, dtype=torch.bfloat16)
+        v_buffer_swa = torch.randn(max_tokens_swa, H_KV, D_V, dtype=torch.bfloat16)
+        k_buffer_swa[0].fill_(float("nan"))
+        v_buffer_swa[0].fill_(float("nan"))
+
+        full_to_swa_mapping = torch.zeros(max_tokens_full, dtype=torch.int64)
+
+        req_to_token_virtual = torch.zeros(B, max_context_len, dtype=torch.int64)
+        req_to_token_mapped = torch.zeros(B, max_context_len, dtype=torch.int64)
+
+        for b in range(B):
+            total_seq_len = seq_lens_list[b]
+            window_start = max(0, seq_len_prefix[b] - window_size + 1)
+            for pos in range(total_seq_len):
+                v_id = 300 + b * 100 + pos
+                req_to_token_virtual[b, pos] = v_id
+                if pos >= window_start:
+                    swa_id = 1 + (b * 50 + pos) % (max_tokens_swa - 1)
+                    full_to_swa_mapping[v_id] = swa_id
+                    req_to_token_mapped[b, pos] = swa_id
+
+        req_pool_indices = torch.arange(B, dtype=torch.int64)
+        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64)
+        extend_seq_lens = torch.tensor(seq_len_extend, dtype=torch.int64)
+        extend_start_loc = torch.zeros(B, dtype=torch.int64)
+        extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+
+        out1 = torch.empty(total_tokens, H_Q, D_V, dtype=torch.bfloat16)
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q,
+            None,
+            None,
+            out1,
+            k_buffer_swa,
+            v_buffer_swa,
+            1.0,
+            1.0,
+            req_to_token_virtual,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max(seq_len_extend),
+            1.0 / (D**0.5),
+            0.0,
+            False,
+            window_size,
+            None,
+            None,
+            None,
+            True,
+            full_to_swa_mapping,
+        )
+
+        out2 = torch.empty(total_tokens, H_Q, D_V, dtype=torch.bfloat16)
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q,
+            None,
+            None,
+            out2,
+            k_buffer_swa,
+            v_buffer_swa,
+            1.0,
+            1.0,
+            req_to_token_mapped,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max(seq_len_extend),
+            1.0 / (D**0.5),
+            0.0,
+            False,
+            window_size,
+            None,
+            None,
+            None,
+            True,
+            None,
+        )
+
+        self.assertFalse(torch.isnan(out1).any(), "out1 contains NaN!")
+        self.assertTrue(torch.allclose(out1, out2, atol=1e-3, rtol=1e-3))
+
+    def test_extend_attention_swa_mapping(self):
+        # 1. Multi-token extend with prefix across block boundary
+        self._test_extend_attention_swa_mapping_case(
+            B=2,
+            H_Q=8,
+            H_KV=2,
+            D=64,
+            D_V=64,
+            seq_len_prefix=[45, 59],
+            seq_len_extend=[13, 7],
+            window_size=29,
+        )
+        # 2. Extend with seq_len <= window_size
+        self._test_extend_attention_swa_mapping_case(
+            B=2,
+            H_Q=4,
+            H_KV=4,
+            D=64,
+            D_V=64,
+            seq_len_prefix=[10, 15],
+            seq_len_extend=[4, 2],
+            window_size=32,
+        )
+
     def test_extend_attention_bidirectional(self):
         # Test for is_causal=False: encoder-only self-attention (e.g. bge-reranker)
         self._test_extend_attention_once(

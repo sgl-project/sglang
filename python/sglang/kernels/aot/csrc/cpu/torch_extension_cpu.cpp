@@ -275,7 +275,8 @@ void decode_attention_cpu(
     bool is_cross_attn,
     int64_t slidling_window_size,
     std::optional<at::Tensor> encoder_lens,
-    std::optional<at::Tensor> sinks);
+    std::optional<at::Tensor> sinks,
+    std::optional<at::Tensor> full_to_swa_mapping = std::nullopt);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -299,7 +300,8 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask,
-    bool is_causal = true);
+    bool is_causal = true,
+    std::optional<at::Tensor> full_to_swa_mapping = std::nullopt);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -824,7 +826,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, float k_cache_scale, float "
       "v_cache_scale, Tensor(a!) output, Tensor? key, Tensor? value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
+      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks, Tensor? "
+      "full_to_swa_mapping=None) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
@@ -834,7 +837,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
-      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True) -> ()");
+      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True, Tensor? full_to_swa_mapping=None) -> "
+      "()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
