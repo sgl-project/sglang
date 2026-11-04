@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -49,7 +50,6 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
-    generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,

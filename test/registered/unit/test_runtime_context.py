@@ -23,9 +23,10 @@ import sglang as _sglang
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import prefill_buffer_ceiling
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
-from sglang.srt.arg_groups.model_override_base import resolving_view
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    resolved_view,
+    resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
     mamba_cache_chunk_size as mamba_cache_chunk_size_of,
@@ -35,7 +36,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.arg_groups.overrides import (
     resolution_result,
-    resolved_view,
 )
 from sglang.srt.runtime_context import (
     Flags,
