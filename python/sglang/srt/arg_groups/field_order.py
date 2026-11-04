@@ -565,5 +565,6 @@ POSITIONAL_FIELD_ORDER = (
     "output_store_backend_extra_config",
     "remote_instance_weight_loader_start_seed_via_nixl",
     "enable_token_space_processor",
+    "remote_instance_weight_loader_start_seed_via_mori",
 )
 # fmt: on
