@@ -794,10 +794,13 @@ class OpenAIServingChat(OpenAIServingBase):
             # The encoder renders tool_choice="none" with or without tools, so a
             # client's explicit "none" reaches it either way; the default "none"
             # of a request without tools does not.
-            if isinstance(request.tool_choice, str) and (
-                (effective_tools and request.tool_choice in ("required", "none"))
-                or (request.tool_choice == "none" and request._tool_choice_explicit)
-            ):
+            passes_tool_choice = (
+                request.tool_choice == "required" and effective_tools
+            ) or (
+                request.tool_choice == "none"
+                and (effective_tools or request._tool_choice_explicit)
+            )
+            if passes_tool_choice:
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
             if request.response_format is not None:
                 template_kwargs.setdefault(
