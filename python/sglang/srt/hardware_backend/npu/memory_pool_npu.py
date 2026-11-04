@@ -758,9 +758,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 # index_size, not self.size: the indexer is replicated.
-                index_pages = (
-                    self.index_size // self.index_page_size + self.index_page_padding
-                )
                 use_quant_indexer = (
                     self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0
                 )
@@ -776,13 +773,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     # One allocation per layer: [P*128 FP8 bytes][P FP32 scales].
                     index_shape = (
                         self.num_indexer_layers,
-                        index_pages,
+                        self.index_size // self.index_page_size
+                        + self.index_page_padding,
                         self.index_page_size * (self.index_head_dim + 4),
                     )
                 else:
                     index_shape = (
                         self.num_indexer_layers,
-                        index_pages,
+                        self.index_size // self.index_page_size
+                        + self.index_page_padding,
                         self.index_page_size,
                         1,
                         self.index_head_dim,
