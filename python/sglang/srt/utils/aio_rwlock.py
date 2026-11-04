@@ -60,14 +60,18 @@ class RWLock:
         async with self._lock:
             # Increment the count of writers waiting
             self._waiting_writers += 1
+            acquired = False
             try:
                 # Wait while either a writer is active or readers are present
                 while self._writer_active or self._readers > 0:
                     await self._cond.wait()
                 self._writer_active = True
+                acquired = True
             finally:
-                # Decrement waiting writers only after we've acquired the writer lock
                 self._waiting_writers -= 1
+                # A cancelled writer may make waiting readers eligible to run.
+                if not acquired:
+                    self._cond.notify_all()
 
     async def release_writer(self):
         async with self._lock:
