@@ -150,7 +150,7 @@ sglang serve \
 ### 5.1.1 Low Concurrency (Latency-Optimized)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
   --dataset-name random \
@@ -203,7 +203,7 @@ Max ITL (ms):                            10.44
 ### 5.1.2 Medium Concurrency (Balanced)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
   --dataset-name random \
@@ -255,7 +255,7 @@ Max ITL (ms):                            74.05
 ### 5.1.3 High Concurrency (Throughput-Optimized)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
   --dataset-name random \
@@ -328,7 +328,7 @@ sglang serve \
 ### 5.2.1 Low Concurrency (Latency-Optimized)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model meta-llama/Llama-4-Maverick-17B-128E-Instruct \
   --dataset-name random \
@@ -380,7 +380,7 @@ Max ITL (ms):                            7.02
 ### 5.2.2 Medium Concurrency (Balanced)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model meta-llama/Llama-4-Maverick-17B-128E-Instruct \
   --dataset-name random \
@@ -432,7 +432,7 @@ Max ITL (ms):                            868.54
 ### 5.2.3 High Concurrency (Throughput-Optimized)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model meta-llama/Llama-4-Maverick-17B-128E-Instruct \
   --dataset-name random \

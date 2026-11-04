@@ -121,7 +121,8 @@ def find_transition_steps(
     for stage, threshold in stage_sigmas.items():
         if stage == 1:
             continue
-        found = n_steps
+        # A threshold never reached still needs a full-res step to upsample into.
+        found = n_steps - 1
         for step_index in range(n_steps):
             if sigmas_list[step_index] <= threshold:
                 found = step_index

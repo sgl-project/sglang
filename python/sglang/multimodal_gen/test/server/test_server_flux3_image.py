@@ -87,6 +87,7 @@ def test_grouped_requests_multi_output_and_repeat(diffusion_server):
 
     for editing in (False, True):
         serial = [generate(index, editing)[0] for index in range(2)]
+        np.testing.assert_array_equal(generate(editing=editing)[0], serial[0])
         barrier = Barrier(2)
         with ThreadPoolExecutor(2) as pool:
             grouped = list(

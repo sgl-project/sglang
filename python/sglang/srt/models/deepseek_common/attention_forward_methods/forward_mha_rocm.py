@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -110,12 +111,11 @@ class DeepseekMHARocmForwardMixin:
                     )
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
-                        self.indexer,
+                        self.run_mla_indexer,
                         hidden_states=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
-                        layer_id=self.layer_id,
                     )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
@@ -329,7 +329,7 @@ class DeepseekMHARocmForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _use_aiter_gfx95:
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),
                 kv_a.unsqueeze(1),
@@ -338,7 +338,7 @@ class DeepseekMHARocmForwardMixin:
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
-            get_token_to_kv_pool().set_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store(
                 self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
@@ -349,14 +349,14 @@ class DeepseekMHARocmForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _use_aiter_gfx95:
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
+            kv_a, k_pe = (
+                get_kv_layers()
+                .read(self.attn_mha.layer_id)
+                .read_mla(self.attn_mha, kv_indices, dst_dtype)
             )
             kv_a = kv_a.squeeze(1)
         else:
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = get_kv_layers().read(self.attn_mha.layer_id).key()
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1

@@ -85,17 +85,6 @@ class MusaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable MUSA "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
     def is_full_mtlink(cls, device_ids: list[int]) -> bool:
         raise NotImplementedError
 
@@ -375,10 +364,3 @@ try:
         MusaPlatform.log_warnings()
 except ModuleNotFoundError:
     MusaPlatform.log_warnings()
-
-if __name__ == "__main__":
-    print(MusaPlatform.__name__)
-    print(MusaPlatform.get_device_name())
-    print(MusaPlatform.get_device_capability())
-    print(MusaPlatform.get_device_total_memory())
-    print(MusaPlatform.is_full_mtlink([0, 1, 2, 3, 4, 5, 6, 7]))
