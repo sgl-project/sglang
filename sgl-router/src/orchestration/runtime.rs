@@ -18,6 +18,7 @@ use sgl_kv_orchestrator::backend_protection::{
 use sgl_kv_orchestrator::{
     models::{PrefixTarget, SessionIdentity},
     operations::{DemandBook, DemandId},
+    preparation::{Estimate, PreparationCosts},
     protocol::{parse_action, Action},
     session_index::{
         Association, AssociationProvenance, ContentKey, ContentRegistration, RequestIdentity,
@@ -247,6 +248,16 @@ fn digest(value: &impl Serialize) -> String {
         )
     )
 }
+fn preparation_owner(url: &str, caps: &Capabilities) -> String {
+    digest(&(
+        url,
+        &caps.engine_id,
+        &caps.epoch,
+        &caps.compatibility,
+        &caps.public["storage_backend"],
+        &caps.public["backend_namespace"],
+    ))
+}
 fn task(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     Ok(SessionIdentity {
         caller_id: caller.into(),
@@ -349,6 +360,7 @@ struct Job {
     cache_watermark: Value,
     ready_end: u64,
     ready_at: Option<Instant>,
+    preparation_estimate: Option<Estimate>,
 }
 struct Intent {
     fingerprint: String,
@@ -383,6 +395,7 @@ struct Actor {
     tick_cursor: usize,
     events: BTreeMap<DemandId, (String, Value)>,
     cost_ms_per_token: f64,
+    preparation_costs: Option<PreparationCosts>,
     traffic: Arc<AtomicU64>,
     backend_owner: Option<BackendProtectionOwner>,
     backend_error: Option<String>,
@@ -413,6 +426,10 @@ impl Actor {
             tick_cursor: 0,
             events: BTreeMap::new(),
             cost_ms_per_token: config.initial_prefetch_ms_per_token,
+            preparation_costs: config
+                .preparation_policy
+                .clone()
+                .map(|policy| PreparationCosts::new(policy).expect("validated preparation config")),
             traffic,
             backend_owner: None,
             backend_error: None,
@@ -782,7 +799,7 @@ impl Actor {
                 None => Value::Null,
             };
             return Ok(
-                json!({"enabled":true,"caller_id":self.config.caller_id,"engine_session_required":false,"lifecycle":"explicit","protection_owner":if self.backend_owner.is_some(){"configured"}else{"unavailable"},"backend_protection":backend,"protection_error":self.backend_error,"feedback":self.feedback.view(),"prefetch_ms_per_token":self.cost_ms_per_token,"index":format!("{:?}",self.index.usage())}),
+                json!({"enabled":true,"caller_id":self.config.caller_id,"engine_session_required":false,"lifecycle":"explicit","protection_owner":if self.backend_owner.is_some(){"configured"}else{"unavailable"},"backend_protection":backend,"protection_error":self.backend_error,"feedback":self.feedback.view(),"prefetch_ms_per_token":self.cost_ms_per_token,"preparation_policy":self.config.preparation_policy,"preparation_cost_groups":self.preparation_costs.as_ref().map(|model|model.groups()),"index":format!("{:?}",self.index.usage())}),
             );
         }
         let task = task(value.get("task").unwrap_or(&value), &self.config.caller_id)?;
@@ -971,14 +988,63 @@ impl Actor {
                         }
                         let target =
                             self.resolve(value.get("target").unwrap_or(&Value::Null), &task)?;
+                        if event == "tool_done" && self.preparation_costs.is_some() {
+                            let prefixes: Vec<_> = target
+                                .known_scope()
+                                .iter()
+                                .filter_map(|scope| self.index.materialize(scope.scope()).ok())
+                                .collect();
+                            for (demand, intent) in &self.intents {
+                                if demand.task != task || intent.released {
+                                    continue;
+                                }
+                                for id in &intent.jobs {
+                                    if let Some(job) = self.jobs.get_mut(id) {
+                                        if !job.quiescent
+                                            && job.action == "sglang.prefetch"
+                                            && value["worker_url"]
+                                                .as_str()
+                                                .is_none_or(|url| url == job.url)
+                                            && prefixes.iter().any(|prefix| {
+                                                prefix.compatibility == job.prefix.compatibility
+                                                    && prefix.token_ids == job.prefix.token_ids
+                                            })
+                                        {
+                                            job.due = Instant::now();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let tokens = target
                             .known_scope()
                             .iter()
                             .map(|s| s.scope().end_token())
                             .max()
                             .unwrap_or(0);
-                        let cost = (tokens as f64 * self.cost_ms_per_token).ceil() as u64;
-                        let lead = cost.saturating_add(self.config.lead_margin_ms);
+                        let owner = value["worker_url"]
+                            .as_str()
+                            .or_else(|| self.last_route.get(&task).map(String::as_str))
+                            .and_then(|url| {
+                                self.caps.get(url).map(|caps| preparation_owner(url, caps))
+                            })
+                            .unwrap_or_default();
+                        let estimate = self.preparation_costs.as_ref().map(|model| {
+                            model.estimate(
+                                &owner,
+                                tokens,
+                                self.config.initial_prefetch_ms_per_token,
+                                self.config.lead_margin_ms,
+                            )
+                        });
+                        let cost = estimate.map_or_else(
+                            || (tokens as f64 * self.cost_ms_per_token).ceil() as u64,
+                            |estimate| estimate.preparation_ms,
+                        );
+                        let lead = estimate.map_or_else(
+                            || cost.saturating_add(self.config.lead_margin_ms),
+                            |estimate| estimate.lead_ms,
+                        );
                         if event == "tool_done"
                             && cost
                                 > value["available_ms"]
@@ -990,7 +1056,9 @@ impl Actor {
                             );
                         }
                         if event == "resume_expected"
-                            && value["expected_wait_ms"].as_u64().unwrap_or(0) < lead
+                            && (value["expected_wait_ms"].as_u64().unwrap_or(0) == 0
+                                || (self.preparation_costs.is_none()
+                                    && value["expected_wait_ms"].as_u64().unwrap_or(0) < lead))
                         {
                             return Ok(
                                 json!({"state":"on_demand_fallback","estimated_ms":cost,"reason":"insufficient preparation lead"}),
@@ -1041,7 +1109,7 @@ impl Actor {
                             json!({"tier":if event=="tool_wait"{"gpu"}else{"storage"}});
                         command["destination"] =
                             json!({"tier":if event=="tool_wait"{"storage"}else{"host"}});
-                        if event == "tool_done" {
+                        if event == "tool_done" && self.preparation_costs.is_none() {
                             let ids: Vec<_> = self
                                 .intents
                                 .keys()
@@ -1058,7 +1126,15 @@ impl Actor {
                                 }
                             }
                         }
-                        self.submit(command, task, demand).await
+                        let mut result = self.submit(command, task, demand).await?;
+                        if self.preparation_costs.is_some() {
+                            result["preparation_estimate"] = result["operations"]
+                                .as_array()
+                                .and_then(|jobs| jobs.first())
+                                .map(|job| job["preparation_estimate"].clone())
+                                .unwrap_or(Value::Null);
+                        }
+                        Ok(result)
                     }
                     _ => Err("unsupported lifecycle signal".into()),
                 }
@@ -1073,6 +1149,7 @@ impl Actor {
         task: SessionIdentity,
         demand: DemandId,
     ) -> Result<Value, String> {
+        let admitted_at = Instant::now();
         let fingerprint = digest(&value);
         if let Some(intent) = self.intents.get(&demand) {
             return if intent.fingerprint == fingerprint {
@@ -1186,6 +1263,29 @@ impl Actor {
                 missing.push("no healthy compatible executable worker".into());
                 continue;
             };
+            let preparation_estimate = self.preparation_costs.as_ref().and_then(|model| {
+                (action == "sglang.prefetch"
+                    && source == "storage"
+                    && destination == "host"
+                    && value["event"] == "resume_expected")
+                    .then(|| {
+                        model.estimate(
+                            &preparation_owner(url, caps),
+                            prefix.end_token,
+                            self.config.initial_prefetch_ms_per_token,
+                            self.config.lead_margin_ms,
+                        )
+                    })
+            });
+            let job_due = preparation_estimate.map_or(due, |estimate| {
+                admitted_at
+                    + Duration::from_millis(
+                        value["expected_wait_ms"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_sub(estimate.lead_ms),
+                    )
+            });
             let mut src = value["source"].clone();
             let mut dst = value["destination"].clone();
             for location in [&mut src, &mut dst] {
@@ -1243,7 +1343,7 @@ impl Actor {
                         releasing_pin: false,
                         cancel_sent: false,
                         quiescent: false,
-                        due,
+                        due: job_due,
                         deadline: expires,
                         last_error: None,
                         started: None,
@@ -1252,6 +1352,7 @@ impl Actor {
                         cache_watermark: Value::Null,
                         ready_end: 0,
                         ready_at: None,
+                        preparation_estimate,
                     },
                 );
             }
@@ -1509,7 +1610,7 @@ impl Actor {
             "admission_gaps":intent.admission_gaps,"claims":intent.claims.iter().filter_map(|id|self.claims.get(id)).map(|c|json!({"claim":c.view,"error":c.error,"feedback_unknown":c.feedback_unknown,"release_requested":c.release_requested})).collect::<Vec<_>>(),
             "released":intent.released,"quiescent":intent.claims.iter().all(|id|self.claims.get(id).is_none_or(|c|c.view["backend_quiescent"]==true)) && intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|j.quiescent)),
             "operations":intent.jobs.iter().filter_map(|id|self.jobs.get(id)).map(|j|json!({"child_id":j.id,"worker_url":j.url,"engine_id":j.caps.engine_id,"owner_epoch":j.caps.epoch,
-                "action":j.action,"result":j.result,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":j.quiescent,"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
+                "action":j.action,"result":j.result,"preparation_estimate":j.preparation_estimate,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":j.quiescent,"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
                 "ready_scope":if !intent.released && self.feedback.current(&j.url,&j.cache_watermark) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
     }
     async fn pump(&mut self) {
@@ -1698,15 +1799,46 @@ impl Actor {
             job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, tier)?;
             job.ready_at = Some(Instant::now());
             if job.ready_end == job.prefix.end_token && !job.cost_recorded {
-                if let Some(start) = job
-                    .started
-                    .filter(|_| job.traffic_at_start == self.traffic.load(Ordering::Relaxed))
-                {
-                    let observed =
-                        start.elapsed().as_secs_f64() * 1000.0 / job.prefix.end_token as f64;
-                    self.cost_ms_per_token = 0.8 * self.cost_ms_per_token + 0.2 * observed;
-                    job.cost_recorded = true;
+                if let Some(start) = job.started {
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    if let Some(model) = &mut self.preparation_costs {
+                        if job.payload["source"]["tier"] == "storage"
+                            && job.payload["destination"]["tier"] == "host"
+                            && job.result["update"]["status"] == "completed"
+                        {
+                            model.observe(
+                                &preparation_owner(&job.url, &job.caps),
+                                job.prefix.end_token,
+                                elapsed_ms,
+                            );
+                            job.cost_recorded = true;
+                        }
+                    }
+                    if self.preparation_costs.is_none()
+                        && job.traffic_at_start == self.traffic.load(Ordering::Relaxed)
+                    {
+                        let observed = elapsed_ms / job.prefix.end_token as f64;
+                        self.cost_ms_per_token = 0.8 * self.cost_ms_per_token + 0.2 * observed;
+                        job.cost_recorded = true;
+                    }
                 }
+            }
+        }
+        if !cancel
+            && job.quiescent
+            && !job.cost_recorded
+            && job.action == "sglang.prefetch"
+            && job.payload["source"]["tier"] == "storage"
+            && job.payload["destination"]["tier"] == "host"
+            && job.result["update"]["status"] != "completed"
+        {
+            if let (Some(model), Some(start)) = (&mut self.preparation_costs, job.started) {
+                model.observe_incomplete(
+                    &preparation_owner(&job.url, &job.caps),
+                    job.prefix.end_token,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                );
+                job.cost_recorded = true;
             }
         }
         job.last_error = None;

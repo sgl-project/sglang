@@ -8,6 +8,20 @@ validates the three new public actions. Other consumers' actions are returned
 unchanged; unsupported `sglang.*` names/versions return `Unsupported`. Existing
 Engine action parsers and semantics remain in Python.
 
+The optional Router `preparation_policy` config enables bounded preparation cost
+samples grouped by worker URL, owner epoch, compatibility and prefix size bucket.
+For example, `{"min_samples":4,"quantile":0.9,"max_lead_ms":10000}` uses a recent
+tail estimate with a bounded lead; missing samples use the configured initial
+cost. `max_groups` defaults to 128 and `sample_window` to 32. Samples describe
+complete observed preparation including control polling and admission, not pure
+I/O. Confirmed storage-to-host completion supplies measured samples. An incomplete
+terminal preparation contributes its observed elapsed time as a lower bound;
+`incomplete_samples` distinguishes those observations from complete samples.
+The reported quantile can therefore be a lower bound on full preparation time.
+A positive remaining wait can overlap part of a late preparation. Missing or
+zero remaining wait retains on-demand recovery. Omitting this config preserves
+the existing global cost/lead policy. No new Engine action fields are required.
+
 P5 is a pure API; Router runtime integration remains P6. `session_index` provides
 `SessionIndex`, explicit `SessionLimits`, canonical `ContentKey`, parent-linked
 `ContentRegistration`, immutable `BranchRevision`, request incarnation bindings

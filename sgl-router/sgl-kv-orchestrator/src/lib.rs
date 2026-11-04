@@ -3,6 +3,7 @@ pub mod backend_protection;
 pub mod models;
 pub mod observations;
 pub mod operations;
+pub mod preparation;
 pub mod protocol;
 pub mod session_index;
 pub mod target_resolver;

@@ -4958,3 +4958,9 @@ parent 完整审阅生产差异和新增测试，并独立运行 host_demote/tra
 增加默认关闭、page 对齐的 native 在途预算、speculative 在途预算、demand host 余量与可选需求优先。普通读取占用参与 native 准入判断，普通推理保留原恢复路径。按成功准入计数，每八次 demand 给背景一次机会；保留 GPU FIFO、同 salt 约束。复核发现 >64 个受阻背景任务可遮住可运行需求，已修复为背景轮转加一次有界机会，并添加 68-job 测试。
 
 parent 审阅完整差异并独立执行 transfers/service/cache/prefetch lifecycle：88 passed、66 subtests，63.38s；活性修复后独立复测 transfers：54 passed、42 subtests，23.25s。日志为 lifecycle-opt/o1-parent-tests.log 和 o1-parent-fairness-tests.log。预算不分配新 slots，未释放取消后的在途预留，不扩大 GPU 驱逐范围。
+
+### O2 — 分组准备成本与有界提前量
+
+新增独立、有界的 preparation 模块，按实际选中 worker/epoch/兼容布局/backend namespace 与前缀大小分组，使用最近成本分位及最大提前量。完整 L3→L2 准备样本与未完成操作的耗时下界区分；其他 tier path 不混入。成本包括实际 admission/control/publication，不能当作纯 I/O。未配置 preparation_policy 时保留旧策略。
+
+复核修正了预选 worker 与实际执行 worker 不一致、H2D 样本混入、后端身份变化，以及 tool_done 提前结束时遗留旧 due 的问题；旧分支完成记录不会代替增长后的当前范围。parent 已审阅完整差异。core 48 项测试通过（另 1 项 live 后端用例按原配置忽略），Router HTTP 19 项通过，覆盖早到、增长范围、late 部分重叠、旧策略与反馈边界。日志为 lifecycle-opt/o2-core-tests.log、o2-router-tests.log。Rust fmt 通过；本机精确 1.92.0 工具链已补齐，后续将执行该版本检查。

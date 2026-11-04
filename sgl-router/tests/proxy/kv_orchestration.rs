@@ -819,6 +819,54 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
 }
 
 #[tokio::test]
+async fn measured_policy_keeps_late_preparation_and_learns_confirmed_scope() {
+    let engine = Engine::start().await;
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(sgl_kv_orchestrator::preparation::PreparationConfig {
+        min_samples: 1,
+        max_lead_ms: 2,
+        ..Default::default()
+    });
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "measured").await;
+    api(&router,json!({"kind":"session_event","task":task("measured"),"event":"request_observed","event_id":"observed","revision":1,
+        "branch_id":"main","branch_revision":1,"request_id":"r","request_incarnation":"one","input_ids":[1,2,3,4],"worker_url":engine.url})).await;
+    let view = api(&router,json!({"kind":"session_event","task":task("measured"),"event":"resume_expected","event_id":"resume","revision":2,
+        "target":{"kind":"session"},"expected_wait_ms":1,"worker_url":engine.url})).await;
+    assert_eq!(view["preparation_estimate"]["lead_ms"], 2);
+    assert_eq!(view["preparation_estimate"]["samples"], 0);
+    assert_eq!(view["operations"].as_array().unwrap().len(), 1);
+    ready(&router, "measured", "resume").await;
+    let caps = api(&router, json!({"kind":"capabilities"})).await;
+    assert_eq!(caps["preparation_cost_groups"], 1);
+    assert_eq!(caps["preparation_policy"]["max_lead_ms"], 2);
+}
+
+#[tokio::test]
+async fn measured_policy_advances_early_tool_done_without_reusing_old_scope() {
+    let engine = Engine::start().await;
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(Default::default());
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "early").await;
+    api(&router,json!({"kind":"session_event","task":task("early"),"event":"request_observed","event_id":"observed","revision":1,
+        "branch_id":"main","branch_revision":1,"request_id":"r","request_incarnation":"one","input_ids":[1,2,3,4],"worker_url":engine.url})).await;
+    api(&router,json!({"kind":"session_event","task":task("early"),"event":"resume_expected","event_id":"resume","revision":2,
+        "target":{"kind":"session"},"expected_wait_ms":10000,"worker_url":engine.url})).await;
+    let done = api(&router,json!({"kind":"session_event","task":task("early"),"event":"tool_done","event_id":"done","revision":3,
+        "target":{"kind":"session"},"available_ms":0,"worker_url":engine.url})).await;
+    assert_eq!(done["state"], "on_demand_fallback");
+    ready(&router, "early", "resume").await;
+    api(&router,json!({"kind":"session_event","task":task("early"),"event":"request_observed","event_id":"grown","revision":4,
+        "branch_id":"main","branch_revision":2,"request_id":"r2","request_incarnation":"two","input_ids":[1,2,3,4,5,6],"worker_url":engine.url})).await;
+    let grown = api(&router,json!({"kind":"session_event","task":task("early"),"event":"tool_done","event_id":"grown-done","revision":5,
+        "target":{"kind":"session"},"available_ms":10000,"worker_url":engine.url})).await;
+    assert_eq!(grown["known_scope"][0]["end_token"], 6);
+    let grown = ready(&router, "early", "grown-done").await;
+    assert_eq!(grown["operations"][0]["ready_scope"]["end_token"], 6);
+}
+
+#[tokio::test]
 async fn lifecycle_schedule_freezes_scope_and_tool_done_advances_only_preparation() {
     let engine = Engine::start().await;
     let router = router(&[&engine], false, true).await;
