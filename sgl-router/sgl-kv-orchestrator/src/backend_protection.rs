@@ -359,7 +359,7 @@ impl BackendProtectionOwner {
         };
         let (tx, rx) = oneshot::channel();
         self.commands
-            .send(Command::Submit(request, target, tx))
+            .send(Command::Submit(Box::new(request), target, tx))
             .await
             .map_err(|_| ProtectionError::Closed)?;
         rx.await.map_err(|_| ProtectionError::Closed)?
@@ -405,9 +405,11 @@ impl BackendProtectionOwner {
     }
 }
 
+type MutationCandidate = (BackendMutation, Vec<(String, Option<Instant>)>);
+
 enum Command {
     Submit(
-        ProtectionRequest,
+        Box<ProtectionRequest>,
         Option<ResolvedStorageTarget>,
         oneshot::Sender<Result<ProtectionClaimView, ProtectionError>>,
     ),
@@ -494,7 +496,7 @@ impl OwnerState {
             let deadline = self.deadline();
             tokio::select! {
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Submit(request, target, tx)) => { let result = self.submit(request, target); let _ = tx.send(result); }
+                    Some(Command::Submit(request, target, tx)) => { let result = self.submit(*request, target); let _ = tx.send(result); }
                     Some(Command::Query(identity, tx)) => { let _ = tx.send(self.snapshot(identity.as_ref())); }
                     Some(Command::Deadline(tx)) => { let _ = tx.send(self.deadline()); }
                     Some(Command::Reconcile(key, remaining, evidence, tx)) => { let result = self.reconcile(key, remaining, evidence); let _ = tx.send(result); }
@@ -702,7 +704,7 @@ impl OwnerState {
             return;
         }
         let now = Instant::now();
-        let mut candidates: Vec<(BackendMutation, Vec<(String, Option<Instant>)>)> = Vec::new();
+        let mut candidates: Vec<MutationCandidate> = Vec::new();
         for (key, object) in &self.objects {
             if object.inflight.is_some()
                 || object.uncertainty.is_some()
@@ -1077,7 +1079,7 @@ fn validate_config(c: &ProtectionConfig) -> Result<(), ProtectionError> {
         || c.max_batches_per_tick == 0
         || !(1..=4096).contains(&c.batch_size)
         || duration_ms(c.max_ttl) == 0
-        || c.max_ttl.as_nanos() % 1_000_000 != 0
+        || !c.max_ttl.as_nanos().is_multiple_of(1_000_000)
         || c.max_ttl > Duration::from_secs(31_536_000)
         || c.rpc_observation_timeout.is_zero()
         || c.retry_delay.is_zero()

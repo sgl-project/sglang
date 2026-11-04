@@ -5008,3 +5008,9 @@ parent 独立 HTTP orchestration 29 项通过，4.71s；harness 15 项通过，8
 恢复输入在发布前缀后追加一个固定合成工具结果 token；源参考使用相同完整输入，发布目标保持页对齐前缀。这样按需与准备组均可复用完整前缀，避免将生成 logits 必须重算的末页计为缓存恢复缺失。request_observed 报告真实完整源输入，Router 继续按既有语义关联完整页；mock 同步采用所声明页大小。全部输入规则、初次/暖参考及发送记录保留。
 
 parent 独立 lifecycle/Router 工具 23 项通过，19.739s；Ruff 和 diff 检查通过。deterministic+release 的 4-case 启动验证三组均 4/4 完成、输出相同且 control drain 完成，重复前缀 prefill 为零。生命周期平均 TTFT 107ms 对按需 302ms，工作吞吐 +4.9%；仅为小工作集配置验证，不作为正式容量压力结论。证据：lifecycle-opt/smoke-deterministic-release，离线复核随后统一归档。
+
+### Rust 1.92.0 兼容与静态检查
+
+修正 core 中七项 Clippy 诊断：actor 大请求经 Box 传递，内部 mutation 元组增加私有类型别名，整数对齐检查使用 is_multiple_of。范围限定为三个文件，没有变更 wire schema、配置或调度语义。
+
+parent 阅读完整差异，并用仓库要求的精确 Rust 1.92.0 独立执行 core 全目标 Clippy（-D warnings）及 core 测试：49 项通过，另 1 项 live 后端测试按原配置忽略。日志：lifecycle-opt/core-clippy-parent.log、core-1.92-parent-tests.log。该 CPU 检查窗口单独记录，不作为正式性能样本。
