@@ -377,7 +377,7 @@ class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
     """NPU DeepSeek-V4.1 low-ratio indexer K pool (packed fp4).
 
     ``indexer_prologue_k`` consumes two separate PA_ND buffers
-    (ops-transformer/experimental/attention/indexer_prologue_k_dsl/README.md)::
+    (vendor operator design notes, ``indexer_prologue_k_dsl`` README)::
 
         k_cache        uint8 [pages, page_size // ratio, 1, index_head_dim // 2]
         k_scale_cache  uint8 [pages, page_size // ratio, 1, index_head_dim // 32]
@@ -918,9 +918,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         arguments: window/``ori_kv`` = ``mxfp8_bf16`` group 32 (544 B),
         compressed/``cmp_kv`` = ``mxfp4_bf16`` group 16 (320 B).
 
-        Reference calls: cann-recipes-infer
-        ``models/deepseek_v4_1/models/modeling_deepseek.py::update_win_kv``
-        (window) and ``modules/compressor.py::update_compress_cache``.
+        Reference calls: the vendor reference implementation
+        ``modeling_deepseek.py::update_win_kv``
+        (window) and ``compressor.py::update_compress_cache``.
         """
         cache_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         if cache.shape[-1] != cache_dim:

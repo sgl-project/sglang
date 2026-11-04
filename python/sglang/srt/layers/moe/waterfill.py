@@ -27,9 +27,12 @@ from sglang.kernels.ops.moe.deepep_waterfill_kernels import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def expand_topk_with_shared_expert(
     topk_ids: Tensor,
     topk_weights: Tensor,

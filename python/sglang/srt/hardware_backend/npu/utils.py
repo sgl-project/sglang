@@ -220,26 +220,27 @@ def init_npu_backend():
         logger.warning("NPU custom kernel packages unavailable: %s", e)
 
     try:
-        # Registers the ds41 (DeepSeek-V4.1) Python operators under
-        # cann_ops_transformer.ops.ds41. Absent for DSV4-only deployments.
+        # Registers the ds41 (DeepSeek-V4.1) Python operators under the
+        # vendor operator extension's ds41 namespace. Absent for DSV4-only
+        # deployments.
         import cann_ops_transformer  # noqa: F401
     except ImportError as e:
         logger.warning(
-            "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
-            "will not be registered: %s",
+            "Vendor DSv4.1 operator extension unavailable; DeepSeek-V4.1 NPU "
+            "operators will not be registered: %s",
             e,
         )
 
     try:
-        # cannbot-arena-net wheel (import name ``ops``): the DeepSeek-V4.1
+        # Vendor DSL operator wheel (import name ``ops``): the DeepSeek-V4.1
         # attention/indexer operators sglang calls directly. Absent for
         # DSV4-only deployments; a missing package surfaces as an ImportError
         # from the first _ds41_ops() call.
         import ops  # noqa: F401
     except ImportError as e:
         logger.warning(
-            "cannbot-arena-net (ops) unavailable; DeepSeek-V4.1 NPU DSL "
-            "operators will not load: %s",
+            "Vendor DSv4.1 DSL operator wheel (ops) unavailable; DeepSeek-V4.1 "
+            "NPU DSL operators will not load: %s",
             e,
         )
 

@@ -115,9 +115,9 @@ def _ensure_dsv41_static_verify_mode() -> None:
 def _ds41_ops():
     """The V4.1 operator entry points, called directly.
 
-    Seven operators are plain functions of the ``cannbot-arena-net`` wheel
-    (import name ``ops``) and are invoked directly, skipping the
-    ``cann_ops_transformer`` torch.library wrapper: ``compressor``,
+    Seven operators are plain functions of the vendor DSL operator wheel
+    (import name ``ops``) and are invoked directly, skipping the vendor
+    torch.library wrapper: ``compressor``,
     ``indexer_prologue_k``, ``quant_lightning_indexer(_metadata)``,
     ``quant_sparse_lightning_indexer(_metadata)`` and
     ``mixed_quant_sparse_flash_mla(_metadata)``. Their keyword names are the
@@ -125,8 +125,8 @@ def _ds41_ops():
 
     ``mixed_quant_sparse_flash_mla`` is the caller-allocated ABI: the caller
     passes ``out``/``lse`` tensors. ``compressor`` is the one exception that is
-    NOT a DSL sample (it is an AOT AscendC extension inside ops-transformer), so
-    it goes through the registered ``torch.ops.cann_ops_transformer.ds41``
+    NOT a DSL sample (it is an AOT AscendC extension in the vendor ops repo), so
+    it goes through the registered ``torch.ops`` ds41
     namespace -- importing this module is also what registers it. Call this
     once during backend init, before any ``torch.ops`` use.
     """
@@ -1017,16 +1017,21 @@ class LowRatioCompressAscendBackendMixin:
     scope, and the two generations differ in kernels and cache row formats.
     The context-parallel and prefill-graph branches of the CUDA source are not
     modeled on NPU.
-
-    Deviation from CUDA: seam A hands its pre-RoPE ``latent`` to seam B,
-    because ``indexer_prologue_k`` projects the index K from that latent,
-    while CUDA writes the index K inside its compress step.
+ 
+    Deviation from CUDA: the compress step hands its pre-RoPE ``latent`` to the
+    index step, because ``indexer_prologue_k`` projects the index K from that
+    latent, while CUDA writes the index K inside its compress step.
     """
 
-    # CUDA-only prefill graph. The model checks this attr to pick its call
-    # contract; False selects the single-call path used on NPU.
+    # Capability declaration for the shared model code, not a live switch on
+    # NPU: the prefill-graph contract is CUDA-only, and
+    # ``_low_ratio_sources_break`` short-circuits on
+    # ``is_in_breakable_cuda_graph()`` (never true here) before this attr is
+    # read. Declared so every backend answers the same question, and so NPU
+    # keeps selecting the single-call path if the breakable graph ever lands.
     low_ratio_prefill_graph = False
-    # Written by the model / replay-tail path, as on CUDA.
+    # Read by ``_low_ratio_compress`` below; still unset on NPU because the
+    # replay-tail path that writes it is CUDA-only, so it stays None.
     tail_source_kv_layer_id: Optional[int] = None
 
     def forward_low_ratio_sources(
@@ -1053,14 +1058,14 @@ class LowRatioCompressAscendBackendMixin:
         if run_compressor and layer.compressor is not None:
             latent = self._low_ratio_compress(layer, x, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
-            # latent may be None here: seam B checks it (a tail layer whose
-            # compressor was skipped only scores against the stored K).
+            # latent may be None here: the index step checks it (a tail layer
+            # whose compressor was skipped only scores against the stored K).
             self._low_ratio_index_topk(layer, latent, x, q_lora, pos, forward_batch)
 
     def _low_ratio_compress(self, layer, x, pos, forward_batch):
-        """Seam A: project, normalize and RoPE one ratio-1/2 compressed latent,
-        then write it into the ratio's compressed pool. Returns the pre-RoPE
-        latent for seam B.
+        """Project, normalize and RoPE one ratio-1/2 compressed latent, then
+        write it into the ratio's compressed pool. Returns the pre-RoPE latent
+        for the index step.
         """
         ratio = layer.compress_ratio
         compressor = layer.compressor
@@ -1144,10 +1149,10 @@ class LowRatioCompressAscendBackendMixin:
         *,
         rows_per_request=None,  # NOTE: only used under CP (unsupported here)
     ) -> None:
-        """Seam B: store the indexer K from ``latent`` and score it with QLI.
+        """Store the indexer K from ``latent`` and score it with QLI.
 
         Anchors: DeepseekV4AttnBackend._low_ratio_index_topk for the role
-        dispatch; cann-recipes-infer indexer.py for the NPU operator ABI.
+        dispatch; the vendor reference ``indexer.py`` for the NPU operator ABI.
         """
         indexer = layer.indexer
         ratio = layer.compress_ratio
@@ -1614,7 +1619,7 @@ class LowRatioCompressAscendBackendMixin:
             )
         return out
 
-    # ---- Seam D: mixed-quant sparse MLA ---------------------------------------
+    # ---- mixed-quant sparse MLA -----------------------------------------------
     #
     # V4.1 attends with ``ds41.mixed_quant_sparse_flash_mla``: the window and
     # compressed sides are passed purely as explicit sparse indices + topk
@@ -1854,9 +1859,9 @@ class LowRatioCompressAscendBackendMixin:
     # ---- V4.1 metadata assembly ------------------------------------------------
     #
     # ``ds41.compressor`` emits ``min(T, T // ratio + B)`` rows: live rows
-    # first, pad last. Positions and slots handed to seam A carry exactly that
-    # many rows; slots use -1 as the filler (the epilog's skip sentinel) and
-    # positions 0 (its row is skipped).
+    # first, pad last. Positions and slots handed to the compress step carry
+    # exactly that many rows; slots use -1 as the filler (the epilog's skip
+    # sentinel) and positions 0 (its row is skipped).
     #
     # V4.1 has no allocator bundle, so a slot is derived as full_loc // ratio,
     # matching how the compressed pools are sized and addressed.

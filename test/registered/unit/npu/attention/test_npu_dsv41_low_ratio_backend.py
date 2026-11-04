@@ -1176,7 +1176,7 @@ class TestCompressedRowIdentity(unittest.TestCase):
                 self.assertEqual(read, written, (ratio, position))
 
 
-class TestSeamBGuards(unittest.TestCase):
+class TestIndexStepGuards(unittest.TestCase):
     def test_candidate_configuration_fails_loudly(self):
         backend = _low_ratio_backend()
         layer = SimpleNamespace(
@@ -1186,7 +1186,7 @@ class TestSeamBGuards(unittest.TestCase):
                 owns_k=False, is_candidate_source=False, uses_candidates=True
             ),
         )
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(RuntimeError, "no published candidate blocks"):
             backend._low_ratio_index_topk(
                 layer, None, torch.zeros(1), torch.zeros(1), torch.zeros(1), None
             )
