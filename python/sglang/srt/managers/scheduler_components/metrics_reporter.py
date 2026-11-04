@@ -558,6 +558,23 @@ class SchedulerMetricsReporter:
 
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
+        # Per-layer attention/MLP/Mamba split for hybrid architectures (NemotronH, etc).
+        layers_block_type = getattr(hf_text_config, "layers_block_type", None)
+        if layers_block_type:
+            num_attn_layers = float(layers_block_type.count("attention"))
+            num_mlp_layers = float(
+                layers_block_type.count("mlp") + layers_block_type.count("moe")
+            )
+        else:
+            full_attention_layer_ids = getattr(
+                hf_text_config, "full_attention_layer_ids", None
+            )
+            num_attn_layers = (
+                float(len(full_attention_layer_ids))
+                if full_attention_layer_ids is not None
+                else num_layers
+            )
+            num_mlp_layers = num_layers
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
             model_config.get_num_attention_heads(get_parallel().tp_size)
@@ -586,12 +603,12 @@ class SchedulerMetricsReporter:
             6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
         )
         self._linear_flops_per_token = max(
-            0.0, (attn_linear_flops + mlp_flops) * num_layers
+            0.0, attn_linear_flops * num_attn_layers + mlp_flops * num_mlp_layers
         )
 
         # Attention dot-product FLOPs coefficient to multiply token-context product.
         # attn_qk + attn_av = 4 * q * TC * d * L
-        self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_layers
+        self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_attn_layers
 
         # KV cache bytes (write one K and one V vector per generated token).
         self._kv_cache_bytes_per_token = (
