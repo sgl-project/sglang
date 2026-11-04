@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (  # noqa: E4
 )
 from sglang.srt.managers import schedule_batch as sb  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -270,6 +270,7 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             batch_result_processor as brp,
         )
 
+        released = []
         req = SimpleNamespace(
             rid="r",
             decode_batch_idx=5,
@@ -296,9 +297,11 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             _prepare_kv_cache_release=lambda req: None,
             _maybe_collect_routed_experts=lambda req: None,
             _maybe_collect_indexer_topk=lambda req: None,
-            _maybe_collect_customized_info=lambda i, req, out: None,
+            _maybe_collect_customized_info=lambda i, req, out, n: None,
+            request_retirer=SimpleNamespace(
+                release_finished=lambda req, checkpoint: released.append(checkpoint)
+            ),
         )
-        released = []
         with (
             patch.object(brp, "get_exec", return_value=_settings(lazy=True)),
             patch.object(
@@ -307,14 +310,6 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
                 return_value=SimpleNamespace(
                     disaggregation_decode_enable_offload_kvcache=False
                 ),
-            ),
-            patch.object(
-                brp, "get_memory", return_value=SimpleNamespace(enable_hisparse=False)
-            ),
-            patch.object(
-                brp,
-                "release_kv_cache",
-                lambda req, cache, checkpoint: released.append(checkpoint),
             ),
         ):
             brp.SchedulerBatchResultProcessor._handle_finish_state_updated_req(

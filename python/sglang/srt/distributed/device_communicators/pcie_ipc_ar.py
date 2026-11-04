@@ -81,7 +81,7 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _FALLBACK_DECODE_WIDTH = 64
 
 
-#: attention_tp / moe_tp / pdmux_prefill_tp carry no pynccl or custom
+#: attention_tp / moe_tp carry no pynccl or custom
 #: all-reduce communicator, so a reduction dispatched to them asserts.
 _ELIGIBLE_GROUP_NAMES = frozenset({"tp"})
 

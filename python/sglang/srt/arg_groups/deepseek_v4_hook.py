@@ -15,13 +15,13 @@ from sglang.srt.arg_groups.engram_config import (
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     context_parallel_attn_dp_size,
+    model_config_of,
+    resolved_view,
+    resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
@@ -95,7 +95,9 @@ def _engram_config_from_env(cfg) -> EngramConfig:
 
 
 def _resolve_engram_config(server_args: ServerArgs) -> None:
-    """The only producer of the engram_config the Engram layers read."""
+    """Validate --engram-config and declare it. A `lookup` of `auto` stays as is:
+    the layers resolve it at model construction (`resolve_engram_config`), once the
+    parallel layout and the GPUs are known."""
     cfg = resolving_view(server_args)
     raw = cfg.engram_config
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":

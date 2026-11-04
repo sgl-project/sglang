@@ -11,7 +11,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
@@ -259,6 +260,9 @@ def _build_tbo_child_replay_fb_view(
     return SimpleNamespace(
         batch_size=child_bs,
         forward_mode=fb_view.forward_mode,
+        # TBO is mutually exclusive with ragged verify; a parent layout would
+        # describe the full batch, not this child slice.
+        ragged_verify_layout=None,
         actual_forward_mode=getattr(
             fb_view, "actual_forward_mode", fb_view.forward_mode
         ),

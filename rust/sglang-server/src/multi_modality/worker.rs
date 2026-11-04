@@ -19,9 +19,8 @@ use crate::utils::error::Error;
 use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
-/// Python parity: caller hashes override the computed ones so an external
-/// router's keys align with the prefix cache. A length mismatch or malformed
-/// entry warns and keeps the computed hash — never blocks the request.
+/// Preserve legacy routing hints for observers. These do not override the
+/// full content identity computed by `make_buffers` for cache equality.
 fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, caller: &[String]) {
     if caller.is_empty() {
         return;
@@ -43,8 +42,7 @@ fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, c
 }
 
 /// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
-/// being the common case), keeping the low 64 bits — only the low 30 are
-/// observable, through `_compute_pad_value`.
+/// being the common case), keeping the low 64 bits in this legacy field only.
 fn parse_caller_hash(entry: &str) -> Option<u64> {
     let hex = entry.strip_prefix("0x").unwrap_or(entry);
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -69,8 +67,9 @@ pub struct MmRequestInfo<'a> {
     pub bootstrap_room: Option<i64>,
 }
 
-/// Client/server class of a media preparation failure, mirroring Python's
-/// loader contract: `ValueError` is a 400, any other exception a 500.
+/// Client/server class of a media preparation or processing failure,
+/// mirroring Python's loader and processor contract: `ValueError` is a 400,
+/// any other exception a 500.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MediaError {
     /// Bad input from the client (400).
@@ -91,7 +90,9 @@ pub enum MediaError {
 /// The media hooks run earlier, during admission on the API runtime, before
 /// any media is fetched or the request reaches the worker pool.
 pub trait MmProcessor: Send + Sync {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String>;
+    /// `Err` is the request's media refused (`Client`, e.g. an undecodable
+    /// image) or the processor's own failure (`Server`).
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError>;
 
     /// Reject a request's media before any of it is fetched, e.g. a modality
     /// the served model cannot encode. `Err` is a client error (400). Runs on
@@ -140,10 +141,11 @@ impl QwenMmProcessor {
 }
 
 impl MmProcessor for QwenMmProcessor {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
         let input = super::payload::to_mm_input(input_ids, mm)?;
-        let output = driver::process(self.family.as_ref(), input)?;
-        encode_driver_output(output)
+        // The driver fails on the request's sources, images, and prompt layout.
+        let output = driver::process(self.family.as_ref(), input).map_err(MediaError::Client)?;
+        encode_driver_output(output).map_err(MediaError::Server)
     }
 }
 
@@ -303,7 +305,7 @@ fn place_features(
 /// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
 /// always last, so a reader that finds it knows the rest is present.
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
-    let meta = MmMeta::of(&entry).encode()?;
+    let meta = MmMeta::of(&entry)?.encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
     let features = items.into_iter().map(|item| item.feature).collect();
     let mut buffers = place_features(features, feature_shm, |_| {
@@ -322,22 +324,36 @@ fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>,
 }
 
 /// Run the processor for one request. `Ok` returns the final expanded ids and
-/// the buffers to ride the ring; `Err` rejects the request back to the client.
+/// the buffers to ride the ring; `Err` rejects the request back to the client:
+/// the processor's [`MediaError`] as `Encode`, which keeps its status class,
+/// and a malformed processor result or an unplaceable buffer -- the server's
+/// fault -- as `Internal` (a 500).
 fn process(
     ctx: &MmContext,
     request: MmRequestInfo<'_>,
     input_ids: TokenIds,
     mut mm: MmData,
-) -> Result<(TokenIds, Vec<Buffer>), String> {
+) -> Result<(TokenIds, Vec<Buffer>), Error> {
     let caller_hashes = std::mem::take(&mut mm.mm_hashes);
-    let mut output = ctx.processor.process(input_ids, mm)?;
-    output.result.validate(output.input_ids.len())?;
+    let mut output = ctx
+        .processor
+        .process(input_ids, mm)
+        .map_err(Error::Encode)?;
+    output
+        .result
+        .validate(output.input_ids.len())
+        .map_err(Error::Internal)?;
     apply_caller_hashes(
         output.result.items.iter_mut().map(|item| &mut item.hash),
         &caller_hashes,
     );
-    ctx.processor.finalize(&mut output.result)?;
-    output.result.validate(output.input_ids.len())?;
+    ctx.processor
+        .finalize(&mut output.result)
+        .map_err(Error::Internal)?;
+    output
+        .result
+        .validate(output.input_ids.len())
+        .map_err(Error::Internal)?;
     // Intake fits the ids to the context (`check_total_tokens`) before the
     // scheduler sees them; fit them first, so `processed` sees the same ids. A
     // prompt intake will reject is not observed.
@@ -348,7 +364,7 @@ fn process(
     if fits {
         ctx.processor.processed(request, &output);
     }
-    let buffers = make_buffers(output.result, ctx.feature_shm)?;
+    let buffers = make_buffers(output.result, ctx.feature_shm).map_err(Error::Internal)?;
     Ok((output.input_ids, buffers))
 }
 
@@ -389,8 +405,8 @@ impl Runnable for MmWorker {
     /// concurrency. Mirrors `TokenizerWorker`: carve the work out of the
     /// request, process, write the result back, advance the FSM
     /// (`EncodeDone` -> PreSendValidating, or `Error` -> Failed, which intake
-    /// rejects to the client as Python turns a per-request exception into a
-    /// 400), and return the request as `Encoded`.
+    /// rejects to the client; see [`process`] for the error's class), and
+    /// return the request as `Encoded`.
     fn run(self) {
         while let Ok(mut req) = self.mm_rx.recv() {
             // A request is never dropped here: a kind this pool cannot serve
@@ -414,9 +430,9 @@ impl Runnable for MmWorker {
                         g.mm_buffers = buffers;
                         Event::EncodeDone
                     }
-                    Err(message) => {
-                        tracing::warn!(rid = %req.rid, %message, "mm processing rejected");
-                        Event::Error(Error::Encode(message))
+                    Err(error) => {
+                        tracing::warn!(rid = %req.rid, %error, "mm processing rejected");
+                        Event::Error(error)
                     }
                 }
             } else {
@@ -450,7 +466,7 @@ mod tests {
     }
 
     impl MmProcessor for ExternalProcessor {
-        fn process(&self, input_ids: TokenIds, _mm: MmData) -> Result<MmProcessOutput, String> {
+        fn process(&self, input_ids: TokenIds, _mm: MmData) -> Result<MmProcessOutput, MediaError> {
             Ok(MmProcessOutput {
                 input_ids,
                 result: MmEncodedEntry {
@@ -815,7 +831,7 @@ mod tests {
         }
 
         impl MmProcessor for FinalizingProcessor {
-            fn process(&self, ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+            fn process(&self, ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
                 ExternalProcessor {
                     shape: vec![1],
                     offsets: vec![(0, 0)],
@@ -914,8 +930,9 @@ mod tests {
 
     /// The worker loop takes the whole request, like the tokenizer pool: on
     /// success it writes the expanded ids and buffers back and advances to
-    /// `PreSendValidating`; on a processor error it marks the request
-    /// `Failed(Encode)`. Either way the request comes back as `Encoded`.
+    /// `PreSendValidating`; on a refusal it marks the request `Failed(Encode)`,
+    /// and on a processor failure or malformed result `Failed(Internal)`.
+    /// Either way the request comes back as `Encoded`.
     #[test]
     fn worker_returns_request_with_fsm_advanced() {
         use crate::utils::fsm::RequestState;
@@ -952,28 +969,47 @@ mod tests {
         assert!(find(&g.mm_buffers, "mm.feature.0").is_some());
         assert!(find(&g.mm_buffers, "mm.meta").is_some());
 
-        // A malformed result (span past the prompt) fails the request in place.
-        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
-        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
-        let bad_ctx = Arc::new(MmContext::with_processor(
-            Arc::new(ExternalProcessor {
-                shape: vec![1],
-                offsets: vec![(1, 2)],
-            }),
-            false,
-        ));
-        let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, bad_ctx).run());
-        mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
-        drop(mm_tx);
-        worker.join().unwrap();
-        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
-            panic!("expected Encoded");
-        };
-        assert!(
-            matches!(req.state, RequestState::Failed(Error::Encode(_))),
-            "{:?}",
-            req.state
-        );
+        // The processor's own failure and a malformed result (span past the
+        // prompt) fail the request in place as the server's fault; a refusal
+        // as the client's.
+        let failing: Arc<dyn MmProcessor> = Arc::new(FailingProcessor(MediaError::Server(
+            "audio decode: Cannot allocate memory".into(),
+        )));
+        let malformed: Arc<dyn MmProcessor> = Arc::new(ExternalProcessor {
+            shape: vec![1],
+            offsets: vec![(1, 2)],
+        });
+        let refusing: Arc<dyn MmProcessor> =
+            Arc::new(FailingProcessor(MediaError::Client("bad image".into())));
+        for (processor, server_fault) in [(failing, true), (malformed, true), (refusing, false)] {
+            let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+            let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+            let ctx = Arc::new(MmContext::with_processor(processor, false));
+            let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
+            mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
+            drop(mm_tx);
+            worker.join().unwrap();
+            let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
+                panic!("expected Encoded");
+            };
+            let RequestState::Failed(error) = &req.state else {
+                panic!("{:?}", req.state);
+            };
+            assert_eq!(error.is_server_fault(), server_fault, "{error:?}");
+        }
+    }
+
+    /// A processor that fails every request with the given error.
+    struct FailingProcessor(MediaError);
+
+    impl MmProcessor for FailingProcessor {
+        fn process(
+            &self,
+            _input_ids: TokenIds,
+            _mm: MmData,
+        ) -> Result<MmProcessOutput, MediaError> {
+            Err(self.0.clone())
+        }
     }
 
     /// `processed` sees the result the scheduler gets -- the caller's hash
@@ -986,7 +1022,11 @@ mod tests {
         #[derive(Default)]
         struct Observing(Mutex<Vec<String>>);
         impl MmProcessor for Observing {
-            fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+            fn process(
+                &self,
+                input_ids: TokenIds,
+                mm: MmData,
+            ) -> Result<MmProcessOutput, MediaError> {
                 ExternalProcessor {
                     shape: vec![1],
                     offsets: vec![(1, 1)],
@@ -1034,7 +1074,11 @@ mod tests {
 
         struct Observing(Mutex<Vec<TokenIds>>);
         impl MmProcessor for Observing {
-            fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+            fn process(
+                &self,
+                input_ids: TokenIds,
+                mm: MmData,
+            ) -> Result<MmProcessOutput, MediaError> {
                 ExternalProcessor {
                     shape: vec![1],
                     offsets: vec![(6, 9)],
@@ -1055,7 +1099,6 @@ mod tests {
                 num_reserved_tokens: 0,
                 allow_auto_truncate,
                 enable_return_hidden_states: false,
-                default_priority: None,
             });
             let (input_ids, _) =
                 process(&ctx, NO_REQUEST, (0..12).collect(), MmData::default()).unwrap();

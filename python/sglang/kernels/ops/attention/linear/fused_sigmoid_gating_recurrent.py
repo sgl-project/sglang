@@ -1,3 +1,4 @@
+import functools
 from typing import Optional
 
 import torch
@@ -5,6 +6,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
@@ -44,6 +46,18 @@ def _select_recurrent_launch_config(
     ):
         return (8, 4) if n == 1 else (16, 2)
     if (
+        _is_hip
+        and _is_gfx95
+        and is_kda
+        and 0 < n <= 4
+        and h == hv == 12
+        and k == 128
+        and v == 128
+    ):
+        # Kimi-K3 TP8 (12 heads) gets 48 CTAs at BV=32; tuned on MI355X at n=1 and n=4,
+        # where BV=8 is 15.2 vs 19.9 us at n=1, T=8. One warp matches BV=32 bit for bit.
+        return 8, 1
+    if (
         target_verify
         and not _is_hip
         and not is_kda
@@ -71,6 +85,22 @@ def _select_recurrent_launch_config(
         # over 8x the CTAs with identical output (6.99 vs 13.66 us isolated).
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
+
+
+@functools.lru_cache(maxsize=8)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_bv(v_size: int, programs_per_split: int, device: torch.device) -> int:
+    # V tiles are independent; splitting them fills otherwise idle SMs at small N.
+    v_pow2 = triton.next_power_of_2(v_size)
+    bv_max = min(v_pow2, 32)
+    bv_min = min(16, bv_max)
+    wanted = max(1, _sm_count(device.index) // max(1, programs_per_split))
+    splits = 1 << (wanted.bit_length() - 1)
+    splits = max(1, min(splits, v_pow2 // bv_min))
+    return max(bv_min, min(bv_max, v_pow2 // splits))
 
 
 _EX2_APPROX_FTZ_F32 = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
@@ -202,6 +232,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    ring_indices=None,
+    SEPARATE_RING_INDEX: tl.constexpr = False,
     SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
@@ -261,6 +293,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
+
+    if IS_VARLEN:
+        num_seqs = tl.num_programs(1) if SPLIT_N_HV_GRID else tl.num_programs(2) // HV
+        if i_n == num_seqs - 1:
+            # Graph padding has no tokens in cu_seqlens, so the recurrent loop
+            # never writes its output. Clear the unused tail in the last
+            # sequence's programs, without touching real tokens or state slots.
+            for pad_token in range(eos, all):
+                p_pad = o + ((i_k * all + pad_token) * HV + i_hv) * V + o_v
+                tl.store(p_pad, 0.0, mask=mask_v)
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -376,7 +418,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # ring; the overflow steps are past the committable prefix, so drop them
         # (writing them would smash the next slot's ring).
         if CACHE_RING:
-            ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
+            if SEPARATE_RING_INDEX:
+                ring_slot = tl.load(ring_indices + i_n).to(tl.int64)
+            else:
+                ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
             if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
                 tl.store(
                     replayssm_rawv
@@ -472,7 +517,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif IS_KDA and V == 128 and BV == 4:
+        elif IS_KDA and (V == 128 and BV == 4):
             # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",
@@ -566,6 +611,8 @@ def fused_sigmoid_gating_delta_rule_update(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    # Request-scoped KDA ring. None keeps the ring on h0_indices (mamba slot).
+    ring_indices: Optional[torch.Tensor] = None,
     # Reproduce FlashInfer's `recurrent_kda` CuTe DSL decode kernel step for
     # step: `b` is then the already-sigmoided FP32 beta, the gate is formed in
     # base 2 with ex2/lg2.approx, Q/K norms reduce lane-striped, the state
@@ -625,6 +672,8 @@ def fused_sigmoid_gating_delta_rule_update(
         target_verify=target_verify,
         cache_steps=cache_steps,
     )
+    if is_kda and _is_sm90 and envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get():
+        BV = _select_bv(V, N * HV, v.device)
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -754,6 +803,10 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        ring_indices=ring_indices
+        if ring_indices is not None
+        else initial_state_indices,
+        SEPARATE_RING_INDEX=ring_indices is not None,
         SPLIT_N_HV_GRID=split_n_hv_grid,
         MATCH_CUTEDSL_DECODE=match_cutedsl_decode,
         ROUND_STATE_TO_BF16=round_state_to_bf16,

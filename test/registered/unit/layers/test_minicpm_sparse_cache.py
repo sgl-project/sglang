@@ -81,10 +81,7 @@ def make_pool_and_req(capacity: int = 64):
         kernel_stride=2,
         enable_memory_saver=False,
     )
-    req = SimpleNamespace(
-        inflight_middle_chunks=0,
-        kv=ReqKvInfo(),
-    )
+    req = SimpleNamespace(kv=ReqKvInfo())
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator
 
@@ -218,7 +215,6 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         req_to_token_pool=pool,
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         get_last_batch=lambda: None,
-        get_running_batch=lambda: None,
         scheduler_stage_metrics=None,
     )
 
@@ -255,6 +251,7 @@ def test_streaming_session_release_frees_compressed_slots():
     cache = SimpleNamespace(
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
+        logical_page_size=allocator.page_size,
         page_size=1,
         unlock=lambda lock: None,
     )
@@ -292,7 +289,6 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
             session_held_mamba_slots=lambda: 0,
         ),
         get_last_batch=lambda: None,
-        get_running_batch=lambda: None,
         scheduler_stage_metrics=None,
     )
 
