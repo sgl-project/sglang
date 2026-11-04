@@ -2949,11 +2949,33 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        # The Mamba state cache is reserved out of the same budget. Remember
+        # how much was left before that reservation so the exhaustion error
+        # below can tell a Mamba-driven shortfall (where raising
+        # --mem-fraction-static cannot help on its own) apart from weights
+        # alone exceeding the budget.
+        pre_mamba_rest_memory = None
+        mamba_state_gb = None
         if self.mambaish_config is not None:
+            pre_mamba_rest_memory = rest_memory
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+            if pre_mamba_rest_memory > 0 and rest_memory <= 0:
+                mamba_state_gb = pre_mamba_rest_memory - rest_memory
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
+            if mamba_state_gb is not None:
+                raise ValueError(
+                    f"Mamba state cache leaves no GPU memory for the KV cache "
+                    f"under --mem-fraction-static="
+                    f"{get_schedule().mem_fraction_static}. The Mamba state "
+                    f"cache reservation is {mamba_state_gb:.2f} GB, leaving "
+                    f"no room in the {pre_mamba_rest_memory:.2f} GB available "
+                    f"after weights and the static slack. Try: (1) reduce "
+                    f"--max-running-requests, (2) cap the state cache with "
+                    f"--max-mamba-cache-size, or (3) reduce "
+                    f"--speculative-num-draft-tokens."
+                )
             minimum_mem_fraction_static = (
                 1 - available_gpu_memory / pre_model_load_memory
             )
