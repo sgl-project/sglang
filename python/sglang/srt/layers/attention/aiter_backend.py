@@ -3203,7 +3203,7 @@ class AiterAttnBackend(AttentionBackend):
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
-                    kv_lens[:bs].to(torch.int32).clone(),
+                    kv_lens[:bs].to(torch.int32, copy=True),
                     None,
                     bs,
                     static_local_kv_lens_cpu=self.cuda_graph_dcp_static_local_kv_lens[

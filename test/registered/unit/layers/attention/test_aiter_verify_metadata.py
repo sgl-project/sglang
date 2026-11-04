@@ -191,8 +191,7 @@ class TestAiterDcpVerifyGraphReplay(CustomTestCase):
     """At DCP, the verify localizes each request's KV to this rank's shard, from
     the KV lengths it is given. The asm cp kernel reads the verify window (the
     draft tokens) from the cache, so its shard must span them. Graph replay gave
-    the prefix lengths: every rank dropped its draft tokens, the verify never saw
-    them, and Kimi-K3 GSM8K at DCP8 fell from 0.97 to about 0.945."""
+    the prefix lengths, so every rank dropped its draft tokens from the verify."""
 
     def setUp(self):
         for target, replacement in (
