@@ -342,6 +342,28 @@ class AnalysisChecks(unittest.TestCase):
         self.assertIn("initial flush seconds", report)
         self.assertIn("capability refresh seconds (included)", report)
 
+    def test_indexed_resource_parts_verify_and_preserve_all_samples(self):
+        parts = []
+        for i in range(2):
+            path = self.root/f"resources-{i:03d}.jsonl.gz"
+            with gzip.open(path, "wt") as out:
+                out.write(json.dumps({"monotonic": 100.+i, "http": [{
+                    "url": "http://b/metrics", "body": f"sglang:kv_available_tokens {10-i}\n"}]})+"\n")
+            parts.append({"file": path.name, "sha256": analyze.sha256(path)})
+        write(self.root/"resources-index.json", {"parts": parts})
+        cell = {"state": "completed", "args": {"engine_b": "http://b"},
+                "destination_boot_server": {"max_total_num_tokens": 100},
+                "arm_windows": [{"id": "arm", "arm": "prefetch", "start": 99., "end": 102., "work_start": 99.}]}
+        sources = analyze.resource_inputs(self.root)
+        result = analyze.attach_resources([cell], sources)
+        self.assertEqual(len(result["files"]), 2)
+        self.assertFalse(result["parse_errors"])
+        self.assertEqual(cell["resources"]["samples"], 2)
+        self.assertEqual(cell["resources"]["metrics"]["b_gpu_resident_or_reserved_tokens"]["sampled_peak"], 91)
+        sources[1].write_bytes(b"changed")
+        with self.assertRaisesRegex(analyze.VerificationError, "checksum-mismatched"):
+            analyze.resource_inputs(self.root)
+
     def test_analysis_preserves_all_cell_states_and_negative_deltas(self):
         fixture(self.root/"good")
         fixture(self.root/"bad", invalid=True)

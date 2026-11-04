@@ -455,19 +455,21 @@ def resource_peaks(samples):
 
 
 def attach_resources(cells, path):
-    if path is None:
+    if not path:
         return {"available": False}
+    paths = list(path) if isinstance(path, (list, tuple)) else [path]
     b_urls = {c["args"]["engine_b"] for c in cells if c["state"] == "completed"}
     by_url = {url: [] for url in b_urls}
     parse_errors = []
-    with open_text(path) as handle:
-        for number, line in enumerate(handle, 1):
-            try:
-                row = json.loads(line)
-                for url in b_urls:
-                    by_url[url].append(resource_sample(row, url))
-            except (ValueError, KeyError, TypeError) as exc:
-                parse_errors.append({"line": number, "error": str(exc)})
+    for source in paths:
+        with open_text(source) as handle:
+            for number, line in enumerate(handle, 1):
+                try:
+                    row = json.loads(line)
+                    for url in b_urls:
+                        by_url[url].append(resource_sample(row, url))
+                except (ValueError, KeyError, TypeError) as exc:
+                    parse_errors.append({"file": source.name, "line": number, "error": str(exc)})
     for cell in cells:
         if cell["state"] != "completed":
             continue
@@ -492,8 +494,29 @@ def attach_resources(cells, path):
         cell["resources_including_flush"] = resource_peaks(unique(inclusive_selected))
         cell["resources_by_group"] = {name: resource_peaks(unique(items)) for name, items in groups.items()}
         cell["resource_window_definition"] = "primary resources and group peaks exclude initial flush using raw arm-result bounds; missing raw timing falls back to marked inclusive approximate windows"
-    return {"available": True, "path": str(path.resolve()), "sha256": sha256(path), "parse_errors": parse_errors,
+    return {"available": True, "files": [{"path": str(p.resolve()), "sha256": sha256(p)} for p in paths], "parse_errors": parse_errors,
             "note": "external observer data; sampled 2s nominal cadence, observed cadence recorded; no synchronization beyond local monotonic clock"}
+
+
+def resource_inputs(results):
+    single = locate(results, "resources.jsonl")
+    index = results/"resources-index.json"
+    if not index.is_file():
+        return single
+    if single:
+        raise VerificationError("ambiguous single resource file and indexed parts")
+    paths = []
+    for part in read_json(index)["parts"]:
+        name = part["file"]
+        if Path(name).name != name:
+            raise VerificationError("unsafe resource part name")
+        source = results/name
+        if source in paths or not source.is_file() or sha256(source) != part["sha256"]:
+            raise VerificationError("duplicate, missing or checksum-mismatched resource part: "+name)
+        paths.append(source)
+    if not paths:
+        raise VerificationError("empty resource part index")
+    return paths
 
 
 def report_text(analysis):
@@ -579,7 +602,7 @@ def run(results, output):
     output.mkdir(parents=True, exist_ok=False)
     directories = {p.parent for pattern in ("manifest.json", "manifest.json.gz", "failure.json", "failure.json.gz", "raw.jsonl", "raw.jsonl.gz") for p in results.rglob(pattern)}
     cells = [analyze_cell(p) for p in sorted(directories)]
-    resource_path = locate(results, "resources.jsonl")
+    resource_path = resource_inputs(results)
     resources = attach_resources(cells, resource_path)
     completed = [c for c in cells if c["state"] == "completed"]
     analysis = {"results": str(results.resolve()), "cells": cells, "resources": resources,

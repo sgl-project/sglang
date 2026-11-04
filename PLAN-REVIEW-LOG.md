@@ -4912,3 +4912,7 @@ root 阅读全部差异并独立验证：40 项通过（analysis-reset-tests-roo
 保护边界：全 PIN 空间无法批准时，已有 demand 的 queued job 真实 DEFERRED，正常进度接口消费零新增 storage span 后允许计算；GPU/FIFO barrier 阻止新 join，join 后出现 GPU load 也 DEFERRED，原 DMA/prefill fence 保留。native-only 仍等待，取消/期限不撤销有效 demand，abort 清理后未启动任务不产生 I/O。
 
 root 阅读全部生产与测试差异并独立运行 transfers、cache、service、protection、feedback、controller：123 passed、96 subtests，24.59s（native-queued-regressions-root.log）。生产文件测试 SHA256=daff864598fe3e266ed5a7352d3d6e5e9267c9f3f7255334fcb5fd885160778a；源码、命令、前后机制证据见 native-proof-manifest.json 与 native_queued_demand_repro.py。运行中的基线 f65 不变；更新尚未启动的优化 runtime 后，以相同 0.8/大池配置完成真实 GPU/Mooncake 验证及 8/16/32 长测。按用户授权提交，不推送。
+
+### 长测监控归档规模
+
+2s 完整 Prometheus/loads 采样持续增长，归档器支持有序 gzip parts 与逐文件 SHA-256，避免单文件超过常用 Git 托管上限。单文件与 parts 同时出现时拒绝，重复/缺失/路径越界/哈希不匹配时拒绝，不丢弃指标。独立测试 41 项通过，新增用例证明两片采样都计入且改写任一片会被检出；原单文件与压缩 cells 保持兼容。
