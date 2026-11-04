@@ -937,6 +937,60 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         prealloc_queue.add.assert_called_once_with(kept, is_rebootstrap=True)
 
+    # Consolidation additions (sgl-project/sglang#47624, pause/resume tier):
+    # idempotency and error contracts around pause/continue. Unit tier is
+    # dtype-agnostic (RFC section 4): the BF16 precision contract is enforced
+    # by the 1-NPU smoke sibling (test_npu_pause_resume_generation.py, P0).
+
+    def test_double_pause_preserves_first_pause_start(self):
+        """A second pause must not reset the pause window: throughput
+        accounting keeps the FIRST pause timestamp."""
+        scheduler = self._new_scheduler()
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=1.0):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=2.0):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(scheduler._pause_started_at, 1.0)
+
+    def test_double_retract_stays_paused(self):
+        """Retracting an already-retracted (empty) engine stays paused and
+        must not raise."""
+        scheduler = self._new_scheduler()
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertTrue(scheduler._engine_paused)
+
+    def test_continue_without_pause_is_noop(self):
+        """continue_generation without a prior pause is an idempotent no-op:
+        no error, no phantom pause intervals."""
+        scheduler = self._new_scheduler()
+
+        scheduler.continue_generation(
+            ContinueGenerationReqInput(torch_empty_cache=False)
+        )
+
+        self.assertFalse(scheduler._engine_paused)
+        self.assertEqual(scheduler._pause_intervals, deque())
+
+    def test_continue_after_pause_records_interval(self):
+        """continue closes the pause window: the interval is recorded and the
+        start timestamp cleared."""
+        scheduler = self._new_scheduler()
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=1.0):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=3.0):
+            scheduler.continue_generation(
+                ContinueGenerationReqInput(torch_empty_cache=False)
+            )
+
+        self.assertEqual(scheduler._pause_intervals, deque([(1.0, 3.0)]))
+        self.assertIsNone(scheduler._pause_started_at)
+        self.assertFalse(scheduler._engine_paused)
+
 
 if __name__ == "__main__":
     unittest.main()
