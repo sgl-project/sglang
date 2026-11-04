@@ -516,7 +516,18 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
         elif hybrid_kda_config(runner.model_config) is not None and not is_npu():
-            prefill_default = flashinfer_kda_prefill_default(runner)
+            if _is_sail:
+                from sglang.srt.hardware_backend.sail.attention.kda_backend import (
+                    sail_pla_prefill_default,
+                )
+
+                # Ask SAIL first: PPU is CUDA-compatible, so is_cuda() and an
+                # SM10x capability can both hold there, which would let the
+                # FlashInfer Blackwell default claim the runner and take the PLA
+                # gate out of the picture for prefill.
+                prefill_default = sail_pla_prefill_default(runner.model_config)
+            else:
+                prefill_default = flashinfer_kda_prefill_default(runner)
         runner.linear_attn_backends = resolve_linear_attn_backends(
             prefill_default=prefill_default
         )
@@ -545,9 +556,18 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
-            linear_attn_backend = _create_linear_attention_backend(
-                runner, GDNAttnBackend
-            )
+            if _is_sail:
+                from sglang.srt.hardware_backend.sail.attention.gdn_backend import (
+                    SailGDNAttnBackend,
+                )
+
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, SailGDNAttnBackend
+                )
+            else:
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, GDNAttnBackend
+                )
             from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 
             if is_qwen_qsa(runner.model_config.hf_config):
@@ -609,14 +629,31 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     runner, AscendKDAAttnBackend
                 )
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+            elif _is_sail:
+                from sglang.srt.hardware_backend.sail.attention.kda_backend import (
+                    SailKDAAttnBackend,
+                )
+
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, SailKDAAttnBackend
+                )
             else:
                 linear_attn_backend = _create_linear_attention_backend(
                     runner, KDAAttnBackend
                 )
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = _create_linear_attention_backend(
-                runner, KDAAttnBackend
-            )
+            if _is_sail:
+                from sglang.srt.hardware_backend.sail.attention.kda_backend import (
+                    SailKDAAttnBackend,
+                )
+
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, SailKDAAttnBackend
+                )
+            else:
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, KDAAttnBackend
+                )
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

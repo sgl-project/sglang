@@ -3243,6 +3243,60 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
 
+    def test_mamba_radix_cache_resolution_sail_paths(self):
+        """The FlashKDA extra-buffer allowance is SAIL-only."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import (
+            _mamba_radix_cache_resolution,
+            supports_mamba_cache_extra_buffer,
+        )
+
+        kimi_k3 = SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+
+        def _view(**kw):
+            defaults = dict(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=1,
+                linear_attn_backend="flashkda",
+                linear_attn_prefill_backend=None,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(hf_config=kimi_k3), **defaults
+                )
+            )
+
+        # Off SAIL the FlashKDA backend is not an extra-buffer backend, so the
+        # strategy falls back to no_buffer even with overlap enabled.
+        self.assertFalse(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(linear_attn_backend="flashkda"), kimi_k3
+            )
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view())["mamba_radix_cache_strategy"],
+            "no_buffer",
+        )
+        # On SAIL FlashKDA prefill still snapshot-writes tracked states through
+        # Triton, so the ping-pong extra buffer is usable.
+        with patch.object(
+            overrides_module,
+            "get_platform",
+            return_value=SimpleNamespace(is_sail=True),
+        ):
+            self.assertTrue(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="flashkda"), kimi_k3
+                )
+            )
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view())["mamba_radix_cache_strategy"],
+                "extra_buffer",
+            )
+
     def test_mamba_radix_cache_resolution_reads_registry_specs(self):
         """A spec registered by config predicate (archs=[]) drives the leaves
         exactly like an arch-registered one, and the spec's

@@ -48,7 +48,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils import is_pin_memory_available, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -1648,7 +1648,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             ring_indices = None
             if mamba_pool.replayssm_request_ring:
                 ring_indices = req_pool_indices[:request_number]
-            commit_kda_replayssm_after_verify(
+            commit_kwargs = dict(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
                 accept_lens=last_correct_step_indices + 1,
@@ -1659,6 +1659,14 @@ class HybridLinearAttnBackend(AttentionBackend):
                 null_block_id=-1,
                 ring_indices=ring_indices,
             )
+            if is_sail():
+                # SAIL folds the accepted window and rolls back conv in one PLA
+                # launch; False hands the batch back to the Triton path below.
+                from sglang.srt.hardware_backend.sail.kernels import kda as sail_kda
+
+                if sail_kda.commit_after_verify(**commit_kwargs):
+                    return
+            commit_kda_replayssm_after_verify(**commit_kwargs)
             return
 
         # KDA fused-accept: the next verify seeds itself in-kernel from the
