@@ -8,6 +8,14 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
@@ -18,16 +26,10 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
-    attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
     validate_declarations,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
@@ -143,6 +145,7 @@ def handle_model_specific_adjustments(server_args: Any):
         NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_kimi_k3,
     )
 
     if cfg.enable_deterministic_inference:
@@ -166,11 +169,15 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
-    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+    if (
+        get_platform().is_npu
+        and cfg.dcp_size > 1
+        and not (is_deepseek_dsa(hf_config) or is_kimi_k3(hf_config))
+    ):
         raise ValueError(
             "NPU decode context parallelism is currently implemented only for "
-            "DeepSeek DSA models; got "
-            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+            "DeepSeek DSA and Kimi-K3 models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a supported model."
         )
 
     if model_arch == "InternS2MobiusForConditionalGeneration":

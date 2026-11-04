@@ -100,8 +100,6 @@ PER_COMMIT_SUITES = {
         "base-c-test-4-gpu-b200",
         "base-c-test-2-gpu-gb300",
         "base-c-test-4-gpu-gb300",
-        "base-c-test-8-gpu-h20",
-        "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
         "base-c-test-8-gpu-b300",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
@@ -114,6 +112,8 @@ PER_COMMIT_SUITES = {
         "extra-b-test-8-gpu-h200",
         "extra-b-test-8-gpu-h20",
         "extra-b-test-8-gpu-b300",
+        "extra-b-test-2-gpu-gb300",
+        "extra-b-test-4-gpu-gb300",
     ],
     HWBackend.NPU: [
         "base-a-test-npu",
@@ -151,6 +151,7 @@ NIGHTLY_SUITES = {
         # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
         # shape as the per-commit suites. No `nightly=True`: the stage name
         # carries the cadence; only the legacy suites below still need the flag.
+        "nightly-test-1-gpu-small",
         "nightly-test-1-gpu-large",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
@@ -158,6 +159,7 @@ NIGHTLY_SUITES = {
         "nightly-test-4-gpu-gb300",
         "nightly-test-8-gpu-h200",
         "nightly-test-8-gpu-b200",
+        "nightly-test-8-gpu-b300",
     ],
     HWBackend.AMD: [
         "nightly-amd",
@@ -475,6 +477,7 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fork_worker_preload=args.fork_worker_preload,
         timeout_overrides=dict(args.timeout_override),
     )
 
@@ -605,6 +608,15 @@ def main():
         help=(
             "Preload common modules, then run this many files in isolated fork "
             "children (default: 1, preserving one exec per file)."
+        ),
+    )
+    parser.add_argument(
+        "--fork-worker-preload",
+        nargs="*",
+        default=[],
+        help=(
+            "Extra modules the fork worker imports before forking, on top of "
+            "the common numpy/torch/triton stack."
         ),
     )
     args = parser.parse_args()
