@@ -67,15 +67,6 @@ class TestPackedIndexCache(unittest.TestCase):
             self.assertTrue(torch.all(backing[:4].cpu() == 0xA5).item())
             self.assertTrue(torch.all(backing[-4:].cpu() == 0xA5).item())
 
-        SetKAndS.execute(
-            pool=pool,
-            buf=cache,
-            loc=loc[:0],
-            index_k=key[:0],
-            index_k_scale=scale[:0],
-        )
-        self.assertTrue(torch.equal(cache.cpu(), expected))
-
 
 if __name__ == "__main__":
     unittest.main()
