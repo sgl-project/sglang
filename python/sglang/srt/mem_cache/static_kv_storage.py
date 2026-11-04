@@ -832,7 +832,10 @@ def _static_state_entries(
     them."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.disaggregation.utils import remap_draft_layer_ids
-    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+        NPUMHATokenToKVPool,
+        NPUMLATokenToKVPool,
+    )
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
     from sglang.srt.mem_cache.memory_pool import (
@@ -1227,6 +1230,13 @@ def _static_state_entries(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+    if isinstance(owner_view, NPUMHATokenToKVPool) and owner_view.is_modelslim_mxfp8:
+        add(
+            StateType.BLOCK_SCALE,
+            *owner_view.get_kv_scale_buf_infos(),
+            layer_ids=owner_view.model_layer_ids,
+        )
 
     regions = {}
     views = {}
