@@ -53,7 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -161,6 +161,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size, config.num_experts, bias=False, quant_config=None

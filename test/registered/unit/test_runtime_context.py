@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+register_cpu_ci(est_time=196, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -23,9 +23,10 @@ import sglang as _sglang
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import prefill_buffer_ceiling
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
-from sglang.srt.arg_groups.model_override_base import resolving_view
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    resolved_view,
+    resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
     mamba_cache_chunk_size as mamba_cache_chunk_size_of,
@@ -35,7 +36,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.arg_groups.overrides import (
     resolution_result,
-    resolved_view,
 )
 from sglang.srt.runtime_context import (
     Flags,
@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    is_scheduler_io_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     publish,
@@ -240,7 +241,7 @@ class TestParallelDelegation(_IsolatedOverrides):
     def test_wrapper_holds_no_resolved_state(self):
         # __slots__: no __dict__; the only instance state is the override hook.
         self.assertFalse(hasattr(get_parallel(), "__dict__"))
-        # tp_group IS exposed: live delegation handles PD-multiplexing / the tp patch.
+        # tp_group IS exposed: live delegation handles the tp patch.
         self.assertTrue(hasattr(ParallelContext, "tp_group"))
         # local_attn_dp is intentionally not part of the wrapper surface.
         self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))
@@ -485,7 +486,7 @@ class TestStampedRanks(_IsolatedOverrides):
 
         self.addCleanup(restore)
         publish(
-            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=8),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=4),
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
@@ -493,13 +494,14 @@ class TestStampedRanks(_IsolatedOverrides):
         dp_flags.use_world_group_for_gather = False
         self.assertEqual(dp_gather_slot(), parallel.attn_dp_rank)
 
-        # After a scale-up the gather spans the expanded WORLD, and the joining
-        # cohort is numbered from its offset.
+        # After scale-up the gather spans expanded WORLD, but its slots remain
+        # logical DP replicas. Physical ranks 8 and 9 therefore share DP slot 4.
         dp_flags.use_world_group_for_gather = True
         dp_flags.joiner_skip_all_gather = False
         parallel.override_permanently(ep_join_rank_offset=8)
-        self.assertEqual(dp_gather_slot(), 8 + parallel.tp_rank)
-        self.assertEqual(parallel.attn_dp_size, 8)
+        self.assertEqual(dp_gather_slot(), (8 + parallel.tp_rank) // 2)
+        self.assertEqual(parallel.attn_dp_size, 4)
+        self.assertEqual(parallel.attn_tp_size, 2)
         self.assertEqual(parallel.tp_size, 8)
 
     def test_a_scale_up_writes_no_width(self):
@@ -671,6 +673,16 @@ class TestParallelOverride(_IsolatedOverrides):
             with p.override(tp_sizee=1):  # typo
                 pass
         self.assertEqual(p._overrides, {})
+
+
+class TestSchedulerIoRank(_IsolatedOverrides):
+    def test_only_rank_zero_of_every_inner_group_is_the_io_rank(self):
+        ranks = {"pp_rank": 0, "attn_tp_rank": 0, "attn_cp_rank": 0}
+        with get_parallel().override(**ranks):
+            self.assertTrue(is_scheduler_io_rank())
+        for name in ranks:
+            with get_parallel().override(**{**ranks, name: 1}):
+                self.assertFalse(is_scheduler_io_rank(), name)
 
 
 class TestParallelDCP(_IsolatedOverrides):
@@ -1160,6 +1172,26 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(get_moe_a2a_backend().is_deepep())
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
+
+    def test_flashinfer_megamoe_speculative_defaults(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "flashinfer_trtllm")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+
+    def test_flashinfer_megamoe_speculative_explicit_wins(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            speculative_moe_runner_backend="triton",
+            speculative_moe_a2a_backend="deepep",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "triton")
+        self.assertTrue(moe.speculative_a2a_backend.is_deepep())
 
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (

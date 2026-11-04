@@ -39,6 +39,18 @@ def normalize_output_seeds(
     return [base_seed + i for i in range(num_outputs_per_prompt)]
 
 
+def output_request_id(request_id: str, output_index: int) -> str:
+    return f"{request_id}:{output_index}"
+
+
+def split_output_request_id(request_id: str) -> tuple[str, int] | None:
+    """Inverse of output_request_id; None for an id without an output index."""
+    parent, _, index = request_id.rpartition(":")
+    if not parent or not index.isdigit():
+        return None
+    return parent, int(index)
+
+
 def _with_output_index_suffix(output_file_name: str, output_index: int) -> str:
     base, ext = os.path.splitext(output_file_name)
     return f"{base}_{output_index}{ext}"
@@ -95,8 +107,10 @@ def expand_request_outputs(
 
     expanded: list[Req] = []
     for output_index, seed in enumerate(seeds):
-        output_request_id = (
-            f"{req.request_id}:{output_index}" if req.request_id is not None else None
+        output_req_id = (
+            output_request_id(req.request_id, output_index)
+            if req.request_id is not None
+            else None
         )
         output_metrics = deepcopy(req.metrics) if preserve_parent_metrics else None
         output_req = copy(req)
@@ -105,7 +119,7 @@ def expand_request_outputs(
         output_req.condition_inputs = dict(req.condition_inputs)
         output_req.trace_ctx = _trace_ctx_for_output(
             req,
-            output_request_id,
+            output_req_id,
             output_index,
             reuse_parent_trace_ctx=reuse_parent_trace_ctx,
         )
@@ -116,8 +130,8 @@ def expand_request_outputs(
         output_req.extra["parent_request_id"] = req.request_id
         output_req.extra["output_index"] = output_index
 
-        if output_request_id is not None:
-            output_req.request_id = output_request_id
+        if output_req_id is not None:
+            output_req.request_id = output_req_id
 
         if req.output_file_name:
             output_req.output_file_name = _with_output_index_suffix(
