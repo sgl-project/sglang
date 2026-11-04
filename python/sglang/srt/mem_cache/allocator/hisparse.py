@@ -116,6 +116,27 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
+    def check_decode_capacity(
+        self, *, num_tokens: int, tree_cache, requests=None, spec_algorithm=None
+    ) -> bool:
+        if (
+            self.page_size > 1
+            and self._spec_scratch_capacity > 0
+            and spec_algorithm is not None
+            and not spec_algorithm.is_none()
+        ):
+            # alloc_for_spec_decode grows logical slots only. Target verify
+            # uses the admitted request's persistent buffer/extra page and
+            # scratch; free physical slots are for admitting NEW requests.
+            self.logical_attn_allocator.evict_to_free_tokens(tree_cache, num_tokens)
+            return self.logical_attn_allocator.available_size() >= num_tokens
+        return super().check_decode_capacity(
+            num_tokens=num_tokens,
+            tree_cache=tree_cache,
+            requests=requests,
+            spec_algorithm=spec_algorithm,
+        )
+
     def get_kvcache(self):
         return self._kvcache
 
