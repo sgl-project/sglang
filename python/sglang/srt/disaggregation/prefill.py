@@ -1136,6 +1136,10 @@ class SchedulerDisaggregationPrefillMixin:
                     == "prefill_complete"
                 ):
                     req.disagg_kv_sender.mark_prefill_complete()
+                # Publish the sampled handoff token before waiting for KV
+                # transfer. Keep the request alive until transfer completes.
+                if req.stream and not req.return_logprob:
+                    self.output_streamer.stream_output([req], False)
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
