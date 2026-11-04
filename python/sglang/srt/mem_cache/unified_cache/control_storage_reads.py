@@ -24,6 +24,9 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 FULL = ComponentType.FULL
+# Limit demand preference without letting a stream of arrivals starve background
+# reads. Physical conflict, capacity, and GPU barriers retain precedence.
+_MAX_DEMAND_BURST = 8
 
 
 @dataclass
@@ -87,6 +90,19 @@ class StorageCacheReads:
         self._joinable: dict[tuple, _Read] = {}
         self._host_reclaim_retry_at = 0.0
         self._next_admission_order = 0
+        self._demand_admissions = 0
+        for name in (
+            "max_storage_read_inflight_tokens",
+            "max_speculative_storage_read_tokens",
+            "demand_host_reserve_tokens",
+        ):
+            if getattr(executor.config, name) % self.cache.page_size:
+                raise ValueError(f"{name} must be page aligned")
+        if (
+            executor.config.demand_host_reserve_tokens
+            >= self.cache.cache_controller.mem_pool_host.size
+        ):
+            raise ValueError("demand_host_reserve_tokens must be below host capacity")
         self.stats = dict(
             demand_coalesced=0,
             demand_consumed=0,
@@ -128,6 +144,20 @@ class StorageCacheReads:
             host_available_tokens=pool.available_size(),
             host_bytes_per_token=pool.size_per_token,
         )
+        for reason in (
+            "whole_scope_capacity",
+            "storage_concurrency_limit",
+            "shared_prefix_serialization",
+            "storage_rate_limit",
+            "source_pending",
+            "storage_inflight_budget",
+            "speculative_read_budget",
+            "demand_priority",
+        ):
+            stats["waiting_" + reason] = sum(
+                job.operation is None and not job.loading and job.waiting == reason
+                for job in self.jobs.values()
+            )
         return stats
 
     @staticmethod
@@ -353,7 +383,16 @@ class StorageCacheReads:
                 job.waiting = "storage_rate_limit"
                 self._release(job)
                 return
-            if not self._host_capacity(job, len(job.tokens) - host_length):
+            needed = len(job.tokens) - host_length
+            budget = self._read_budget(job, needed)
+            if budget is not None:
+                if budget.startswith("scope_exceeds_"):
+                    self._retire(job, status=Status.DEFERRED, code=budget)
+                else:
+                    job.waiting = budget
+                    self._release(job)
+                return
+            if not self._host_capacity(job, needed):
                 job.waiting = "whole_scope_capacity"
                 if job.demands:
                     # Ordinary demand must be able to continue computation
@@ -393,12 +432,53 @@ class StorageCacheReads:
             self.stats["jobs_started"] += 1
             self.stats["queue_seconds"] += job.started_at - job.created_at
             self.stats["requested_tokens"] += job.reserved_host_tokens
+            if self.executor.config.storage_demand_priority:
+                self._demand_admissions = (
+                    min(_MAX_DEMAND_BURST, self._demand_admissions + 1)
+                    if job.demands
+                    else 0
+                )
             job.operation.native_quiescent = False
             job.operation.native_on_publish = lambda: self._published(job)
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
             if job.operation is None and not job.loading:
                 self._retire(job)
+
+    def _read_budget(self, job, needed):
+        """Gate new native work; ordinary recovery keeps its existing fallback.
+
+        Controller occupancy includes ordinary and native query/GET allocations.
+        Native speculative spans are charged once per physical in-flight job;
+        completed residency is managed by Router policy and ordinary eviction.
+        """
+        config = self.executor.config
+        limit = config.max_storage_read_inflight_tokens
+        if limit:
+            if needed > limit:
+                return "scope_exceeds_read_budget"
+            if self.cache.cache_controller.prefetch_tokens_occupied + needed > limit:
+                return "storage_inflight_budget"
+        if not job.demands:
+            limit = config.max_speculative_storage_read_tokens
+            if limit:
+                if needed > limit:
+                    return "scope_exceeds_speculative_budget"
+                occupied = sum(
+                    other.reserved_host_tokens
+                    for other in self.jobs.values()
+                    if other is not job
+                    and other.operation is not None
+                    and not other.demands
+                )
+                if occupied + needed > limit:
+                    return "speculative_read_budget"
+            if (
+                needed + config.demand_host_reserve_tokens
+                > self.cache.cache_controller.mem_pool_host.size
+            ):
+                return "scope_exceeds_speculative_capacity"
+        return None
 
     def _admission_wait(self, job):
         # Polling rotates the job dictionary. Use immutable admission order so
@@ -420,6 +500,20 @@ class StorageCacheReads:
             for other in active
         ):
             return "shared_prefix_serialization"
+        if (
+            self.executor.config.storage_demand_priority
+            and not job.demands
+            and self._demand_admissions < _MAX_DEMAND_BURST
+        ):
+            if any(
+                other is not job
+                and other.demands
+                and other.operation is None
+                and not other.loading
+                and self._has_live_interest(other)
+                for other in self.jobs.values()
+            ):
+                return "demand_priority"
         return None
 
     def _gpu_barrier(self, job):
@@ -477,6 +571,10 @@ class StorageCacheReads:
         """
         pool = self.cache.cache_controller.mem_pool_host
         reserved = self._unallocated_reservations(job)
+        # Capacity and outstanding promises use token slots exactly once.
+        # The reserve is an admission floor, never a physical allocation.
+        if not job.demands:
+            needed += self.executor.config.demand_host_reserve_tokens
         available = pool.available_size() - reserved
         if needed <= available:
             return True
@@ -534,7 +632,24 @@ class StorageCacheReads:
         if not self.jobs:
             return
         self.cache.drain_storage_control_queues()
-        for job in tuple(self.jobs.values())[:limit]:
+        jobs = tuple(self.jobs.values())
+        if self.executor.config.storage_demand_priority:
+            active = [job for job in jobs if job.operation is not None or job.loading]
+            queued = [job for job in jobs if job.operation is None and not job.loading]
+            demand = sorted(
+                (job for job in queued if job.demands),
+                key=lambda job: job.admission_order,
+            )
+            # Keep rotating background candidates: a bounded poll must not keep
+            # retrying the same blocked scopes while feasible work waits later.
+            background = [job for job in queued if not job.demands]
+            if self._demand_admissions >= _MAX_DEMAND_BURST:
+                # One background candidate gets a turn; a blocked candidate
+                # must not hide runnable demand behind a full background queue.
+                jobs = active + background[:1] + demand + background[1:]
+            else:
+                jobs = active + demand + background
+        for job in jobs[:limit]:
             self.jobs.pop(job.key)
             self.jobs[job.key] = job
             cancelled = not job.demands and all(

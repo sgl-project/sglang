@@ -26,6 +26,10 @@ class CacheControlConfig:
     max_policy_claims_per_copy: int = 4
     max_prepared_prefixes: int = 128
     max_concurrent_storage_reads: int = 4
+    max_storage_read_inflight_tokens: int = 0
+    max_speculative_storage_read_tokens: int = 0
+    demand_host_reserve_tokens: int = 0
+    storage_demand_priority: bool = False
 
     def __post_init__(self):
         validated(self.namespace, Identifier)
@@ -49,6 +53,18 @@ class CacheControlConfig:
             raise ValueError(
                 "max_concurrent_storage_reads must be an integer in [1, 64]"
             )
+        for name in (
+            "max_storage_read_inflight_tokens",
+            "max_speculative_storage_read_tokens",
+            "demand_host_reserve_tokens",
+        ):
+            if (
+                type(getattr(self, name)) is not int
+                or not 0 <= getattr(self, name) <= 1 << 40
+            ):
+                raise ValueError(f"{name} must be a nonnegative bounded integer")
+        if type(self.storage_demand_priority) is not bool:
+            raise ValueError("storage_demand_priority must be a boolean")
 
 
 @dataclass(frozen=True)

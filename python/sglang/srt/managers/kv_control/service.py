@@ -60,6 +60,14 @@ class CacheLimits(Value):
     max_result_targets: int = 4096
     max_prepared_prefixes: int = 128
     max_concurrent_storage_reads: Annotated[int, msgspec.Meta(ge=1, le=64)] = 4
+    # Zero disables the optional native admission budget. Ordinary restore
+    # occupancy counts against it, but ordinary inference is never gated here.
+    max_storage_read_inflight_tokens: Annotated[int, msgspec.Meta(ge=0, le=1 << 40)] = 0
+    max_speculative_storage_read_tokens: Annotated[
+        int, msgspec.Meta(ge=0, le=1 << 40)
+    ] = 0
+    demand_host_reserve_tokens: Annotated[int, msgspec.Meta(ge=0, le=1 << 40)] = 0
+    storage_demand_priority: bool = False
 
 
 class ServiceConfig(Value):

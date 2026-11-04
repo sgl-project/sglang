@@ -4,6 +4,21 @@ Native KV control implements [RFC #45189](https://github.com/sgl-project/sglang/
 It is disabled by default. Enabling it executes explicit commands; policies run
 only when listed in the configuration.
 
+Native storage reads accept optional `cache_limits` settings:
+`max_storage_read_inflight_tokens`, `max_speculative_storage_read_tokens`,
+`demand_host_reserve_tokens`, and `storage_demand_priority`. Token budgets default
+to zero (disabled) and must be page aligned; priority defaults to false. The
+total-read gate counts ordinary read occupancy before admitting native work;
+ordinary inference retains its existing recovery path. The speculative budget
+counts native in-flight physical spans, not completed cache residency. A real
+demand joining that job changes its classification without duplicating I/O.
+Demand preference allows one background turn after eight demand admissions and
+preserves GPU FIFO and same-salt serialization. The host reserve is an admission
+floor, not a new allocation. A scope larger than its enabled budget is deferred.
+Read cost and capacity observations are available through the existing capacity
+query and `loads.memory.storage.prefetch_stats`; byte counters describe anchor
+KV API payload, and wire bytes remain unknown.
+
 ## Configuration
 
 ```bash

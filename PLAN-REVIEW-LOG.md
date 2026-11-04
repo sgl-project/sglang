@@ -4952,3 +4952,9 @@ parent 已阅读完整五文件差异并独立运行 transfers/cache/feedback/se
 增加 FULL host-only 叶节点/可回收后缀的保存后定向回收，复用 HiCache 原生写入及完整前缀确认。owner 在 ACK 后释放自有引用，再检查 PIN/计算/DMA/结构依赖。定向 helper 不递归回收范围外祖先；GPU 驻留的 host 副本仍保留并报告 source_gpu_resident。legacy File 正向 metadata 缓存不能提供新鲜确认时，不声明该破坏性路径。
 
 parent 完整审阅生产差异和新增测试，并独立运行 host_demote/transfers/protection/service/manager：121 passed、107 subtests，23.42s。实际 CPU K/V 恢复及 H2D 内容一致；write_through/write_back、部分写入、共享前缀、split、引用和取消均覆盖。selected ruff 通过；真实 GPU/Mooncake 与性能评估在后续阶段执行。日志：/tmp/sglang-rfc-build/lifecycle-opt/o3a-parent-tests.log。
+
+### O1 — native 预算与真实需求优先
+
+增加默认关闭、page 对齐的 native 在途预算、speculative 在途预算、demand host 余量与可选需求优先。普通读取占用参与 native 准入判断，普通推理保留原恢复路径。按成功准入计数，每八次 demand 给背景一次机会；保留 GPU FIFO、同 salt 约束。复核发现 >64 个受阻背景任务可遮住可运行需求，已修复为背景轮转加一次有界机会，并添加 68-job 测试。
+
+parent 审阅完整差异并独立执行 transfers/service/cache/prefetch lifecycle：88 passed、66 subtests，63.38s；活性修复后独立复测 transfers：54 passed、42 subtests，23.25s。日志为 lifecycle-opt/o1-parent-tests.log 和 o1-parent-fairness-tests.log。预算不分配新 slots，未释放取消后的在途预留，不扩大 GPU 驱逐范围。

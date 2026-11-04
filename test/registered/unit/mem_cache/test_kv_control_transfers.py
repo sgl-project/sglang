@@ -1738,6 +1738,403 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
+    def test_storage_admission_config_validation_and_optional_defaults(self):
+        from dataclasses import replace
+
+        from sglang.srt.mem_cache.unified_cache.control_storage_reads import (
+            StorageCacheReads,
+        )
+        from sglang.srt.mem_cache.unified_cache.priority_claims import (
+            CacheControlConfig,
+        )
+
+        names = (
+            "max_storage_read_inflight_tokens",
+            "max_speculative_storage_read_tokens",
+            "demand_host_reserve_tokens",
+        )
+        defaults = ServiceConfig(namespace="ns").cache_config()
+        for name in names:
+            self.assertEqual(getattr(defaults, name), 0)
+            for bound in (0, 1 << 40):
+                parsed = parse_config(
+                    {"namespace": "ns", "cache_limits": {name: bound}}
+                )
+                self.assertEqual(getattr(parsed.cache_config(), name), bound)
+            for invalid in (-1, (1 << 40) + 1, True, 1.5):
+                with self.subTest(name=name, invalid=invalid):
+                    with self.assertRaises((ValueError, msgspec.ValidationError)):
+                        CacheControlConfig(namespace="ns", **{name: invalid})
+                    with self.assertRaises((ValueError, msgspec.ValidationError)):
+                        parse_config(
+                            {"namespace": "ns", "cache_limits": {name: invalid}}
+                        )
+        self.assertFalse(defaults.storage_demand_priority)
+        for invalid in (1, "true", None):
+            with self.assertRaises((ValueError, msgspec.ValidationError)):
+                CacheControlConfig(namespace="ns", storage_demand_priority=invalid)
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            executor = service.control.executor
+            with (
+                patch.object(
+                    executor,
+                    "config",
+                    replace(defaults, max_storage_read_inflight_tokens=3),
+                ),
+                patch.object(cache.tree_core, "page_size", 2),
+                self.assertRaisesRegex(ValueError, "page aligned"),
+            ):
+                StorageCacheReads(executor)
+            with (
+                patch.object(
+                    executor,
+                    "config",
+                    replace(
+                        defaults,
+                        demand_host_reserve_tokens=cache.cache_controller.mem_pool_host.size,
+                    ),
+                ),
+                self.assertRaisesRegex(ValueError, "below host capacity"),
+            ):
+                StorageCacheReads(executor)
+
+    def test_speculative_inflight_budget_is_shared_and_demand_promotion_bypasses_it(
+        self,
+    ):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            cache_limits=CacheLimits(max_speculative_storage_read_tokens=4),
+        )
+        with hicache(self, config, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [cache_fixtures.target(cache_salt=f"budget-{i}") for i in range(2)]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get, query = cc.page_get_func, cc._storage_hit_query
+            queries = []
+            demand = CacheRequestHandle("budget-demand", 0)
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            def counted_query(operation):
+                queries.append(operation)
+                return query(operation)
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cc, "_storage_hit_query", counted_query),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    first = self._restore(service, scopes[0], "budget-first")
+                    wait_for(service, entered.is_set)
+                    second = self._restore(service, scopes[1], "budget-second")
+                    shared = self._restore(service, scopes[0], "budget-shared")
+                    self.assertEqual(
+                        current(service, second).update.code, "speculative_read_budget"
+                    )
+                    self.assertEqual(len(queries), 1)
+                    self.assertEqual(
+                        cache.prefetch_outcome_stats_snapshot()[
+                            "native_speculative_inflight_tokens"
+                        ],
+                        4,
+                    )
+                    self._ordinary_prefetch(cache, service, scopes[1], demand)
+                    wait_for(service, lambda: len(queries) == 2)
+                    self.assertEqual(
+                        cache.prefetch_outcome_stats_snapshot()[
+                            "native_speculative_inflight_tokens"
+                        ],
+                        4,
+                    )
+                    release.set()
+                    for result in (first, second, shared):
+                        self.assertEqual(wait(service, result).status, Status.COMPLETED)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand), (4, 0)
+                    )
+                    self.assertEqual(len(queries), 2)
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_total_read_budget_accounts_for_ordinary_read_and_oversize_defers(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            cache_limits=CacheLimits(max_storage_read_inflight_tokens=4),
+        )
+        with hicache(self, config, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [cache_fixtures.target(cache_salt=f"total-{i}") for i in range(2)]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get = cc.page_get_func
+            ordinary = CacheRequestHandle("total-ordinary", 0)
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    self._ordinary_prefetch(cache, service, scopes[0], ordinary)
+                    wait_for(
+                        service,
+                        lambda: (
+                            cache.drain_storage_control_queues(),
+                            entered.is_set(),
+                        )[1],
+                    )
+                    second = self._restore(service, scopes[1], "total-second")
+                    self.assertEqual(
+                        current(service, second).update.code, "storage_inflight_budget"
+                    )
+                    self.assertEqual(cc.prefetch_tokens_occupied, 4)
+                    release.set()
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, ordinary),
+                        (4, 0),
+                    )
+                    self.assertEqual(wait(service, second).status, Status.COMPLETED)
+                oversized = self._restore(
+                    service,
+                    cache_fixtures.target(range(10), cache_salt="oversized"),
+                    "oversized",
+                )
+                self.assertEqual(oversized.status, Status.DEFERRED)
+                self.assertEqual(oversized.update.code, "scope_exceeds_read_budget")
+            finally:
+                release.set()
+                cache.release_aborted_request(ordinary)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_host_reserve_is_not_allocated_and_joined_demand_can_use_it(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            cache_limits=CacheLimits(demand_host_reserve_tokens=32),
+        )
+        with hicache(self, config, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            target = cache_fixtures.target(range(1, 41), cache_salt="reserve")
+            self._cold_scopes(owner, [target])
+            pressure = self._host_pressure(owner, leave_free=60)
+            self._pin_pressure(service, pressure)
+            demand = CacheRequestHandle("reserve-demand", 0)
+            cc = cache.cache_controller
+            try:
+                with (
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    patch.object(
+                        cache, "evict_host", wraps=cache.evict_host
+                    ) as evictions,
+                ):
+                    result = self._restore(service, target, "reserve-restore")
+                    self.assertEqual(result.update.code, "whole_scope_capacity")
+                    self.assertEqual(cc.mem_pool_host.available_size(), 60)
+                    self.assertEqual(evictions.call_args.args, (12,))
+                    self._ordinary_prefetch(cache, service, target, demand)
+                    self.assertEqual(wait(service, result).status, Status.COMPLETED)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand), (40, 0)
+                    )
+                    self.assertEqual(cc.mem_pool_host.available_size(), 20)
+            finally:
+                cache.release_aborted_request(demand)
+                self._pin_pressure(service, pressure, mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_queued_demand_priority_and_bounded_background_fairness(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        for demand_count in (1, 10):
+            config = ServiceConfig(
+                namespace="ns",
+                engine_id="engine",
+                cache_limits=CacheLimits(
+                    max_concurrent_storage_reads=1, storage_demand_priority=True
+                ),
+            )
+            with (
+                self.subTest(demand_count=demand_count),
+                hicache(self, config, namespace_keys=True) as owner,
+            ):
+                _, cache, service, _ = owner
+                scopes = [
+                    cache_fixtures.target(cache_salt=f"priority-{i}")
+                    for i in range(2 + demand_count)
+                ]
+                self._cold_scopes(owner, scopes)
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                get, query = cc.page_get_func, cc._storage_hit_query
+                queries, results, foreground_jobs = [], [], []
+                demands = [
+                    CacheRequestHandle(f"priority-demand-{i}", 0)
+                    for i in range(demand_count)
+                ]
+
+                def blocked_get(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(5)
+                    return get(*args, **kwargs)
+
+                def counted_query(operation):
+                    queries.append(operation)
+                    return query(operation)
+
+                try:
+                    with (
+                        patch.object(cc, "page_get_func", blocked_get),
+                        patch.object(cc, "_storage_hit_query", counted_query),
+                        patch.object(cache, "prefetch_threshold", 1),
+                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    ):
+                        results.append(
+                            self._restore(service, scopes[0], "priority-first")
+                        )
+                        wait_for(service, entered.is_set)
+                        background = self._restore(
+                            service, scopes[1], "priority-background"
+                        )
+                        results.append(background)
+                        reads = service.control.executor.storage_reads
+                        background_job = reads.interests[
+                            background.ref.operation_id
+                        ].job
+                        for index, demand in enumerate(demands):
+                            result = self._restore(
+                                service,
+                                scopes[index + 2],
+                                f"priority-foreground-{index}",
+                            )
+                            results.append(result)
+                            foreground_jobs.append(
+                                reads.interests[result.ref.operation_id].job
+                            )
+                            self._ordinary_prefetch(
+                                cache, service, scopes[index + 2], demand
+                            )
+                        release.set()
+                        for result in results:
+                            self.assertEqual(
+                                wait(service, result).status, Status.COMPLETED
+                            )
+                        for demand in demands:
+                            self.assertEqual(
+                                self._consume_ordinary_prefetch(cache, service, demand),
+                                (4, 0),
+                            )
+                        expected = (
+                            foreground_jobs[:8] + [background_job] + foreground_jobs[8:]
+                        )
+                        self.assertEqual(
+                            [operation.request_id for operation in queries[1:]],
+                            [job.handle.rid for job in expected],
+                        )
+                finally:
+                    release.set()
+                    for demand in demands:
+                        cache.release_aborted_request(demand)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_background_burst_turn_cannot_hide_demand_beyond_poll_limit(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            cache_limits=CacheLimits(
+                max_concurrent_storage_reads=2,
+                max_speculative_storage_read_tokens=4,
+                storage_demand_priority=True,
+            ),
+        )
+        with hicache(self, config, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [
+                cache_fixtures.target(cache_salt=f"poll-budget-{i}") for i in range(68)
+            ]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get = cc.page_get_func
+            demand = CacheRequestHandle("poll-budget-demand", 0)
+            background = []
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    first = self._restore(service, scopes[0], "poll-budget-first")
+                    wait_for(service, entered.is_set)
+                    background = [
+                        self._restore(service, target, f"poll-budget-background-{i}")
+                        for i, target in enumerate(scopes[1:-1])
+                    ]
+                    foreground = self._restore(
+                        service, scopes[-1], "poll-budget-foreground"
+                    )
+                    reads = service.control.executor.storage_reads
+                    job = reads.interests[foreground.ref.operation_id].job
+                    self.assertIsNone(job.operation)
+                    self._ordinary_prefetch(cache, service, scopes[-1], demand)
+                    # The separate burst test reaches this value through eight
+                    # real admissions. Here isolate bounded poll liveness.
+                    reads._demand_admissions = 8
+                    wait_for(service, lambda: job.operation is not None)
+                    for result in background:
+                        self.assertEqual(
+                            service.control.cancel(result.ref).status, Status.CANCELLED
+                        )
+                    release.set()
+                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                    self.assertEqual(wait(service, foreground).status, Status.COMPLETED)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand), (4, 0)
+                    )
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+                for result in background:
+                    service.control.cancel(result.ref)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_storage_pipeline_config_defaults_bounds_and_public_wiring(self):
         from sglang.srt.mem_cache.unified_cache.priority_claims import (
             CacheControlConfig,
