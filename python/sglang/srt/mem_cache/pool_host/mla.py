@@ -327,10 +327,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # helper. FP8 DSA packs V into K, so v_width is 0 and v_buffer
             # becomes a 5-D zero-element empty tensor.
             native = self._native_buffers
-            k_width = (
-                native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
-            )
-            v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
             base_dims = (self.layer_num, self.page_num, self.page_size, 1)
             indexer_dims = (
                 len(native.index_layer_indices),
@@ -341,9 +337,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return self._init_kv_split_buffer(
                 base_dims,
                 indexer_dims,
-                k_width,
-                v_width,
-                require_memfabric=True,
             )
         elif self.layout == "page_first":
             dims = (
@@ -383,9 +376,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # pool packs them as (num_indexer_layers, page, ...); the Host
             # mirror uses (page, num_indexer_layers, ...).
             native = self._native_buffers
-            k_width = (
-                native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
-            )
             base_dims = (self.page_num, self.layer_num, self.page_size, 1)
             indexer_dims = (
                 self.page_num,
@@ -396,9 +386,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return self._init_kv_split_buffer(
                 base_dims,
                 indexer_dims,
-                k_width,
-                self.qk_rope_head_dim,
-                require_memfabric=False,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -420,9 +407,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         return buffer
 
-    def _init_kv_split_buffer(
-        self, base_dims, indexer_dims, k_width, v_width, require_memfabric
-    ):
+    def _init_kv_split_buffer(self, base_dims, indexer_dims):
         """Allocate split K/V (+ indexer) host buffers for NPU.
 
         ``base_dims``/``indexer_dims`` carry the axis order, so both
@@ -433,14 +418,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         native = self._native_buffers
         num_indexer_layers = len(native.index_layer_indices)
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
-
-        if require_memfabric and not memfabric_host_memory_enabled():
-            # layer_first_kv_split on NPU goes through the Memfabric AscendC
+        k_width = (
+            native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
+        )
+        v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
+        if not memfabric_host_memory_enabled():
+            # page/layer_first_kv_split on NPU goes through the Memfabric AscendC
             # zero-copy path, whose AIV kernel de-references host pointers via
             # get_dva. Reject a non-memfabric host pool here rather than
             # failing later inside get_dva.
             raise ValueError(
-                "layer_first_kv_split layout requires "
+                "page/layer_first_kv_split layout requires "
                 "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric on NPU "
                 "(generic MHA/MLA host pool AscendC path)"
             )

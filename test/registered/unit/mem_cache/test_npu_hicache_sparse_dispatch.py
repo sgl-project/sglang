@@ -352,7 +352,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     h.dsa_kv_cache_store_fp8 = packed
                     h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
                     self.native.k_width = 656 if packed else 512
-                    v_width = 0 if packed and layout == "layer_first_kv_split" else 64
+                    v_width = 0 if packed else 64
                     self.assertIs(h.init_kv_buffer(), h.k_buffer)
                     self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
                     self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
