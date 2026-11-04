@@ -772,18 +772,15 @@ class OpenAIServingChat(OpenAIServingBase):
             if image_count:
                 template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
+            supported_efforts = ("low", "high", "max")
+            if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
+                supported_efforts = ("low", "medium", "high", "max")
             if (
-                request.reasoning_effort in ("low", "high", "max")
+                request.reasoning_effort in supported_efforts
                 and "thinking_effort" not in template_kwargs
             ):
                 template_kwargs["thinking_effort"] = request.reasoning_effort
-            elif request.reasoning_effort not in (
-                None,
-                "none",
-                "low",
-                "high",
-                "max",
-            ):
+            elif request.reasoning_effort not in (None, "none", *supported_efforts):
                 logger.warning(
                     "Kimi K3 does not support reasoning_effort=%r; using the "
                     "encoder default.",

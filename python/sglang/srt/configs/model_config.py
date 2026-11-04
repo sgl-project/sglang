@@ -212,7 +212,7 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
-    )
+    ) or is_kimi_k31(config)
 
 
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
@@ -235,7 +235,23 @@ def is_glm_moe_dsa(config) -> bool:
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+    )
+
+
+_KIMI_K31_ARCHS = (
+    "KimiK31ForConditionalGeneration",
+    "KimiLinearForCausalLM",
+    "KimiK3LinearForCausalLM",
+)
+
+
+def is_kimi_k31(config) -> bool:
+    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
+    return (
+        _hf_arch(config) in _KIMI_K31_ARCHS
+        and _hf_attr(config, "index_topk") is not None
     )
 
 
@@ -1551,6 +1567,7 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -1559,6 +1576,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
             # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
@@ -2617,6 +2637,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "MuseGlimmerForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
