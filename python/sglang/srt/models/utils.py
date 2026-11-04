@@ -41,7 +41,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -296,6 +296,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
+    # The fused RoPE writer cannot localize DCP slots or filter token owners.
+    if get_parallel().dcp_enabled:
+        return False
     pool = get_token_to_kv_pool()
     return (
         _is_cuda

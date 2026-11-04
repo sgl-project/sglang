@@ -116,7 +116,7 @@ void store_kv_index(
   auto cache_dtype = SymbolicDType{};
   auto indice_dtype = SymbolicDType{};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   // All cache/source tensors share the same store dtype (fast-path precondition).
   TensorMatcher({B, Mrow})  //
