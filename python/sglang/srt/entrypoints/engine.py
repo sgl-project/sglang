@@ -76,6 +76,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.disagg_service import start_disagg_service_for_rust_server
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     CloseSessionReqInput,
@@ -500,6 +501,12 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        # Embeddings placed at positions of the prompt during prefill: one value, or
+        # for a batch a list with one entry per request.
+        # See GenerateReqInput.positional_embed_overrides.
+        positional_embed_overrides: Optional[
+            Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
+        ] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -525,6 +532,7 @@ class Engine(EngineScoreMixin, EngineBase):
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
+            positional_embed_overrides=positional_embed_overrides,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
@@ -612,6 +620,10 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        # See Engine.generate.
+        positional_embed_overrides: Optional[
+            Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
+        ] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -642,6 +654,7 @@ class Engine(EngineScoreMixin, EngineBase):
             routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
+            positional_embed_overrides=positional_embed_overrides,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,

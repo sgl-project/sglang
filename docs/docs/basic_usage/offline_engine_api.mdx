@@ -32,6 +32,18 @@ The engine supports [vlm inference](https://github.com/sgl-project/sglang/blob/m
 
 Please see [the examples](https://github.com/sgl-project/sglang/tree/main/examples/runtime/engine) for further use cases.
 
+To feed embeddings for some or all of the prompt tokens, pass `positional_embed_overrides` to `generate` or `async_generate`. `embeds` is a tensor of shape `[len(positions), hidden_size]` that replaces the token embeddings at those positions of the prompt; a position outside the prompt is ignored. For a batch, pass one value for every request or a list with one entry per request. A tensor on the GPU travels through the CUDA IPC pool (`SGLANG_MM_FEATURE_CACHE_MB`) on one node without pipeline parallelism. A CPU tensor is pickled with the request, which costs more on long prompts, and so is a GPU tensor when the pool is full or not used. The prefill of such a request runs without a CUDA graph and skips the radix cache; decode is unchanged. A request with `session_params` builds its input from token ids, so overrides do not apply to it. The model's `forward` must use `input_embeds` and the model must have `get_input_embeddings()`, as Llama and Qwen2 do; other models can end the server or ignore the overrides.
+
+```python
+from sglang.srt.managers.embed_types import PositionalEmbeds
+
+output = llm.generate(
+    input_ids=input_ids,
+    positional_embed_overrides=PositionalEmbeds(embeds=embeds, positions=positions),
+    sampling_params={"max_new_tokens": 32},
+)
+```
+
 ## Offline Batch Inference
 
 SGLang offline engine supports batch inference with efficient scheduling.
