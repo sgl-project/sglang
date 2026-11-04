@@ -789,6 +789,35 @@ def register_fake_ops(tp_size: int):
         As = input.new_empty(M, dtype=torch.float32)
         return Aq, As
 
+    @register_cpu_compile_fake("sgl_per_token_group_quant_8bit_cpu")
+    def _(input, group_size, eps):
+        scale_shape = (*input.shape[:-1], input.shape[-1] // group_size)
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(scale_shape, dtype=torch.float32),
+        )
+
+    @register_cpu_compile_fake("sgl_per_token_quant_fp8_cpu")
+    def _(input):
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(input.shape[0], 1, dtype=torch.float32),
+        )
+
+    @register_cpu_compile_fake("sgl_per_tensor_quant_fp8_cpu")
+    def _(input, scale):
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(1, dtype=torch.float32),
+        )
+
+    @register_cpu_compile_fake("mxfp8_group_quantize_cpu")
+    def _(input):
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(input.shape[0], input.shape[1] // 32, dtype=torch.uint8),
+        )
+
     @register_cpu_compile_fake("int8_scaled_mm_cpu")
     def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
         M = mat1.shape[0]

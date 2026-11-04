@@ -912,13 +912,13 @@ def static_quant_fp8(
     assert x_s.numel() == 1, "only supports per-tensor scale"
 
     if _is_cpu:
-        x_q_2d, scale = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
+        x_q_2d, _ = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
             x.reshape(-1, x.shape[-1]), x_s
         )
         x_q = x_q_2d.reshape(x.shape)
         if repeat_scale:
-            scale = scale.repeat(x.numel() // x.shape[-1]).view(-1, 1)
-        return x_q, scale
+            return x_q, x_s.repeat(x.numel() // x.shape[-1]).view(-1, 1)
+        return x_q, x_s
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // x.shape[-1]
@@ -1270,9 +1270,11 @@ elif _is_cpu:
         if per_token:
             output, scale = torch.ops.sgl_kernel.sgl_per_token_quant_fp8_cpu(input)
         else:
-            output, scale = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
+            output, computed_scale = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
                 input, scale
             )
+            if scale is None:
+                scale = computed_scale
 
         num_rows = input.shape[0]
         if num_token_padding and num_token_padding > num_rows:
