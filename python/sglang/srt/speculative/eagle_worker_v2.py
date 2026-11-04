@@ -31,8 +31,8 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,

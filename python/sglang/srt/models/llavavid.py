@@ -25,7 +25,7 @@ from transformers import CLIPVisionModel, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
