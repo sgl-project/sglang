@@ -1113,6 +1113,16 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Pad the AITER MXFP4 MoE intermediate to 128, not 256 (Quark W4A4 keeps the
+    # checkpoint width), and skip the router-logits contiguous copy on HIP.
+    SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_K3_OPT"
+    )
+    # Use the radix-4 HIP router for K3 top-k on the AITER path; other routing
+    # shapes keep AITER's kernel.
+    SGLANG_OPT_HIP_K3_RADIX4_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K3_RADIX4_TOPK"
+    )
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
@@ -2300,20 +2310,6 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
-
-    # ===================================================================
-    # Kimi-K3 on ROCm (HIP)
-    # ===================================================================
-    # Pad the AITER MXFP4 MoE intermediate to 128, not 256 (Quark W4A4 keeps the
-    # checkpoint width), and skip the router-logits contiguous copy on HIP.
-    SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_AITER_K3_OPT"
-    )
-    # Use the radix-4 HIP router for K3 top-k on the AITER path; other routing
-    # shapes keep AITER's kernel.
-    SGLANG_OPT_HIP_K3_RADIX4_TOPK = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_K3_RADIX4_TOPK"
-    )
 
     # ===================================================================
     # Symmetric memory
