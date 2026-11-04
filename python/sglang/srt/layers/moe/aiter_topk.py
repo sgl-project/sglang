@@ -93,11 +93,13 @@ def try_select_experts(
     from aiter import biased_grouped_topk
 
     # Lazy import because the common dispatcher imports this module.
+    from sglang.srt.eplb.expert_distribution import (
+        get_global_expert_distribution_recorder,
+    )
     from sglang.srt.layers.moe.topk import (
         StandardTopKOutput,
         aiter_grouped_topk_route_inputs,
         capture_routed_experts_if_allowed,
-        get_global_expert_distribution_recorder,
     )
 
     assert hidden_states.shape[0] == router_logits.shape[0]
