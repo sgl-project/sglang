@@ -53,13 +53,14 @@ class MambaCacheKLMixin:
         return logprobs - np.logaddexp.reduce(logprobs)
 
 
-class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
+class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
     """Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
 
     Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
     two cached prefixes, the request's live state, and its keep checkpoint. The
-    first decode boundary finds no free track slot and skips its snapshot; delayed
-    prefill processing must not publish the keep buffer under a wrong length.
+    first decode boundary finds no free track slot, evicts a cached state to get
+    one, and never writes the keep buffer; delayed prefill processing must not
+    publish that buffer under a wrong length.
 
     Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
     before and after a 32-token decode seeds the cache. Comparing later free-running
