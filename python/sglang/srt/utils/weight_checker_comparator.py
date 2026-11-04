@@ -101,8 +101,10 @@ class Fp8BlockComparable(ComparableWeight):
 
     def iter_chunks(self):
         s, block_size = self._scale_and_block_size()
+        use_cuda = torch.cuda.is_available()
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
-            q, s_chunk = q.cuda(), s_chunk.cuda()
+            if use_cuda:
+                q, s_chunk = q.cuda(), s_chunk.cuda()
             if self.is_shuffled:
                 q = unshuffle_fp8_weight(q)
             yield (
@@ -131,8 +133,10 @@ class RawComparable(ComparableWeight):
 
     def iter_chunks(self):
         flat = self.tensor.reshape(-1)
+        use_cuda = torch.cuda.is_available()
         for start in range(0, flat.numel(), CHUNK_NUMEL):
-            yield flat[start : start + CHUNK_NUMEL].cuda(), None
+            chunk = flat[start : start + CHUNK_NUMEL]
+            yield (chunk.cuda() if use_cuda else chunk), None
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         return self.tensor
@@ -143,9 +147,9 @@ def compare_weights(
 ) -> CompareResult:
     """Chunked element-wise compare in ComparableWeight space."""
     equal = True
-    max_abs_err = torch.zeros((), dtype=torch.float32)
-    sum_abs_err = 0.0
-    num_exceed = 0
+    max_abs_err: Optional[torch.Tensor] = None
+    sum_abs_err: Optional[torch.Tensor] = None
+    num_exceed: Optional[torch.Tensor] = None
     numel = 0
     for (expect_dq, expect_tol), (actual_dq, actual_tol) in zip(
         expect.iter_chunks(), actual.iter_chunks(), strict=True
@@ -154,6 +158,8 @@ def compare_weights(
             f"{expect_dq.shape=} {actual_dq.shape=}"
         )
         numel += expect_dq.numel()
+        if torch.equal(expect_dq, actual_dq) and torch.isfinite(expect_dq).all():
+            continue
         abs_diff = (actual_dq.float() - expect_dq.float()).abs()
         if torch.all(abs_diff == 0):
             continue
@@ -162,12 +168,24 @@ def compare_weights(
         tol = (
             0.0 if expect_tol is None or actual_tol is None else expect_tol + actual_tol
         )
-        max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
-        sum_abs_err += abs_diff.sum().item()
+        chunk_max = abs_diff.max()
+        max_abs_err = (
+            chunk_max if max_abs_err is None else torch.maximum(max_abs_err, chunk_max)
+        )
+        chunk_sum = abs_diff.sum(dtype=torch.float64)
+        sum_abs_err = chunk_sum if sum_abs_err is None else sum_abs_err + chunk_sum
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
-        num_exceed += int((~(abs_diff <= tol)).sum())
+        chunk_exceed = (~(abs_diff <= tol)).sum(dtype=torch.int64)
+        num_exceed = (
+            chunk_exceed if num_exceed is None else num_exceed + chunk_exceed
+        )
+    if equal:
+        return CompareResult(True, 0.0, 0.0, 0)
     return CompareResult(
-        equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
+        False,
+        float(max_abs_err.item()),
+        float(sum_abs_err.item()) / max(numel, 1),
+        int(num_exceed.item()),
     )
 
 
