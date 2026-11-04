@@ -260,9 +260,10 @@ existing two kernels and the fusion, both alone and with the same FP8 GEMM.
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
-Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` (`silu_mul_mxfp8` in
-`sglang.kernels.ops.activation.swiglu_mxfp8_swizzled`, `indexed_scale_shift_mxfp8_` in
-`modulate/indexed_scale_shift_mxfp8_triton.py`) and re-exported here.
+`mxfp8_quantize_swizzled` lives in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton`
+and `silu_mul_mxfp8` in `sglang.kernels.ops.activation.swiglu_mxfp8_swizzled`; import them
+from there. `indexed_scale_shift_mxfp8_` (`modulate/indexed_scale_shift_mxfp8_triton.py`) is
+exported here.
 
 | Entry point | Backend | Contract |
 |---|---|---|

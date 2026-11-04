@@ -25,6 +25,7 @@ import unittest
 import weakref
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2424,7 +2425,13 @@ def _wan_block_env():
             ("_maybe_install_backend_autotune", None),
         ):
             stack.enter_context(patch.object(attn_layer, name, return_value=value))
-        stack.enter_context(set_forward_context(0, None))
+        stack.enter_context(
+            set_forward_context(
+                0,
+                None,
+                SimpleNamespace(sampling_params=SimpleNamespace(quality="lossless")),
+            )
+        )
         yield
 
 
