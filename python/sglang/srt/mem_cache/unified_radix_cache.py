@@ -345,8 +345,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
         }
-        # --hicache-async-ready-sync: dedicated gloo group (None = synchronous
-        # path) and the in-flight (work, counts, write_snap, load_snap).
+        # Async ready-count sync: dedicated gloo group (None = synchronous path)
+        # and the in-flight (work, counts, write_snap, load_snap).
         self._async_ready_sync_group: Optional[torch.distributed.ProcessGroup] = None
         self._async_ready_sync_pending: Optional[tuple] = None
 
@@ -3654,7 +3654,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _create_async_ready_sync_group(
         self,
     ) -> Optional[torch.distributed.ProcessGroup]:
-        if not get_memory().hicache_async_ready_sync:
+        if get_memory().disable_hicache_async_ready_sync:
             return None
         cp = self.attn_cp_group
         group = self.attn_tp_group if self.attn_tp_group is not None else self.tp_group
@@ -3670,9 +3670,9 @@ class UnifiedRadixCache(BasePrefixCache):
         elif group is None or torch.distributed.get_world_size(group=group) <= 1:
             reason = "a single attention rank"
         if reason is not None:
-            logger.warning(
-                "--hicache-async-ready-sync: not applied (%s); the ready-count "
-                "sync stays synchronous",
+            logger.info(
+                "HiCache async ready-count sync not applied (%s); the sync stays "
+                "synchronous",
                 reason,
             )
             return None
@@ -3681,8 +3681,8 @@ class UnifiedRadixCache(BasePrefixCache):
             ranks, backend="gloo", use_local_synchronization=True
         )
         logger.info(
-            "--hicache-async-ready-sync: deferred ready-count sync on its own "
-            "gloo group over ranks %s",
+            "HiCache async ready-count sync on its own gloo group over ranks %s "
+            "(--disable-hicache-async-ready-sync to turn off)",
             ranks,
         )
         return async_group
@@ -3695,9 +3695,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # drain only on the synchronous path, so settle and fall back for good.
             self._consume_deferred_ready_sync()
             self._async_ready_sync_group = None
-            logger.warning(
-                "--hicache-async-ready-sync: storage backend attached; the "
-                "ready-count sync is synchronous from now on"
+            logger.info(
+                "HiCache storage backend attached; the ready-count sync is "
+                "synchronous from now on"
             )
             return False
         return True

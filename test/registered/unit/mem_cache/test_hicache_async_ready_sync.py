@@ -263,12 +263,12 @@ class _GroupCfg:
             setattr(self, k, v)
 
 
-def _create_group(cfg, flag=True):
+def _create_group(cfg, disabled=False):
     new_group = mock.MagicMock(return_value="async-group")
     with (
         mock.patch(
             "sglang.srt.mem_cache.unified_radix_cache.get_memory",
-            return_value=SimpleNamespace(hicache_async_ready_sync=flag),
+            return_value=SimpleNamespace(disable_hicache_async_ready_sync=disabled),
         ),
         mock.patch.object(
             torch.distributed, "get_world_size", lambda group: group.size
@@ -282,24 +282,24 @@ def _create_group(cfg, flag=True):
 
 
 @pytest.mark.parametrize(
-    "overrides, flag",
+    "overrides, disabled",
     [
-        pytest.param({}, False, id="flag-off"),
-        pytest.param({"cache_controller": None}, True, id="no-host-cache"),
-        pytest.param({"pp_size": 2}, True, id="pipeline-parallel"),
-        pytest.param({"enable_storage": True}, True, id="storage-at-startup"),
-        pytest.param({"host_memory_mode": "buffer_only"}, True, id="buffer-only"),
-        pytest.param({"attn_cp_group": _SizedGroup(2)}, True, id="attention-cp"),
-        pytest.param({"attn_tp_group": _SizedGroup(1)}, True, id="single-attn-rank"),
+        pytest.param({}, True, id="disabled"),
+        pytest.param({"cache_controller": None}, False, id="no-host-cache"),
+        pytest.param({"pp_size": 2}, False, id="pipeline-parallel"),
+        pytest.param({"enable_storage": True}, False, id="storage-at-startup"),
+        pytest.param({"host_memory_mode": "buffer_only"}, False, id="buffer-only"),
+        pytest.param({"attn_cp_group": _SizedGroup(2)}, False, id="attention-cp"),
+        pytest.param({"attn_tp_group": _SizedGroup(1)}, False, id="single-attn-rank"),
     ],
 )
-def test_ineligible_setups_keep_sync_path(overrides, flag):
-    group, new_group = _create_group(_GroupCfg(**overrides), flag=flag)
+def test_ineligible_setups_keep_sync_path(overrides, disabled):
+    group, new_group = _create_group(_GroupCfg(**overrides), disabled=disabled)
     assert group is None
     new_group.assert_not_called()
 
 
-def test_eligible_setup_creates_dedicated_gloo_group():
+def test_default_creates_dedicated_gloo_group():
     group, new_group = _create_group(_GroupCfg())
     assert group == "async-group"
     new_group.assert_called_once_with(
