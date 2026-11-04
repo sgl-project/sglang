@@ -324,11 +324,15 @@ def load_image_from_base64(image):
 
 
 def expand2square(pil_img, background_color):
+    """Pad an image to a square, returning RGB."""
     width, height = pil_img.size
+    if pil_img.mode != "RGB":
+        # Image processors expect three channels. The previous "L"-only
+        # conversion was skipped entirely for square inputs, and LA/I;16/1
+        # raised TypeError from Image.new because the background is a 3-tuple.
+        pil_img = pil_img.convert("RGB")
     if width == height:
         return pil_img
-    if pil_img.mode == "L":
-        pil_img = pil_img.convert("RGB")
     if width > height:
         result = Image.new(pil_img.mode, (width, width), background_color)
         result.paste(pil_img, (0, (width - height) // 2))
