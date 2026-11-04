@@ -26,7 +26,7 @@ import torch
 from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
@@ -35,18 +35,17 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
     UocrDocumentConfig,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
+from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
@@ -688,6 +687,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        if is_embedding_nemotron3(self.hf_config):
+            # A bare Ministral3 backbone configured as a mean-pooled embedder.
+            self.hf_config.architectures = ["EmbeddingNemotron3Model"]
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
@@ -2083,6 +2085,9 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
+        # Deferred: the registry imports every quantization method's kernels.
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
@@ -2442,6 +2447,21 @@ def is_embedding_gemma(config) -> bool:
     )
 
 
+def is_embedding_nemotron3(config) -> bool:
+    """Whether ``config`` is an NVIDIA Nemotron-3-Embed checkpoint.
+
+    Nemotron-3-Embed is serialized as the bare ``Ministral3Model`` backbone,
+    which is also used by generative checkpoints. Its bidirectional attention
+    and mean pooling fields are the defining distinction.
+    """
+    fields = config.to_dict()
+    return (
+        config.architectures == ["Ministral3Model"]
+        and fields.get("is_causal") is False
+        and fields.get("pooling") == "avg"
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -2460,6 +2480,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
+        or "EmbeddingNemotron3Model" in model_architectures
         or "Contriever" in model_architectures
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
