@@ -12,13 +12,12 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
 from sglang.srt.models.kimi_vl_moonvit import MoonVitEncoderLayer
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
