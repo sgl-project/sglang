@@ -3953,19 +3953,6 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
-    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-downstream-wait-timeout",
-            "45",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
-
     def test_disagg_role_alias_cli_arg_is_accepted(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -4046,21 +4033,6 @@ class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
                             "http_graceful_shutdown_timeout": timeout,
                         }
                     )
-
-
-class TestDisaggTransferBackendArgs(unittest.TestCase):
-    def test_transfer_backend_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-transfer-backend",
-            "mock",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
 class TestNcclNvlsArgs(unittest.TestCase):
