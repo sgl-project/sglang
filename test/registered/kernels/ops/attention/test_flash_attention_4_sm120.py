@@ -1406,10 +1406,6 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
     """Called the way FlashAttentionBackend calls it, every layer of a paged
     prefill after the first reuses its TVM-FFI plan, and that launch matches the
     generic path bit for bit."""
-    from sglang.kernels.ops.attention.flash_attention import (
-        flash_attn_with_kvcache as dispatch_flash_attn_with_kvcache,
-    )
-
     sm120_forward_host.clear_launch_plans()
     cache_hits = []
     original_try_paged = sm120_forward_host.try_paged
@@ -1437,8 +1433,10 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
         q_offsets.append(q_offsets[-1] + length)
     cu_seqlens_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
 
-    def run(q, k_cache, v_cache, out, max_seqlen_k=max(lengths)):
-        return dispatch_flash_attn_with_kvcache(
+    # FlashAttentionBackend's paged extend passes no max_seqlen_k; the host then
+    # keys the plan on the KV pool's capacity.
+    def run(q, k_cache, v_cache, out, max_seqlen_k=None):
+        return flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -1451,7 +1449,6 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
             num_splits=1,
             pack_gqa=None,
             out=out,
-            ver=4,
         )
 
     # Layers share the batch metadata and differ in their Q, KV cache and output.
