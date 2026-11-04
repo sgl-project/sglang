@@ -24,7 +24,7 @@ use sgl_router::{
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::task::JoinHandle;
 
@@ -38,6 +38,11 @@ struct EngineState {
     running: bool,
     cancelled: bool,
     claims: BTreeMap<String, Value>,
+    claim_deadlines: BTreeMap<String, Instant>,
+    pin_refusal: Option<String>,
+    lose_pin_submit_once: bool,
+    fail_claim: bool,
+    fail_pin_release: bool,
     epoch: String,
     fail_residency: bool,
     lose_submit_once: bool,
@@ -82,7 +87,7 @@ async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Valu
     let s = state.lock().unwrap();
     let mut reply = json!({"success":true,"data":{"engine_id":"mock-engine","engine_epoch":s.epoch,"namespace":"weights-v1",
         "cache_salt_encoding":"owner_assertion","executor":{"cache_generation":1},"public_protocol":{"actions":{"sglang.prefetch":["1.0"],"sglang.demote":["1.0"],"sglang.pin":["1.0"]},
-        "paths":{"sglang.prefetch":[["storage","host"],["host","gpu"]],"sglang.demote":[["gpu","storage"],["gpu","host"]]},
+        "paths":{"sglang.prefetch":[["storage","host"],["host","gpu"]],"sglang.demote":[["gpu","storage"],["gpu","host"],["host","storage"]]},
         "storage_backend":"mooncake","backend_namespace":"pool-a","storage_targets":true,"prefix":{"namespace":"weights-v1","layout_id":"full:p1","page_size":1,"components":["full"],"hash_scheme":"sglang.sha256.u32le.i64.v1"}}}});
     if s.feedback && !s.hide_feedback {
         reply["data"]["feedback"] = json!({"query":"events","version":"1.0","source_id":"control:mock","source_epoch":s.feedback_epoch,
@@ -147,6 +152,24 @@ fn command_now(
         );
     }
     if body["kind"] == "claim" {
+        if s.fail_claim {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"success":false})),
+            );
+        }
+        let id = body["claim_id"].as_str().unwrap();
+        if s.claim_deadlines
+            .get(id)
+            .is_some_and(|deadline| Instant::now() >= *deadline)
+        {
+            if let Some(claim) = s.claims.get_mut(id) {
+                if claim["state"] == "active" {
+                    claim["state"] = json!("expired");
+                    claim["effective_protection"] = Value::Null;
+                }
+            }
+        }
         let claim = s
             .claims
             .get(body["claim_id"].as_str().unwrap())
@@ -200,21 +223,42 @@ fn command_now(
             .as_array()
             .unwrap()
             .len() as u64;
-        let result = json!({"ref":{"context":body["context"],"message_id":id,"action_id":"transfer","operation_id":format!("op-{id}")},
+        let mut result = json!({"ref":{"context":body["context"],"message_id":id,"action_id":"transfer","operation_id":format!("op-{id}")},
             "sequence":1,"update":{"status":if s.running{"running"}else{"completed"},"quiescent":!s.running},"public_result":{"state_version":99_999}});
         if action["action_type"] == "sglang.pin" {
             let payload = &action["payload"];
-            let epoch = s.epoch.clone();
-            s.claims.insert(payload["claim_id"].as_str().unwrap().into(),json!({"owner_epoch":epoch,"revision":payload["revision"],
-                "state":if payload["mode"]=="release"{"released"}else{"active"},"effective_protection":"eviction_exclusion","actual_scope":[{"start_token":0,"end_token":count}]}));
+            if payload["mode"] == "release" && s.fail_pin_release {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"success":false})),
+                );
+            }
+            if !s.operations.contains_key(&id) {
+                if let Some(refusal) = &s.pin_refusal {
+                    result["update"] = json!({"status":refusal,"quiescent":true});
+                    if refusal == "missing" {
+                        s.resident = 0;
+                    }
+                } else {
+                    let epoch = s.epoch.clone();
+                    let claim_id = payload["claim_id"].as_str().unwrap().to_string();
+                    s.claims.insert(claim_id.clone(),json!({"owner_epoch":epoch,"revision":payload["revision"],
+                "state":if payload["mode"]=="release"{"released"}else{"active"},"effective_protection":if payload["mode"]=="release"{Value::Null}else{json!("eviction_exclusion")},"actual_scope":[{"start_token":0,"end_token":count}]}));
+                    if let Some(ttl) = payload["ttl_seconds"].as_f64() {
+                        s.claim_deadlines
+                            .insert(claim_id, Instant::now() + Duration::from_secs_f64(ttl));
+                    }
+                }
+            }
         }
         let fresh = !s.operations.contains_key(&id);
         s.operations.entry(id).or_insert(result);
         if fresh && !s.running && action["action_type"] == "sglang.prefetch" {
             s.resident = s.partial.unwrap_or(count);
         }
-        if s.lose_submit_once {
+        if s.lose_submit_once || (s.lose_pin_submit_once && action["action_type"] == "sglang.pin") {
             s.lose_submit_once = false;
+            s.lose_pin_submit_once = false;
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"success":false,"error":{"code":"lost-response"}})),
@@ -865,6 +909,315 @@ async fn measured_policy_advances_early_tool_done_without_reusing_old_scope() {
     assert_eq!(grown["known_scope"][0]["end_token"], 6);
     let grown = ready(&router, "early", "grown-done").await;
     assert_eq!(grown["operations"][0]["ready_scope"]["end_token"], 6);
+}
+
+fn auto_pin_config(ttl_ms: u64, max_tokens: u64) -> OrchestrationConfig {
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(sgl_kv_orchestrator::preparation::PreparationConfig {
+        ready_pin_ttl_ms: ttl_ms,
+        auto_pin_max_tokens: max_tokens,
+        ..Default::default()
+    });
+    cfg
+}
+async fn lifecycle_prepare(router: &TestRouter, engine: &Engine, id: &str, tokens: Vec<u32>) {
+    api(router,json!({"kind":"session_event","task":task(id),"event":"resume_expected","event_id":"prepare","revision":2,
+        "target":prefix(tokens),"expected_wait_ms":100,"worker_url":engine.url})).await;
+}
+async fn pin_view(router: &TestRouter, id: &str, expected: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let view = query(router, id, "prepare").await;
+            if view["operations"][0]["auto_pin"]["state"] == expected {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn lifecycle_ready_pin_shares_parent_interests_and_recovers_lost_acquire_reply() {
+    let engine = Engine::start().await;
+    engine.state.lock().unwrap().lose_pin_submit_once = true;
+    engine.state.lock().unwrap().claims.insert(
+        "foreign".into(),
+        json!({"owner_epoch":"epoch-1","state":"active","revision":1}),
+    );
+    let router = router_with(&[&engine], false, Some(auto_pin_config(3000, 4))).await;
+    start(&router, "a").await;
+    start(&router, "b").await;
+    lifecycle_prepare(&router, &engine, "a", vec![1, 2, 3, 4]).await;
+    lifecycle_prepare(&router, &engine, "b", vec![1, 2, 3, 4]).await;
+    let view = pin_view(&router, "a", "active").await;
+    assert_eq!(view["operations"].as_array().unwrap().len(), 1);
+    assert_eq!(view["operations"][0]["ready_scope"]["end_token"], 4);
+    let child = view["operations"][0]["auto_pin"]["child_id"].clone();
+    assert_eq!(
+        pin_view(&router, "b", "active").await["operations"][0]["auto_pin"]["child_id"],
+        child
+    );
+    api(
+        &router,
+        json!({"kind":"cancel","task":task("a"),"message_id":"prepare"}),
+    )
+    .await;
+    api(
+        &router,
+        json!({"kind":"ack","task":task("a"),"message_id":"prepare"}),
+    )
+    .await;
+    assert_eq!(
+        pin_view(&router, "b", "active").await["operations"][0]["auto_pin"]["child_id"],
+        child
+    );
+    // Sending ordinary inference does not end the preparation interest/lease.
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", router.url))
+        .json(&json!({"model":MODEL,"messages":[{"role":"user","content":"keep claim"}],
+            "kv_context":{"session_id":"b","incarnation":"task-1","branch_id":"main","revision":3,"branch_revision":1,"request_id":"r","request_incarnation":"one"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        pin_view(&router, "b", "active").await["operations"][0]["auto_pin"]["claim"]["state"],
+        "active"
+    );
+    event(&router, "b", "task_finished", 4, "finish").await;
+    let done = pin_view(&router, "b", "released").await;
+    assert_eq!(done["quiescent"], true);
+    api(
+        &router,
+        json!({"kind":"ack","task":task("b"),"message_id":"prepare"}),
+    )
+    .await;
+    start(&router, "c").await;
+    lifecycle_prepare(&router, &engine, "c", vec![1, 2, 3, 4]).await;
+    let next = pin_view(&router, "c", "active").await;
+    assert_ne!(next["operations"][0]["auto_pin"]["child_id"], child);
+    event(&router, "c", "task_finished", 3, "finish").await;
+    pin_view(&router, "c", "released").await;
+    api(
+        &router,
+        json!({"kind":"ack","task":task("c"),"message_id":"prepare"}),
+    )
+    .await;
+    let state = engine.state.lock().unwrap();
+    assert_eq!(state.claims.len(), 3);
+    assert_eq!(state.claims["foreign"]["state"], "active");
+    let ids: std::collections::BTreeSet<_> = state
+        .commands
+        .iter()
+        .filter(|c| {
+            c["kind"] == "submit"
+                && c["envelope"]["actions"][0]["action_type"] == "sglang.pin"
+                && c["envelope"]["actions"][0]["payload"]["mode"] == "acquire"
+        })
+        .map(|c| c["envelope"]["message_id"].clone().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2);
+}
+
+#[tokio::test]
+async fn lifecycle_ready_pin_budget_and_engine_refusals_keep_readiness_distinct() {
+    for refusal in [None, Some("deferred"), Some("missing")] {
+        let engine = Engine::start().await;
+        engine.state.lock().unwrap().pin_refusal = refusal.map(str::to_owned);
+        let budget = if refusal.is_none() { 3 } else { 4 };
+        let router = router_with(&[&engine], false, Some(auto_pin_config(1000, budget))).await;
+        start(&router, "task").await;
+        lifecycle_prepare(&router, &engine, "task", vec![1, 2, 3, 4]).await;
+        let view = if refusal.is_some() {
+            pin_view(&router, "task", "not_acquired").await
+        } else {
+            ready(&router, "task", "prepare").await
+        };
+        if refusal.is_none() {
+            assert_eq!(
+                view["operations"][0]["auto_pin_error"],
+                "auto PIN token capacity"
+            );
+            assert!(view["operations"][0]["auto_pin"].is_null());
+        } else {
+            let denied = pin_view(&router, "task", "not_acquired").await;
+            assert_eq!(
+                denied["operations"][0]["auto_pin"]["result"]["update"]["status"],
+                refusal.unwrap()
+            );
+            assert_eq!(denied["quiescent"], true);
+        }
+        if refusal == Some("missing") {
+            assert!(
+                query(&router, "task", "prepare").await["operations"][0]["ready_scope"].is_null()
+            );
+        } else {
+            assert_eq!(view["operations"][0]["ready_scope"]["end_token"], 4);
+        }
+        assert!(engine.state.lock().unwrap().claims.is_empty());
+        api(
+            &router,
+            json!({"kind":"ack","task":task("task"),"message_id":"prepare"}),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_ready_pin_expiry_is_not_reacquired_by_poll_or_new_interest() {
+    let engine = Engine::start().await;
+    let router = router_with(&[&engine], false, Some(auto_pin_config(200, 4))).await;
+    start(&router, "a").await;
+    lifecycle_prepare(&router, &engine, "a", vec![1, 2, 3, 4]).await;
+    pin_view(&router, "a", "active").await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let expired = pin_view(&router, "a", "expired").await;
+    assert_eq!(expired["quiescent"], true);
+    start(&router, "b").await;
+    lifecycle_prepare(&router, &engine, "b", vec![1, 2, 3, 4]).await;
+    pin_view(&router, "b", "expired").await;
+    let state = engine.state.lock().unwrap();
+    assert_eq!(
+        state
+            .commands
+            .iter()
+            .filter(|c| c["kind"] == "submit"
+                && c["envelope"]["actions"][0]["action_type"] == "sglang.pin"
+                && c["envelope"]["actions"][0]["payload"]["mode"] == "acquire")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_ready_pin_charges_both_prefix_and_payload_material() {
+    let engine = Engine::start().await;
+    let mut cfg = auto_pin_config(1000, 4);
+    // Four tokens occupy 32 logical bytes across the parent's two owned copies;
+    // another 32 for its PIN child must not exceed the shared 48-byte budget.
+    cfg.limits.max_token_material_bytes = 48;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "task").await;
+    lifecycle_prepare(&router, &engine, "task", vec![1, 2, 3, 4]).await;
+    let view = ready(&router, "task", "prepare").await;
+    assert_eq!(
+        view["operations"][0]["auto_pin_error"],
+        "auto PIN operation/material/claim capacity"
+    );
+    assert!(view["operations"][0]["auto_pin"].is_null());
+    assert!(engine.state.lock().unwrap().claims.is_empty());
+}
+
+#[tokio::test]
+async fn refused_explicit_pin_renewal_still_queries_the_existing_claim() {
+    let engine = Engine::start().await;
+    let router = router(&[&engine], false, true).await;
+    start(&router, "task").await;
+    for (message, mode, revision) in [("keep", "acquire", 1), ("renew", "renew", 2)] {
+        if mode == "renew" {
+            engine.state.lock().unwrap().pin_refusal = Some("failed".into());
+        }
+        api(&router,json!({"kind":"submit","task":task("task"),"message_id":message,"action":"sglang.pin","target":prefix(vec![1,2,3,4]),
+            "location":{"tier":"host"},"mode":mode,"claim_id":"keep","revision":revision,"ttl_seconds":10,"required_protection":"eviction_exclusion"})).await;
+        let view = query(&router, "task", message).await;
+        assert_eq!(view["operations"][0]["claim"]["state"], "active");
+        if mode == "renew" {
+            assert_eq!(
+                view["operations"][0]["result"]["update"]["status"],
+                "failed"
+            );
+        }
+    }
+    engine.state.lock().unwrap().pin_refusal = None;
+    event(&router, "task", "task_finished", 1, "finish").await;
+    assert_eq!(
+        query(&router, "task", "keep").await["operations"][0]["claim"]["state"],
+        "released"
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_ready_pin_unknown_cleanup_blocks_ack_and_retains_budget() {
+    let engine = Engine::start().await;
+    let router = router_with(&[&engine], false, Some(auto_pin_config(3000, 4))).await;
+    start(&router, "a").await;
+    lifecycle_prepare(&router, &engine, "a", vec![1, 2, 3, 4]).await;
+    pin_view(&router, "a", "active").await;
+    engine.state.lock().unwrap().fail_claim = true;
+    let cancelled = api(
+        &router,
+        json!({"kind":"cancel","task":task("a"),"message_id":"prepare"}),
+    )
+    .await;
+    assert_eq!(cancelled["quiescent"], false);
+    let unknown = query(&router, "a", "prepare").await;
+    assert_eq!(unknown["quiescent"], false);
+    assert!(unknown["operations"][0]["auto_pin"]["error"].is_string());
+    let response: Value = reqwest::Client::new()
+        .post(format!("{}/v1/kv/control", router.url))
+        .bearer_auth("test-control")
+        .json(&json!({"kind":"ack","task":task("a"),"message_id":"prepare"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["success"], false);
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.fail_claim = false;
+        state.fail_pin_release = true;
+    }
+    assert_eq!(query(&router, "a", "prepare").await["quiescent"], false);
+    start(&router, "b").await;
+    lifecycle_prepare(&router, &engine, "b", vec![5, 6, 7, 8]).await;
+    assert_eq!(
+        ready(&router, "b", "prepare").await["operations"][0]["auto_pin_error"],
+        "auto PIN token capacity"
+    );
+    engine.state.lock().unwrap().fail_pin_release = false;
+    assert_eq!(pin_view(&router, "a", "released").await["quiescent"], true);
+    api(
+        &router,
+        json!({"kind":"ack","task":task("a"),"message_id":"prepare"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lifecycle_host_source_is_opt_in_and_disabled_ready_pin_remains_absent() {
+    for measured in [false, true] {
+        let engine = Engine::start().await;
+        let mut cfg = orchestration();
+        if measured {
+            cfg.preparation_policy = Some(Default::default());
+        }
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "task").await;
+        api(&router,json!({"kind":"session_event","task":task("task"),"event":"tool_wait","event_id":"cold","revision":1,
+            "target":prefix(vec![1,2,3,4]),"worker_url":engine.url,"pressure":true,"expected_wait_ms":100,"source":{"tier":"host"}})).await;
+        query(&router, "task", "cold").await;
+        lifecycle_prepare(&router, &engine, "task", vec![5, 6, 7, 8]).await;
+        let view = ready(&router, "task", "prepare").await;
+        assert!(view["operations"][0]["auto_pin"].is_null());
+        let state = engine.state.lock().unwrap();
+        let demote = state
+            .commands
+            .iter()
+            .find(|c| {
+                c["kind"] == "submit"
+                    && c["envelope"]["actions"][0]["action_type"] == "sglang.demote"
+            })
+            .unwrap();
+        assert_eq!(
+            demote["envelope"]["actions"][0]["payload"]["source"]["tier"],
+            if measured { "host" } else { "gpu" }
+        );
+        assert!(state.claims.is_empty());
+    }
 }
 
 #[tokio::test]

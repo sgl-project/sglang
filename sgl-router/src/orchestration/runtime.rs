@@ -361,6 +361,46 @@ struct Job {
     ready_end: u64,
     ready_at: Option<Instant>,
     preparation_estimate: Option<Estimate>,
+    ready_pin_eligible: bool,
+    ready_pin: Option<Box<Job>>,
+    ready_pin_error: Option<String>,
+}
+impl Job {
+    fn material_bytes(&self) -> usize {
+        let tokens = self.prefix.token_ids.as_ref().map_or(0, Vec::len)
+            + self.payload["target"]["token_ids"]
+                .as_array()
+                .map_or(0, Vec::len);
+        tokens.saturating_mul(4).saturating_add(
+            self.ready_pin
+                .as_ref()
+                .map_or(0, |pin| pin.material_bytes()),
+        )
+    }
+
+    fn pin_inactive(&self) -> bool {
+        self.quiescent
+            && ((!self.attempted && !self.releasing_pin)
+                || (self.last_error.is_none()
+                    && (self.pin_refused()
+                        || matches!(
+                            self.claim_view["state"].as_str(),
+                            Some("released" | "expired" | "invalidated")
+                        ))))
+    }
+
+    fn pin_refused(&self) -> bool {
+        // Only internal children use a fresh claim key for each episode.
+        // A refused explicit renewal can still have an older active claim.
+        self.id.starts_with("ready-pin-")
+            && self.quiescent
+            && !self.releasing_pin
+            && matches!(
+                self.result["update"]["status"].as_str(),
+                Some("missing" | "deferred" | "unsupported" | "failed" | "cancelled")
+            )
+            && self.result["public_result"]["claim"].is_null()
+    }
 }
 struct Intent {
     fingerprint: String,
@@ -870,7 +910,7 @@ impl Actor {
                 }
                 if ids
                     .iter()
-                    .any(|id| self.jobs.get(id).is_some_and(|j| !j.quiescent))
+                    .any(|id| self.jobs.get(id).is_some_and(|j| !self.job_quiescent(j)))
                     || identities.iter().any(|id| {
                         self.claims
                             .get(id)
@@ -1109,8 +1149,15 @@ impl Actor {
                         } else {
                             "sglang.prefetch"
                         });
+                        let demote_source = if self.preparation_costs.is_some()
+                            && value["source"]["tier"] == "host"
+                        {
+                            "host"
+                        } else {
+                            "gpu"
+                        };
                         command["source"] =
-                            json!({"tier":if event=="tool_wait"{"gpu"}else{"storage"}});
+                            json!({"tier":if event=="tool_wait"{demote_source}else{"storage"}});
                         command["destination"] =
                             json!({"tier":if event=="tool_wait"{"storage"}else{"host"}});
                         if event == "tool_done" && self.preparation_costs.is_none() {
@@ -1368,6 +1415,9 @@ impl Actor {
                         ready_end: 0,
                         ready_at: None,
                         preparation_estimate,
+                        ready_pin_eligible: false,
+                        ready_pin: None,
+                        ready_pin_error: None,
                     },
                 );
             }
@@ -1385,9 +1435,18 @@ impl Actor {
             .jobs
             .values()
             .chain(planned.values())
-            .map(|j| j.prefix.token_ids.as_ref().map_or(0, |t| t.len() * 4))
+            .map(Job::material_bytes)
             .sum();
-        if bytes > self.config.limits.max_token_material_bytes {
+        if bytes > self.config.limits.max_token_material_bytes
+            || self.jobs.len()
+                + planned.len()
+                + self
+                    .jobs
+                    .values()
+                    .filter(|job| job.ready_pin.is_some())
+                    .count()
+                > self.config.max_operations
+        {
             return Err("operation token material capacity".into());
         }
         let pin_claims: Vec<_> = planned
@@ -1426,6 +1485,25 @@ impl Actor {
                 .map_err(|e| format!("{e:?}"))?;
         }
         self.jobs.extend(planned);
+        if self
+            .config
+            .preparation_policy
+            .as_ref()
+            .is_some_and(|policy| {
+                policy.ready_pin_ttl_ms > 0
+                    && action == "sglang.prefetch"
+                    && source == "storage"
+                    && destination == "host"
+                    && matches!(
+                        value["event"].as_str(),
+                        Some("resume_expected" | "tool_done")
+                    )
+            })
+        {
+            for id in &ids {
+                self.jobs.get_mut(id).unwrap().ready_pin_eligible = true;
+            }
+        }
         self.intents.insert(
             demand.clone(),
             Intent {
@@ -1623,9 +1701,10 @@ impl Actor {
             "missing_scope":intent.frozen.missing_scope().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "materialization_required":intent.frozen.materialization_required().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "admission_gaps":intent.admission_gaps,"claims":intent.claims.iter().filter_map(|id|self.claims.get(id)).map(|c|json!({"claim":c.view,"error":c.error,"feedback_unknown":c.feedback_unknown,"release_requested":c.release_requested})).collect::<Vec<_>>(),
-            "released":intent.released,"quiescent":intent.claims.iter().all(|id|self.claims.get(id).is_none_or(|c|c.view["backend_quiescent"]==true)) && intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|j.quiescent)),
+            "released":intent.released,"quiescent":intent.claims.iter().all(|id|self.claims.get(id).is_none_or(|c|c.view["backend_quiescent"]==true)) && intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|self.job_quiescent(j))),
             "operations":intent.jobs.iter().filter_map(|id|self.jobs.get(id)).map(|j|json!({"child_id":j.id,"worker_url":j.url,"engine_id":j.caps.engine_id,"owner_epoch":j.caps.epoch,
-                "action":j.action,"result":j.result,"preparation_estimate":j.preparation_estimate,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":j.quiescent,"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
+                "action":j.action,"result":j.result,"preparation_estimate":j.preparation_estimate,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":self.job_quiescent(j),"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
+                "auto_pin":j.ready_pin.as_ref().map(|pin|json!({"child_id":pin.id,"result":pin.result,"state":if pin.pin_refused(){json!("not_acquired")}else{pin.claim_view["state"].clone()},"claim":pin.claim_view,"error":pin.last_error,"quiescent":self.job_quiescent(j),"release_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested)||now>=pin.deadline})),"auto_pin_error":j.ready_pin_error,
                 "ready_scope":if !intent.released && self.feedback.current(&j.url,&j.cache_watermark) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
     }
     async fn pump(&mut self) {
@@ -1671,21 +1750,115 @@ impl Actor {
         let Some(mut job) = self.jobs.remove(id) else {
             return;
         };
-        let result = self.advance(&mut job).await;
+        let cancel = self.book.job(id).is_some_and(|b| b.cancel_requested);
+        let result = self.advance(&mut job, cancel).await;
         if let Err(e) = result {
             job.last_error = Some(e);
             job.ready_end = 0;
             job.ready_at = None;
             job.claim_view = Value::Null;
         }
-        if job.quiescent {
+        self.poll_ready_pin(&mut job, cancel).await;
+        if self.job_quiescent(&job) {
             let _ = self.book.mark_quiescent(id);
         }
         self.jobs.insert(id.into(), job);
     }
-    async fn advance(&mut self, job: &mut Job) -> Result<(), String> {
-        let cancel = self.book.job(&job.id).is_some_and(|b| b.cancel_requested);
-        if !job.submitted && !job.attempted && cancel {
+    fn job_quiescent(&self, job: &Job) -> bool {
+        job.quiescent
+            && job.ready_pin.as_ref().is_none_or(|pin| {
+                pin.pin_inactive()
+                    || (pin.quiescent
+                        && pin.last_error.is_none()
+                        && Instant::now() < pin.deadline
+                        && !self
+                            .book
+                            .job(&job.id)
+                            .is_some_and(|book| book.cancel_requested))
+            })
+    }
+
+    async fn poll_ready_pin(&mut self, job: &mut Job, cancel: bool) {
+        if job.ready_pin_eligible
+            && job.ready_pin.is_none()
+            && !cancel
+            && job.last_error.is_none()
+            && job.quiescent
+            && job.result["update"]["status"] == "completed"
+            && job.ready_end == job.prefix.end_token
+        {
+            job.ready_pin_eligible = false;
+            let policy = self.config.preparation_policy.as_ref().unwrap();
+            let reserved: u64 = self
+                .jobs
+                .values()
+                .filter_map(|j| j.ready_pin.as_ref())
+                .filter(|pin| !pin.pin_inactive())
+                .map(|pin| pin.prefix.end_token)
+                .sum();
+            let material: usize = self.jobs.values().map(Job::material_bytes).sum();
+            let children = self.jobs.values().filter(|j| j.ready_pin.is_some()).count();
+            if reserved.saturating_add(job.prefix.end_token) > policy.auto_pin_max_tokens {
+                job.ready_pin_error = Some("auto PIN token capacity".into());
+            } else if material
+                .saturating_add(job.material_bytes())
+                .saturating_add(job.prefix.end_token as usize * 8)
+                > self.config.limits.max_token_material_bytes
+                || self.jobs.len() + children + 2 > self.config.max_operations
+                || self.index.usage().claims + children + 1 > self.config.limits.max_claims
+            {
+                job.ready_pin_error = Some("auto PIN operation/material/claim capacity".into());
+            } else {
+                let id = format!("ready-pin-{}", digest(&job.message_id));
+                let ttl_ms = policy.ready_pin_ttl_ms;
+                let now = Instant::now();
+                job.ready_pin = Some(Box::new(Job {
+                    id: id.clone(),
+                    url: job.url.clone(),
+                    caps: job.caps.clone(),
+                    prefix: job.prefix.clone(),
+                    action: "sglang.pin".into(),
+                    payload: json!({"target":job.prefix,"location":{"tier":"host","engine_id":job.caps.engine_id},"mode":"acquire",
+                        "claim_id":id,"revision":1,"ttl_seconds":ttl_ms as f64/1000.0,"required_protection":"eviction_exclusion"}),
+                    context: job.context.clone(),
+                    result: Value::Null,
+                    operation_ref: None,
+                    claim_view: Value::Null,
+                    submitted: false,
+                    attempted: false,
+                    message_id: id,
+                    releasing_pin: false,
+                    cancel_sent: false,
+                    quiescent: false,
+                    due: now,
+                    deadline: now + Duration::from_millis(ttl_ms),
+                    last_error: None,
+                    started: None,
+                    cost_recorded: false,
+                    traffic_at_start: 0,
+                    cache_watermark: Value::Null,
+                    ready_end: 0,
+                    ready_at: None,
+                    preparation_estimate: None,
+                    ready_pin_eligible: false,
+                    ready_pin: None,
+                    ready_pin_error: None,
+                }));
+            }
+        }
+        if let Some(pin) = &mut job.ready_pin {
+            if pin.pin_inactive() {
+                return;
+            }
+            let release = cancel || Instant::now() >= pin.deadline;
+            if let Err(error) = self.advance(pin, release).await {
+                pin.last_error = Some(error);
+                pin.claim_view = Value::Null;
+            }
+        }
+    }
+    async fn advance(&mut self, job: &mut Job, cancel: bool) -> Result<(), String> {
+        if !job.submitted && !job.attempted && !job.releasing_pin && cancel {
             job.quiescent = true;
             return Ok(());
         }
@@ -1707,11 +1880,15 @@ impl Actor {
                 return Ok(());
             }
             let current = self.client.command(&job.url, &json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
+            if current["owner_epoch"] != job.caps.epoch {
+                return Err("stale claim owner epoch".into());
+            }
             if matches!(
                 current["state"].as_str(),
                 Some("released" | "expired" | "invalidated")
             ) {
                 job.claim_view = current;
+                job.last_error = None;
                 return Ok(());
             }
             job.payload["mode"] = json!("release");
@@ -1781,6 +1958,13 @@ impl Actor {
         job.ready_end = 0;
         job.ready_at = None;
         if job.action == "sglang.pin" {
+            // A terminal refusal establishes that no claim was acquired. The
+            // Engine returns the operation result, without a claim to query.
+            if job.pin_refused() {
+                job.claim_view = Value::Null;
+                job.last_error = None;
+                return Ok(());
+            }
             let ticket = self.feedback.ticket(&job.url)?;
             let claim=self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
             if claim["owner_epoch"] != job.caps.epoch {

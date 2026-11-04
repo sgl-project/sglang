@@ -22,6 +22,18 @@ A positive remaining wait can overlap part of a late preparation. Missing or
 zero remaining wait retains on-demand recovery. Omitting this config preserves
 the existing global cost/lead policy. No new Engine action fields are required.
 
+`preparation_policy.ready_pin_ttl_ms` optionally submits a separate finite host
+PIN after confirmed lifecycle storage-to-host preparation. It defaults to zero
+(disabled), and is limited to 60,000ms. `auto_pin_max_tokens` defaults to 65,536
+and conservatively reserves token ranges across this Router's child claims;
+overlapping jobs can be overcharged, while the Engine enforces physical dedup
+and its own protection budget. Each preparation episode makes one lease attempt,
+without automatic reacquisition after expiry. Parent cancellation/cleanup releases
+only its own claim when no shared interests remain; unknown child outcomes block
+acknowledgement. The query exposes `auto_pin` independently from `ready_scope`.
+With this policy configured, `tool_wait` can explicitly select a host source for
+L2-to-L3 DEMOTE; the default source remains GPU.
+
 P5 is a pure API; Router runtime integration remains P6. `session_index` provides
 `SessionIndex`, explicit `SessionLimits`, canonical `ContentKey`, parent-linked
 `ContentRegistration`, immutable `BranchRevision`, request incarnation bindings

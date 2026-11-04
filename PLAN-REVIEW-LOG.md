@@ -4982,3 +4982,9 @@ parent 完整审阅 17 行 runtime 改动与回归，独立运行 HTTP orchestra
 新增 additive lifecycle_bench/analyze_lifecycle 与文档/测试，复用原 HTTP/SSE、控制、配置对齐和统计工具，原 stress/router 入口保持原口径。按需、固定预取、生命周期策略复用同一固定任务计划；控制收尾有界异步，背压及期末 drain 计入，保留发送迟到、所有完成响应和无效路径。支持共享祖先/salt、预测误差、取消、路由归属和真实压力采样；模拟 rollout 与真实 trainer 指标分开。
 
 parent 审阅完整工具与测试，修正 tool_wait RPC 耗时未从 resume_expected 剩余时间扣除的问题，并增加确定性时钟测试。每组保存实际 capacity 成本快照，缺失明确 unknown；源首次生成及暖缓存参考都保留并计入源成本。独立复测新增 14 项通过，7.266s；旧 stress/analyze/router 41 项在首次组合复测通过。Ruff、格式及文档链接检查通过。日志：lifecycle-opt/o5-harness-parent-final-tests.log；正式 GPU 结果另行归档。
+
+### O4 — 有界准备后 PIN
+
+在原准备 Job 内挂载一次有限 L2 PIN 子操作，默认 TTL=0 关闭；已有兴趣共享决定清理，失效不自动重获。保守 token 预算、操作/claim 计数和父子 prefix/payload material 均受限；未知申请或释放保留预算并阻止 ack。内部子 claim 身份绑定 wire episode；公开准备观察与 auto_pin 结果分开。host 来源的生命周期 DEMOTE 仅在新策略配置后开放。
+
+parent 阅读完整差异与测试，要求将无 claim 查询的拒绝快捷路径限制为内部新 claim，防止显式失败续期掩盖旧有效 claim。修正后 parent 独立复测 HTTP orchestration 27 项通过，3.14s；core 49 项通过，另 1 项 live 测试按原配置忽略。真实请求发送不会释放保护；共享清理、丢响应、未知释放、TTL、缺失窗口及 material 拒绝均覆盖。Rustfmt 1.92.0 通过；Clippy 无新增诊断，原 backend_protection/observations/protocol 的七项诊断独立记录。日志：lifecycle-opt/o4-parent-http-tests.log、o4-parent-core-tests.log。

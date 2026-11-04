@@ -12,6 +12,10 @@ pub struct PreparationConfig {
     pub min_samples: usize,
     pub quantile: f64,
     pub max_lead_ms: u64,
+    /// Separate, finite L2 claim after lifecycle preparation; zero disables it.
+    pub ready_pin_ttl_ms: u64,
+    /// Conservative token reservation; overlapping jobs may be charged twice.
+    pub auto_pin_max_tokens: u64,
 }
 
 impl Default for PreparationConfig {
@@ -22,6 +26,8 @@ impl Default for PreparationConfig {
             min_samples: 4,
             quantile: 0.9,
             max_lead_ms: 10_000,
+            ready_pin_ttl_ms: 0,
+            auto_pin_max_tokens: 65_536,
         }
     }
 }
@@ -35,6 +41,9 @@ impl PreparationConfig {
             || !self.quantile.is_finite()
             || !(0.0..=1.0).contains(&self.quantile)
             || !(1..=86_400_000).contains(&self.max_lead_ms)
+            || self.ready_pin_ttl_ms > 60_000
+            || self.auto_pin_max_tokens > 1 << 24
+            || (self.ready_pin_ttl_ms > 0 && self.auto_pin_max_tokens == 0)
         {
             return Err("invalid preparation sample or lead budget");
         }
@@ -210,8 +219,10 @@ mod tests {
         }
         model.observe("a", 0, 1.0);
         assert_eq!(model.groups(), 0);
-        let mut config = PreparationConfig::default();
-        config.quantile = f64::NAN;
+        let mut config = PreparationConfig {
+            quantile: f64::NAN,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         config.quantile = 0.9;
         config.min_samples = config.sample_window + 1;
@@ -226,5 +237,18 @@ mod tests {
         let estimate = model.estimate("a", 100, 1.0, 0);
         assert_eq!(estimate.preparation_ms, 900);
         assert_eq!(estimate.incomplete_samples, 1);
+    }
+
+    #[test]
+    fn ready_pin_is_disabled_by_default_and_has_finite_capacity_and_ttl() {
+        assert_eq!(PreparationConfig::default().ready_pin_ttl_ms, 0);
+        for (ttl, tokens) in [(60_001, 1), (1, 0), (1, (1 << 24) + 1)] {
+            let config = PreparationConfig {
+                ready_pin_ttl_ms: ttl,
+                auto_pin_max_tokens: tokens,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
     }
 }
