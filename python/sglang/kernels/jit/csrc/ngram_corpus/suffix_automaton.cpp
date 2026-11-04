@@ -45,10 +45,12 @@ void SuffixAutomaton::finalize() {
   }
   finalized_ = true;
   if (!saw_token_) {
+    std::vector<SamState>().swap(states_);
     return;
   }
 
   propagateOccurrencesAndRecency_();
+  freeze_();
   loaded_ = true;
 }
 
@@ -82,8 +84,6 @@ void SuffixAutomaton::extend_(int32_t token, int64_t pos) {
   states_.push_back(states_[q]);
   states_[clone].max_len = states_[p].max_len + 1;
   states_[clone].occ_count = 0;
-  states_[clone].children_by_freq.clear();
-  states_[clone].children_by_recency.clear();
 
   while (p != -1 && states_[p].next[token] == q) {
     states_[p].next[token] = clone;
@@ -110,32 +110,89 @@ void SuffixAutomaton::propagateOccurrencesAndRecency_() {
     states_[link].occ_count += states_[state].occ_count;
     states_[link].max_end_pos = std::max(states_[link].max_end_pos, states_[state].max_end_pos);
   }
+}
 
-  for (auto& state : states_) {
-    state.children_by_freq.clear();
-    state.children_by_recency.clear();
-    state.children_by_freq.reserve(state.next.size());
-    state.children_by_recency.reserve(state.next.size());
-    for (const auto& [token, child_state] : state.next) {
-      if (token == kSeparatorToken) {
-        continue;
-      }
-      state.children_by_freq.emplace_back(token, child_state);
-      state.children_by_recency.emplace_back(token, child_state);
+void SuffixAutomaton::freeze_() {
+  const size_t num_states = states_.size();
+  size_t num_edges = 0;
+  for (const auto& state : states_) {
+    num_edges += state.next.size();
+  }
+
+  link_.resize(num_states);
+  max_len_.resize(num_states);
+  occ_count_.resize(num_states);
+  edge_begin_.resize(num_states + 1);
+  edge_token_.resize(num_edges);
+  edge_target_.resize(num_edges);
+  by_recency_.resize(num_edges);
+  by_freq_.resize(num_edges);
+
+  // Drafting orders: most frequent / most recent child first, ties broken by
+  // token and then by state.
+  auto more_frequent = [this](uint32_t lhs, uint32_t rhs) {
+    const auto lhs_freq = states_[edge_target_[lhs]].occ_count;
+    const auto rhs_freq = states_[edge_target_[rhs]].occ_count;
+    return std::tie(rhs_freq, edge_token_[lhs], edge_target_[lhs]) <
+           std::tie(lhs_freq, edge_token_[rhs], edge_target_[rhs]);
+  };
+  auto more_recent = [this](uint32_t lhs, uint32_t rhs) {
+    const auto lhs_recency = states_[edge_target_[lhs]].max_end_pos;
+    const auto rhs_recency = states_[edge_target_[rhs]].max_end_pos;
+    return std::tie(rhs_recency, edge_token_[lhs], edge_target_[lhs]) <
+           std::tie(lhs_recency, edge_token_[rhs], edge_target_[rhs]);
+  };
+
+  std::vector<std::pair<int32_t, int>> edges;
+  uint32_t cursor = 0;
+  for (size_t s = 0; s < num_states; ++s) {
+    auto& state = states_[s];
+    link_[s] = state.link;
+    max_len_[s] = state.max_len;
+    occ_count_[s] = static_cast<uint32_t>(state.occ_count);
+
+    const uint32_t begin = cursor;
+    edge_begin_[s] = begin;
+    edges.assign(state.next.begin(), state.next.end());
+    std::sort(edges.begin(), edges.end());
+    for (const auto& [token, target] : edges) {
+      edge_token_[cursor] = token;
+      edge_target_[cursor] = target;
+      ++cursor;
     }
 
-    std::sort(state.children_by_freq.begin(), state.children_by_freq.end(), [this](const auto& lhs, const auto& rhs) {
-      const auto lhs_freq = states_[lhs.second].occ_count;
-      const auto rhs_freq = states_[rhs.second].occ_count;
-      return std::tie(rhs_freq, lhs.first, lhs.second) < std::tie(lhs_freq, rhs.first, rhs.second);
-    });
-    std::sort(
-        state.children_by_recency.begin(), state.children_by_recency.end(), [this](const auto& lhs, const auto& rhs) {
-          const auto lhs_recency = states_[lhs.second].max_end_pos;
-          const auto rhs_recency = states_[rhs.second].max_end_pos;
-          return std::tie(rhs_recency, lhs.first, lhs.second) < std::tie(lhs_recency, rhs.first, rhs.second);
-        });
+    // Separator edges sort first and are never drafted.
+    const uint32_t first_child = (begin != cursor && edge_token_[begin] == kSeparatorToken) ? begin + 1 : begin;
+    const uint32_t num_children = cursor - first_child;
+    std::iota(by_freq_.begin() + begin, by_freq_.begin() + begin + num_children, first_child);
+    std::sort(by_freq_.begin() + begin, by_freq_.begin() + begin + num_children, more_frequent);
+    std::iota(by_recency_.begin() + begin, by_recency_.begin() + begin + num_children, first_child);
+    std::sort(by_recency_.begin() + begin, by_recency_.begin() + begin + num_children, more_recent);
+
+    // The comparators above only read occ_count / max_end_pos, so this state's
+    // transitions can be released as soon as they have been copied.
+    std::unordered_map<int32_t, int>().swap(state.next);
   }
+  edge_begin_[num_states] = cursor;
+
+  std::vector<SamState>().swap(states_);
+}
+
+int SuffixAutomaton::transition_(int state, int32_t token) const {
+  const auto first = edge_token_.begin() + edge_begin_[state];
+  const auto last = edge_token_.begin() + edge_begin_[state + 1];
+  const auto iter = std::lower_bound(first, last, token);
+  if (iter == last || *iter != token) {
+    return -1;
+  }
+  return edge_target_[iter - edge_token_.begin()];
+}
+
+int SuffixAutomaton::numChildren_(int state) const {
+  const uint32_t begin = edge_begin_[state];
+  const uint32_t end = edge_begin_[state + 1];
+  const bool has_separator = begin != end && edge_token_[begin] == kSeparatorToken;
+  return static_cast<int>(end - begin) - (has_separator ? 1 : 0);
 }
 
 std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len, size_t max_depth) const {
@@ -148,16 +205,17 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
   int32_t matched_len = 0;
   for (size_t i = start; i < len; ++i) {
     const auto token = context[i];
-    while (state != 0 && !states_[state].next.contains(token)) {
-      state = states_[state].link;
-      matched_len = std::min<int32_t>(matched_len, states_[state].max_len);
+    int next_state = transition_(state, token);
+    while (state != 0 && next_state < 0) {
+      state = link_[state];
+      matched_len = std::min<int32_t>(matched_len, max_len_[state]);
+      next_state = transition_(state, token);
     }
-    if (auto iter = states_[state].next.find(token); iter != states_[state].next.end()) {
-      state = iter->second;
+    // The loop stops at a state that has the transition, or at the root, so a
+    // miss here means the root has no transition on `token` either.
+    if (next_state >= 0) {
+      state = next_state;
       ++matched_len;
-    } else if (auto root_iter = states_[0].next.find(token); root_iter != states_[0].next.end()) {
-      state = root_iter->second;
-      matched_len = 1;
     } else {
       state = 0;
       matched_len = 0;
@@ -166,14 +224,14 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
 
   std::vector<SamAnchor> anchors;
   while (state > 0 && matched_len > 0) {
-    if (!states_[state].children_by_freq.empty()) {
+    if (numChildren_(state) > 0) {
       anchors.push_back({state, matched_len});
     }
-    state = states_[state].link;
+    state = link_[state];
     if (state <= 0) {
       break;
     }
-    matched_len = std::min<int32_t>(matched_len, states_[state].max_len);
+    matched_len = std::min<int32_t>(matched_len, max_len_[state]);
   }
   return anchors;
 }
@@ -195,12 +253,13 @@ Result SuffixAutomaton::buildRecency(
       auto [parent, cur_breadth, state] = queue.front();
       queue.pop();
 
-      const auto& children = states_[state].children_by_recency;
+      const uint32_t children = edge_begin_[state];
+      const int num_children = numChildren_(state);
       const auto breadth = std::max(1, static_cast<int32_t>(cur_breadth));
-      for (int i = 0;
-           i < breadth && i < static_cast<int>(children.size()) && cursor <= static_cast<int>(draft_token_num);
-           ++i) {
-        const auto [token, child_state] = children[i];
+      for (int i = 0; i < breadth && i < num_children && cursor <= static_cast<int>(draft_token_num); ++i) {
+        const uint32_t edge = by_recency_[children + i];
+        const int32_t token = edge_token_[edge];
+        const int child_state = edge_target_[edge];
         int pos = -1;
         if (auto iter = tree[parent].next.find(token); iter != tree[parent].next.end()) {
           pos = iter->second;
@@ -238,28 +297,23 @@ Result SuffixAutomaton::buildFrequency(
     if (top_k <= 0) {
       return;
     }
-    const auto& children = states_[state].children_by_freq;
-    if (children.empty()) {
+    const uint32_t children = edge_begin_[state];
+    const int num_children = std::min(numChildren_(state), top_k);
+    if (num_children == 0) {
       return;
     }
     double sum_freq = 0.0;
-    int count = 0;
-    for (const auto& [_, child_state] : children) {
-      sum_freq += static_cast<double>(states_[child_state].occ_count);
-      if (++count >= top_k) {
-        break;
-      }
+    for (int i = 0; i < num_children; ++i) {
+      sum_freq += static_cast<double>(occ_count_[edge_target_[by_freq_[children + i]]]);
     }
     if (sum_freq <= 0) {
       sum_freq = 1.0;
     }
-    count = 0;
-    for (const auto& [token, child_state] : children) {
-      const auto scaled_prob = static_cast<double>(states_[child_state].occ_count) / sum_freq * prob;
-      heap.emplace(parent, token, child_state, scaled_prob);
-      if (++count >= top_k) {
-        break;
-      }
+    for (int i = 0; i < num_children; ++i) {
+      const uint32_t edge = by_freq_[children + i];
+      const int child_state = edge_target_[edge];
+      const auto scaled_prob = static_cast<double>(occ_count_[child_state]) / sum_freq * prob;
+      heap.emplace(parent, edge_token_[edge], child_state, scaled_prob);
     }
   };
 
