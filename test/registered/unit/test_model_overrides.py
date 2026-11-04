@@ -18,12 +18,12 @@ from unittest.mock import patch
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
+from sglang.srt.arg_groups.model_override_base import register_model_override
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
 from sglang.srt.arg_groups.overrides import (
     collect_model_override_declarations,
-    register_model_override,
     resolution_result,
     validate_declarations,
 )
@@ -71,7 +71,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
         )
 
     def test_input_scattered_is_resolved_only_for_forwards_without_the_scope(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
 
         for model_type in (
@@ -317,10 +317,8 @@ class TestBoundaryReductionDefaults(CustomTestCase):
         from unittest.mock import patch
 
         from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
-        from sglang.srt.arg_groups.overrides import (
-            resolving_view,
-            run_post_process_pass,
-        )
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
         from sglang.srt.server_args import ServerArgs
 
         for same_model in (False, True):
@@ -335,7 +333,7 @@ class TestBoundaryReductionDefaults(CustomTestCase):
                     hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
                 )
                 with patch(
-                    "sglang.srt.utils.hf_transformers_utils.get_config",
+                    "sglang.srt.utils.hf_transformers.get_config",
                     return_value=SimpleNamespace(model_type="qwen3"),
                 ) as load:
                     run_post_process_pass(args, resolve_boundary_reduction)
@@ -449,7 +447,9 @@ class TestModelOverrideRegistry(_IsolatedRegistry):
             collect_model_override_declarations("FakeForCausalLM", None, None)
 
     def test_predicate_keyed_provider(self):
-        from sglang.srt.arg_groups.overrides import register_model_override_predicate
+        from sglang.srt.arg_groups.model_override_base import (
+            register_model_override_predicate,
+        )
 
         @register_model_override("FakeStep9ForCausalLM")
         def _exact(server_args, hf_config):
@@ -474,7 +474,7 @@ class TestResolvedViewAndPasses(CustomTestCase):
     """Pipeline skeleton: read-only view semantics + transition invocation."""
 
     def test_view_forwards_reads_and_rejects_writes(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
 
         live = SimpleNamespace(a=1, method=lambda: "m")
         view = ResolvedView(live)
@@ -486,7 +486,7 @@ class TestResolvedViewAndPasses(CustomTestCase):
             view.a = 3
 
     def test_view_overlay_wins(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
 
         view = ResolvedView(SimpleNamespace(a=1, b=2), overlay={"a": 10})
         self.assertEqual(view.a, 10)
@@ -1961,44 +1961,92 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._leaf("attention_backend"), deterministic_fills[0])
 
     def test_deterministic_incompatible_backend_raises(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         view = ResolvedView(
             SimpleNamespace(
-                enable_deterministic_inference=True, attention_backend="flashmla"
+                enable_deterministic_inference=True,
+                attention_backend="flashmla",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
             )
         )
         with self.assertRaises(ValueError):
             _deterministic_attention_backend(view)
 
     def test_deterministic_incompatible_phase_backend_raises(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         # A per-phase backend overrides --attention-backend for its phase, so a
         # non-deterministic one must be refused even when the main backend is fine.
         for field in ("prefill_attention_backend", "decode_attention_backend"):
-            with self.subTest(field=field):
+            with (
+                self.subTest(field=field),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=False,
+                ),
+            ):
+                phases = {
+                    "prefill_attention_backend": None,
+                    "decode_attention_backend": None,
+                    field: "aiter",
+                }
                 view = ResolvedView(
                     SimpleNamespace(
                         enable_deterministic_inference=True,
                         attention_backend="triton",
-                        **{field: "aiter"},
+                        **phases,
                     )
                 )
                 with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
                     _deterministic_attention_backend(view)
 
+    def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
+        """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
+        and its speculative verify path is not; AITER prefill attention never is."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
+
+        cases = [
+            # (gfx950, MLA model, prefill backend, speculative algorithm, accepted)
+            (True, False, "triton", None, True),
+            (False, False, "triton", None, False),
+            (True, True, "triton", None, False),
+            (True, False, "aiter", None, False),
+            (True, False, "triton", "EAGLE", False),
+        ]
+        for gfx950, mla, prefill, spec, accepted in cases:
+            with (
+                self.subTest(gfx950=gfx950, mla=mla, prefill=prefill, spec=spec),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=gfx950,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=mla
+                ),
+            ):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        prefill_attention_backend=prefill,
+                        decode_attention_backend="aiter",
+                        speculative_algorithm=spec,
+                    )
+                )
+                if accepted:
+                    self.assertEqual(_deterministic_attention_backend(view), {})
+                else:
+                    with self.assertRaises(ValueError):
+                        _deterministic_attention_backend(view)
+
     def test_deterministic_compatible_phase_backends_are_accepted(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         view = ResolvedView(
             SimpleNamespace(
@@ -2011,10 +2059,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_deterministic_attention_backend(view), {})
 
     def test_deterministic_ascend_is_left_alone(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_sampling_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_sampling_backend
 
         view = ResolvedView(
             SimpleNamespace(
@@ -2026,10 +2072,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_deterministic_rocm_rccl_check(self):
         """Deterministic ROCm TP above 2 must not fall back to RCCL; CUDA (which
         disables the custom all-reduce itself) and TP2 (one summation order) are allowed."""
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_rocm_rccl_check,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_rocm_rccl_check
 
         # (is_hip, deterministic, tp_size, disable_custom_all_reduce, raises)
         for is_hip, det, tp, disable, raises in [
@@ -2153,8 +2197,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_compatibility_passes_at_callable_level(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _attention_backend_default,
             _attention_backend_fa3_fp8_fallback,
             _attention_backend_platform_fallbacks,
@@ -2192,10 +2236,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_attention_backend_platform_fallbacks(view), {})
 
     def test_dllm_platform_paths_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dllm_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dllm_attention_backend
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
         def _view(**kw):
@@ -2230,7 +2272,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_page_size_default_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _page_size_default
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _page_size_default
 
         # user-set page_size: nothing to declare
         self.assertEqual(
@@ -2250,7 +2293,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_dllm_page_size_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _dllm_page_size
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dllm_page_size
 
         def _view(**kw):
             defaults = dict(
@@ -2277,8 +2321,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
 
     def test_overlap_disable_passes(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _dllm_overlap_disable,
             _pipeline_parallel_overlap_disable,
             _sparse_head_overlap_disable,
@@ -2620,10 +2664,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
 
     def test_speculative_moe_runner_default_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _speculative_moe_runner_default,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _speculative_moe_runner_default
 
         self.assertEqual(
             _speculative_moe_runner_default(
@@ -2660,10 +2702,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_dsa_split_backend_resolution_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_split_backend_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
 
         def _view(arch="DeepseekV32ForCausalLM", learnable_sink=False, **kw):
             hf = SimpleNamespace(architectures=[arch], learnable_sink=learnable_sink)
@@ -2771,8 +2811,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_flashinfer_allreduce_fusion_passes(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _deterministic_allreduce_fusion_disable,
             _enforce_disable_allreduce_fusion,
             _flashinfer_allreduce_fusion_auto_enable,
@@ -2871,10 +2911,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_cutedsl_prefill_backend_fill_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _cutedsl_prefill_backend_fill,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _cutedsl_prefill_backend_fill
 
         def _view(**kw):
             defaults = dict(
@@ -2941,10 +2979,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moss_vl_overrides(_args(attention_backend="fa3"), None)
 
     def test_dsa_kv_cache_dtype_default_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_kv_cache_dtype_default,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_kv_cache_dtype_default
 
         def _view(**kw):
             hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
@@ -2989,10 +3025,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_v4_kv_cache_dtype,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deepseek_v4_kv_cache_dtype
 
         def _view(arch="DeepseekV4ForCausalLM", **kw):
             hf = SimpleNamespace(architectures=[arch])
@@ -3021,10 +3055,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_deepseek_spec_moe_resolution_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_spec_moe_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deepseek_spec_moe_resolution
         from sglang.srt.environ import envs
 
         def _view(**kw):
@@ -3086,8 +3118,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
 
     def test_mamba_radix_cache_resolution_pass(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _mamba_radix_cache_resolution,
             supports_mamba_cache_extra_buffer,
         )
@@ -3215,8 +3247,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         """A spec registered by config predicate (archs=[]) drives the leaves
         exactly like an arch-registered one, and the spec's
         `support_mamba_cache_extra_buffer` gates the extra_buffer strategy."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _mamba_radix_cache_resolution,
             supports_mamba_cache_extra_buffer,
         )
@@ -3399,8 +3431,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_moe_runner_quant_constraint_pass(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _moe_runner_backend_quant_constraints,
         )
 
@@ -3456,10 +3488,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_gguf_quantization_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _gguf_quantization
 
         with patch(
-            "sglang.srt.utils.hf_transformers_utils.check_gguf_file",
+            "sglang.srt.utils.hf_transformers.check_gguf_file",
             return_value=True,
         ):
             self.assertEqual(
@@ -3558,8 +3591,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(ov["page_size"], 128)
 
     def test_page_constraint_passes_at_callable_level(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _fa4_page_constraint,
             _intel_xpu_page_constraint,
             _mla_backend_page_constraints,
@@ -3780,10 +3813,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_deepseek_moe_quant_slot_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_moe_quant_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deepseek_moe_quant_resolution
 
         def _view(arch="DeepseekV32ForCausalLM", quant_cfg=None, **kw):
             defaults = dict(
@@ -3820,8 +3851,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_moe_quant_resolution(_view()), {})
 
     def test_data_parallelism_and_a2a_passes(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _a2a_ep_size,
             _data_parallelism_defaults,
         )
