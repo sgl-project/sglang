@@ -654,17 +654,6 @@ def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor
     return torch.empty_like(t).copy_(result)
 
 
-def _interleave_mega_moe_l1_weights(
-    l1_weights: tuple[torch.Tensor, torch.Tensor],
-    mma_type: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    gran = 16 if mma_type == "mxf4xmxf4" else 8
-    return (
-        _interleave_mega_moe_gate_up(l1_weights[0], gran=gran),
-        _interleave_mega_moe_gate_up(l1_weights[1], gran=gran),
-    )
-
-
 def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     num_groups, mn, packed_sf_k = sf.shape
     assert sf.dtype == torch.int and mn % 128 == 0
@@ -727,14 +716,15 @@ def build_mega_moe_experts_weights(experts) -> None:
     # the deep-ep path consumes the non-transposed interleaved scale and a
     # swizzle-aware activation kernel. L2 weight is untouched by the mega
     # transform, so the existing `w2_weight.data` is shared directly.
-    w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
-        (w13, w13_sf), mma_type
-    )
+    gran = 16 if mma_type == "mxf4xmxf4" else 8
+    w13_sf_interleaved = _interleave_mega_moe_gate_up(w13_sf, gran=gran)
     w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
     w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+    w13_interleaved = _interleave_mega_moe_gate_up(w13, gran=gran)
 
+    localize = _is_mega_moe_localization_enabled()
     mega_l1, mega_l2 = w13_interleaved, w2
-    if _is_mega_moe_localization_enabled():
+    if localize:
         import deep_gemm
 
         # (domains, experts, N / domains, K) for the kernel; the parameters get the
@@ -764,6 +754,9 @@ def build_mega_moe_experts_weights(experts) -> None:
     )
 
     experts._mega_moe_weights_built = True
+    if localize:
+        del w13, w13_sf, w13_sf_fp32, w2_sf_fp32
+        torch.cuda.empty_cache()
 
 
 def build_mega_moe_shared_weights(
@@ -772,8 +765,9 @@ def build_mega_moe_shared_weights(
     from deep_gemm import transform_weights_for_mega_moe
 
     gate_up_proj, down_proj = shared_experts.gate_up_proj, shared_experts.down_proj
-    # L1 is copied interleaved (2*moe_intermediate*hidden FP8 bytes per layer);
-    # the original stays for the forward_normal fallback above the token cap.
+    # L1 is copied interleaved (2*moe_intermediate*hidden FP8 bytes per layer).
+    # Without localization the original stays for the forward_normal fallback
+    # above the token cap; with it, both originals are freed below.
     l1, l2 = transform_weights_for_mega_moe(
         (gate_up_proj.weight.data, _transform_mega_moe_shared_sf(gate_up_proj)),
         (down_proj.weight.data, _transform_mega_moe_shared_sf(down_proj)),
@@ -783,6 +777,9 @@ def build_mega_moe_shared_weights(
 
         l1 = (deep_gemm.localize(l1[0]), l1[1])
         l2 = (deep_gemm.localize(l2[0]), l2[1])
+        gate_up_proj.weight.data = gate_up_proj.weight.data.new_empty(0)
+        down_proj.weight.data = down_proj.weight.data.new_empty(0)
+        torch.cuda.empty_cache()
     return l1, l2
 
 
