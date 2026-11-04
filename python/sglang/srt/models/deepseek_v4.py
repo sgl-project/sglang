@@ -1674,6 +1674,7 @@ class MQALayer(MqaAttentionBase):
         out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
+        mhc.run_deferred_attn_stats_fork()
         data, scale = attn_backend.forward(
             q=q,
             k=q,
