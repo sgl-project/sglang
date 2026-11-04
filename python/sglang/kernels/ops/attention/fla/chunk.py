@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     custom_device_ctx,
     input_guard,
     is_intel,
+    is_nvidia,
 )
 
 if is_intel:
@@ -183,8 +184,13 @@ def _chunk_gated_delta_rule_fwd_normalized(
 
 def chunk_gated_delta_rule_reads_strided_qk(q: torch.Tensor, k: torch.Tensor) -> bool:
     """Whether chunk_gated_delta_rule with use_qk_l2norm_in_kernel reads these
-    q / k views (and a matching v) without copying them."""
-    return l2norm_fwd_strided_supported(q) and l2norm_fwd_strided_supported(k)
+    q / k views (and a matching v) without copying them. NVIDIA only: the
+    bitwise match with the copy path is verified there."""
+    return (
+        is_nvidia
+        and l2norm_fwd_strided_supported(q)
+        and l2norm_fwd_strided_supported(k)
+    )
 
 
 def _chunk_gated_delta_rule_strided_qkv(q, k, v, **kwargs):
@@ -330,7 +336,7 @@ def chunk_gated_delta_rule(
     if (
         use_qk_l2norm_in_kernel
         and not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
-        and chunk_gated_delta_rule_reads_strided_qk(q, k)
+        and chunk_gated_delta_rule_reads_strided_qk(q=q, k=k)
     ):
         o, h = _chunk_gated_delta_rule_strided_qkv(
             q=q,
