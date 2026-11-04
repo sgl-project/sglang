@@ -27,6 +27,17 @@ echo "===== Install kubernetes - End ====="
 
 PYTHON_FOR_SGLANG="python"
 PIP_FOR_SGLANG="pip"
+
+# Temporary workaround for the CANN 9.2 nightly images: torch_npu registers the
+# npu random seed APIs as in-graph functions, which conflicts with the rule
+# torch._dynamo already holds, so every model import fails. The marker file is
+# created by the multi-node workflow only for nightly jobs.
+# Run it twice: the second run proves the patch was persisted.
+if [ -f "${sglang_source_path}/.patch_torch_npu_trace_rule" ]; then
+  ${PYTHON_FOR_SGLANG} "${sglang_source_path}/scripts/ci/npu/patch_torch_npu_trace_rule.py"
+  ${PYTHON_FOR_SGLANG} "${sglang_source_path}/scripts/ci/npu/patch_torch_npu_trace_rule.py"
+fi
+
 if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
   echo "===== Install transformers for sglang - Begin ====="
   TRANSFORMERS_PKG_PATH_SOURCE=/root/.cache/.cache/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
