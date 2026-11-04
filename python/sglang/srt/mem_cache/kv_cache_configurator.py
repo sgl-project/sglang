@@ -4,6 +4,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import msgspec
@@ -422,6 +423,7 @@ class KVCacheConfigurator:
         init=False, default=None
     )
     _dsv4_layouts_resolved: bool = field(init=False, default=False)
+    modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
 
     @property
     def draft_attn_tp_size(self) -> int:
@@ -450,6 +452,16 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.draft_owns_its_depth and bool(
             self.layer_info.swa_attention_layer_ids
         )
+        quant_config = getattr(self.model, "quant_config", None)
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            self.modelslim_cache_layout = quant_config.get_modelslim_kv_cache_layout(
+                self.model,
+                use_mla_backend=self.use_mla_backend,
+            )
 
     def resolve_dsv4_storage_layouts(
         self,
@@ -2208,6 +2220,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
 
@@ -2628,6 +2641,12 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
+            )
+        if self.modelslim_cache_layout is not None:
+            full_pool_class = partial(
+                full_pool_class,
+                modelslim_cache_layout=self.modelslim_cache_layout,
+                is_draft_worker=self.is_draft_worker,
             )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
