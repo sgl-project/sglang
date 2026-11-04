@@ -22,13 +22,13 @@ This middleware validates API keys for requests to `/api` and `/v1` paths:
 cd examples/wasm-guest-auth
 ./build.sh
 
-# Deploy (replace file_path with actual path)
+# Deploy (the file must live under a --wasm-module-root directory)
 curl -X POST http://localhost:3000/wasm \
   -H "Content-Type: application/json" \
   -d '{
     "modules": [{
       "name": "auth-middleware",
-      "file_path": "/absolute/path/to/wasm_guest_auth.component.wasm",
+      "file_path": "/srv/wasm-modules/wasm_guest_auth.component.wasm",
       "module_type": "Middleware",
       "attach_points": [{"Middleware": "OnRequest"}]
     }]
