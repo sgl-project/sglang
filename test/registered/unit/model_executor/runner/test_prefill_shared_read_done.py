@@ -58,7 +58,7 @@ _DEVICE_MODULE = SimpleNamespace(Event=_Event)
 
 
 def _batch(mode=ForwardMode.EXTEND):
-    return SimpleNamespace(forward_mode=mode)
+    return SimpleNamespace(forward_mode=mode, mixed_num_prefill_tokens=None)
 
 
 def _prepare_and_publish(runner, batch):
