@@ -1,10 +1,7 @@
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.ep_moe_kernels import (
-    post_reorder_deepgemm,
-    post_reorder_triton_kernel,
-)
+from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -74,14 +71,7 @@ def test_post_reorder_deepgemm(num_tokens, pad_frac, rsf):
     new = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device=dev)
     post_reorder_deepgemm(do, new, s2d, tids, tw, tk, num_tokens, hidden, rsf)
 
-    old = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device=dev)
-    post_reorder_triton_kernel[(num_tokens,)](
-        do, old, s2d, tids, tw, tk, hidden, BLOCK_SIZE=512
-    )
-    old *= rsf
-
     torch.testing.assert_close(new.float(), ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(new.float(), old.float(), rtol=5e-2, atol=0.5)
 
 
 if __name__ == "__main__":

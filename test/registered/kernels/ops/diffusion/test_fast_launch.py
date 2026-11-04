@@ -12,6 +12,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton import knobs
 from triton.runtime.jit import JITFunction
 
 from sglang.kernels.kda_kernels.layernorm_modulate_triton import (
@@ -23,9 +24,13 @@ from sglang.kernels.ops.diffusion.activation.silu_mul_bitexact import (
 )
 from sglang.kernels.ops.diffusion.common import fast_launch
 from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
+from sglang.kernels.ops.diffusion.modulate.head_gate_triton import head_gate_mul
 from sglang.kernels.ops.diffusion.norm.native_bf16_rmsnorm_triton import (
     rmsnorm_scale,
     rmsnorm_tanh_residual,
+)
+from sglang.kernels.ops.diffusion.norm.rmsnorm_scale_shift_bitexact import (
+    fused_rmsnorm_scale_shift_bitexact,
 )
 from sglang.kernels.ops.diffusion.norm.zimage_qk_rmsnorm_triton import (
     zimage_qk_rmsnorm_native,
@@ -64,6 +69,22 @@ def _qkv_slices(tokens, heads):
 
 
 WRAPPERS = {
+    "head_gate_audio": lambda: (
+        head_gate_mul,
+        (_bf16(1, 126, 32, 64), _bf16(1, 126, 32)),
+    ),
+    "head_gate_video": lambda: (
+        head_gate_mul,
+        (_bf16(2, 1536, 4096), _bf16(2, 1536, 32)),
+    ),
+    "rmsnorm_modulate_audio": lambda: (
+        fused_rmsnorm_scale_shift_bitexact,
+        (_bf16(1, 126, 2048), _bf16(2048), _bf16(1, 1, 2048), _bf16(1, 1, 2048), EPS),
+    ),
+    "rmsnorm_modulate_video": lambda: (
+        fused_rmsnorm_scale_shift_bitexact,
+        (_bf16(2, 1536, 4096), _bf16(4096), _bf16(2, 1, 4096), _bf16(2, 1, 4096), EPS),
+    ),
     "rmsnorm_scale": lambda: (
         rmsnorm_scale,
         (_bf16(1, 1088, 3840), _bf16(3840), _bf16(1, 1, 3840), EPS),
@@ -174,12 +195,33 @@ def _float(n=4096, offset=0):
 
 
 @torch.no_grad()
-def test_toy_wrapper_replays():
+@pytest.mark.parametrize("has_launch_hooks", [True, False])
+def test_toy_wrapper_replays(monkeypatch, has_launch_hooks):
+    if not has_launch_hooks:
+        monkeypatch.setattr(fast_launch, "knobs", None)
     toy = _Counted(_copy_out)
     for _ in range(3):
         x = _float()
         assert torch.equal(toy.fn(x), x)
     assert toy.calls == 1
+
+
+@torch.no_grad()
+def test_launch_hooks_see_replayed_launches():
+    toy = _Counted(_copy_out)
+    toy.fn(_float())  # records
+    seen = []
+
+    def hook(metadata):
+        seen.append(metadata.get()["name"])
+
+    knobs.runtime.launch_enter_hook.add(hook)
+    try:
+        x = _float()
+        assert torch.equal(toy.fn(x), x)
+    finally:
+        knobs.runtime.launch_enter_hook.remove(hook)
+    assert seen == ["_copy_kernel"] and toy.calls == 1
 
 
 def _copy_out_through_view(x):
@@ -322,12 +364,41 @@ def test_capture_replays_and_records():
 
 
 @torch.no_grad()
-def test_compile_traces_the_wrapper(monkeypatch):
-    fn, args = WRAPPERS["rmsnorm_scale"]()
+@pytest.mark.parametrize(
+    "name", ["rmsnorm_scale", "head_gate_audio", "rmsnorm_modulate_audio"]
+)
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_compile_traces_the_wrapper(monkeypatch, name, backend):
+    fn, args = WRAPPERS[name]()
     expected = _normal_path(monkeypatch, fn, args)
     fn(*args)  # recorded; tracing must still run the wrapper
-    compiled = torch.compile(fn, fullgraph=True, backend="eager")
+    compiled = torch.compile(fn, fullgraph=True, backend=backend)
     assert torch.equal(compiled(*args), expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "name",
+    [
+        "head_gate_audio",
+        "head_gate_video",
+        "rmsnorm_modulate_audio",
+        "rmsnorm_modulate_video",
+    ],
+)
+def test_production_wrapper_capture_uses_updated_inputs(monkeypatch, name):
+    fn, args = WRAPPERS[name]()
+    fn(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fn(*args)
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            arg.copy_(torch.randn_like(arg))
+    expected = _normal_path(monkeypatch, fn, args)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
 
 
 @torch.no_grad()

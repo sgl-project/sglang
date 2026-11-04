@@ -13,7 +13,7 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=240, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=112, stage="extra-a", runner_config="1-gpu-large")
 
 
 class MambaCacheKLMixin:
@@ -109,6 +109,19 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
         self._flush_cache()
         self._generate([44] * 128, 1)
         self._generate([42] * 128, 1)
+
+    def test_lazy_donation_with_four_slots_and_one_request(self):
+        """A prefix-hit request must finish without a fifth Mamba slot under overlap."""
+        self._flush_cache()
+        self._generate([42] * 128, 1)
+
+        # One cached prefix, live state, and keep checkpoint occupy three slots;
+        # the boundary decode takes the fourth before prefill donation runs.
+        result = self._generate([42] * 128 + [43] * 127, 32)
+        self.assertEqual(result["meta_info"]["cached_tokens"], 128)
+        logprobs = result["meta_info"]["output_token_logprobs"]
+        self.assertEqual(len(logprobs), 32)
+        self.assertTrue(np.isfinite([row[0] for row in logprobs]).all())
 
     def test_reuse_distribution_after_inplace_tracking(self):
         config = AutoConfig.from_pretrained(self.model)

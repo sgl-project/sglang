@@ -539,10 +539,11 @@ def test_topk_variants_are_exact_on_variable_windows(
     kind: str, force_one_block: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Cover both dispatches and all three APIs on adversarial score distributions."""
+    monkeypatch.delenv("SGL_DSA_TOPK_ROW_SPLIT", raising=False)
     if force_one_block:
-        monkeypatch.setenv("SGL_DSA_TOPK_ROW_SPLIT", "0")
+        monkeypatch.setenv("SGLANG_DSA_TOPK_ROW_SPLIT", "0")
     else:
-        monkeypatch.delenv("SGL_DSA_TOPK_ROW_SPLIT", raising=False)
+        monkeypatch.delenv("SGLANG_DSA_TOPK_ROW_SPLIT", raising=False)
 
     bs, k = 4, 2048
     score = _make_scores(kind, bs, MAX_SEQ_LEN, seed=1200 + force_one_block)

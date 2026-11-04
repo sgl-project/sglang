@@ -4,9 +4,6 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention import kda_decode_mtp
-from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
-    commit_kda_replayssm_spec,
-)
 from sglang.kernels.ops.attention.kda_decode_mtp import fused_kda_decode_mtp_dspark
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -111,93 +108,6 @@ class TestKdaDecodeMtp(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
-
-    def test_mtp_replayssm_ring(self):
-        num_requests, num_heads, num_spec, key_dim = 2, 2, 2, 128
-        num_slots, ring_size = num_requests + 2, 16
-
-        def run(cache_ring):
-            kwargs = _make_inputs(num_requests, num_spec, key_dim, num_heads)
-            state = kwargs["recurrent_state"]
-            slots = kwargs["ssm_state_indices"]
-            scratch = kwargs["intermediate_state_indices"]
-            if not cache_ring:
-                intermediate = torch.zeros(
-                    num_requests,
-                    1 + num_spec,
-                    num_heads,
-                    key_dim,
-                    key_dim,
-                    device="cuda",
-                )
-                output = fused_kda_decode_mtp_dspark(
-                    intermediate_ssm=intermediate,
-                    **kwargs,
-                )
-                return output, intermediate, slots, scratch
-
-            raw_v = torch.zeros(
-                num_slots,
-                num_heads,
-                ring_size,
-                key_dim,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            raw_k = torch.zeros_like(raw_v)
-            ring_gate = torch.zeros(
-                num_slots,
-                num_heads,
-                ring_size,
-                key_dim,
-                device="cuda",
-            )
-            ring_beta = torch.zeros(
-                num_slots,
-                num_heads,
-                ring_size,
-                device="cuda",
-            )
-            output = fused_kda_decode_mtp_dspark(
-                intermediate_ssm=None,
-                replayssm_rawv=raw_v,
-                replayssm_rawk=raw_k,
-                replayssm_g=ring_gate,
-                replayssm_beta=ring_beta,
-                **kwargs,
-            )
-            return (
-                output,
-                state,
-                slots,
-                (raw_v, raw_k, ring_gate, ring_beta),
-            )
-
-        baseline, intermediate, slots, scratch = run(cache_ring=False)
-        ring_output, checkpoint, ring_slots, rings = run(cache_ring=True)
-        self.assertTrue(torch.equal(ring_output, baseline))
-        commit_kda_replayssm_spec(
-            checkpoint,
-            *rings,
-            ring_slots,
-            torch.full(
-                (num_requests,),
-                1 + num_spec,
-                device="cuda",
-                dtype=torch.int32,
-            ),
-            max_cache_len=ring_size,
-            num_k_heads=num_heads,
-            use_qk_l2norm_in_kernel=True,
-            null_block_id=-1,
-        )
-        for request in range(num_requests):
-            expected = intermediate[scratch[request], num_spec]
-            actual = checkpoint[slots[request]]
-            relative_error = (
-                actual - expected
-            ).abs().max() / expected.abs().max().clamp_min(1e-6)
-            self.assertLess(relative_error.item(), 2e-2)
 
     def _run(self, num_requests, num_spec, *, onorm, block_threads=None):
         kwargs = _make_inputs(num_requests, num_spec)

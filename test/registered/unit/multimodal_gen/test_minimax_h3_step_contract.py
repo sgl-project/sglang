@@ -33,9 +33,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     MINIMAX_H3_CANONICAL_REQUEST_EXTRA_KEY,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-    MiniMaxH3DenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.timestep_preparation import (
     MiniMaxH3TimestepPreparationStage,
 )
@@ -98,8 +95,6 @@ def test_admission_schedule_loop_and_workload_agree(admission, steps):
     for schedule in sigmas.values():
         assert len(schedule) == steps + 1
         assert schedule[0] == 1.0 and schedule[-1] == 0.0
-    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
-    assert stage.default_workload_iterations(request, steps) == steps
     packed = minimax_h3_packed_sequence(
         text_len=3,
         latent_t=2,

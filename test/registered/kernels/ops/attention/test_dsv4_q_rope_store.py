@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention import deepseek_v4_rope
-from sglang.kernels.ops.attention.dsv4.elementwise import (
+from sglang.kernels.ops.attention.dsv4 import rope as deepseek_v4_rope
+from sglang.kernels.ops.attention.dsv4.norm_rope import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
