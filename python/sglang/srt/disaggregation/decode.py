@@ -103,7 +103,6 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     is_war_barrier_enabled,
-    make_abort_req,
 )
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -1079,22 +1078,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
-            discard_kv_cache_backup(
-                req,
-                self.tree_cache,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
-            self.scheduler.send_abort_output(make_abort_req(req), req)
+            self.scheduler.request_retirer.abort_queued(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
             lambda req: recv_req.matches(req.rid)
         ):
-            req.finish_outside_step(FINISH_ABORT())
-            self.scheduler.release_aborted_request(req)
-            self.scheduler.send_abort_output(
-                make_abort_req(req, finished_reason=recv_req.finished_reason), req
+            self.scheduler.request_retirer.abort_queued(
+                req, finished_reason=recv_req.finished_reason
             )
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
@@ -1114,11 +1106,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue.clear()
         self._pending_publish.clear()
         for req in self.retracted_queue:
-            discard_kv_cache_backup(
-                req,
-                self.tree_cache,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
+            discard_kv_cache_backup(req, self.tree_cache)
         self.retracted_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -3136,7 +3124,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.scheduler.enable_hisparse:
             self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
         if self.enable_host_receive:
-            discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
+            discard_kv_cache_backup(decode_req.req, self.tree_cache)
             if decode_req.host_staged:
                 return
         release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
