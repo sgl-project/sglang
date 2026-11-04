@@ -1426,6 +1426,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
 
     def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
         prefill.agent = _MemcpyNixlAgent(memory)
+        prefill.enable_kv_packing = False
         prefill._prepared_state_plans = {}
         prefill._state_layout_rejections = {}
         handles = list(
