@@ -182,6 +182,7 @@ def retire_window(
         frontier,
         window=tree_cache.swa_retain_window,
         retain_floor=tree_cache.swa_retain_floor(req),
+        reprefill_tail_tokens=tree_cache.swa_reprefill_tail_tokens(req),
         shares_prefixes=tree_cache.supports_prefix_sharing(),
         eviction_interval=eviction_interval,
     )

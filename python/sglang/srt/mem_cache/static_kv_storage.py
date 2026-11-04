@@ -279,6 +279,7 @@ class StaticKVStorage:
         retain_floor: Optional[int],
         shares_prefixes: bool,
         eviction_interval: int = 1,
+        reprefill_tail_tokens: int = 0,
     ) -> None:
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 
@@ -292,6 +293,7 @@ class StaticKVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
+            reprefill_tail_tokens=reprefill_tail_tokens,
         )
 
     def release_row(self, req: Req) -> None:
