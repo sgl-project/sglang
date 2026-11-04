@@ -1084,15 +1084,19 @@ class KimiK3MoE(nn.Module):
         group.reduce_scatter_tensor(output, shared_output.contiguous())
         return output
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
-        if not self._shared_experts_tp_comm:
+    def _forward_shared_experts(
+        self, hidden_states: torch.Tensor, *, group=None
+    ) -> torch.Tensor:
+        """Run TP-sharded shared experts on scattered DeepEP or CP tokens."""
+        if group is None and not self._shared_experts_tp_comm:
             return self.shared_experts(hidden_states)
 
-        gathered_hidden_states = self._gather_shared_expert_inputs(hidden_states)
+        gathered_hidden_states = self._gather_shared_expert_inputs(
+            hidden_states, group=group
+        )
         gathered_shared_output = self.shared_experts(gathered_hidden_states)
         return self._reduce_scatter_shared_experts(
-            gathered_shared_output, hidden_states
+            gathered_shared_output, hidden_states, group=group
         )
 
     def _can_overlap_shared_experts_npu(self, hidden_states: torch.Tensor) -> bool:
@@ -1123,40 +1127,13 @@ class KimiK3MoE(nn.Module):
             and not is_in_tc_piecewise_cuda_graph()
         )
 
-    def _forward_cp(self, hidden_states, forward_batch, *, prefix_sum=None):
-        """Keep the replicated latent down/up projections on this rank's rows.
-
-        Experts remain TP-sharded: gather their latent input and router logits
-        in rank order, then reduce-scatter before the local norm/up projection.
-        Shared experts keep their existing TP weights and use the same moves.
-        """
-        group = get_parallel().attn_cp_group
-        router_logits = self.gate(hidden_states)
-        routed_local, _ = self.routed_expert_down_proj(hidden_states)
-        routed_full = self._gather_shared_expert_inputs(routed_local, group=group)
-        router_full = self._gather_shared_expert_inputs(router_logits, group=group)
-        # Padding is interspersed between rank blocks, not a suffix of the
-        # gathered operand. Route all physical rows and discard padding on exit.
-        with _every_row_routed(forward_batch, routed_full.shape[0]):
-            topk_output = self.topk(routed_full, router_full)
-            expert_output = self.experts(routed_full, topk_output)
-        latent = self._reduce_scatter_shared_experts(
-            expert_output, routed_local, group=group
-        )
-        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
-        if self.shared_experts is not None:
-            shared_input = self._gather_shared_expert_inputs(hidden_states, group=group)
-            shared_output = self._reduce_scatter_shared_experts(
-                self.shared_experts(shared_input), hidden_states, group=group
-            )
-            return _add3(out, shared_output, prefix_sum)
-        return out if prefix_sum is None else out + prefix_sum
-
     def _forward_unfused(
         self,
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
+        cp_group=None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1167,7 +1144,18 @@ class KimiK3MoE(nn.Module):
         # boundaries:
         #   current: front ---------- dispatch ---------- routed GEMMs -- tail
         #   alt:     all-gather ----- shared MLP -------- reduce-scatter
-        fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
+        # CP reuses the shared-expert side stream, with its collectives on
+        # the current stream. Fine-grained dispatch hooks require DeepEP,
+        # which the CP/TP-sharing configuration does not use.
+        shared_tp_comm = cp_group is not None or self._shared_experts_tp_comm
+        shared_overlap = self._sbo_shared_overlap or (
+            cp_group is not None
+            and self.shared_experts is not None
+            and self.alt_stream is not None
+        )
+        fine_grained_overlap = (
+            cp_group is None and self._can_overlap_shared_experts_npu(hidden_states)
+        )
         shared_input = None
         shared_output = None
         shared_event = None
@@ -1186,20 +1174,24 @@ class KimiK3MoE(nn.Module):
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
                     shared_input.record_stream(self.alt_stream)
                 return
-            if self._sbo_shared_overlap:
+            if shared_overlap:
                 current_stream = torch.cuda.current_stream()
                 # Keep HCCL collectives on the current stream. The alternate
                 # stream only executes the shared-expert MLP.
                 shared_input = hidden_states
-                if self._shared_experts_tp_comm:
-                    shared_input = self._gather_shared_expert_inputs(hidden_states)
+                if shared_tp_comm:
+                    shared_input = self._gather_shared_expert_inputs(
+                        hidden_states, group=cp_group
+                    )
                 shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, group=cp_group
+                )
 
         def run_experts(expert_input, topk_output):
             if not fine_grained_overlap:
@@ -1254,20 +1246,22 @@ class KimiK3MoE(nn.Module):
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
             shared_output.record_stream(current_stream)
-            if self._shared_experts_tp_comm and not fine_grained_overlap:
+            if shared_tp_comm and not fine_grained_overlap:
                 shared_output = self._reduce_scatter_shared_experts(
-                    shared_output, hidden_states
+                    shared_output, hidden_states, group=cp_group
                 )
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
-        if _is_npu and self._sbo_shared_overlap:
+        if _is_npu and shared_overlap:
             issue_shared()
 
         # Front: gate + TopK (+ latent down-proj when merged). Strategy table:
         # kernels/ops/moe/moe_front.py.
-        routed_input = self._ep_front(hidden_states)
-        if routed_input is None and not fine_grained_overlap:
+        # CP routes the gathered physical rows below. The optimized EP
+        # fronts return local TopK results and cannot be used for that layout.
+        routed_input = self._ep_front(hidden_states) if cp_group is None else None
+        if routed_input is None and cp_group is None and not fine_grained_overlap:
             routed_input = self._ep_front_overlap(hidden_states)
         topk_output = None
         if routed_input is not None:
@@ -1277,8 +1271,9 @@ class KimiK3MoE(nn.Module):
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
-        if not (_is_npu and self._sbo_shared_overlap):
+            if cp_group is None:
+                topk_output = self.topk(hidden_states, router_logits)
+        if not (_is_npu and shared_overlap):
             issue_shared()
 
         if not self.use_latent_moe:
@@ -1304,25 +1299,46 @@ class KimiK3MoE(nn.Module):
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        expert_output = run_experts(routed_input, topk_output)
+        if cp_group is not None:
+            # Keep replicated projections local; only the TP experts need
+            # matching rows on every rank. Shared GEMMs can overlap these
+            # gathers and the routed experts on the existing side stream.
+            routed_local = routed_input
+            routed_input = self._gather_shared_expert_inputs(
+                routed_local, group=cp_group
+            )
+            router_logits = self._gather_shared_expert_inputs(
+                router_logits, group=cp_group
+            )
+            # Rank blocks contain interspersed padding, not a single suffix.
+            # Route every physical row and discard padding at the CP exit.
+            with _every_row_routed(forward_batch, routed_input.shape[0]):
+                topk_output = self.topk(routed_input, router_logits)
+                expert_output = run_experts(routed_input, topk_output)
+        else:
+            expert_output = run_experts(routed_input, topk_output)
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
             # source-side empty result while avoiding empty RMSNorm/up-proj
             # launches; the collective itself has already completed above.
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
-            latent = self._reduce_latent(expert_output)
+            if cp_group is not None:
+                # Complete the TP sum before the nonlinear norm, returning
+                # just this rank's rows for the replicated up projection.
+                latent = self._reduce_scatter_shared_experts(
+                    expert_output, routed_local, group=cp_group
+                )
+                latent = self._latent_norm(latent)
+            else:
+                latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
         wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
-            if (
-                self.tp_size > 1
-                and not self._shared_experts_tp1
-                and not self._shared_experts_tp_comm
-            ):
+            if self.tp_size > 1 and not self._shared_experts_tp1 and not shared_tp_comm:
                 shared_output = self._reduce_shared(shared_output)
             out = _add3(out, shared_output, prefix_sum)
             return out
@@ -1575,18 +1591,28 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        cp_group = None
         if (
             self.use_latent_moe
             and forward_batch is not None
             and _shards_rows_over_cp(forward_batch)
         ):
-            return self._forward_cp(
-                hidden_states, forward_batch, prefix_sum=prefix_sum
-            ).view(num_tokens, hidden_size)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+            cp_group = get_parallel().attn_cp_group
+        # The fused front/tail assumes replicated TP rows and all-reduce.
+        # CP must use the unfused gather/reduce-scatter schedule instead.
+        if (
+            cp_group is None
+            and hidden_states.shape[0] > 0
+            and self._eligible_for_fused_front
+        ):
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                forward_batch=forward_batch,
+                cp_group=cp_group,
+            )
         return out.view(num_tokens, hidden_size)
 
 
@@ -2590,7 +2616,8 @@ def _stage_facts(
     )
     if latent_cp:
         # K3 owns the latent MoE's expert gather and reduction. The boundary
-        # sees a complete local FFN; CP-TP sharing makes attention TP size one.
+        # sees complete local input/output rows, not TP1 expert weights.
+        # Actual dense layers declare their own compute width below.
         dense_tp_size = 1
     elif is_moe:
         dense_tp_size = None

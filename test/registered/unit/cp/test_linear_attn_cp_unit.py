@@ -594,104 +594,250 @@ class TestKimiCPWeightGroups(CustomTestCase):
 
 
 class TestKimiK3CPMoE(CustomTestCase):
-    def test_latent_projections_stay_local_and_reduce_before_normalization(self):
+    def _make_cp_moe(self, rank, *, shared, overlap=False):
         hidden = torch.arange(24, dtype=torch.float32).reshape(4, 6) / 10
         down = torch.arange(18, dtype=torch.float32).reshape(6, 3) / 20
         up = torch.arange(18, dtype=torch.float32).reshape(3, 6) / 30
         router = torch.arange(24, dtype=torch.float32).reshape(6, 4) / 40
         routed, logits = hidden @ down, hidden @ router
+        group = Mock(world_size=2)
+        batch = SimpleNamespace(
+            attn_cp_metadata=object(),
+            num_token_non_padded=torch.tensor(3),
+            global_num_token_non_padded_cpu=3,
+        )
+        state = SimpleNamespace(
+            hidden=hidden,
+            local=hidden.chunk(2)[rank],
+            routed=routed,
+            up=up,
+            batch=batch,
+            original_count=batch.num_token_non_padded,
+            group=group,
+            rank=rank,
+            events=[],
+            current_stream=Mock(),
+            on_shared_stream=False,
+        )
+        gathered = {3: routed, 4: logits, 6: hidden}
+
+        def gather(output, value):
+            full = gathered[value.shape[1]]
+            torch.testing.assert_close(value, full.chunk(2)[rank])
+            output.copy_(full)
+
+        def scatter(output, value):
+            shared_output = value.shape[1] == 6
+            full = hidden if shared_output else routed
+            if shared_output and overlap:
+                self.assertIn("wait_shared", state.events)
+            state.events.append("scatter_shared" if shared_output else "scatter_latent")
+            torch.testing.assert_close(value, full * (rank + 1))
+            output.copy_((full * 3).chunk(2)[rank])
+
+        def topk(values, scores):
+            torch.testing.assert_close(values, routed)
+            torch.testing.assert_close(scores, logits)
+            self.assertEqual(batch.num_token_non_padded.item(), 4)
+            self.assertEqual(batch.global_num_token_non_padded_cpu, 4)
+            return None
+
+        def experts(value, _):
+            state.events.append("experts")
+            self.assertEqual(batch.num_token_non_padded.item(), 4)
+            return value * (rank + 1)
+
+        def shared_experts(value):
+            self.assertEqual(state.on_shared_stream, overlap)
+            state.events.append("shared")
+            torch.testing.assert_close(value, hidden)
+            return value * (rank + 1)
+
+        group.all_gather_into_tensor.side_effect = gather
+        group.reduce_scatter_tensor.side_effect = scatter
+        moe = kimi_k3.KimiK3MoE.__new__(kimi_k3.KimiK3MoE)
+        nn.Module.__init__(moe)
+        moe.use_latent_moe = True
+        moe.tp_size = 2
+        moe._shared_experts_tp1 = False
+        moe._shared_experts_tp_comm = False
+        moe._shared_experts_tp_group = None
+        moe._sbo_shared_overlap = False
+        moe._use_mega_moe = False
+        moe.alt_stream = Mock() if overlap else None
+        # CP must bypass a front that would otherwise be eligible.
+        moe._eligible_for_fused_front = True
+        moe._forward_fused = Mock(side_effect=AssertionError("CP used the fused path"))
+        moe._ep_front = Mock(side_effect=AssertionError("CP routed local rows"))
+        moe._ep_front_overlap = Mock(side_effect=AssertionError("CP routed local rows"))
+        moe._can_overlap_shared_experts_npu = Mock(
+            side_effect=AssertionError("CP entered the DeepEP overlap path")
+        )
+        moe._reduce_latent = Mock(side_effect=AssertionError("CP used all-reduce"))
+        moe._reduce_shared = Mock(side_effect=AssertionError("CP reduced shared twice"))
+        moe.gate = Mock(side_effect=lambda x: x @ router)
+        moe.routed_expert_down_proj = Mock(side_effect=lambda x: (x @ down, None))
+        moe.routed_expert_up_proj = Mock(side_effect=lambda x: (x @ up, None))
+        moe._latent_norm = Mock(side_effect=lambda x: x.square())
+        moe.shared_experts = Mock(side_effect=shared_experts) if shared else None
+        moe.topk = Mock(side_effect=topk)
+        moe.experts = Mock(side_effect=experts)
+        state.moe = moe
+        return state
+
+    def _cp_context(self, state):
+        stack = ExitStack()
+        stack.enter_context(
+            get_context().override_server_args(enable_cp_tp_group_sharing=True)
+        )
+        stack.enter_context(
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=state.rank,
+                moe_tp_size=2,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_cp_size=2,
+                attn_cp_rank=state.rank,
+                attn_cp_group=state.group,
+            )
+        )
+        stack.enter_context(patch(_K3 + "is_cp_active", return_value=True))
+        stack.enter_context(patch(_K3 + "_is_npu", False))
+        stack.enter_context(
+            patch(
+                _K3 + "use_symmetric_memory", side_effect=lambda *a, **kw: nullcontext()
+            )
+        )
+        if state.moe.alt_stream is not None:
+            alt_stream = state.moe.alt_stream
+            shared_event = object()
+            alt_stream.record_event.return_value = shared_event
+
+            def wait_shared(event):
+                self.assertIs(event, shared_event)
+                state.events.append("wait_shared")
+
+            state.current_stream.wait_event.side_effect = wait_shared
+
+            class SharedStream:
+                def __enter__(self):
+                    state.on_shared_stream = True
+
+                def __exit__(self, *args):
+                    state.on_shared_stream = False
+
+            def shared_stream(stream):
+                self.assertIs(stream, alt_stream)
+                return SharedStream()
+
+            stack.enter_context(
+                patch.object(
+                    torch.cuda, "current_stream", return_value=state.current_stream
+                )
+            )
+            stack.enter_context(
+                patch.object(torch.cuda, "stream", side_effect=shared_stream)
+            )
+            stack.enter_context(
+                patch.object(torch.Tensor, "record_stream", return_value=None)
+            )
+        return stack
+
+    def test_latent_projections_stay_local_and_reduce_before_normalization(self):
         for rank in (0, 1):
-            for shared in (False, True):
-                with self.subTest(rank=rank, shared=shared):
-                    local = hidden.chunk(2)[rank]
-                    prefix = torch.full_like(local, 0.5)
-                    group = Mock(world_size=2)
-                    gathered = {3: routed, 4: logits, 6: hidden}
-
-                    def gather(output, value):
-                        full = gathered[value.shape[1]]
-                        torch.testing.assert_close(value, full.chunk(2)[rank])
-                        output.copy_(full)
-
-                    def scatter(output, value):
-                        full = routed if value.shape[1] == 3 else hidden
-                        torch.testing.assert_close(value, full * (rank + 1))
-                        output.copy_((full * 3).chunk(2)[rank])
-
-                    group.all_gather_into_tensor.side_effect = gather
-                    group.reduce_scatter_tensor.side_effect = scatter
-                    moe = kimi_k3.KimiK3MoE.__new__(kimi_k3.KimiK3MoE)
-                    nn.Module.__init__(moe)
-                    moe.use_latent_moe = True
-                    moe.gate = Mock(side_effect=lambda x: x @ router)
-                    moe.routed_expert_down_proj = Mock(
-                        side_effect=lambda x: (x @ down, None)
-                    )
-                    moe.routed_expert_up_proj = Mock(
-                        side_effect=lambda x: (x @ up, None)
-                    )
-                    moe._latent_norm = Mock(side_effect=lambda x: x.square())
-                    moe.shared_experts = (
-                        Mock(side_effect=lambda x: x * (rank + 1)) if shared else None
-                    )
-                    batch = SimpleNamespace(
-                        attn_cp_metadata=object(),
-                        num_token_non_padded=torch.tensor(3),
-                        global_num_token_non_padded_cpu=3,
-                    )
-                    original_count = batch.num_token_non_padded
-
-                    def topk(values, scores):
-                        torch.testing.assert_close(values, routed)
-                        torch.testing.assert_close(scores, logits)
-                        self.assertEqual(batch.num_token_non_padded.item(), 4)
-                        self.assertEqual(batch.global_num_token_non_padded_cpu, 4)
-                        return None
-
-                    moe.topk = Mock(side_effect=topk)
-                    moe.experts = Mock(side_effect=lambda x, _: x * (rank + 1))
-                    with (
-                        get_context().override_server_args(
-                            enable_cp_tp_group_sharing=True
-                        ),
-                        get_parallel().override(
-                            tp_size=2,
-                            tp_rank=rank,
-                            moe_tp_size=2,
-                            attn_tp_size=1,
-                            attn_tp_rank=0,
-                            attn_cp_size=2,
-                            attn_cp_rank=rank,
-                            attn_cp_group=group,
-                        ),
-                        patch(_K3 + "is_cp_active", return_value=True),
-                        patch(
-                            _K3 + "use_symmetric_memory",
-                            side_effect=lambda *a, **kw: nullcontext(),
-                        ),
+            for shared, overlap in ((False, False), (True, False), (True, True)):
+                for with_prefix in (False, True):
+                    with self.subTest(
+                        rank=rank, shared=shared, overlap=overlap, prefix=with_prefix
                     ):
-                        output = moe(local, forward_batch=batch, prefix_sum=prefix)
-                    latent = (routed * 3).chunk(2)[rank]
-                    expected = latent.square() @ up + prefix
-                    if shared:
-                        expected += local * 3
-                        torch.testing.assert_close(
-                            moe.shared_experts.call_args.args[0], hidden
+                        state = self._make_cp_moe(rank, shared=shared, overlap=overlap)
+                        moe = state.moe
+                        prefix = (
+                            torch.full_like(state.local, 0.5) if with_prefix else None
                         )
-                    torch.testing.assert_close(output, expected)
-                    torch.testing.assert_close(moe.gate.call_args.args[0], local)
-                    torch.testing.assert_close(
-                        moe.routed_expert_down_proj.call_args.args[0], local
-                    )
-                    torch.testing.assert_close(
-                        moe.routed_expert_up_proj.call_args.args[0], latent.square()
-                    )
-                    self.assertIs(batch.num_token_non_padded, original_count)
-                    self.assertEqual(batch.global_num_token_non_padded_cpu, 3)
-                    self.assertEqual(
-                        group.reduce_scatter_tensor.call_count, 2 if shared else 1
-                    )
-                    group.all_reduce.assert_not_called()
+                        with self._cp_context(state):
+                            output = moe(
+                                state.local,
+                                forward_batch=state.batch,
+                                prefix_sum=prefix,
+                            )
+                        latent = (state.routed * 3).chunk(2)[rank]
+                        expected = latent.square() @ state.up
+                        if prefix is not None:
+                            expected += prefix
+                        if shared:
+                            expected += state.local * 3
+                        torch.testing.assert_close(output, expected)
+                        torch.testing.assert_close(
+                            moe.gate.call_args.args[0], state.local
+                        )
+                        torch.testing.assert_close(
+                            moe.routed_expert_down_proj.call_args.args[0], state.local
+                        )
+                        torch.testing.assert_close(
+                            moe._latent_norm.call_args.args[0], latent
+                        )
+                        torch.testing.assert_close(
+                            moe.routed_expert_up_proj.call_args.args[0], latent.square()
+                        )
+                        self.assertIs(
+                            state.batch.num_token_non_padded, state.original_count
+                        )
+                        self.assertEqual(state.batch.global_num_token_non_padded_cpu, 3)
+                        self.assertEqual(
+                            state.group.reduce_scatter_tensor.call_count,
+                            2 if shared else 1,
+                        )
+                        state.group.all_reduce.assert_not_called()
+                        moe._forward_fused.assert_not_called()
+                        moe._ep_front.assert_not_called()
+                        moe._ep_front_overlap.assert_not_called()
+                        if overlap:
+                            moe.alt_stream.wait_stream.assert_called_once_with(
+                                state.current_stream
+                            )
+                            self.assertLess(
+                                state.events.index("shared"),
+                                state.events.index("experts"),
+                            )
+                            self.assertLess(
+                                state.events.index("wait_shared"),
+                                state.events.index("scatter_shared"),
+                            )
+
+    def test_cp_restores_padding_metadata_when_experts_fail(self):
+        state = self._make_cp_moe(0, shared=False)
+        state.moe.experts.side_effect = RuntimeError("expert failure")
+        with (
+            self._cp_context(state),
+            self.assertRaisesRegex(RuntimeError, "expert failure"),
+        ):
+            state.moe(state.local, forward_batch=state.batch)
+        self.assertIs(state.batch.num_token_non_padded, state.original_count)
+        self.assertEqual(state.batch.global_num_token_non_padded_cpu, 3)
+        state.group.reduce_scatter_tensor.assert_not_called()
+
+    def test_inactive_cp_preserves_fused_and_unfused_dispatch(self):
+        hidden = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+        prefix = torch.full_like(hidden, 0.5)
+        batch = SimpleNamespace(attn_cp_metadata=object())
+        for eligible in (False, True):
+            with self.subTest(fused=eligible):
+                moe = kimi_k3.KimiK3MoE.__new__(kimi_k3.KimiK3MoE)
+                nn.Module.__init__(moe)
+                moe.use_latent_moe = True
+                moe._eligible_for_fused_front = eligible
+                moe._forward_fused = Mock(return_value=hidden + 1)
+                moe._forward_unfused = Mock(return_value=hidden + 2)
+                with patch(_K3 + "_shards_rows_over_cp", return_value=False):
+                    output = moe(hidden, forward_batch=batch, prefix_sum=prefix)
+                selected = moe._forward_fused if eligible else moe._forward_unfused
+                unselected = moe._forward_unfused if eligible else moe._forward_fused
+                selected.assert_called_once()
+                unselected.assert_not_called()
+                self.assertIs(selected.call_args.kwargs["prefix_sum"], prefix)
+                torch.testing.assert_close(output, hidden + (1 if eligible else 2))
 
 
 class TestCPModelBoundaries(CustomTestCase):
