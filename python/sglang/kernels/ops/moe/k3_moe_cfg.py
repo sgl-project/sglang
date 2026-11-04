@@ -52,10 +52,8 @@ def _patch_table(fm) -> int:
 
 @functools.cache
 def apply_k3_moe_decode_cfg() -> None:
-    try:
-        import aiter.fused_moe as fm
-    except ImportError:
-        return
+    import aiter.fused_moe as fm
+
     orig = fm.get_2stage_cfgs
     if getattr(orig, "_k3_decode_cfg", False):
         return
