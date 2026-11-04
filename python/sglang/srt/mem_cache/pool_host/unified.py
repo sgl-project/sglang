@@ -428,32 +428,43 @@ class _SharedPageEnvelopeHostBacking:
         finally:
             self.release_layout()
 
-    def _compact_side(self, side: _Side) -> None:
-        reverse = side.grow_direction == "down"
-        live = sorted(side.physical_to_logical.items(), reverse=reverse)
-        if reverse:
-            targets = range(side.page_num - 1, side.page_num - 1 - len(live), -1)
-        else:
-            targets = range(len(live))
-
-        new_logical_to_physical = {}
-        new_physical_to_logical = {}
-        for (source, logical), target in zip(live, targets, strict=True):
-            if source != target:
-                source_offset = source * side.page_bytes
-                target_offset = target * side.page_bytes
-                self.raw[target_offset : target_offset + side.page_bytes].copy_(
-                    self.raw[source_offset : source_offset + side.page_bytes].clone()
-                )
-            new_logical_to_physical[logical] = target
-            new_physical_to_logical[target] = logical
-
-        side.logical_to_physical = new_logical_to_physical
-        side.physical_to_logical = new_physical_to_logical
-        side.free_physical_pages.clear()
-        side.watermark = (
-            len(live) if side.grow_direction == "up" else side.page_num - 1 - len(live)
+    def _compact_side(self, side: _Side) -> int:
+        # Only fill holes inside the final packed region. Live pages already
+        # inside it stay put; donors come from the boundary being released.
+        # Logical IDs do not require physical pages to preserve their order.
+        grow_up = side.grow_direction == "up"
+        new_watermark = (
+            side.live_page_count
+            if grow_up
+            else side.page_num - 1 - side.live_page_count
         )
+        step = -1 if grow_up else 1
+        source = side.watermark + step
+        moved_pages = 0
+        for target in sorted(side.free_physical_pages, reverse=not grow_up):
+            if (grow_up and target >= new_watermark) or (
+                not grow_up and target <= new_watermark
+            ):
+                break
+            while source in side.free_physical_pages:
+                source += step
+            logical = side.physical_to_logical[source]
+            source_offset = source * side.page_bytes
+            target_offset = target * side.page_bytes
+            # The destination is a hole and the source is outside the retained
+            # region, so the page slices are disjoint and need no temporary copy.
+            self.raw[target_offset : target_offset + side.page_bytes].copy_(
+                self.raw[source_offset : source_offset + side.page_bytes]
+            )
+            del side.physical_to_logical[source]
+            side.physical_to_logical[target] = logical
+            side.logical_to_physical[logical] = target
+            source += step
+            moved_pages += 1
+
+        side.free_physical_pages.clear()
+        side.watermark = new_watermark
+        return moved_pages
 
     def _compact(self) -> None:
         events = self._begin_compaction()
