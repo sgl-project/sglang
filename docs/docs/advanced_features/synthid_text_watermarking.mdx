@@ -1,0 +1,128 @@
+---
+title: "SynthID Text Watermarking"
+description: "Configure per-request SynthID Text watermarking for ordinary and linear speculative generation."
+---
+
+SGLang supports the hash-based [SynthID Text](https://github.com/google-deepmind/synthid-text) tournament transform for NVIDIA CUDA generation. Watermarking is OFF by default and can be enabled per request without truncating OFF requests to the watermark candidate cap.
+
+For the default Aaronson-Gumbel algorithm, see [Text Watermarking](/docs/advanced_features/text_watermarking).
+
+## Server configuration
+
+Store the configuration in a file readable only by the server account. The following keys are public test values, not production secrets:
+
+```json
+{
+  "keys": [654, 400, 836, 123],
+  "ngram_len": 5,
+  "top_k": 512,
+  "context_history_size": 1024,
+  "default_enabled": false,
+  "enforce_all": false
+}
+```
+
+```bash
+chmod 600 /run/secrets/synthid.json
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-4B \
+  --enable-watermark \
+  --watermark-algorithm synthid \
+  --watermark-config /run/secrets/synthid.json
+```
+
+SynthID configuration must be a file path, not inline JSON. Instead of `keys`, the configuration may contain `key_file`, pointing to a separate JSON file containing the integer key list. Do not combine both fields.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `keys` or `key_file` | Required | Up to 64 signed 64-bit integer layer keys. |
+| `ngram_len` | `5` | Hash-context n-gram length; must be at least 2. |
+| `top_k` | `1024` | Server-wide watermark candidate cap, from 2 to 65,536, clamped to the vocabulary size. |
+| `context_history_size` | `1024` | Number of prior eligible context hashes retained per request. |
+| `skip_first_ngram_calls` | `false` | Skip watermarking the first `ngram_len - 1` generated tokens. |
+| `default_enabled` | `false` | Enable watermarking when a request omits its control. Explicit OFF remains allowed. |
+| `enforce_all` | `false` | Enable watermarking for every request and reject explicit OFF. |
+
+The `--synthid-watermark-key-file` and corresponding `--synthid-watermark-*` parameter flags are also supported. Supplying a SynthID key file implicitly selects the SynthID capability, but does not change the request-opt-in default.
+
+Keys, n-gram parameters, and the candidate cap are server-wide. Requests cannot override SynthID keys or context settings. Protect configuration files, process/GPU core dumps, and any other artifacts that can contain in-memory keys.
+
+## Request control
+
+For the native API, pass `watermark` at the request top level or inside `sampling_params`, but not both:
+
+```bash
+curl http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Explain why the sky is blue.",
+    "sampling_params": {
+      "temperature": 1.0,
+      "max_new_tokens": 128,
+      "watermark": {"enabled": true}
+    }
+  }'
+```
+
+The OpenAI-compatible completion and chat APIs accept the same `watermark` object at the request top level. Use `{"enabled": false}` for explicit opt-out. Omitted controls remain OFF unless the server sets `default_enabled` or `enforce_all`.
+
+ON and OFF requests can share a batch. OFF requests retain ordinary full-vocabulary sampling and logprob conventions. Greedy requests retain their unwatermarked argmax and do not provide a meaningful watermark signal.
+
+## Ordinary sampling
+
+Ordinary generation applies these steps:
+
+1. Apply the standard penalties, grammar constraints, custom logit processors, and logit bias.
+2. Apply the request temperature.
+3. Select the SynthID candidate cap and apply the request's top-k, top-p, and min-p filters within it.
+4. Normalize, apply the SynthID tournament, and sample without applying the filters again.
+
+An unlimited request top-k still uses the server's candidate cap for ON requests. OFF requests are not subject to that cap. The implementation preserves each sampling backend's filtering conventions.
+
+Eligible single-device stochastic requests use fused Triton sampling through candidate cap 1,024. Wider caps use a separate GPU path; they do not fall back to the CPU. Benchmark the chosen cap for the target workload.
+
+## Output scores and sampling masks
+
+By default, returned generated-token logprobs describe the unwatermarked reference logits after request temperature, before request filters and watermarking. Existing greedy and prompt-logprob conventions are preserved.
+
+| Reporting mode | Generated-token scores |
+| --- | --- |
+| Default | Unwatermarked reference scores. |
+| `SGLANG_RETURN_ORIGINAL_LOGPROB=true` | Pre-temperature, pre-filter, pre-watermark scores after standard logit preprocessing. |
+| `SGLANG_RETURN_WATERMARKED_LOGPROB=true` | Final filtered and watermarked sampling probabilities for ON rows. |
+
+The two explicit reporting flags are mutually exclusive. Watermarked-score reporting requires SynthID and non-speculative generation. These flags change reporting, not token sampling.
+
+Sampling-mask output and selected-action sampling logprobs describe the realized sampling distribution independently of the reference-logprob reporting mode.
+
+## Speculative decoding
+
+SynthID supports single-layer linear EAGLE/NEXTN and STANDALONE speculation with `--speculative-eagle-topk 1` and `--speculative-use-rejection-sampling`. For a model with native MTP weights:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-4B \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path Qwen/Qwen3.5-4B \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-use-rejection-sampling \
+  --enable-watermark \
+  --watermark-algorithm synthid \
+  --watermark-config /run/secrets/synthid.json
+```
+
+Draft and target distributions use the same provisional context. Only accepted tokens, including the bonus token, update stable request state. Rejection sampling preserves the target watermarked distribution.
+
+Eligible stochastic draft batches use CUDA graphs with live request masks and context state. Sparse verification is available through candidate cap 1,024; wider candidates use dense rejection after scattering their probabilities. Mixed ON/OFF batches retain full-vocabulary OFF proposals.
+
+Request filters, seeded sampling, unsupported graph-state dimensions, and mixed greedy/stochastic batches use correctness-preserving fallback paths. Speculative watermarked-score reporting, tree speculation, multi-layer EAGLE, token maps, pipeline-parallel speculation, PD disaggregation, diffusion, embedding models, and other speculative algorithms are rejected.
+
+## State and detection
+
+The context history is a bounded ring of eligible calls, not an unlimited set of distinct contexts. A context can become eligible again after eviction. Discarded intermediate chunked-prefill samples do not advance stable history.
+
+Slot generations remain monotonic across cache flushes. A flush invalidates cached watermark state, and reused slots are reinitialized before the next watermarked decode.
+
+Use the official SynthID detector with the same tokenizer, keys, n-gram configuration, and algorithm version. Calibrate detection thresholds against output length and the required false-positive rate; a low detector score is not proof of authorship.

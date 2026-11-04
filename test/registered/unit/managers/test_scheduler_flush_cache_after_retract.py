@@ -3,7 +3,7 @@ from collections import deque
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -32,7 +33,7 @@ def _make_req(is_retracted: bool, holds_kv: bool = False) -> MagicMock:
     return req
 
 
-class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
+class TestSchedulerFlushCacheAfterRetract(CustomTestCase):
     """Regression coverage for flush_cache() no-oping while the engine is paused.
 
     With generation paused and running_batch drained, nothing in waiting_queue
@@ -42,6 +43,10 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     parallelism), where gating the flush on them starves weight updates until
     the caller's retry budget times out (reproduced in RL training at 512
     in-flight requests)."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(get_context().override_server_args())
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)

@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.sampling.watermarking.synthid_request import is_enabled
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -379,6 +380,7 @@ def build_eagle_verify_input(
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
     draft_probs: Optional[torch.Tensor],
+    draft_prob_token_ids: Optional[torch.Tensor] = None,
     *,
     target_worker: TpModelWorker,
     topk: int,
@@ -484,6 +486,7 @@ def build_eagle_verify_input(
         draft_probs=draft_probs,
         prepared_out_cache_loc=prepared_out_cache_loc,
         prepared_mrope_positions=prepared_mrope_positions,
+        draft_prob_token_ids=draft_prob_token_ids,
     )
 
 
@@ -729,6 +732,11 @@ def run_eagle_verify(
         logits_output,
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
+        synthid_processor=(
+            target_worker.model_runner.sampler.synthid_watermark
+            if is_enabled(batch.sampling_info.synthid_state)
+            else None
+        ),
         watermark_state=target_worker.model_runner.watermark_state,
         watermark_full_mask=(
             target_worker.model_runner.attn_backend.verify_mask is None

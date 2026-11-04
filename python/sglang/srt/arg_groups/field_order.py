@@ -559,5 +559,11 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "synthid_watermark_key_file",
+    "synthid_watermark_ngram_len",
+    "synthid_watermark_top_k",
+    "synthid_watermark_context_history_size",
+    "synthid_watermark_skip_first_ngram_calls",
+    "watermark_algorithm",
 )
 # fmt: on

@@ -58,10 +58,7 @@ class TestSeededVerifyCoins(CustomTestCase):
         self.assertFalse(torch.equal(coins[0], coins[2]))  # different seq_len
 
     def test_column_split_maps_rejection_then_final(self):
-        # Structured hash: hashed[i, j] = i * 1000 + j, so each coin names its
-        # (row, column) origin. Locks the column-space contract: columns
-        # [0, draft_token_num) become the per-draft rejection coins and column
-        # draft_token_num becomes the final-sampling coin.
+        # The release-base columns begin at zero, not a SynthID RNG domain.
         umax = torch.iinfo(torch.uint32).max
 
         def _structured_hash(seed, positions, col_indices):
