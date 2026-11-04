@@ -99,6 +99,48 @@ def _cached(model, kwargs: dict) -> dict:
     }
 
 
+class TestLTX2PromptMask(CustomTestCase):
+    @torch.no_grad()
+    def test_local_attention_takes_prebuilt_mask_unchanged(self):
+        with ExitStack() as stack:
+            _patch_attention_layers(stack)
+            attention = layer.LocalAttention(
+                num_heads=4,
+                head_size=16,
+                is_cross_attention=True,
+                allow_cudnn_sdp=True,
+                capture_dense_attention=True,
+            )
+            q = torch.randn(2, 8, 4, 16, dtype=torch.bfloat16)
+            k = torch.randn(2, 12, 4, 16, dtype=torch.bfloat16)
+            v = torch.randn(2, 12, 4, 16, dtype=torch.bfloat16)
+            mask = torch.ones(2, 12, dtype=torch.int64)
+            mask[1, 7:] = 0
+            prebuilt = layer.prepare_sdpa_mask(mask, dtype=q.dtype, device=q.device)
+            self.assertTrue(
+                torch.equal(
+                    attention(q, k, v, attn_mask=prebuilt),
+                    attention(q, k, v, attn_mask=mask),
+                )
+            )
+
+    @torch.no_grad()
+    def test_model_mask_built_once_matches_per_block_conversion(self):
+        with ExitStack() as stack:
+            _patch_attention_layers(stack)
+            model = _tiny_model()
+            kwargs = _forward_kwargs(text_seed=1)
+            built_once = model(**kwargs)
+            # the blocks' LocalAttention converts the raw mask on every call instead
+            with patch.object(
+                ltx_2, "prepare_sdpa_mask", side_effect=lambda mask, **_: mask
+            ) as convert:
+                per_block = model(**kwargs)
+            self.assertEqual(convert.call_count, 2)
+            for actual, expected in zip(built_once, per_block, strict=True):
+                self.assertTrue(torch.equal(actual, expected))
+
+
 class TestLTX2PromptKVCache(CustomTestCase):
     @torch.no_grad()
     def test_cached_prompt_kv_is_bitwise_equal_to_per_step_projection(self):

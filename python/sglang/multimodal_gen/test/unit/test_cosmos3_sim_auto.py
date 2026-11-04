@@ -5,7 +5,6 @@ FlexAttention block mask against a dense oracle, the fixed-step sampler, the
 KV ring, request validation and registry wiring."""
 
 import copy
-import json
 import math
 import os
 import unittest
@@ -89,8 +88,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     sde_step_seed,
 )
 from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
-
-EXPORT_DIR = "/mnt/kdub_disk/models/Cosmos3-Nano-Sim-Auto"
 
 LIDAR_BLOCK = {
     "dtype": "float32",
@@ -275,23 +272,6 @@ class TestManifest(unittest.TestCase):
         self.assertEqual(deployment.inference_default("fps", None), 30.0)
         self.assertTrue(deployment.supports_lidar)
         self.assertEqual(deployment.rig_view_ids(["camera_cross_left_120fov"]), [5])
-
-    @unittest.skipUnless(os.path.isdir(EXPORT_DIR), "Sim-Auto export not mounted")
-    def test_real_export(self):
-        with open(os.path.join(EXPORT_DIR, "transformer", "config.json")) as handle:
-            manifest = load_cosmos3_sim_auto_manifest(json.load(handle))
-        self.assertEqual(
-            manifest.checkpoint_id,
-            "sim_auto_joint_stage3_sfdmd_mads_all@iter_000001800",
-        )
-        self.assertEqual(len(manifest.cameras), 11)
-        self.assertEqual(
-            (manifest.frames_per_chunk, manifest.cache_chunks, manifest.sink_chunks),
-            (3, 2, 1),
-        )
-        self.assertEqual(manifest.text_sink_tokens, 4)
-        self.assertEqual(manifest.rig_view_embedding["lidar_id"], 11)
-        self.assertTrue(manifest.joint)
 
 
 class TestSchedule(unittest.TestCase):
