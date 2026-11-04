@@ -51,6 +51,12 @@ class ResidencySnapshot(Value):
     missing: tuple[TargetOutcome, ...]
 
 
+class _StorageScope(Value):
+    payload: CopyTo
+    target: ResolvedTarget
+    max_result_targets: int
+
+
 @dataclass(frozen=True)
 class _Row:
     selection: CopySelection
@@ -97,6 +103,8 @@ class UnifiedCacheExecutor:
         self.cache_available = None
         self.transfers = None
         self.storage = None
+        self.storage_adapter = None
+        self.storage_reason = "Storage is not attached"
         self.storage_reads = None
         self.preparations = {}
         if self.core.enable_hicache and not self._transfer_unsupported_reason():
@@ -108,11 +116,30 @@ class UnifiedCacheExecutor:
             self._refresh_storage_adapter()
 
     def _refresh_storage_adapter(self):
-        enabled = (
-            self.transfers is not None
-            and self.cache.enable_storage
-            and self.cache.cache_controller.storage_backend_type == "file"
+        from sglang.srt.mem_cache.unified_cache.storage_execution import (
+            storage_execution_adapter,
         )
+
+        adapter, reason = (None, "Storage is not attached")
+        if self.transfers is not None and self.cache.enable_storage:
+            adapter, reason = storage_execution_adapter(self.cache)
+        changed = self.storage_adapter is not None and (
+            adapter is None
+            or adapter.store is not self.storage_adapter.store
+            or adapter.backend_namespace != self.storage_adapter.backend_namespace
+        )
+        if changed and self.storage is not None:
+            if (
+                self.storage.jobs
+                or self.storage.interests
+                or self.storage_reads.jobs
+                or self.storage_reads.interests
+            ):
+                raise ControlError(
+                    "busy", "Storage control must drain before replacing its adapter"
+                )
+        self.storage_adapter, self.storage_reason = adapter, reason
+        enabled = adapter is not None
         if enabled and self.storage is None:
             from sglang.srt.mem_cache.unified_cache.control_storage import (
                 StorageCacheTransfers,
@@ -269,18 +296,27 @@ class UnifiedCacheExecutor:
                 {
                     "copy_to": (("gpu", "host"), ("host", "gpu"))
                     + (
-                        (
-                            ("gpu", "storage"),
-                            ("host", "storage"),
-                            ("storage", "host"),
-                            ("storage", "gpu"),
-                        )
-                        if self.storage is not None
+                        self.storage_adapter.copy_paths
+                        if self.storage_adapter is not None
                         else ()
                     ),
                     "move_to": (("gpu", "host"),)
-                    + ((("gpu", "storage"),) if self.storage is not None else ()),
-                    "storage_backend": "file" if self.storage is not None else None,
+                    + (
+                        self.storage_adapter.move_paths
+                        if self.storage_adapter is not None
+                        else ()
+                    ),
+                    "storage_backend": self.storage_adapter.backend
+                    if self.storage_adapter
+                    else None,
+                    "backend_namespace": self.storage_adapter.backend_namespace
+                    if self.storage_adapter
+                    else None,
+                    "storage_targets": self.storage_adapter is not None,
+                    "storage_profile": self.storage_adapter.profile
+                    if self.storage_adapter
+                    else None,
+                    "storage_adapter_reason": self.storage_reason,
                     "storage_scope": "single_complete_token_prefix"
                     if self.storage is not None
                     else None,
@@ -297,6 +333,74 @@ class UnifiedCacheExecutor:
             ),
             "reason": reason or ("" if supported else "Linker is unsupported"),
         }
+
+    def storage_targets(self, target, location):
+        """Trusted owner query: key descriptions, without a network existence check."""
+        from sglang.srt.managers.kv_control.contracts import (
+            Prefetch,
+            PublicLocation,
+            validate_public,
+            validate_target,
+        )
+        from sglang.srt.managers.kv_control.public import normalize_public
+        from sglang.srt.mem_cache.utils import get_storage_hash_str
+
+        validate_target(target)
+        validate_public(
+            Prefetch(
+                target=target, source=location, destination=PublicLocation(tier="host")
+            )
+        )
+        self._refresh_storage_adapter()
+        if self.storage_adapter is None:
+            raise ControlError("unsupported", self.storage_reason)
+        payload = normalize_public(
+            Prefetch(
+                target=target, source=location, destination=PublicLocation(tier="host")
+            ),
+            self.capabilities(),
+        )
+        service = self.cache.kv_control_service
+        scope = service.control.index.resolve(payload.target)
+        self._check(scope)
+        # The shared path validator checks complete-prefix geometry and budgets;
+        # no operation, claim or transfer interest is created by this query.
+        projection = _StorageScope(
+            payload=payload,
+            target=scope,
+            max_result_targets=self.config.max_result_targets,
+        )
+        tokens, compatibility = self.storage_reads._scope(projection)
+        hashes = get_storage_hash_str(
+            RadixKey(
+                array("q", tokens),
+                extra_key=compatibility.extra_key,
+                cache_salt=compatibility.cache_salt,
+            ),
+            page_size=self.core.page_size,
+        )
+        pages = self.storage_adapter.describe_pages(hashes)
+        return dict(
+            description_version="1.0",
+            namespace=scope.namespace,
+            compatibility=cache_compatibility(scope.branches[0].content),
+            key_salt_encoding="sglang.kv.weight.v1"
+            if service.namespace_keys
+            else "owner_assertion",
+            page_size=self.core.page_size,
+            location=self.storage_adapter.location(),
+            existence="unknown",
+            pages=tuple(
+                dict(
+                    start_token=i * self.core.page_size,
+                    end_token=(i + 1) * self.core.page_size,
+                    component="full",
+                    storage_digest=h,
+                    **page,
+                )
+                for i, (h, page) in enumerate(zip(hashes, pages))
+            ),
+        )
 
     def _compatibility(self, content):
         compatibility = cache_compatibility(content)
@@ -730,6 +834,22 @@ class UnifiedCacheExecutor:
     def start(self, work: ExecutionRequest) -> ExecutionUpdate:
         try:
             self._refresh_storage_adapter()
+            payload = work.payload
+            locations = (
+                (payload.location,)
+                if isinstance(payload, SetPriority)
+                else (payload.src, payload.dst)
+            )
+            for location in locations:
+                if location.backend_namespace is not None and (
+                    location.tier != "storage"
+                    or self.storage_adapter is None
+                    or location.backend_namespace
+                    != self.storage_adapter.backend_namespace
+                ):
+                    raise ControlError(
+                        "incompatible_namespace", "Storage backend namespace differs"
+                    )
             if (
                 work.ref.context.engine_id != self.engine_id
                 or work.ref.context.engine_epoch != self.engine_epoch

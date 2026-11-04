@@ -57,7 +57,10 @@ def public_capabilities(caps):
             token_material="complete_prefix",
         ),
         storage_backend=directions.get("storage_backend"),
-        backend_namespace_selection=False,
+        backend_namespace_selection=bool(directions.get("backend_namespace")),
+        backend_namespace=directions.get("backend_namespace"),
+        storage_targets=directions.get("storage_targets", False),
+        storage_profile=directions.get("storage_profile"),
         timeout="relative_ms_cancel_and_drain",
         result_version="1.0",
     )
@@ -72,9 +75,12 @@ def normalize_public(payload, caps):
     if path not in capability["paths"][name]:
         raise ControlError("unsupported", "Public transfer path is not executable")
     for location in (payload.source, payload.destination):
-        if location.backend_namespace is not None:
+        if (
+            location.backend_namespace is not None
+            and location.backend_namespace != capability["backend_namespace"]
+        ):
             raise ControlError(
-                "unsupported", "Backend namespace selection is not integrated"
+                "incompatible_namespace", "Storage backend namespace differs"
             )
         if location.tier == "storage" and location.backend not in (
             None,
@@ -122,11 +128,13 @@ def normalize_public(payload, caps):
             tier=payload.source.tier,
             engine_id=payload.source.engine_id,
             backend=payload.source.backend,
+            backend_namespace=payload.source.backend_namespace,
         ),
         dst=Location(
             tier=payload.destination.tier,
             engine_id=payload.destination.engine_id,
             backend=payload.destination.backend,
+            backend_namespace=payload.destination.backend_namespace,
         ),
     )
 

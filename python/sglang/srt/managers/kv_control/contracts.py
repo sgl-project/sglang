@@ -142,10 +142,11 @@ LogicalTarget: TypeAlias = ContentTarget | TokensTarget | SessionTarget
 Target: TypeAlias = LogicalTarget | Literal["request_cached"]
 
 
-class Location(Value):
+class Location(Value, omit_defaults=True):
     tier: Literal["gpu", "host", "storage"]
     engine_id: Identifier | None = None
     backend: Identifier | None = None
+    backend_namespace: Identifier | None = None
 
 
 # Event hashes are signed i64 decimal strings, never JSON numbers or storage keys.

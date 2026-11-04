@@ -735,7 +735,10 @@ class TestPublicKVProtocol(CustomTestCase):
                     },
                 )
             result = control.submit(envelope(a), control.context("A")).results[0]
-            self.assertEqual(result.status, Status.UNSUPPORTED)
+            self.assertEqual(
+                result.status,
+                Status.REJECTED if mutation == "namespace" else Status.UNSUPPORTED,
+            )
             self.assertEqual(executor.starts, 0)
             self.assertIsNone(result.public_result.claim)
 

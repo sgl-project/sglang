@@ -4530,3 +4530,111 @@ Reviewed public normalization, capability gating, timeout cancellation/drain, re
 ### P4a L2 protection foundation — independent review
 
 Added owner-thread FULL host-prefix protection with split-aware native receipts, shared physical-slot budgets, per-caller/task/incarnation claim revisions, finite TTL, tombstones and reset invalidation. Public PIN execution is still pending. Independently reviewed both new files; protection/cache/transfer regression: 33 passed, 18 subtests passed (12.14 s). After integration with P1, focused protection suite: 12 passed. Logs: /tmp/sglang-rfc-build/p4a-parent-regression.log and p4a-integrated-tests.log. Approved for feature commit; runtime wiring follows separately.
+
+## P2 backend/PREFETCH implementation evidence — 2026-11-04
+
+Base: P1 `e96321c648` plus P4a `b3bccb5015`. No commits/pushes or subdelegation.
+`protection.py` and public PIN execution are unchanged. Parent review/commit is
+pending; P3, P4 wiring and P5+ remain separate work.
+
+Added `unified_cache/storage_execution.py`: explicit file/Mooncake adapter registry,
+backend instance/layout validation, declared copy/move paths, stable backend
+namespace and writer-derived object descriptions. The existing HiCache worker
+queues, whole-scope approval, owner-thread host publication, exact-prefix shared
+interests and cancel/drain/reference mechanisms continue to perform physical I/O.
+Mooncake support is restricted to single TP/PP/CP/DCP, FULL MHA,
+`page_first_direct`, without split heads or unified storage suffixes. The upstream
+external layout reporter's MHA/multi-rank restriction remains unchanged.
+
+Capabilities under `public_protocol` now include:
+
+```json
+{
+  "storage_backend": "mooncake",
+  "storage_profile": "tp1_full_mha_page_first_direct_v1",
+  "backend_namespace": "sglang.storage.v1:<64 hex SHA256>",
+  "backend_namespace_selection": true,
+  "storage_targets": true,
+  "paths": {
+    "sglang.prefetch": [["host","gpu"],["storage","host"],["storage","gpu"]],
+    "sglang.demote": [["gpu","host"],["gpu","storage"]]
+  },
+  "pin_protections": [],
+  "hash_only_execution": false
+}
+```
+
+File advertises backend `file`, profile `native_full_file_v1`. Paths remain the
+intersection with the live cache executor. Unsupported/detached backends expose
+no storage paths. A named namespace must equal the bound adapter's fingerprint;
+mismatch returns `incompatible_namespace`. Omission preserves legacy local-backend
+selection. The fingerprint excludes engine identity/epoch, host pointers and pool
+capacity; it includes actual endpoint/tenant/key builders and byte layout. File
+also includes canonical directory and hostname. Endpoint aliases are not inferred.
+Storage result locations contain backend + backend_namespace and no engine_id.
+The Location schema gains an optional backend_namespace, with absent defaults
+omitted; shared result schema/fixtures were regenerated and Rust-tested.
+
+P4 prerequisite query uses the existing trusted control endpoint and context:
+`{kind:"storage_targets", context, target, location:{tier:"storage",backend,
+backend_namespace}}`. Target must resolve to one definite, complete, aligned token
+prefix. Response fields: description_version="1.0", namespace, compatibility
+(raw salt), key_salt_encoding, page_size, location, existence="unknown", pages.
+Each page has start_token/end_token, component="full", full storage_digest,
+keys, and (Mooncake) parallel object_bytes. It creates no operation/claim or
+network existence check. Actual keys use `get_storage_hash_str` and the real
+writer's `_tag_keys`/`_batch_preprocess` (K/V/rank), or file `_get_component_keys`.
+No event i64 is inverted. The service namespace/salt transform is applied once.
+Exact payload example and reproducible live command are in
+`sgl-router/sgl-kv-orchestrator/README.md`.
+
+The live test used Mooncake SDK **0.3.14** from
+`/home/youwei/.cache/sglang-rfc-tools/mooncake`, master `127.0.0.1:52091`, metadata
+`http://127.0.0.1:52093/metadata`, metrics/admin port `52092`, tenant `default`, TCP,
+standalone=false/check_server=false. GPU 2 was NVIDIA A100 80GB PCIe, torch
+2.14.1+cu130. Two independent cache owners with distinct pools/epochs shared the
+backend. A unique weight namespace isolated each run. No reference-server cache
+was read or changed; GPU 0/1 servers were not stopped.
+
+Live evidence: ordinary insertion with service-encoded Unicode salt produced the
+same full digests as both owners' public descriptions; all eight physical objects
+(four pages × K/V, two layers/two heads) were absent before writing and existed
+after acknowledged writing. The reader had no radix prefix or session association.
+Independent public L3→L2 restored exact host bytes, joined/cancelled an independent
+interest without losing the remaining reader, and loaded exact bytes back to GPU.
+Readiness was absent at submission and present with actual host registration.
+This is real GPU/host/Mooncake I/O; it is not model-generation or Router acceptance.
+
+Found and fixed a production completion issue: Mooncake accepted any positive
+object read count, including short reads. Completion now requires all expected
+bytes and rejects missing receipts; partial write receipts retain failures. CPU
+regressions exercise real key/buffer metadata with controlled SDK responses,
+plus existing file partial/cancel/publication tests. The registered GPU test now
+uses `tree_slots`, allocator `.state`, and explicit `attn_dcp_rank` fixture APIs;
+its original host/file/preparation assertions remain.
+
+Proof commands retain the requested six CPU files and GPU test. All Python runs
+prepend `/home/youwei/.cache/sglang-rfc-tools/mooncake:python` to PYTHONPATH. GPU runs
+use `CUDA_VISIBLE_DEVICES=2`; the focused live run sets
+`KV_CONTROL_MOONCAKE_CONFIG` to the JSON documented in the README.
+
+```text
+Six CPU files: 74 passed, 17 warnings, 66 subtests passed in 14.78s
+Registered GPU test: 1 passed, 1 skipped, 17 warnings, 2 subtests passed in 14.09s
+Focused live Mooncake: 1 passed, 1 deselected, 17 warnings in 13.44s
+Mooncake group/tenant regression: 21 passed, 17 warnings in 11.47s
+Locked Rust shared fixtures: 4 passed; 0 failed
+```
+
+The normal GPU command skips only the opt-in live test; the focused live command
+passes it against the supplied master. Logs are `/tmp/sglang-rfc-build/p2-`:
+`cpu-tests.log`, `gpu-tests.log`, `mooncake-live.log`, `mooncake-regression.log`,
+`rust-fixtures.log`, and `environment.log`. Warnings are existing dependency
+deprecations. Changed Python files pass `ruff --select F`; `git diff --check` is
+clean. No production reference constraints were bypassed. Remaining validation:
+model-generation/Router joint acceptance (P8), other host layouts/MLA/multiple
+ranks (P9), expanded DEMOTE (P3), PIN (P4), Router/recovery (P5–P7).
+
+### P2 independent review and proof
+
+Reviewed registered adapters, namespace/key descriptions, native read/write completion and short-read checks. Independent seven-file CPU regression (including protection foundation): 86 passed, 77 subtests passed (15.19 s). Independent real GPU host/file and live Mooncake tests on GPU1: 2 passed, 2 subtests passed (13.78 s). Both restored K/V bytes and post-publication GPU load-back verified. Shared exact-scope cancellation preserves the other interest. Locked Rust protocol fixtures passed. Logs: /tmp/sglang-rfc-build/p2-parent-{cpu,gpu,rust}.log. Initial supported Mooncake path is TP1 FULL MHA page_first_direct; other physical layouts are not advertised. P2 approved for commit; model-level two-worker acceptance remains P8.

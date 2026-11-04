@@ -631,6 +631,108 @@ def assert_files(cache, node):
 
 
 class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
+    def test_storage_namespace_description_and_backend_mismatch(self):
+        from sglang.srt.managers.kv_control.contracts import ControlError
+        from sglang.srt.managers.kv_control.service import Command
+        from sglang.srt.mem_cache.unified_cache.storage_execution import (
+            storage_execution_adapter,
+        )
+        from pathlib import Path
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, dma = owner
+            caps = service.capabilities()["public_protocol"]
+            location = dict(
+                tier="storage",
+                backend="file",
+                backend_namespace=caps["backend_namespace"],
+            )
+            target = dict(kind="tokens", namespace="ns", token_ids=[1, 2, 3, 4])
+            command = dict(
+                kind="storage_targets",
+                context=msgspec.to_builtins(service.control.context("A")),
+                target=target,
+                location=location,
+            )
+            before = service.control.registry.capacity()
+            description = service.execute(msgspec.convert(command, type=Command))
+            self.assertEqual(description["existence"], "unknown")
+            self.assertFalse(cache.tree_core.root_node.children)
+            self.assertEqual(before, service.control.registry.capacity())
+            paths = [Path(key) for page in description["pages"] for key in page["keys"]]
+            self.assertFalse(any(path.exists() for path in paths))
+            for changes in (
+                {"backend_namespace": "different"},
+                {"backend": "mooncake"},
+            ):
+                with self.assertRaises(ControlError):
+                    service.execute(
+                        msgspec.convert(
+                            dict(command, location=dict(location, **changes)),
+                            type=Command,
+                        )
+                    )
+            seed(cache)
+            result = transfer(service, dst="storage")
+            service.progress()
+            dma.finish()
+            done = wait(service, result)
+            self.assertEqual(done.status, Status.COMPLETED)
+            self.assertTrue(all(path.exists() for path in paths))
+            self.assertEqual(
+                description, service.execute(msgspec.convert(command, type=Command))
+            )
+            self.assertIsNone(done.update.target_outcomes[0].location.engine_id)
+            self.assertEqual(
+                done.update.target_outcomes[0].location.backend_namespace,
+                location["backend_namespace"],
+            )
+            with patch.object(
+                cache.cache_controller, "storage_backend_type", "unregistered"
+            ):
+                adapter, reason = storage_execution_adapter(cache)
+                self.assertIsNone(adapter)
+                self.assertTrue(reason)
+
+    def test_mooncake_short_object_read_and_write_receipts_are_not_complete_pages(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        with hicache(self, storage=True) as owner:
+            _, cache, _, _ = owner
+            # Real writer key/buffer metadata; only the external SDK response is controlled.
+            store = MooncakeStore.__new__(MooncakeStore)
+            store.mem_pool_host = cache.host_pool_group.anchor_entry.host_pool
+            store.storage_config = cache.cache_controller.storage_config
+            store.config_prefix = "test"
+            store.is_mla_backend = False
+            store.should_split_heads = False
+            store.mha_suffix = "0"
+            store.dcp_size = 1
+            store.enable_storage_metrics = False
+            store._use_group_semantics = False
+            indices = torch.arange(store.mem_pool_host.page_size, dtype=torch.int64)
+            keys, _, sizes = store._batch_preprocess(
+                store._tag_keys(["digest"]), indices
+            )
+            self.assertEqual(keys, ["test_digest_0_k", "test_digest_0_v"])
+            for receipt, expected in (
+                (sizes, [True]),
+                ([sizes[0], sizes[1] - 1], [False]),
+                ([sizes[0]], [False]),
+                ([], [False]),
+            ):
+                with patch.object(
+                    store, "_get_batch_zero_copy_impl", return_value=receipt
+                ):
+                    self.assertEqual(store.batch_get_v1(["digest"], indices), expected)
+            with (
+                patch.object(store, "_batch_exist", return_value=[0, 0]),
+                patch.object(store, "_put_batch_zero_copy_impl", return_value=[0]),
+            ):
+                self.assertEqual(store.batch_set_v1(["digest"], indices), [False])
+
     def test_copy_and_move_wait_for_storage_worker_not_enqueue(self):
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner

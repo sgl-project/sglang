@@ -304,6 +304,19 @@
             }
           ],
           "default": null
+        },
+        "backend_namespace": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [

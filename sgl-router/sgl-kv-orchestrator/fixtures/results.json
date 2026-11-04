@@ -32,9 +32,7 @@
           "branch_index": 0,
           "content_id": null,
           "location": {
-            "tier": "host",
-            "engine_id": null,
-            "backend": null
+            "tier": "host"
           },
           "completed_steps": [
             "destination_ready"
@@ -62,9 +60,7 @@
           "branch_index": 0,
           "content_id": null,
           "location": {
-            "tier": "host",
-            "engine_id": null,
-            "backend": null
+            "tier": "host"
           },
           "completed_steps": [
             "destination_ready"
@@ -88,9 +84,7 @@
           "branch_index": 0,
           "content_id": null,
           "location": {
-            "tier": "host",
-            "engine_id": null,
-            "backend": null
+            "tier": "host"
           },
           "completed_steps": [
             "destination_ready"

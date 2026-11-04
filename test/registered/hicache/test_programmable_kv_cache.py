@@ -3,6 +3,11 @@
 
 import atexit
 import json
+import os
+import uuid
+from contextlib import contextmanager, ExitStack
+
+import msgspec
 import tempfile
 import time
 import unittest
@@ -28,8 +33,113 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+
+
+@contextmanager
+def mooncake_owner(extra, namespace, engine_id):
+    with (
+        get_parallel().override(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            attn_dcp_rank=0,
+            attn_dcp_size=1,
+        ),
+        get_context().override_server_args(
+            device="cuda",
+            enable_hierarchical_cache=True,
+            hicache_ratio=2,
+            hicache_mem_layout="page_first_direct",
+            hicache_write_policy="write_back",
+            hicache_io_backend="direct",
+            disable_overlap_schedule=True,
+            hicache_storage_backend="mooncake",
+            hicache_storage_backend_extra_config=json.dumps(extra),
+        ),
+    ):
+        config = ServiceConfig(namespace=namespace, engine_id=engine_id)
+        pool = MHATokenToKVPool(
+            size=64,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=128,
+            layer_num=2,
+            device="cuda",
+            enable_memory_saver=False,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=64, dtype=torch.float16, device="cuda", kvcache=pool, need_sort=False
+        )
+        req = ReqToTokenPool(
+            size=4, max_context_len=32, device="cuda", enable_memory_saver=False
+        )
+        allocator.state = req.state
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=req,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            tree_core_backend="python",
+            kv_control_config=config.cache_config(),
+        )
+        cache = UnifiedRadixCache(params)
+        cache.init_hicache(get_server_args(), params)
+        atexit.unregister(cache.shutdown)
+        try:
+            service = KVControlService(
+                cache, config, namespace_keys=True, idle_check=lambda: True
+            )
+            yield cache, service, pool
+        finally:
+            torch.cuda.synchronize()
+            cache._storage_attachment.shutdown()
+            cache.release_host_resources()
+
+
+def public_action(service, kind, target, source, destination, message):
+    return service.control.submit(
+        KvHintsEnvelope(
+            protocol_version="0.1",
+            message_id=message,
+            actions=[
+                KvHintAction(
+                    action_id="a",
+                    action_type="sglang." + kind,
+                    action_version="1.0",
+                    payload=dict(
+                        target=target,
+                        source=source,
+                        destination=destination,
+                        timeout_ms=10000,
+                    ),
+                )
+            ],
+        ),
+        service.control.context("test"),
+    ).results[0]
+
+
+def describe(service, target, location):
+    from sglang.srt.managers.kv_control.service import Command
+
+    command = msgspec.convert(
+        dict(
+            kind="storage_targets",
+            context=msgspec.to_builtins(service.control.context("test")),
+            target=target,
+            location=location,
+        ),
+        type=Command,
+    )
+    return msgspec.to_builtins(service.execute(command))
 
 
 class TestProgrammableKVCache(CustomTestCase):
@@ -41,7 +151,9 @@ class TestProgrammableKVCache(CustomTestCase):
     def _roundtrip(self, storage):
         with (
             tempfile.TemporaryDirectory() as storage_dir,
-            get_parallel().override(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1),
+            get_parallel().override(
+                tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_dcp_rank=0
+            ),
             get_context().override_server_args(
                 device="cuda",
                 enable_hierarchical_cache=True,
@@ -86,10 +198,11 @@ class TestProgrammableKVCache(CustomTestCase):
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 tree_core_backend="python",
                 kv_control_config=config.cache_config(),
             )
+            allocator.state = params.req_to_token_pool.state
             cache = UnifiedRadixCache(params)
             cache.init_hicache(get_server_args(), params)
             atexit.unregister(cache.shutdown)
@@ -194,6 +307,149 @@ class TestProgrammableKVCache(CustomTestCase):
                 if storage:
                     cache._storage_attachment.shutdown()
                 cache.release_host_resources()
+
+    @unittest.skipUnless(
+        os.environ.get("KV_CONTROL_MOONCAKE_CONFIG"),
+        "Set KV_CONTROL_MOONCAKE_CONFIG to live backend JSON",
+    )
+    def test_live_mooncake_independent_prefetch_and_key_resolution(self):
+        extra = json.loads(os.environ["KV_CONTROL_MOONCAKE_CONFIG"])
+        namespace = "p2-live-" + uuid.uuid4().hex
+        with ExitStack() as stack:
+            a, sa, pool_a = stack.enter_context(
+                mooncake_owner(extra, namespace, "writer-a")
+            )
+            b, sb, pool_b = stack.enter_context(
+                mooncake_owner(extra, namespace, "reader-b")
+            )
+            caps_a = sa.capabilities()["public_protocol"]
+            caps_b = sb.capabilities()["public_protocol"]
+            self.assertEqual(caps_a["storage_backend"], "mooncake")
+            self.assertEqual(caps_a["backend_namespace"], caps_b["backend_namespace"])
+            compatibility = dict(caps_a["prefix"])
+            compatibility.pop("token_material")
+            compatibility["cache_salt"] = "tenant-租户"
+            target = json.loads(
+                json.dumps(
+                    dict(
+                        kind="prefix",
+                        compatibility=compatibility,
+                        start_token=0,
+                        end_token=4,
+                        token_ids=[1, 2, 3, 4],
+                    )
+                )
+            )
+            location = dict(
+                tier="storage",
+                backend="mooncake",
+                backend_namespace=caps_a["backend_namespace"],
+            )
+            desc_a = describe(sa, target, location)
+            desc_b = describe(sb, target, location)
+            self.assertEqual(desc_a, desc_b)
+            self.assertEqual(desc_b["existence"], "unknown")
+            keys = [k for page in desc_b["pages"] for k in page["keys"]]
+            self.assertEqual(len(keys), 8)  # four pages, K and V for each
+            backend = a.cache_controller.storage_backend
+            self.assertFalse(any(backend._batch_exist(keys)))
+            slots = a.token_to_kv_pool_allocator.alloc(4)
+            for layer in range(2):
+                pool_a.k_buffer[layer][slots] = 17 + layer
+                pool_a.v_buffer[layer][slots] = 27 + layer
+            a.insert(
+                InsertParams(
+                    key=RadixKey(
+                        array("q", [1, 2, 3, 4]),
+                        cache_salt=sa.cache_salt("tenant-租户"),
+                    ),
+                    value=slots.to(torch.int64),
+                )
+            )
+            # Ordinary insertion salt and public resolution use the same key chain.
+            from sglang.srt.managers.kv_control.contracts import TokensTarget
+
+            ordinary = TokensTarget(
+                namespace=namespace, token_ids=(1, 2, 3, 4), cache_salt="tenant-租户"
+            )
+            path = sa.control.executor._walk(
+                ordinary.token_ids, sa.control.executor._compatibility(ordinary)
+            )
+            self.assertEqual(
+                [h for node, *_ in path for h in a.tree_core.get_hash_values(node.id)],
+                [p["storage_digest"] for p in desc_a["pages"]],
+            )
+            saved = public_action(
+                sa, "demote", target, {"tier": "gpu"}, location, "save"
+            )
+            saved = self._wait(sa, saved.ref)
+            self.assertTrue(saved.public_result.preserved_scope)
+            self.assertEqual(
+                saved.public_result.ready_location.backend_namespace,
+                location["backend_namespace"],
+            )
+            self.assertIsNone(saved.public_result.ready_location.engine_id)
+            self.assertTrue(all(v == 1 for v in backend._batch_exist(keys)))
+            self.assertFalse(b.tree_core.root_node.children)
+            self.assertFalse(sb.control.index.capacity()["continuations"])
+            restored = public_action(
+                sb,
+                "prefetch",
+                target,
+                location,
+                {"tier": "host", "engine_id": "reader-b"},
+                "restore",
+            )
+            self.assertFalse(restored.public_result.ready_scope)
+            # Joining an exact-prefix operation shares I/O; cancellation drains
+            # only that interest while the other still owns the physical job.
+            other = public_action(
+                sb, "prefetch", target, location, {"tier": "host"}, "shared"
+            )
+            self.assertEqual(len(sb.control.executor.storage_reads.jobs), 1)
+            sb.control.cancel(other.ref)
+            done = self._wait(sb, restored.ref)
+            self.assertTrue(done.public_result.ready_scope)
+            self.assertEqual(done.public_result.ready_location.tier, "host")
+            self.assertEqual(
+                sb.control.registry.get(other.ref).status, Status.CANCELLED
+            )
+            nodes = sb.control.executor._walk(
+                ordinary.token_ids, sb.control.executor._compatibility(ordinary)
+            )
+            host = b.host_pool_group.anchor_entry.host_pool
+            for node, *_ in nodes:
+                cd = node.component_data[ComponentType.FULL]
+                self.assertIsNone(cd.value)
+                for layer in range(2):
+                    self.assertTrue(
+                        torch.all(
+                            host.k_data_refs[layer][cd.host_value] == 17 + layer
+                        ).item()
+                    )
+                    self.assertTrue(
+                        torch.all(
+                            host.v_data_refs[layer][cd.host_value] == 27 + layer
+                        ).item()
+                    )
+            # A normal host-to-GPU load after publication verifies usable bytes.
+            loaded = public_action(
+                sb, "prefetch", target, {"tier": "host"}, {"tier": "gpu"}, "load"
+            )
+            self._wait(sb, loaded.ref)
+            for node, *_ in nodes:
+                cd = node.component_data[ComponentType.FULL]
+                for layer in range(2):
+                    self.assertTrue(
+                        torch.all(pool_b.k_buffer[layer][cd.value] == 17 + layer).item()
+                    )
+                    self.assertTrue(
+                        torch.all(pool_b.v_buffer[layer][cd.value] == 27 + layer).item()
+                    )
+            self.assertFalse(sa.has_pending)
+            self.assertFalse(sb.has_pending)
+            a.sanity_check()
+            b.sanity_check()
 
     def _wait(self, service, ref):
         deadline = time.monotonic() + 10

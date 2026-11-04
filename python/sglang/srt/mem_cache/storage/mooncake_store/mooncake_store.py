@@ -1194,6 +1194,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 all_key_strs, all_ptrs, all_sizes
             )
 
+        if not is_set:
+            io_results = self._validate_read_sizes(io_results, all_sizes)
         results: dict = {}
         for name, key_multiplier, start, end in prepared:
             results[name] = self._batch_postprocess(
@@ -1381,6 +1383,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
+    @staticmethod
+    def _validate_read_sizes(results, sizes):
+        # A positive short read leaves part of a K/V object uninitialized.
+        # The completion contract requires every byte, including all buffers.
+        return [
+            results[i]
+            if i < len(results)
+            and results[i] == (sum(size) if isinstance(size, (list, tuple)) else size)
+            else -1
+            for i, size in enumerate(sizes)
+        ]
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -1408,6 +1422,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
+        get_results = self._validate_read_sizes(get_results, buffer_sizes)
         return self._batch_postprocess(get_results, is_set_operate=False)
 
     def batch_set_v1(
@@ -1463,8 +1478,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     len(set_keys) / (end_time - start_time) * self.gb_per_page
                 )
 
-            for i in range(len(set_indices)):
-                set_results[set_indices[i]] = put_results[i]
+            for i, result in zip(set_indices, put_results):
+                set_results[i] = result
 
         return self._batch_postprocess(set_results, is_set_operate=True)
 

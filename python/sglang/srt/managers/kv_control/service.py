@@ -19,6 +19,8 @@ from sglang.srt.managers.kv_control.contracts import (
     Location,
     LogicalTarget,
     OperationRef,
+    PublicLocation,
+    PublicTarget,
     Seconds,
     TokensTarget,
     Value,
@@ -182,6 +184,12 @@ class Residency(Value, tag="residency", tag_field="kind"):
     location: Location = Location(tier="gpu")
 
 
+class StorageTargets(Value, tag="storage_targets", tag_field="kind"):
+    context: ControlContext
+    target: PublicTarget
+    location: PublicLocation
+
+
 class Associations(Value, tag="associations", tag_field="kind"):
     context: ControlContext
     session_id: Identifier | None = None
@@ -201,6 +209,7 @@ Command = (
     | Ack
     | Cancel
     | Residency
+    | StorageTargets
     | Associations
     | Capacity
 )
@@ -507,6 +516,15 @@ class KVControlService:
             command.ref.context if isinstance(command, Cancel) else command.context
         )
         registry.validate_context(context)
+        if isinstance(command, StorageTargets):
+            if self.weights.active:
+                raise ControlError("busy", "Weight update is in progress")
+            if command.target == "request_cached" or command.location.tier != "storage":
+                raise ControlError(
+                    "invalid_payload",
+                    "Storage descriptions require a definite target and storage location",
+                )
+            return control.executor.storage_targets(command.target, command.location)
         if isinstance(command, Submit):
             if self.weights.active:
                 raise ControlError(

@@ -73,8 +73,9 @@ class StorageCacheReads:
         if (
             not isinstance(payload, CopyTo)
             or payload.src.tier != "storage"
-            or payload.dst.tier not in ("gpu", "host")
-            or payload.src.backend not in (None, "file")
+            or (payload.src.tier, payload.dst.tier)
+            not in self.executor.storage_adapter.copy_paths
+            or payload.src.backend not in (None, self.executor.storage_adapter.backend)
             or payload.dst.backend is not None
             or any(
                 p.engine_id not in (None, self.executor.engine_id)
@@ -82,7 +83,7 @@ class StorageCacheReads:
             )
         ):
             raise ControlError(
-                "unsupported", "File storage reads support local COPY to host/GPU"
+                "unsupported", "Storage adapter supports local COPY to host/GPU"
             )
         if len(work.target.branches) != 1:
             raise ControlError(

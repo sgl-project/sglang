@@ -698,6 +698,10 @@ class KVControl:
                 or actual.tier != location.tier
                 or actual.engine_id not in (None, pending.ref.context.engine_id)
                 or (location.backend is not None and actual.backend != location.backend)
+                or (
+                    location.backend_namespace is not None
+                    and actual.backend_namespace != location.backend_namespace
+                )
                 or coverage.component is None
             ):
                 raise ControlError(

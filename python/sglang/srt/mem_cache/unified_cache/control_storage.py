@@ -64,9 +64,16 @@ class StorageCacheTransfers:
         self.interests: dict[str, _Interest] = {}
 
     def _local_work(self, work):
-        backend = self.cache.cache_controller.storage_backend_type
+        adapter = self.executor.storage_adapter
+        backend = adapter.backend
+        paths = (
+            adapter.move_paths
+            if isinstance(work.payload, MoveTo)
+            else adapter.copy_paths
+        )
         if (
-            work.payload.src.tier not in ("gpu", "host")
+            (work.payload.src.tier, work.payload.dst.tier) not in paths
+            or work.payload.src.tier not in ("gpu", "host")
             or work.payload.dst.tier != "storage"
             or isinstance(work.payload, MoveTo)
             and work.payload.src.tier != "gpu"
@@ -264,11 +271,7 @@ class StorageCacheTransfers:
                 else Status.PARTIAL
                 if ready
                 else Status.MISSING,
-                location=Location(
-                    tier="storage",
-                    engine_id=self.executor.engine_id,
-                    backend=self.cache.cache_controller.storage_backend_type,
-                ),
+                location=self.executor.storage_adapter.location(),
                 completed_steps=steps,
                 code="" if complete else "source_busy" if ready else "missing_copy",
             )

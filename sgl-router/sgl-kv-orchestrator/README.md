@@ -64,13 +64,13 @@ host→storage is schema-valid but not executable. Actual paths are the intersec
 with the live executor's directions under capabilities `public_protocol.paths`.
 The corresponding `public_protocol.actions` map lists only executable actions.
 `schema_versions` includes PIN for parsing/discovery, independently of execution.
-Storage is currently **file only**; Mooncake execution remains P2. Public action
+Storage adapters support **file** and the P2 **TP1 FULL MHA, page_first_direct Mooncake** profile. Public action
 normalization uses existing `CopyTo`/`MoveTo`; old actions and versions are unchanged.
 
 Locations have `tier` plus nullable `engine_id`, `backend`, `backend_namespace`.
 Engine tiers cannot name a backend; storage cannot name an engine. A supplied
-backend must match the executor. Non-null `backend_namespace` is unsupported in
-P1. Remote Engine IDs are rejected. Raw salt must be sent to the Engine; its
+backend must match the executor. A supplied `backend_namespace` must equal the live capability value; mismatches
+return `incompatible_namespace`. Omission retains the legacy bound-backend behavior. Remote Engine IDs are rejected. Raw salt must be sent to the Engine; its
 existing transform applies namespace encoding once. The Rust helper matches
 `encode_cache_salt`: SHA256 of compact UTF-8 JSON
 `["sglang.kv.weight.v1",namespace,original_salt_or_null]`; empty salt maps to null.
@@ -137,3 +137,86 @@ Run from the repository root:
 cargo test --manifest-path sgl-router/Cargo.toml -p sgl-kv-orchestrator
 PYTHONPATH=python .venv/bin/python -m pytest -q test/registered/unit/managers/test_kv_control.py
 ```
+
+
+## P2 storage execution and physical target descriptions
+
+`public_protocol` additionally exposes `backend_namespace`,
+`backend_namespace_selection`, `storage_targets`, and `storage_profile`.
+The Mooncake profile is `tp1_full_mha_page_first_direct_v1`; file uses
+`native_full_file_v1`. Existing `paths` remain authoritative: PREFETCH supports
+storage→host/gpu and host→gpu; DEMOTE reuses gpu→host/storage. There is no new
+host reclamation, PIN, remote engine transfer or Router integration.
+
+The backend namespace is `sglang.storage.v1:<sha256>`. It fingerprints actual
+backend configuration and byte layout, independently of engine ID/epoch and pool
+capacity. Mooncake includes master address, metadata address, tenant, writer key
+prefix/suffixes and object sizes; file includes hostname, canonical directory and
+writer suffixes. Both include pool class/layout/dtype/page size/layer interval,
+bytes per token and head geometry. Identical compatible workers derive the same
+value. Endpoint aliases are conservatively distinct; this is configuration
+identity, not automatic cluster alias discovery. Send the source worker's namespace
+when sharing content. Weight namespace and raw cache salt remain content identity.
+
+The existing trusted Engine `POST /v1/kv/control` also accepts:
+
+```json
+{
+  "kind": "storage_targets",
+  "context": {
+    "engine_id": "worker-b",
+    "engine_epoch": "epoch-from-capabilities",
+    "namespace": "weights-v1",
+    "caller_id": "router-owner"
+  },
+  "target": {
+    "kind": "tokens",
+    "namespace": "weights-v1",
+    "token_ids": [1, 2, 3, 4],
+    "cache_salt": "original-tenant-salt"
+  },
+  "location": {
+    "tier": "storage",
+    "backend": "mooncake",
+    "backend_namespace": "sglang.storage.v1:<value-from-capabilities>"
+  }
+}
+```
+
+PrefixTarget is also accepted with the P1 nested compatibility fields. The target
+must resolve to one complete, aligned token prefix. `request_cached`, hash-only,
+unsupported layouts, foreign epochs/namespaces and mismatched backends are rejected.
+Existing control authentication/context validation applies; this is a trusted
+control query, without a new public authorization mechanism.
+
+The result has `description_version: "1.0"`, `namespace`, `compatibility` (raw
+salt), `key_salt_encoding` (`sglang.kv.weight.v1` or `owner_assertion`), `page_size`,
+`location` (storage backend and backend_namespace, no engine_id),
+`existence: "unknown"`, and `pages`. Each page contains `start_token`, `end_token`,
+`component: "full"`, full `storage_digest`, and `keys`; Mooncake also returns
+`object_bytes` parallel to `keys`. These are physical object descriptions, with no
+residency assertion, allocation, claim, network query or operation record.
+
+Keys use the actual storage namespace hash chain and writer helpers:
+Mooncake `_tag_keys`/`_batch_preprocess`, including rank and K/V pieces; file
+`_get_component_keys`. Event i64 hashes are never expanded into storage digests.
+The query applies the service's existing salt transform once, like ordinary
+request insertion. Returned compatibility retains raw salt for safe reuse.
+
+Live verification uses actual CUDA pools and Mooncake I/O, with no model download.
+The reader starts without radix nodes or session metadata. Set
+`KV_CONTROL_MOONCAKE_CONFIG` to backend JSON, prepend the desired SDK directory to
+`PYTHONPATH`, and run the existing registered GPU test. For the supplied test master:
+
+```sh
+export CUDA_VISIBLE_DEVICES=2
+export PYTHONPATH=/home/youwei/.cache/sglang-rfc-tools/mooncake:python
+export KV_CONTROL_MOONCAKE_CONFIG='{"master_server_address":"127.0.0.1:52091","metadata_server":"http://127.0.0.1:52093/metadata","master_metrics_port":52092,"local_hostname":"127.0.0.1","protocol":"tcp","standalone_storage":false,"check_server":false,"tenant_id":"default","global_segment_size":33554432}'
+.venv/bin/python -m pytest -q --tb=short test/registered/hicache/test_programmable_kv_cache.py
+```
+
+Without the opt-in variable, the live test skips and the existing GPU/host/file
+roundtrip still runs. Each live run uses a unique weight namespace. The test checks
+write→resolved-key existence, cross-worker key equality, host registration, shared
+interest cancellation and GPU load-back bytes. Model generation, TP>1, MLA,
+other Mooncake host layouts and Router-driven recovery remain separate validation.

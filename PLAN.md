@@ -1,6 +1,6 @@
 # SGLang Session-Aware KV Cache Orchestrator 实现方案与实施计划
 
-日期：2026-11-04。状态：P0 已由 parent 提交为 `46ba2e84b9`；P1 协议与模型基础已实现并通过指定验证，工作树未提交，待 parent 审查。D1–D7 已采用。P2–P8 待实施，P9 为后续扩展；这些阶段的描述不表示当前代码已经具备相应能力。
+日期：2026-11-04。状态：P0/P1 已由 parent 提交（P1 `e96321c648`），P4a L2 registry 基础已提交为 `b3bccb5015`。P2 backend/PREFETCH 已实现并通过 CPU、GPU/file 和真实 Mooncake 验证，工作树未提交，待 parent 审查。D1–D7 已采用。P3、P4 执行接入和 P5–P8 待实施，P9 为后续扩展。
 
 目标是在保留 `rfc-kvc` 引擎控制实现的基础上，接入 Router 侧的 session 编排，完成 `PREFETCH`、`DEMOTE`、`PIN`、Mooncake 执行适配及结果反馈。主要验证场景是：应用等待工具期间，将已存在于 Mooncake 的上下文准备到另一个 Engine 的 L2，并在恢复推理时实际复用。
 
@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | C1 | 在现有 `rfc-kvc` 基础上修改，保留提交历史并合入上游基线 | 采用 merge 整合；本计划不要求重写已有提交 |
 | C2 | Mooncake 为主要存储后端，file 用于测试 | 真实功能验收必须覆盖 Mooncake；file 和 mock 用于可控测试 |
-| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 当前任务执行 P1 协议与模型基础；按本任务明确限制保持未提交、不推送，由 parent 审查和提交；未授权部署 |
+| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 当前任务执行 P2 后端适配和独立 PREFETCH；按本任务明确限制保持未提交、不推送，由 parent 审查和提交；未授权部署 |
 
 ### 已采用的实施默认值 D1–D7
 
@@ -448,13 +448,13 @@ Router wire 与外部 bridge 当前忽略 session 信息，需要分别接入。
 
 ## 11. 实施阶段与依赖
 
-本任务实施 P1。三动作 schema、PrefixTarget、结果投影、Rust 纯模型和跨语言 fixtures 已完成；新搬运动作仅复用已有执行路径。P2–P8 的物理功能与 Router 集成待实施，PIN 仅有 schema，执行返回 unsupported。P9 为后续扩展。Capabilities 仅公布当前执行器支持的路径。
+本任务实施 P2。file/Mooncake execution adapters、backend namespace、独立 L3→L2 PREFETCH 和 `storage_targets` 物理 key 描述查询已完成。P2 复用已有搬运、容量批准、引用和取消 drain；P3 扩展、P4 PIN 执行与 P5–P8 Router/恢复/联合验收待实施。已提交的 P4a registry 基础保持原样，公开 PIN 仍返回 unsupported。P9 为后续扩展。
 
 | 阶段 | 主要产物 | 依赖 | 退出条件 |
 | --- | --- | --- | --- |
 | P0 基线整合 | 固定 merge 基线、冲突记录、D1–D7 决策记录 | C1/C2 | 原有控制/搬运回归通过，Router/indexer 可构建 |
-| P1 协议与模型（已实现，未提交） | 三动作 schema、PrefixTarget、capabilities、结果、跨语言 fixtures、Rust 纯模型 | P0 | Python 72 tests + 66 subtests；Rust 4 tests；locked Router/indexer check 通过 |
-| P2 后端与 PREFETCH | storage adapter、Mooncake 数据路径、独立 L3→L2、最小完成事件 | P1 | 无本地前缀、无推理请求也能准备真实 host cache |
+| P1 协议与模型（已提交） | 三动作 schema、PrefixTarget、capabilities、结果、跨语言 fixtures、Rust 纯模型 | P0 | Python 72 tests + 66 subtests；Rust 4 tests；locked Router/indexer check 通过 |
+| P2 后端与 PREFETCH（已实现，未提交） | 注册 file/Mooncake adapters、独立 L3→L2、完成结果、物理 key 描述 | P1 | CPU 74 tests + 66 subtests；GPU/file 通过；真实 Mooncake 跨 owner 无本地前缀恢复及 GPU load-back 通过 |
 | P3 DEMOTE | 复用 native 回收，区分保存/回收，部分结果与阻塞原因 | P2 | 活跃引用和传输期间不误回收；真实释放可验证 |
 | P4 PIN | L2 registry、L3 protection owner、对象聚合、TTL/renew/release | P1/P2 | 共享保护、未知结果与过期处理通过专项测试 |
 | P5 Router 关联与观察 | session/branch index、confirmed-only 接口、关联输入、位置查询 adapter | P1 | 多分支和纯命中能正确建关联，位置失效不删除关联 |
@@ -622,4 +622,4 @@ request metadata 的变更还涉及 [io_struct.py](/home/youwei/bzh/project/Toke
 | 能力限制 | 仍返回 unsupported 的路径、unknown 恢复边界 |
 | 后续依赖 | 未完成前不能宣布支持的能力 |
 
-当前进度：P0 已提交，P1 实现及验证证据见根目录 `PLAN-REVIEW-LOG.md`。P1 未提交，待 parent 审查；P2–P8 待实施，P9 为后续扩展。D1–D7 已采用。精确 wire 契约见 `sgl-router/sgl-kv-orchestrator/README.md` 和 fixtures。Mooncake 实际验证版本、实验硬件和 Agent/RL 接入框架待后续阶段记录。外部计划源文件保持不变。
+当前进度：P0/P1 与 P4a registry 基础已提交，P2 实现及验证证据见 `PLAN-REVIEW-LOG.md`，P2 未提交。P3、P4 执行与 P5–P8 待实施，P9 为后续扩展。精确 wire 契约和 live proof 命令见 `sgl-router/sgl-kv-orchestrator/README.md`。P2 使用 Mooncake SDK 0.3.14、TCP、GPU 2 NVIDIA A100 80GB、torch 2.14.1+cu130；没有启动模型推理请求或改动已有 GPU 0 reference server。Agent/RL 联合验证仍属 P8。外部计划源文件保持不变。
