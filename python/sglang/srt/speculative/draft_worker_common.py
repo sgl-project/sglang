@@ -71,22 +71,26 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
 
 
 def _aiter_serves_draft() -> bool:
-    # A DSpark MHA draft attends to its block bidirectionally; AITER's
-    # unified_attention runs that only once it accepts causal=False. The aiter
-    # MLA verify is causal-only, and the aiter backend reads neither a SHUFFLE
-    # 5D pool through unified_attention nor a unified-memory pool.
+    # A DSpark draft verifies its block bidirectionally: only AITER unified_attention
+    # with causal=False serves that, and it takes no MLA, sliding window, 5D or unified-memory pool.
     from sglang.srt.environ import envs
-    from sglang.srt.speculative.dspark_components.dspark_config import draft_is_mla
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        draft_has_sliding_window,
+        draft_is_mla,
+    )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils.aiter import aiter_unified_attention_supports_non_causal
 
     spec_algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     return (
         spec_algo.is_dspark()
+        and envs.SGLANG_USE_AITER_UNIFIED_ATTN.get() is not False
+        and envs.SGLANG_AITER_UNIFIED_VERIFY.get()
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "nhd"
         and not get_memory().enable_unified_memory
         and aiter_unified_attention_supports_non_causal()
         and not draft_is_mla()
+        and not draft_has_sliding_window()
     )
 
 

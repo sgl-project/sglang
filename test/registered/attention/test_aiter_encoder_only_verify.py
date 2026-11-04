@@ -14,14 +14,13 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-_RUNNABLE = False
+_NON_CAUSAL = False
 if is_hip():
-    from sglang.srt.utils.aiter import aiter_unified_attention_supports_non_causal
-
-    _RUNNABLE = aiter_unified_attention_supports_non_causal()
-if _RUNNABLE:
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.utils.aiter import aiter_unified_attention_supports_non_causal
+
+    _NON_CAUSAL = aiter_unified_attention_supports_non_causal()
 
 _DRAFT_NUM = 4
 _PAGE_SIZE = 16
@@ -69,9 +68,7 @@ def _reference(q, keys, values, prefix_lens, scaling, causal):
     return torch.cat(out)
 
 
-@unittest.skipUnless(
-    _RUNNABLE, "requires HIP with an AITER unified_attention that takes causal=False"
-)
+@unittest.skipUnless(is_hip(), "requires HIP")
 class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
     def _run_verify(self, *, shape, attn_type, kv_dtype):
         prefix_lens, num_q_heads, num_kv_heads, head_dim = shape
@@ -170,7 +167,11 @@ class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
                 (fp8_dtype,) if name == "mtp_shape" else (torch.bfloat16, fp8_dtype)
             )
             for kv_dtype in kv_dtypes:
-                for attn_type in (AttentionType.ENCODER_ONLY, AttentionType.DECODER):
+                # ENCODER_ONLY needs an AITER unified_attention that takes causal=False.
+                attn_types = (AttentionType.DECODER,) + (
+                    (AttentionType.ENCODER_ONLY,) if _NON_CAUSAL else ()
+                )
+                for attn_type in attn_types:
                     with self.subTest(
                         shape=name, kv_dtype=kv_dtype, attn_type=attn_type.name
                     ):

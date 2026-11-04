@@ -575,10 +575,11 @@ class AiterAttnBackend(AttentionBackend):
         )
         _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
 
+        use_unified_attn_env = envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
-        elif envs.SGLANG_USE_AITER_UNIFIED_ATTN.is_set():
-            self.use_triton_unified_attention = envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
+        elif use_unified_attn_env is not None:
+            self.use_triton_unified_attention = use_unified_attn_env
         else:
             self.use_triton_unified_attention = (
                 _dspark_mha_draft_uses_unified_attention(
@@ -605,7 +606,7 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention
             and not self.use_mla
             and self.topk == 1
-            and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+            and envs.SGLANG_AITER_UNIFIED_VERIFY.get()
         )
 
         # aiter kernel related initialization

@@ -14,7 +14,15 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestDraftWorkerAttentionBackend(CustomTestCase):
     def _resolve(
-        self, *, algorithm, aiter_non_causal=True, draft_is_mla=False, layout="nhd"
+        self,
+        *,
+        algorithm,
+        aiter_non_causal=True,
+        draft_is_mla=False,
+        draft_has_sliding_window=False,
+        layout="nhd",
+        unified_attn=None,
+        unified_verify=True,
     ):
         spec = SimpleNamespace(
             speculative_algorithm=algorithm, speculative_draft_attention_backend=None
@@ -36,19 +44,31 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
                 "sglang.srt.speculative.dspark_components.dspark_config.draft_is_mla",
                 return_value=draft_is_mla,
             ),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_config."
+                "draft_has_sliding_window",
+                return_value=draft_has_sliding_window,
+            ),
             envs.SGLANG_AITER_KV_CACHE_LAYOUT.override(layout),
+            envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(unified_attn),
+            envs.SGLANG_AITER_UNIFIED_VERIFY.override(unified_verify),
         ):
             return draft_worker_common.resolve_draft_worker_attention_backend()
 
     def test_aiter_serves_only_a_dspark_mha_draft_on_a_non_causal_aiter(self):
         """A DSpark draft verifies its block bidirectionally. An AITER without
-        causal=False, the causal-only aiter MLA verify, a SHUFFLE 5D pool and
-        DFLASH must all leave the draft on the fallback."""
+        causal=False, the causal-only aiter MLA verify, a sliding-window draft, a
+        SHUFFLE 5D pool, unified attention or verify switched off, and DFLASH
+        must all leave the draft on the fallback."""
         self.assertEqual(self._resolve(algorithm="DSPARK"), "aiter")
+        self.assertEqual(self._resolve(algorithm="DSPARK", unified_attn=True), "aiter")
         for case in (
             dict(algorithm="DSPARK", aiter_non_causal=False),
             dict(algorithm="DSPARK", draft_is_mla=True),
+            dict(algorithm="DSPARK", draft_has_sliding_window=True),
             dict(algorithm="DSPARK", layout="shuffle"),
+            dict(algorithm="DSPARK", unified_attn=False),
+            dict(algorithm="DSPARK", unified_verify=False),
             dict(algorithm="DFLASH"),
         ):
             with self.subTest(**case):
