@@ -19,7 +19,7 @@ register_amd_ci(
     est_time=180,
     stage="stage-b",
     runner_config="2-gpu-large-amd",
-    disabled="fails in AMD parity run #48317 (MI300, rocm10): OSError: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cach",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): model files not reachable: HF connection failed and they are not in the CI cache",
 )
 
 
