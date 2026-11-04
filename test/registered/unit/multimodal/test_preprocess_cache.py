@@ -4,6 +4,8 @@ DiskPreprocessCache(dir)
   one process writes, another reads the dir -> every field back, video metadata too;
       umask file mode; a file deleted mid-read (ESTALE) is a miss
   a key whose file exists -> not rewritten
+  a key another writer is writing -> left to it; a failed write -> the next writer takes it
+  a temporary file a killed process left -> removed when the directory is opened
 
 snapshot_media / parse_content_hash
   hash strings -> strict, normalized format
@@ -31,6 +33,7 @@ import base64
 import errno
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -112,6 +115,61 @@ class TestDiskPreprocessCache(unittest.TestCase):
         self.assertEqual(first._path(key).stat().st_ino, inode)
         self.assertEqual(save.call_count, 0)
         self.assertTrue(torch.equal(second.get(key), torch.zeros(1024)))
+
+    def test_a_key_being_written_is_left_to_its_writer(self):
+        """The temporary file is the claim: the second of two concurrent writers does nothing."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        key = build_cache_key("image.png")
+        cache = DiskPreprocessCache(directory.name)
+        release = threading.Event()
+        real_save = torch.save
+
+        def slow_save(value, file):
+            release.wait(timeout=10)
+            real_save(value, file)
+
+        with patch("torch.save", side_effect=slow_save) as save:
+            first = threading.Thread(
+                target=cache.__setitem__, args=(key, torch.zeros(8))
+            )
+            first.start()
+            while (
+                not cache._path(key).with_name(cache._path(key).name + ".tmp").exists()
+            ):
+                pass
+            cache[key] = torch.ones(8)
+            self.assertEqual(save.call_count, 1)
+            release.set()
+            first.join()
+        self.assertTrue(torch.equal(cache.get(key), torch.zeros(8)))
+        self.assertEqual(
+            [path.name for path in Path(directory.name).rglob("*.tmp")], []
+        )
+
+        failing_key = build_cache_key("video.mp4")
+        with patch("torch.save", side_effect=OSError(errno.ENOSPC, "No space left")):
+            with self.assertRaises(OSError):
+                cache[failing_key] = torch.zeros(8)
+        self.assertEqual(
+            [path.name for path in Path(directory.name).rglob("*.tmp")], []
+        )
+        cache[failing_key] = torch.ones(8)
+        self.assertTrue(torch.equal(cache.get(failing_key), torch.ones(8)))
+
+    def test_opening_the_directory_removes_stale_temporary_files(self):
+        """A claim left by a killed process would otherwise keep its key from ever being written."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        key = build_cache_key("image.png")
+        stale = DiskPreprocessCache(directory.name)._path(key)
+        stale.parent.mkdir(parents=True)
+        stale.with_name(stale.name + ".tmp").write_bytes(b"half")
+
+        cache = DiskPreprocessCache(directory.name)
+        self.assertEqual(list(Path(directory.name).rglob("*.tmp")), [])
+        cache[key] = torch.ones(8)
+        self.assertTrue(torch.equal(cache.get(key), torch.ones(8)))
 
 
 class TestMediaIdentity(unittest.TestCase):
