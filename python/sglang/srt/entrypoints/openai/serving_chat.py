@@ -108,6 +108,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
+    without_schema_identifiers,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
@@ -771,18 +772,15 @@ class OpenAIServingChat(OpenAIServingBase):
             if image_count:
                 template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
+            supported_efforts = ("low", "high", "max")
+            if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
+                supported_efforts = ("low", "medium", "high", "max")
             if (
-                request.reasoning_effort in ("low", "high", "max")
+                request.reasoning_effort in supported_efforts
                 and "thinking_effort" not in template_kwargs
             ):
                 template_kwargs["thinking_effort"] = request.reasoning_effort
-            elif request.reasoning_effort not in (
-                None,
-                "none",
-                "low",
-                "high",
-                "max",
-            ):
+            elif request.reasoning_effort not in (None, "none", *supported_efforts):
                 logger.warning(
                     "Kimi K3 does not support reasoning_effort=%r; using the "
                     "encoder default.",
@@ -790,11 +788,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             effective_tools = self._effective_tools(request)
-            if (
-                effective_tools
-                and isinstance(request.tool_choice, str)
-                and request.tool_choice in ("required", "none")
-            ):
+            # The encoder renders tool_choice="none" with or without tools, so a
+            # client's explicit "none" reaches it either way; the default "none"
+            # of a request without tools does not.
+            passes_tool_choice = (
+                request.tool_choice == "required" and effective_tools
+            ) or (
+                request.tool_choice == "none"
+                and (effective_tools or request._tool_choice_explicit)
+            )
+            if passes_tool_choice:
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
             if request.response_format is not None:
                 template_kwargs.setdefault(
@@ -1189,7 +1192,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                Draft202012Validator.check_schema(
+                    without_schema_identifiers(tool.function.parameters)
+                )
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -1872,9 +1877,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=(
+                    True if enable_thinking is None else bool(enable_thinking)
+                ),
             )
 
         # Apply chat template and its stop strings
@@ -2056,15 +2061,19 @@ class OpenAIServingChat(OpenAIServingBase):
             else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
-        strict_tool_call_arguments = (
-            self._encoding_adapter.strict_tool_call_arguments
-            if self._encoding_adapter is not None
-            else self.chat_encoding_spec != "kimi_k3"
-        )
-        for message in messages:
-            normalize_assistant_tool_call_arguments(
-                message, strict=strict_tool_call_arguments
+        # The Kimi-K3 encoder parses history tool-call arguments itself and keeps
+        # the original bytes of nested values; parsing them here would
+        # re-serialize them and change the prompt.
+        if self._encoding_adapter is not None or self.chat_encoding_spec != "kimi_k3":
+            strict_tool_call_arguments = (
+                self._encoding_adapter.strict_tool_call_arguments
+                if self._encoding_adapter is not None
+                else True
             )
+            for message in messages:
+                normalize_assistant_tool_call_arguments(
+                    message, strict=strict_tool_call_arguments
+                )
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),

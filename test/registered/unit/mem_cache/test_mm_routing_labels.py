@@ -120,12 +120,18 @@ class TestMmRoutingLabels(CustomTestCase):
         self.assertIsNone(self.registry.get(X[0]))  # least recently used
 
     def test_processor_output_registers_labels_after_msgpack(self):
-        # The moved request types must retain labels across tokenizer IPC and
-        # register the scheduler's final pad values for event recording.
+        # Processor finalization can change pad values before tokenizer IPC;
+        # event labels must use the final identity and survive the transfer.
         labeled = MultimodalDataItem(
             modality=Modality.IMAGE, hash=0xDEADBEEF, routing_label=LABEL_U
         )
         unlabeled = MultimodalDataItem(modality=Modality.IMAGE, hash=0xFEEDFACE)
+        labeled.set_pad_value()
+        initial_padding = labeled.padding_values()
+        fingerprint = "sha256:" + "12" * 32
+        labeled.bind_processor_fingerprint(fingerprint)
+        final_identity, final_padding = labeled.identity, labeled.padding_values()
+        self.assertNotEqual(initial_padding, final_padding)
         req = TokenizedGenerateReqInput(
             input_text="",
             input_ids=array("q", [1, 2]),
@@ -146,9 +152,14 @@ class TestMmRoutingLabels(CustomTestCase):
         mm_inputs = MultimodalInputs.from_processor_output(decoded.mm_inputs)
         labeled, unlabeled = mm_inputs.mm_items
         self.assertEqual(labeled.routing_label, LABEL_U)
+        self.assertEqual(labeled.processor_fingerprint, fingerprint)
+        self.assertEqual(labeled.identity, final_identity)
+        self.assertEqual(labeled.padding_values(), final_padding)
         self.assertIsNone(unlabeled.routing_label)
         for value in labeled.padding_values():
             self.assertEqual(self.registry.get(value), LABEL_U)
+        for value in initial_padding:
+            self.assertIsNone(self.registry.get(value))
         for value in unlabeled.padding_values():
             self.assertIsNone(self.registry.get(value))
 
@@ -175,8 +186,10 @@ class TestMmRoutingLabels(CustomTestCase):
         )
         plain = MultimodalDataItem(modality=Modality.IMAGE, hash=0xDEADBEEF)
         for item in (labeled, plain):
+            item.bind_processor_fingerprint("sha256:" + "12" * 32)
             item.set_pad_value()
         self.assertEqual(labeled.hash, plain.hash)
+        self.assertEqual(labeled.cache_key, plain.cache_key)
         self.assertEqual(labeled.padding_values(), plain.padding_values())
 
     def test_batched_labels_follow_each_request(self):
