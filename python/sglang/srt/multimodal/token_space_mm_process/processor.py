@@ -12,6 +12,7 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.multimodal_processor_mixin import (
     MultimodalProcessorMixin,
     _tokenizer_of,
+    media_load_errors,
 )
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
@@ -73,6 +74,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             {
                 "strategy_class": strategy_class,
                 "gpu_image_decode": strategy_class.gpu_image_decode,
+                "smart_rgb_conversion": strategy_class.smart_rgb_conversion,
             },
         )
 
@@ -176,6 +178,37 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             compute_mrope_positions=compute_mrope_positions,
             package_output=package_output,
         )
+
+    def _submit_mm_data_loading_tasks_simple(
+        self,
+        data_list,
+        modality,
+        audio_sample_rate,
+        discard_alpha_channel,
+        video_decode_device=None,
+    ):
+        # The strategy's loaders carry the options the mixin's loader takes here.
+        return [
+            (
+                modality,
+                index,
+                self.io_executor.submit(
+                    self._load_item, data, modality, video_decode_device
+                ),
+            )
+            for index, data in enumerate(data_list or ())
+        ]
+
+    def _load_item(self, data, modality, video_decode_device):
+        """One source through the strategy's loader; a failure classifies as the mixin's."""
+        with media_load_errors(data):
+            if modality == Modality.IMAGE:
+                return self.strategy.load_image(data)
+            if modality == Modality.VIDEO:
+                return self.strategy.load_video(
+                    data, video_decode_device=video_decode_device
+                )
+            return self.strategy.load_audio(data)
 
     def _check_media_sources(self, image_data, video_data, audio_data):
         sources = {

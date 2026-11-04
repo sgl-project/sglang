@@ -5,6 +5,11 @@ import torch
 from transformers import BatchFeature
 
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.multimodal_processor_mixin import (
+    load_audio_item,
+    load_image_item,
+    load_video_item,
+)
 
 
 def concat_media_features(item_features):
@@ -60,6 +65,7 @@ class TokenSpaceProcessStrategy:
     video_preprocessing_device: str | None = None
     # False decodes JPEGs with PIL even on CUDA; nvJPEG pixels differ from PIL's.
     gpu_image_decode: bool = True
+    smart_rgb_conversion: bool = False
 
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         # `processor` is the shared original; read config from it here, never keep it.
@@ -70,6 +76,26 @@ class TokenSpaceProcessStrategy:
         self.audio_config = mm_process_config.get("audio", {})
         # Token IDs and sizes for expansion, e.g. image_token_id, spatial_merge_size.
         self.mm_token_expansion_params = {}
+
+    # Media loading, one source per call. The IO threads share this instance: these read
+    # class attributes and __init__ state and never write `self`. Override to decode as
+    # the model's own processor does.
+    def load_image(self, source):
+        """The decoded image of one source: a PIL image, or a GPU tensor when nvJPEG decoded it."""
+        return load_image_item(
+            source,
+            gpu_image_decode=self.gpu_image_decode,
+            discard_alpha_channel=self.discard_alpha_channel,
+            smart_rgb_conversion=self.smart_rgb_conversion,
+        )
+
+    def load_video(self, source, *, video_decode_device):
+        """The frame reader of one source; decodes on the GPU unless the device is "cpu"."""
+        return load_video_item(source, video_decode_device=video_decode_device)
+
+    def load_audio(self, source):
+        """The mono waveform of one source at `audio_sample_rate`."""
+        return load_audio_item(source, audio_sample_rate=self.audio_sample_rate)
 
     def resolve_media_options(
         self, processor, *, image_device=None, video_device=None

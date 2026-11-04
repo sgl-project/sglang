@@ -947,3 +947,49 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStrategyLoaders(unittest.TestCase):
+    """The IO path decodes every source with the strategy's loaders, the shared ones by default."""
+
+    def _processor(self, strategy_class):
+        processor = TokenSpaceProcessor.for_strategy(strategy_class)(
+            None,
+            _bare_tokenizer(),
+            processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
+        )
+        self.addCleanup(processor.shutdown)
+        return processor
+
+    def test_sources_go_through_the_strategy_loaders(self):
+        png = io.BytesIO()
+        Image.new("RGB", (3, 1)).save(png, format="PNG")
+
+        class _ReversedImageStrategy(_ImageWidthStrategy):
+            def load_image(self, source):
+                return Image.open(io.BytesIO(source)).transpose(Image.ROTATE_90)
+
+        # Default: the shared loader decodes the bytes; override: the strategy's own decode.
+        for strategy_class, width in (
+            (_ImageWidthStrategy, 3),
+            (_ReversedImageStrategy, 1),
+        ):
+            output = asyncio.run(
+                self._processor(strategy_class).process(
+                    [png.getvalue()], input_ids=[1, IMAGE]
+                )
+            )
+            self.assertEqual(output["input_ids"].tolist(), [[1] + [IMAGE] * width])
+
+    def test_loader_failures_classify_as_the_mixins(self):
+        """A client media error stays a ValueError; anything else a RuntimeError, as legacy loading."""
+
+        class _FailingStrategy(_ImageWidthStrategy):
+            def load_image(self, source):
+                raise {"bad": ValueError, "io": OSError}[source]("cannot decode")
+
+        processor = self._processor(_FailingStrategy)
+        with self.assertRaises(ValueError):
+            asyncio.run(processor.process(["bad"], input_ids=[1, IMAGE]))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(processor.process(["io"], input_ids=[1, IMAGE]))
