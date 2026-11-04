@@ -222,6 +222,26 @@ class BenchmarkChecks(unittest.TestCase):
                  for a, b, c in [(0, 32, "full"), (16, 64, "full"), (0, 64, "full"), (0, 128, "swa")]]
         self.assertEqual(bench.intervals_size(spans), 64)
 
+    def test_required_cache_details_accept_only_explicit_integer_zero(self):
+        for meta in ({"cached_tokens": 0},
+                     {"cached_tokens": 0, "cached_tokens_details": None}):
+            counts = bench.cache_details(meta, require=True)
+            self.assertEqual([counts[t] for t in ("device", "cpu", "storage")], [0, 0, 0])
+            self.assertFalse(counts["details_present"])
+            self.assertEqual(counts["provenance"], "explicit_zero_total")
+        for meta in ({}, {"cached_tokens": None}, {"cached_tokens": False},
+                     {"cached_tokens": True}, {"cached_tokens": 0.0},
+                     {"cached_tokens": "0"}, {"cached_tokens": 1},
+                     {"cached_tokens": -1}):
+            with self.subTest(meta=meta), self.assertRaises(bench.BenchError):
+                bench.cache_details(meta, require=True)
+
+    def test_optional_cache_details_preserve_legacy_zero_behavior(self):
+        expected = {"device": 0, "cpu": 0, "storage": 0, "details_present": False}
+        for meta in ({}, {"cached_tokens": 0}, {"cached_tokens": False},
+                     {"cached_tokens": 0.0}):
+            self.assertEqual(bench.cache_details(meta), expected)
+
     def test_sse_truncation_and_comments(self):
         events = list(bench.sse_objects([b":keepalive\n", b'data: {"text":\n', b'data: "x"}\n', b"\n", b"data: [DONE]\n", b"\n"]))
         self.assertEqual(events, [{"text": "x"}])

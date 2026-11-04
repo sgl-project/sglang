@@ -561,6 +561,45 @@ class LifecycleHTTPTests(unittest.TestCase):
         ]
         self.assertLessEqual(len(queries), 4)
 
+    def test_explicit_zero_cache_total_counts_full_repeated_prefill(self):
+        args = self.make_args()
+        case = {
+            "id": 0,
+            "family": 0,
+            "branch": 0,
+            "prefix": list(range(64)),
+            "salt": "full-miss",
+        }
+        self.prepare_source(case)
+        self.engines[1].storage.pop(case["salt"])
+        generate = self.b.http.generate
+
+        def upstream_zero_details(*args, **kwargs):
+            response = generate(*args, **kwargs)
+            self.assertEqual(response["meta_info"]["cached_tokens"], 0)
+            response["meta_info"]["cached_tokens_details"] = None
+            return response
+
+        controls = lb.AsyncControls(1, 2)
+        spec = {
+            "id": "full-miss",
+            "trial": "full-miss",
+            "arm": "on_demand",
+            "tool_wait_s": 0,
+            "predicted_wait_s": 0,
+            "cancelled": False,
+            "route_change": False,
+        }
+        with patch.object(self.b.http, "generate", side_effect=upstream_zero_details):
+            row = lb.resume_task(
+                args, self.a, self.b, self.router, case, spec, controls, self.journal
+            )
+        controls.drain()
+        self.assertTrue(row["valid"], row)
+        self.assertEqual(row["repeated_prefill_tokens"], 64)
+        self.assertEqual(row["cache"]["provenance"], "explicit_zero_total")
+        self.assertFalse(row["cache"]["details_present"])
+
     def test_unknown_router_owner_keeps_completed_response(self):
         args = self.make_args(via_router=True)
         self.state.omit_header = True

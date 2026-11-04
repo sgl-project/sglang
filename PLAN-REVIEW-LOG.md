@@ -5050,3 +5050,9 @@ parent 阅读完整生产、文档及新测试差异，并独立执行 read_batc
 新策略且 Engine 明确支持 read_batch 时，将能力、反馈、操作及 scope/claim 观察合入一次 RPC；初次发现/提交、取消与释放仍单独执行。抽取既有能力绑定及反馈应用，串行与批量共用操作身份、ticket、水位、范围和 claim 验证。日志分页未追上、gap、错误/超限回复或失效都撤销 readiness，按既有单查询路径修复后再尝试；不依赖批量“原子快照”。旧 Engine 和未配置策略保留原路径。
 
 parent 阅读完整三个文件差异，并独立 HTTP orchestration 40 项通过，3.46s；精确 Rust 1.92 fmt 全 workspace 检查通过。新增回归核验持续 partial 观察实际只发一个 HTTP RPC、终态与 queued、PIN TTL/新 release 消息、协商回退、坏/缺/超限结果、epoch/generation/gap、分页及失效恢复。日志：lifecycle-opt/read-batch-parent-http-tests.log。后续真实压力需统一切换两端再评估，原筛选负结果完整保留。
+
+### O7 — 显式零命中与完整重算
+
+C32 原始响应中，按需十条、生命周期九条 cached_tokens 明确为整数 0，cached_tokens_details 为 null。上游 output_streamer 的零命中分支返回 None；旧工具将此合法响应标为详情异常，原 repeated_prefill 汇总漏掉对应完整重算。原始 invalid、异常和验收失败状态保持原样，不改写证据。
+
+strict 模式仅将明确整数 0 解释为各层零命中，保留 details_present=false 与 explicit_zero_total 来源；缺少总量、非零或非法类型继续 unknown。非严格旧调用保持兼容。parent 阅读完整差异并独立 session/stress/analyze/lifecycle 62 项通过，17.561s，diff 检查通过；新 HTTP 回归验证完整前缀计入重算。日志：lifecycle-opt/zero-cache-parent-tests.log。只读逐条证明为 zero-cache-c32-proof.json：对应前缀重算至少 163840/147456 tokens，固定预取未出现该类响应；不能继续将旧汇总的零值作为无重算证明。

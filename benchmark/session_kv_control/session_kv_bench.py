@@ -100,6 +100,9 @@ def ready_tokens(op):
 def cache_details(meta, require=False):
     raw = meta.get("cached_tokens_details")
     if raw is None:
+        if require and type(meta.get("cached_tokens")) is int and meta["cached_tokens"] == 0:
+            return {"device": 0, "cpu": 0, "storage": 0, "details_present": False,
+                    "provenance": "explicit_zero_total"}
         if meta.get("cached_tokens", 0) == 0 and not require:
             return {"device": 0, "cpu": 0, "storage": 0, "details_present": False}
         raise BenchError("cached_tokens_details missing; cannot identify hit tier")
