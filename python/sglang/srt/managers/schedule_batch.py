@@ -133,6 +133,7 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -622,6 +623,7 @@ class Req(ReqDllmMixin):
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
+        self.matched_auxiliary_swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
@@ -932,7 +934,9 @@ class Req(ReqDllmMixin):
     def auxiliary_swa_host_hit_length(self) -> int:
         plan = self.staged_prefetch_plan
         return (
-            plan.window_tokens(ComponentType.AUXILIARY_SWA) if plan is not None else 0
+            plan.window_tokens(ComponentType.AUXILIARY_SWA)
+            if plan is not None
+            else self.matched_auxiliary_swa_host_hit_length
         )
 
     def needs_host_load_back(self) -> bool:
@@ -2661,16 +2665,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            # In lazy mode, skip the swap — the second ping-pong slot is not
-            # allocated yet; it will be allocated on demand at the track boundary
-            # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
-            req.kv.mamba_last_track_idx = req.kv.mamba_next_track_idx
-            if not get_exec().mamba.enable_mamba_extra_buffer_lazy:
-                req.kv.mamba_next_track_idx = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.kv.mamba_next_track_idx
-                    )
-                )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -2687,7 +2681,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
-            req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+            kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).advance(
+                req,
+                tracking=TrackingAdvance(
+                    boundary=mamba_track_seqlen_aligned,
+                    last_position=track_position,
+                    next_position=track_position
+                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
+                    else self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        track_position
+                    ),
+                ),
+            )
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
@@ -3105,10 +3112,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 storage.take_tracking_slot(req, other_idx)
             )
             if took:
-                req.kv.mamba_next_track_idx = other_idx
+                storage.advance(req, tracking=TrackingAdvance(next_position=other_idx))
             else:
                 # The in-flight write invalidates the keep slot's old checkpoint.
-                req.kv.mamba_last_track_seqlen = None
+                storage.advance(req, tracking=TrackingAdvance(boundary=None))
 
     def mamba_lazy_undo_prealloc_at_boundary(self):
         """Give back the slots mamba_lazy_prealloc_at_boundary handed this decode
@@ -3126,8 +3133,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if buf[1 - next_idx].item() == -1:
                 # The prealloc failed, so tracking would have been in place.
                 continue
-            storage.release_tracking_slot(req, next_idx)
-            req.kv.mamba_next_track_idx = 1 - next_idx
+            storage.advance(
+                req,
+                tracking=TrackingAdvance(
+                    next_position=1 - next_idx, release_positions=(next_idx,)
+                ),
+            )
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3161,7 +3172,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     storage.take_tracking_slot(req, other_idx)
                 )
                 if not has_pending:
-                    req.kv.mamba_last_track_seqlen = None
+                    storage.advance(req, tracking=TrackingAdvance(boundary=None))
             # On failure the verify scatters in place into the keep slot.
             track_positions.append(
                 other_idx if has_pending else req.kv.mamba_next_track_idx
@@ -3558,7 +3569,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                     # Past the retain window the request no longer reads its prefill's
                     # SWA; release that part of the tree lock so SWA LRU can reclaim it.
-                    if release_leaf_lock and req.decode_batch_idx >= retain_window:
+                    if release_leaf_lock and (
+                        has_auxiliary_swa or req.decode_batch_idx >= retain_window
+                    ):
                         self.tree_cache.release_swa_prefix_lock(req)
                 elif (
                     self.forward_mode.is_extend()

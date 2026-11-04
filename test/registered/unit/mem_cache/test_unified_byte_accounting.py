@@ -149,6 +149,9 @@ class TestSharedVirtualIdSpace(unittest.TestCase):
 
     @staticmethod
     def _build(n_full, n_swa, full_layers, swa_layers):
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
         _arena, allocator, _kvcache = build_window_chain(
             n_full_slots=n_full,
             n_swa_slots=n_swa,
