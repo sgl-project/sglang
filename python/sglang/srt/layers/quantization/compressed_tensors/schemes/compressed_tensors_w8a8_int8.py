@@ -23,7 +23,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import is_cuda
 
-__all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
+__all__ = [
+    "CompressedTensorsW8A8Int8",
+    "NPUCompressedTensorsW8A8Int8",
+    "XPUCompressedTensorsW8A8Int8",
+]
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -200,3 +204,33 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
 
     def apply_weights(self, layer, x, bias):
         return self.kernel.apply(layer, x, bias)
+
+
+class XPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
+    """W8A8 int8 linear on XPU: dynamic symmetric per-token activations, per-channel weights.
+
+    sgl-kernel-xpu has no ``int8_scaled_mm``, so the int8 x int8 -> int32 GEMM runs on
+    ``torch._int_mm`` (oneDNN) and the per-token x per-channel rescale, bias add and cast
+    are applied afterwards in fp32. ``layer.weight`` is the [K, N] transposed view that
+    ``process_weights_after_loading`` already produces for ``int8_scaled_mm``.
+    """
+
+    def __init__(
+        self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
+    ):
+        super().__init__(strategy, is_static_input_scheme, input_symmetric)
+        if is_static_input_scheme or not input_symmetric:
+            raise NotImplementedError(
+                "XPU W8A8 int8 supports only dynamic symmetric per-token activations."
+            )
+
+    def apply_weights(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        x_q, x_scale = per_token_quant_int8(x_2d)
+        acc = torch._int_mm(x_q, layer.weight)
+        out = acc.to(torch.float32) * x_scale * layer.weight_scale.view(1, -1).float()
+        if bias is not None:
+            out = out + bias.float()
+        return out.to(x.dtype).reshape(*x.shape[:-1], out.shape[-1])

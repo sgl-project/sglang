@@ -6,10 +6,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 if _is_cuda:
     from sglang.kernels.ops.quantization.per_token_group_quant import (
         per_token_group_quant,
@@ -29,7 +30,7 @@ def _per_token_quant_int8(
     N,
     CAL_SUM: tl.constexpr,
     BLOCK: tl.constexpr,
-    IS_HIP: tl.constexpr,
+    GENERIC_LIBDEVICE: tl.constexpr,
 ):
     # Adapted from https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
     row_id = tl.program_id(0)
@@ -41,9 +42,9 @@ def _per_token_quant_int8(
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
-    if IS_HIP:
-        # ROCm Triton dropped the CUDA `tl.extra.cuda.libdevice.*` shim
-        # (`__nv_roundf`); use the backend-agnostic libdevice instead.
+    if GENERIC_LIBDEVICE:
+        # `tl.extra.cuda.libdevice.round` lowers to `__nv_roundf`, which ROCm
+        # Triton dropped and XPU cannot link; use the backend-agnostic libdevice.
         x_q = libdevice.round(x_q).to(tl.int8)
     else:
         x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
@@ -79,7 +80,7 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
         N=N,
         CAL_SUM=cal_sum,
         BLOCK=BLOCK,
-        IS_HIP=_is_hip,
+        GENERIC_LIBDEVICE=_is_hip or _is_xpu,
         num_warps=num_warps,
         num_stages=1,
     )

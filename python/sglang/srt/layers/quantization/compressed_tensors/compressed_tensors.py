@@ -61,6 +61,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    XPUCompressedTensorsW8A8Int8,
     XPUCompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -891,6 +892,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
+                if _is_xpu:
+                    return XPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=False,
+                        input_symmetric=input_quant.symmetric,
+                    )
                 if not _is_npu:
                     return CompressedTensorsW8A8Int8(
                         strategy=weight_quant.strategy,
@@ -1138,7 +1145,12 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Note: NPU devices do not support min_capability function
         if _is_xpu:
             if not isinstance(
-                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
+                scheme,
+                (
+                    CompressedTensorsW8A8Fp8,
+                    XPUCompressedTensorsW8A8Int8,
+                    XPUCompressedTensorsWNA16,
+                ),
             ):
                 raise RuntimeError(
                     f"{scheme.__class__.__name__} is not supported on XPU "
