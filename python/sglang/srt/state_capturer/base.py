@@ -128,28 +128,42 @@ class BaseTopkCapturer:
         device: str,
         name: str,
         device_topk_size: Optional[int] = None,
-        allocate_host_cache: bool = True,
+        allocate_caches: bool = True,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
         are dropped before writing to host_cache via [:topk_size] truncation.
-        Without a host cache, forwards copy nothing back; callers must check
-        has_host_cache before get_topk.
+        Without caches, forwards copy nothing back, callers must check
+        has_host_cache before get_topk, and the subclass must not call
+        capture().
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
+        self.device_topk_size = (
+            device_topk_size if device_topk_size is not None else topk_size
+        )
 
         self.host_cache = (
-            BaseHostCache(num_tokens, num_layers, topk_size, name=name, device=device)
-            if allocate_host_cache
+            BaseHostCache(
+                num_tokens=num_tokens,
+                num_layers=num_layers,
+                topk_size=topk_size,
+                name=name,
+                device=device,
+            )
+            if allocate_caches
             else None
         )
-        self.device_cache = BaseDeviceCache(
-            max_batch_size,
-            num_layers,
-            device_topk_size if device_topk_size is not None else topk_size,
-            device,
-            name=name,
+        self.device_cache = (
+            BaseDeviceCache(
+                max_batch_size=max_batch_size,
+                num_layers=num_layers,
+                topk_size=self.device_topk_size,
+                device=device,
+                name=name,
+            )
+            if allocate_caches
+            else None
         )
 
     @property
