@@ -224,13 +224,6 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:dsv3_fused_a_gemm",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
         capabilities=CUDA_ONLY,
