@@ -84,7 +84,7 @@ def test_listener_drains_on_sigterm_and_stops_schedulers_once(restore_sigterm):
 
 
 def test_force_shutdown_env_forces_the_drain(restore_sigterm, monkeypatch):
-    monkeypatch.setenv("SGL_FORCE_SHUTDOWN", "1")
+    monkeypatch.setenv("SGLANG_FORCE_SHUTDOWN", "1")
     fake = _FakeServer()
     RustServer(fake, http_port=0).install_sigterm_drain()
     os.kill(os.getpid(), signal.SIGTERM)
