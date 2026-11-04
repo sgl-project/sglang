@@ -21,9 +21,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _view(deterministic: bool, strategy: str = "auto", disable_radix: bool = False):
-    hf_config = SimpleNamespace(
-        architectures=["Qwen3_5ForCausalLM"], layer_types=[]
-    )
+    hf_config = SimpleNamespace(architectures=["Qwen3_5ForCausalLM"], layer_types=[])
     return SimpleNamespace(
         enable_deterministic_inference=deterministic,
         mamba_radix_cache_strategy=strategy,

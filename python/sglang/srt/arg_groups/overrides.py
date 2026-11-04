@@ -465,7 +465,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         return {}
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
-    if view.enable_deterministic_inference and mamba_extra_buffer_of(view):
+    if (
+        view.enable_deterministic_inference
+        and not view.disable_radix_cache
+        and view.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
+    ):
         # Reusing a donated Mamba checkpoint makes the output depend on the
         # request that produced it: the restored recurrent state came from a
         # different prefill batch shape, and its FP32 internal state was
