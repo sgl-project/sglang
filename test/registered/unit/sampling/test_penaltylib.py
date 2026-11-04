@@ -22,6 +22,9 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -29,11 +32,14 @@ DEVICE = "cpu"
 
 
 # Helpers: mock Req and ScheduleBatch
-def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
+def _make_req(
+    freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2, repetition=1.0
+):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.sampling_params.frequency_penalty = freq
     req.sampling_params.presence_penalty = presence
+    req.sampling_params.repetition_penalty = repetition
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.eos_token_ids = None
@@ -446,6 +452,50 @@ class TestBatchedPenalizerBase(CustomTestCase):
 
 
 # Orchestrator with multiple penalizer types
+class TestCombinedPenaltyOrder(CustomTestCase):
+    def test_additive_before_repetition_for_any_penalizer_order(self):
+        # Both dictionary orders can result from the constructor's set of classes.
+        for repetition_first in (True, False):
+            for repetition in (0.5, 2.0):
+                with self.subTest(
+                    repetition_first=repetition_first, repetition=repetition
+                ):
+                    batch = _make_batch(
+                        [_make_req(freq=1.0, presence=0.5, repetition=repetition)]
+                    )
+                    types = [
+                        BatchedFrequencyPenalizer,
+                        BatchedPresencePenalizer,
+                        BatchedRepetitionPenalizer,
+                    ]
+                    if repetition_first:
+                        types.reverse()
+                    orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, set(types))
+                    orch.penalizers = {kind: orch.penalizers[kind] for kind in types}
+                    # Token 5 appears twice and token 6 once; token 7 is unseen.
+                    for token in (5, 6, 5):
+                        orch.cumulate_output_tokens(torch.tensor([token]))
+                    logits = torch.zeros(1, VOCAB_SIZE)
+                    logits[0, 5:8] = torch.tensor([4.0, 0.5, 0.6])
+                    expected = logits.clone()
+                    # Independent scalar reference, matching overlap sampling:
+                    # subtract frequency/count and presence, then scale by sign.
+                    for token, count in ((5, 2), (6, 1)):
+                        value = logits[0, token].item() - count - 0.5
+                        expected[0, token] = (
+                            value * repetition if value < 0 else value / repetition
+                        )
+                    regular = logits.clone()
+                    orch.apply(regular)
+                    torch.testing.assert_close(regular, expected)
+                    repeated = logits.repeat_interleave(3, dim=0)
+                    orch.apply(repeated, repeat=3)
+                    torch.testing.assert_close(
+                        repeated, expected.repeat_interleave(3, dim=0)
+                    )
+                    self.assertEqual(regular.argmax().item(), expected.argmax().item())
+
+
 class TestOrchestratorMultiplePenalizers(CustomTestCase):
     def test_all_three_penalizers(self):
         """Test orchestrator managing frequency, presence, and min_new_tokens together."""
