@@ -237,7 +237,7 @@ impl TokenizerRegistry {
         let affixes = self.prompt_affixes.as_ref()?;
         let tokenizer = self.get(model_id)?;
         // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
-        let ids = if self.stats.backend() == stats::EncodeBackend::Tiktoken {
+        let ids = if self.stats.backend().is_tiktoken() {
             kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
         } else {
             adapter::encode(&tokenizer, text)
@@ -250,6 +250,13 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {
         self.formatters.contains_key(model_id)
+    }
+
+    /// Whether `model_id` is MiniMax-M3.1 (see [`ChatFormatter::is_minimax_m31`]).
+    pub fn is_minimax_m31(&self, model_id: &str) -> bool {
+        self.formatters
+            .get(model_id)
+            .is_some_and(|e| e.formatter.is_minimax_m31())
     }
 
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
@@ -323,6 +330,7 @@ mod tests {
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {
+                aliases: Vec::new(),
                 id: "tiny".into(),
                 tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 disable_input_ids_forwarding: false,
