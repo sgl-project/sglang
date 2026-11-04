@@ -546,7 +546,7 @@ DFlash V2 on one Google Cloud TPU v7 host (2x2x1: 4 chips, 8 TensorCores, `--tp-
 
 - **Container image.** `<public sglang-torchtpu image: TBD>`.
 - **Host.** 960 GiB of RAM. The HiCache host tier is 2.0x the device KV pool per rank through concurrency 10, and 56 GB per rank from concurrency 16 (`--hicache-size 56`, 448 GB across the eight ranks).
-- **Acceptance.** SemiAnalysis measured these points with a synthetic speculative-decoding acceptance length of 4.05 (InferenceX golden AL via `SGLANG_SIMULATE_ACC_LEN`), which is not part of these commands. Real speed depends on your workload's acceptance.
+- **Acceptance.** SemiAnalysis measured these points with a synthetic speculative-decoding acceptance length of 4.05 (InferenceX golden AL via `SGLANG_SIMULATE_ACC_LEN`), which is not part of these commands. Where a command sets `SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY=MIN_BS:4:3.06`, steps with at least `MIN_BS` decoding requests verify only the first 4 tokens of the 8-token draft block, and the measurement gave those steps the golden acceptance length for 3 draft tokens, 3.06 (the rule's third field). The engine reads that field only when `SGLANG_SIMULATE_ACC_LEN` is set. Real speed depends on your workload's acceptance.
 - **Settings.** The commands are the submission's server settings, from [`agentx.py`](https://github.com/sgl-project/sglang-torchtpu/blob/haolin/ms-v11/benchmark/tpu/recipe/configs/muse_spark/agentx.py) in SGLang-TorchTPU, without its logging, diagnostics and telemetry settings and without values equal to the engine defaults.
 
 {/* TPU v7 commands: begin */}
