@@ -934,9 +934,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         previous registration's verdict still stands. Returns the rejection
         reason, if any.
         """
-        mismatch = self._kv_layout_mismatch(decode_kv_args)
+        kv_layout_mismatch = self._kv_layout_mismatch(decode_kv_args)
         fully_checked, state_mismatch = self._validate_peer_state_layout(decode_kv_args)
-        mismatch = mismatch or state_mismatch
+        mismatch = kv_layout_mismatch or state_mismatch
         self.check_peer_aux_buffer_count(
             mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
         )

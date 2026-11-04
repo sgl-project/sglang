@@ -431,20 +431,24 @@ class TestDisaggregationWire(unittest.TestCase):
         """
         flashmla, trtllm = 656 * 64, 576 * 64
         cases = [
-            # (prefill lens, start layer, decode lens, mla, prefill/decode TP, rejected)
-            ([flashmla] * 4, 0, [trtllm] * 4, True, (1, 1), True),
-            ([trtllm] * 2, 2, [flashmla] * 2 + [trtllm] * 2, True, (1, 1), False),
-            ([trtllm] * 2, 2, [trtllm] * 2 + [flashmla] * 2, True, (1, 1), True),
+            # (prefill lens, start layer, decode lens, mla, prefill/decode TP,
+            #  KV layer ids, rejected)
+            ([flashmla] * 4, 0, [trtllm] * 4, True, (1, 1), [], True),
+            ([trtllm] * 2, 2, [flashmla] * 2 + [trtllm] * 2, True, (1, 1), [], False),
+            ([trtllm] * 2, 2, [trtllm] * 2 + [flashmla] * 2, True, (1, 1), [], True),
             # TP-sliced MHA reslices heads, so its item length differs by design.
-            ([4096] * 4, 0, [2048] * 4, False, (2, 4), False),
+            # Pools that publish KV layer ids (K then V) would otherwise be
+            # compared entry by entry, so only the TP guard keeps this peer.
+            ([4096] * 4, 0, [2048] * 4, False, (2, 4), [0, 1, 0, 1], False),
         ]
-        for src_lens, start, dst_lens, mla, (src_tp, dst_tp), rejected in cases:
+        for src_lens, start, dst_lens, mla, tp, layer_ids, rejected in cases:
+            src_tp, dst_tp = tp
             with self.subTest(src_lens=src_lens, start=start, dst_lens=dst_lens):
                 manager = object.__new__(MooncakeKVManager)
                 manager.kv_args = SimpleNamespace(
                     kv_data_ptrs=[0x1000 + i for i in range(len(src_lens))],
                     kv_item_lens=src_lens,
-                    kv_layer_ids=[],
+                    kv_layer_ids=layer_ids,
                     page_size=64,
                     num_draft_entries=0,
                     prefill_start_layer=start,
@@ -466,7 +470,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     mooncake_session_id="decode",
                     dst_kv_ptrs=[0x2000 + i for i in range(len(dst_lens))],
                     dst_kv_item_lens=dst_lens,
-                    dst_kv_layer_ids=[],
+                    dst_kv_layer_ids=layer_ids,
                     dst_attn_tp_size=dst_tp,
                     requires_dcp_relayout=False,
                     dst_aux_ptrs=[],
