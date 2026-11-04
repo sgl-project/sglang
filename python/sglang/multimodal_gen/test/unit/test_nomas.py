@@ -582,10 +582,10 @@ def test_text_mask_and_skip_layer_contract():
 
 def test_segment_text_dedup_includes_continuations_and_copies_conditions():
     from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
-    from sglang.multimodal_gen.runtime.pipelines.nomas_pipeline import (
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
         NomasTextEncodingStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
     stage = object.__new__(NomasTextEncodingStage)
     args = SimpleNamespace(pipeline_config=NomasPipelineConfig())

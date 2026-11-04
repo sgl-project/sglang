@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch, sentinel
 
 import torch
 
+from sglang.srt.arg_groups.choices import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
@@ -21,7 +22,6 @@ from sglang.srt.layers.attention.linear.kernels import gdn_xpu
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_xpu import XpuGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
-from sglang.srt.server_args import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 

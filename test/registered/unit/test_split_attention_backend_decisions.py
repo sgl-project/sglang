@@ -31,7 +31,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+)
 
 
 class TestSplitBackendsReachTheDecisions(CustomTestCase):
