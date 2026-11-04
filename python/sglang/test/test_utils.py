@@ -40,7 +40,6 @@ from sglang.lang.global_config import global_config
 from sglang.srt.configs.device_config import SUPPORTED_DEVICES
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    cpu_has_amx_support,
     get_bool_env_var,
     get_device,
     is_blackwell,
@@ -752,7 +751,7 @@ def popen_launch_server(
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
-    `device="auto"` appends a detected `--device`; other values are ignored.
+    device="auto" appends a detected --device; other values are ignored.
     `num_replicas` applies to mixed PD mode.
     """
     other_args = other_args or []
@@ -2676,20 +2675,6 @@ def write_results_to_json(model, metrics, mode="a"):
 
     with open("results.json", "w") as f:
         json.dump(existing_results, f, indent=2)
-
-
-def requires_intel_amx():
-    # Evaluated at decoration time, so keep this a factory rather than a
-    # module-level constant: every test_utils importer would otherwise probe
-    # the device on import.
-    if is_in_ci():
-        # Only the Intel CPU lanes pick these suites up, and AMX hardware plus
-        # kernels are a precondition there: losing either must be red, not skipped.
-        return lambda test_class: test_class
-    return unittest.skipUnless(
-        auto_config_device() == "cpu" and cpu_has_amx_support(),
-        "Requires a CPU run with AMX kernels.",
-    )
 
 
 def intel_amx_benchmark(extra_args=None, min_throughput=None):

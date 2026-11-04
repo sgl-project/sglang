@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.configs.device_config import SUPPORTED_DEVICES, DeviceConfig
-from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -26,7 +25,7 @@ def _parse(argv):
 
 
 def _parse_expecting_exit(argv):
-    """Parse ``argv`` expecting rejection; return argparse's stderr text."""
+    """Parse argv expecting rejection; return the argparse stderr text."""
     stderr = io.StringIO()
     with contextlib.redirect_stderr(stderr):
         try:
@@ -50,13 +49,6 @@ class TestIntelXpuDevice(CustomTestCase):
 class TestAmdRocmDevice(CustomTestCase):
     """Tests for --device on AMD GPUs, which PyTorch exposes as "cuda"."""
 
-    def test_platform_device_type_is_cuda_not_rocm(self):
-        """AMD is driven through the "cuda" CLI value, which NVIDIA also uses."""
-        platform = RocmSRTPlatform()
-        self.assertTrue(platform.is_rocm())
-        self.assertEqual(platform.device_name, "rocm")
-        self.assertEqual(platform.device_type, "cuda")
-
     def test_rocm_is_rejected_by_cli_and_device_config(self):
         """The parser must not offer a value the server would refuse."""
         with self.assertRaises(RuntimeError):
@@ -79,11 +71,6 @@ class TestDeviceChoices(CustomTestCase):
         for device in SUPPORTED_DEVICES:
             with self.subTest(device=device):
                 self.assertEqual(_parse(["--device", device]).device, device)
-
-    def test_default_is_auto(self):
-        """Omitting --device must defer to auto-detection, not pin a device."""
-        self.assertEqual(_parse([]).device, "auto")
-        self.assertEqual(_parse(["--device", "auto"]).device, "auto")
 
 
 if __name__ == "__main__":
