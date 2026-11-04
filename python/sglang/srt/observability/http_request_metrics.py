@@ -24,21 +24,22 @@ class RefCountedGauge:
 class _HttpRequestMetrics:
     def __init__(self):
         from prometheus_client import Counter, Gauge
+        from sglang.srt.observability.metrics_collector import format_metric_name
 
         self.requests_total = Counter(
-            name="sglang:http_requests_total",
+            name=format_metric_name("sglang:http_requests_total"),
             documentation="Total number of HTTP requests by endpoint and method",
             labelnames=["endpoint", "method"],
         )
 
         self.responses_total = Counter(
-            name="sglang:http_responses_total",
+            name=format_metric_name("sglang:http_responses_total"),
             documentation="Total number of HTTP responses by endpoint and status code",
             labelnames=["endpoint", "status_code", "method"],
         )
 
         self.requests_active = Gauge(
-            name="sglang:http_requests_active",
+            name=format_metric_name("sglang:http_requests_active"),
             documentation="Number of currently active HTTP requests",
             labelnames=["endpoint", "method"],
             multiprocess_mode="livesum",
@@ -46,7 +47,7 @@ class _HttpRequestMetrics:
 
         self.routing_keys_active = RefCountedGauge(
             Gauge(
-                name="sglang:routing_keys_active",
+                name=format_metric_name("sglang:routing_keys_active"),
                 documentation="Number of unique routing keys with active requests",
                 multiprocess_mode="livesum",
             )
