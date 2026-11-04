@@ -1641,6 +1641,29 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def get_spec_kv_layout() -> Optional[dict]:
+    """The speculative settings that shape the draft KV a prefill injects.
+
+    DSpark and DFlash write the draft's context KV during prefill from target
+    hidden states. A decode cannot rebuild those bytes from the transferred
+    metadata, so both PD roles must agree on these settings before any
+    destination buffer is registered. None for every other algorithm.
+    """
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not algorithm.is_dflash_family():
+        return None
+    return {
+        "algorithm": str(spec.speculative_algorithm).upper(),
+        "num_draft_tokens": spec.speculative_num_draft_tokens,
+        "num_steps": spec.speculative_num_steps,
+        "dspark_block_size": spec.speculative_dspark_block_size,
+        "dflash_block_size": spec.speculative_dflash_block_size,
+    }
+
+
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
