@@ -109,9 +109,11 @@ def acquire_rows(
     if state is None:
         return rows
     try:
-        state.acquire(
-            table, reqs, rows, fresh_rows, reset_request_parts=reset_request_parts
-        )
+        if reset_request_parts:
+            # Preserve the default acquire contract of backend state overrides.
+            state.acquire(table, reqs, rows, fresh_rows)
+        else:
+            state.acquire(table, reqs, rows, fresh_rows, reset_request_parts=False)
     except StateSlotsExhausted:
         for req, fresh in zip(reqs, fresh_rows):
             if fresh:
