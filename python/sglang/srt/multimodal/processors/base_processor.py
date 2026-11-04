@@ -25,17 +25,13 @@ from PIL import Image
 from transformers import BaseImageProcessor
 
 from sglang.srt import platforms
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -268,6 +264,9 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    # Placeholder tokens that the loader matches per modality; a processor without
+    # them reads media its own way, so callers cannot tell which media it reads.
+    mm_tokens: Optional[MultimodalSpecialTokens] = None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs

@@ -655,6 +655,16 @@ field defaults to the conservative answer.
 
 SGLang custom ops (e.g. the <code>inplace_all_reduce</code> collective) register their implementation under the <code>PrivateUse1</code> dispatch key on an out-of-tree platform, the key torch reserves for out-of-tree backends.
 
+Register a linear-attention backend with
+`register_oot_linear_attention_backend(backend_class_name, factory, platform_key)` from
+`sglang.srt.layers.attention.attention_registry`. The factory receives the model
+runner and constructs the backend; the default backend is not constructed first.
+Use the fully qualified backend class name, as in `LinearAttnModelSpec`.
+In-tree platforms and unregistered classes keep their existing backend.
+Subclass `GDNAttnBackend` or `KDAAttnBackend` and override
+`_create_kernel_dispatcher()` to customize kernels while reusing cache and
+forward-metadata handling. Your backend owns validation of its supported options.
+
 #### Lifecycle Hooks (from SRTPlatform)
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

@@ -215,6 +215,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
             layer.register_parameter("w2_weight_zero_point", w2_qzeros)
             set_weight_attrs(w2_qzeros, extra_weight_attrs)
+            set_weight_attrs(w2_qzeros, {"load_full_w2": load_full_w2})
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(

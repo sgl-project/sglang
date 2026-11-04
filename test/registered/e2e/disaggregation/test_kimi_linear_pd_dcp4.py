@@ -16,7 +16,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=700, stage="nightly", runner_config="8-gpu-b200")
+register_cuda_ci(est_time=700, stage="weekly", runner_config="8-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 PHYSICAL_PAGE_SIZE = 64

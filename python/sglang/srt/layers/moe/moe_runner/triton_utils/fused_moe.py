@@ -15,6 +15,9 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.activation.silu_and_mul_block_quant import (
+    silu_and_mul_block_quant_two_group,
+)
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
     invoke_fused_moe_kernel,
@@ -638,6 +641,7 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (not (hooks and hooks.after_down is not None))
     )
 
     if fuse_swiglu_interleaved:
@@ -709,11 +713,33 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
+    use_native_fused_fp8_tail = (
+        not is_batch_invariant_mode_enabled()
+        and not fuse_swiglu_interleaved
+        and activation == "silu"
+        and is_gated
+        and gemm1_alpha is None
+        and _is_cuda
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and use_fp8_w8a8
+        and block_shape is not None
+        and len(block_shape) == 2
+        and block_shape[1] == 128
+        and a2_scale is None
+        and swiglu_limit is None
+        and hooks is None
+        and 128 < N // 2 < 256
+        and (N // 2) % 16 == 0
+    )
     if not fuse_swiglu_interleaved:
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        intermediate_cache2 = (
+            None
+            if use_native_fused_fp8_tail
+            else torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         )
 
     row_filter = _activation_row_filter(
@@ -756,6 +782,18 @@ def _fused_moe_kernel_sequence(
                     gemm1_alpha,
                     gemm1_limit,
                 )
+        elif use_native_fused_fp8_tail:
+            intermediate_cache2, a2_scale = silu_and_mul_block_quant_two_group(
+                intermediate_cache1.view(-1, N),
+                block_shape[1],
+                expert_ids=(
+                    (expert_ids if down_moe_use_tma else topk_ids.view(-1))
+                    if filter_expert
+                    else None
+                ),
+                expert_step=config["BLOCK_SIZE_M"] if down_moe_use_tma else 1,
+                routed_limit=gemm1_limit,
+            )
         elif gemm1_limit is not None:
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
@@ -988,12 +1026,12 @@ def moe_combine_topk(
 
     if no_combine:
         pass
+    elif use_fused_moe_sum_all_reduce:
+        if routed_scaling_factor != 1.0 and not _use_aiter:
+            assert out_slice is not None
+            out_slice.mul_(routed_scaling_factor)
     elif _is_cuda or _is_musa:
-        if use_fused_moe_sum_all_reduce:
-            if routed_scaling_factor != 1.0:
-                assert out_slice is not None
-                out_slice.mul_(routed_scaling_factor)
-        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
             pass  # we wrote directly into out_hidden_states
         elif topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
