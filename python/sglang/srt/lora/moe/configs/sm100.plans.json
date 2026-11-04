@@ -128,7 +128,7 @@
               "BLOCK_SIZE_N": 256,
               "GROUP_SIZE_M": 1,
               "num_stages": 2,
-              "num_warps": 8
+              "num_warps": 4
             },
             "gate_up_a": {
               "BLOCK_SIZE_K": 128,
@@ -469,6 +469,54 @@
       },
       "tiles": [
         {
+          "max_rank": 32,
+          "sites": {
+            "b_activation": {
+              "BLOCK_SIZE_K": 16,
+              "BLOCK_SIZE_W": 64,
+              "GROUP_SIZE_M": 1,
+              "num_stages": 2,
+              "num_warps": 4
+            },
+            "down_a": {
+              "BLOCK_SIZE_K": 128,
+              "BLOCK_SIZE_N": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 4,
+              "num_warps": 4
+            },
+            "down_b": {
+              "BLOCK_SIZE_K": 32,
+              "BLOCK_SIZE_M": 16,
+              "BLOCK_SIZE_N": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 2,
+              "num_warps": 4
+            },
+            "gate_up_a": {
+              "BLOCK_SIZE_K": 256,
+              "BLOCK_SIZE_N": 16,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 4,
+              "num_warps": 4
+            },
+            "gate_up_b": {
+              "BLOCK_SIZE_K": 32,
+              "BLOCK_SIZE_M": 16,
+              "BLOCK_SIZE_N": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 2,
+              "num_warps": 4
+            },
+            "routing_block_size": 16,
+            "shared_one_pass": {
+              "BLOCK_SIZE_H": 128,
+              "num_stages": 3,
+              "num_warps": 4
+            }
+          }
+        },
+        {
           "sites": {
             "b_activation": {
               "BLOCK_SIZE_K": 64,
@@ -550,7 +598,7 @@
               "num_warps": 4
             },
             "down_a": {
-              "BLOCK_SIZE_K": 128,
+              "BLOCK_SIZE_K": 256,
               "BLOCK_SIZE_N": 64,
               "GROUP_SIZE_M": 8,
               "num_stages": 4,
@@ -605,6 +653,54 @@
         "route_builder": "parallel_shared_outer"
       },
       "tiles": [
+        {
+          "max_rank": 32,
+          "sites": {
+            "b_activation": {
+              "BLOCK_SIZE_K": 64,
+              "BLOCK_SIZE_W": 64,
+              "GROUP_SIZE_M": 1,
+              "num_stages": 2,
+              "num_warps": 4
+            },
+            "down_a": {
+              "BLOCK_SIZE_K": 128,
+              "BLOCK_SIZE_N": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 4,
+              "num_warps": 4
+            },
+            "down_b": {
+              "BLOCK_SIZE_K": 32,
+              "BLOCK_SIZE_M": 16,
+              "BLOCK_SIZE_N": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 2,
+              "num_warps": 4
+            },
+            "gate_up_a": {
+              "BLOCK_SIZE_K": 128,
+              "BLOCK_SIZE_N": 16,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 4,
+              "num_warps": 4
+            },
+            "gate_up_b": {
+              "BLOCK_SIZE_K": 32,
+              "BLOCK_SIZE_M": 16,
+              "BLOCK_SIZE_N": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 2,
+              "num_warps": 4
+            },
+            "routing_block_size": 16,
+            "shared_one_pass": {
+              "BLOCK_SIZE_H": 128,
+              "num_stages": 3,
+              "num_warps": 4
+            }
+          }
+        },
         {
           "sites": {
             "b_activation": {
@@ -667,6 +763,60 @@
         "route_builder": "parallel_shared_outer"
       },
       "tiles": [
+        {
+          "max_rank": 32,
+          "sites": {
+            "b_activation": {
+              "BLOCK_SIZE_K": 16,
+              "BLOCK_SIZE_W": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 4,
+              "num_warps": 4
+            },
+            "down_a": {
+              "BLOCK_SIZE_K": 64,
+              "BLOCK_SIZE_N": 16,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 3,
+              "num_warps": 4
+            },
+            "down_b": {
+              "BLOCK_SIZE_K": 64,
+              "BLOCK_SIZE_N": 256,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 2,
+              "num_warps": 2
+            },
+            "gate_up_a": {
+              "BLOCK_SIZE_K": 256,
+              "BLOCK_SIZE_N": 16,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 4,
+              "num_warps": 4
+            },
+            "gate_up_b": {
+              "BLOCK_SIZE_K": 32,
+              "BLOCK_SIZE_M": 32,
+              "BLOCK_SIZE_N": 64,
+              "GROUP_SIZE_M": 8,
+              "num_stages": 2,
+              "num_warps": 4
+            },
+            "routing_block_size": 32,
+            "shared_token_delta": {
+              "reduce": {
+                "BLOCK_SIZE_T": 32,
+                "num_stages": 2,
+                "num_warps": 4
+              },
+              "tail": {
+                "BLOCK_SIZE_H": 1024,
+                "num_stages": 2,
+                "num_warps": 8
+              }
+            }
+          }
+        },
         {
           "sites": {
             "b_activation": {
