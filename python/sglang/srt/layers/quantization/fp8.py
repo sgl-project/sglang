@@ -61,7 +61,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
-    deepgemm_mxfp8_input_flashinfer_min_rows,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     deepgemm_w8a8_mxfp8_linear_with_fallback,
     dense_mxscale_wanted,
@@ -81,7 +80,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    batch_invariant_or_deterministic,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -497,16 +499,6 @@ class Fp8Config(QuantizationConfig):
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
             )
-
-
-def _batch_invariant_or_deterministic() -> bool:
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-    from sglang.srt.runtime_context import get_exec
-
-    return (
-        is_batch_invariant_mode_enabled()
-        or get_exec().deterministic.enable_deterministic_inference
-    )
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -1066,9 +1058,6 @@ class Fp8LinearMethod(LinearMethodBase):
             "weight_scale_inv_deepgemm",
             pack_mxfp8_weight_scale_for_deepgemm(scale_u8, n, k),
         )
-        layer.deepgemm_mxfp8_input_flashinfer_min_rows = (
-            deepgemm_mxfp8_input_flashinfer_min_rows(n, k)
-        )
         return True
 
     def _process_mxfp8_linear_weight_scale(
@@ -1448,7 +1437,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_tensor = x[0] if isinstance(x, tuple) else x
                 num_tokens = input_tensor.numel() // input_tensor.shape[-1]
                 if num_tokens >= self.mxfp8_prefill_autotune_min_tokens:
-                    extra_kwargs["pin_tactic"] = _batch_invariant_or_deterministic()
+                    extra_kwargs["pin_tactic"] = batch_invariant_or_deterministic()
             if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():

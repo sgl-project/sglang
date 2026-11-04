@@ -1,8 +1,11 @@
 """Explicit input layout for a linear consuming prequantized MXFP8 activations."""
 
-from typing import NamedTuple, Optional, Tuple, Union
+from typing import NamedTuple, Tuple, Union
 
 import torch
+
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.runtime_context import get_exec
 
 
 class Mxfp8SwizzledInput(NamedTuple):
@@ -53,14 +56,17 @@ def accepts_mxfp8_deepgemm_input(linear) -> bool:
     )
 
 
-def deepgemm_pair_takes_flashinfer(min_rows: Optional[int], rows: int) -> bool:
-    """Whether a DeepGEMM producer of ``rows`` writes FlashInfer's 128x4 scales for a
-    linear whose ``deepgemm_mxfp8_input_flashinfer_min_rows`` is ``min_rows``."""
-    if min_rows is None or rows < min_rows:
-        return False
-    from sglang.srt.layers.quantization.fp8 import _batch_invariant_or_deterministic
+def batch_invariant_or_deterministic() -> bool:
+    return (
+        is_batch_invariant_mode_enabled()
+        or get_exec().deterministic.enable_deterministic_inference
+    )
 
-    return not _batch_invariant_or_deterministic()
+
+def deepgemm_pair_takes_flashinfer() -> bool:
+    """Whether a DeepGEMM producer feeding a FlashInfer linear writes FlashInfer's
+    128x4 scales; batch-invariant and deterministic modes keep the DeepGEMM GEMM."""
+    return not batch_invariant_or_deterministic()
 
 
 def deepgemm_mxfp8_linear_input(

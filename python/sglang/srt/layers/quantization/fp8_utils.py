@@ -1030,18 +1030,6 @@ def pack_mxfp8_weight_scale_for_deepgemm(
     )
 
 
-# (SM, N, K) -> rows from which a DeepGEMM producer writes FlashInfer's 128x4
-# scale layout and the linear runs on FlashInfer. Shapes not listed stay on DeepGEMM.
-_DEEPGEMM_MXFP8_INPUT_FLASHINFER_MIN_ROWS = {
-    (107, 5120, 8192): 32,  # DSv4 wo_b
-    (107, 1792, 5120): 32,  # DSv4 wqkv_a
-}
-
-
-def deepgemm_mxfp8_input_flashinfer_min_rows(n: int, k: int) -> Optional[int]:
-    return _DEEPGEMM_MXFP8_INPUT_FLASHINFER_MIN_ROWS.get((get_device_sm(), n, k))
-
-
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():

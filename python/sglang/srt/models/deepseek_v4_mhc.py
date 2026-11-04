@@ -104,7 +104,7 @@ def empty_deepgemm_mxfp8_pair(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Empty fp8 rows and UE8M0 scales for a DeepGEMM producer to fill."""
     data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
-    return data, empty_deepgemm_mxfp8_scales(rows, cols, device, flashinfer)
+    return data, empty_deepgemm_mxfp8_scales(rows, cols, device, flashinfer=flashinfer)
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -265,7 +265,6 @@ class HcNextBoundary(NamedTuple):
     accepts_mxfp8_deepgemm: bool = False
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None
     extend: bool = False
-    mxfp8_deepgemm_flashinfer_min_rows: Optional[int] = None
 
 
 def is_local_extend(forward_batch: Optional[ForwardBatch]) -> bool:
@@ -305,7 +304,6 @@ def make_boundary(
     accepts_mxfp8_deepgemm: bool = False,
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None,
     extend: bool = False,
-    mxfp8_deepgemm_flashinfer_min_rows: Optional[int] = None,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -324,7 +322,6 @@ def make_boundary(
         accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
         mega_moe_input=mega_moe_input,
         extend=extend,
-        mxfp8_deepgemm_flashinfer_min_rows=mxfp8_deepgemm_flashinfer_min_rows,
     )
 
 
@@ -729,9 +726,7 @@ def _post_fusion(
             y_fp8, y_sf = empty_deepgemm_mxfp8_pair(
                 *y.shape,
                 y.device,
-                deepgemm_pair_takes_flashinfer(
-                    next.mxfp8_deepgemm_flashinfer_min_rows, y.shape[0]
-                ),
+                flashinfer=deepgemm_pair_takes_flashinfer(),
             )
         elif next.mega_moe_input is not None:
             moe_input = next.mega_moe_input(y)

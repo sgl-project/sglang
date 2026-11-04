@@ -11,12 +11,19 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from flashinfer import block_scale_interleave
 
-from sglang.srt.layers.quantization import fp8_utils
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization import fp8, fp8_utils, mxfp8_input
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    deepgemm_mxfp8_linear_input,
+    deepgemm_pair_takes_flashinfer,
+    zero_deepgemm_mxfp8_scale_rows,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -405,17 +412,6 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
     def test_deepgemm_producer_flashinfer_layout(self):
         if "flashinfer_cutedsl" not in _block32_backends():
             self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")
-        from flashinfer import block_scale_interleave
-
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-        from sglang.srt.layers.quantization import fp8 as fp8_module
-        from sglang.srt.layers.quantization.mxfp8_input import (
-            deepgemm_mxfp8_linear_input,
-            deepgemm_pair_takes_flashinfer,
-            zero_deepgemm_mxfp8_scale_rows,
-        )
 
         def as_flashinfer_4d(scale):
             # DeepGEMM-packed [rows, K / 128] int32 -> [ceil(rows / 128), K / 128, 32, 4]
@@ -430,9 +426,11 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
                 .contiguous()
             )
 
-        self.assertFalse(deepgemm_pair_takes_flashinfer(None, 4096))
-        self.assertFalse(deepgemm_pair_takes_flashinfer(257, 256))
-        self.assertTrue(deepgemm_pair_takes_flashinfer(256, 256))
+        self.assertTrue(deepgemm_pair_takes_flashinfer())
+        with mock.patch.object(
+            mxfp8_input, "batch_invariant_or_deterministic", return_value=True
+        ):
+            self.assertFalse(deepgemm_pair_takes_flashinfer())
 
         torch.manual_seed(7)
         with mock.patch.object(
@@ -470,9 +468,9 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
                     outs = {}
                     for name, inp in (("fi", swizzled), ("dg", (q, s))):
                         with mock.patch.object(
-                            fp8_module,
+                            fp8,
                             "deepgemm_w8a8_mxfp8_linear_with_fallback",
-                            wraps=fp8_module.deepgemm_w8a8_mxfp8_linear_with_fallback,
+                            wraps=fp8.deepgemm_w8a8_mxfp8_linear_with_fallback,
                         ) as dg:
                             outs[name] = layer.quant_method.apply(layer, inp)
                         self.assertEqual(dg.call_count, int(name == "dg"))
@@ -634,12 +632,14 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
                 rows=rows, invariant=invariant, deterministic=deterministic
             ):
                 with (
-                    mock.patch(
-                        "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                    mock.patch.object(
+                        mxfp8_input,
+                        "is_batch_invariant_mode_enabled",
                         return_value=invariant,
                     ),
-                    mock.patch(
-                        "sglang.srt.runtime_context.get_exec",
+                    mock.patch.object(
+                        mxfp8_input,
+                        "get_exec",
                         return_value=SimpleNamespace(
                             deterministic=SimpleNamespace(
                                 enable_deterministic_inference=deterministic

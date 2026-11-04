@@ -1612,11 +1612,6 @@ class MQALayer(MqaAttentionBase):
     def accepts_deepgemm_mxfp8_input(self) -> bool:
         return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
 
-    def deepgemm_mxfp8_flashinfer_min_rows(self) -> Optional[int]:
-        if not self.accepts_deepgemm_mxfp8_input():
-            return None
-        return getattr(self.wqkv_a, "deepgemm_mxfp8_input_flashinfer_min_rows", None)
-
     def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
         method = self.wq_b.quant_method
         backend = getattr(method, "mxfp8_dense_backend", None)
@@ -1650,7 +1645,7 @@ class MQALayer(MqaAttentionBase):
                     rows,
                     self.n_local_groups * self.o_lora_rank,
                     q.device,
-                    self._wo_b_takes_flashinfer(rows),
+                    flashinfer=deepgemm_pair_takes_flashinfer(),
                 )
                 bcg_deepseek_v4_mega_attention_with_mxfp8_output(
                     self, q, y, y_sf, attn_sink
@@ -1665,11 +1660,6 @@ class MQALayer(MqaAttentionBase):
 
     def _mega_mxfp8_output(self, rows: int) -> bool:
         return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
-
-    def _wo_b_takes_flashinfer(self, rows: int) -> bool:
-        return deepgemm_pair_takes_flashinfer(
-            getattr(self.wo_b, "deepgemm_mxfp8_input_flashinfer_min_rows", None), rows
-        )
 
     def _mega_core(
         self,
@@ -1700,7 +1690,7 @@ class MQALayer(MqaAttentionBase):
                 rows,
                 groups * self.o_lora_rank,
                 data.device,
-                self._wo_b_takes_flashinfer(rows),
+                flashinfer=deepgemm_pair_takes_flashinfer(),
             )
         if isinstance(out, tuple):
             y, y_sf = out
