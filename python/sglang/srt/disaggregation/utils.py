@@ -1641,24 +1641,22 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
-def get_spec_kv_layout() -> Optional[dict]:
-    """The speculative settings that shape the draft KV a prefill injects.
-
-    DSpark and DFlash write the draft's context KV during prefill from target
-    hidden states. A decode cannot rebuild those bytes from the transferred
-    metadata, so both PD roles must agree on these settings before any
-    destination buffer is registered. None for every other algorithm.
-    """
+def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
+    """Prefill-injected draft KV layout: {} when the algorithm injects none,
+    None when this rank has no draft KV entries, so peers skip the comparison."""
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec = get_spec()
     algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
     if not algorithm.is_dflash_family():
+        return {}
+    # State-only drafts (DSV4) keep legacy behavior: existing NPU decode-only
+    # DSpark deployments have no prefill draft pool.
+    if not kv_args.num_draft_entries:
         return None
     return {
-        "algorithm": str(spec.speculative_algorithm).upper(),
-        "num_draft_tokens": spec.speculative_num_draft_tokens,
-        "num_steps": spec.speculative_num_steps,
+        "algorithm": algorithm.name,
+        "num_draft_entries": kv_args.num_draft_entries,
         "dspark_block_size": spec.speculative_dspark_block_size,
         "dflash_block_size": spec.speculative_dflash_block_size,
     }

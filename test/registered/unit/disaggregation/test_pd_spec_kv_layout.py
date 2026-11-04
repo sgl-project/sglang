@@ -22,14 +22,25 @@ from sglang.test.test_utils import CustomTestCase, published_topology
 PAGE = 64
 DSPARK = {
     "algorithm": "DSPARK",
-    "num_draft_tokens": 4,
-    "num_steps": 3,
+    "num_draft_entries": 6,
     "dspark_block_size": 4,
     "dflash_block_size": None,
 }
 SENTINEL_QUERY = dict.fromkeys(
     ("prefill_dp_rank", "prefill_cp_rank", "target_tp_rank", "target_pp_rank"), "-1"
 )
+
+
+def layout(algorithm, *, num_draft_entries=6, num_steps=3, num_draft_tokens=4):
+    kv_args = SimpleNamespace(num_draft_entries=num_draft_entries)
+    with published_topology(
+        speculative_algorithm=algorithm,
+        speculative_num_steps=num_steps,
+        speculative_num_draft_tokens=num_draft_tokens,
+        speculative_dspark_block_size=4,
+        speculative_dflash_block_size=None,
+    ):
+        return get_spec_kv_layout(kv_args)
 
 
 def decode_manager(spec_kv_layout):
@@ -60,48 +71,62 @@ def prefill_info(spec_kv_layout):
     )
     payload = dataclasses.asdict(info)
     if spec_kv_layout is None:
-        # What an older bootstrap server, or one with no spec, returns.
         payload.pop("spec_kv_layout")
     response = MagicMock(status_code=200)
     response.json.return_value = payload
     return response
 
 
+def bootstrap_server():
+    with patch.object(CommonKVBootstrapServer, "run"):
+        return CommonKVBootstrapServer("127.0.0.1", 0)
+
+
+def register(server, row, **fields):
+    request = SimpleNamespace(json=AsyncMock(return_value={**row, **fields}))
+    return asyncio.run(server._handle_route_put(request))
+
+
+def route(server, *, opt_in=False):
+    query = dict(SENTINEL_QUERY)
+    if opt_in:
+        query["spec_kv_layout"] = "1"
+    response = asyncio.run(server._handle_route_get(SimpleNamespace(query=query)))
+    return response.status, json.loads(
+        response.text
+    ) if response.status == 200 else None
+
+
 class TestSpecKVLayout(CustomTestCase):
     def test_only_prefill_injected_draft_kv_publishes_a_layout(self):
-        for algorithm, expected in (
-            (None, None),
-            ("EAGLE", None),
-            ("NEXTN", None),
-            ("DSPARK", {**DSPARK, "num_draft_tokens": 5, "dspark_block_size": 5}),
-            (
-                "DFLASH",
-                {
-                    **DSPARK,
-                    "algorithm": "DFLASH",
-                    "dspark_block_size": None,
-                    "dflash_block_size": 8,
-                },
-            ),
-        ):
+        for algorithm in (None, "EAGLE", "NEXTN"):
             with self.subTest(algorithm=algorithm):
-                kwargs = dict(speculative_num_draft_tokens=4, speculative_num_steps=3)
-                if algorithm == "DSPARK":
-                    kwargs.update(
-                        speculative_num_draft_tokens=5, speculative_dspark_block_size=5
-                    )
-                if algorithm == "DFLASH":
-                    kwargs.update(speculative_dflash_block_size=8)
-                with published_topology(speculative_algorithm=algorithm, **kwargs):
-                    self.assertEqual(get_spec_kv_layout(), expected)
+                self.assertEqual(layout(algorithm), {})
+        self.assertEqual(layout("DSPARK"), DSPARK)
+        self.assertEqual(layout("DSPARK", num_steps=8, num_draft_tokens=16), DSPARK)
+        self.assertEqual(layout("DSPARK", num_draft_entries=0), None)
+        self.assertEqual(
+            layout("DFLASH"),
+            {
+                "algorithm": "DFLASH",
+                "num_draft_entries": 6,
+                "dspark_block_size": 4,
+                "dflash_block_size": None,
+            },
+        )
 
-    def test_decode_compares_layout_before_recording_the_prefill(self):
+    def test_decode_compares_only_known_layouts(self):
         cases = {
-            "no spec on either side": (None, None, None),
+            "ordinary PD or decode-only EAGLE": ({}, {}, None),
             "matched DSpark": (DSPARK, DSPARK, None),
-            "decode-only EAGLE": (None, None, None),
-            "DSpark decode, prefill without spec or older": (DSPARK, None, "mismatch"),
-            "DSpark prefill, decode without spec": (None, DSPARK, "mismatch"),
+            "legacy prefill": (DSPARK, None, None),
+            "DSpark decode, target-only prefill": (DSPARK, {}, "mismatch"),
+            "DSpark prefill, target-only decode": ({}, DSPARK, "mismatch"),
+            "different draft entries": (
+                DSPARK,
+                {**DSPARK, "num_draft_entries": 4},
+                "mismatch",
+            ),
             "different block size": (
                 DSPARK,
                 {**DSPARK, "dspark_block_size": 5},
@@ -114,7 +139,7 @@ class TestSpecKVLayout(CustomTestCase):
                 with patch(
                     "sglang.srt.disaggregation.common.conn.requests.get",
                     return_value=prefill_info(remote),
-                ):
+                ) as get:
                     if error:
                         with self.assertRaisesRegex(
                             RuntimeError, "Speculative KV layout mismatch"
@@ -125,12 +150,11 @@ class TestSpecKVLayout(CustomTestCase):
                         self.assertTrue(
                             manager.try_ensure_parallel_info("prefill:8998")
                         )
+                    self.assertIn("spec_kv_layout=1", get.call_args.args[0])
 
 
 class TestSpecKVLayoutBootstrap(CustomTestCase):
     def setUp(self):
-        with patch.object(CommonKVBootstrapServer, "run"):
-            self.server = CommonKVBootstrapServer("127.0.0.1", 0)
         self.row = dict(
             attn_tp_size=1,
             attn_tp_rank=0,
@@ -148,34 +172,39 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
             kv_cache_dtype="bf16",
         )
 
-    def register(self, **fields):
-        request = SimpleNamespace(json=AsyncMock(return_value={**self.row, **fields}))
-        return asyncio.run(self.server._handle_route_put(request))
+    def test_draftless_ranks_and_old_decodes_are_compatible(self):
+        for order in ((None, DSPARK), (DSPARK, None)):
+            with self.subTest(order=order):
+                server = bootstrap_server()
+                for pp_rank, spec_kv_layout in enumerate(order):
+                    status = register(
+                        server, self.row, pp_rank=pp_rank, spec_kv_layout=spec_kv_layout
+                    ).status
+                    self.assertEqual(status, 200)
+                status, payload = route(server)
+                self.assertEqual(status, 200)
+                self.assertNotIn("spec_kv_layout", payload)
+                _, payload = route(server, opt_in=True)
+                self.assertEqual(payload["spec_kv_layout"], DSPARK)
 
-    def route(self):
-        response = asyncio.run(
-            self.server._handle_route_get(SimpleNamespace(query=SENTINEL_QUERY))
-        )
-        return response.status, json.loads(response.text)
-
-    def test_ranks_must_agree_and_old_decodes_never_see_the_field(self):
-        self.assertEqual(self.register(spec_kv_layout=DSPARK).status, 200)
-        self.assertEqual(self.register(pp_rank=1).status, 400)
+    def test_known_layouts_must_agree_across_ranks(self):
+        server = bootstrap_server()
+        self.assertEqual(register(server, self.row, spec_kv_layout=DSPARK).status, 200)
+        incompatible = {**DSPARK, "num_draft_entries": 7}
         self.assertEqual(
-            self.register(pp_rank=1, spec_kv_layout={**DSPARK, "num_steps": 1}).status,
+            register(server, self.row, pp_rank=1, spec_kv_layout=incompatible).status,
             400,
         )
-        self.assertEqual(self.register(pp_rank=1, spec_kv_layout=DSPARK).status, 200)
-        status, payload = self.route()
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["spec_kv_layout"], DSPARK)
+        self.assertEqual(route(server)[0], 503)
 
-    def test_no_spec_prefill_omits_the_field(self):
-        self.assertEqual(self.register().status, 200)
-        self.assertEqual(self.register(pp_rank=1).status, 200)
-        status, payload = self.route()
-        self.assertEqual(status, 200)
-        self.assertNotIn("spec_kv_layout", payload)
+    def test_no_spec_prefill_publishes_an_empty_layout_only_on_opt_in(self):
+        server = bootstrap_server()
+        self.assertEqual(register(server, self.row, spec_kv_layout={}).status, 200)
+        self.assertEqual(
+            register(server, self.row, pp_rank=1, spec_kv_layout={}).status, 200
+        )
+        self.assertNotIn("spec_kv_layout", route(server)[1])
+        self.assertEqual(route(server, opt_in=True)[1]["spec_kv_layout"], {})
 
 
 if __name__ == "__main__":

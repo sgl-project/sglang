@@ -201,12 +201,17 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         let mut topo = (**current).clone();
         layout_mismatch =
             topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
-        spec_mismatch = topo.registered_count > 0 && topo.spec_kv_layout != body.spec_kv_layout;
+        spec_mismatch = topo.registered_count > 0
+            && topo.spec_kv_layout.is_some()
+            && body.spec_kv_layout.is_some()
+            && topo.spec_kv_layout != body.spec_kv_layout;
         if layout_mismatch || spec_mismatch {
             return topo;
         }
         topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
-        topo.spec_kv_layout = body.spec_kv_layout.clone();
+        if topo.spec_kv_layout.is_none() {
+            topo.spec_kv_layout = body.spec_kv_layout.clone();
+        }
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
         topo.attn_cp_size.get_or_insert(body.attn_cp_size);
         topo.dp_size.get_or_insert(dp_size);
@@ -311,7 +316,11 @@ async fn route_get(
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
             kv_layout: topo.kv_layout.clone(),
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
-            spec_kv_layout: topo.spec_kv_layout.clone(),
+            spec_kv_layout: if query.get("spec_kv_layout").is_some_and(|v| v == "1") {
+                topo.spec_kv_layout.clone()
+            } else {
+                None
+            },
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             stores_to_linker: topo.stores_to_linker.unwrap_or(false),
@@ -601,23 +610,30 @@ mod tests {
     }
 
     #[test]
-    fn spec_kv_layout_round_trip_and_rank_mismatch() {
+    fn spec_kv_layout_opt_in_and_rank_compatibility() {
         let (_rt, addr) = start_on_free_port();
-        let layout = serde_json::json!({"algorithm": "DSPARK", "dspark_block_size": 4});
+        let layout = serde_json::json!({
+            "algorithm": "DSPARK", "num_draft_entries": 6, "dspark_block_size": 4
+        });
         let body = put_route(serde_json::json!({"pp_size": 2, "spec_kv_layout": layout}));
         assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
 
-        // A rank without the field (no spec, or an older build) is rejected.
-        let incompatible = put_route(serde_json::json!({"pp_size": 2, "pp_rank": 1}));
+        let incompatible = put_route(serde_json::json!({
+            "pp_size": 2, "pp_rank": 1,
+            "spec_kv_layout": {"algorithm": "DSPARK", "num_draft_entries": 7},
+        }));
         assert_eq!(request(addr, "PUT", "/route", Some(&incompatible)).0, 400);
         assert_eq!(request(addr, "GET", SENTINEL, None).0, 503);
 
-        let body = put_route(serde_json::json!({
-            "pp_size": 2, "pp_rank": 1, "spec_kv_layout": layout,
-        }));
-        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        let draftless = put_route(serde_json::json!({"pp_size": 2, "pp_rank": 1}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&draftless)).0, 200);
         let (status, body) = request(addr, "GET", SENTINEL, None);
         assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(info.get("spec_kv_layout").is_none());
+
+        let query = format!("{SENTINEL}&spec_kv_layout=1");
+        let (_, body) = request(addr, "GET", &query, None);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["spec_kv_layout"], layout);
     }
