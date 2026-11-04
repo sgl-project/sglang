@@ -54,6 +54,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            # Decode rejects a prefill whose injected draft KV it cannot read.
+            "spec_kv_layout",
             # Decode pulls from every shard-group rank when this is set.
             "enable_kv_cache_sharding",
             # Self-registered HTTP API port used to derive the PD retract

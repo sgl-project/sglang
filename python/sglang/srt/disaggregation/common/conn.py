@@ -43,16 +43,13 @@ from sglang.srt.disaggregation.common.bootstrap import (
     DeferredBootstrap,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.disaggregation.peer_fingerprint import (
-    peer_fingerprint_mismatches,
-    same_model_identity,
-)
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    get_spec_kv_layout,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -135,7 +132,7 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
-    peer_fingerprint: Optional[dict] = None
+    spec_kv_layout: Optional[dict] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
@@ -311,7 +308,7 @@ class CommonKVManager(BaseKVManager):
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
-    peer_fingerprint: Optional[dict] = None
+    spec_kv_layout: Optional[dict] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
     # shard group. Each rank owns a subset of logical KV pages.
@@ -337,7 +334,7 @@ class CommonKVManager(BaseKVManager):
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
-        self.peer_fingerprint = args.peer_fingerprint
+        self.spec_kv_layout = get_spec_kv_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -1347,7 +1344,7 @@ class CommonKVManager(BaseKVManager):
             url = (
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
-                f"target_tp_rank={-1}&target_pp_rank={-1}&peer_fingerprint=1"
+                f"target_tp_rank={-1}&target_pp_rank={-1}&spec_kv_layout=1"
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -1402,23 +1399,6 @@ class CommonKVManager(BaseKVManager):
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
 
-        if self.peer_fingerprint is not None:
-            problems = peer_fingerprint_mismatches(
-                self.peer_fingerprint, info.peer_fingerprint
-            )
-            if problems:
-                raise RuntimeError(
-                    f"PD peer mismatch with prefill {bootstrap_addr}: "
-                    + "; ".join(problems)
-                    + ". Launch both roles with the same model, speculation "
-                    "and KV layout."
-                )
-            if info.peer_fingerprint is None:
-                logger.warning(
-                    f"Prefill {bootstrap_addr} publishes no peer fingerprint; "
-                    "its model and KV layout are not verified."
-                )
-
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1450,6 +1430,19 @@ class CommonKVManager(BaseKVManager):
                     "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
                     "servers (including prefill CP ranks for MLA)"
                 )
+
+        if (
+            info.spec_kv_layout is not None
+            and self.spec_kv_layout is not None
+            and info.spec_kv_layout != self.spec_kv_layout
+        ):
+            raise RuntimeError(
+                "Speculative draft KV layout mismatch: prefill server has "
+                f"spec_kv_layout={info.spec_kv_layout}, but decode server has "
+                f"spec_kv_layout={self.spec_kv_layout}. DSpark and DFLASH decode "
+                "read the draft KV their prefill writes, so both servers must use "
+                "the same --speculative-algorithm and draft model."
+            )
 
         # Every send path rejects head-sharded MXFP8 block scales across
         # attention TP sizes, so each request would fail at its first transfer.
@@ -1661,7 +1654,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
-            "peer_fingerprint": self.peer_fingerprint,
+            "spec_kv_layout": self.spec_kv_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
@@ -3081,17 +3074,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 )
 
 
-def _same_peer_identity(first: Optional[dict], other: Optional[dict]) -> bool:
-    # Prefill ranks differ in per-rank layout (PP stages); model and speculation must not.
-    if first is None or other is None:
-        return first is other
-    return (
-        same_model_identity(first["target"], other["target"])
-        and same_model_identity(first["draft"], other["draft"])
-        and first["speculation"] == other["speculation"]
-    )
-
-
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, host: str, port: int):
         self.host = host
@@ -3111,7 +3093,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
-        self.peer_fingerprint: Optional[dict] = None
+        self.spec_kv_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3189,13 +3171,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
-        peer_fingerprint = data.get("peer_fingerprint")
-        if self._registered_count and not _same_peer_identity(
-            self.peer_fingerprint, peer_fingerprint
-        ):
-            return web.Response(
-                text="Model or speculation differs across prefill ranks", status=400
-            )
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
@@ -3208,8 +3183,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Inconsistent prefill allocation policies", status=400
             )
         self.dsv41_spec_layout = dsv41_spec_layout
-        if self.peer_fingerprint is None:
-            self.peer_fingerprint = peer_fingerprint
         self.decode_allocation_policy = policy
 
         if self.attn_tp_size is None:
@@ -3232,6 +3205,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_layout is None and kv_layout is not None:
             self.kv_layout = kv_layout
+
+        if self.spec_kv_layout is None:
+            self.spec_kv_layout = data.get("spec_kv_layout")
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -3315,7 +3291,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
-                peer_fingerprint=self.peer_fingerprint,
+                spec_kv_layout=self.spec_kv_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3332,11 +3308,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("dsv41_spec_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
+            # Old decodes fail on unknown keys, so send it only when requested.
             if (
-                info.peer_fingerprint is None
-                or request.query.get("peer_fingerprint") != "1"
+                info.spec_kv_layout is None
+                or request.query.get("spec_kv_layout") != "1"
             ):
-                payload.pop("peer_fingerprint")
+                payload.pop("spec_kv_layout")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

@@ -44,8 +44,6 @@ struct PrefillServerInfo {
     kv_layout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dsv41_spec_layout: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    peer_fingerprint: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     stores_to_linker: bool,
@@ -115,7 +113,6 @@ struct Topology {
     kv_cache_dtype: Option<String>,
     kv_layout: Option<String>,
     dsv41_spec_layout: Option<serde_json::Value>,
-    peer_fingerprint: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     stores_to_linker: Option<bool>,
@@ -168,8 +165,6 @@ struct Route {
     kv_layout: Option<String>,
     #[serde(default)]
     dsv41_spec_layout: Option<serde_json::Value>,
-    #[serde(default)]
-    peer_fingerprint: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
     #[serde(default)]
@@ -178,30 +173,6 @@ struct Route {
     enable_dsa_cache_layer_split: Option<bool>,
     #[serde(default)]
     stores_to_linker: Option<bool>,
-}
-
-fn same_model_identity(first: &serde_json::Value, other: &serde_json::Value) -> bool {
-    if first.is_null() || other.is_null() {
-        return first == other;
-    }
-    first["config_digest"] == other["config_digest"]
-        && (first["revision"].is_null()
-            || other["revision"].is_null()
-            || first["revision"] == other["revision"])
-}
-
-fn same_peer_identity(
-    first: &Option<serde_json::Value>,
-    other: &Option<serde_json::Value>,
-) -> bool {
-    match (first, other) {
-        (Some(first), Some(other)) => {
-            same_model_identity(&first["target"], &other["target"])
-                && same_model_identity(&first["draft"], &other["draft"])
-                && first["speculation"] == other["speculation"]
-        }
-        _ => first == other,
-    }
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -220,18 +191,12 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
     // Copy-on-write update. `rcu` may re-run the closure under write
     // contention, so it only reads `body` and clones what it stores.
     let mut layout_mismatch = false;
-    let mut peer_mismatch = false;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
         layout_mismatch =
             topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
-        peer_mismatch = topo.registered_count > 0
-            && !same_peer_identity(&topo.peer_fingerprint, &body.peer_fingerprint);
-        if layout_mismatch || peer_mismatch {
+        if layout_mismatch {
             return topo;
-        }
-        if topo.registered_count == 0 {
-            topo.peer_fingerprint = body.peer_fingerprint.clone();
         }
         topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
@@ -269,12 +234,6 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         topo
     });
 
-    if peer_mismatch {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "Model or speculation differs across prefill ranks",
-        );
-    }
     if layout_mismatch {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -338,11 +297,6 @@ async fn route_get(
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
             kv_layout: topo.kv_layout.clone(),
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
-            peer_fingerprint: if query.get("peer_fingerprint").is_some_and(|v| v == "1") {
-                topo.peer_fingerprint.clone()
-            } else {
-                None
-            },
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             stores_to_linker: topo.stores_to_linker.unwrap_or(false),
@@ -502,15 +456,6 @@ mod tests {
     const SENTINEL: &str =
         "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1";
 
-    fn peer_fingerprint() -> serde_json::Value {
-        serde_json::json!({
-            "target": {"config_digest": "target", "revision": "a".repeat(40)},
-            "draft": {"config_digest": "draft", "revision": "b".repeat(40)},
-            "speculation": {"algorithm": "DFLASH", "requires_prefill_draft_kv": true},
-            "layout": {"kv_layer_ids": [0]},
-        })
-    }
-
     /// Minimal boot config (same shape as the `runtime` tests): no tokenizer
     /// load, a complete default `model_config`, and the given PD role.
     fn test_server_args(disaggregation_mode: DisaggregationMode) -> ServerArgs {
@@ -577,10 +522,7 @@ mod tests {
 
         // Register the single rank; rank_port as a STRING (Python coerces
         // with `int(data["rank_port"])`, so the wire tolerates it).
-        let fingerprint = peer_fingerprint();
-        let body = put_route(serde_json::json!({
-            "rank_port": "17000", "peer_fingerprint": fingerprint,
-        }));
+        let body = put_route(serde_json::json!({"rank_port": "17000"}));
         let (status, text) = request(addr, "PUT", "/route", Some(&body));
         assert_eq!((status, text.as_str()), (200, "OK"));
 
@@ -600,11 +542,6 @@ mod tests {
                 "prefill_http_port": 30000,
             })
         );
-
-        let (status, body) = request(addr, "GET", &format!("{SENTINEL}&peer_fingerprint=1"), None);
-        assert_eq!(status, 200);
-        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(info["peer_fingerprint"], fingerprint);
 
         // Per-rank lookup: `PrefillRankInfo` shape, rank_port back as an int.
         let (status, body) = request(
@@ -631,46 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_fingerprint_rank_consistency() {
-        let (_rt, addr) = start_on_free_port();
-        let first = peer_fingerprint();
-        let body = put_route(serde_json::json!({"pp_size": 2, "peer_fingerprint": first}));
-        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
-
-        for (section, key, value) in [
-            ("target", "revision", serde_json::json!("c".repeat(40))),
-            ("draft", "revision", serde_json::json!("c".repeat(40))),
-            ("target", "config_digest", serde_json::json!("different")),
-            ("draft", "config_digest", serde_json::json!("different")),
-            ("speculation", "algorithm", serde_json::json!("DSPARK")),
-        ] {
-            let mut incompatible = first.clone();
-            incompatible[section][key] = value;
-            let body = put_route(serde_json::json!({
-                "pp_size": 2, "pp_rank": 1, "peer_fingerprint": incompatible,
-            }));
-            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 400);
-            assert_eq!(request(addr, "GET", SENTINEL, None).0, 503);
-        }
-
-        let mut other = first.clone();
-        other["target"]["revision"] = serde_json::Value::Null;
-        other["draft"]["revision"] = serde_json::Value::Null;
-        other["layout"]["kv_layer_ids"] = serde_json::json!([1]);
-        let body = put_route(serde_json::json!({
-            "pp_size": 2, "pp_rank": 1, "peer_fingerprint": other,
-        }));
-        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
-        let (status, body) = request(addr, "GET", &format!("{SENTINEL}&peer_fingerprint=1"), None);
-        assert_eq!(status, 200);
-        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(info["peer_fingerprint"], first);
-
-        let legacy = put_route(serde_json::json!({}));
-        assert_eq!(request(addr, "PUT", "/route", Some(&legacy)).0, 400);
-    }
-
-    #[test]
     fn dspark_layout_round_trip_and_rank_mismatch() {
         let (_rt, addr) = start_on_free_port();
         let layout = serde_json::json!({"num_draft_tokens": 6, "state_item_lens": [[4096]]});
@@ -680,10 +577,6 @@ mod tests {
         assert_eq!(status, 200);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["dsv41_spec_layout"], layout);
-
-        let (_, body) = request(addr, "GET", &format!("{SENTINEL}&peer_fingerprint=1"), None);
-        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(info.get("peer_fingerprint").is_none());
 
         let incompatible = put_route(serde_json::json!({"dsv41_spec_layout": null}));
         assert_eq!(request(addr, "PUT", "/route", Some(&incompatible)).0, 400);

@@ -64,7 +64,6 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.disaggregation.peer_fingerprint import collect_peer_fingerprint
 from sglang.srt.disaggregation.utils import (
     KVClassType,
     MetadataBuffers,
@@ -761,9 +760,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             storage,
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
-        )
-        kv_args.peer_fingerprint = collect_peer_fingerprint(
-            self.scheduler, kv_args, self.token_to_kv_pool
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool

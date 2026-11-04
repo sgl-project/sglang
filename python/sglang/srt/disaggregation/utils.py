@@ -1641,6 +1641,23 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
+    """The draft KV a DFLASH-family prefill writes for its decode: {} when the
+    algorithm writes none, None on a rank that transfers no draft KV."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    if not algorithm.is_dflash_family():
+        return {}
+    if not kv_args.num_draft_entries:
+        return None
+    # Draft widths may differ per rank: PD reslices draft heads across TP and DCP.
+    return {
+        "algorithm": algorithm.name,
+        "num_draft_entries": kv_args.num_draft_entries,
+    }
+
+
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
