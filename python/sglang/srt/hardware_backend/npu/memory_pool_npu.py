@@ -945,16 +945,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, index_k, index_k_scale):
-        from sglang.srt.hardware_backend.npu.attention.dsa_index_k_cache import (
-            set_index_k_scale_buffer_npu,
-        )
+        from sglang.kernels.ops.kvcache.dsa_index_k_cache import SetKAndS
 
-        set_index_k_scale_buffer_npu(
-            self.index_k_buffer[self._get_indexer_slot(layer_id)],
-            loc.reshape(-1).contiguous(),
-            index_k.reshape(-1, self.index_head_dim).contiguous(),
-            index_k_scale.reshape(-1).contiguous(),
-            self.index_page_size,
+        SetKAndS.execute(
+            pool=self,
+            buf=self.index_k_buffer[self._get_indexer_slot(layer_id)],
+            loc=loc.reshape(-1).contiguous(),
+            index_k=index_k.reshape(-1, self.index_head_dim).contiguous(),
+            index_k_scale=index_k_scale.reshape(-1).contiguous(),
         )
 
     def _get_disagg_buffer_entries(self):

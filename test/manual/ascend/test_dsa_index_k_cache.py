@@ -4,13 +4,12 @@ python -m unittest discover -s test/manual/ascend -p test_dsa_index_k_cache.py -
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch_npu  # noqa: F401
 
-from sglang.srt.hardware_backend.npu.attention.dsa_index_k_cache import (
-    set_index_k_scale_buffer_npu,
-)
+from sglang.kernels.ops.kvcache.dsa_index_k_cache import SetKAndS
 
 
 @unittest.skipUnless(torch.npu.is_available(), "requires an Ascend NPU")
@@ -29,6 +28,7 @@ class TestPackedIndexCache(unittest.TestCase):
 
     def _check_store(self, page_size, loc_dtype, scale_column):
         torch.manual_seed(42)
+        pool = SimpleNamespace(index_page_size=page_size)
         loc_cpu = torch.tensor(
             [3 * page_size - 1, page_size, 0, 2 * page_size + 1, page_size - 1],
             dtype=loc_dtype,
@@ -54,8 +54,12 @@ class TestPackedIndexCache(unittest.TestCase):
                 start = page_size * 128 + slot * 4
                 expected[page, start : start + 4] = scale_bytes[token]
 
-            set_index_k_scale_buffer_npu(
-                cache, loc, key, scale[:, None] if scale_column else scale, page_size
+            SetKAndS.execute(
+                pool=pool,
+                buf=cache,
+                loc=loc,
+                index_k=key,
+                index_k_scale=scale[:, None] if scale_column else scale,
             )
             torch.npu.synchronize()
             # Full-buffer comparison also checks untouched slots/pages.
@@ -63,7 +67,13 @@ class TestPackedIndexCache(unittest.TestCase):
             self.assertTrue(torch.all(backing[:4].cpu() == 0xA5).item())
             self.assertTrue(torch.all(backing[-4:].cpu() == 0xA5).item())
 
-        set_index_k_scale_buffer_npu(cache, loc[:0], key[:0], scale[:0], page_size)
+        SetKAndS.execute(
+            pool=pool,
+            buf=cache,
+            loc=loc[:0],
+            index_k=key[:0],
+            index_k_scale=scale[:0],
+        )
         self.assertTrue(torch.equal(cache.cpu(), expected))
 
 
