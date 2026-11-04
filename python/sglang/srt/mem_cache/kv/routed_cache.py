@@ -91,6 +91,10 @@ class RoutedKVCache(KVCache):
     # -- the arena --
 
     @property
+    def backing_owner(self):
+        return self._arena
+
+    @property
     def post_capture_active(self) -> bool:
         return self._arena.backed_after_capture
 

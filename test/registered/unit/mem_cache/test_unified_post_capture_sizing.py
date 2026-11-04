@@ -29,8 +29,19 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    setup_allocator_context,
+)
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
@@ -39,7 +50,11 @@ _FINAL_BYTES = 16 << 20
 _PAGE_SIZE = 4
 
 
-def _bundle(*, total_bytes: int, post_capture_active: bool):
+def _bundle(
+    *, total_bytes: int, post_capture_active: bool, chain="swa", fused_draft=None
+):
+    has_state = chain in ("state", "tri")
+    has_window = chain in ("swa", "tri")
     return build_test_unified_pools(
         device="cuda",
         kv_cache_dtype=torch.float16,
@@ -52,14 +67,47 @@ def _bundle(*, total_bytes: int, post_capture_active: bool):
         page_size=_PAGE_SIZE,
         start_layer=0,
         end_layer=4,
-        swa_attention_layer_ids=[1, 3],
+        swa_attention_layer_ids=[1, 3] if has_window else [],
+        mamba_layer_ids=[1, 3] if has_state else [],
+        mamba2_cache_params=SimpleNamespace(
+            layers=[1, 3],
+            shape=SimpleNamespace(conv=[(3, 8)], temporal=(1, 4, 8)),
+            dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
+        )
+        if has_state
+        else None,
+        max_mamba_cache_size=16 if has_state else 0,
+        speculative_num_draft_tokens=2 if has_state else None,
         full_attention_layer_ids=[0, 2],
         total_bytes=total_bytes,
+        fused_draft=fused_draft,
         enable_memory_saver=False,
         post_capture_active=post_capture_active,
         need_sort=False,
         model_context_len=256,
         sliding_window_size=64,
+    )
+
+
+def _final_config(bundle):
+    storage = bundle.token_to_kv_pool_allocator.storage
+    sized = size_plan(
+        storage.plan,
+        KVSizingInputs(
+            budget_bytes=_FINAL_BYTES,
+            context_len=256,
+            floor_window=64,
+            max_running_requests=1,
+            state_slots=16,
+            alignment=1,
+        ),
+        frozen=storage.sized,
+    )
+    return SimpleNamespace(
+        unified_memory_pool_bytes=sized.total_bytes,
+        unified_full_cap_tokens=sized.full_cap_tokens,
+        full_max_total_num_tokens=sized.full_tokens,
+        swa_max_total_num_tokens=sized.window_tokens,
     )
 
 
@@ -95,8 +143,124 @@ def _capacities(bundle) -> dict:
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestUnifiedPostCaptureSizing(unittest.TestCase):
+    def setUp(self):
+        setup_allocator_context()
+
     def _post_capture_bundle(self, total_bytes=_RESERVED_BYTES):
         return _bundle(total_bytes=total_bytes, post_capture_active=True)
+
+    def test_auto_state_shrink_preserves_captured_buffers(self):
+        from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+        from sglang.srt.mem_cache.kv.decl import (
+            MHAGeometry,
+            StateGeometry,
+            kv_layer_decls,
+        )
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+
+        setup_allocator_context()
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=MHAGeometry(
+                    head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.float16
+                ),
+                state_layer_ids=(1,),
+                state_geometry=StateGeometry(
+                    conv_state_shapes=((8, 8),),
+                    conv_dtype=torch.float16,
+                    temporal_state_shape=(1, 4, 8),
+                    temporal_dtype=torch.float32,
+                ),
+            ),
+            page_size=4,
+            speculative_num_draft_tokens=3,
+        )
+        captured = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=1 << 20,
+                max_running_requests=10,
+                radix_cache=False,
+                context_len=16,
+                alignment=1,
+            ),
+        )
+        storage = build_kv_storage(
+            plan,
+            captured,
+            UnifiedBuildContext(
+                device="cuda",
+                start_layer=0,
+                end_layer=2,
+                enable_memory_saver=False,
+                need_sort=False,
+                max_num_reqs=10,
+                model_context_len=16,
+                state_cache_params=SimpleNamespace(layers=(1,)),
+                speculative_num_draft_tokens=3,
+                post_capture_active=True,
+            ),
+        )
+        a = storage.allocator
+        buffers = [
+            a.arena.raw,
+            storage.requests.req_to_token,
+            *storage.scratch.tensors.values(),
+        ]
+        buffers.extend(
+            t
+            for b in a.members
+            for t in (b.ids.virtual_to_physical, b.ids.physical_to_virtual)
+        )
+        identities = [(t.data_ptr(), tuple(t.shape)) for t in buffers]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            a.arena.raw[:1].fill_(7)
+        # Only five state slots plus their minimum token demand fit now.
+        state_bytes = plan.sub_pool("mamba").spec.entry_bytes()
+        budget = (
+            captured.fixed_bytes
+            + plan.sink_bytes()
+            + 5 * state_bytes
+            + 16 * plan.owner().spec.entry_bytes()
+        )
+        final = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=budget,
+                max_running_requests=10,
+                radix_cache=False,
+                context_len=16,
+                alignment=1,
+            ),
+            frozen=captured,
+        )
+        self.assertLess(final.max_running_requests, captured.max_running_requests)
+        self.assertGreater(final.max_running_requests, 0)
+        self.assertEqual(final.units("mamba"), final.max_running_requests)
+        self.assertEqual(final.fixed, captured.fixed)
+        config = SimpleNamespace(
+            unified_memory_pool_bytes=final.total_bytes,
+            unified_full_cap_tokens=final.full_cap_tokens,
+            full_max_total_num_tokens=final.full_tokens,
+            swa_max_total_num_tokens=final.window_tokens,
+        )
+        a.get_kvcache().finalize_backing(config)
+        a.resize(config)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(a.arena.raw[0].item(), 7)
+        self.assertEqual([(t.data_ptr(), tuple(t.shape)) for t in buffers], identities)
+        slots = a.alloc_state_slots(final.max_running_requests)
+        self.assertIsNotNone(slots)
+        tokens = a.alloc(
+            -(-2 * final.max_running_requests // a.page_size) * a.page_size
+        )
+        self.assertIsNotNone(tokens)
+        a.free(tokens)
+        a.state_slots.free(slots)
+        self.assertEqual(storage.accounting_violations(), [])
 
     def test_reservation_backs_only_the_sink_before_capture(self):
         """Before sizing, the arena is address space: the sink is resident and
@@ -104,7 +268,11 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         bundle = self._post_capture_bundle()
         shared = bundle.arena
         self.assertTrue(bundle.token_to_kv_pool.post_capture_active)
-        self.assertEqual(shared.total_bytes, _RESERVED_BYTES)
+        self.assertEqual(
+            shared.total_bytes
+            + bundle.token_to_kv_pool_allocator.storage.sized.fixed_bytes,
+            _RESERVED_BYTES,
+        )
         self.assertGreater(shared.accessible_bytes, 0)
         self.assertLessEqual(shared.accessible_bytes, shared.backed_bytes)
         self.assertLess(shared.backed_bytes, _RESERVED_BYTES)
@@ -123,7 +291,7 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         ]
         table_ptrs = [table.data_ptr() for table in tables]
 
-        config = SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
+        config = _final_config(bundle)
         bundle.token_to_kv_pool.finalize_backing(config)
         allocator.resize(config)
 
@@ -147,6 +315,167 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         self.assertIsNotNone(allocator.alloc(n))
         self.assertEqual(allocator.available_size(), 0)
 
+    def test_retraction_restores_complete_entries_at_new_dcp_coordinates(self):
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [2]},
+            regions={
+                "full": DenseDraftRegion(
+                    lane_num=2,
+                    head_num=1,
+                    head_dim=3,
+                    v_head_dim=5,
+                    store_dtype=torch.bfloat16,
+                )
+            },
+        )
+        for dcp in (1, 2, 4):
+            for rank in range(dcp):
+                with (
+                    self.subTest(dcp=dcp, rank=rank),
+                    get_parallel().override(attn_dcp_size=dcp, attn_dcp_rank=rank),
+                ):
+                    bundle = _bundle(
+                        total_bytes=_FINAL_BYTES,
+                        post_capture_active=False,
+                        chain="state",
+                        fused_draft=placement,
+                    )
+                    allocator = bundle.token_to_kv_pool_allocator
+                    source = allocator.alloc(16 * dcp)
+                    old_state = allocator.alloc_state_slots(1)
+                    target = allocator.alloc(16 * dcp)
+                    new_state = allocator.alloc_state_slots(1)
+                    for band in allocator.members:
+                        virtual = old_state if band.sub_pool_name == "mamba" else source
+                        physical = band.ids.translate_write(virtual.to(torch.int64))
+                        physical = physical[physical > 0]
+                        allocator.arena.entries(band.sub_pool_name)[physical] = 79
+                    saved = allocator.get_cpu_copy(source, mamba_indices=old_state)
+                    allocator.load_cpu_copy(saved, target, mamba_indices=new_state)
+                    for band in allocator.members:
+                        virtual = new_state if band.sub_pool_name == "mamba" else target
+                        physical = band.ids.translate_write(virtual.to(torch.int64))
+                        physical = physical[physical > 0]
+                        self.assertTrue(
+                            torch.all(
+                                allocator.arena.entries(band.sub_pool_name)[physical]
+                                == 79
+                            )
+                        )
+
+    def test_every_chain_retains_captured_and_fixed_addresses(self):
+        for chain, dcp in (
+            ("full", 1),
+            ("swa", 1),
+            ("state", 1),
+            ("tri", 1),
+            ("state", 2),
+            ("state", 4),
+        ):
+            with (
+                self.subTest(chain=chain, dcp=dcp),
+                get_parallel().override(attn_dcp_size=dcp),
+            ):
+                bundle = _bundle(
+                    total_bytes=_RESERVED_BYTES, post_capture_active=True, chain=chain
+                )
+                allocator = bundle.token_to_kv_pool_allocator
+                storage = allocator.storage
+                tensors = [bundle.arena.raw, storage.requests.req_to_token]
+                tensors.extend(storage.scratch.tensors.values())
+                for band in allocator.members:
+                    tensors.extend(
+                        (band.ids.virtual_to_physical, band.ids.physical_to_virtual)
+                    )
+                pointers = [t.data_ptr() for t in tensors]
+                shapes = [tuple(t.shape) for t in tensors]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    bundle.arena.raw[:1].fill_(9)
+                config = _final_config(bundle)
+                bundle.token_to_kv_pool.finalize_backing(config)
+                allocator.resize(config)
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertEqual(bundle.arena.raw[0].item(), 9)
+                self.assertEqual([t.data_ptr() for t in tensors], pointers)
+                self.assertEqual([tuple(t.shape) for t in tensors], shapes)
+                eager = _bundle(
+                    total_bytes=_FINAL_BYTES, post_capture_active=False, chain=chain
+                )
+                self.assertEqual(
+                    allocator.available_size(),
+                    eager.token_to_kv_pool_allocator.available_size(),
+                )
+                self.assertEqual(allocator.verify_byte_accounting(), [])
+                for band in allocator.members:
+                    self.assertEqual(
+                        band.max_slots, bundle.arena.num_entries(band.sub_pool_name)
+                    )
+                    view = allocator.views[band.sub_pool_name]
+                    self.assertEqual(view.size, band.max_slots - band.pool_page_size)
+                if allocator.state is not None:
+                    state = allocator.state.pool
+                    self.assertEqual(allocator.state_slots.size, state.size)
+                    self.assertEqual(allocator.state_slots.available_size(), state.size)
+                    self.assertEqual(state.host_capacity_tokens, state.size)
+                    self.assertEqual(
+                        state.host_capacity_bytes,
+                        state.size * allocator.mamba_allocator.entry_bytes,
+                    )
+
+    def test_short_draft_rows_store_and_replay_without_touching_host(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                region = DenseDraftRegion(
+                    lane_num=2, head_num=1, head_dim=3, v_head_dim=5, store_dtype=dtype
+                )
+                bundle = _bundle(
+                    total_bytes=1 << 20,
+                    post_capture_active=False,
+                    fused_draft=FusedDraftPlacement.from_counts(
+                        counts={"full": [2]}, regions={"full": region}
+                    ),
+                )
+                arena = bundle.arena
+                spec = bundle.storage.plan.owner().spec
+                view = DraftMHAView(
+                    arena=arena,
+                    host_spec=spec,
+                    layer_lanes={0: 0, 1: 1},
+                    page_size=_PAGE_SIZE,
+                )
+                arena.raw.fill_(11)
+                before = arena.raw.clone()
+                loc = torch.tensor([8, 13], device="cuda", dtype=torch.int64)
+                k = (
+                    torch.arange(6, device="cuda", dtype=torch.float32)
+                    .view(2, 1, 3)
+                    .to(dtype)
+                )
+                v = (
+                    torch.arange(10, device="cuda", dtype=torch.float32)
+                    .view(2, 1, 5)
+                    .to(dtype)
+                )
+                layer = SimpleNamespace(layer_id=1)
+                view.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    view.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
+                k.add_(3)
+                v.add_(5)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(view.k_buffer[1][loc], k)
+                torch.testing.assert_close(view.v_buffer[1][loc], v)
+                changed = torch.zeros_like(arena.raw, dtype=torch.bool)
+                for part in region.parts(spec.draft_offset_in_entry()):
+                    for row in (8, 13):
+                        lo = row * spec.entry_bytes() + part.layer_offset_bytes(1)
+                        changed[lo : lo + part.row_bytes()] = True
+                self.assertTrue(torch.equal(arena.raw[~changed], before[~changed]))
+
     def test_sizing_contract_is_enforced(self):
         bundle = self._post_capture_bundle()
         kvcache = bundle.token_to_kv_pool
@@ -155,9 +484,7 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "must be backed before allocator.resize"
             ):
-                allocator.resize(
-                    SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-                )
+                allocator.resize(_final_config(bundle))
         with self.subTest("budget without a byte count"):
             with self.assertRaises(ValueError):
                 kvcache.finalize_backing(
@@ -174,18 +501,14 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
                     SimpleNamespace(unified_memory_pool_bytes=4096)
                 )
         with self.subTest("resize with live allocations"):
-            kvcache.finalize_backing(
-                SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-            )
+            kvcache.finalize_backing(_final_config(bundle))
             # Move the grow-down allocator's frontier into the backed range
             # before allocating; it still reflects the larger reservation.
-            allocator.resize(SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES))
+            allocator.resize(_final_config(bundle))
             handed = allocator.alloc(_PAGE_SIZE)
             self.assertIsNotNone(handed)
             with self.assertRaisesRegex(RuntimeError, "non-empty"):
-                allocator.resize(
-                    SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-                )
+                allocator.resize(_final_config(bundle))
             allocator.free(handed)
 
         eager = _bundle(total_bytes=_FINAL_BYTES, post_capture_active=False)

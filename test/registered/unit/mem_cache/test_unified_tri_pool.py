@@ -319,7 +319,6 @@ class TestUnifiedTriPool(unittest.TestCase):
         pool, allocator, _, mamba_kv = self._build()
         slot_alloc = UnifiedMambaSlotAllocator(
             allocator.mamba_allocator,
-            max_size=pool.num_entries("mamba") - 1,
             device=_DEV,
         )
         v = slot_alloc.alloc(3)
@@ -367,7 +366,6 @@ class TestUnifiedTriPool(unittest.TestCase):
                 )
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
-                    max_size=allocator.mamba_allocator.max_slots - 1,
                     device=_DEV,
                 )
 
@@ -991,7 +989,7 @@ class TestTriFactorySizing(unittest.TestCase):
             mamba2_cache_params=cp,
             full_max_total_num_tokens=64,
             swa_max_total_num_tokens=32,
-            max_mamba_cache_size=4,
+            max_mamba_cache_size=20,
             model_context_len=16,
             extra_max_context_len=4,
             max_num_reqs=4,
@@ -1149,7 +1147,7 @@ class TestTriFactorySizing(unittest.TestCase):
                                 cfg,
                                 "get_schedule",
                                 return_value=SimpleNamespace(
-                                    max_mamba_cache_size=4,
+                                    max_mamba_cache_size=20,
                                     disable_overlap_schedule=False,
                                     mamba_full_memory_ratio=None,
                                 ),
@@ -1167,7 +1165,24 @@ class TestTriFactorySizing(unittest.TestCase):
                             patch.object(
                                 cfg, "mamba_cache_chunk_size", return_value=64
                             ),
+                            patch.object(
+                                cfg,
+                                "max_speculative_num_draft_tokens",
+                                return_value=None,
+                            ),
                         ):
+                            # Construction consumes the already resolved plan and size.
+                            # Keep request tracking reservations identical to the runner.
+                            planned = build_test_unified_pools(
+                                **self._factory_kwargs(
+                                    swa_attention_layer_ids=[1] if tri_pool else [],
+                                    enable_mamba_extra_buffer=True,
+                                    enable_mamba_extra_buffer_lazy=lazy,
+                                    disable_overlap_schedule=False,
+                                )
+                            ).token_to_kv_pool_allocator.storage
+                            configurator._unified_plan = planned.plan
+                            configurator._unified_sized = planned.sized
                             storage = cfg.KVCacheConfigurator._init_unified_pools(
                                 configurator,
                                 sizes=SimpleNamespace(
@@ -1282,10 +1297,8 @@ class TestTriFactorySizing(unittest.TestCase):
         self.assertEqual(
             [m.sub_pool_name for m in allocator.members], ["full", "swa", "mamba"]
         )
-        # Buffer = budget + the state pool's bytes (budget captured AFTER the
-        # state carve-out), never the token-count re-sum.
-        state_bytes = 4 * plan.sub_pool("mamba").spec.entry_bytes()
-        self.assertEqual(pool.total_bytes, budget + state_bytes)
+        sized = allocator.storage.sized
+        self.assertEqual(pool.total_bytes + sized.fixed_bytes, budget)
         # Boot signature: 3 sub-pools in chain order, swa is the float.
         self.assertEqual(len(pool.bands), 3)
         self.assertEqual(
@@ -1300,7 +1313,9 @@ class TestTriFactorySizing(unittest.TestCase):
         want = (
             64 * plan.sub_pool("full").spec.entry_bytes()
             + 32 * plan.sub_pool("swa").spec.entry_bytes()
-            + 4 * plan.sub_pool("mamba").spec.entry_bytes()
+            + self._factory_kwargs()["max_mamba_cache_size"]
+            * plan.sub_pool("mamba").spec.entry_bytes()
+            + plan.sink_bytes()
         )
         self.assertEqual(pool.total_bytes, want)
 

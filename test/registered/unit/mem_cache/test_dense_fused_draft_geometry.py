@@ -162,6 +162,42 @@ class TestFusedRegionConfinement(unittest.TestCase):
                     self.assertLessEqual(hi, (page + 1) * self.PS * entry)
 
 
+class TestDraftPartAlignment(unittest.TestCase):
+    def test_mixed_dtype_state_parts_are_aligned_and_move_with_the_entry(self):
+        region = DraftStateRegion(
+            lane_num=3,
+            state=DraftStateGeometry(
+                conv_state_shapes=((1, 3), (1, 1)),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(3,),
+                temporal_dtype=torch.float32,
+            ),
+        )
+        state = _mamba_spec(region)
+        full = _host_spec()
+        arena = arena_of(
+            total_bytes=16384,
+            sub_pool_specs=[state, full],
+            device="cpu",
+            enable_memory_saver=False,
+            page_size=1,
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"mamba": [3]}, regions={"mamba": region}
+            ),
+        )
+        arena.raw.zero_()
+        conv, temporal = state.draft_views(arena)
+        for tensor in (*conv, temporal):
+            self.assertEqual(tensor.data_ptr() % tensor.element_size(), 0)
+            tensor[:, 4].fill_(7)
+        arena.move_units("mamba", torch.tensor([6]), torch.tensor([4]))
+        for tensor in (*conv, temporal):
+            self.assertTrue(torch.all(tensor[:, 6] == 7))
+        host_conv, host_temporal = state.views(arena)
+        for tensor in (*host_conv, host_temporal):
+            self.assertTrue(torch.all(tensor[:, 6] == 0))
+
+
 class TestDraftMHAView(unittest.TestCase):
     PS = 2
     PAGES = 8
@@ -285,14 +321,17 @@ class TestFusedStateHost(unittest.TestCase):
     """A state (mamba) entry carries the draft's state block after the host's
     streams: the same aligned entry for both, byte-disjoint blocks within a
     slot, and the host's whole-entry copy/clear carry the draft block, so a
-    radix checkpoint restores the draft's state with the target's. Unfused,
-    the entry stays its raw size; that identity guards every state deploy."""
+    radix checkpoint restores the draft's state with the target's. Temporal
+    rows remain aligned both within and between entries."""
 
     SLOTS = 8
 
-    def test_unfused_spec_is_byte_identical_to_before(self):
+    def test_unfused_spec_preserves_temporal_row_alignment(self):
         s = _mamba_spec()
-        self.assertEqual(s.host_entry_bytes(), 2 * (3 * 8 * 2 + 2 * 4))
+        layout = s.entry_layout()
+        self.assertEqual(layout.offsets["temporal"], 128)
+        self.assertEqual(layout.layer_strides["temporal"], 64)
+        self.assertEqual(s.host_entry_bytes(), 256)
         self.assertEqual(s.entry_bytes(), s.host_entry_bytes())
 
     def _pool(self):
@@ -342,7 +381,6 @@ class TestFusedStateHost(unittest.TestCase):
         host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=2,
             mamba_layer_ids=[0, 1],
         )
         draft_conv, _ = pool.spec("mamba").draft_views(pool)
@@ -385,7 +423,6 @@ class TestFusedStateHost(unittest.TestCase):
         host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=2,
             mamba_layer_ids=[0, 1],
         )
         draft_conv, draft_temporal = pool.spec("mamba").draft_views(pool)
