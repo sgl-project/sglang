@@ -284,8 +284,8 @@ def ensure_mamba_capacity(
 def alloc_tracking_slots(
     storage: KVStorage | StaticKVStorage,
     state: StateStorage,
-    tree_cache: BasePrefixCache | None,
     candidates: list[tuple[Req, int]],
+    tree_cache: BasePrefixCache | None,
 ) -> list[bool]:
     """Give each (req, position) candidate a lazy tracking slot; one bool each.
 

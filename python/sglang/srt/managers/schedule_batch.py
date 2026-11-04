@@ -3059,6 +3059,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
+        return alloc_tracking_slots(
+            kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator),
+            self.token_to_kv_pool_allocator.state,
+            candidates,
+            self.tree_cache,
+        )
+
     def mamba_lazy_prealloc_at_boundary(
         self, track_mask_cpu: torch.Tensor
     ) -> torch.Tensor:
@@ -3075,10 +3083,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         track mask, so the forward writes no track state and the keep slot
         still holds the checkpoint at mamba_last_track_seqlen.
         """
-        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         track_mask_cpu = track_mask_cpu.clone()
-        # A held other slot means the previous boundary's post-processing
-        # (which frees it) has not run yet under overlap.
         rows = []
         for i, (req, at_boundary) in enumerate(zip(self.reqs, track_mask_cpu.tolist())):
             assert req.kv.mamba_ping_pong_track_buffer is not None
@@ -3086,13 +3091,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if at_boundary and req.kv.mamba_ping_pong_empty[other_idx]:
                 rows.append((i, req, other_idx))
             elif at_boundary:
+                # A held other slot means the previous boundary's
+                # post-processing (which frees it) has not run yet under overlap.
                 track_mask_cpu[i] = False
-        took = alloc_tracking_slots(
-            storage,
-            self.token_to_kv_pool_allocator.state,
-            self.tree_cache,
-            [(req, other_idx) for _, req, other_idx in rows],
-        )
+        took = self._alloc_tracking_slots([(req, pos) for _, req, pos in rows])
         for (i, req, other_idx), ok in zip(rows, took):
             if ok:
                 req.kv.mamba_next_track_idx = other_idx
@@ -3125,7 +3127,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         scatter position is recorded on the batch and rides the result-queue
         copy (forward isolation restores batch fields).
         """
-        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         track_positions: List[int] = []
         rows = []
         for i, req in enumerate(self.reqs):
@@ -3141,12 +3142,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.kv.mamba_ping_pong_empty[other_idx]:
                 rows.append((i, req, other_idx))
             track_positions.append(other_idx)
-        took = alloc_tracking_slots(
-            storage,
-            self.token_to_kv_pool_allocator.state,
-            self.tree_cache,
-            [(req, other_idx) for _, req, other_idx in rows],
-        )
+        took = self._alloc_tracking_slots([(req, pos) for _, req, pos in rows])
         # On failure the verify skips this crossing's snapshot (-1), so the
         # keep slot still holds the checkpoint at mamba_last_track_seqlen.
         for (i, _, _), ok in zip(rows, took):
