@@ -812,7 +812,6 @@ stabilize_flashinfer_jit_paths() {
 
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.14"
-    NIXL_VERSION="1.3.0"
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
     NIXL_BIN_NAME="nixl-cu13"
@@ -830,18 +829,9 @@ install_extra_deps() {
 
     $PIP_CMD install "helion==1.4.0" $PIP_INSTALL_SUFFIX
 
-    NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    if [ "$NIXL_INSTALLED" = "$NIXL_VERSION" ] && [ "$NIXL_BIN_INSTALLED" = "$NIXL_VERSION" ]; then
-        echo "nixl==${NIXL_VERSION} and ${NIXL_BIN_NAME}==${NIXL_VERSION} already installed, keeping them"
-    else
-        echo "nixl mismatch (meta: ${NIXL_INSTALLED:-none}, ${NIXL_BIN_NAME}: ${NIXL_BIN_INSTALLED:-none}, required: ${NIXL_VERSION}); installing"
-        # Meta stub owns the nixl import path; install only the CUDA binary for
-        # this runner's torch CUDA major. --no-deps avoids pulling the other CUDA
-        # variant; leave any other variant already on the runner image untouched.
-        $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
-            --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
-    fi
+    # NIXL 1.5+ contains the Torch-versioned EP extensions required by the CI image.
+    $PIP_CMD install "nixl>=1.5.0" "${NIXL_BIN_NAME}>=1.5.0" \
+        --no-deps $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         # pyarrow 26 needs NumPy 2 at import, but lmms_eval pins numpy 1.26.4;
