@@ -4266,6 +4266,9 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     input_ids=input_ids,
                     cp_all_tokens=cp_extend,
+                    gate_basis=(
+                        getattr(self, "engram_gate_basis", None) if _is_npu else None
+                    ),
                 )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
@@ -5134,6 +5137,71 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def _load_npu_engram_gate_basis(self) -> None:
+        """Load the ModelSlim sidecar once, shared by this rank's Engram layers."""
+        if (
+            not _is_npu
+            or self.quant_config is None
+            or self.quant_config.get_name() != "modelslim"
+        ):
+            return
+        rotation = getattr(self.config, "engram_rotation_config", None)
+        if not rotation:
+            return
+        expected = {
+            "value_projection_rotated": True,
+            "value_basis": "quarot_global",
+            "key_and_gate_basis": "original",
+            "runtime_delta_rotation": False,
+        }
+        if not isinstance(rotation, dict) or any(
+            rotation.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(f"Unsupported ModelSlim Engram rotation: {rotation}")
+        if getattr(self.model, "engram_gate_basis", None) is not None:
+            return
+        engram = next(
+            (
+                layer.engram
+                for layer in self.model.layers
+                if getattr(layer, "engram", None) is not None
+            ),
+            None,
+        )
+        if engram is None:
+            return
+        if engram.q_weight.is_meta:
+            raise ValueError("Load Engram weights before loading the gate rotation")
+
+        from pathlib import Path
+
+        from safetensors import safe_open
+
+        model_path = getattr(self.config, "_name_or_path", None)
+        if not model_path:
+            raise ValueError("ModelSlim Engram rotation requires the checkpoint path")
+        path = Path(model_path) / "optional" / "quarot.safetensors"
+        if not path.is_file():
+            raise FileNotFoundError(f"ModelSlim Engram rotation requires {path}")
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            if "global_rotation" not in tensors.keys():
+                raise ValueError(f"Missing global_rotation in {path}")
+            basis = tensors.get_tensor("global_rotation")
+        dim = self.config.hidden_size
+        if basis.shape != (dim, dim) or not basis.is_floating_point():
+            raise ValueError(
+                f"global_rotation must be a floating-point [{dim}, {dim}] tensor"
+            )
+        basis = basis.float()
+        if not torch.isfinite(basis).all():
+            raise ValueError("global_rotation contains non-finite values")
+        self.model.register_buffer(
+            "engram_gate_basis",
+            basis.to(device=engram.q_weight.device),
+            persistent=False,
+        )
+        logger.info("Loaded ModelSlim Engram gate rotation from %s", path)
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
@@ -5144,6 +5212,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        self._load_npu_engram_gate_basis()
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
