@@ -549,8 +549,6 @@ DFlash V2 on one Google Cloud TPU v7 host (2x2x1: 4 chips, 8 TensorCores, `--tp-
 {/* TPU v7 commands: begin */}
 
 ```bash Concurrency 1
-FORCE_SINGLE_HOST=1 \
-HF_HUB_OFFLINE=0 \
 LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_all_gather=false" \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
 SGLANG_DFLASH_CONV_MATMUL_EXPAND=1 \
@@ -604,7 +602,6 @@ SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS=512:512 \
 SGLANG_TPU_RPA_TRANSPOSED=1 \
 SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 \
 TPU_PREMAPPED_BUFFER_SIZE=4294967296 \
-TRANSFORMERS_OFFLINE=0 \
 python3 -m sglang.launch_server \
   --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
   --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
@@ -654,8 +651,6 @@ At concurrency 10, set `--max-running-requests 6`, `--prefill-decode-interval 64
 From concurrency 16, the host KV pool, the sessions and the 16-request profile change enough that the command is shown in full:
 
 ```bash Concurrency 16
-FORCE_SINGLE_HOST=1 \
-HF_HUB_OFFLINE=0 \
 LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_all_gather=false" \
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
 SGLANG_DFLASH_CONV_MATMUL_EXPAND=1 \
@@ -713,7 +708,6 @@ SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS=512:512 \
 SGLANG_TPU_RPA_TRANSPOSED=1 \
 SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 \
 TPU_PREMAPPED_BUFFER_SIZE=4294967296 \
-TRANSFORMERS_OFFLINE=0 \
 python3 -m sglang.launch_server \
   --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
   --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
