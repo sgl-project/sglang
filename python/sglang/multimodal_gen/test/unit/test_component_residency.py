@@ -133,6 +133,34 @@ def test_snapshot_offload_preserves_host_storage_and_live_buffers(
     assert not weight_d2h
 
 
+@pytest.mark.parametrize("free_gib, loads", [(0.5, False), (64, True)])
+def test_component_offload_xpu_prefetch_only_when_it_fits(monkeypatch, free_gib, loads):
+    # A synchronous XPU prefetch loaded the next component beside the kept one
+    # and OOMed LongCat-Image on a 24 GiB card; it must still run when it fits.
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        residency_strategies, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        residency_strategies, "_module_ready_on_local_device", lambda *a, **k: False
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_available_gpu_memory",
+        lambda device_id, empty_cache: free_gib,
+    )
+    load = Mock()
+    monkeypatch.setattr(ComponentOffloadStrategy, "_load_component", load)
+    strategy = ComponentOffloadStrategy()
+    use = ComponentUse("denoise", "transformer")
+
+    fetched = strategy.prefetch_for_use(torch.nn.Linear(4, 4), use, ResidencyState())
+
+    assert fetched is loads
+    assert load.called is loads
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_snapshot_offload_refit_and_lora_context_refresh_weights():
     module = torch.nn.Linear(4, 4, bias=False)

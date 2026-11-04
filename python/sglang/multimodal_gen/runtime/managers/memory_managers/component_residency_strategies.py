@@ -30,6 +30,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES = 12 * 1024**3
 # Leave headroom for the allocator when deciding whether a warmup preload fits.
 _WARMUP_PRELOAD_MARGIN_BYTES = 1 * 1024**3
+# Arbitrary allocator headroom for an early component load; not measured.
+_PREFETCH_MARGIN_BYTES = 1 * 1024**3
 
 logger = init_logger(__name__)
 
@@ -103,6 +105,30 @@ def _device_free_bytes() -> int | None:
     except RuntimeError:
         # Some backends expose mem_get_info without implementing it.
         return None
+
+
+def _prefetch_fits_device_memory(module: nn.Module, use: ComponentUse) -> bool:
+    if _module_ready_on_local_device(module, dtype=use.target_dtype):
+        return True
+    required_bytes = _cpu_module_nbytes(module, dtype=use.target_dtype)
+    # Not torch.xpu.mem_get_info: with torch 2.14.0+xpu it reports free memory
+    # equal to total even when memory is allocated, so a full device looks empty.
+    free_bytes = int(
+        current_platform.get_available_gpu_memory(
+            device_id=get_local_torch_device().index or 0, empty_cache=False
+        )
+        * 1024**3
+    )
+    if required_bytes <= free_bytes - _PREFETCH_MARGIN_BYTES:
+        return True
+    logger.warning_once(
+        "Skipping prefetch of %s (%.2f GiB needed, %.2f GiB free); "
+        "it will load on first use instead.",
+        use.component_name,
+        required_bytes / 1024**3,
+        free_bytes / 1024**3,
+    )
+    return False
 
 
 def _is_out_of_memory_error(error: BaseException) -> bool:
@@ -216,6 +242,8 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> bool:
+        if current_platform.is_xpu() and not _prefetch_fits_device_memory(module, use):
+            return False
         if not current_platform.is_cuda():
             self.prepare_for_use(module, use, state)
             return True
