@@ -130,7 +130,7 @@ class TestMRopeAxisMap(CustomTestCase):
             )
 
     def test_qwen35_npu_prefill_and_decode_dispatch(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import qwen3_5
 
         layer = SimpleNamespace(
