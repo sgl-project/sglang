@@ -571,9 +571,8 @@ def embed_mm_inputs(
             masks += [mask]
 
     # 3. Get input embeddings
-    # Models can read input_ids again after this routine (e.g. Qwen4-Exp's per-layer
-    # N-gram embedding hashes it), so multimodal positions get their placeholder token
-    # id, as in the HF reference, rather than the clamped pad value.
+    # Models may read input_ids after this routine (e.g. per-layer N-gram
+    # embeddings); give multimodal positions their placeholder token id.
     _fill_mm_placeholder_token_ids(
         input_ids=input_ids,
         mm_inputs_list=mm_inputs_list,
