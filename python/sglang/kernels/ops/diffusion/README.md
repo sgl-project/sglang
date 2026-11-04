@@ -75,6 +75,14 @@ and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
 
+SANA-Video's depthwise convolution/GLU fusion reuses input rows and avoids
+materializing the convolution output. It is enabled for large (`numel >= 2**24`)
+channels-last BF16 inputs with cuDNN enabled on SM120, after an exact comparison with the existing
+cuDNN convolution and rounded post-ops. Each shape/cuDNN-policy signature is
+verified before graph capture; an unverified capture or numerical mismatch uses
+the existing path. Autograd and `torch.compile` retain that path as well.
+SANA-WM uses a different convolution/bias rounding contract and is unchanged.
+
 SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
 GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
@@ -167,6 +175,7 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `bias_residual_add` | JIT CUDA | bit-exact `(y + bias[c]) + h` with aten's per-op bf16 rounding, for a conv that skipped its bias pass | channels_last-dense (`C % 8 == 0`) or NCHW/NCDHW contiguous (spatial `% 8 == 0`) bf16; `h` shares `y`'s layout (Qwen-Image 2.1 VAE residual blocks) |
+| `fused_depthwise_conv3x3_bias_glu` | KDA (Triton) | preserves separate BF16 convolution, bias, and SiLU rounding | channels-last BF16 CUDA depthwise 3x3, stride/padding one; SANA-Video inference on SM120, first-use verification per shape and cuDNN policy |
 | `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
 | `residual_gate_fp32` | Triton | separate FP32 multiply/add, then cast to input dtype | contiguous `[B,S,D]`, strided `[B or 1,1,D]` gate; Kandinsky6 |
 | `indexed_gate_bf16` / `indexed_gate_fp32` (`_` in place) | Triton | bit-exact vs `x + gate[idx] * other`: bf16 rounds the product, fp32 keeps a separate FP32 multiply/add | bf16 rows, per-row index into a `[n, D]` gate table (MiniMax-H3) |
@@ -196,6 +205,7 @@ tensor copy at each residual site.
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
 | `rmsnorm_cast_before_weight_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `fused_rope_rotate_half_fp32` | Triton | paired split-half Q/K RoPE with separately rounded FP32 products and sum before the FP16/BF16 cast; Anima verifies each new signature against eager |
 | `flux3_video_qknorm_rope` | Triton | bit-exact vs affine-free ``nn.RMSNorm`` (head dim 64) plus eager rotate-half RoPE; FLUX 3 video VAE, ``eps=1e-5`` |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
 | `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |

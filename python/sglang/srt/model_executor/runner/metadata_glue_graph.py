@@ -93,6 +93,14 @@ class MetadataGlueGraph:
     def run(self, attn_backend, fb_view, key) -> None:
         """Run ``init_forward_metadata_out_graph`` for this replay, through the
         captured glue graph once it is ready."""
+        if any(
+            backend.requires_eager_metadata for backend in self._leaves(attn_backend)
+        ):
+            self.disabled = True
+            self.eager += 1
+            attn_backend.init_forward_metadata_out_graph(fb_view)
+            return
+
         st = self._states.get(key)
         if st is None:
             st = {"warmups": 0, "graph": None, "meta": None}

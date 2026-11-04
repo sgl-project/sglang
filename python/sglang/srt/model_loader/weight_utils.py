@@ -1798,6 +1798,13 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
              if no remapping is needed.
         None: If the remapped name is not found in params_dict.
     """
+    # ModelSlim: map fa_k.scale to attn_mqa.fa_k_scale; skip unused FA parameters.
+    stem, _, parameter = name.rpartition(".")
+    prefix, _, component = stem.rpartition(".")
+    if parameter in ("scale", "offset") and component in ("fa_q", "fa_k", "fa_v"):
+        remapped_name = f"{prefix}.attn_mqa.{component}_{parameter}"
+        return remapped_name if remapped_name in params_dict else None
+
     if name.endswith(".kv_scale"):
         print_warning_once(
             "DEPRECATED. Found kv_scale in the checkpoint. "

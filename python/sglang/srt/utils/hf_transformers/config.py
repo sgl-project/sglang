@@ -20,6 +20,7 @@ from typing import Dict, Optional, Tuple
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import (
     DeepseekV41Config,
     normalize_deepseek_v41_config,
@@ -36,7 +37,6 @@ from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
     _CONFIG_REGISTRY,
     AutoConfig,
-    DeepseekVLV2Config,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,

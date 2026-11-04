@@ -615,6 +615,10 @@ return {
       },
       verifiedRecipes: [
         { id: "b200-resident-8", hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
+        // Auto takes the first entry for a GPU count. 4x B200 holds the DiT
+        // resident, which beats FSDP by 4-7% (FL2VA 209f 64.9 vs 67.6 s,
+        // T2VA 124f 36.0 vs 38.7 s); FSDP stays available as a placement.
+        { id: "b200-resident-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b200-fsdp-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "fsdp", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b300-resident-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
         { id: "b300-fsdp-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "fsdp", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto" },

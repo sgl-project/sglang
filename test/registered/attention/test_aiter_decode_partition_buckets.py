@@ -26,7 +26,7 @@ if _RUNNABLE:
         _AITER_PARTITION_SIZE_ROCM,
         AiterAttnBackend,
     )
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.model_executor.runner_utils.capture_mode import (
         _set_capture_attention_variant,
     )

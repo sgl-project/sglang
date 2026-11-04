@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as dsv4
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

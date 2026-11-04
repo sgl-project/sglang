@@ -13,7 +13,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bert import BertEncoder
-from sglang.srt.utils.hf_transformers_utils import download_from_hf
+from sglang.srt.utils.hf_transformers import download_from_hf
 
 RobertaConfig = None
 

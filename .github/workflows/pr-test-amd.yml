@@ -631,9 +631,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+  # Waits for the MI300 stage-b jobs, like stage-c: the MI35x 1-GPU pool is the
+  # scarcest AMD runner pool, so a PR run only asks it for a runner once its
+  # MI300 tests have passed. Scheduled runs skip the wait jobs and still run
+  # this in parallel.
   stage-b-test-1-gpu-small-amd-mi35x:
     name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
-    needs: [check-changes, wait-for-stage-a-amd]
+    needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
       (

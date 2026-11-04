@@ -36,7 +36,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device, is_hip, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_config
+from sglang.srt.utils.hf_transformers import get_config
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()

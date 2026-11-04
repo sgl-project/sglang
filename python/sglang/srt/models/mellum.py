@@ -41,11 +41,11 @@ from sglang.srt.layers.rotary_embedding.yarn import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen3_moe import (
     Qwen3MoeAttention,
     Qwen3MoeDecoderLayer,
     Qwen3MoeForCausalLM,
-    Qwen3MoeMLP,
     Qwen3MoeModel,
     Qwen3MoeSparseMoeBlock,
 )

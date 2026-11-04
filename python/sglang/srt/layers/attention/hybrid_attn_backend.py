@@ -10,7 +10,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,

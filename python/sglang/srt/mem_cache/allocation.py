@@ -177,14 +177,17 @@ def retire_window(
 ) -> None:
     """Retire the window rows of a running request behind ``frontier``,
     keeping what the prefix tree still needs of the window."""
-    _storage(tree_cache).advance(
-        req,
-        frontier,
-        window=tree_cache.swa_retain_window,
-        retain_floor=tree_cache.swa_retain_floor(req),
-        shares_prefixes=tree_cache.supports_prefix_sharing(),
-        eviction_interval=eviction_interval,
-    )
+    storage = _storage(tree_cache)
+    for component, window, floor in tree_cache.window_retention(req):
+        storage.advance(
+            req,
+            frontier,
+            window=window,
+            retain_floor=floor,
+            shares_prefixes=tree_cache.supports_prefix_sharing(),
+            eviction_interval=eviction_interval,
+            component_type=component,
+        )
 
 
 def _room_in(tree_cache: BasePrefixCache):
@@ -260,14 +263,7 @@ def ensure_mamba_capacity(
     if not req_to_token_pool.holds_state_slots:
         return True
 
-    # Count the slots `acquire` will hand out for each request.
-    needed = 0
-    for req in reqs:
-        if not req.kv.holds_mamba:
-            needed += 1
-
-        if req.kv.mamba_ping_pong_track_buffer is None:
-            needed += req_to_token_pool.mamba_initial_tracking_slots
+    needed = sum(state.pending_request_slots(req_to_token_pool, req) for req in reqs)
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = state.slots

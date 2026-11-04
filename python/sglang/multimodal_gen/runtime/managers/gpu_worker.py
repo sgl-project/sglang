@@ -71,9 +71,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
-from sglang.multimodal_gen.runtime.managers.request_cancel import (
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
-    raise_if_cancelled,
 )
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import (

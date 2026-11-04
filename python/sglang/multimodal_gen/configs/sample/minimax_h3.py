@@ -97,7 +97,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
     def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any]:
         """Use the same independent-seed grouped path in serve and generate."""
 
-        from sglang.multimodal_gen.runtime.entrypoints.utils import (
+        from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
             expand_request_outputs,
         )
 

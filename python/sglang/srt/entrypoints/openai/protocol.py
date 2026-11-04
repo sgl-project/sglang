@@ -230,7 +230,7 @@ class UsageInfo(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
+    include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
 
 
@@ -965,6 +965,9 @@ class ChatCompletionRequest(PDRoutingFields):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    # Whether the client sent tool_choice, as opposed to the default filled in
+    # by set_tool_choice_default.
+    _tool_choice_explicit: bool = PrivateAttr(default=False)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1086,17 +1089,22 @@ class ChatCompletionRequest(PDRoutingFields):
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
+    def set_tool_choice_default(cls, values, handler):
+        if not isinstance(values, dict):
+            return handler(values)
+        explicit = values.get("tool_choice") is not None
+        if not explicit:
             if values.get("tools") is None and not _has_message_level_tools(
                 values.get("messages")
             ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
-        return values
+        request = handler(values)
+        request._tool_choice_explicit = explicit
+        return request
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod

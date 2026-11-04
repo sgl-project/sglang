@@ -40,7 +40,7 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
-from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from sglang.srt.utils.hf_transformers import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 

@@ -18,7 +18,7 @@ from unittest.mock import call, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import gemma4_diffusion, gemma4_mm
 from sglang.srt.models.gemma4_diffusion import DiffusionGemmaForBlockDiffusion
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration

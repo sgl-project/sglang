@@ -31,21 +31,17 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
@@ -88,10 +84,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_post_verify_graphs import (
-    EaglePostVerifyGraphs,
-    simulated_acc_len_generator,
-)
+from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     compact_verify_max_top_k,
@@ -117,6 +110,7 @@ from sglang.srt.speculative.spec_utils import (
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
+    simulated_acc_len_generator,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
@@ -1487,6 +1481,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        self._wait_for_fused_hicache_load(batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination

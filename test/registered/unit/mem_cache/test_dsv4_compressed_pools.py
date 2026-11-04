@@ -40,7 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,

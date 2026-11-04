@@ -14,7 +14,7 @@ from sglang.srt.lora.backend.triton_backend import (  # noqa: E402
 )
 from sglang.srt.lora.backend.triton_v2_backend import TritonV2LoRABackend  # noqa: E402
 from sglang.srt.lora.dense.plan import DenseLoraKind  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import reset_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 

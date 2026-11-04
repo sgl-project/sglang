@@ -7,13 +7,15 @@ import copy
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
-    post_capture_kv_sizing_planned,
     resolved_view,
     resolving_view,
     use_mla_backend,
+)
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    post_capture_kv_sizing_planned,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase

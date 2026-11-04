@@ -57,7 +57,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 Glm4Config = None
 

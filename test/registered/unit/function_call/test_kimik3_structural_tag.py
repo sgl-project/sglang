@@ -328,6 +328,101 @@ def test_strict_schema_supports_refs_and_mixed_unions():
     )
 
 
+def _value_tool(value_schema, **extra):
+    return Tool(
+        type="function",
+        function=Function(
+            name="emit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "required": ["value"],
+                "additionalProperties": False,
+                "properties": {"value": value_schema},
+                **extra,
+            },
+        ),
+    )
+
+
+def _accepts_value(grammar, value):
+    return _accepts(
+        grammar,
+        _tools_section(_call("emit", 1, _argument("value", "object", value))),
+    )
+
+
+def test_strict_schema_resolves_refs_into_the_root_structure():
+    sibling = _grammar(
+        [
+            _value_tool(
+                {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "string"},
+                        "b": {"$ref": "#/properties/value/properties/a"},
+                    },
+                }
+            )
+        ],
+        tool_choice="required",
+    )
+    assert _accepts_value(sibling, '{"a":"x","b":"y"}')
+    assert not _accepts_value(sibling, '{"b":1}')
+
+    items = _grammar(
+        [
+            _value_tool(
+                {
+                    "type": "object",
+                    "properties": {
+                        "list": {"type": "array", "items": {"type": "string"}},
+                        "one": {"$ref": "#/properties/value/properties/list/items"},
+                    },
+                }
+            )
+        ],
+        tool_choice="required",
+    )
+    assert _accepts_value(items, '{"list":["a"],"one":"b"}')
+    assert not _accepts_value(items, '{"one":2}')
+
+    chained = _grammar(
+        [
+            _value_tool(
+                {
+                    "type": "object",
+                    "properties": {
+                        "a": {"$ref": "#/$defs/S"},
+                        "b": {"type": "integer"},
+                        "c": {"$ref": "#/properties/value/properties/b"},
+                    },
+                },
+                **{"$defs": {"S": {"type": "string"}}},
+            )
+        ],
+        tool_choice="required",
+    )
+    assert _accepts_value(chained, '{"a":"s","b":1,"c":2}')
+    assert not _accepts_value(chained, '{"c":"two"}')
+
+
+def test_strict_schema_resolves_recursive_root_structure_refs():
+    tree = {
+        "type": "object",
+        "properties": {
+            "kids": {
+                "type": "array",
+                "items": {"$ref": "#/properties/value"},
+            }
+        },
+        "additionalProperties": False,
+    }
+    grammar = _grammar([_value_tool(tree)], tool_choice="required")
+    assert _accepts_value(grammar, '{"kids":[{"kids":[]},{}]}')
+    assert not _accepts_value(grammar, '{"kids":[{"kids":[1]}]}')
+
+
 def test_strict_schema_handles_number_enums_and_all_of_integer_constraints():
     tool = Tool(
         type="function",
