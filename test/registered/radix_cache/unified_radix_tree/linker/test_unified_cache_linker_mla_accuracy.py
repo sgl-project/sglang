@@ -31,7 +31,12 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=900,
+    stage="extra-b",
+    # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
+    runner_config="4-gpu-h100",
+)
 
 _MODEL_PATH = os.environ.get(
     "SGLANG_LINKER_MLA_ACCURACY_MODEL", "deepseek-ai/DeepSeek-V2-Lite-Chat"
@@ -134,7 +139,10 @@ class TestPlainMLALinkerRestoreAccuracy(_MLALinkerCase):
                 f"sample {index}: restored logprobs diverged",
             )
 
-        print(f"store-restored prompt tokens per sample: {', '.join(restores)}", flush=True)
+        print(
+            f"store-restored prompt tokens per sample: {', '.join(restores)}",
+            flush=True,
+        )
 
 
 @unittest.skipUnless(
