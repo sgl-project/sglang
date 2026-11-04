@@ -685,7 +685,6 @@ class Envs:
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
-    SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
     # Compact extend-attention scheduler tile-budget admission (AMD/HIP-only).
     # Budget <= 0 disables; >0 sets the max prefix-extend tiles per batch.
     SGLANG_PREFILL_TILE_BUDGET = EnvInt(0)
@@ -869,9 +868,6 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
-    # HiCache host<->device transfers use the TMA staging kernel when the GPU
-    # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
-    SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -1267,15 +1263,6 @@ class Envs:
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
-    # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
-    # Consults the tuned per-(N, K, M) Triton tile config table in
-    # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /
-    # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
-    # default CUTLASS path. Only takes effect on a GPU with a matching
-    # dtype=fp8_w8a8_channelwise config JSON under
-    # kernels/ops/gemm/configs/ (currently L40S), so it is a no-op on
-    # any other GPU / untuned shape even when enabled.
-    SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
     # ===================================================================
     # Humming quantization
@@ -1431,9 +1418,6 @@ class Envs:
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
-    # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
-    # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
-    SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1739,7 +1723,6 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
-    SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
@@ -2225,7 +2208,6 @@ class Envs:
     # ===================================================================
     # Muse Spark
     # ===================================================================
-    SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR = EnvBool(True)
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
@@ -2243,8 +2225,6 @@ class Envs:
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
-    # Use the FP8 decode indexer instead of MSA-v1 Q8KV4 on the NVFP4 KV cache.
-    SGLANG_DISABLE_MSA_V1_Q8KV4 = EnvBool(False)
     # Vision tokens per block in the ViT MLP and projector; <= 0 runs all at once.
     SGLANG_MINIMAX_VIT_TOKEN_BLOCK = EnvInt(32768)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
@@ -2252,9 +2232,6 @@ class Envs:
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
-    # Emit the main Q and index Q of the grouped QK norm/RoPE kernel directly as
-    # FP8, dropping the NVFP4 backend's two separate Q cast kernels.
-    SGLANG_OPT_USE_MINIMAX_FP8_Q_EPILOGUE = EnvBool(True)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)

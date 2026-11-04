@@ -19,7 +19,6 @@ from sglang.kernels.ops.attention.msa_v1.compact_dequant import (
 )
 from sglang.kernels.ops.attention.msa_v1.decode_plan import update_msa_v1_decode_plan
 from sglang.kernels.ops.attention.msa_v1.flashinfer_decode import FlashInferQ8K8Decode
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -171,8 +170,6 @@ _TOPK = 16
 
 def msa_v1_qmul4_decode_capability() -> tuple[bool, str | None]:
     """Probe prerequisites without compiling the Q8KV4 decode extension."""
-    if envs.SGLANG_DISABLE_MSA_V1_Q8KV4.get():
-        return False, "disabled by SGLANG_DISABLE_MSA_V1_Q8KV4=1"
     if not MSA_V1_DECODE_ATTENTION_AVAILABLE:
         return False, (
             "Q8KV4 wrapper import failed: "

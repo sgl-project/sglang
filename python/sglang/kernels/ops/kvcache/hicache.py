@@ -13,7 +13,6 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -129,9 +128,7 @@ def use_hicache_tma_kernel(
     A chunk that straddles pages degrades to one bulk op per row, so pages must
     tile the chunk; `page_size=None` (caller unaware of paging) trusts the indices.
     """
-    if _is_hip or not envs.SGLANG_HICACHE_TMA_TRANSFER.get():
-        return False
-    if element_size % 16 != 0 or not current_arch().is_sm_at_least(9):
+    if _is_hip or element_size % 16 != 0 or not current_arch().is_sm_at_least(9):
         return False
     if page_size is not None and page_size % hicache_tma_rows_per_chunk(element_size):
         return False

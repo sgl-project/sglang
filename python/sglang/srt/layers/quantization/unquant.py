@@ -326,11 +326,6 @@ def precompile_splitk_tactics() -> bool:
     return True
 
 
-def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
-    """Return whether the optional Split-K path should be initialized."""
-    return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
-
-
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
@@ -399,7 +394,7 @@ def initialize_bf16_gemm_config() -> None:
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _enable_bf16_splitk_gemm = False
-    if should_enable_bf16_splitk_gemm(backend):
+    if backend.is_cutedsl():
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
             prefer_direct_bf16_gemm_sm100,
