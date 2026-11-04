@@ -1330,5 +1330,109 @@ class TestEstimatedPerfConstantsTpSharding(CustomTestCase):
         self.assertGreater(tp1._linear_flops_per_token, 0.0)
 
 
+class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
+    """Hybrid Mamba+attention+MLP architectures (NemotronH, etc.) mix
+    attention-only, MLP-only, and Mamba-only layers. Attention and MLP FLOPs
+    must be costed by their own per-layer counts, not by the model's total
+    layer count (see _init_estimated_perf_constants)."""
+
+    HIDDEN_SIZE = 16.0
+    HEAD_DIM = 8.0
+    NUM_HEADS = 4.0
+    NUM_KV_HEADS = 4.0
+    INTERMEDIATE_SIZE = 64.0
+    # Total layer count ModelConfig reports for hybrid stacks (no hybrid-Mamba
+    # special case there), deliberately wrong to use directly for FLOPs.
+    NUM_ATTENTION_LAYERS = 10
+
+    def _attn_linear_flops(self):
+        return (
+            2.0
+            * self.HIDDEN_SIZE
+            * self.HEAD_DIM
+            * (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            + 2.0 * self.HIDDEN_SIZE * self.HEAD_DIM * self.NUM_HEADS
+        )
+
+    def _mlp_flops(self):
+        return 6.0 * self.HIDDEN_SIZE * self.INTERMEDIATE_SIZE
+
+    def _constants(self, *, layers_block_type=None, full_attention_layer_ids=None):
+        scheduler = types.SimpleNamespace()
+        scheduler.waiting_queue = []
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        hf_text_config = types.SimpleNamespace(
+            intermediate_size=self.INTERMEDIATE_SIZE
+        )
+        if layers_block_type is not None:
+            hf_text_config.layers_block_type = layers_block_type
+        if full_attention_layer_ids is not None:
+            hf_text_config.full_attention_layer_ids = full_attention_layer_ids
+        scheduler.model_config = types.SimpleNamespace(
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_layers=self.NUM_ATTENTION_LAYERS,
+            head_dim=self.HEAD_DIM,
+            dtype=types.SimpleNamespace(itemsize=2),
+            hf_text_config=hf_text_config,
+            get_num_attention_heads=lambda tp: self.NUM_HEADS,
+            get_num_kv_heads=lambda tp: self.NUM_KV_HEADS,
+        )
+        reporter = _make_reporter(self, scheduler)
+        enter_scope(
+            self,
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                moe_tp_size=1,
+            ),
+        )
+        reporter._init_estimated_perf_constants()
+        return reporter
+
+    def test_layers_block_type_splits_attention_mlp_moe_and_ignores_mamba(self):
+        # 10 layers: 2 attention, 3 mlp, 2 moe, 3 mamba (left uncosted).
+        layers_block_type = (
+            ["attention"] * 2 + ["mlp"] * 3 + ["moe"] * 2 + ["mamba"] * 3
+        )
+        reporter = self._constants(layers_block_type=layers_block_type)
+        expected_linear = self._attn_linear_flops() * 2 + self._mlp_flops() * 5
+        expected_attn_coeff = 4.0 * self.NUM_HEADS * self.HEAD_DIM * 2
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+
+    def test_full_attention_layer_ids_fallback_still_costs_mlp_for_every_layer(self):
+        # Non-hybrid configs that expose full_attention_layer_ids (instead of
+        # layers_block_type) split out attention layers but keep MLP at the
+        # full layer count -- there are no Mamba-only layers to exclude.
+        reporter = self._constants(full_attention_layer_ids=[0, 3, 7])
+        expected_linear = self._attn_linear_flops() * 3 + self._mlp_flops() * (
+            self.NUM_ATTENTION_LAYERS
+        )
+        expected_attn_coeff = 4.0 * self.NUM_HEADS * self.HEAD_DIM * 3
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+
+    def test_no_hybrid_metadata_treats_every_layer_as_attention_and_mlp(self):
+        # Plain transformer configs expose neither field: every layer costs
+        # both attention and MLP, matching pre-hybrid-split behavior.
+        reporter = self._constants()
+        expected_linear = (
+            self._attn_linear_flops() + self._mlp_flops()
+        ) * self.NUM_ATTENTION_LAYERS
+        expected_attn_coeff = (
+            4.0 * self.NUM_HEADS * self.HEAD_DIM * self.NUM_ATTENTION_LAYERS
+        )
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+
+
 if __name__ == "__main__":
     unittest.main()
