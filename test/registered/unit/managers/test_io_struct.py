@@ -9,6 +9,7 @@ from unittest.mock import patch
 import msgspec
 import numpy as np
 import torch
+from pydantic import TypeAdapter, ValidationError
 
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
@@ -1228,6 +1229,44 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestGenerateReqInputBodyBinding(CustomTestCase):
+    """FastAPI binds a /generate body with pydantic; the dataclass constructor checks nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.adapter = TypeAdapter(GenerateReqInput)
+
+    def _bind(self, input_embeds):
+        return self.adapter.validate_python({"input_embeds": input_embeds})
+
+    def test_input_embeds_union_keeps_the_shape_and_coerces_ints(self):
+        """Normalization tells single from batch by isinstance(x[0][0], float), so ints must bind as floats."""
+        single = self._bind([[0, 1], [2.5, 3]])
+        self.assertEqual(single.input_embeds, [[0.0, 1.0], [2.5, 3.0]])
+        self.assertIsInstance(single.input_embeds[0][0], float)
+
+        batch = self._bind([[[0, 1]], [[2, 3.5]]])
+        self.assertEqual(batch.input_embeds, [[[0.0, 1.0]], [[2.0, 3.5]]])
+        self.assertIsInstance(batch.input_embeds[0][0][0], float)
+
+        for malformed in ([[0.5], [[1.5]]], [[[0.5]], [1.5]], [1.0, 2.0], "abc"):
+            with self.subTest(malformed=malformed), self.assertRaises(ValidationError):
+                self._bind(malformed)
+
+    def test_input_embeds_null_binds(self):
+        """A discriminator has no tag for null, so Optional must stay outside the Annotated."""
+        self.assertIsNone(self._bind(None).input_embeds)
+
+    def test_input_embeds_body_is_walked_against_one_union_member(self):
+        """Walking both members costs one error per float: minutes and gigabytes for a large body with one bad value."""
+        for body in ([[0.5, 1.5], [2.5, "x"]], [[[0.5, 1.5]], [[2.5, "x"]]]):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError) as caught:
+                    self._bind(body)
+                self.assertEqual(caught.exception.error_count(), 1)
 
 
 class TestKvHintsTransport(CustomTestCase):
