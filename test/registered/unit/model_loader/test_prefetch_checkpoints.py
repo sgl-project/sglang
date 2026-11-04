@@ -13,6 +13,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import safetensors
 import safetensors.torch
 import torch
 
@@ -21,7 +22,9 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
+    _prefetch_checkpoint_file,
     buffered_multi_thread_safetensors_weights_iterator,
+    default_weight_loader,
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
@@ -85,6 +88,112 @@ class TestPrefetchCheckpoints(CustomTestCase):
             safetensors.torch.save_file(tensors, path)
             paths.append(path)
         return paths
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_prefetch_timeout_preserves_load_error_and_close(self, _):
+        """A stuck prefetch must not replace the consumer's load failure."""
+        for iterator_fn, kwargs in (
+            (safetensors_weights_iterator, {}),
+            (buffered_multi_thread_safetensors_weights_iterator, {"max_workers": 1}),
+        ):
+            for outcome in ("corrupt", "close", "exhaust", "exhaust_in_except"):
+                with self.subTest(iterator=iterator_fn.__name__, outcome=outcome):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        paths = self._create_safetensors_files(tmpdir, num_shards=1)
+                        if outcome == "corrupt":
+                            with open(paths[0], "wb") as f:
+                                f.write(b"invalid safetensors")
+                        handle = MagicMock(spec=CheckpointFilePrefetchHandle)
+                        handle.stop.side_effect = TimeoutError("stuck checkpoint I/O")
+                        with patch(
+                            "sglang.srt.model_loader.weight_utils._prefetch_all_checkpoints",
+                            return_value=handle,
+                        ):
+                            weights = iterator_fn(paths, prefetch=True, **kwargs)
+                            if outcome == "exhaust_in_except":
+                                try:
+                                    raise ValueError("unrelated caller exception")
+                                except ValueError:
+                                    with self.assertRaisesRegex(
+                                        TimeoutError, "stuck checkpoint"
+                                    ):
+                                        list(weights)
+                            elif outcome == "exhaust":
+                                with self.assertRaisesRegex(
+                                    TimeoutError, "stuck checkpoint"
+                                ):
+                                    list(weights)
+                            else:
+                                with self.assertLogs(
+                                    "sglang.srt.model_loader.weight_utils",
+                                    level="WARNING",
+                                ):
+                                    if outcome == "corrupt":
+                                        with self.assertRaises(
+                                            safetensors.SafetensorError
+                                        ):
+                                            next(weights)
+                                    else:
+                                        next(weights)
+                                        weights.close()
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_prefetch_stops_when_weight_loading_is_interrupted(self, _):
+        """Failed shard parsing and early close must not leave prefetch running."""
+        for iterator_fn, kwargs in (
+            (safetensors_weights_iterator, {}),
+            (buffered_multi_thread_safetensors_weights_iterator, {"max_workers": 1}),
+        ):
+            for corrupt in (False, True):
+                with self.subTest(iterator=iterator_fn.__name__, corrupt=corrupt):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        paths = self._create_safetensors_files(tmpdir, num_shards=1)
+                        if corrupt:
+                            with open(paths[0], "wb") as f:
+                                f.write(b"invalid safetensors")
+                        started = threading.Event()
+                        handles = []
+
+                        def slow_prefetch(path, cancel_event):
+                            # Hold the file-I/O boundary until cancellation, so
+                            # the consumer deterministically finishes first.
+                            started.set()
+                            cancel_event.wait(5)
+                            _prefetch_checkpoint_file(path, cancel_event)
+
+                        def start_prefetch(*args, **kw):
+                            handle = _prefetch_all_checkpoints(*args, **kw)
+                            handles.append(handle)
+                            self.assertTrue(started.wait(5))
+                            return handle
+
+                        with (
+                            patch(
+                                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                                side_effect=slow_prefetch,
+                            ),
+                            patch(
+                                "sglang.srt.model_loader.weight_utils._prefetch_all_checkpoints",
+                                side_effect=start_prefetch,
+                            ),
+                        ):
+                            weights = iterator_fn(paths, prefetch=True, **kwargs)
+                            try:
+                                if corrupt:
+                                    with self.assertRaises(safetensors.SafetensorError):
+                                        next(weights)
+                                else:
+                                    _, tensor = next(weights)
+                                    param = torch.nn.Parameter(torch.empty_like(tensor))
+                                    default_weight_loader(param, tensor)
+                                    torch.testing.assert_close(param, tensor)
+                                    weights.close()
+                                self.assertTrue(handles[0].cancelled)
+                                self.assertTrue(handles[0].done)
+                            finally:
+                                weights.close()
+                                for handle in handles:
+                                    handle.stop(timeout=5)
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_weights_match_with_and_without_prefetch(self, _):
