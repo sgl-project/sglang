@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import errno
 import os
-import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,14 +17,18 @@ class DiskPreprocessCache:
 
     Every process that sees the directory shares it, e.g. an RL job's rollout
     engines and trainers. A value is written to a temporary file and renamed into
-    place, so a reader sees all of it or none. Nothing is deleted: the directory
-    lives as long as the job that created it. Values are unpickled on read, since
+    place, so a reader sees all of it or none, and a key is written once: a writer
+    that finds the file or the temporary file leaves it. Opening the directory
+    removes temporary files a killed process left. Nothing else is deleted: the
+    directory lives as long as the job that created it. Values are unpickled on read, since
     processor outputs hold non-tensor objects such as video metadata, so only
     trusted processes may write the directory.
     """
 
     def __init__(self, directory: str):
         self.directory = Path(directory)
+        for temp_path in self.directory.glob("*/*.tmp"):
+            temp_path.unlink(missing_ok=True)
 
     def get(self, key: str) -> Optional[Any]:
         try:
@@ -42,11 +45,20 @@ class DiskPreprocessCache:
         if path.exists():
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Not tempfile, which creates files 0600: other users must read them.
-        temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-        with open(temp_path, "xb") as file:
-            torch.save(value, file)
-        os.replace(temp_path, path)
+        # The temporary file is the claim: a writer that finds it leaves the key to its holder.
+        temp_path = path.with_name(f"{path.name}.tmp")
+        try:
+            # Not tempfile, which creates files 0600: other users must read them.
+            file = open(temp_path, "xb")
+        except FileExistsError:
+            return
+        try:
+            with file:
+                torch.save(value, file)
+            os.replace(temp_path, path)
+        except BaseException:
+            os.unlink(temp_path)
+            raise
 
     def _path(self, key: str) -> Path:
         digest = key.removeprefix(CONTENT_HASH_PREFIX)
