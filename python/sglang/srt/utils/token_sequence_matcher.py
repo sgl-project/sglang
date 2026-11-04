@@ -37,6 +37,8 @@ class TokenSequenceMatcher:
         return len(self.pattern)
 
     def advance(self, matched: int, token: int) -> int:
+        if matched == len(self.pattern):
+            matched = self.prefix_lengths[matched - 1]
         while matched > 0 and token != self.pattern[matched]:
             matched = self.prefix_lengths[matched - 1]
         if token == self.pattern[matched]:
