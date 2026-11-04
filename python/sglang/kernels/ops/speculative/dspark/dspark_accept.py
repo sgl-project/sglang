@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Optional
 
 import msgspec
@@ -18,10 +18,10 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.utils import is_gfx1250_supported, is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 _is_npu = is_npu()
-_is_gfx1250_supported = is_gfx1250_supported()
+_is_hip = is_hip()
 
 if _is_npu:
     from sgl_kernel_npu.sample import chain_speculative_sampling_triton
@@ -461,6 +461,11 @@ def _softmax_temp_normalize_kernel(
         tl.store(out_base + offs, tl.exp(x - row_max) * inv_sum, mask=vmask)
 
 
+@lru_cache(maxsize=None)
+def _num_compute_units(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def softmax_temp_triton(
     *,
     logits: torch.Tensor,
@@ -474,7 +479,9 @@ def softmax_temp_triton(
     )
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
-    if not _is_gfx1250_supported:
+    # One CTA per row leaves most CUs idle when there are few rows; then split
+    # the vocab across CTAs instead.
+    if not (_is_hip and num_rows < _num_compute_units(logits.device)):
         BLOCK_V = 4096
         _softmax_temp_kernel[(num_rows,)](
             logits,
