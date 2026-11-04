@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     ModelOptModelLoader,
+    _get_quantization_config,
     get_model_loader,
 )
 from sglang.srt.model_loader.weight_utils import (
@@ -960,6 +961,56 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertIsNone(
             quant_config.resolve_quant_algo("model.layers.3.mlp.shared_expert")
         )
+
+
+class TestModelOptFp8CapabilityGate(CustomTestCase):
+    def _resolve_quant_config(self, capability):
+        quant_config = ModelOptFp8Config.from_config(
+            {"quant_algo": "FP8", "ignore": ["lm_head"]}
+        )
+        model_config = SimpleNamespace(
+            quantization="modelopt_fp8",
+            dtype=torch.bfloat16,
+            hf_config=PretrainedConfig(),
+        )
+        with (
+            patch(
+                "sglang.srt.model_loader.loader.get_model_architecture",
+                return_value=(nn.Module, "LlamaForCausalLM"),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.get_quant_config",
+                return_value=quant_config,
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.get_device_capability",
+                return_value=capability,
+            ),
+        ):
+            return _get_quantization_config(model_config, LoadConfig())
+
+    def test_modelopt_fp8_loads_on_ampere(self):
+        """ModelOpt FP8 must load on SM80/SM86 via the Marlin fallback and stay rejected on SM75."""
+        for capability in ((8, 0), (8, 6)):
+            with self.subTest(capability=capability):
+                self.assertIsInstance(
+                    self._resolve_quant_config(capability), ModelOptFp8Config
+                )
+        with self.assertRaisesRegex(ValueError, "Minimum capability"):
+            self._resolve_quant_config((7, 5))
+
+    def test_modelopt_fp8_moe_rejected_on_ampere(self):
+        """ModelOpt FP8 MoE must fail at layer construction on SM86, not during CUDA graph capture."""
+        quant_config = self._resolve_quant_config((8, 6))
+        moe = FusedMoE.__new__(FusedMoE)
+        with (
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.get_device_capability",
+                return_value=(8, 6),
+            ),
+            self.assertRaisesRegex(ValueError, "SM89"),
+        ):
+            quant_config.get_quant_method(moe, "model.layers.0.mlp.experts")
 
 
 if __name__ == "__main__":
