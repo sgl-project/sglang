@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 
 from analyze_lifecycle import load_json, open_text
-from analyze_stress import resource_peaks, resource_sample
+from analyze_stress import prometheus, resource_peaks, resource_sample
 from bench_report import distribution
 from bench_statistics import bootstrap_mean_ci, stable_seed
 from lifecycle_bench import write_json
@@ -212,6 +212,42 @@ def gpu_capacity(server):
     )
 
 
+def host_byte_seconds(samples, storage, gap):
+    units = (storage.get("gauges") or {}).get("native_host_bytes_per_token") or []
+    unit = units[0] if len(units) == 2 and units[0] == units[1] else None
+    if (
+        not storage.get("epoch_verified")
+        or type(unit) not in (int, float)
+        or type(units[1]) not in (int, float)
+        or not math.isfinite(unit)
+        or unit <= 0
+    ):
+        unit = None
+    seconds = token_seconds = 0
+    for left, right in zip(samples, samples[1:]):
+        dt = right["monotonic"] - left["monotonic"]
+        used = [s["metrics"].get("b_host_used_tokens") for s in (left, right)]
+        total = [s["metrics"].get("b_host_total_tokens") for s in (left, right)]
+        if (
+            not 0 < dt <= gap
+            or not all(s.get("single_host_pool") for s in (left, right))
+            or not all(
+                type(v) in (int, float) and math.isfinite(v) for v in used + total
+            )
+            or not all(0 <= u <= t and t > 0 for u, t in zip(used, total))
+        ):
+            continue
+        seconds += dt
+        token_seconds += sum(used) * dt / 2
+    return {
+        "observed_resident_or_reserved_byte_seconds": token_seconds * unit
+        if seconds and unit
+        else None,
+        "integrated_seconds": seconds,
+        "scope_definition": "sampled host-pool allocations including staging and references, not purely speculative KV; no gap or boundary extrapolation",
+    }
+
+
 def analyze(roots, resource_paths=(), process_paths=(), gap=6, b_gpu=1):
     issues, arms, incomplete = [], [], []
     for directory in roots:
@@ -300,6 +336,16 @@ def analyze(roots, resource_paths=(), process_paths=(), gap=6, b_gpu=1):
                         issues.append({"sample": row["monotonic"], "error": str(error)})
                         continue
                     sample["capture_duration_unknown"] = duration is None
+                    pools = [
+                        prometheus(reply.get("body"))
+                        for reply in row.get("http", [])
+                        if reply.get("url") == arm["url"] + "/metrics"
+                    ]
+                    sample["single_host_pool"] = len(pools) == 1 and all(
+                        len(pools[0].get("sglang:hicache_host_" + kind + "_tokens", []))
+                        == 1
+                        for kind in ("used", "total")
+                    )
                     metrics = sample["metrics"]
                     if (
                         metrics.get("b_host_total_tokens", 0) > 0
@@ -319,6 +365,7 @@ def analyze(roots, resource_paths=(), process_paths=(), gap=6, b_gpu=1):
             "capture starts inside exact arm bounds; known captures finish inside; unknown durations explicit; GPU capacity minus free includes reserved transfers; sampled peaks"
         )
         arm["resources"]["b_gpu"] = arm["resources"]["gpu"].get(str(b_gpu), {})
+        arm["host_byte_seconds"] = host_byte_seconds(samples, arm["storage"], gap)
         arm["resource_coverage"] = coverage(
             [s["monotonic"] for s in samples], arm["start"], arm["end"], gap
         )

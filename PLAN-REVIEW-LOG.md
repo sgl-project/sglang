@@ -5074,3 +5074,9 @@ parent 审阅完整 runtime/core/HTTP 差异并独立复测：48 HTTP 项通过�
 工具将中间 query 或最终 drain 才出现的 late_before_submit 标记累计到 policy_fallback，保留原始响应及初始退回状态，不把正常策略退回记作异常。已创建 intent 的 admitted 状态不变，继续完整 cancel/query/ack，未取得 Engine 回执仍为 unknown。
 
 parent 审阅完整两文件差异，并独立 lifecycle 工具 20 项通过，14.756s；selected Ruff、格式及 diff 检查通过。新增回归分别在 query/drain 阶段给出退回标记，证明各执行一次 cancel/ack、最终 quiescent 且不产生错误；无标记的 null 回执仍计零。日志：lifecycle-opt/fallback-parent-tests.log。
+
+### O7 — 实测 L2 占用时间积分
+
+离线成本工具为有效单 host pool 的相邻容量样本增加梯形积分，字节比例仅采用同 epoch 且前后相等的实测 native_host_bytes_per_token。缺失、歧义、多池、大间隔和区间边界不推算，积分覆盖秒数独立报告。指标包含 staging 与引用占用，不能解释为纯推测缓存成本。
+
+parent 阅读完整两文件差异，并独立复测成本工具 15 项通过，5.122s；selected Ruff、格式及 diff 检查通过。覆盖手算面积、零占用、缺失/变化/非法单位、pool 歧义及容量越界。日志：lifecycle-opt/host-byte-seconds-parent-tests.log。该变更只读离线数据，未修改正在运行的实验。

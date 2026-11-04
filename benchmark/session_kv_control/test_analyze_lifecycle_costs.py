@@ -144,6 +144,87 @@ class CostAnalysisTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_host_byte_seconds_trapezoid_uses_measured_unit_without_extrapolation(self):
+        arm = self.arms[0]
+        for snapshot in ("costs_before", "costs_after"):
+            arm[snapshot]["http://b"]["data"]["storage_reads"][
+                "native_host_bytes_per_token"
+            ] = 4
+        (self.root / (arm["id"] + ".json")).write_text(json.dumps(arm))
+        write_records(self.root / "lifecycle-raw.jsonl", self.raw)
+        path = self.root / "host-area.jsonl"
+        write_records(
+            path, [resource_row(0, 10), resource_row(2, 30), resource_row(5, 50)]
+        )
+        observed = costs.analyze([self.root], [path], gap=3)["arms"][0]
+        area = observed["host_byte_seconds"]
+        self.assertEqual(area["observed_resident_or_reserved_byte_seconds"], 640)
+        self.assertEqual(area["integrated_seconds"], 5)
+        self.assertEqual(observed["resource_coverage"]["boundary_unobserved_s"], [0, 5])
+        self.assertIn("staging and references", area["scope_definition"])
+        # Existing peak parsing chooses max across series; the integral must
+        # separately reject ambiguous multi-pool samples.
+        first = resource_row(0, 10)
+        first["http"][0]["body"] += '\nsglang:hicache_host_used_tokens{pool="other"} 20'
+        write_records(path, [first, resource_row(2, 30)])
+        area = costs.analyze([self.root], [path])["arms"][0]["host_byte_seconds"]
+        self.assertIsNone(area["observed_resident_or_reserved_byte_seconds"])
+        self.assertEqual(area["integrated_seconds"], 0)
+
+    def test_host_byte_seconds_unknown_or_changed_unit_stays_unknown(self):
+        samples = [
+            {
+                "monotonic": t,
+                "single_host_pool": True,
+                "metrics": {"b_host_used_tokens": 0, "b_host_total_tokens": 100},
+            }
+            for t in (0, 1)
+        ]
+        for verified, units in (
+            (True, []),
+            (True, None),
+            (True, [None, None]),
+            (True, [4, 8]),
+            (False, [4, 4]),
+            (True, [True, True]),
+            (True, [1, True]),
+        ):
+            result = costs.host_byte_seconds(
+                samples,
+                {
+                    "epoch_verified": verified,
+                    "gauges": {"native_host_bytes_per_token": units},
+                },
+                3,
+            )
+            self.assertIsNone(result["observed_resident_or_reserved_byte_seconds"])
+            self.assertEqual(result["integrated_seconds"], 1)
+        result = costs.host_byte_seconds(
+            samples,
+            {"epoch_verified": True, "gauges": {"native_host_bytes_per_token": [4, 4]}},
+            3,
+        )
+        self.assertEqual(result["observed_resident_or_reserved_byte_seconds"], 0)
+
+    def test_host_byte_seconds_skips_large_gap_and_invalid_endpoints(self):
+        samples = [
+            {
+                "monotonic": t,
+                "single_host_pool": True,
+                "metrics": {"b_host_used_tokens": 10, "b_host_total_tokens": 100},
+            }
+            for t in (0, 1, 10, 11, 12)
+        ]
+        samples[3]["metrics"]["b_host_used_tokens"] = 101
+        samples[4]["metrics"].pop("b_host_total_tokens")
+        result = costs.host_byte_seconds(
+            samples,
+            {"epoch_verified": True, "gauges": {"native_host_bytes_per_token": [4, 4]}},
+            3,
+        )
+        self.assertEqual(result["observed_resident_or_reserved_byte_seconds"], 40)
+        self.assertEqual(result["integrated_seconds"], 1)
+
     def test_exact_windows_cpu_coverage_ready_and_all_completed_timing(self):
         resource = self.root / "resources.jsonl"
         write_records(
