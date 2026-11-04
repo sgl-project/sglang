@@ -75,13 +75,11 @@ class StorageCacheTransfers:
             (work.payload.src.tier, work.payload.dst.tier) not in paths
             or work.payload.src.tier not in ("gpu", "host")
             or work.payload.dst.tier != "storage"
-            or isinstance(work.payload, MoveTo)
-            and work.payload.src.tier != "gpu"
             or work.payload.dst.backend not in (None, backend)
             or work.payload.src.backend is not None
         ):
             raise ControlError(
-                "unsupported", "Storage supports GPU/host COPY and GPU-to-storage MOVE"
+                "unsupported", "Storage supports GPU/host COPY and MOVE to storage"
             )
         if len(work.target.branches) != 1:
             raise ControlError(
@@ -251,9 +249,35 @@ class StorageCacheTransfers:
                         )
                 self._retire(job)
 
-    def _outcomes(self, interest):
+    def _host_reclamation_reason(self, node):
+        if node.write_through_pending_id is not None:
+            return "inflight_backup"
+        if self.host._load_pending(node):
+            return "inflight_load"
+        if any(cd.host_lock_ref or cd.lock_ref for cd in node.component_data):
+            return "active_reference"
+        if not node.evicted:
+            return "source_gpu_resident"
+        if node.children:
+            return "structural_dependency"
+        return "" if self.cache.tree_core._is_host_leaf(node) else "not_reclaimable"
+
+    def _reclaim_host(self, job, paths):
+        # Worker ACK is quiescent. Only this job's source receipts have been
+        # released; PINs, computation and other transfers keep their own holds.
+        for node, _, _ in reversed(paths[0][2]):
+            if self._host_reclamation_reason(node):
+                continue
+            result = self.cache.tree_core.evict_host_leaf(node.id)
+            freed = sum(value.numel() for value in result.host_frees.get(FULL, ()))
+            self.cache._free_values(result.device_frees, result.host_frees)
+            self.cache._apply_cache_actions(result.cache_actions)
+            if freed:
+                job.reclaimed.add(node.id)
+
+    def _outcomes(self, interest, paths):
         job, work = interest.job, interest.work
-        tokens, compatibility, rows = self.host._paths(job.staging, source=False)[0]
+        tokens, compatibility, rows = paths[0]
         boundaries = [0, job.completed, len(tokens)]
         if job.completed == len(tokens) and isinstance(work.payload, MoveTo):
             boundaries.extend(end for _, _, end in rows)
@@ -278,7 +302,11 @@ class StorageCacheTransfers:
                 else:
                     code = next(
                         (
-                            self.host._reclamation_reason(n)
+                            (
+                                self._host_reclamation_reason(n)
+                                if work.payload.src.tier == "host"
+                                else self.host._reclamation_reason(n)
+                            )
                             for n, a, b in rows
                             if a < end and b > start and n.id not in job.reclaimed
                         ),
@@ -319,6 +347,9 @@ class StorageCacheTransfers:
         )
 
     def _retire(self, job):
+        # Freeze current radix geometry before a host MOVE removes any nodes.
+        # Ordinary matching may have split the path while the worker ran.
+        paths = self.host._paths(job.staging, source=False) if job.staged else ()
         self.host._release_gpu(job)
         active = any(not self.interests[i].cancelled for i in job.interests)
         if (
@@ -327,11 +358,15 @@ class StorageCacheTransfers:
             and active
             and isinstance(job.work.payload, MoveTo)
         ):
-            self.host._reclaim(job, self.host._paths(job.staging, source=False))
+            if job.work.payload.src.tier == "host":
+                self.host._release_host(job)
+                self._reclaim_host(job, paths)
+            else:
+                self.host._reclaim(job, paths)
         try:
             for identity in job.interests:
                 interest = self.interests[identity]
-                outcomes = self._outcomes(interest) if job.staged else ()
+                outcomes = self._outcomes(interest, paths) if job.staged else ()
                 status = (
                     job.failure_status
                     if job.failure

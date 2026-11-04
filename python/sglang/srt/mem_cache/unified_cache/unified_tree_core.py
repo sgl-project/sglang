@@ -2101,6 +2101,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
+        *,
+        prune_ancestors: bool = True,
     ) -> None:
         """Atomically evict all components on a host leaf.
 
@@ -2121,9 +2123,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
-        self._iteratively_delete_tombstone_leaf(
-            node, tracker, device_frees, host_frees, cache_actions=cache_actions
+        if prune_ancestors:
+            self._iteratively_delete_tombstone_leaf(
+                node, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
+        else:
+            self._update_evictable_leaf_sets(node.parent)
+
+    def evict_host_leaf(self, node_id: NodeId) -> DriveHostEvictionResult:
+        """Evict exactly one H-leaf without reclaiming any ancestor's data.
+
+        The owner must first confirm preservation and release its own holds.
+        Callers may walk a selected suffix backwards, rechecking each node.
+        """
+        result = DriveHostEvictionResult()
+        self._evict_host_leaf(
+            self.node_by_id(node_id),
+            result.tracker,
+            result.device_frees,
+            result.host_frees,
+            result.cache_actions,
+            prune_ancestors=False,
         )
+        return result
 
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Release a node's device KV once its host copy exists; the node stays in the

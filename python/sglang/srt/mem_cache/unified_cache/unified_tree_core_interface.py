@@ -552,6 +552,10 @@ class UnifiedTreeCoreInterface(ABC):
         """Evict a component's host-side resources; no-op if the component is absent."""
         ...
 
+    def evict_host_leaf(self, node_id: NodeId) -> DriveHostEvictionResult:
+        """Evict exactly one host-only leaf, without pruning ancestors."""
+        raise NotImplementedError("Targeted host eviction is not supported")
+
     @abstractmethod
     def evict_excess_path_states(
         self,

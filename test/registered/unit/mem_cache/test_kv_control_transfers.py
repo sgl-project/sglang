@@ -196,7 +196,9 @@ def branched_scope(cache, service):
 
 
 @contextmanager
-def hicache(case, config=None, *, storage=False, namespace_keys=False):
+def hicache(
+    case, config=None, *, storage=False, namespace_keys=False, write_policy="write_back"
+):
     config = config or ServiceConfig(namespace="ns", engine_id="engine")
     storage = storage or namespace_keys
     storage_dir = TemporaryDirectory(prefix="sglang-kv-test-")
@@ -215,7 +217,7 @@ def hicache(case, config=None, *, storage=False, namespace_keys=False):
         device="cpu",
         enable_hierarchical_cache=True,
         hicache_ratio=2,
-        hicache_write_policy="write_back",
+        hicache_write_policy=write_policy,
         hicache_mem_layout="layer_first",
         disable_overlap_schedule=True,
         **storage_args,

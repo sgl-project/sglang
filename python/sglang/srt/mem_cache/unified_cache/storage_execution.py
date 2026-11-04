@@ -40,7 +40,7 @@ class _Adapter:
         ("storage", "host"),
         ("storage", "gpu"),
     )
-    move_paths = (("gpu", "storage"),)
+    move_paths = (("gpu", "storage"), ("host", "storage"))
 
     def __init__(self, store, pool, domain):
         self.store, self.pool = store, pool
@@ -87,6 +87,11 @@ class FileExecutionAdapter(_Adapter):
                 store._get_component_keys(""),
             ),
         )
+        # Legacy positive metadata can outlive another writer's eviction.
+        # Destructive host moves require fresh backend existence checks;
+        # unified file chunks already bypass that cache and validate sizes.
+        if store.metadata_cache is not None and store._unified_suffixes is None:
+            self.move_paths = (("gpu", "storage"),)
 
     def describe_pages(self, hashes):
         return [

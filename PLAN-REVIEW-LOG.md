@@ -4946,3 +4946,9 @@ CSV 标准 CRLF、matplotlib SVG path 换行及一份原始测试输出含生成
 O0 增加普通恢复与 native 读取的查询/GET 累积调用、时间及 anchor KV payload tokens/bytes；wire bytes 保持 unknown。native 观测按物理 job 计数，逻辑兴趣与真实 demand 分开；容量与预留 gauge 经已有 loads/capacity 查询返回，不修改公共三动作 schema。
 
 parent 已阅读完整五文件差异并独立运行 transfers/cache/feedback/service：76 passed、39 subtests，22.22s。仓库要求的 ruff F401/F821/F823/UP037 检查通过。日志为 /tmp/sglang-rfc-build/lifecycle-opt/o0-parent-tests.log。本提交不宣称性能改善；后续同二进制配对将验证观测成本与策略收益。
+
+### O3a — host→storage DEMOTE
+
+增加 FULL host-only 叶节点/可回收后缀的保存后定向回收，复用 HiCache 原生写入及完整前缀确认。owner 在 ACK 后释放自有引用，再检查 PIN/计算/DMA/结构依赖。定向 helper 不递归回收范围外祖先；GPU 驻留的 host 副本仍保留并报告 source_gpu_resident。legacy File 正向 metadata 缓存不能提供新鲜确认时，不声明该破坏性路径。
+
+parent 完整审阅生产差异和新增测试，并独立运行 host_demote/transfers/protection/service/manager：121 passed、107 subtests，23.42s。实际 CPU K/V 恢复及 H2D 内容一致；write_through/write_back、部分写入、共享前缀、split、引用和取消均覆盖。selected ruff 通过；真实 GPU/Mooncake 与性能评估在后续阶段执行。日志：/tmp/sglang-rfc-build/lifecycle-opt/o3a-parent-tests.log。

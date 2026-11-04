@@ -2,6 +2,7 @@
 """Public protocol adapters. Capabilities describe execution, not schema presence."""
 
 import msgspec
+
 from sglang.srt.managers.kv_control.contracts import (
     ACTION_VERSION,
     HASH_SCHEME,
@@ -32,7 +33,11 @@ def public_capabilities(caps):
             "copy_to",
             (("host", "gpu"), ("storage", "host"), ("storage", "gpu")),
         ),
-        ("sglang.demote", "move_to", (("gpu", "host"), ("gpu", "storage"))),
+        (
+            "sglang.demote",
+            "move_to",
+            (("gpu", "host"), ("gpu", "storage"), ("host", "storage")),
+        ),
     ):
         available = (
             directions.get(primitive, ())
