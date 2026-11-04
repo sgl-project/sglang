@@ -334,16 +334,18 @@ class TestTransferChainSingleGpu(CustomTestCase):
         return torch.zeros(nbytes, dtype=torch.uint8).pin_memory()
 
     def test_copies_in_every_direction(self):
-        n = 3 * _MiB + 123  # a ragged last chunk
-        dev = self._src(n)
-        host = torch.randint(0, 255, (n,), dtype=torch.uint8).pin_memory()
+        """Chunked copies land bit-exact, also when an odd chunk size splits
+        the elements of a multi-byte dtype (chunks are counted in bytes)."""
+        dev = torch.randn(1031, 1537, device=self.device).bfloat16()  # ~3 MiB
+        host = torch.randn(dev.shape).bfloat16().pin_memory()
+        bits = lambda t: t.cpu().view(torch.uint8)
         for link in (None, Link.PCIE_H2D):
             chain = TransferChain(link)
-            for chunk in (None, _MiB, 2 * _MiB):  # 1, 4 and 2 chunks
+            for chunk in (None, _MiB + 1, 2 * _MiB):  # 1, 4 and 2 chunks, ragged
                 for dst, src in (
                     (torch.empty_like(dev), dev),  # D2D
                     (torch.empty_like(dev), host),  # H2D
-                    (self._pinned(n), dev),  # D2H
+                    (torch.empty(dev.shape, dtype=dev.dtype, pin_memory=True), dev),
                 ):
                     with self.subTest(link=link, chunk=chunk, dst=dst.device):
                         torch.cuda.synchronize()
@@ -352,7 +354,7 @@ class TestTransferChainSingleGpu(CustomTestCase):
                             copy_chunks(dst, src, chunk), after=self.after, done=done
                         )
                         done.synchronize()
-                        self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
+                        self.assertTrue(torch.equal(bits(dst), bits(src)))
 
     def test_pageable_host_memory_is_rejected(self):
         """A pageable copy blocks the host, which would hang behind a gate."""
@@ -657,6 +659,48 @@ class TestTransferChainSingleGpu(CustomTestCase):
             gc.collect()
             del dst  # torch records an event on the chain's stream here
             torch.cuda.synchronize()
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, timeout=300
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode()[-2000:])
+
+    def test_chain_binds_its_context(self):
+        """torch binds a thread's CUDA context at its first runtime call, and a
+        chain makes driver calls: it must work as the first CUDA call of a
+        process (construction) and of a thread (run, wait)."""
+        code = textwrap.dedent(
+            """
+            import threading
+
+            import torch
+
+            from sglang.srt.distributed.device_communicators.gated_transfer import (
+                Link,
+                TransferChain,
+                copy_chunks,
+            )
+
+            chain = TransferChain(Link.NVLINK)  # the process's first CUDA call
+            src = torch.ones(1 << 20, dtype=torch.uint8, device="cuda")
+            dst = torch.zeros_like(src)
+            torch.cuda.synchronize()
+            errors = []
+
+            def first_cuda_calls_of_this_thread():
+                try:
+                    chain.run(copy_chunks(dst, src))
+                    chain.wait()
+                except Exception as e:
+                    errors.append(e)
+
+            thread = threading.Thread(target=first_cuda_calls_of_this_thread)
+            thread.start()
+            thread.join()
+            torch.cuda.synchronize()
+            assert not errors, errors
+            assert torch.equal(dst, src)
             """
         )
         result = subprocess.run(

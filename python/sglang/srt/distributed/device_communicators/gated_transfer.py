@@ -59,10 +59,13 @@ load (a kernel's first launch, an NCCL lazy connect) or a device-wide sync
 (``cudaFree`` when an allocation misses the cache) inside a bracket, or a
 stream waiting on the paused transfer inside the bracket (``wait`` refuses
 that on the pausing thread). So bracket only the communication call, after
-its outputs exist. A watchdog thread (``SGLANG_GATED_TRANSFER_WATCHDOG_MS``)
-forces open, with a host store, a gate whose same pause has been held that
-long, and logs it: the transfer then overlaps the foreground op, a slowdown
-instead of a hang.
+its outputs exist. ``run`` enqueues all its chunks at once, and a chain's
+streams hold about a thousand parked chunks (single copies, B200); past
+that, ``run`` blocks the host until the pause ends, so a run issued inside
+a bracket of its own link must stay well below that. A watchdog thread
+(``SGLANG_GATED_TRANSFER_WATCHDOG_MS``) forces open, with a host store, a
+gate whose same pause has been held that long, and logs it: the transfer
+then overlaps the foreground op, a slowdown instead of a hang.
 
 Brackets are eager-only: no-ops under ``torch.compile`` tracing and stream
 capture. Chains refuse capture (a captured chain loses the drain bound).
@@ -134,6 +137,19 @@ def _events_done(events) -> bool:
         cu.cuThreadExchangeStreamCaptureMode(mode)
 
 
+def _bind_context(device: int) -> None:
+    """Make ``device``'s primary context current if this thread has none:
+    torch binds it at a thread's first runtime call, and a driver call here
+    may come first."""
+    result = cu.cuCtxGetCurrent()
+    if not result[0] and int(result[1]):
+        return
+    check_drv(result, "cuCtxGetCurrent")
+    handle = check_drv(cu.cuDeviceGet(device), "cuDeviceGet")
+    context = check_drv(cu.cuDevicePrimaryCtxRetain(handle), "cuDevicePrimaryCtxRetain")
+    check_drv(cu.cuCtxSetCurrent(context), "cuCtxSetCurrent")
+
+
 # ---- gates --------------------------------------------------------------------
 
 
@@ -144,17 +160,17 @@ class _Gate:
         self.link = link
         self.device = device
         # Host memory the GPU waits on, so the watchdog can open it with a
-        # plain store. Never freed: gates live as long as the process.
-        with torch.cuda.device(device):
-            host = check_drv(
-                cu.cuMemHostAlloc(
-                    64, cu.CU_MEMHOSTALLOC_PORTABLE | cu.CU_MEMHOSTALLOC_DEVICEMAP
-                ),
-                "cuMemHostAlloc",
-            )
-            address = check_drv(
-                cu.cuMemHostGetDevicePointer(host, 0), "cuMemHostGetDevicePointer"
-            )
+        # plain store. Never freed: gates live as long as the process. Made
+        # by a chain, with its device's context current.
+        host = check_drv(
+            cu.cuMemHostAlloc(
+                64, cu.CU_MEMHOSTALLOC_PORTABLE | cu.CU_MEMHOSTALLOC_DEVICEMAP
+            ),
+            "cuMemHostAlloc",
+        )
+        address = check_drv(
+            cu.cuMemHostGetDevicePointer(host, 0), "cuMemHostGetDevicePointer"
+        )
         self.address = int(address)
         self._word = ctypes.c_uint32.from_address(host)
         self._word.value = 0
@@ -314,25 +330,23 @@ class TransferChain:
         )
         self.link = link
         self.device = torch.cuda.current_device()
-        with torch.cuda.device(self.device):
-            self._handles = tuple(
-                check_drv(
-                    cu.cuStreamCreate(cu.CUstream_flags.CU_STREAM_NON_BLOCKING),
-                    "cuStreamCreate",
-                )
-                for _ in range(1 if link is None else 2)
+        _bind_context(self.device)
+        self._handles = tuple(
+            check_drv(
+                cu.cuStreamCreate(cu.CUstream_flags.CU_STREAM_NON_BLOCKING),
+                "cuStreamCreate",
             )
-            self._streams = tuple(
-                torch.cuda.ExternalStream(
-                    int(h), device=torch.device("cuda", self.device)
-                )
-                for h in self._handles
-            )
-            # _chunk_done[i]: after the last chunk on stream i; the next chunk,
-            # on the other stream, waits for it.
-            self._chunk_done = (_create_event(), _create_event())
-            self._after = _create_event()
-            self._last = _create_event()
+            for _ in range(1 if link is None else 2)
+        )
+        self._streams = tuple(
+            torch.cuda.ExternalStream(int(h), device=torch.device("cuda", self.device))
+            for h in self._handles
+        )
+        # _chunk_done[i]: after the last chunk on stream i; the next chunk,
+        # on the other stream, waits for it.
+        self._chunk_done = (_create_event(), _create_event())
+        self._after = _create_event()
+        self._last = _create_event()
         self._gate = None
         if link is not None:
             self._gate = _get_gate(link, self.device)
@@ -356,7 +370,7 @@ class TransferChain:
         If an op raises, the work enqueued before it stays tracked: ``done``
         is still recorded, and ``wait`` and the brackets still see it.
         """
-        self._check_device()
+        self._use_device()
         caller = torch.cuda.current_stream(self.device)
         after_handle = (caller if after is None else after).cuda_stream
         if check_drv(cu.cuStreamIsCapturing(after_handle), "cuStreamIsCapturing"):
@@ -447,7 +461,7 @@ class TransferChain:
                 "waiting on a gated transfer inside the bracket that paused it "
                 "would deadlock"
             )
-        self._check_device()
+        self._use_device()
         if stream is None:
             stream = torch.cuda.current_stream(self.device)
         if done is not None:
@@ -458,8 +472,9 @@ class TransferChain:
                 "cuStreamWaitEvent",
             )
 
-    def _check_device(self) -> None:
+    def _use_device(self) -> None:
         assert torch.cuda.current_device() == self.device, "use a chain on its device"
+        _bind_context(self.device)
 
 
 # ---- foreground brackets ------------------------------------------------------
