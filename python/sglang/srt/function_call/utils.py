@@ -5,6 +5,7 @@ from copy import deepcopy
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
+from urllib.parse import unquote
 
 import orjson
 import partial_json_parser
@@ -184,6 +185,7 @@ def hoist_json_schema_defs(schema: Any) -> None:
     if not keys:
         return
     collected: Dict[str, Dict[str, Any]] = {key: {} for key in keys}
+    referenced: Dict[str, set] = {key: set() for key in keys}
 
     def collect(node: Any) -> bool:
         if isinstance(node, list):
@@ -192,6 +194,11 @@ def hoist_json_schema_defs(schema: Any) -> None:
             return True
         if node is not schema and ("$id" in node or "id" in node):
             return False
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            parts = unquote(ref).split("/")
+            if len(parts) > 2 and parts[0] == "#" and parts[1] in referenced:
+                referenced[parts[1]].add(parts[2].replace("~1", "/").replace("~0", "~"))
         for key in keys:
             nested = node.get(key)
             if isinstance(nested, dict):
@@ -235,8 +242,15 @@ def hoist_json_schema_defs(schema: Any) -> None:
 
     if collect(schema):
         for key in keys:
-            if collected[key]:
-                schema[key] = deepcopy(collected[key])
+            # Unreferenced definitions stay nested; promoting them would collide
+            # with other tools' same-named definitions in the required-choice merge.
+            needed = {
+                name: definition
+                for name, definition in collected[key].items()
+                if name in referenced[key]
+            }
+            if needed:
+                schema[key] = deepcopy(needed)
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:

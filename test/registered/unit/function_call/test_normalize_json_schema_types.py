@@ -418,8 +418,9 @@ class TestHoistJsonSchemaDefs(CustomTestCase):
                     "properties": {
                         "w": {
                             "$ref": f"#/{key}/WaitFor",
-                            key: {"WaitFor": {"type": "string"}},
+                            key: {"WaitFor": {"$ref": f"#/{key}/Delay"}},
                         },
+                        "d": {key: {"Delay": {"type": "string"}}},
                         "local": {"$ref": f"#/properties/w/{key}/WaitFor"},
                     },
                 }

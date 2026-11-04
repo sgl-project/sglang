@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
+    hoist_json_schema_defs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -149,6 +150,53 @@ class TestJsonSchemaConstraint(unittest.TestCase):
                 jsonschema.Draft202012Validator(schema).validate(
                     [{"name": "noop", "parameters": {"any": 1}}]
                 )
+
+    def test_required_tool_choice_after_hoisting_nested_defs(self):
+        """Unused nested definitions that differ across tools must not make a
+        required-choice request conflict once hoisted; referenced ones still resolve."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="f",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "x": {
+                                "$ref": "#/$defs/Used",
+                                "$defs": {
+                                    "Used": {"type": "integer"},
+                                    "Unused": {"type": "string"},
+                                },
+                            }
+                        },
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="other",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "y": {
+                                "type": "integer",
+                                "$defs": {"Unused": {"type": "integer"}},
+                            }
+                        },
+                    },
+                ),
+            ),
+        ]
+        for tool in tools:
+            hoist_json_schema_defs(tool.function.parameters)
+        validator = jsonschema.Draft202012Validator(
+            get_json_schema_constraint(tools, "required")
+        )
+        validator.validate([{"name": "f", "parameters": {"x": 1}}])
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate([{"name": "f", "parameters": {"x": "1"}}])
 
     def test_specific_tool_choice_dict_schema(self):
         """Test schema generation for specific tool choice as ToolChoice object"""
