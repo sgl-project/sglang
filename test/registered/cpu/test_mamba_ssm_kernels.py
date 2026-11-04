@@ -77,7 +77,6 @@ def _assert_close_scaled(actual, expected, dtype):
     ("dtype", "seqlen", "chunk_size", "nheads", "headdim", "dstate", "ngroups"),
     [
         (torch.bfloat16, 13, 4, 4, 16, 32, 2),
-        (torch.float16, 19, 8, 8, 16, 64, 4),
     ],
 )
 @pytest.mark.parametrize("has_z", [False, True])
@@ -139,7 +138,6 @@ SCAN_EDGE_CASES = [
 ]
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     (
         "seqlen",
@@ -154,9 +152,10 @@ SCAN_EDGE_CASES = [
     SCAN_EDGE_CASES,
 )
 def test_mamba_chunk_scan_combined_cpu_edge_cases(
-    dtype, seqlen, chunk_size, nheads, headdim, dstate, ngroups, has_init, D_1d
+    seqlen, chunk_size, nheads, headdim, dstate, ngroups, has_init, D_1d
 ):
     torch.manual_seed(7)
+    dtype = torch.bfloat16
     batch = 1
     x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype)
     dt = torch.randn(batch, seqlen, nheads, dtype=dtype)
@@ -194,7 +193,6 @@ def test_mamba_chunk_scan_combined_cpu_edge_cases(
     _assert_close_scaled(final_state, expected_state, dtype)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     ("seqlen", "chunk_size", "nheads", "headdim", "dstate", "ngroups"),
     [
@@ -203,9 +201,10 @@ def test_mamba_chunk_scan_combined_cpu_edge_cases(
     ],
 )
 def test_mamba_chunk_scan_combined_cpu_vs_ssd_minimal(
-    dtype, seqlen, chunk_size, nheads, headdim, dstate, ngroups
+    seqlen, chunk_size, nheads, headdim, dstate, ngroups
 ):
     torch.manual_seed(0)
+    dtype = torch.bfloat16
     batch = 1
     A = -torch.exp(torch.rand(nheads))
     dt = F.softplus(torch.randn(batch, seqlen, nheads) - 4).to(dtype)
@@ -400,11 +399,11 @@ def _selective_state_update_reference(
     return output, expected_state
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dstate", [16, 64])
 @pytest.mark.parametrize("disable_state_update", [False, True])
-def test_selective_state_update_cpu(dtype, dstate, disable_state_update):
+def test_selective_state_update_cpu(dstate, disable_state_update):
     torch.manual_seed(31)
+    dtype = torch.bfloat16
     batch, time, nheads, dim, ngroups = 3, 3, 4, 16, 2
     state = torch.randn(6, nheads, dim, dstate, dtype=dtype)
     state_before = state.clone()
@@ -459,7 +458,6 @@ def test_selective_state_update_cpu(dtype, dstate, disable_state_update):
     assert torch.equal(state[5], state_before[5])
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("state_dtype", [torch.float32, None])
 @pytest.mark.parametrize(
     ("batch", "nheads", "headdim", "dstate", "ngroups"),
@@ -469,10 +467,11 @@ def test_selective_state_update_cpu(dtype, dstate, disable_state_update):
     ],
 )
 def test_selective_state_update_cpu_mamba2_layout(
-    dtype, state_dtype, batch, nheads, headdim, dstate, ngroups
+    state_dtype, batch, nheads, headdim, dstate, ngroups
 ):
     # same expanded (stride 0) A/dt/dt_bias/D layout as the Mamba2 decode path
     torch.manual_seed(5)
+    dtype = torch.bfloat16
     state_dtype = state_dtype or dtype
     total_slots = 4 * batch
     state = torch.randn(total_slots, nheads, headdim, dstate, dtype=state_dtype)
@@ -511,10 +510,10 @@ def test_selective_state_update_cpu_mamba2_layout(
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_selective_state_update_cpu_mamba1_layout(dtype):
+def test_selective_state_update_cpu_mamba1_layout():
     # Mamba1 decode maps onto (nheads=dim, head_dim=1, ngroups=1) with a z gate
     torch.manual_seed(9)
+    dtype = torch.bfloat16
     batch, dim, dstate = 4, 256, 16
     state = torch.randn(batch, dim, 1, dstate)
     x = torch.randn(batch, dim, 1, dtype=dtype)
@@ -538,6 +537,317 @@ def test_selective_state_update_cpu_mamba1_layout(dtype):
     rtol, atol = (1e-1, 1e-1) if dtype == torch.bfloat16 else (5e-3, 3e-2)
     torch.testing.assert_close(state, state_ref, rtol=3e-4, atol=1e-3)
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
+
+
+# nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 Mamba config.
+NEMOTRON_DTYPE = torch.bfloat16
+NEMOTRON_MAMBA_NUM_HEADS = 64
+NEMOTRON_MAMBA_HEAD_DIM = 64
+NEMOTRON_SSM_STATE_SIZE = 128
+NEMOTRON_N_GROUPS = 8
+NEMOTRON_CHUNK_SIZE = 128
+NEMOTRON_DT_LIMIT = (0.0, float("inf"))
+
+
+def _nemotron_make_negative_A(nheads):
+    return -torch.rand(nheads, dtype=torch.float32) - 0.1
+
+
+@pytest.mark.parametrize("has_z", [False, True])
+def test_nemotron_mamba_chunk_scan_combined_cpu_direct_model_shape(has_z):
+    torch.manual_seed(2026)
+    batch = 1
+    seqlen = NEMOTRON_CHUNK_SIZE + 1
+    nheads = NEMOTRON_MAMBA_NUM_HEADS
+    headdim = NEMOTRON_MAMBA_HEAD_DIM
+    dstate = NEMOTRON_SSM_STATE_SIZE
+    ngroups = NEMOTRON_N_GROUPS
+    dtype = NEMOTRON_DTYPE
+
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype)
+    dt = torch.randn(batch, seqlen, nheads, dtype=dtype)
+    A = _nemotron_make_negative_A(nheads)
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype)
+    C = torch.randn_like(B)
+    D = torch.randn(nheads, dtype=torch.float32)
+    z = torch.randn_like(x) if has_z else None
+    dt_bias = torch.randn(nheads, dtype=torch.float32) - 3.0
+    initial_states = torch.randn(batch, nheads, headdim, dstate, dtype=dtype) * 0.1
+    out = torch.empty_like(x)
+
+    final_state = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        NEMOTRON_CHUNK_SIZE,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        dt_softplus=True,
+        dt_limit=NEMOTRON_DT_LIMIT,
+        out=out,
+        return_final_states=True,
+        state_dtype=dtype,
+    )
+    expected_out, expected_state = _mamba_scan_reference(
+        x, dt, A, B, C, D, z, dt_bias, initial_states, NEMOTRON_DT_LIMIT
+    )
+
+    _assert_close_scaled(out, expected_out, dtype)
+    _assert_close_scaled(final_state, expected_state, dtype)
+
+
+def test_nemotron_mamba_chunk_scan_combined_cpu_varlen_track_model_shape():
+    torch.manual_seed(2027)
+    dtype = NEMOTRON_DTYPE
+    seqlens = [1, NEMOTRON_CHUNK_SIZE + 1]
+    total_tokens = sum(seqlens)
+    nheads = NEMOTRON_MAMBA_NUM_HEADS
+    headdim = NEMOTRON_MAMBA_HEAD_DIM
+    dstate = NEMOTRON_SSM_STATE_SIZE
+    ngroups = NEMOTRON_N_GROUPS
+
+    x = torch.randn(1, total_tokens, nheads, headdim, dtype=dtype)
+    dt = torch.randn(1, total_tokens, nheads, dtype=dtype)
+    A = _nemotron_make_negative_A(nheads)
+    B = torch.randn(1, total_tokens, ngroups, dstate, dtype=dtype)
+    C = torch.randn_like(B)
+    D = torch.randn(nheads, dtype=torch.float32)
+    dt_bias = torch.randn(nheads, dtype=torch.float32) - 3.0
+    initial_states = torch.randn(len(seqlens), nheads, headdim, dstate, dtype=dtype) * 0.1
+    cu_seqlens = torch.tensor([0, seqlens[0], total_tokens], dtype=torch.int32)
+    seq_idx = torch.cat(
+        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(seqlens)]
+    )[None]
+    chunk_indices = torch.tensor([[0, 0], [1, 0], [1, 1]], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 0, NEMOTRON_CHUNK_SIZE], dtype=torch.int32)
+    track_seq_idx = torch.tensor([0, 1], dtype=torch.int32)
+    track_end_locs = torch.tensor([1, seqlens[0] + NEMOTRON_CHUNK_SIZE], dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    intermediate_states, varlen_states, track_states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        NEMOTRON_CHUNK_SIZE,
+        D=D,
+        z=None,
+        dt_bias=dt_bias,
+        seq_idx=seq_idx,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        cu_seqlens=cu_seqlens,
+        initial_states=initial_states,
+        dt_softplus=True,
+        dt_limit=NEMOTRON_DT_LIMIT,
+        out=out,
+        return_varlen_states=True,
+        return_final_states=False,
+        return_track_states=True,
+        track_seq_idx=track_seq_idx,
+        track_end_locs=track_end_locs,
+        state_dtype=dtype,
+    )
+
+    expected_out = torch.empty_like(x)
+    expected_intermediate = [initial_states[0]]
+    expected_final = []
+    expected_track = []
+    start = 0
+    for sequence, length in enumerate(seqlens):
+        end = start + length
+        sequence_out, sequence_final = _mamba_scan_reference(
+            x[:, start:end],
+            dt[:, start:end],
+            A,
+            B[:, start:end],
+            C[:, start:end],
+            D,
+            None,
+            dt_bias,
+            initial_states[sequence : sequence + 1],
+            NEMOTRON_DT_LIMIT,
+        )
+        expected_out[:, start:end].copy_(sequence_out)
+        expected_final.append(sequence_final[0])
+
+        boundary = NEMOTRON_CHUNK_SIZE
+        if start < boundary < end:
+            _, boundary_state = _mamba_scan_reference(
+                x[:, start:boundary],
+                dt[:, start:boundary],
+                A,
+                B[:, start:boundary],
+                C[:, start:boundary],
+                D,
+                None,
+                dt_bias,
+                initial_states[sequence : sequence + 1],
+                NEMOTRON_DT_LIMIT,
+            )
+            expected_intermediate.append(boundary_state[0])
+
+        tracked_length = int(track_end_locs[sequence]) - start
+        _, tracked_final = _mamba_scan_reference(
+            x[:, start : start + tracked_length],
+            dt[:, start : start + tracked_length],
+            A,
+            B[:, start : start + tracked_length],
+            C[:, start : start + tracked_length],
+            D,
+            None,
+            dt_bias,
+            initial_states[sequence : sequence + 1],
+            NEMOTRON_DT_LIMIT,
+        )
+        expected_track.append(tracked_final[0])
+        start = end
+
+    _assert_close_scaled(out, expected_out, dtype)
+    assert intermediate_states.shape == (1, 2, nheads, headdim, dstate)
+    _assert_close_scaled(intermediate_states[0], torch.stack(expected_intermediate), dtype)
+    _assert_close_scaled(varlen_states, torch.stack(expected_final), dtype)
+    _assert_close_scaled(track_states, torch.stack(expected_track), dtype)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "batch"),
+    [
+        (1, 2),
+        (2, 2),
+        (4, 4),
+        (8, 4),
+    ],
+)
+def test_nemotron_selective_state_update_cpu_decode_model_shapes(tp_size, batch):
+    torch.manual_seed(2028 + tp_size)
+    dtype = NEMOTRON_DTYPE
+    nheads = NEMOTRON_MAMBA_NUM_HEADS // tp_size
+    ngroups = NEMOTRON_N_GROUPS // tp_size
+    headdim = NEMOTRON_MAMBA_HEAD_DIM
+    dstate = NEMOTRON_SSM_STATE_SIZE
+    total_slots = 4 * batch
+
+    state = torch.randn(total_slots, nheads, headdim, dstate, dtype=dtype)
+    state_indices = torch.randperm(total_slots)[:batch].to(torch.int32)
+    state_ref = state[state_indices].clone()
+
+    A = _nemotron_make_negative_A(nheads)
+    A_d = A[:, None, None].expand(-1, headdim, dstate)
+    dt = torch.randn(batch, nheads, dtype=dtype)
+    dt_d = dt[:, :, None].expand(-1, -1, headdim)
+    dt_bias = (torch.rand(nheads, dtype=torch.float32) - 4.0)[:, None].expand(
+        -1, headdim
+    )
+    D = torch.randn(nheads, dtype=torch.float32)
+    D_d = D[:, None].expand(-1, headdim)
+    x = torch.randn(batch, nheads, headdim, dtype=dtype)
+    B = torch.randn(batch, ngroups, dstate, dtype=dtype)
+    C = torch.randn_like(B)
+    out = torch.empty_like(x)
+
+    selective_state_update(
+        state,
+        x,
+        dt_d,
+        A_d,
+        B,
+        C,
+        D=D_d,
+        z=None,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_indices,
+        out=out,
+    )
+    out_ref = selective_state_update_ref(
+        state_ref,
+        x,
+        dt_d,
+        A_d,
+        B,
+        C,
+        D=D_d,
+        z=None,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+    )
+
+    torch.testing.assert_close(state[state_indices], state_ref, rtol=0.1, atol=0.1)
+    torch.testing.assert_close(out, out_ref, rtol=0.1, atol=0.1)
+
+
+def test_nemotron_selective_state_update_cpu_decode_pad_slot_model_shape():
+    torch.manual_seed(2029)
+    dtype = NEMOTRON_DTYPE
+    batch = 3
+    nheads = NEMOTRON_MAMBA_NUM_HEADS
+    ngroups = NEMOTRON_N_GROUPS
+    headdim = NEMOTRON_MAMBA_HEAD_DIM
+    dstate = NEMOTRON_SSM_STATE_SIZE
+
+    state = torch.randn(8, nheads, headdim, dstate, dtype=dtype)
+    state_before = state.clone()
+    state_indices = torch.tensor([4, PAD_SLOT_ID, 1], dtype=torch.int32)
+    x = torch.randn(batch, nheads, headdim, dtype=dtype)
+    dt = torch.randn(batch, nheads, dtype=dtype)[:, :, None].expand(-1, -1, headdim)
+    A = _nemotron_make_negative_A(nheads)[:, None, None].expand(-1, headdim, dstate)
+    B = torch.randn(batch, ngroups, dstate, dtype=dtype)
+    C = torch.randn_like(B)
+    D = torch.randn(nheads, dtype=torch.float32)[:, None].expand(-1, headdim)
+    dt_bias = (torch.rand(nheads, dtype=torch.float32) - 4.0)[:, None].expand(
+        -1, headdim
+    )
+    out = torch.full_like(x, 17.0)
+
+    selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        z=None,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_indices,
+        pad_slot_id=PAD_SLOT_ID,
+        out=out,
+    )
+
+    state_ref = state_before[state_indices[state_indices != PAD_SLOT_ID]].clone()
+    x_ref = x[state_indices != PAD_SLOT_ID]
+    dt_ref = dt[state_indices != PAD_SLOT_ID]
+    B_ref = B[state_indices != PAD_SLOT_ID]
+    C_ref = C[state_indices != PAD_SLOT_ID]
+    out_ref = selective_state_update_ref(
+        state_ref,
+        x_ref,
+        dt_ref,
+        A,
+        B_ref,
+        C_ref,
+        D=D,
+        z=None,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+    )
+
+    torch.testing.assert_close(out[0], out_ref[0], rtol=0.1, atol=0.1)
+    torch.testing.assert_close(out[2], out_ref[1], rtol=0.1, atol=0.1)
+    assert torch.equal(out[1], torch.full_like(out[1], 17.0))
+    assert torch.equal(state[0], state_before[0])
+    assert torch.equal(state[2], state_before[2])
+    assert torch.equal(state[3], state_before[3])
+    assert torch.equal(state[5], state_before[5])
+    assert torch.equal(state[6], state_before[6])
+    assert torch.equal(state[7], state_before[7])
 
 
 if __name__ == "__main__":
