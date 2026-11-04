@@ -258,9 +258,7 @@ def _mamba_chunk_scan_cpu_varlen(
     def initial_state_for(seq_idx):
         if initial_states is not None:
             return initial_states[seq_idx].to(result_dtype)
-        return torch.zeros(
-            nheads, headdim, dstate, dtype=result_dtype, device=x.device
-        )
+        return torch.zeros(nheads, headdim, dstate, dtype=result_dtype, device=x.device)
 
     def run_segment(seq_idx, start, end, segment_out=None):
         init = (

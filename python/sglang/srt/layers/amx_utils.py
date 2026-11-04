@@ -152,7 +152,6 @@ def _amx_process_weight_after_loading(
             if transpose_dims and transpose_dims[i]:
                 weight_tensor = weight_tensor.transpose(*transpose_dims[i])
             is_conv_weight = is_dim_conv_weight(weight_tensor)
-
             # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
             if (
                 (not dim_is_supported(weight_tensor))

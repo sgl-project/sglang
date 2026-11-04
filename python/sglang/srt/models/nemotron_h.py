@@ -422,8 +422,8 @@ class NemotronHMoE(nn.Module):
             if self.use_latent_moe:
                 hidden_states = self._apply_fc1_latent_proj(hidden_states)
             final_hidden_states = self.experts(hidden_states, topk_output)
-
         get_current_device_stream_fast().wait_stream(alt_stream)
+
         return final_hidden_states, shared_output
 
     def _forward_core_prefill_overlap(

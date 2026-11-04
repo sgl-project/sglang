@@ -468,10 +468,8 @@ void biased_grouped_topk_kernel_impl(
 
       // Use ATen topk(sorted=False) so tie behavior matches
       // biased_grouped_topk_impl exactly.
-      auto tmp_scores_tensor = at::from_blob(
-          tmp_scores,
-          {NUM_EXPERTS},
-          at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+      auto tmp_scores_tensor =
+          at::from_blob(tmp_scores, {NUM_EXPERTS}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
       auto topk_result = at::topk(tmp_scores_tensor, TOPK, -1, true, false);
       auto topk_idx_tensor = std::get<1>(topk_result);
       const int64_t* topk_idx_ptr = topk_idx_tensor.template data_ptr<int64_t>();

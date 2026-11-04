@@ -253,15 +253,11 @@ void causal_conv1d_fwd_kernel_impl(
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
-        const bool has_initial_states_value =
-            has_conv_states && has_initial_state != nullptr && has_initial_state[bs];
+        const bool has_initial_states_value = has_conv_states && has_initial_state != nullptr && has_initial_state[bs];
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
         if (has_conv_indices && conv_state_index == pad_slot_id) {
           for (int64_t m = 0; m < mb_size; ++m) {
-            std::memset(
-                out + bs * seqlen * dim + (mb_start + m) * dim + nb_start,
-                0,
-                nb_size * sizeof(scalar_t));
+            std::memset(out + bs * seqlen * dim + (mb_start + m) * dim + nb_start, 0, nb_size * sizeof(scalar_t));
           }
           data_index_step(mb, num_seq_blocks, nb, NB);
           continue;
@@ -308,16 +304,16 @@ void causal_conv1d_fwd_kernel_impl(
   }
 }
 
-#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                                                   \
-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                                  \
-      input + batch_offset * dim + mb_start * dim + nb_start,                                       \
-      weight + nb_start * width,                                                                    \
-      out + batch_offset * dim + mb_start * dim + nb_start,                                         \
-      has_bias ? bias + nb_start : nullptr,                                                         \
+#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                                                     \
+  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                                   \
+      input + batch_offset * dim + mb_start * dim + nb_start,                                         \
+      weight + nb_start * width,                                                                      \
+      out + batch_offset * dim + mb_start * dim + nb_start,                                           \
+      has_bias ? bias + nb_start : nullptr,                                                           \
       has_initial_states_value ? conv_states + conv_state_index * (K - 1) * dim + nb_start : nullptr, \
-      has_initial_states_value,                                                                     \
-      mb_size,                                                                                      \
-      dim,                                                                                          \
+      has_initial_states_value,                                                                       \
+      mb_size,                                                                                        \
+      dim,                                                                                            \
       mb_start == 0);
 
 template <typename scalar_t>
@@ -365,10 +361,7 @@ void causal_conv1d_fwd_varlen_kernel_impl(
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
         if (has_conv_indices && conv_state_index == pad_slot_id) {
           for (int64_t m = 0; m < mb_size; ++m) {
-            std::memset(
-                out + batch_offset * dim + (mb_start + m) * dim + nb_start,
-                0,
-                nb_size * sizeof(scalar_t));
+            std::memset(out + batch_offset * dim + (mb_start + m) * dim + nb_start, 0, nb_size * sizeof(scalar_t));
           }
           data_index_step(mb, num_seq_blocks, nb, NB);
           continue;
@@ -376,8 +369,7 @@ void causal_conv1d_fwd_varlen_kernel_impl(
         if (has_conv_states) {
           TORCH_CHECK(conv_state_index >= 0 && conv_state_index < num_cache_lines, "conv state index out of range");
         }
-        const bool has_initial_states_value =
-            has_conv_states && has_initial_state != nullptr && has_initial_state[bs];
+        const bool has_initial_states_value = has_conv_states && has_initial_state != nullptr && has_initial_state[bs];
 
         switch (width << 4 | nb_size >> 4) {
           case 0x42:
