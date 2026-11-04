@@ -25,7 +25,8 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_exec,

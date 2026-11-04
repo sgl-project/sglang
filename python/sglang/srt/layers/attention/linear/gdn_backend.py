@@ -40,7 +40,8 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -548,6 +549,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
+    def _create_kernel_dispatcher(self, backends):
+        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
@@ -562,9 +566,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
-        self.kernel_dispatcher = GDNKernelDispatcher(
-            backends.decode, backends.prefill, backends.verify
-        )
+        self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
