@@ -1857,6 +1857,7 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
             torch.zeros((2, 1), dtype=torch.int64),
             torch.tensor([2, 3]),
             None,
+            None,
         )
 
         future_map._resolve_spec_extras(SimpleNamespace(spec_info=spec_input))

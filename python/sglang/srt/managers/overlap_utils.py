@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import (
+    gather_spec_extras,
+    scatter_spec_extras,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
@@ -348,6 +351,9 @@ class FutureMap:
         self.accept_lens_buf: Optional[torch.Tensor] = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
+        # Off when every reader of the published lengths is ordered on the forward
+        # stream (the scheduler decides), so no event is recorded for them.
+        self.record_publish = True
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
@@ -498,6 +504,10 @@ class FutureMap:
         # record_batch_in_overlap; record_stream here is redundant.
         if indices.device.type != "cpu":
             indices.record_stream(torch.get_device_module(self.device).current_stream())
+        with_dsa_topk = draft_input.future_dsa_topk_indices_available
+        if with_dsa_topk:
+            assert self.dsa_topk_indices_buf is not None
+        draft_input.dsa_topk_indices = None
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
@@ -507,12 +517,14 @@ class FutureMap:
                 draft_input.topk_index,
                 bonus_tokens,
                 hidden_states,
+                draft_input.dsa_topk_indices,
             ) = gather_spec_extras(
                 indices,
                 self.topk_p_buf,
                 self.topk_index_buf,
                 self.output_tokens_buf,
                 hidden_states_buf,
+                self.dsa_topk_indices_buf if with_dsa_topk else None,
             )
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
@@ -526,11 +538,8 @@ class FutureMap:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
-        if draft_input.future_dsa_topk_indices_available:
-            assert self.dsa_topk_indices_buf is not None
+        if with_dsa_topk and not self.need_topk:
             draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
-        else:
-            draft_input.dsa_topk_indices = None
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -669,7 +678,7 @@ class FutureMap:
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
-        if self.spec_algo.is_some():
+        if self.spec_algo.is_some() and self.record_publish:
             if self.publish_ready is None:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
@@ -693,31 +702,39 @@ class FutureMap:
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         relay = self._relay
+        bonus = (payload.bonus_tokens, self.output_tokens_buf)
         if relay is not None and payload.bonus_tokens is relay.published_bonus:
             relay.published_bonus = None
-        else:
-            self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-                self.output_tokens_buf.dtype
-            )
+            bonus = None
 
         # Staging transitions refresh only the bonus token. Preserve top-k and
         # hidden state already published by the preceding target forward.
-        if self.need_topk and payload.topk_p is not None:
+        topk = self.need_topk and payload.topk_p is not None
+        if topk:
             assert payload.topk_index is not None
-            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
-            self.topk_index_buf[indices] = payload.topk_index.to(
-                self.topk_index_buf.dtype
-            )
-        if self.need_hidden_states and payload.hidden_states is not None:
-            self.hidden_states_buf[indices] = payload.hidden_states.to(
-                self.hidden_states_buf.dtype
-            )
-        if self.draft_probs_buf is not None and payload.draft_probs is not None:
-            self.draft_probs_buf[indices] = payload.draft_probs
-        if (
-            self.dsa_topk_indices_buf is not None
-            and payload.dsa_topk_indices is not None
-        ):
-            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
-                self.dsa_topk_indices_buf.dtype
-            )
+        # One launch writes every relayed row (each pair: rows, the buffer they go to)
+        scatter_spec_extras(
+            indices,
+            (
+                bonus,
+                (payload.topk_p, self.topk_p_buf) if topk else None,
+                (payload.topk_index, self.topk_index_buf) if topk else None,
+                (
+                    (payload.hidden_states, self.hidden_states_buf)
+                    if self.need_hidden_states and payload.hidden_states is not None
+                    else None
+                ),
+                (
+                    (payload.draft_probs, self.draft_probs_buf)
+                    if self.draft_probs_buf is not None
+                    and payload.draft_probs is not None
+                    else None
+                ),
+                (
+                    (payload.dsa_topk_indices, self.dsa_topk_indices_buf)
+                    if self.dsa_topk_indices_buf is not None
+                    and payload.dsa_topk_indices is not None
+                    else None
+                ),
+            ),
+        )
