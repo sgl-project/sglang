@@ -1710,8 +1710,10 @@ def _gather_mamba_track_indices(
     req_pool_indices: torch.Tensor,
     track_positions: torch.Tensor,
 ) -> torch.Tensor:
-    """Each request's ping-pong slot id at its track position, read on the device."""
-    return ping_pong_mapping[req_pool_indices, track_positions]
+    """Each request's ping-pong slot id at its track position, read on the device;
+    a negative position has no slot and gives -1."""
+    slots = ping_pong_mapping[req_pool_indices, track_positions.clamp(min=0)]
+    return torch.where(track_positions >= 0, slots, -1)
 
 
 def mamba_lazy_spec_in_window(
@@ -1737,10 +1739,7 @@ def set_mamba_track_indices_from_reqs(
     """
     mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
-        # Guard: mamba_next_track_idx may be None for requests that haven't
-        # been given a ping-pong buffer yet (e.g., spec v2 verify path).
-        # Keep the gather in bounds for those requests. Freed rows are
-        # invalidated below so they cannot scatter into a recycled slot.
+        # A request without a ping-pong buffer yet (spec v2 verify) records 0.
         track_positions = [
             (
                 req.kv.mamba_next_track_idx
@@ -1749,22 +1748,20 @@ def set_mamba_track_indices_from_reqs(
             )
             for req in batch.reqs
         ]
-    # A -1 position gathers the last column; the row is invalidated below.
-    skipped_rows = [
-        i
-        for i, (req, position) in enumerate(zip(batch.reqs, track_positions))
-        if req.kv.mamba_next_track_idx is None or position < 0
-    ]
     batch.mamba_track_buffer_indices = list(track_positions)
-    positions = async_h2d(track_positions, dtype=torch.int64, device=mapping.device)
+    # A request whose state was freed under overlap (it may already belong to
+    # another request) has no slot; -1 makes the scatter write nothing.
+    positions = async_h2d(
+        [
+            -1 if req.kv.mamba_next_track_idx is None else position
+            for req, position in zip(batch.reqs, track_positions)
+        ],
+        dtype=torch.int64,
+        device=mapping.device,
+    )
     batch.mamba_track_indices = _gather_mamba_track_indices(
         mapping, batch.req_pool_indices, positions
     )
-    if skipped_rows:
-        # A row whose state was freed under overlap (and may already belong to
-        # another request) or that has no planned slot must scatter nothing;
-        # the scatter treats a negative destination as a no-op.
-        batch.mamba_track_indices[skipped_rows] = -1
 
 
 def unresumable_abort_message() -> str:
