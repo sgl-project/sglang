@@ -23,9 +23,9 @@ from sglang.srt.managers.mm_schedule import (
     _move_items_to_device,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
     move,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
@@ -196,13 +196,13 @@ class DocPrefetch:
         # Vision runs on every TP rank in lockstep; it is not encoded out of step.
         self._encode_ahead = early is not None and tp_size == 1
         # Follow-ups waiting for their predecessor.
-        self._parked = _RequestList(
+        self._parked = IndexedReqList(
             ListKind.UOCR_PARKED, abort=lambda r: self._abort(self._parked, r)
         )
         # Completion tokens of finished predecessors whose follow-up has not arrived.
         self._finished: Dict[str, int] = {}
         # Follow-ups whose predecessor finished, for the scheduler to queue.
-        self._released = _RequestList(
+        self._released = IndexedReqList(
             ListKind.UOCR_RELEASED, abort=lambda r: self._abort(self._released, r)
         )
 
@@ -259,13 +259,13 @@ class DocPrefetch:
         """Follow-ups released since the last call, in release order."""
         return self._released.take()
 
-    def request_lists(self) -> Dict[ListKind, RequestList]:
+    def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
             ListKind.UOCR_PARKED: self._parked,
             ListKind.UOCR_RELEASED: self._released,
         }
 
-    def _abort(self, windows: RequestList, recv_req: AbortReq) -> None:
+    def _abort(self, windows: ReqList, recv_req: AbortReq) -> None:
         aborted = windows.take(lambda r: recv_req.matches(r.rid))
         for r in aborted:
             self.release_early(r.rid)
