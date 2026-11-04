@@ -4830,3 +4830,9 @@ Parent independent checks: 12 real HTTP proxy tests passed; 44 orchestrator test
 Engine bounded owner-thread feedback polling plus optional separate nonblocking ZMQ/replay publisher, actual native mutation watermarks, request-use facts and explicit association, claim/invalidation events, legacy location/session watermark preservation are integrated. Parent review covered journal byte/record bounds, source/cursor/gap handling, request accounting and lifecycle hooks.
 
 Parent independent isolated tests145passed90subtests; integrated with native/demand sharing149passed92subtests(33.96s), Router wire24passed. A prior integrated attempt hit the existing random-port probe bind race; isolated KV events7passed4subtests and final full rerun passed, no production change hidden. Evidence p7a-parent-tests.log, p7a-integrated-final-tests.log, p7a-port-recheck.log, p7a-parent-wire-tests.log and p7-report.md under /tmp/sglang-rfc-build. P7b indexer source fences and P7c Router consumption are separate commits.
+
+## P7b Indexer recovery acceptance — 2026-11-04
+
+Registered publisher source epochs, compare-and-swap lifecycle authority, bounded retired epochs/chunk fingerprints, atomic placement+query evidence, native cache generation/version, session label preservation, bridge split-batch coordinates and Indexer restart UUID fences are integrated. Legacy sources remain advisory/unknown; trusted empty-cut reconciliation and external invalidation are explicit, no durable replay/HA advertised.
+
+Parent reviewed source gate/reconcile/clear paths, placement lock atomicity, split bridge shape, client confirmation filters and protobuf reserved fields. Independent indexer156passed; combined main indexer156+orchestrator44passed with1optional liveignored. P6/P7a retained. Evidence: /tmp/sglang-rfc-build/p7b-report.md, p7b-parent-tests.log, p7b-integrated-tests.log.

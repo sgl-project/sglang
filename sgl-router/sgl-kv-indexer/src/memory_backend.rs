@@ -16,9 +16,11 @@ use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
     ExternalKvActionType, ExternalKvNodeMatch, GetExternalKvHitCountsRequest,
     GetExternalKvHitCountsResponse, HitCountEntry, MatchExternalKvPrefixRequest,
-    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
-    TierType, WorkerCacheSpec,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+    QueryObservation, ReconcileSourceRequest, ReconcileSourceResponse, RegisterSourceRequest,
+    RegisterSourceResponse, SourceObservation, TierHashes, TierType, WorkerCacheSpec,
 };
+use crate::recovery::{SourceLimits, SourceRegistry};
 use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner, COMPONENT_FULL};
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
 
@@ -40,6 +42,7 @@ struct BlockRecord {
     token_count: u32,
     /// Resident component snapshot for each `(worker, tier)`.
     placements: HashMap<(String, i32), u32>,
+    sessions: HashMap<(String, i32), String>,
     /// Workers for which the root-to-this-block prefix is complete and this
     /// boundary is servable by the Legacy/FULL-only fast path.
     prefix_complete_workers: HashSet<String>,
@@ -58,6 +61,7 @@ struct WorkerRecord {
 
 #[derive(Debug, Default)]
 struct State {
+    sources: SourceRegistry,
     blocks: HashMap<i64, BlockRecord>,
     workers: HashMap<String, WorkerRecord>,
     hit_counts: HashMap<i64, u64>,
@@ -67,7 +71,7 @@ struct WorkerView {
     worker_id: String,
     address: String,
     spec: Option<WorkerCacheSpec>,
-    hashes_by_tier: BTreeMap<i32, Vec<(i64, u32, u32)>>,
+    hashes_by_tier: BTreeMap<i32, Vec<(i64, u32, u32, String)>>,
     blocks: Vec<Option<BlockComponents>>,
 }
 
@@ -95,6 +99,14 @@ impl InMemoryKvIndexerBackend {
         Self::default()
     }
 
+    pub fn with_source_limits(limits: SourceLimits) -> Self {
+        assert!(limits.max_sources > 0 && limits.max_retired_epochs > 0);
+        let mut state = State::default();
+        state.sources.limits = limits;
+        Self {
+            state: RwLock::new(state),
+        }
+    }
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, Status> {
         self.state
             .read()
@@ -112,9 +124,29 @@ impl InMemoryKvIndexerBackend {
         req: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let mut state = self.write_state()?;
+        crate::service::validate_source_apply(&req)?;
+        if req.worker_id.is_empty() || req.worker_id.len() > 256 {
+            return Err(Status::invalid_argument("invalid worker id"));
+        }
+        if !state.workers.contains_key(&req.worker_id)
+            && state.workers.len() >= state.sources.limits.max_sources
+        {
+            return Err(Status::resource_exhausted("worker/source capacity"));
+        }
+        crate::service::validate_actions(&req.actions)?;
+        if !state.sources.replay_candidate(&req) {
+            validate_actions(&state, &req.actions)?;
+        }
+        let gate = state.sources.apply(&req);
+        clear_worker_tiers(&mut state, &req.worker_id, &gate.clear);
+        let duplicate = gate.result?;
+        if duplicate {
+            return Ok(ApplyExternalKvBatchResponse {
+                duplicate_chunk: true,
+                source: state.sources.view(&req.worker_id),
+            });
+        }
         let worker_id = req.worker_id;
-
-        validate_actions(&state, &req.actions)?;
 
         let previous_fast_path = state.workers.get(&worker_id).and_then(fast_path_kind);
 
@@ -157,6 +189,12 @@ impl InMemoryKvIndexerBackend {
                             .or_default()
                             .placements
                             .insert((worker_id.clone(), action.tier), mask);
+                        let sessions = &mut state.blocks.get_mut(&hash).unwrap().sessions;
+                        if let Some(session_id) = &action.session_id {
+                            sessions.insert((worker_id.clone(), action.tier), session_id.clone());
+                        } else {
+                            sessions.remove(&(worker_id.clone(), action.tier));
+                        }
                         adjust_component_placement_count(
                             &mut state,
                             &worker_id,
@@ -232,22 +270,28 @@ impl InMemoryKvIndexerBackend {
             prune_empty_leaf(&mut state, hash);
         }
 
-        Ok(ApplyExternalKvBatchResponse {})
+        Ok(ApplyExternalKvBatchResponse {
+            duplicate_chunk: false,
+            source: observation_for_worker(&state, &worker_id),
+        })
     }
 
     fn do_match(&self, req: MatchExternalKvRequest) -> Result<MatchExternalKvResponse, Status> {
         let hashes = dedup_preserve_order(&req.hashes);
-        let workers = if req.count_as_hit {
+        let (workers, observation) = if req.count_as_hit {
             let mut state = self.write_state()?;
             let (workers, matched_hashes) = Self::collect_worker_views(&state, &hashes, false);
             for hash in matched_hashes {
                 let count = state.hit_counts.entry(hash).or_default();
                 *count = count.saturating_add(1);
             }
-            workers
+            (workers, query_observation(&state))
         } else {
             let state = self.read_state()?;
-            Self::collect_worker_views(&state, &hashes, false).0
+            (
+                Self::collect_worker_views(&state, &hashes, false).0,
+                query_observation(&state),
+            )
         };
         let matches = workers
             .into_iter()
@@ -259,18 +303,25 @@ impl InMemoryKvIndexerBackend {
                     .into_iter()
                     .map(|(tier, placements)| TierHashes {
                         tier,
-                        hashes: placements.iter().map(|(hash, _, _)| *hash).collect(),
-                        component_masks: placements.iter().map(|(_, mask, _)| *mask).collect(),
+                        hashes: placements.iter().map(|(hash, _, _, _)| *hash).collect(),
+                        component_masks: placements.iter().map(|(_, mask, _, _)| *mask).collect(),
+                        session_ids: placements
+                            .iter()
+                            .map(|(_, _, _, session)| session.clone())
+                            .collect(),
                         block_sizes: placements
                             .into_iter()
-                            .map(|(_, _, block_size)| block_size)
+                            .map(|(_, _, block_size, _)| block_size)
                             .collect(),
                     })
                     .collect(),
             })
             .collect();
 
-        Ok(MatchExternalKvResponse { matches })
+        Ok(MatchExternalKvResponse {
+            matches,
+            observation: Some(observation),
+        })
     }
 
     fn collect_worker_views(
@@ -321,6 +372,11 @@ impl InMemoryKvIndexerBackend {
                         *hash,
                         *mask,
                         block.token_count,
+                        block
+                            .sessions
+                            .get(&(worker.clone(), *tier))
+                            .cloned()
+                            .unwrap_or_default(),
                     ));
                 }
             }
@@ -370,6 +426,7 @@ impl InMemoryKvIndexerBackend {
                 matches: Vec::new(),
                 best_prefix_blocks: 0,
                 blocks_read: 1,
+                observation: Some(query_observation(&state)),
             });
         };
         let known_prefix_len = known_request_prefix_len(&state, hashes).unwrap_or(0);
@@ -474,7 +531,9 @@ impl InMemoryKvIndexerBackend {
                 prefix,
             ))
         }));
-        Ok(assemble_prefix_response(entries, limit as u32))
+        let mut response = assemble_prefix_response(entries, limit as u32);
+        response.observation = Some(query_observation(&state));
+        Ok(response)
     }
 
     fn do_hit_counts(
@@ -496,6 +555,61 @@ impl InMemoryKvIndexerBackend {
             })
             .collect();
         Ok(GetExternalKvHitCountsResponse { entries })
+    }
+}
+
+fn clear_worker_tiers(state: &mut State, worker_id: &str, tiers: &[i32]) {
+    if tiers.is_empty() {
+        return;
+    }
+    let mut dirty = Vec::new();
+    for tier in tiers {
+        let hashes = state
+            .workers
+            .get(worker_id)
+            .and_then(|w| w.holdings.get(tier))
+            .cloned()
+            .unwrap_or_default();
+        for hash in hashes {
+            revoke_one(state, worker_id, &hash, *tier);
+            dirty.push(hash);
+        }
+    }
+    recompute_worker_subtrees(state, worker_id, dirty.clone());
+    for hash in dirty {
+        prune_empty_leaf(state, hash);
+    }
+}
+fn observation_for_worker(state: &State, worker: &str) -> Option<SourceObservation> {
+    state.sources.view(worker).or_else(|| {
+        state.workers.get(worker).map(|w| {
+            let mut tiers: Vec<_> = w.holdings.keys().copied().collect();
+            tiers.sort_unstable();
+            SourceObservation {
+                worker_id: worker.into(),
+                indexer_epoch: state.sources.indexer_epoch.clone(),
+                tiers,
+                reason: "legacy_unknown".into(),
+                ..Default::default()
+            }
+        })
+    })
+}
+fn query_observation(state: &State) -> QueryObservation {
+    let mut sources = state.sources.observations();
+    sources.extend(
+        state
+            .workers
+            .keys()
+            .filter(|w| !state.sources.contains(w))
+            .filter_map(|w| observation_for_worker(state, w)),
+    );
+    sources.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    QueryObservation {
+        scope_only: true,
+        full_snapshot: false,
+        sources,
+        indexer_epoch: state.sources.indexer_epoch.clone(),
     }
 }
 
@@ -810,6 +924,7 @@ fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
     let mut removed_mask = None;
     if let Some(block) = state.blocks.get_mut(hash) {
         removed_mask = block.placements.remove(&(worker_id.to_string(), tier));
+        block.sessions.remove(&(worker_id.to_string(), tier));
     }
     adjust_component_placement_count(state, worker_id, removed_mask, None);
 
@@ -865,6 +980,36 @@ fn dedup_preserve_order(hashes: &[i64]) -> Vec<i64> {
 
 #[tonic::async_trait]
 impl KvIndexerBackend for InMemoryKvIndexerBackend {
+    async fn register_source(
+        &self,
+        request: RegisterSourceRequest,
+    ) -> Result<RegisterSourceResponse, Status> {
+        let mut state = self.write_state()?;
+        if !state.workers.contains_key(&request.worker_id)
+            && state.workers.len() >= state.sources.limits.max_sources
+        {
+            return Err(Status::resource_exhausted("worker/source capacity"));
+        }
+        let worker = request.worker_id.clone();
+        let (tiers, source) = state.sources.register(request)?;
+        clear_worker_tiers(&mut state, &worker, &tiers);
+        Ok(RegisterSourceResponse {
+            source: Some(source),
+        })
+    }
+    async fn reconcile_source(
+        &self,
+        request: ReconcileSourceRequest,
+    ) -> Result<ReconcileSourceResponse, Status> {
+        let mut state = self.write_state()?;
+        let worker = request.worker_id.clone();
+        let (tiers, source) = state.sources.reconcile(request)?;
+        clear_worker_tiers(&mut state, &worker, &tiers);
+        Ok(ReconcileSourceResponse {
+            source: Some(source),
+        })
+    }
+
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,

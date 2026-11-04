@@ -76,12 +76,14 @@ message ExternalKvAction {
   // Every later hash is the child of the preceding hash. The Indexer and Bridge
   // are deployed together, so this new protocol does not support old senders.
   optional sfixed64 parent_block_hash = 6;
+  // Attribution on the physical report; no duplicate placement is created.
+  optional string session_id = 7;
 }
 
 message ApplyExternalKvBatchRequest {
   string worker_id = 1;
-  // The SGLang batch sequence number, monotonic per worker. Observability only:
-  // every batch is applied, with no deduplication, fencing, or checkpointing.
+  // Publisher sequence within source_epoch. Legacy epoch-less senders remain
+  // accepted with unknown observation completeness.
   uint64 seq = 2;
   repeated ExternalKvAction actions = 3;
   // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
@@ -94,13 +96,22 @@ message ApplyExternalKvBatchRequest {
   // The worker's component cache spec, carried on every batch so it self-heals
   // across reconnects and indexer restarts. Absent means legacy / full-only.
   WorkerCacheSpec cache_spec = 6;
+  optional string source_epoch = 7;
+  // All chunks of one publisher batch reuse seq; every chunk has a distinct
+  // index. New sources must send count >= 1, including an empty no-op batch.
+  uint32 chunk_index = 8;
+  uint32 chunk_count = 9;
+  // A decoded publisher batch lost mutations; invalidate before this chunk.
+  bool observation_gap = 10;
+  CacheWatermark cache_watermark = 11;
 }
 
-// Deliberately empty: applies are unconditional, so there is nothing to report
-// back. Kept as a message so the RPC signature stays stable.
+// Mutation receipt; the old reserved field numbers remain unused.
 message ApplyExternalKvBatchResponse {
   // Fields 1-3 held the durable seq checkpoint and duplicate flag.
   reserved 1, 2, 3;
+  bool duplicate_chunk = 4;
+  SourceObservation source = 5;
 }
 
 message TierHashes {
@@ -110,6 +121,8 @@ message TierHashes {
   // cannot expose component detail.
   repeated uint32 component_masks = 3;
   repeated uint32 block_sizes = 4;
+  // Latest report attribution, aligned with hashes; empty string means absent.
+  repeated string session_ids = 5;
 }
 
 message ExternalKvNodeMatch {
@@ -120,6 +133,7 @@ message ExternalKvNodeMatch {
 
 message MatchExternalKvResponse {
   repeated ExternalKvNodeMatch matches = 1;
+  QueryObservation observation = 2;
 }
 
 message MatchExternalKvPrefixRequest {
@@ -160,6 +174,7 @@ message MatchExternalKvPrefixResponse {
   // and truncation are observable. NOT part of the prefix semantics: backends may
   // report different values for the same matches.
   uint32 blocks_read = 3;
+  QueryObservation observation = 4;
 }
 
 message HitCountEntry {
@@ -175,8 +190,63 @@ message GetExternalKvHitCountsResponse {
   repeated HitCountEntry entries = 1;
 }
 
+// Only trusted source lifecycle authorities may call registration/reconciliation.
+// There is no built-in transport authentication; deployment must isolate the
+// mutation endpoint. Epoch strings are opaque, never ordered by time or text.
+message RegisterSourceRequest {
+  string worker_id = 1;
+  string source_epoch = 2;
+  optional string previous_epoch = 3; // CAS; absent only for initial registration
+  repeated TierType tiers = 4;
+}
+message RegisterSourceResponse { SourceObservation source = 1; }
+message ReconcileSourceRequest {
+  string worker_id = 1;
+  string source_epoch = 2;
+  uint64 expected_source_version = 3; // CAS against a query/register receipt
+  // true asserts an authoritative empty cache at next_seq; false invalidates
+  // (e.g. worker death) and suspends all further applies until reconciliation.
+  bool confirmed_empty = 4;
+  uint64 next_seq = 5;
+  string evidence_id = 6; // external receipt/reset evidence, never inferred
+  string expected_indexer_epoch = 7;
+}
+message ReconcileSourceResponse { SourceObservation source = 1; }
+message CacheWatermark {
+  string source_id = 1;
+  string source_epoch = 2;
+  uint64 generation = 3;
+  uint64 version = 4;
+}
+message SourceObservation {
+  string worker_id = 1;
+  string source_epoch = 2; // empty for legacy/unknown sources
+  repeated TierType tiers = 3;
+  optional uint64 watermark_seq = 4; // last fully committed publisher batch
+  optional uint64 pending_seq = 5;
+  uint32 next_chunk_index = 6;
+  uint32 chunk_count = 7;
+  bool complete = 8; // full registered-domain coverage only with reset evidence
+  string reason = 9;
+  uint64 source_version = 10;
+  bool suspended = 11;
+  // Separate native cache recorder coordinate, never the ZMQ publisher seq.
+  CacheWatermark cache_watermark = 12;
+  string indexer_epoch = 13;
+}
+message QueryObservation {
+  // Queries return a consistent snapshot of the requested hash scope only.
+  // No RPC in this version returns a full placement snapshot.
+  bool scope_only = 1;
+  bool full_snapshot = 2;
+  repeated SourceObservation sources = 3;
+  string indexer_epoch = 4;
+}
+
 service KVIndexer {
-  // The sole mutation API: applies an ordered SGLang KVEventBatch.
+  rpc RegisterSource(RegisterSourceRequest) returns (RegisterSourceResponse);
+  rpc ReconcileSource(ReconcileSourceRequest) returns (ReconcileSourceResponse);
+  // Applies one bounded chunk of an ordered publisher KVEventBatch.
   rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
 
   rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);

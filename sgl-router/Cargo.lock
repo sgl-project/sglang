@@ -3616,6 +3616,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeromq",
 ]
 
