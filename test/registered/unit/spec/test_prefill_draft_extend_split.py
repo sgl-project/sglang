@@ -117,7 +117,8 @@ class TestSplitPrefillDraftExtend(CustomTestCase):
         self.assertEqual(last_batch.extend_num_tokens, 3)
         # The KV-only batch ends before, and the last-token batch at, the last token.
         self.assertEqual(kv_batch.seq_lens.tolist(), [4, 7, 11])
-        self.assertEqual(kv_batch.seq_lens_sum, kv_batch.seq_lens_cpu.sum().item())
+        self.assertEqual(kv_batch.seq_lens_cpu.tolist(), [4, 7, 11])
+        self.assertEqual(kv_batch.seq_lens_sum, 22)
         self.assertEqual(last_batch.seq_lens.tolist(), [5, 8, 12])
         for sub_batch in (kv_batch, last_batch):
             self.assertFalse(sub_batch.return_logprob)
