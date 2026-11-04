@@ -4842,3 +4842,9 @@ Parent reviewed source gate/reconcile/clear paths, placement lock atomicity, spl
 Explicit router_bench.py B2/B3 pair uses the same Router lifecycle preparation targeting B, fixed tool deadlines, both workers cold after verified shared publication, actual x-sgl-worker-url attribution, tier/output consistency and stable task cancellation/drain/ack. Direct B2 and freely routed B3 are distinguished; route-change negatives remain in raw. Auth values are absent from raw.
 
 Parent independent integrated16unittests passed(11.953s), reviewed source setup, timer/observer separation, worker/epoch checks, cleanup and accounting. P6 real-model experiment running separately; no GPU benefit inferred from HTTP fixtures. Evidence /tmp/sglang-rfc-build/p8-router-harness-report.md and p8-router-integrated-tests.log.
+
+## P8 measured Engine benchmark archive — 2026-11-04
+
+Six completed runs/202 scenarios archived under benchmark/session_kv_control/results/2026-11-04 with immutable raw JSONL gzip, launch/runtime provenance, original negative samples, schedules/manifests, paired CI/derived CSV and static figures. Parent independently rebuilt derived artifacts offline and verified SHA256/raw/schedule/result consistency. CSV writer uses LF for repository whitespace checks; captured source raw unchanged.
+
+All202scenario validations passed. Short-window optimized TTFT means2K194.97->70.85ms,8K484.93->137.00ms,16K1190.62->864.61ms (N10 each). Entire-cycle gains are not universal. Original16K negative and hostpressure pre-fix regression, background completion throughput decline are explicitly retained. Cross-snapshot comparisons contain P4/P5 and harness/N confounds, not isolated causal proof. Mechanistic2GET->1GET proof is separate. B3 and capacity correction are later additive records.
