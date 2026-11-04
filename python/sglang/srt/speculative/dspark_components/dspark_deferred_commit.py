@@ -112,7 +112,7 @@ class DeferredContextCommit:
         self._proj_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._proj_stream), torch.inference_mode():
             kvs = self._kv_injector.draft_model.project_commit_kv(
-                main_hidden=pack_aux_hidden_states(aux), pool=self._pool()
+                main_hidden=pack_aux_hidden_states(aux)
             )
             if self.kvs is None:
                 assert not _capturing(), "the commit KV buffers are made at a warmup"
