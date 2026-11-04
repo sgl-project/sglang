@@ -48,7 +48,12 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
-from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    ceil_div,
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    is_hip,
+)
 from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
 logger = logging.getLogger(__name__)
@@ -597,6 +602,7 @@ class DeepSeekV4IndexerPool(KVCache):
             use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.use_fp4_indexer = use_fp4_indexer
         self.uses_aiter_fp4_layout = _is_hip and self.use_fp4_indexer
+        self.fp4_natural_layout = self.uses_aiter_fp4_layout and is_gfx1250_supported()
         # Low-ratio pools round to nearest even; c4 keeps threshold rounding.
         self.index_k_rne = False
         # aiter's row-group page-8 layout inside each page (pack_kv_cache): page size and shapes
@@ -624,9 +630,14 @@ class DeepSeekV4IndexerPool(KVCache):
                 else nullcontext()
             ):
                 if self.uses_aiter_fp4_layout:
+                    payload_shape, scale_shape = (
+                        ((self.page_size, 64), (self.page_size, 4))
+                        if self.fp4_natural_layout
+                        else ((1, 4, self.page_size, 16), (1, 4, self.page_size))
+                    )
                     self.index_k_payload_buffer = [
                         torch.zeros(
-                            (num_pages, 1, 4, self.page_size, 16),
+                            (num_pages, *payload_shape),
                             dtype=torch.uint8,
                             device=self.device,
                         ).view(torch.float4_e2m1fn_x2)
@@ -634,7 +645,7 @@ class DeepSeekV4IndexerPool(KVCache):
                     ]
                     self.index_k_scale_buffer = [
                         torch.zeros(
-                            (num_pages, 1, 4, self.page_size),
+                            (num_pages, *scale_shape),
                             dtype=torch.uint8,
                             device=self.device,
                         )
@@ -687,13 +698,17 @@ class DeepSeekV4IndexerPool(KVCache):
                     layout="index_fused",
                 )
             )
-        page_slots = self.index_k_payload_buffer[0].shape[3]
-        scale_slots = self.index_k_scale_buffer[0].shape[3]
-        if scale_slots != page_slots:
-            raise ValueError(
-                "FP4 indexer payload and scale must agree on slots per page: "
-                f"payload={page_slots}, scale={scale_slots}"
-            )
+        if self.fp4_natural_layout:
+            # Payload and scale are both allocated per pool page.
+            page_slots = self.index_page_size
+        else:
+            page_slots = self.index_k_payload_buffer[0].shape[3]
+            scale_slots = self.index_k_scale_buffer[0].shape[3]
+            if scale_slots != page_slots:
+                raise ValueError(
+                    "FP4 indexer payload and scale must agree on slots per page: "
+                    f"payload={page_slots}, scale={scale_slots}"
+                )
         rows = self.contiguous_page_row_buffers()
         key_layers = len(self.index_k_payload_buffer)
         return DSV4IndexerBufferInfo(
@@ -761,6 +776,18 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.fp4_natural_layout:
+            from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
+                store_fp4_index_k_cache_natural,
+            )
+
+            return store_fp4_index_k_cache_natural(
+                cache_k,
+                self.index_k_payload_buffer[layer_id - self.start_layer],
+                self.index_k_scale_buffer[layer_id - self.start_layer],
+                loc,
+                rne=self.index_k_rne,
+            )
         if self.uses_aiter_fp4_layout:
             # the FlyDSL kernels read the fp4 payload and the packed ue8m0 scales
             # from two buffers

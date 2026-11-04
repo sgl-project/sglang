@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
+        FP4OpusWorkspace,
         FP4PrefillWorkspace,
         FP4RowgroupDecodeWorkspace,
         FP4RowgroupPrefillWorkspace,
@@ -702,10 +703,10 @@ class DSV4Metadata:
     # Captured kernels bind these FP4 indexer buffers by address; absent from copy_
     # so addresses stay pinned across replays (the builders refresh contents).
     fp4_decode_workspace: Optional[
-        Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+        Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace, FP4OpusWorkspace]
     ] = field(default=None, repr=False)
-    fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
-        default=None, repr=False
+    fp4_prefill_workspace: Optional[Union[FP4PrefillWorkspace, FP4OpusWorkspace]] = (
+        field(default=None, repr=False)
     )
     # Derived by the first C4 layer of a forward and reused by the rest.
     fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
@@ -1912,14 +1913,26 @@ class DeepseekV4HipRadixBackend(
             return
 
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            fp4_natural_layout,
             prepare_fp4_prefill_workspace,
         )
 
         indexer_metadata = metadata.indexer_metadata
+        cu_seq_q = None
+        if (
+            fp4_natural_layout()
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and forward_batch.extend_num_tokens == indexer_metadata.page_table.shape[0]
+        ):
+            cu_seq_q = F.pad(
+                torch.cumsum(forward_batch.extend_seq_lens, 0, dtype=torch.int32),
+                (1, 0),
+            )
         metadata.fp4_prefill_workspace = prepare_fp4_prefill_workspace(
             indexer_metadata.page_table,
             indexer_metadata.compressed_seq_lens,
             workspace=metadata.fp4_prefill_workspace,
+            cu_seq_q=cu_seq_q,
         )
 
     def init_forward_metadata_out_graph(
