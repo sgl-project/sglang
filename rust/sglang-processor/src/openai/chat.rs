@@ -1420,10 +1420,14 @@ impl ChatResponder {
         events
     }
 
-    /// `_reported_prompt_tokens`.
+    /// `_reported_prompt_tokens` and `_reported_cached_tokens`.
     fn report_prompt_tokens(&self, meta: &mut GenerateMetaInfo) {
         meta.prompt_tokens =
             u64::from(meta.prompt_tokens).saturating_sub(self.unreported_prompt_tokens) as u32;
+        if self.unreported_prompt_tokens > 0 {
+            // A full-prompt cache hit also covers the prompt tokens left out above.
+            meta.cached_tokens = meta.cached_tokens.min(meta.prompt_tokens);
+        }
     }
 
     /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
@@ -1667,5 +1671,56 @@ mod tests {
             .collect();
         assert!(created.len() > 1, "{events:?}");
         assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
+    }
+
+    /// A full-prompt cache hit also covers K3's generation stub, which usage
+    /// leaves out of `prompt_tokens`; `cached_tokens` must not exceed it.
+    #[test]
+    fn kimi_k3_usage_caps_cached_tokens_at_reported_prompt_tokens() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let settings = OpenAiSettings {
+            enable_cache_report: true,
+            ..OpenAiSettings::default()
+        };
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let (_, mut responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &k3,
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        let frame = json!({"text": "a", "output_ids": [2], "meta_info": {
+            "id": "r",
+            "finish_reason": {"type": "stop"},
+            "prompt_tokens": 1025,
+            "completion_tokens": 1,
+            "cached_tokens": 1024,
+        }});
+        let mut events = responder
+            .stream_data(Ok(serde_json::from_value(frame).unwrap()))
+            .unwrap();
+        events.extend(responder.stream_end());
+        let usage = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .find_map(|chunk| chunk.get("usage").filter(|u| !u.is_null()).cloned())
+            .expect("usage chunk");
+        assert_eq!(usage["prompt_tokens"], json!(1022), "{usage}");
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"],
+            json!(1022),
+            "{usage}"
+        );
     }
 }
