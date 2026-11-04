@@ -5,9 +5,7 @@ A request that sets ``return_outputs_via_store`` keeps its routed experts, index
 top-k, and sampling mask out of the response: the tokenizer collects them, stores them
 when the request finishes, and returns ``meta_info["output_store_ref"]`` instead.
 The sampled tokens' logprobs, one per token, stay in ``meta_info``; support-mode
-logprobs are stored with the mask. The request's ``replay_layer_splits`` cut the
-routed experts and indexer top-k into layer blocks, one stored field each, so that a
-trainer pipeline stage reads only its own layers.
+logprobs are stored with the mask.
 SGLang-specific assumptions:
 
 - Requests of one prompt with n=1, no streaming or beam search.
@@ -31,10 +29,7 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 # --output-store-backend must not need the package installed.
 if TYPE_CHECKING:
     from radix_transfer_plugins import OutputStore, StoreRef
-    from radix_transfer_plugins.stashes.token_output import (
-        LayerBlocks,
-        TokenOutputStash,
-    )
+    from radix_transfer_plugins.stashes.token_output import TokenOutputStash
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +72,8 @@ class TokenOutputCollector(msgspec.Struct):
             )
         }
 
-    def to_stash(
-        self, *, routed_experts_splits: List[int], indexer_topk_splits: List[int]
-    ) -> TokenOutputStash:
-        """Runs on a writer thread; the tensors are on the CPU, so .numpy() copies nothing.
-        Splits are layer ids for routed experts and capturer slots for the indexer."""
+    def to_stash(self) -> TokenOutputStash:
+        """Runs on a writer thread; the tensors are on the CPU, so .numpy() copies nothing."""
         from radix_transfer_plugins.stashes.token_output import TokenOutputStash
 
         chunks = self.sampling_mask_chunks
@@ -100,8 +92,8 @@ class TokenOutputCollector(msgspec.Struct):
                     [chunk.logprobs for chunk in chunks]
                 )
         return TokenOutputStash(
-            routed_experts=_layer_blocks(self.routed_experts, routed_experts_splits),
-            indexer_topk=_layer_blocks(self.indexer_topk, indexer_topk_splits),
+            routed_experts=_numpy(self.routed_experts),
+            indexer_topk=_numpy(self.indexer_topk),
             **mask,
         )
 
@@ -117,18 +109,9 @@ class OutputStoreWriter:
         self._closed = False
 
     def submit_put(
-        self,
-        collector: TokenOutputCollector,
-        *,
-        routed_experts_splits: List[int],
-        indexer_topk_splits: List[int],
+        self, collector: TokenOutputCollector
     ) -> concurrent.futures.Future[StoreRef]:
-        return self._executor.submit(
-            self._put,
-            collector,
-            routed_experts_splits=routed_experts_splits,
-            indexer_topk_splits=indexer_topk_splits,
-        )
+        return self._executor.submit(self._put, collector)
 
     def cleanup_after(self, future: concurrent.futures.Future[StoreRef]) -> None:
         """Delete the object once a put whose ref will never be sent succeeds."""
@@ -149,18 +132,8 @@ class OutputStoreWriter:
         self._executor.shutdown(wait=True)
         self._store.close()
 
-    def _put(
-        self,
-        collector: TokenOutputCollector,
-        *,
-        routed_experts_splits: List[int],
-        indexer_topk_splits: List[int],
-    ) -> StoreRef:
-        stash = collector.to_stash(
-            routed_experts_splits=routed_experts_splits,
-            indexer_topk_splits=indexer_topk_splits,
-        )
-        (ref,) = self._store.put_many([stash])
+    def _put(self, collector: TokenOutputCollector) -> StoreRef:
+        (ref,) = self._store.put_many([collector.to_stash()])
         return ref
 
     def _delete_put_result(self, future: concurrent.futures.Future[StoreRef]) -> None:
@@ -196,17 +169,5 @@ def maybe_create_output_store(
     return OutputStoreWriter(OutputStore(backend=create_backend(backend, extra_config)))
 
 
-def _layer_blocks(
-    tensor: Optional[torch.Tensor], splits: List[int]
-) -> Optional[LayerBlocks]:
-    """Views of [num_tokens, width, k] cut along the width at the splits."""
-    if tensor is None:
-        return None
-    array = tensor.numpy()
-    edges = [0, *splits, array.shape[1]]
-    # Equal slots (DeepSeek-V4 layers with no indexer between them) make no empty block.
-    return {
-        (start, end): array[:, start:end]
-        for start, end in zip(edges, edges[1:])
-        if start < end
-    }
+def _numpy(tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    return None if tensor is None else tensor.numpy()
