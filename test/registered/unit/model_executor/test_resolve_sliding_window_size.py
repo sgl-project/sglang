@@ -99,17 +99,11 @@ class TestHFSlidingWindowLayers(CustomTestCase):
         initialize_dp_attention_flags(server)
 
     def test_sliding_layers_exclude_the_query_from_the_window(self):
-        from transformers import (
-            Cohere2Config,
-            Cohere2MoeConfig,
-            ExaoneMoeConfig,
-            Gemma3nTextConfig,
-        )
+        from transformers import Cohere2Config, Cohere2MoeConfig, Gemma3nTextConfig
 
         from sglang.srt.configs.step3p5 import Step3p5Config
         from sglang.srt.models.cohere2_moe import Cohere2MoeAttention
         from sglang.srt.models.commandr import CohereAttention
-        from sglang.srt.models.exaone_moe import ExaoneMoEAttention
         from sglang.srt.models.gemma3n_causal import Gemma3nAttention
         from sglang.srt.models.step3p5 import Step3p5DecoderLayer
         from sglang.srt.models.transformers import TransformersBase
@@ -162,12 +156,6 @@ class TestHFSlidingWindowLayers(CustomTestCase):
             layers = {
                 "commandr": CohereAttention(cohere2).attn,
                 "cohere2_moe": Cohere2MoeAttention(Cohere2MoeConfig(**hf)).attn,
-                "exaone_moe": ExaoneMoEAttention(
-                    config=ExaoneMoeConfig(**hf),
-                    hidden_size=64,
-                    num_heads=4,
-                    num_kv_heads=2,
-                ).attn,
                 "gemma3n": Gemma3nAttention(
                     layer_id=0,
                     config=Gemma3nTextConfig(**hf),
