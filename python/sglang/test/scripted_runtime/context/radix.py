@@ -50,7 +50,7 @@ def get_node_lock_ref(tree_cache: Any, node_handle: Any) -> int:
             core.get_component_device_lock_ref(node_handle, component)
             for component in tree_cache.tree_components
         )
-    if node_handle is getattr(tree_cache, "root_node", None):
+    if node_handle is tree_cache.root_node:
         return 0
     return _node_lock_ref(node_handle)
 

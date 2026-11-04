@@ -16,20 +16,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation impo
 )
 
 
-def text_seq_lens_by_encoder(pipeline_config, prompt_embeds, has_pooled_embeds):
-    """Per-encoder text lengths; None marks a pooled projection, not a text stream."""
-    # A 2-D entry is [seq, dim] text unless the batch carries pooled embeds, in
-    # which case it is the pooled projection and its leading dim is the batch.
-    return [
-        (
-            None
-            if has_pooled_embeds and embeds.ndim == 2
-            else pipeline_config.seq_lens_from_prompt_embeds(embeds)
-        )
-        for embeds in prompt_embeds
-    ]
-
-
 class ComfyUILatentPreparationStage(LatentPreparationStage):
     """One DiT step: restore cached conditioning, then prepare latents."""
 
@@ -41,22 +27,6 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
         # DenoisingStage reads batch.scheduler. Native pipelines attach it in
         # TimestepPreparationStage; ComfyUI already owns the timestep schedule.
         get_or_create_request_scheduler(batch, self.scheduler)
-
-        # No TextEncodingStage here, so back-fill require_text_seq_lens' input.
-        pipeline_config = server_args.pipeline_config
-        if batch.prompt_embeds is not None and batch.prompt_seq_lens is None:
-            batch.prompt_seq_lens = text_seq_lens_by_encoder(
-                pipeline_config, batch.prompt_embeds, bool(batch.pooled_embeds)
-            )
-        if (
-            batch.negative_prompt_embeds is not None
-            and batch.negative_prompt_seq_lens is None
-        ):
-            batch.negative_prompt_seq_lens = text_seq_lens_by_encoder(
-                pipeline_config,
-                batch.negative_prompt_embeds,
-                bool(batch.neg_pooled_embeds),
-            )
 
         original_latents_shape = None
         if batch.latents is not None:

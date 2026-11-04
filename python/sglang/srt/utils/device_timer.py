@@ -5,7 +5,7 @@ from typing import Callable, Deque, Dict, List, Optional, Protocol
 
 import torch
 
-from sglang.srt.utils.common import device_timing_event, get_device_module
+from sglang.srt.utils.common import get_device_module
 
 
 def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
@@ -30,8 +30,12 @@ class TimingObserver(Protocol):
 class DeviceTimer:
     def __init__(self, reporter: Optional[Callable] = None):
         self._device_module = get_device_module()
-        # CPU has no timing event; degrade to a no-op rather than raise from every wrap.
-        self.timing_supported = device_timing_event(self._device_module) is not None
+        # torch.cpu.Event rejects enable_timing; degrade to a no-op rather than raise per wrap.
+        try:
+            self._device_module.Event(enable_timing=True)
+            self.timing_supported = True
+        except TypeError:
+            self.timing_supported = False
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [] if reporter is None else [reporter]
         self._in_wrap = False
@@ -162,14 +166,13 @@ class _TimingInterval:
 
     @staticmethod
     def create(device_module, track_stream: bool = False):
-        # Only reached past wrap()'s timing_supported gate, so the event exists.
         stream = device_module.current_stream() if track_stream else None
-        start_event = device_timing_event(device_module)
+        start_event = device_module.Event(enable_timing=True)
         start_event.record()
         return _TimingInterval(start_event=start_event, stream=stream)
 
     def end(self, device_module, metadata: Dict):
-        end_event = device_timing_event(device_module)
+        end_event = device_module.Event(enable_timing=True)
         end_event.record()
 
         assert self.end_event is None

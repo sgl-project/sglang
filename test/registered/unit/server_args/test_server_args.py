@@ -5190,7 +5190,8 @@ class TestDwdpPlatformGate(CustomTestCase):
 
     @override_platform(is_hip=False)
     def test_allows_cuda(self):
-        parallel_hook.handle_dwdp(self._args(device="cuda"))
+        with patch.dict(os.environ):
+            parallel_hook.handle_dwdp(self._args(device="cuda"))
 
 
 class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
