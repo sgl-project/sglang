@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager  # noqa: E402
 from sglang.srt.managers.incremental_detokenize import (  # noqa: E402
     DetokenizeHeader,
