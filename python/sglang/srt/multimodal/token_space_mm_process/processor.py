@@ -30,6 +30,11 @@ def _device_type(device):
     return None if device is None else torch.device(device).type
 
 
+def _log_failed_write(future):
+    if future.exception() is not None:
+        logger.warning("Item feature cache write failed", exc_info=future.exception())
+
+
 def _check_cached_features(media_item, cached, computed):
     modality = media_item[0]
     if cached.keys() != computed.keys():
@@ -245,8 +250,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                 )
                 for modality, source, _, item_kwargs in media_items
             ]
-            # A backend may block on IO, e.g. a disk cache reads whole files, so get and
-            # set run in the default thread pool, off the event loop and the media IO pool.
+            # A backend may block on IO, e.g. a disk cache reads whole files, so get runs
+            # in the default thread pool, off the event loop and the media IO pool.
             item_features = list(
                 await asyncio.gather(
                     *(
@@ -306,17 +311,16 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         for index, cached in checked.items():
             _check_cached_features(media_items[index], cached, item_features[index])
         if self._item_feature_cache is not None:
-            await asyncio.gather(
-                *(
-                    asyncio.to_thread(
+            # Written behind the request: a reader that comes first misses and computes.
+            loop = asyncio.get_running_loop()
+            for index in missed:
+                if index not in checked:
+                    loop.run_in_executor(
+                        None,
                         self._item_feature_cache.__setitem__,
                         item_keys[index],
                         item_features[index],
-                    )
-                    for index in missed
-                    if index not in checked
-                )
-            )
+                    ).add_done_callback(_log_failed_write)
         return item_features
 
     async def _process_items(self, media_items, request_options):
