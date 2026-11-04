@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
@@ -12,6 +9,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_THINK_MODE,
     RESOLUTION_ALIGNMENT,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def _is_runtime_option_requested(value) -> bool:
