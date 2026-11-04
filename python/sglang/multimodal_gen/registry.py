@@ -718,10 +718,6 @@ def get_model_info(
 _discover_and_register_configs()
 
 
-def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    return get_non_diffusers_pipeline_name(model_path) is not None
-
-
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
     if is_sensenova_u1_model(model_path):

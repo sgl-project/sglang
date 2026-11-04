@@ -52,7 +52,6 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_atten
     build_replay_fa4_mask,
     build_replay_mask,
     build_replay_plan,
-    dense_token_mask,
     replay_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layout import (
@@ -73,7 +72,6 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layou
     chunk_token_count,
     chunk_token_metadata,
     committed_metadata,
-    latent_frames_from_pixel_frames,
     lidar_num_sweeps,
     rgb_sensor_grid,
     ring_slot_for_step,
@@ -296,7 +294,7 @@ class TestManifest(unittest.TestCase):
 
 class TestSchedule(unittest.TestCase):
     def test_reference_horizon(self):
-        latents = latent_frames_from_pixel_frames(297, 4)
+        latents = 1 + (297 - 1) // 4
         sweeps = lidar_num_sweeps(297, camera_fps=30.0, lidar_fps=10.0)
         self.assertEqual((latents, sweeps), (75, 99))
         schedule = build_chunk_schedule(
@@ -342,8 +340,6 @@ class TestSchedule(unittest.TestCase):
                 rgb_seconds_per_frame=4 / 30,
                 lidar_seconds_per_frame=0.1,
             )
-        with self.assertRaisesRegex(ValueError, "4k \\+ 1"):
-            latent_frames_from_pixel_frames(16, 4)
 
 
 def _grid():
@@ -502,6 +498,16 @@ def _plan(
     return plan, items, frame_unit, slots
 
 
+def _dense_token_mask(plan):
+    """The run-level truth table expanded to ``[queries, current + ring + captions]``."""
+    rows = plan.query_run_ids
+    columns = plan.key_run_ids
+    mask = torch.zeros(rows.numel(), columns.numel(), dtype=torch.bool)
+    real = columns >= 0
+    mask[:, real] = plan.allowed[rows][:, columns[real]]
+    return mask
+
+
 def _token(items, kind, view, frame):
     """Packed index of (item kind, view, frame) in a chunk with one token per frame."""
     offset = 0
@@ -525,7 +531,7 @@ class TestPredicate(unittest.TestCase):
 
     def setUp(self):
         self.plan, self.items, self.frame_unit, self.slots = _plan(2, PASS_NOISY)
-        self.mask = dense_token_mask(self.plan)
+        self.mask = _dense_token_mask(self.plan)
         self.current = self.plan.num_current_tokens
         chunk0 = _items(_schedule()[0])
         chunk1 = _items(_schedule()[1])
@@ -624,7 +630,7 @@ class TestPredicate(unittest.TestCase):
 
     def test_clean_pass_is_chunk_causal(self):
         plan, items, _, _ = _plan(2, PASS_CLEAN)
-        mask = dense_token_mask(plan)
+        mask = _dense_token_mask(plan)
         q4 = _token(items, "rgb_target", 0, 4)
         self.assertTrue(mask[q4, _token(items, "rgb_target", 0, 6)])
         self.assertFalse(mask[q4, _token(items, "rgb_target", 1, 6)])
@@ -644,7 +650,7 @@ class TestPredicate(unittest.TestCase):
 
     def test_conditions_in_chunk_zero(self):
         plan, items, _, _ = _plan(0, PASS_NOISY, joint=True)
-        mask = dense_token_mask(plan)
+        mask = _dense_token_mask(plan)
         cond = _token(items, "rgb_target", 0, 0)
         self.assertTrue(mask[cond, cond])
         self.assertTrue(mask[cond, _token(items, "rgb_control", 0, 0)])
@@ -661,7 +667,7 @@ class TestPredicate(unittest.TestCase):
     def test_joint_lidar_reads_rgb_within_window(self):
         # Chunk 2 sweeps 5..8 sit at 0.5..0.8 s; RGB frames 4, 5, 6 at 0.533, 0.667, 0.8 s.
         plan, items, _, _ = _plan(2, PASS_NOISY, joint=True)
-        mask = dense_token_mask(plan)
+        mask = _dense_token_mask(plan)
         sweep7 = _token(items, "lidar_target", 2, 7)
         self.assertTrue(mask[sweep7, _token(items, "rgb_target", 0, 5)])
         self.assertTrue(mask[sweep7, _token(items, "rgb_target", 0, 4)])
@@ -680,7 +686,7 @@ class TestPredicate(unittest.TestCase):
 
     def test_caption_bounds_and_padding(self):
         plan, items, _, _ = _plan(2, PASS_NOISY, horizon=0.6)
-        mask = dense_token_mask(plan)
+        mask = _dense_token_mask(plan)
         caption_base = plan.num_current_tokens + plan.num_history_tokens
         late = _token(items, "rgb_target", 0, 6)
         early = _token(items, "rgb_target", 0, 4)
@@ -770,7 +776,7 @@ class TestBlockMask(unittest.TestCase):
         k = torch.randn(1, plan.num_key_tokens, kv_heads, head_dim)
         v = torch.randn(1, plan.num_key_tokens, kv_heads, head_dim)
         out = replay_attention(q, k, v, block)
-        expected = _dense_oracle(q, k, v, dense_token_mask(plan))
+        expected = _dense_oracle(q, k, v, _dense_token_mask(plan))
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
         self.assertEqual(block.padded_q_len % 64, 0)
         self.assertEqual(block.padded_kv_len % 64, 0)
@@ -812,7 +818,7 @@ class TestBlockMask(unittest.TestCase):
                     self.assertEqual(sparsity.q_word_base.numel(), mask.padded_q_len)
                     self.assertEqual(sparsity.k_group_ids.numel(), mask.padded_kv_len)
                     torch.testing.assert_close(
-                        _expand_fa4_mask(mask), dense_token_mask(plan)
+                        _expand_fa4_mask(mask), _dense_token_mask(plan)
                     )
                     if index == 1:
                         # The wide plan must exercise all three tile classes.
@@ -857,7 +863,7 @@ class TestBlockMask(unittest.TestCase):
         fa4 = replay_attention(
             q, k, v, build_replay_mask(plan, device=device, backend="fa4")
         )
-        expected = _dense_oracle(q, k, v, dense_token_mask(plan).to(device))
+        expected = _dense_oracle(q, k, v, _dense_token_mask(plan).to(device))
         torch.testing.assert_close(fa4.float(), expected, atol=3e-2, rtol=3e-2)
         triton = replay_attention(
             q, k, v, build_replay_mask(plan, device=device, backend="triton")

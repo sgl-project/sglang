@@ -463,23 +463,6 @@ def _make_pair_allowed(
     return pair_allowed
 
 
-def multiview_pair_predicate(
-    metadata: MultiviewFlexMetadata,
-    q_index: torch.Tensor,
-    kv_index: torch.Tensor,
-) -> torch.Tensor:
-    """Evaluate the exact token visibility predicate (also used as mask_mod)."""
-    pair_allowed = _make_pair_allowed(
-        metadata.query_vectors(),
-        metadata.key_vectors(),
-        metadata.attention_scope,
-        metadata.decomposed_temporal_window_seconds,
-        metadata.control_attends_sensor,
-        metadata.lidar_attends_captions,
-    )
-    return pair_allowed(q_index, kv_index)
-
-
 def _semantic_groups(
     vectors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:

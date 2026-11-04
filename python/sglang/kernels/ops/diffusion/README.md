@@ -126,10 +126,9 @@ Keep that convention explicit at their call sites; do not add it to direct
 kernel entry points.
 
 A kernel that is only built or validated for one architecture generation gates
-on `common.platform.is_cuda_sm_at_least(min_sm, x.device)` inside its
-`can_use_*` predicate. That predicate checks for a CUDA build before comparing
-the compute capability, because ROCm reports a gfx-derived capability that
-would otherwise clear a plain `>= (10, 0)` test. Kernel-level predicates stop
+on `sglang.kernels.arch.current_arch().is_sm_at_least(major, minor)` inside its
+`can_use_*` predicate. That query is false off NVIDIA CUDA, because ROCm reports
+a gfx-derived capability that would otherwise clear a plain `>= (10, 0)` test. Kernel-level predicates stop
 at the tensor contract, the architecture floor and
 `torch.compiler.is_compiling()`; grad mode and stream capture are the model
 gate's business.

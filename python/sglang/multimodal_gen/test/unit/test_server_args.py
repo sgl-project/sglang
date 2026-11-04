@@ -67,7 +67,6 @@ from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
-    is_known_non_diffusers_multimodal_model,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -1256,7 +1255,6 @@ class TestMiniMaxH3Routing(unittest.TestCase):
         actual = _get_config_info("MiniMax/MiniMax-H3")
         self.assertIsNotNone(expected)
         self.assertIs(actual, expected)
-        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
         self.assertEqual(
             get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
             "MiniMaxH3Pipeline",
@@ -3953,19 +3951,6 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
-    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-downstream-wait-timeout",
-            "45",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
-
     def test_disagg_role_alias_cli_arg_is_accepted(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -4046,21 +4031,6 @@ class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
                             "http_graceful_shutdown_timeout": timeout,
                         }
                     )
-
-
-class TestDisaggTransferBackendArgs(unittest.TestCase):
-    def test_transfer_backend_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-transfer-backend",
-            "mock",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
 class TestNcclNvlsArgs(unittest.TestCase):

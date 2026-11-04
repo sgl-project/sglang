@@ -383,6 +383,32 @@ async def save_image_to_path(
 
 
 # Helpers
+async def save_first_input_image(
+    image_sources,
+    request_id: str,
+    uploads_dir: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str | None:
+    """Save the first input image from a list of sources and return its path."""
+    image_list = merge_image_input_list(image_sources)
+    if not image_list:
+        return None
+    image = image_list[0]
+
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    filename = image.filename if hasattr(image, "filename") else "url_image"
+    safe_name = sanitize_upload_filename(filename, "url_image")
+    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
+    return await save_image_to_path(
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_dir,
+    )
+
+
 async def _save_upload_to_path(
     upload: Union[UploadFile, bytes], target_path: str
 ) -> str:
@@ -630,6 +656,28 @@ async def process_generation_batch(
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
 
     return save_file_path_list, result
+
+
+def output_variant_index(variant: str | None) -> int | None:
+    """The output index a ``?variant=`` query names: 0 when absent, None when malformed."""
+    try:
+        return 0 if variant is None else int(variant)
+    except (TypeError, ValueError):
+        return None
+
+
+def select_output_variant(
+    item: dict, variant: str | None, many: str, one: str
+) -> Any | None:
+    """``item[many][variant]`` of a multi-output request, else ``item[one]`` for
+    variant 0; None when the request has no such output."""
+    index = output_variant_index(variant)
+    if index is None:
+        return None
+    values = item.get(many)
+    if values:
+        return values[index] if 0 <= index < len(values) else None
+    return item.get(one) if index == 0 else None
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
