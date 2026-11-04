@@ -269,6 +269,17 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
+# XORed into the server seed so these draws differ from other samplers'.
+_SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
+
+
+def simulated_acc_len_generator(seed: int) -> torch.Generator:
+    """The generator of the SGLANG_SIMULATE_ACC_LEN draws (forced lengths, and
+    DSpark's bonus seed), seeded alike on every rank from the server seed."""
+    return torch.Generator().manual_seed(
+        (int(seed) ^ _SIM_ACC_LEN_DOMAIN) & 0x7FFFFFFFFFFFFFFF
+    )
+
 
 def check_simulate_acc_token_mode() -> None:
     if SIMULATE_ACC_LEN > 0 and SIMULATE_ACC_TOKEN_MODE not in (

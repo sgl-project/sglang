@@ -125,6 +125,12 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
                 "SGLANG_RAGGED_VERIFY_MODE=static: the HiSparse verify swap assumes "
                 f"a uniform verify window per request (got {ragged_mode.value!r})."
             )
+    # A HiSparse decode receives KV into its host pool, which the checksum does not read.
+    if cfg.disaggregation_mode == "decode" and cfg.disaggregation_enable_kv_checksum:
+        raise ValueError(
+            "--enable-hisparse does not support --disaggregation-enable-kv-checksum "
+            "on a decode server yet."
+        )
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:
