@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
@@ -629,9 +631,11 @@ def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     """The support for eagle_sample's top-k branches, or None for the dense branch:
     every request must sample with a finite top-k within the compact limit.
     SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING turns it on; when it is unset,
-    rejection sampling does too, since its top-k target probs equal the dense ones."""
+    rejection sampling on the AITER (ROCm) path does too, since its top-k target
+    probs equal the dense ones."""
     enabled = _COMPACT_VERIFY_SAMPLING or (
-        not _COMPACT_VERIFY_SAMPLING_SET
+        _use_aiter
+        and not _COMPACT_VERIFY_SAMPLING_SET
         and get_spec().speculative_use_rejection_sampling
     )
     if not enabled or batch.forward_mode.is_idle():
