@@ -20,7 +20,7 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps unified memory disabled; **High Throughput** removes all speculative decoding parameters and enables unified memory on NVIDIA GPUs (B300, GB300, B200, and H200). On **TPU v7** (one host, [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu)), Low Latency keeps DFlash at 2 running requests and High Throughput runs 64 requests without speculative decoding; for Low Latency, run `python3 -m benchmark.tpu.recipe.configs.muse_spark.windowed_draft` in an SGLang-TorchTPU checkout once to write the draft directory its command reads. TPU v7 support is on the SGLang-TorchTPU branch [`haolin/ms-v11`](https://github.com/sgl-project/sglang-torchtpu/tree/haolin/ms-v11) and is not merged yet. Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
+Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps unified memory disabled; **High Throughput** removes all speculative decoding parameters and enables unified memory on NVIDIA GPUs (B300, GB300, B200, and H200). On **TPU v7** (one host, [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu)), Low Latency keeps DFlash at 2 running requests and High Throughput runs 64 requests without speculative decoding. TPU v7 support is on the SGLang-TorchTPU branch [`haolin/ms-v11`](https://github.com/sgl-project/sglang-torchtpu/tree/haolin/ms-v11) and is not merged yet. Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
 
 With a current SGLang build, the commands omit settings inferred from the checkpoint and GPU. Muse Spark NVFP4 selects `modelopt_fp4`, with `flashinfer_trtllm` MoE on B200/B300/GB300 or `marlin` on H200. The default static memory fraction is `0.8` on Blackwell and `0.85` on Hopper; recipes with a different budget keep an explicit override. LayerNorm-SP enables MegaMoE automatically for NVFP4 on data-center Blackwell when EP equals TP and is greater than 1, except on PD decode workers. Use `--no-enable-megamoe-for-layernorm-sp` to opt out. Muse Spark DFlash2 drafts default to FA4 on these NVIDIA platforms and eight draft tokens. Explicit settings take precedence.
 
@@ -542,7 +542,6 @@ DFlash V2 on one Google Cloud TPU v7 host (2x2x1: 4 chips, 8 TensorCores, `--tp-
 
 - **Container image.** `<public sglang-torchtpu image: TBD>`.
 - **Host.** 960 GiB of RAM. The HiCache host tier is 2.0x the device KV pool per rank through concurrency 10, and 56 GB per rank from concurrency 16 (`--hicache-size 56`, 448 GB across the eight ranks).
-- **Draft.** Run `python3 -m benchmark.tpu.recipe.configs.muse_spark.windowed_draft` once in an SGLang-TorchTPU checkout. Every layer of the DFlash2 draft is 2048-token sliding-window attention, but its config does not say so; the step writes a copy whose config does to `~/.cache/sglang/muse-spark-open-dflash2-windowed`, which the commands read, so SGLang keeps the draft's KV in the target's sliding-window slots. The weights stay the downloaded files.
 - **Acceptance.** SemiAnalysis measured these points with a synthetic speculative-decoding acceptance length of 4.05 (InferenceX golden AL via `SGLANG_SIMULATE_ACC_LEN`), which is not part of these commands. Real speed depends on your workload's acceptance.
 - **Settings.** The commands are the submission's server settings, from [`agentx.py`](https://github.com/sgl-project/sglang-torchtpu/blob/haolin/ms-v11/benchmark/tpu/recipe/configs/muse_spark/agentx.py) in SGLang-TorchTPU, without its logging, diagnostics and telemetry settings and without values equal to the engine defaults.
 
@@ -631,7 +630,7 @@ python3 -m sglang.launch_server \
   --scheduler-recv-interval 8 \
   --speculative-algorithm DFLASH \
   --speculative-draft-attention-backend pallas_tpu_rpa_v3 \
-  --speculative-draft-model-path ~/.cache/sglang/muse-spark-open-dflash2-windowed \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
   --speculative-num-draft-tokens 8 \
   --swa-full-tokens-ratio 0.0625 \
   --tool-call-parser muse \
@@ -741,7 +740,7 @@ python3 -m sglang.launch_server \
   --session-leaf-at-prompt-end \
   --speculative-algorithm DFLASH \
   --speculative-draft-attention-backend pallas_tpu_rpa_v3 \
-  --speculative-draft-model-path ~/.cache/sglang/muse-spark-open-dflash2-windowed \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
   --speculative-num-draft-tokens 8 \
   --swa-full-tokens-ratio 0.0625 \
   --tool-call-parser muse \

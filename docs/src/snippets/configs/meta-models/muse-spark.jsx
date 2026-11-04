@@ -69,7 +69,6 @@ export const config = {
     NODE0_IP: { target: "command", label: "Head node IP", default: "<node0-ip>" },
     NODE_RANK: { target: "command", label: "This node rank", default: "<node-rank>" },
     DRAFT_MODEL_ID: { target: "command", label: "Dflash V2 draft model", default: "RadixArk/Muse-Spark-Open-DFlash2" },
-    TPU_DRAFT_DIR: { target: "command", label: "Windowed DFlash2 draft (TPU v7)", default: "~/.cache/sglang/muse-spark-open-dflash2-windowed" },
     HF_TOKEN: { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
@@ -611,10 +610,8 @@ export const config = {
     // TPU v7 (SGLang-TorchTPU, one host). Both cells run the decode megakernel over
     // fp8 KV in the SEQ_ALONG_LANE layout (batched-RPA attention, 256-token pages),
     // with host-side prefill padding and compiled batch/prefill buckets. Low Latency
-    // keeps DFlash (it reads the windowed draft that sglang-torchtpu's
-    // benchmark/tpu/recipe/configs/muse_spark/windowed_draft.py writes); High
-    // Throughput runs 64 requests without speculative decoding, the megakernel
-    // taking decode steps of up to 64 rows.
+    // keeps DFlash; High Throughput runs 64 requests without speculative decoding,
+    // the megakernel taking decode steps of up to 64 rows.
     {
       match: { hw: "tpu7x", quant: "nvfp4", strategy: "low-latency" },
       verificationStatus: "in-progress",
@@ -642,7 +639,7 @@ export const config = {
         "--tpu-compile-bs 1 2",
         "--tpu-compile-tokens 1024 2048 4096",
         "--speculative-algorithm DFLASH",
-        "--speculative-draft-model-path {{TPU_DRAFT_DIR}}",
+        "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
         "--speculative-draft-attention-backend pallas_tpu_rpa_v3",
         "--speculative-num-draft-tokens 8",
         "--reasoning-parser muse",
