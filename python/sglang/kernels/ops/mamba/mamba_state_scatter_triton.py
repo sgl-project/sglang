@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils.common import is_sail_runtime
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.utils.device import get_device_core_count
 
@@ -332,6 +333,15 @@ def fused_mamba_state_scatter_with_mask(
         dst_indices_raw: Raw destination indices for all requests [total_requests]
         step_indices_raw: Raw step indices; entry >= 0 means valid [total_requests]
     """
+    if is_sail_runtime():
+        from sglang.kernels.ops.mamba.mamba_state_scatter_sail import (
+            fused_mamba_state_scatter_with_mask as _sail_scatter,
+        )
+
+        return _sail_scatter(
+            dst, src, dst_indices_raw, step_indices_raw, src_indices_raw
+        )
+
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0:
         return
@@ -500,6 +510,15 @@ def fused_conv_window_scatter_with_mask(
     ``dst`` (the real conv-state pool) is the usual contiguous
     ``[layers, cache, dim, K-1]``.
     """
+    if is_sail_runtime():
+        from sglang.kernels.ops.mamba.mamba_state_scatter_sail import (
+            fused_conv_window_scatter_with_mask as _sail_scatter,
+        )
+
+        return _sail_scatter(
+            dst, src, dst_indices_raw, step_indices_raw, src_indices_raw
+        )
+
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0 or dst.numel() == 0:
         return
