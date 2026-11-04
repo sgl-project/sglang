@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -80,9 +83,11 @@ def _is_anima_block(name, module):
 
 
 def _anima_residual_add(residual, update, gate):
-    if torch.compiler.is_compiling():
-        return residual + gate * update
-    return residual_gate_add(residual, update, gate)
+    # The fused kernel saves GPU time, but its dispatch is slower in eager.
+    # BCG marks both its pre-capture warmup and capture with this context.
+    if not torch.compiler.is_compiling() and is_in_breakable_cuda_graph():
+        return residual_gate_add(residual, update, gate)
+    return residual + gate * update
 
 
 class AnimaPatchEmbed(nn.Module):
