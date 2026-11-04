@@ -958,6 +958,13 @@ class Envs:
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
     # ===================================================================
+    # Elastic EP
+    # ===================================================================
+    SGLANG_ELASTIC_LIVE_SCALE = EnvStr("")
+    # Parse strictly in the coordinator instead of falling back on invalid input.
+    SGLANG_ELASTIC_CAPTURE_SERVICE_STEPS = EnvStr("32")
+
+    # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)

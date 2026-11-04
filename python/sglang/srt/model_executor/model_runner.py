@@ -600,7 +600,6 @@ class ModelRunner:
             register_recover_cohort(offset, offset + parallel.tp_size, parallel.tp_size)
 
     def _initialize_elastic_ep_serving(self) -> None:
-        """Keep recovery admission synchronous and live control consistent afterwards."""
         from sglang.srt.elastic_ep.live_scale import (
             LiveScaleCoordinator,
             live_scale_mode,
@@ -608,9 +607,7 @@ class ModelRunner:
 
         if live_scale_mode():
             if get_exec().moe.ep_join_mode == "recover":
-                # Recovery keeps its ordinary admission/weight/ready protocol.
-                # Install the coordinator afterwards so every serving rank uses
-                # the same DP control metadata and can join later live growth.
+                # Admit recovery synchronously before enabling live DP control.
                 self._initialize_elastic_ep_joiner()
             self.live_scale = LiveScaleCoordinator(self)
             self.live_scale.initialize()
@@ -2610,7 +2607,7 @@ class ModelRunner:
         self._rearm_eplb_after_elastic_scale()
 
         if self.live_scale is not None:
-            self.live_scale.preparation = None
+            self.live_scale.complete_preparation()
 
         # A survivor drops the announce, not the joiner: a joiner that dies mid-join
         # would leave the next grow onto these slots planned off a stale width.
@@ -2764,9 +2761,8 @@ class ModelRunner:
                 self._finalize_recovered_ep_ranks(ranks_to_recover)
             return
 
-        # Live ranks consume the same deadline vote in the DP metadata gather.
-        # A local recheck here could make one rank abort while its peers enter
-        # the preparation collective in this scheduler turn.
+        # Live ranks use the gathered deadline vote; a local recheck could
+        # abort one rank while its peers enter the preparation collective.
         if (
             self.live_scale is None
             and state.pending_since is not None

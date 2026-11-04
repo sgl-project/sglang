@@ -1283,11 +1283,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture_step(self, size: int) -> None:
-        """Record one shape with all capture contexts closed before returning.
+        """Capture one shape; the coordinator publishes the runner after all shapes.
 
-        The coordinator keeps this runner unpublished until every shape exists.
-        capture() resets shared index inputs on *each* entry, preserving the
-        mid-serving KV safety reset of ordinary elastic recapture.
+        Each capture resets shared index inputs modified by intervening serving.
         """
         if size not in self.capture_bs:
             raise ValueError(f"Unknown capture shape {size}")

@@ -628,23 +628,15 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
         device = get_device()
 
         self._enable_global_physical_experts = enable_global_physical_experts
+        num_experts = self._expert_location_metadata.num_local_physical_experts
+        if enable_global_physical_experts:
+            num_experts = self._expert_location_metadata.num_physical_experts
+            if get_exec().moe.elastic_ep_reuse_cuda_graph:
+                num_experts = (
+                    get_parallel().max_ep_size or self._expert_location_metadata.ep_size
+                ) * self._expert_location_metadata.num_local_physical_experts
         self._data = torch.zeros(
-            (
-                self._expert_location_metadata.num_layers,
-                (
-                    (
-                        (
-                            get_parallel().max_ep_size
-                            or self._expert_location_metadata.ep_size
-                        )
-                        * self._expert_location_metadata.num_local_physical_experts
-                        if get_exec().moe.elastic_ep_reuse_cuda_graph
-                        else self._expert_location_metadata.num_physical_experts
-                    )
-                    if enable_global_physical_experts
-                    else self._expert_location_metadata.num_local_physical_experts
-                ),
-            ),
+            (self._expert_location_metadata.num_layers, num_experts),
             dtype=torch.int,
             device=device,
         )
