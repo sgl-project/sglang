@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     SERVICE_PORT,
+    check_port_availability,
     check_role,
     kill_process_group,
     launch_pd_mix_node,
@@ -48,6 +50,10 @@ logger.info(f"PYTHON_FOR_TEST_TOOL: {PYTHON_FOR_TEST_TOOL}")
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 MAX_SERVER_KEEP_ALIVE_TIME = 3600
+
+# npu_memcache L3 backend MetaService readiness.
+META_SERVICE_READY_TIMEOUT = 300
+META_SERVICE_READY_POLL_INTERVAL = 5
 
 ACCURACY_TOLERANCE = 0.99
 
@@ -635,10 +641,16 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     # Per-case evalscope accuracy retry count. None uses the dataset default
     # (get_max_retries); set to 1 to fail fast on first measurement.
     max_retries = None
+    # npu_memcache metaservice_config content (meta_service_url /
+    # config_store_url / metrics_url). When set, the prefill node starts the
+    # Ascend MemCache MetaService before launching the model server, since
+    # the L3 cache backend needs it to be running first.
+    meta_service_config = None
 
     @classmethod
     def setUpClass(cls):
         cls.process = None
+        cls.meta_service_process = None
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
         cls.port = SERVICE_PORT
@@ -663,6 +675,11 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        if cls.meta_service_process:
+            try:
+                kill_process_group(cls.meta_service_process)
+            except Exception as e:
+                logger.error(f"Error stopping MetaService during tearDown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["router"])
@@ -684,6 +701,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
+        # The L3 storage backend must be reachable before the model server
+        # starts, so bring up the MetaService first.
+        cls.start_meta_service()
         logger.info(f"Starting pd separation node...")
         cls.process = launch_pd_separation_node(cls.model_config)
         logger.info(f"Pd separation node started with PID: {cls.process.pid}")
@@ -696,6 +716,55 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                 raise Exception(
                     f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
                 )
+
+    @classmethod
+    def start_meta_service(cls):
+        """Start the npu_memcache MetaService before the model server.
+
+        The L3 npu_memcache backend connects to the Ascend MemCache
+        MetaService at startup, so it must already be listening. In PD
+        separation only the prefill node enables the L3 backend.
+        """
+        if not cls.meta_service_config or cls.role != "prefill":
+            return
+
+        # Materialize the config on the pod-local temp dir so runtime ports
+        # (chosen by the test case) are not baked into a checked-in file.
+        config_path = os.path.join(
+            tempfile.gettempdir(), "npu_memcache_metaservice_config.json"
+        )
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(cls.meta_service_config, f, indent=4)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+            "--config_path",
+            config_path,
+        ]
+        logger.info(f"Starting npu_memcache MetaService: {' '.join(cmd)}")
+        cls.meta_service_process = subprocess.Popen(cmd, start_new_session=True)
+
+        parsed_url = urlparse(cls.meta_service_config["meta_service_url"])
+        host, port = parsed_url.hostname, parsed_url.port
+
+        start_time = time.time()
+        while time.time() - start_time < META_SERVICE_READY_TIMEOUT:
+            if cls.meta_service_process.poll() is not None:
+                raise RuntimeError(
+                    f"npu_memcache MetaService exited with code "
+                    f"{cls.meta_service_process.returncode} before it was ready"
+                )
+            if check_port_availability(host, port):
+                logger.info(f"npu_memcache MetaService is ready at {host}:{port}")
+                return
+            time.sleep(META_SERVICE_READY_POLL_INTERVAL)
+
+        raise RuntimeError(
+            f"Timed out after {META_SERVICE_READY_TIMEOUT}s waiting for "
+            f"npu_memcache MetaService at {host}:{port}"
+        )
 
     @check_role(allowed_roles=["router"])
     def run_accuracy(self):

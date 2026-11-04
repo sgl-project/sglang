@@ -1,3 +1,5 @@
+import json
+import os
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -14,6 +16,43 @@ register_npu_ci(
     est_time=3800,
     suite="",
     nightly=True,
+)
+
+# npu_memcache MetaService must be started before the model server so the L3
+# cache backend can connect to it. Its ports follow the same per-pod offset
+# convention as SERVICE_PORT (first visible NPU id) so that concurrent test
+# pods sharing a host (hostNetwork) do not collide.
+def _get_first_visible_device():
+    devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
+        "ASCEND_VISIBLE_DEVICES"
+    )
+    if not devices:
+        return 0
+    return int(devices.strip().split(",")[0])
+
+
+DEVICE_OFFSET = _get_first_visible_device()
+META_SERVICE_PORT = 5007 + DEVICE_OFFSET
+CONFIG_STORE_PORT = 6007 + DEVICE_OFFSET
+META_METRICS_PORT = 8007 + DEVICE_OFFSET
+
+METASERVICE_CONFIG = {
+    "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
+    "config_store_url": f"tcp://127.0.0.1:{CONFIG_STORE_PORT}",
+    "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
+}
+
+# Local service config for the npu_memcache L3 backend; it must point at the
+# same MetaService/config-store endpoints as METASERVICE_CONFIG.
+HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
+    {
+        "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
+        "config_store_url": METASERVICE_CONFIG["config_store_url"],
+        "log_level": "info",
+        "world_size": 8,
+        "protocol": "device_sdma",
+        "dram_size": "20GB",
+    }
 )
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
@@ -140,10 +179,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
-    # "--hicache-storage-backend",
-    # "npu_memcache",
-    # "--hicache-storage-backend-extra-config",
-    # '{"meta_service_url":"tcp://127.0.0.1:5007", "config_store_url":"tcp://127.0.0.1:6007", "log_level":"info", "world_size":8, "protocol": "device_sdma", "dram_size": "20GB"}'
+    "--hicache-storage-backend",
+    "npu_memcache",
+    "--hicache-storage-backend-extra-config",
+    HICACHE_STORAGE_EXTRA_CONFIG,
 ]
 
 # Decode node launch arguments.
@@ -229,41 +268,27 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
+    # Start the npu_memcache MetaService on the prefill node before the model
+    # server, as required by the L3 cache backend. Its ports are derived from
+    # the pod's visible devices (see METASERVICE_CONFIG above).
+    meta_service_config = METASERVICE_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 64
-    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 10%
+    # percent: L2 host and L3 storage hit rates must exceed the thresholds.
+    min_hit_rate_pcts = {"host": 0, "storage": 0}
 
     # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
     #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
     #     self.run_accuracy()
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
-        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
+    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_l3_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the L2/L3 hit rates"""
         # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
-        metrics = run_bench_serving(
-            host=self.host,
-            port=self.port,
-            model_path=self.model_config.get("model_path"),
-            dataset_name="generated-shared-prefix",
-            input_len=32000,
-            output_len=1024,
-            max_concurrency=32,
-            gsp_num_groups=3,
-            gsp_prompts_per_group=32,
-            seed=100,
-            warmup_requests=16,
-            cache_report=True,
-        )
-        assert_metrics(self, metrics)
-
-    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
-        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
-        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        # plus a 3200-token question, which exceeds L1 so evictions land in L2
+        # and L3.
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
