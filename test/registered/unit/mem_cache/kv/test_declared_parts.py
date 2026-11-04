@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -49,8 +49,15 @@ def _build(
     ple=False,
     fused_draft=None,
     window_with_state=False,
+    window=16,
+    full_tokens=256,
+    window_tokens=128,
+    lazy_compaction=False,
+    enable_mamba_extra_buffer=False,
+    setup=True,
 ):
-    setup_allocator_context()
+    if setup:
+        setup_allocator_context()
     dense = MHAGeometry(
         head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
     )
@@ -81,9 +88,10 @@ def _build(
         if state and not window_with_state
         else (3 if state else 1,),
         window_geometry=dense,
-        window=16,
+        window=window,
         state_layer_ids=(1, 2) if state else (),
         state_geometry=geometry if state else None,
+        checkpoint_interval=mamba_cache_chunk_size() if state else None,
     )
     plan = plan_kv_storage(
         decls,
@@ -94,8 +102,8 @@ def _build(
         fused_draft=fused_draft,
     )
     inputs = KVSizingInputs(
-        full_tokens=256,
-        window_tokens=128,
+        full_tokens=full_tokens,
+        window_tokens=window_tokens,
         state_slots=16,
         max_running_requests=3,
         context_len=64,
@@ -110,6 +118,8 @@ def _build(
         need_sort=False,
         max_num_reqs=3,
         model_context_len=64,
+        lazy_compaction=lazy_compaction,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
         state_cache_params=SimpleNamespace(layers=(1, 2)),
         speculative_num_draft_tokens=gamma,
     )
@@ -117,6 +127,353 @@ def _build(
 
 
 class TestDeclaredParts(CustomTestCase):
+    def test_file_cache_keeps_rank_local_draft_inside_mla_pages(self):
+        import tempfile
+        from unittest.mock import patch
+
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+        from sglang.srt.mem_cache.kv.decl import MLAGeometry
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.mla_host_dedup import mla_host_dedup_eligible
+        from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+
+        setup_allocator_context()
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=MLAGeometry(
+                    kv_lora_rank=8, qk_rope_head_dim=8, kv_cache_dtype=torch.bfloat16
+                ),
+                state_layer_ids=(1,),
+                state_geometry=StateGeometry(
+                    conv_state_shapes=((3, 8),),
+                    conv_dtype=torch.bfloat16,
+                    temporal_state_shape=(1, 4, 8),
+                    temporal_dtype=torch.float32,
+                ),
+            ),
+            page_size=4,
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"full": [1]},
+                regions={
+                    "full": DenseDraftRegion(
+                        lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                    )
+                },
+            ),
+        )
+        sized = size_plan(
+            plan,
+            KVSizingInputs(
+                full_tokens=32,
+                state_slots=4,
+                max_running_requests=1,
+                context_len=64,
+                alignment=1,
+            ),
+        )
+        records = []
+        with tempfile.TemporaryDirectory() as directory:
+            for rank in (0, 1):
+                storage = build_kv_storage(
+                    plan,
+                    sized,
+                    UnifiedBuildContext(
+                        device="cpu",
+                        start_layer=0,
+                        end_layer=2,
+                        enable_memory_saver=False,
+                        need_sort=False,
+                        max_num_reqs=1,
+                        model_context_len=64,
+                        state_cache_params=SimpleNamespace(layers=(1,)),
+                    ),
+                )
+                view = storage.view("full")
+                controller = HiCacheController.__new__(HiCacheController)
+                controller.mem_pool_device = view
+                controller.mem_pool_host = SimpleNamespace(layout="page_first")
+                controller.storage_host_pool = UnifiedPageEnvelopeHostPool
+                controller.enable_storage_metrics = False
+                controller.page_size = 4
+                with (
+                    get_parallel().override(
+                        tp_size=2,
+                        tp_rank=rank,
+                        attn_tp_size=2,
+                        attn_tp_rank=rank,
+                        moe_tp_size=2,
+                        moe_tp_rank=rank,
+                        pp_rank=0,
+                    ),
+                    patch.object(
+                        controller, "get_attn_cp_rank_and_size", return_value=(0, 1)
+                    ),
+                    patch.object(controller, "_build_unified_plan", return_value=None),
+                ):
+                    config = controller._generate_storage_config("ranked-model")
+                page = view.host_layout().get_page_envelope_buffer()[1]
+                page.fill_(23)
+                entry = plan.owner().spec
+                rows = page.view(4, entry.entry_bytes())
+                rows[:, entry.draft_offset_in_entry() :] = 101 + rank
+                backend = HiCacheFile(config, file_path=directory)
+                if config.is_storage_writer:
+                    self.assertTrue(backend.set("prefix-page", page))
+                records.append((backend, page.clone(), config, view))
+            for backend, expected, config, view in records:
+                output = torch.empty_like(expected)
+                self.assertIsNotNone(backend.get("prefix-page", output))
+                torch.testing.assert_close(output, expected)
+            self.assertNotEqual(
+                records[0][0].config_suffix, records[1][0].config_suffix
+            )
+            for _, _, config, view in records:
+                self.assertTrue(config.is_storage_writer)
+                with patch(
+                    "sglang.srt.mem_cache.mla_host_dedup.is_cuda", return_value=True
+                ):
+                    self.assertFalse(mla_host_dedup_eligible(view, "file"))
+
+    def test_decode_early_release_tracks_independent_window_locks(self):
+        from array import array
+        from unittest.mock import patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        for draft_window in (8, 32):
+            with (
+                self.subTest(draft_window=draft_window),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(True),
+                envs.SGLANG_SWA_EVICTION_INTERVAL.override(1),
+            ):
+                placement = FusedDraftPlacement.from_counts(
+                    counts={"draft_swa": [1]},
+                    regions={
+                        "draft_swa": DenseDraftRegion(
+                            lane_num=1,
+                            head_num=1,
+                            head_dim=8,
+                            store_dtype=torch.bfloat16,
+                        )
+                    },
+                    new_bands={
+                        "draft_swa": DraftBand(kind="window", window=draft_window)
+                    },
+                )
+                storage, _, _ = _build(
+                    fused_draft=placement, full_tokens=128, window_tokens=32
+                )
+                a = storage.allocator
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=storage.tree_slots(),
+                        tree_core_backend="python",
+                    )
+                )
+                prefix = a.alloc(16)
+                self.assertIsNotNone(prefix)
+                key = RadixKey(array("q", range(16)))
+                cache.insert(InsertParams(key=key, value=prefix.clone()))
+                node_id = cache.match_prefix(
+                    MatchPrefixParams(key=key)
+                ).last_device_node
+                lock = cache.lock(node_id)
+                req = SimpleNamespace(
+                    session=None,
+                    lock=lock,
+                    seqlen=17,
+                    decode_batch_idx=0,
+                    kv=ReqKvInfo(req_pool_idx=1, cache_protected_len=16),
+                )
+                storage.requests.req_to_token[1, :16] = prefix
+                batch = ScheduleBatch(
+                    reqs=[req],
+                    tree_cache=cache,
+                    req_to_token_pool=storage.requests,
+                    token_to_kv_pool_allocator=a,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                node = cache.tree_core.node_by_id(node_id)
+                for frontier in range(20, 65, 4):
+                    ids = a.alloc(4)
+                    self.assertIsNotNone(ids, frontier)
+                    storage.requests.req_to_token[1, frontier - 4 : frontier] = ids
+                    req.seqlen = frontier + 1
+                    req.decode_batch_idx = frontier - 16
+                    if req.decode_batch_idx == min(16, draft_window):
+                        # A recurrent checkpoint can still need the prefix even
+                        # after this window has left the current decode tail.
+                        with patch.object(cache, "swa_retain_floor", return_value=0):
+                            batch.maybe_evict_swa()
+                        for ct in (ComponentType.SWA, ComponentType.AUXILIARY_SWA):
+                            self.assertEqual(node.component_data[ct].lock_ref, 1)
+                    batch.maybe_evict_swa()
+                    # Repeated scheduling must neither release twice nor drop
+                    # the longer window while it still reads the cached prefix.
+                    batch.maybe_evict_swa()
+                    cache.evict(
+                        EvictParams(swa_num_tokens=80, auxiliary_swa_num_tokens=80)
+                    )
+                    for ct, window in (
+                        (ComponentType.SWA, 16),
+                        (ComponentType.AUXILIARY_SWA, draft_window),
+                    ):
+                        self.assertEqual(
+                            node.component_data[ct].lock_ref,
+                            int(req.decode_batch_idx < window),
+                        )
+                self.assertEqual(a.full_attn_allocator.allocated_count(), 64)
+                for band in a._windows:
+                    window = 16 if band is a.swa_attn_allocator else draft_window
+                    self.assertEqual(band.allocated_count(), window)
+                extra = a.alloc(4)
+                self.assertIsNotNone(extra)
+                a.free(extra)
+                cache.free_kv_row(req.kv, [(16, 64)])
+                cache.unlock(lock)
+                cache.evict(
+                    EvictParams(
+                        num_tokens=80, swa_num_tokens=80, auxiliary_swa_num_tokens=80
+                    )
+                )
+                self.assertEqual(storage.accounting_violations(), [])
+                self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
+
+    def test_decode_retires_each_declared_window(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_draft_pool import routed_draft_pool
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+            MultiLayerEagleWorkerV2,
+        )
+
+        for draft_window in (8, 32):
+            for interval, front in ((1, 0), (8, 0), (1, 5), (8, 5)):
+                with (
+                    self.subTest(
+                        draft_window=draft_window, interval=interval, front=front
+                    ),
+                    envs.SGLANG_SWA_EVICTION_INTERVAL.override(interval),
+                    envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+                ):
+                    placement = FusedDraftPlacement.from_counts(
+                        counts={"draft_swa": [1, 1]},
+                        regions={
+                            "draft_swa": DenseDraftRegion(
+                                lane_num=2,
+                                head_num=1,
+                                head_dim=8,
+                                store_dtype=torch.bfloat16,
+                            )
+                        },
+                        new_bands={
+                            "draft_swa": DraftBand(kind="window", window=draft_window)
+                        },
+                    )
+                    storage, _, _ = _build(fused_draft=placement)
+                    a = storage.allocator
+                    runners = [
+                        SimpleNamespace(
+                            token_to_kv_pool=routed_draft_pool(
+                                arena=a.arena,
+                                plan=storage._plan,
+                                owner="full",
+                                page_size=4,
+                                lanes_by_host={"draft_swa": {0: depth}},
+                            ),
+                            sliding_window_size=draft_window,
+                            runner_ids=SimpleNamespace(is_fused_draft=True),
+                        )
+                        for depth in range(2)
+                    ]
+                    worker = object.__new__(MultiLayerEagleWorkerV2)
+                    worker._draft_worker = SimpleNamespace(
+                        draft_runner_list=runners, draft_extend_num_front_tokens=front
+                    )
+                    reaches = worker.draft_window_reaches
+                    self.assertEqual(reaches, {"draft_swa": draft_window + front})
+                    cache = UnifiedRadixCache(
+                        CacheInitParams(
+                            disable=False,
+                            req_to_token_pool=storage.requests,
+                            token_to_kv_pool_allocator=a,
+                            page_size=4,
+                            sliding_window_size=16,
+                            draft_window_reaches=reaches,
+                            tree_slots=storage.tree_slots(window_reaches=reaches),
+                            tree_core_backend="python",
+                        )
+                    )
+                    req = SimpleNamespace(
+                        seqlen=1, decode_batch_idx=1, kv=ReqKvInfo(req_pool_idx=1)
+                    )
+                    batch = ScheduleBatch(
+                        reqs=[req],
+                        tree_cache=cache,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        forward_mode=ForwardMode.DECODE,
+                    )
+                    chunks = []
+                    for frontier in range(4, 65, 4):
+                        ids = a.alloc(4)
+                        self.assertIsNotNone(ids)
+                        chunks.append(ids)
+                        storage.requests.req_to_token[1, frontier - 4 : frontier] = ids
+                        req.seqlen = frontier + 1
+                        batch.maybe_evict_swa()
+                        for name, window in (
+                            ("swa", 16),
+                            ("draft_swa", draft_window + front),
+                        ):
+                            self.assertLessEqual(
+                                next(
+                                    b for b in a.members if b.sub_pool_name == name
+                                ).allocated_count(),
+                                window + interval + 4,
+                            )
+                    self.assertGreater(
+                        req.kv.get_evicted_seqlen(ComponentType.AUXILIARY_SWA), 0
+                    )
+                    self.assertEqual(a.full_attn_allocator.allocated_count(), 64)
+                    a.free(torch.cat(chunks))
+                    self.assertEqual(storage.accounting_violations(), [])
+
     def test_unified_sizing_rejects_an_unbudgeted_private_draft(self):
         from unittest.mock import patch
 
@@ -618,6 +975,234 @@ class TestDeclaredParts(CustomTestCase):
         self.assertIsNotNone(slots)
         self.assertEqual(slots.numel(), count)
 
+    def test_multi_window_admission_reclaims_cached_state(self):
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=256)},
+        )
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                storage, _, _ = _build(
+                    state=True,
+                    window_with_state=True,
+                    fused_draft=placement,
+                    lazy_compaction=lazy,
+                )
+                a = storage.allocator
+                states = a.alloc_state_slots(16)
+                chunks = []
+                while a.ensure_capacity(4, 4):
+                    chunks.append(a.alloc(4))
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        enable_mamba_extra_buffer=True,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=tuple(
+                            msgspec.structs.replace(slot, checkpoint_interval=4)
+                            if slot.family == "state"
+                            else slot
+                            for slot in storage.tree_slots()
+                        ),
+                        tree_core_backend="python",
+                    )
+                )
+                nodes = []
+                for i, state in enumerate(states):
+                    value = torch.cat(chunks[i :: len(states)])
+                    key = RadixKey(list(range(i * 10000, i * 10000 + len(value))))
+                    cache.insert(
+                        InsertParams(
+                            key=key,
+                            value=value.clone(),
+                            mamba_value=state.reshape(1),
+                        )
+                    )
+                    nodes.append(
+                        cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                    )
+                budget = a.create_prefill_budget(cache)
+                self.assertTrue(budget.state_slots_fit(1))
+                # The longer draft retains this whole prompt. Its bytes plus
+                # FULL 248 require a state donor, while the prompt remains below
+                # nominal FULL capacity so permanent chunk fallback cannot hide
+                # a missing eviction credit.
+                demand = dict(
+                    extend_input_len=240,
+                    total_tokens=248,
+                    max_new_tokens=0,
+                    input_tokens=240,
+                    swa_host_hit_length=0,
+                    chunk_limit=16,
+                    state_slots=1,
+                )
+                # An idle cache must reach reclamation before admission can stop.
+                self.assertTrue(budget.check_prefill(**demand)[0])
+                receipts = [
+                    cache.inc_lock_ref(
+                        node,
+                        skip_lock_components=(
+                            ComponentType.FULL,
+                            ComponentType.SWA,
+                            ComponentType.AUXILIARY_SWA,
+                        ),
+                    )
+                    for node in nodes
+                ]
+                try:
+                    self.assertEqual(cache.mamba_evictable_size(), 0)
+                    self.assertFalse(budget.check_prefill(**demand)[0])
+                finally:
+                    for node, receipt in zip(nodes, receipts):
+                        cache.dec_lock_ref(node, receipt.to_dec_params())
+                self.assertTrue(budget.check_prefill(**demand)[0])
+                self.assertIsNone(
+                    a.reclaim_for_prealloc(
+                        cache, 248, 20, auxiliary_swa_tokens=244, state_slots=1
+                    )
+                )
+                incoming_state = a.alloc_state_slots(1)
+                self.assertIsNotNone(incoming_state)
+                first_chunk = a.alloc(16)
+                self.assertIsNotNone(first_chunk)
+                budget.reserve(240, 0, state_slots=1, chunk_limit=16)
+                self.assertFalse(budget.check_prefill(**demand)[0])
+                a.free(first_chunk)
+                a.state_slots.free(incoming_state)
+                self.assertEqual(storage.accounting_violations(), [])
+
+    def test_multi_window_reclaim_uses_unlocked_state_checkpoints(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        for lazy, demand in ((lazy, n) for lazy in (False, True) for n in (4, 16, 32)):
+            with self.subTest(lazy=lazy, demand=demand):
+                storage, _, _ = _build(
+                    state=True,
+                    window_with_state=True,
+                    fused_draft=placement,
+                    lazy_compaction=lazy,
+                )
+                a = storage.allocator
+                states = a.state_slots.alloc(16)
+                chunks = []
+                while a.ensure_capacity(4, 4):
+                    chunks.append(a.alloc(4))
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        enable_mamba_extra_buffer=True,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=tuple(
+                            msgspec.structs.replace(slot, checkpoint_interval=4)
+                            if slot.family == "state"
+                            else slot
+                            for slot in storage.tree_slots()
+                        ),
+                        tree_core_backend="python",
+                    )
+                )
+                receipts = []
+                for i, state in enumerate(states):
+                    key = RadixKey(list(range(i * 10000, i * 10000 + 4)))
+                    cache.insert(
+                        InsertParams(
+                            key=key,
+                            value=chunks[i].clone(),
+                            mamba_value=state.reshape(1),
+                        )
+                    )
+                    node = cache.match_prefix(
+                        MatchPrefixParams(key=key)
+                    ).last_device_node
+                    receipt = cache.inc_lock_ref(
+                        node, skip_lock_components=(ComponentType.MAMBA,)
+                    )
+                    receipts.append((node, receipt))
+                try:
+                    self.assertEqual(cache.full_evictable_size(), 0)
+                    self.assertEqual(cache.swa_evictable_size(), 0)
+                    self.assertEqual(cache.auxiliary_swa_evictable_size(), 0)
+                    self.assertEqual(cache.mamba_evictable_size(), 16)
+                    phases = []
+                    original = cache.evict_for_alloc
+
+                    def walk(params, **kwargs):
+                        phases.append(params)
+                        return original(params, **kwargs)
+
+                    with patch.object(cache, "evict_for_alloc", side_effect=walk):
+                        self.assertTrue(a.evict_to_free_tokens(cache, demand))
+                    self.assertIsNotNone(a.alloc(demand))
+                    self.assertEqual(len(phases), 2)
+                    self.assertEqual(phases[0].mamba_num, 0)
+                    token_bytes = demand * sum(
+                        b.entry_bytes for b in (a.full_attn_allocator, *a._windows)
+                    )
+                    self.assertEqual(
+                        phases[1].mamba_num,
+                        -(-token_bytes // a.mamba_allocator.entry_bytes),
+                    )
+                    self.assertEqual(phases[1].num_tokens, 0)
+                    for (node, _), prior in zip(receipts, chunks):
+                        torch.testing.assert_close(
+                            cache.tree_core.get_component_device_value(
+                                node, ComponentType.FULL
+                            ),
+                            prior,
+                        )
+                finally:
+                    for node, receipt in receipts:
+                        cache.dec_lock_ref(node, receipt.to_dec_params())
+                self.assertEqual(storage.accounting_violations(), [])
+
     def test_full_cap_reclaims_cached_tokens_before_allocation(self):
         from sglang.srt.mem_cache.base_prefix_cache import InsertParams
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1107,6 +1692,1450 @@ class TestDeclaredParts(CustomTestCase):
                 plan.sub_pool("mamba").spec.entry_bytes(),
             )
 
+    def test_draft_windows_allocate_and_retire_independently(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftKVGeometry,
+            DraftKVProfile,
+            DraftLayerSet,
+            PlacementContext,
+            place_fused_draft,
+        )
+
+        for target_state in (False, True):
+            for draft_window in (8, 32):
+                with self.subTest(state=target_state, draft_window=draft_window):
+                    placement = place_fused_draft(
+                        profile=DraftKVProfile(
+                            num_layers=1,
+                            kinds={
+                                "window": DraftLayerSet(
+                                    layer_ids=(0,),
+                                    window=draft_window,
+                                    geometry=DraftKVGeometry(
+                                        head_num=1, head_dim=3, v_head_dim=5
+                                    ),
+                                )
+                            },
+                        ),
+                        num_runners=1,
+                        ctx=PlacementContext(
+                            host_names=("full", "swa", "mamba")
+                            if target_state
+                            else ("full", "swa"),
+                            target_window=16,
+                        ),
+                        store_dtype=torch.bfloat16,
+                    ).placement
+                    self.assertEqual(set(placement.new_bands), {"draft_swa"})
+                    storage, plan, _ = _build(
+                        state=target_state,
+                        window_with_state=True,
+                        fused_draft=placement,
+                    )
+                    allocator = storage.allocator
+                    self.assertEqual(len(allocator.bands), 4 if target_state else 3)
+                    ids = allocator.alloc(8)
+                    self.assertIsNotNone(ids)
+                    draft = allocator.window_allocators["draft_swa"]
+                    physical = draft.ids.translate(ids).long()
+                    k, v = plan.sub_pool("draft_swa").spec.draft_views(
+                        storage.allocator.arena
+                    )
+                    k[0][physical] = 11
+                    v[0][physical] = 13
+                    allocator.free_swa_segment(ids[:4], start_pos=0)
+                    self.assertTrue(
+                        torch.all(draft.ids.translate(ids).long() == physical)
+                    )
+                    torch.testing.assert_close(
+                        k[0][physical], torch.full_like(k[0][physical], 11)
+                    )
+                    # Failure in the last physical reservation leaves every id
+                    # and live page untouched, including the earlier window.
+                    before = [
+                        (b, b.allocated_count(), b.ids.virtual_to_physical.clone())
+                        for b in allocator.bands
+                    ]
+                    free_ids = allocator.full_attn_allocator.free_virtual_ids.clone()
+                    with patch.object(
+                        allocator._windows[-1],
+                        "take_planned_physical_pages",
+                        return_value=None,
+                    ):
+                        self.assertIsNone(allocator.alloc(4))
+                    for band, count, mapping in before:
+                        self.assertEqual(band.allocated_count(), count)
+                        torch.testing.assert_close(
+                            band.ids.virtual_to_physical, mapping
+                        )
+                    torch.testing.assert_close(
+                        allocator.full_attn_allocator.free_virtual_ids, free_ids
+                    )
+                    allocator.free(ids)
+                    self.assertEqual(allocator.verify_byte_accounting(), [])
+                    self.assertTrue(
+                        all(b.allocated_count() == 0 for b in allocator.bands)
+                    )
+
+    def test_request_cleanup_releases_independently_retained_windows(self):
+        """Returning owner ids must not strand a longer window's physical pages."""
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+
+        for window in (8, 32):
+            placement = FusedDraftPlacement.from_counts(
+                counts={"draft_swa": [1]},
+                regions={
+                    "draft_swa": DenseDraftRegion(
+                        lane_num=1,
+                        head_num=1,
+                        head_dim=8,
+                        store_dtype=torch.bfloat16,
+                    )
+                },
+                new_bands={"draft_swa": DraftBand(kind="window", window=window)},
+            )
+            for grouped in (False, True):
+                for direct in (False, True):
+                    with self.subTest(window=window, grouped=grouped, direct=direct):
+                        storage, _, _ = _build(fused_draft=placement)
+                        a = storage.allocator
+                        ids = a.alloc(32)
+                        self.assertIsNotNone(ids)
+                        a.free_swa_segment(ids[:16], start_pos=0)
+                        if window < 16:
+                            a.free_window_segment("draft_swa", ids[:24], start_pos=0)
+                        if grouped:
+                            a.free_group_begin()
+                        if direct:
+                            a.free_full(ids[:16])
+                            a.free(ids[16:])
+                        else:
+                            from sglang.srt.managers.schedule_batch import ReqKvInfo
+                            from sglang.srt.mem_cache.unified_cache.component_type import (
+                                ComponentType,
+                            )
+
+                            storage.requests.req_to_token[0, :32] = ids
+                            kv = ReqKvInfo(req_pool_idx=0)
+                            kv.set_evicted_seqlen(ComponentType.SWA, 16)
+                            if window < 16:
+                                kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 24)
+                            storage.free_row(kv, [(0, 32)])
+                        if grouped:
+                            a.free_group_end()
+                        self.assertEqual(
+                            {b.sub_pool_name: b.allocated_count() for b in a.bands},
+                            {b.sub_pool_name: 0 for b in a.bands},
+                        )
+                        self.assertEqual(storage.accounting_violations(), [])
+                        reused = a.alloc(32)
+                        self.assertIsNotNone(reused)
+                        for band in a._windows:
+                            self.assertTrue(torch.all(band.ids.translate(reused) > 0))
+                        a.free(reused)
+                        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_multiwindow_preallocation_preserves_primary_window_demand(self):
+        """A small host-restored window must not be expanded to the full prefix."""
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        setup_allocator_context()
+        dense = MHAGeometry(
+            head_num=1, head_dim=16, v_head_dim=16, kv_cache_dtype=torch.bfloat16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1,
+                    head_num=1,
+                    head_dim=16,
+                    v_head_dim=16,
+                    store_dtype=torch.bfloat16,
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=dense,
+                window_layer_ids=(1,),
+                window_geometry=dense,
+                window=16,
+            ),
+            page_size=4,
+            fused_draft=placement,
+        )
+        sized = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=81920,
+                context_len=1024,
+                max_running_requests=3,
+                alignment=1,
+            ),
+        )
+        storage = build_kv_storage(
+            plan,
+            sized,
+            UnifiedBuildContext(
+                device="cpu",
+                start_layer=0,
+                end_layer=2,
+                enable_memory_saver=False,
+                need_sort=False,
+                max_num_reqs=3,
+                model_context_len=1024,
+                lazy_compaction=False,
+            ),
+        )
+        a = storage.allocator
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=a,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        self.assertTrue(a.can_reserve(400, 16))
+        self.assertFalse(a.can_reserve(400, 400))
+        full_budget = a.full_available_size()
+        swa_budget = a.conserve_swa_available_size()
+        self.assertTrue(
+            a.prealloc_fits(
+                cache,
+                400,
+                16,
+                full_budget_tokens=full_budget,
+                swa_budget_tokens=swa_budget,
+            )
+        )
+        # Pending requests and decode headroom are deducted from these budgets.
+        # They must still be charged to the joint byte demand, not just compared
+        # with this request's individual token counts.
+        self.assertFalse(a.can_reserve(full_budget, 16))
+        for full_reserved, swa_reserved, fits in (
+            (4, 4, True),
+            (full_budget - 400, 0, False),
+            (full_budget - 399, 0, False),
+            (0, swa_budget - 15, False),
+        ):
+            with self.subTest(full_reserved=full_reserved, swa_reserved=swa_reserved):
+                self.assertEqual(
+                    a.prealloc_fits(
+                        cache,
+                        400,
+                        16,
+                        full_budget_tokens=full_budget - full_reserved,
+                        swa_budget_tokens=swa_budget - swa_reserved,
+                    ),
+                    fits,
+                )
+        self.assertIsNone(a.reclaim_for_prealloc(cache, 400, 16))
+        self.assertTrue(a.ensure_capacity(400, 16))
+
+    def test_multiwindow_reclaim_uses_one_window_as_joint_byte_donor(self):
+        """A reclaimable window can fund a page in every locked companion band."""
+        from array import array
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        for lazy, draft_dim in ((False, 16), (True, 16), (False, 32), (True, 32)):
+            with self.subTest(lazy=lazy, draft_dim=draft_dim):
+                placement = FusedDraftPlacement.from_counts(
+                    counts={"draft_swa": [1]},
+                    regions={
+                        "draft_swa": DenseDraftRegion(
+                            lane_num=1,
+                            head_num=1,
+                            head_dim=draft_dim,
+                            store_dtype=torch.bfloat16,
+                        )
+                    },
+                    new_bands={"draft_swa": DraftBand(kind="window", window=160)},
+                )
+                storage, _, _ = _build(
+                    fused_draft=placement,
+                    full_tokens=160,
+                    window_tokens=160,
+                    lazy_compaction=lazy,
+                )
+                a = storage.allocator
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=storage.tree_slots(),
+                        tree_core_backend="python",
+                    )
+                )
+                ids = a.alloc(160)
+                self.assertIsNotNone(ids)
+                key = RadixKey(array("q", range(160)))
+                # Page-sized checkpoints keep the donor walk's quota observable.
+                for end in range(4, 161, 4):
+                    cache.insert(
+                        InsertParams(
+                            key=key[:end],
+                            value=ids[:end].clone(),
+                            prev_prefix_len=end - 4,
+                        )
+                    )
+                node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                receipt = cache.inc_lock_ref(node)
+                try:
+                    self.assertEqual(cache.full_evictable_size(), 0)
+                    self.assertEqual(cache.auxiliary_swa_evictable_size(), 0)
+                    self.assertEqual(cache.swa_evictable_size(), 144)
+                    self.assertFalse(a.ensure_capacity(4, 4))
+                    self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
+                    with patch.object(
+                        cache, "evict_for_alloc", wraps=cache.evict_for_alloc
+                    ) as evict:
+                        self.assertTrue(
+                            a.check_decode_capacity(num_tokens=4, tree_cache=cache)
+                        )
+                    # FULL/target cost 32 bytes per token; draft costs 64 or 128.
+                    # A four-token request therefore needs 16 or 24 target
+                    # donor tokens, regardless of physical retention order.
+                    expected_quota = 16 if draft_dim == 16 else 24
+                    self.assertEqual(
+                        evict.call_args_list[0].args[0].swa_num_tokens, expected_quota
+                    )
+                    self.assertGreater(cache.swa_evictable_size(), 0)
+                    fresh = a.alloc(4)
+                    self.assertIsNotNone(fresh)
+                    a.free(fresh)
+                    self.assertEqual(storage.accounting_violations(), [])
+                finally:
+                    cache.dec_lock_ref(node, receipt.to_dec_params())
+
+    def test_host_match_keeps_each_window_restore_length(self):
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+
+        root = object()
+        node = SimpleNamespace(
+            parent=root,
+            component_data={
+                ComponentType.SWA: SimpleNamespace(
+                    value=None, host_value=torch.arange(4)
+                ),
+                ComponentType.AUXILIARY_SWA: SimpleNamespace(
+                    value=None, host_value=torch.arange(32)
+                ),
+            },
+        )
+        for order in (
+            (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
+            (ComponentType.AUXILIARY_SWA, ComponentType.SWA),
+        ):
+            with self.subTest(order=order):
+                result = MatchResult(64, node, node, node, full_kv_hit_length=64)
+                for ct in order:
+                    component = SWAComponent.__new__(SWAComponent)
+                    component.component_type = ct
+                    component.tree_core = SimpleNamespace(root_node=root, page_size=4)
+                    component.sliding_window_size = 4 if ct == ComponentType.SWA else 32
+                    result = component.finalize_match_result_in_tree_core(
+                        result, None, [], 0
+                    )
+                self.assertEqual(result.swa_host_hit_length, 4)
+                self.assertEqual(result.auxiliary_swa_host_hit_length, 32)
+                req = Req.__new__(Req)
+                req.matched_auxiliary_swa_host_hit_length = (
+                    result.auxiliary_swa_host_hit_length
+                )
+                req.staged_prefetch_plan = None
+                self.assertEqual(req.auxiliary_swa_host_hit_length, 32)
+                req.staged_prefetch_plan = SimpleNamespace(window_tokens=lambda ct: 16)
+                self.assertEqual(req.auxiliary_swa_host_hit_length, 16)
+
+    def test_final_chunk_bounds_each_window_by_its_resolved_read_reach(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1,
+                    head_num=1,
+                    head_dim=64,
+                    store_dtype=torch.bfloat16,
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=8)},
+        )
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                storage, _, _ = _build(
+                    fused_draft=placement,
+                    full_tokens=1024,
+                    window_tokens=64,
+                    gamma=4,
+                    lazy_compaction=lazy,
+                )
+                a = storage.allocator
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=storage.tree_slots(window_reaches={"draft_swa": 12}),
+                        tree_core_backend="python",
+                    )
+                )
+                budget = a.create_prefill_budget(cache)
+                # The draft reads beyond its retained window during speculation.
+                self.assertEqual(budget.auxiliary_window_size, 12)
+                self.assertEqual(budget.auxiliary_tokens(1, 400, chunk_limit=8), 16)
+                self.assertIsNotNone(a.alloc(8))
+                self.assertEqual(
+                    budget.fit_chunk(
+                        extend_input_len=1,
+                        max_new_tokens=400,
+                        chunk_limit=8,
+                    ),
+                    8,
+                )
+                self.assertTrue(
+                    budget.can_allocate_prefill(
+                        paged_input=8,
+                        extend_input_len=1,
+                        max_new_tokens=400,
+                        chunk_limit=8,
+                    )
+                )
+                self.assertIsNotNone(a.alloc(4))
+                budget.reserve(1, 400, chunk_limit=8)
+                self.assertEqual(budget.total_offset, 408)
+                self.assertEqual(budget.auxiliary_swa_offset, 16)
+                # A later request includes both selected work and restored pages,
+                # each priced with this band's own retention and page size.
+                full, primary, demand = budget._load_back_demand(
+                    full_tokens=8,
+                    extend_input_len=1,
+                    max_new_tokens=400,
+                    swa_host_hit_length=5,
+                    auxiliary_swa_host_hit_length=9,
+                    chunk_limit=8,
+                )
+                self.assertEqual(full, 416)
+                self.assertEqual(demand["auxiliary_swa_tokens"], 44)
+                self.assertGreater(primary, budget.swa_offset)
+                self.assertEqual(storage.accounting_violations(), [])
+
+    def test_auxiliary_restore_reserves_prefill_and_pending_demand(self):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1,
+                    head_num=1,
+                    head_dim=32,
+                    store_dtype=torch.bfloat16,
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        storage, _, _ = _build(fused_draft=placement, full_tokens=64, window_tokens=32)
+        a = storage.allocator
+        cache = SimpleNamespace(
+            sliding_window_size=16,
+            window_retain_size=lambda component: 32,
+            full_evictable_size=lambda: 0,
+            swa_evictable_size=lambda: 0,
+            auxiliary_swa_evictable_size=lambda: 0,
+            supports_mamba=lambda: False,
+            evict_for_alloc=lambda *args, **kwargs: EvictResult(),
+        )
+        budget = a.create_prefill_budget(cache)
+        from sglang.srt.mem_cache.kv.alloc.pricing import no_relief_plan
+
+        def fits_restore(tokens):
+            return no_relief_plan(
+                a.pricing_snapshot(),
+                tuple(
+                    (
+                        b.sub_pool_name,
+                        tokens // 4 if b.sub_pool_name == "draft_swa" else 2,
+                    )
+                    for b in (a.full_attn_allocator, *a._windows)
+                ),
+            )
+
+        resident = a.alloc(32)
+        self.assertIsNotNone(resident)
+        a.free_window("draft_swa", resident)
+        capacity = 0
+        while fits_restore(capacity + 4):
+            capacity += 4
+        self.assertGreaterEqual(capacity, 8)
+        kwargs = dict(
+            extend_input_len=4,
+            total_tokens=8,
+            max_new_tokens=0,
+            input_tokens=4,
+            swa_host_hit_length=0,
+            chunk_limit=None,
+        )
+        self.assertEqual(budget.check_prefill(**kwargs), (True, None))
+        self.assertEqual(
+            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=capacity),
+            (False, None),
+        )
+        prepare = dict(
+            full_tokens=8,
+            extend_input_len=4,
+            max_new_tokens=0,
+            swa_host_hit_length=0,
+            chunk_limit=None,
+        )
+        self.assertFalse(
+            budget.prepare_load_back(**prepare, auxiliary_swa_host_hit_length=capacity)
+        )
+        restore = min(32, capacity - 8)
+        self.assertEqual(
+            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=restore),
+            (True, None),
+        )
+        budget.reserve(capacity, 0)
+        self.assertEqual(
+            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=restore),
+            (False, None),
+        )
+        budget = a.create_prefill_budget(cache)
+        self.assertTrue(
+            budget.prepare_load_back(**prepare, auxiliary_swa_host_hit_length=restore)
+        )
+        # Realize a window-only host restoration, then the promised joint
+        # allocation. Admission must leave both in the same byte envelope.
+        window = next(w for w in a._windows if w.sub_pool_name == "draft_swa")
+        with budget.load_back_scope(**prepare, auxiliary_swa_host_hit_length=restore):
+            window.alloc_with_virtual(resident[:restore:4] // 4)
+        self.assertIsNotNone(a.alloc(8))
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_multiwindow_admission_reclaims_cached_prefixes(self):
+        """Evictable prefixes must not leave an idle allocator refusing new work."""
+        from array import array
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1,
+                    head_num=1,
+                    head_dim=8,
+                    store_dtype=torch.bfloat16,
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        storage, _, _ = _build(fused_draft=placement)
+        a = storage.allocator
+        empty_demands = [n for n in range(8, 128, 4) if a.can_reserve(n, n)]
+        ids = []
+        while a.can_reserve(4, 4):
+            allocation = a.alloc(4)
+            self.assertIsNotNone(allocation)
+            ids.append(allocation)
+        ids = torch.cat(ids)
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=a,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        key = RadixKey(array("q", range(ids.numel())))
+        cache.insert(InsertParams(key=key, value=ids.clone()))
+        need = next(n for n in empty_demands if not a.can_reserve(n, n))
+        budget = a.create_prefill_budget(cache)
+        before = a.pricing_snapshot()
+        self.assertTrue(budget._fits(need, need, empty_pool=True))
+        self.assertTrue(budget._fits(need, need))
+        self.assertEqual(a.pricing_snapshot(), before)
+        node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        receipt = cache.inc_lock_ref(node)
+        try:
+            self.assertFalse(budget._fits(need, need))
+            self.assertTrue(budget._fits(need, need, empty_pool=True))
+        finally:
+            cache.dec_lock_ref(node, receipt.to_dec_params())
+        self.assertEqual(
+            budget.check_prefill(
+                extend_input_len=need - 4,
+                total_tokens=need,
+                max_new_tokens=0,
+                input_tokens=need - 4,
+                swa_host_hit_length=0,
+                chunk_limit=None,
+            ),
+            (True, None),
+        )
+        # PD must admit against reclaimable space without consuming another
+        # request's reservation, and realize that credit before allocating.
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+        queue = object.__new__(DecodePreallocQueue)
+        queue.tree_cache = cache
+        queue.token_to_kv_pool_allocator = a
+        full_budget = a.full_available_size() + cache.full_evictable_size()
+        swa_budget = a.swa_available_size() + cache.swa_evictable_size()
+        for full, swa, fits in (
+            (full_budget, swa_budget, True),
+            (need - 1, swa_budget, False),
+            (full_budget, need - 1, False),
+        ):
+            self.assertEqual(
+                queue._prealloc_reservation_fits(
+                    need,
+                    need,
+                    full_allocatable_tokens=full,
+                    swa_allocatable_tokens=swa,
+                ),
+                fits,
+            )
+        self.assertTrue(a.prealloc_fits_assumes_reclaim())
+        self.assertIsNone(
+            queue._reclaim_swa_tail_capacity(need, "resume", full_len=need)
+        )
+        fresh = a.alloc(need)
+        self.assertIsNotNone(fresh)
+        a.free(fresh)
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_partial_prefix_reclaim_credits_unblocked_end_compaction(self):
+        """A protected prefix must not strand reclaimable end bytes at admission."""
+        from array import array
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={"draft_swa": region},
+            new_bands={"draft_swa": DraftBand(kind="window", window=4)},
+        )
+        storage, _, _ = _build(
+            fused_draft=placement,
+            window=8,
+            full_tokens=100,
+            window_tokens=12,
+            lazy_compaction=True,
+        )
+        a = storage.allocator
+        # Build a packed checkpoint with the real band allocation primitives.
+        # This fixture specifies retained contents, independent of prefill order.
+        ids = a.full_attn_allocator.alloc(100)
+        self.assertIsNotNone(ids)
+        for name, tail in (("swa", 8), ("draft_swa", 4)):
+            retained = torch.cat((ids[20 - tail : 20], ids[100 - tail : 100]))
+            a.window_allocators[name].alloc_with_virtual(retained[::4] // 4)
+        self.assertEqual(storage.accounting_violations(), [])
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=a,
+                page_size=4,
+                sliding_window_size=8,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        key = RadixKey(array("q", range(20)))
+        for cache_key, value in (
+            (key, ids[:20]),
+            (RadixKey(array("q", range(1000, 1080))), ids[20:]),
+        ):
+            cache.insert(
+                InsertParams(
+                    key=cache_key,
+                    value=value.clone(),
+                    component_evicted_seqlens={
+                        ComponentType.SWA: value.numel() - 8,
+                        ComponentType.AUXILIARY_SWA: value.numel() - 4,
+                    },
+                )
+            )
+        node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        receipt = cache.inc_lock_ref(node)
+        self.addCleanup(cache.dec_lock_ref, node, receipt.to_dec_params())
+        self.assertEqual(
+            (
+                cache.full_evictable_size(),
+                cache.swa_evictable_size(),
+                cache.auxiliary_swa_evictable_size(),
+            ),
+            (80, 8, 4),
+        )
+        budget = a.create_prefill_budget(cache)
+        pinned = [True]
+        a.full_attn_allocator.add_pin_source(lambda: pinned[0])
+        a.swa_attn_allocator.add_pin_source(lambda: pinned[0])
+        self.assertFalse(budget._fits(8, 8))
+        pinned[0] = False
+        self.assertTrue(budget._fits(8, 8))
+        cache.evict_for_alloc(
+            EvictParams(
+                num_tokens=80,
+                swa_num_tokens=8,
+                auxiliary_swa_num_tokens=4,
+            )
+        )
+        self.assertFalse(a.can_reserve(8, 8))
+        for band in (a.full_attn_allocator, a.swa_attn_allocator):
+            band.flush_for_allocation()
+        self.assertTrue(a.can_reserve(8, 8))
+        fresh = a.alloc(8)
+        self.assertIsNotNone(fresh)
+        a.free(fresh)
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_recurrent_draft_keeps_the_target_checkpoint_policy_through_cache_init(
+        self,
+    ):
+        """Fused recurrent payloads inherit the target's actual cache checkpoint grid."""
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftKVProfile,
+            DraftLayerSet,
+            DraftStateGeometry,
+            PlacementContext,
+            place_fused_draft,
+        )
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = place_fused_draft(
+            profile=DraftKVProfile(
+                num_layers=1,
+                kinds={
+                    "state": DraftLayerSet(
+                        layer_ids=(0,),
+                        geometry=DraftStateGeometry(
+                            conv_state_shapes=((1, 3),),
+                            conv_dtype=torch.bfloat16,
+                            temporal_state_shape=(3,),
+                            temporal_dtype=torch.float32,
+                        ),
+                    )
+                },
+            ),
+            num_runners=1,
+            ctx=PlacementContext(host_names=("full", "swa", "mamba"), target_window=16),
+            store_dtype=torch.bfloat16,
+        ).placement
+        storage, plan, _ = _build(
+            state=True,
+            window_with_state=True,
+            fused_draft=placement,
+            enable_mamba_extra_buffer=True,
+        )
+        params = CacheInitParams(
+            disable=False,
+            enable_mamba_extra_buffer=True,
+            req_to_token_pool=storage.requests,
+            token_to_kv_pool_allocator=storage.allocator,
+            page_size=4,
+            sliding_window_size=16,
+            tree_slots=storage.tree_slots(),
+            tree_core_backend="python",
+        )
+        cache = UnifiedRadixCache(params)
+        component = cache.components[ComponentType.MAMBA]
+        checkpoint_interval = mamba_cache_chunk_size()
+        self.assertEqual(
+            plan.sub_pool("mamba").lifetime.checkpoint_interval, checkpoint_interval
+        )
+        self.assertEqual(component.mamba_cache_chunk_size, checkpoint_interval)
+        self.assertEqual(component.mamba_checkpoint_grid, checkpoint_interval)
+        spec = plan.sub_pool("mamba").spec
+        self.assertGreater(spec.host_entry_bytes(), 0)
+        slots = storage.allocator.alloc_state_slots(2)
+        physical = storage.allocator.mamba_allocator.ids.translate(slots).long()
+        conv, temporal = spec.draft_views(storage.allocator.arena)
+        conv[0][:, physical[0]] = 7
+        temporal[:, physical[0]] = 9
+        storage.allocator.state.pool.copy_from(physical[:1], physical[1:])
+        torch.testing.assert_close(temporal[:, physical[0]], temporal[:, physical[1]])
+        storage.allocator.mamba_allocator.free(slots)
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_memory_only_draft_state_cannot_advertise_prefix_checkpoints(self):
+        """Storage can represent state without claiming an execution checkpoint policy."""
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftBand,
+            DraftStateGeometry,
+            DraftStateRegion,
+            FusedDraftPlacement,
+        )
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"mamba": [1]},
+            regions={
+                "mamba": DraftStateRegion(
+                    lane_num=1,
+                    state=DraftStateGeometry(
+                        conv_state_shapes=((1, 3),),
+                        conv_dtype=torch.bfloat16,
+                        temporal_state_shape=(3,),
+                        temporal_dtype=torch.float32,
+                    ),
+                )
+            },
+            new_bands={"mamba": DraftBand(kind="state")},
+        )
+        storage, plan, _ = _build(fused_draft=placement)
+        self.assertIsNone(plan.sub_pool("mamba").lifetime.checkpoint_interval)
+        with self.assertRaisesRegex(ValueError, "positive checkpoint interval"):
+            storage.tree_slots()
+
+    def test_request_only_state_cannot_be_advertised_as_cacheable(self):
+        """A state lifetime without snapshots cannot publish a prefix-cache component."""
+        from sglang.srt.mem_cache.kv.decl import StateLifetime
+
+        storage, plan, _ = _build(state=True)
+        for interval in (None, 0):
+            with self.subTest(interval=interval):
+                invalid = msgspec.structs.replace(
+                    plan,
+                    sub_pools=tuple(
+                        msgspec.structs.replace(
+                            sub_pool,
+                            lifetime=StateLifetime(checkpoint_interval=interval),
+                        )
+                        if isinstance(sub_pool.lifetime, StateLifetime)
+                        else sub_pool
+                        for sub_pool in plan.sub_pools
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "positive checkpoint interval"):
+                    invalid.tree_slots()
+
+    def test_two_window_tree_restores_only_the_evicted_component(self):
+        from array import array
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        storage, _, _ = _build(fused_draft=placement)
+        alloc = storage.allocator
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=alloc,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        key = RadixKey(array("q", range(32)))
+        ids = alloc.alloc(32)
+        cache.insert(InsertParams(key=key, value=ids.clone()))
+        cache.evict(EvictParams(auxiliary_swa_num_tokens=4))
+        old_full = alloc.full_attn_allocator.ids.translate(ids).clone()
+        incoming = alloc.alloc(32)
+        self.assertIsNotNone(incoming)
+        cache.insert(InsertParams(key=key, value=incoming.clone()))
+        torch.testing.assert_close(
+            alloc.full_attn_allocator.ids.translate(ids), old_full
+        )
+        matched = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(matched.device_prefix_len, 32)
+        self.assertEqual(storage.accounting_violations(), [])
+        cache.evict(
+            EvictParams(num_tokens=64, swa_num_tokens=64, auxiliary_swa_num_tokens=64)
+        )
+        self.assertEqual(
+            {b.sub_pool_name: b.allocated_count() for b in alloc.bands},
+            {b.sub_pool_name: 0 for b in alloc.bands},
+        )
+
+    def test_each_window_prices_its_own_minimum_retention(self):
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+
+        for window in (8, 32):
+            placement = FusedDraftPlacement.from_counts(
+                counts={"draft_swa": [1]},
+                regions={
+                    "draft_swa": DenseDraftRegion(
+                        lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                    )
+                },
+                new_bands={"draft_swa": DraftBand(kind="window", window=window)},
+            )
+            _, plan, _ = _build(fused_draft=placement)
+            sized = size_plan(
+                plan,
+                KVSizingInputs(
+                    full_tokens=256,
+                    window_tokens=128,
+                    context_len=64,
+                    floor_window=16,
+                    alignment=1,
+                ),
+            )
+            floors = dict(sized.bs1_floor_terms)
+            self.assertEqual(
+                floors["swa_window_kv"], 20 * plan.sub_pool("swa").spec.entry_bytes()
+            )
+            self.assertEqual(
+                floors["draft_swa_window_kv"],
+                (window + 4) * plan.sub_pool("draft_swa").spec.entry_bytes(),
+            )
+
+    def test_storage_namespace_distinguishes_draft_weights_and_layout(self):
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            FusedDraftPlacement,
+        )
+
+        region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        tags = []
+        for source, width in (("draft-a", 8), ("draft-b", 8), ("draft-a", 16)):
+            candidate = msgspec.structs.replace(
+                placement,
+                source=(source, "revision"),
+                regions={"full": msgspec.structs.replace(region, head_dim=width)},
+            )
+            _, plan, _ = _build(fused_draft=candidate)
+            tags.append(plan.storage_format_tag())
+        self.assertEqual(len(set(tags)), 3)
+
+    def test_file_storage_roundtrip_preserves_fused_page_parts(self):
+        from tempfile import TemporaryDirectory
+
+        from sglang.srt.mem_cache.hicache_storage import (
+            HiCacheFile,
+            HiCacheStorageConfig,
+            PoolName,
+            PoolTransfer,
+        )
+        from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            FusedDraftPlacement,
+        )
+
+        region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=3, v_head_dim=5, store_dtype=torch.bfloat16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1], "swa": [1]},
+            regions={"full": region, "swa": region},
+        )
+        storage, _, _ = _build(fused_draft=placement)
+        with TemporaryDirectory() as directory:
+            backend = HiCacheFile(
+                HiCacheStorageConfig(
+                    tp_rank=0,
+                    tp_size=1,
+                    pp_rank=0,
+                    pp_size=1,
+                    attn_cp_rank=0,
+                    attn_cp_size=1,
+                    is_mla_model=False,
+                    enable_storage_metrics=False,
+                    is_page_first_layout=False,
+                    model_name="fused-entry-test",
+                    extra_config={"file_storage_path": directory},
+                )
+            )
+            for name, wire in (("full", PoolName.KV), ("swa", PoolName.SWA)):
+                host = storage.host_layout(name).build(
+                    HostPoolOptions(
+                        ratio=1,
+                        size=0,
+                        page_size=4,
+                        layout="layer_first",
+                        allocator_type="default",
+                        pin_memory=False,
+                        pool_label=name,
+                    )
+                )
+                try:
+                    ids = host.alloc(4)
+                    page = torch.arange(host.item_bytes, dtype=torch.int64).to(
+                        torch.uint8
+                    )
+                    host.set_from_flat_data_page(int(ids[0]), page)
+                    backend.register_mem_host_pool_v2(host, wire)
+                    transfer = PoolTransfer(
+                        name=wire, host_indices=ids, keys=["prefix"]
+                    )
+                    self.assertEqual(backend.batch_set_v2([transfer])[wire], [True])
+                    host.set_from_flat_data_page(int(ids[0]), torch.zeros_like(page))
+                    self.assertEqual(backend.batch_get_v2([transfer])[wire], [True])
+                    torch.testing.assert_close(host.get_data_page(int(ids[0])), page)
+                    host.free(ids)
+                finally:
+                    host.destroy()
+
+    def test_dcp_draft_window_keeps_all_tokens_and_releases_its_band(self):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftKVGeometry,
+            DraftKVProfile,
+            DraftLayerSet,
+            PlacementContext,
+            place_fused_draft,
+        )
+        from sglang.srt.mem_cache.unified_draft_pool import routed_draft_pool
+
+        setup_allocator_context()
+        for factor in (2, 4):
+            with (
+                self.subTest(dcp=factor),
+                get_parallel().override(attn_dcp_size=factor),
+            ):
+                placement = place_fused_draft(
+                    profile=DraftKVProfile(
+                        num_layers=1,
+                        kinds={
+                            "window": DraftLayerSet(
+                                layer_ids=(0,),
+                                window=16,
+                                geometry=DraftKVGeometry(
+                                    head_num=1, head_dim=3, v_head_dim=5
+                                ),
+                            ),
+                        },
+                    ),
+                    num_runners=1,
+                    ctx=PlacementContext(host_names=("full", "mamba"), dcp_size=factor),
+                    store_dtype=torch.bfloat16,
+                ).placement
+                storage, plan, _ = _build(
+                    state=True, fused_draft=placement, setup=False
+                )
+                alloc = storage.allocator
+                ids = alloc.alloc(8 * factor)
+                self.assertEqual(alloc.page_size, 4 * factor)
+                pool = routed_draft_pool(
+                    arena=alloc.arena,
+                    plan=plan,
+                    owner="full",
+                    page_size=4,
+                    lanes_by_host={"swa": {0: 0}},
+                )
+                runner = RunnerIds(
+                    req_to_token=storage.requests.req_to_token,
+                    token_to_kv_pool_allocator=alloc,
+                    token_to_kv_pool=pool,
+                    page_size=4,
+                    device="cpu",
+                    is_draft_worker=True,
+                )
+                self.assertEqual(
+                    runner.capture_token_capacity(0),
+                    alloc.full_attn_allocator.ids.virtual_to_physical.numel()
+                    * alloc.page_size,
+                )
+                owner_mapping = runner.space("full").read_mapping()
+                self.assertIsNotNone(owner_mapping)
+                owner_physical = runner.space("full").ids(ids)
+                torch.testing.assert_close(
+                    owner_mapping[ids[::4] // 4], owner_physical[::4] // 4
+                )
+                space = runner.space("swa")
+                physical = space.ids(ids).long()
+                self.assertTrue(torch.all(physical > 0))
+                self.assertEqual(physical.unique().numel(), ids.numel())
+                mapping = space.read_mapping()
+                torch.testing.assert_close(mapping[ids[::4] // 4], physical[::4] // 4)
+                from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+
+                for name in ("full", "swa"):
+                    layout = storage.host_layout(name)
+                    self.assertEqual(layout.page_size, alloc.page_size)
+                    host = layout.build(
+                        HostPoolOptions(
+                            ratio=1,
+                            size=0,
+                            page_size=alloc.page_size,
+                            layout="layer_first",
+                            allocator_type="default",
+                            pool_label=name,
+                            pin_memory=False,
+                        )
+                    )
+                    host_ids = host.alloc(ids.numel())
+                    transfer_ids = storage.host_ids(name)
+                    device_ids = (
+                        transfer_ids(ids)
+                        if transfer_ids is not None
+                        else storage.window_ids(name, ids)
+                    )
+                    page_ids = device_ids[:: alloc.page_size] // alloc.page_size
+                    buffer = layout.get_page_envelope_buffer()
+                    buffer[page_ids] = 37
+                    expected = buffer[page_ids].clone()
+                    host.backup_from_device_all_layer(
+                        layout, host_ids, device_ids, "kernel"
+                    )
+                    buffer[page_ids] = 0
+                    host.load_to_device_per_layer(
+                        layout, host_ids, device_ids, 0, "kernel"
+                    )
+                    torch.testing.assert_close(buffer[page_ids], expected)
+                    host.free(host_ids)
+                alloc.free(ids)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+                self.assertTrue(all(b.allocated_count() == 0 for b in alloc.bands))
+
+    def test_latent_draft_parts_preserve_target_rows(self):
+        from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftKVProfile,
+            DraftLayerSet,
+            DraftMLAGeometry,
+            PlacementContext,
+            place_fused_draft,
+        )
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        placement = place_fused_draft(
+            profile=DraftKVProfile(
+                num_layers=2,
+                kinds={
+                    "full": DraftLayerSet(
+                        layer_ids=(0, 1),
+                        geometry=DraftMLAGeometry(
+                            kv_lora_rank=3,
+                            qk_rope_head_dim=5,
+                        ),
+                    ),
+                },
+            ),
+            num_runners=1,
+            ctx=PlacementContext(host_names=("full", "swa")),
+            store_dtype=torch.bfloat16,
+        ).placement
+        storage, plan, _ = _build(fused_draft=placement)
+        alloc = storage.allocator
+        ids = alloc.alloc(8)
+        loc = alloc.full_attn_allocator.ids.translate(ids).long()
+        host = alloc.views["full"]
+        host.k_buffer[0].fill_(17)
+        host.v_buffer[0].fill_(19)
+        view = DraftMLAView(
+            arena=alloc.arena,
+            host_spec=plan.owner().spec,
+            layer_lanes={0: 0, 1: 1},
+            page_size=4,
+        )
+        self.assertEqual(len(plan.owner().spec.draft_region.parts(0)), 1)
+        for layer in (0, 1):
+            data = torch.arange(64, dtype=torch.bfloat16).reshape(8, 1, 8) + layer
+            view.set_kv_buffer(
+                SimpleNamespace(layer_id=layer),
+                KVWriteLoc(loc, physical=True),
+                data,
+                None,
+            )
+            torch.testing.assert_close(view.get_key_buffer(layer)[loc], data)
+            torch.testing.assert_close(view.get_value_buffer(layer)[loc], data[..., :3])
+        self.assertTrue(torch.all(host.k_buffer[0] == 17))
+        self.assertTrue(torch.all(host.v_buffer[0] == 19))
+        alloc.free(ids)
+        self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_replicated_draft_uses_all_dcp_tokens_and_its_own_coordinates(self):
+        from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            FusedDraftPlacement,
+        )
+
+        setup_allocator_context()
+        for factor in (2, 4):
+            for rank in range(factor):
+                with (
+                    self.subTest(factor=factor, rank=rank),
+                    get_parallel().override(attn_dcp_size=factor, attn_dcp_rank=rank),
+                ):
+                    placement = FusedDraftPlacement.from_counts(
+                        counts={"full": [1]},
+                        regions={
+                            "full": DenseDraftRegion(
+                                lane_num=1,
+                                head_num=1,
+                                head_dim=3,
+                                v_head_dim=5,
+                                store_dtype=torch.bfloat16,
+                                token_replicas=factor,
+                            )
+                        },
+                    )
+                    plan = plan_kv_storage(
+                        kv_layer_decls(
+                            full_layer_ids=(0, 1, 2, 3),
+                            full_geometry=MHAGeometry(
+                                head_num=1,
+                                head_dim=8,
+                                v_head_dim=8,
+                                kv_cache_dtype=torch.bfloat16,
+                            ),
+                        ),
+                        page_size=4,
+                        fused_draft=placement,
+                    )
+                    sized = size_plan(
+                        plan,
+                        KVSizingInputs(
+                            budget_bytes=65536,
+                            max_running_requests=2,
+                            context_len=64,
+                            alignment=1,
+                        ),
+                    )
+                    storage = build_kv_storage(
+                        plan,
+                        sized,
+                        UnifiedBuildContext(
+                            device="cpu",
+                            start_layer=0,
+                            end_layer=4,
+                            enable_memory_saver=False,
+                            need_sort=False,
+                            max_num_reqs=2,
+                            model_context_len=64,
+                        ),
+                    )
+                    alloc = storage.allocator
+                    virtual = alloc.alloc(8 * factor)
+                    table = storage.requests.req_to_token
+                    table[1, : len(virtual)] = virtual.int()
+                    target = RunnerIds(
+                        req_to_token=table,
+                        token_to_kv_pool_allocator=alloc,
+                        token_to_kv_pool=alloc.get_kvcache(),
+                        page_size=4,
+                        device="cpu",
+                    )
+                    draft_pool = DraftMHAView(
+                        arena=alloc.arena,
+                        host_spec=plan.owner().spec,
+                        layer_lanes={0: 0},
+                        page_size=4,
+                    )
+                    draft = RunnerIds(
+                        req_to_token=table,
+                        token_to_kv_pool_allocator=alloc,
+                        token_to_kv_pool=draft_pool,
+                        page_size=4,
+                        device="cpu",
+                        is_draft_worker=True,
+                    )
+                    iteration = IterationIds(
+                        source=target,
+                        req_pool_indices=torch.tensor([1]),
+                        seq_lens=torch.tensor([len(virtual)]),
+                        seq_lens_cpu=torch.tensor([len(virtual)]),
+                        write_virtual=virtual,
+                    )
+                    physical = iteration.write_ids(draft).long()
+                    self.assertEqual(physical.unique().numel(), virtual.numel())
+                    self.assertTrue(torch.all(physical > 0))
+                    self.assertTrue(iteration.is_read_by(draft))
+                    self.assertNotEqual(
+                        target.space("full").key, draft.space("full").key
+                    )
+                    target_view = storage.view("full")
+                    for k in target_view.k_buffer:
+                        k.fill_(17)
+                    draft_pool.k_buffer[0][physical] = torch.arange(
+                        len(physical), dtype=torch.bfloat16
+                    )[:, None, None]
+                    for k in target_view.k_buffer:
+                        self.assertTrue(torch.all(k == 17))
+                    reads = iteration.read_table(reader=draft)
+                    self.assertEqual(
+                        reads.ids[0].tolist(), (physical[::4] // 4).tolist()
+                    )
+                    self.assertEqual(
+                        (iteration.write_ids(target) > 0).sum().item(),
+                        len(virtual) // factor,
+                    )
+                    mapping_ptr = draft.space("full").table.data_ptr()
+                    alloc.free(virtual[: 4 * factor])
+                    refreshed = draft.space("full").read_mapping()
+                    self.assertEqual(refreshed.data_ptr(), mapping_ptr)
+                    self.assertTrue(
+                        torch.all(refreshed[virtual[: 4 * factor : 4] // 4] == 0)
+                    )
+                    self.assertEqual(storage.accounting_violations(), [])
+
+    def test_host_roundtrip_preserves_every_fused_part(self):
+        from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+
+        region = DenseDraftRegion(
+            lane_num=2, head_num=1, head_dim=3, v_head_dim=5, store_dtype=torch.bfloat16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [2], "draft_swa": [2]},
+            regions={"full": region, "draft_swa": region},
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        storage, plan, _ = _build(fused_draft=placement)
+        allocator = storage.allocator
+        ids = allocator.alloc(8)
+        try:
+            for name in ("full", "draft_swa"):
+                band = next(b for b in allocator.bands if b.sub_pool_name == name)
+                physical = band.ids.translate(ids).long()
+                entries = allocator.arena.entries(name)
+                entries[physical] = 37 if name == "full" else 93
+                expected = entries[physical].clone()
+                host = storage.host_layout(name).build(
+                    HostPoolOptions(
+                        ratio=1,
+                        size=0,
+                        page_size=4,
+                        layout="page_first_direct",
+                        allocator_type="default",
+                        pool_label=name,
+                        pin_memory=False,
+                    )
+                )
+                try:
+                    host_ids = host.alloc(8)
+                    host.backup_from_device_all_layer(
+                        storage.view(name), host_ids, physical, "direct"
+                    )
+                    entries[physical] = 0
+                    host.load_to_device_per_layer(
+                        storage.view(name), host_ids, physical, 0, "direct"
+                    )
+                    torch.testing.assert_close(entries[physical], expected)
+                    host.free(host_ids)
+                finally:
+                    host.destroy()
+        finally:
+            allocator.free(ids)
+
     def test_frozen_sizing_reduces_auto_state_demand_with_concurrency(self):
         for gamma in (None, 3):
             with self.subTest(scratch=gamma):
@@ -1165,6 +3194,96 @@ class TestDeclaredParts(CustomTestCase):
                     larger.max_running_requests, captured.max_running_requests
                 )
                 self.assertLessEqual(larger.full_tokens, captured.full_tokens)
+
+    def test_dcp_window_policy_separates_logical_and_host_capacities(self):
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+
+        capacities = {}
+        for factor in (1, 2, 4):
+            for shape in ("window", "float", "multi"):
+                with self.subTest(dcp=factor, shape=shape):
+                    setup_allocator_context()
+                    with get_parallel().override(attn_dcp_size=factor, attn_dcp_rank=0):
+                        placement = (
+                            None
+                            if shape == "window"
+                            else FusedDraftPlacement.from_counts(
+                                counts={"draft_swa": [1]},
+                                regions={
+                                    "draft_swa": DenseDraftRegion(
+                                        lane_num=1,
+                                        head_num=1,
+                                        head_dim=8,
+                                        store_dtype=torch.bfloat16,
+                                        token_replicas=factor,
+                                    )
+                                },
+                                new_bands={
+                                    "draft_swa": DraftBand(kind="window", window=32)
+                                },
+                            )
+                        )
+                        storage, _, sized = _build(
+                            state=shape != "window",
+                            window_with_state=shape == "multi",
+                            fused_draft=placement,
+                            setup=False,
+                        )
+                        a = storage.allocator
+                        if factor == 1:
+                            capacities[shape] = (a.size_full, a.size_swa)
+                        full_capacity, window_capacity = capacities[shape]
+                        self.assertEqual(a.size_full, full_capacity * factor)
+                        self.assertEqual(a.size_swa, window_capacity * factor)
+                        for band, capacity in (
+                            (a.full_attn_allocator, full_capacity),
+                            *((b, window_capacity) for b in a._windows),
+                        ):
+                            view = a.views[band.sub_pool_name]
+                            self.assertEqual(view.host_capacity_tokens, capacity)
+                            self.assertEqual(
+                                view.host_capacity_bytes, capacity * band.entry_bytes
+                            )
+                            self.assertEqual(
+                                storage.host_layout(band.sub_pool_name).capacity,
+                                capacity * factor,
+                            )
+                        if a.mamba_allocator is not None:
+                            token_page_bytes = sum(
+                                b.entry_bytes_per_page
+                                for b in (a.full_attn_allocator, *a._windows)
+                            )
+                            expected_cost = -(
+                                -a.mamba_allocator.entry_bytes
+                                * a.page_size
+                                // token_page_bytes
+                            )
+                            self.assertEqual(
+                                a.admission_rules().state_slot_cost,
+                                0 if shape == "multi" else expected_cost,
+                            )
+                        ids = a.alloc(32 * factor)
+                        self.assertIsNotNone(ids)
+                        self.assertEqual(
+                            a.conserve_swa_available_size(),
+                            (window_capacity - 32) * factor,
+                        )
+                        self.assertGreater(a.swa_available_size(), 0)
+                        full, window = a.swa_capacity_and_available(
+                            full_capacity=sized.full_tokens,
+                            swa_capacity=sized.window_tokens,
+                        )
+                        self.assertEqual(window[0] - window[1], 32 * factor)
+                        a.free(ids)
+                        self.assertEqual(
+                            a.conserve_swa_available_size(),
+                            window_capacity * factor,
+                        )
+                        self.assertEqual(storage.accounting_violations(), [])
 
     def test_runtime_budget_adapter_returns_the_declared_plan_sizes(self):
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator

@@ -37,6 +37,9 @@ _DEV = "cpu"
 
 
 def _swa_factory(**over):
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     kw = dict(
         device=_DEV,
         kv_cache_dtype=torch.float16,
@@ -111,7 +114,7 @@ class TestBudgetSizing(unittest.TestCase):
             ),
             page_size=4,
         )
-        for cap, dcp in ((None, 1), (4096, 1)):
+        for cap, dcp in ((None, 1), (4096, 1), (4096, 2)):
             with (
                 self.subTest(cap=cap, dcp=dcp),
                 get_parallel().override(attn_dcp_size=dcp),

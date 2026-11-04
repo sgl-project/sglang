@@ -96,6 +96,15 @@ class StateStorage:
 
     # -- slot lifecycle --
 
+    def pending_request_slots(self, table, req: Req) -> int:
+        """Slots acquire will allocate for this request's working/tracking state."""
+        return int(not req.kv.holds_mamba) + (
+            table.mamba_initial_tracking_slots
+            if table.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is None
+            else 0
+        )
+
     def acquire(
         self,
         table,
@@ -272,12 +281,3 @@ class StateStorage:
         if src_index.numel() == 0:
             return
         self.pool.copy_from(src_index, dst_index)
-
-    def pending_request_slots(self, table, req: Req) -> int:
-        """Slots acquire will allocate for this request's working/tracking state."""
-        return int(not req.kv.holds_mamba) + (
-            table.mamba_initial_tracking_slots
-            if table.enable_mamba_extra_buffer
-            and req.kv.mamba_ping_pong_track_buffer is None
-            else 0
-        )
