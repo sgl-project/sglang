@@ -1,3 +1,4 @@
+use super::feedback::{Effect, FeedbackCache};
 use super::{
     client::{confirmed_end, Capabilities, EngineClient},
     OrchestrationConfig,
@@ -364,6 +365,7 @@ struct ClaimRecord {
     view: Value,
     release_requested: bool,
     interests: BTreeSet<DemandId>,
+    feedback_unknown: Option<String>,
     error: Option<String>,
 }
 struct Actor {
@@ -385,6 +387,7 @@ struct Actor {
     backend_owner: Option<BackendProtectionOwner>,
     backend_error: Option<String>,
     claims: BTreeMap<ClaimIdentity, ClaimRecord>,
+    feedback: FeedbackCache,
 }
 impl Actor {
     fn new(
@@ -414,6 +417,11 @@ impl Actor {
             backend_owner: None,
             backend_error: None,
             claims: BTreeMap::new(),
+            feedback: FeedbackCache::new(
+                config.max_workers,
+                config.max_operations,
+                config.max_engine_bytes,
+            ),
         }
     }
     async fn run(mut self, mut rx: mpsc::Receiver<Message>) {
@@ -463,6 +471,8 @@ impl Actor {
     async fn refresh(&mut self, url: &str) -> Result<Capabilities, String> {
         match self.client.capabilities(url).await {
             Ok(caps) => {
+                let effect = self.feedback.bind(url, &caps);
+                self.invalidate_feedback(url, effect, "discovered owner/source change");
                 if self.caps.get(url).is_some_and(|old| {
                     old.epoch != caps.epoch
                         || old.generation != caps.generation
@@ -479,12 +489,60 @@ impl Actor {
                 Ok(caps)
             }
             Err(e) => {
+                let effect = self.feedback.fail(url, "capabilities unavailable");
+                self.invalidate_feedback(url, effect, "capabilities unavailable");
                 self.caps.remove(url);
                 for job in self.jobs.values_mut().filter(|j| j.url == url) {
                     job.ready_end = 0;
                     job.ready_at = None;
                 }
                 Err(e)
+            }
+        }
+    }
+    fn invalidate_feedback(&mut self, url: &str, effect: Effect, reason: &str) {
+        for job in self.jobs.values_mut().filter(|job| job.url == url) {
+            if effect.ready {
+                job.ready_end = 0;
+                job.ready_at = None;
+            }
+            if effect.claims {
+                job.claim_view = Value::Null;
+            }
+        }
+        if effect.storage {
+            for claim in self.claims.values_mut() {
+                claim.feedback_unknown = Some(reason.into());
+                suppress_protection(&mut claim.view);
+            }
+        }
+        // Both normal routing paths read this publication. No I/O holds its lock.
+        self.publish();
+    }
+    async fn poll_feedback(&mut self, url: &str, caps: &Capabilities) -> Result<(), String> {
+        let limit = self.config.queue_capacity.min(256).max(1);
+        let request = self
+            .feedback
+            .command(url, caps.context(&self.config.caller_id), limit);
+        let result = match request {
+            Ok(None) => return Ok(()),
+            Ok(Some(command)) => match self.client.command(url, &command).await {
+                Ok(page) => self
+                    .feedback
+                    .apply(url, &self.config.caller_id, &page, limit),
+                Err(reason) => Err(reason),
+            },
+            Err(reason) => Err(reason),
+        };
+        match result {
+            Ok(effect) => {
+                self.invalidate_feedback(url, effect, "feedback invalidation/gap");
+                Ok(())
+            }
+            Err(reason) => {
+                let effect = self.feedback.fail(url, &reason);
+                self.invalidate_feedback(url, effect, &reason);
+                Err(reason)
             }
         }
     }
@@ -712,6 +770,9 @@ impl Actor {
     }
     async fn apply(&mut self, value: Value) -> Result<Value, String> {
         let kind = value["kind"].as_str().ok_or("kind required")?;
+        if kind == "feedback" {
+            return Ok(self.feedback.view());
+        }
         if kind == "capabilities" {
             let backend = match &self.backend_owner {
                 Some(owner) => {
@@ -721,7 +782,7 @@ impl Actor {
                 None => Value::Null,
             };
             return Ok(
-                json!({"enabled":true,"caller_id":self.config.caller_id,"engine_session_required":false,"lifecycle":"explicit","protection_owner":if self.backend_owner.is_some(){"configured"}else{"unavailable"},"backend_protection":backend,"protection_error":self.backend_error,"prefetch_ms_per_token":self.cost_ms_per_token,"index":format!("{:?}",self.index.usage())}),
+                json!({"enabled":true,"caller_id":self.config.caller_id,"engine_session_required":false,"lifecycle":"explicit","protection_owner":if self.backend_owner.is_some(){"configured"}else{"unavailable"},"backend_protection":backend,"protection_error":self.backend_error,"feedback":self.feedback.view(),"prefetch_ms_per_token":self.cost_ms_per_token,"index":format!("{:?}",self.index.usage())}),
             );
         }
         let task = task(value.get("task").unwrap_or(&value), &self.config.caller_id)?;
@@ -1374,6 +1435,10 @@ impl Actor {
                     view,
                     release_requested: false,
                     interests,
+                    feedback_unknown: self
+                        .claims
+                        .get(&identity)
+                        .and_then(|claim| claim.feedback_unknown.clone()),
                     error,
                 },
             );
@@ -1427,6 +1492,9 @@ impl Actor {
             }
             Err(e) => claim.error = Some(e.to_string()),
         }
+        if claim.feedback_unknown.is_some() {
+            suppress_protection(&mut claim.view);
+        }
         self.claims.insert(identity.clone(), claim);
     }
     fn intent_view(&self, demand: &DemandId) -> Value {
@@ -1438,11 +1506,11 @@ impl Actor {
             "known_scope":intent.frozen.known_scope().iter().map(|s|json!({"branch":s.snapshot().map(|b|b.id().branch_id.clone()),"end_token":s.scope().end_token(),"content":s.scope().key().digest()})).collect::<Vec<_>>(),
             "missing_scope":intent.frozen.missing_scope().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "materialization_required":intent.frozen.materialization_required().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
-            "admission_gaps":intent.admission_gaps,"claims":intent.claims.iter().filter_map(|id|self.claims.get(id)).map(|c|json!({"claim":c.view,"error":c.error,"release_requested":c.release_requested})).collect::<Vec<_>>(),
+            "admission_gaps":intent.admission_gaps,"claims":intent.claims.iter().filter_map(|id|self.claims.get(id)).map(|c|json!({"claim":c.view,"error":c.error,"feedback_unknown":c.feedback_unknown,"release_requested":c.release_requested})).collect::<Vec<_>>(),
             "released":intent.released,"quiescent":intent.claims.iter().all(|id|self.claims.get(id).is_none_or(|c|c.view["backend_quiescent"]==true)) && intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|j.quiescent)),
             "operations":intent.jobs.iter().filter_map(|id|self.jobs.get(id)).map(|j|json!({"child_id":j.id,"worker_url":j.url,"engine_id":j.caps.engine_id,"owner_epoch":j.caps.epoch,
                 "action":j.action,"result":j.result,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":j.quiescent,"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
-                "ready_scope":if !intent.released && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
+                "ready_scope":if !intent.released && self.feedback.current(&j.url,&j.cache_watermark) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
     }
     async fn pump(&mut self) {
         let now = Instant::now();
@@ -1470,6 +1538,12 @@ impl Actor {
             job.ready_end = 0;
             job.ready_at = None;
             job.last_error = Some("worker unavailable".into());
+        }
+        let candidates = self.workers();
+        if let Some(worker) = candidates.get(self.tick_cursor % candidates.len().max(1)) {
+            if let Ok(caps) = self.refresh(&worker.url).await {
+                let _ = self.poll_feedback(&worker.url, &caps).await;
+            }
         }
         let ids: Vec<_> = self.jobs.keys().cloned().collect();
         if !ids.is_empty() {
@@ -1549,6 +1623,7 @@ impl Actor {
                 "owner epoch/compatibility changed; reconcile old operation separately".into(),
             );
         }
+        self.poll_feedback(&job.url, &live).await?;
         job.caps.generation = live.generation;
         if !job.submitted {
             if !job.attempted && !job.releasing_pin && Instant::now() >= job.deadline {
@@ -1590,9 +1665,14 @@ impl Actor {
         job.ready_end = 0;
         job.ready_at = None;
         if job.action == "sglang.pin" {
+            let ticket = self.feedback.ticket(&job.url)?;
             let claim=self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
             if claim["owner_epoch"] != job.caps.epoch {
                 return Err("stale claim owner epoch".into());
+            }
+            self.poll_feedback(&job.url, &live).await?;
+            if !self.feedback.accept_claim(&job.url, &ticket) {
+                return Err("claim query crossed feedback invalidation".into());
             }
             job.claim_view = claim;
         }
@@ -1601,10 +1681,16 @@ impl Actor {
             let tier = job.payload["destination"]["tier"]
                 .as_str()
                 .unwrap_or("host");
+            let ticket = self.feedback.ticket(&job.url)?;
             let snapshot = self
                 .client
                 .residency(&job.url, &live, &self.config.caller_id, &job.prefix, tier)
                 .await?;
+            self.poll_feedback(&job.url, &live).await?;
+            let effect =
+                self.feedback
+                    .accept_query(&job.url, &ticket, &snapshot["cache_watermark"])?;
+            self.invalidate_feedback(&job.url, effect, "newer scoped query watermark");
             job.cache_watermark = snapshot
                 .get("cache_watermark")
                 .cloned()
@@ -1655,6 +1741,7 @@ impl Actor {
             .values()
             .filter(|j| {
                 j.ready_end > 0
+                    && self.feedback.current(&j.url, &j.cache_watermark)
                     && self
                         .book
                         .job(&j.id)
@@ -1681,4 +1768,26 @@ impl Actor {
 }
 fn task_fn(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     task(value, caller)
+}
+
+/// Keep cleanup/drain identities, suppress any positive protection after missing
+/// backend history. Querying a cached backend-owner receipt does not re-probe
+/// the underlying objects and cannot repair such an invalidation by itself.
+fn suppress_protection(view: &mut Value) {
+    if !view.is_object() {
+        return;
+    }
+    if matches!(view["phase"].as_str(), Some("released" | "expired")) {
+        return;
+    }
+    view["phase"] = json!("unknown");
+    view["uncertain"] = json!(true);
+    view["effective_protection"] = Value::Null;
+    view["confirmed_remaining_ms"] = Value::Null;
+    if let Some(scopes) = view["scopes"].as_array_mut() {
+        for scope in scopes {
+            scope["uncertain"] = json!(true);
+            scope["confirmed_remaining_ms"] = Value::Null;
+        }
+    }
 }

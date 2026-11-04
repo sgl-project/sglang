@@ -14,6 +14,7 @@ pub struct Capabilities {
     pub public: Value,
     pub generation: Option<u64>,
     pub salt_encoding: String,
+    pub feedback: Option<Value>,
 }
 impl Capabilities {
     pub fn parse(value: Value) -> Result<Self, String> {
@@ -59,6 +60,7 @@ impl Capabilities {
                 "owner_assertion" => "owner_assertion",
                 _ => "unsupported",
             }.into(),
+            feedback:value.get("feedback").filter(|v|!v.is_null()).cloned(),
             compatibility,
             public,
         })

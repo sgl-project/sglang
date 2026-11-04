@@ -82,9 +82,11 @@ async fn external_indexer_routes_to_the_cached_worker() {
                 component_masks: Vec::new(),
                 block_sizes: Vec::new(),
                 parent_block_hash: None,
+                session_id: None,
             }],
             worker_address: cached.url.clone(),
             cache_spec: None,
+            ..Default::default()
         })
         .await
         .unwrap();

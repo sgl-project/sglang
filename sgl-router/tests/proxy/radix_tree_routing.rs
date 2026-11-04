@@ -72,6 +72,7 @@ async fn lora_requests_match_only_their_adapter_blocks() {
     tree.store_event(
         &KvWorkerId::new(lora.url.clone(), 0),
         &BlockStored {
+            session_id: None,
             block_hashes: (0..ids.len()).map(|i| 1000 + i as i64).collect(),
             parent_block_hash: None,
             token_ids: ids.clone(),

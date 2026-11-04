@@ -1,6 +1,7 @@
 //! Optional single-owner Router orchestration. Normal inference uses try_send;
 //! only the background actor performs discovery, Engine control and reconciliation.
 mod client;
+mod feedback;
 mod protection;
 mod runtime;
 pub use protection::BackendOwnerConfig;

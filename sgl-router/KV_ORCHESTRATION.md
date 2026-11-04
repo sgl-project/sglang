@@ -21,7 +21,7 @@ cargo build --locked --manifest-path sgl-router/Cargo.toml -p sgl-router
 "$CARGO_TARGET_DIR/debug/sgl-router" \
   --host 127.0.0.1 --port 51900 \
   --model-id /home/youwei/bzh/model/Qwen/Qwen3-8B \
-  --tokenizer-path /home/youwei/bzh/model/Qwen/Qwen3-8B \
+  --tokenizer-path /home/youwei/bzh/model/Qwen/Qwen3-8B/tokenizer.json \
   --worker-urls http://127.0.0.1:51801 http://127.0.0.1:51803 \
   --policy cache_aware --cache-prefix-provider radix_tree \
   --kv-orchestration-config sgl-router/kv-orchestration.example.json
@@ -135,8 +135,9 @@ Location results are scoped Engine queries, not operation-result leases. Pending
 routing stakes never create confirmed locations. A failed query, epoch/generation
 change or unhealthy worker removes preparation evidence. Normal routing consumes
 only a bounded recent advisory view (at most two configured poll periods); it
-retains final admission/affinity/load decisions. P7's cache-watermark/event adapter
-can invalidate this view immediately. The operation evidence sequence is never
+retains final admission/affinity/load decisions. When Engine discovery advertises
+feedback `events` version 1.0, the Router polls its journal and fences the view
+with its independent native cache watermark. The operation evidence sequence is never
 compared to a cache stream version. Results include worker URL, owner epoch,
 query age, and cache watermark when supplied; formal HTTP responses include
 `x-sgl-worker-url`. Storage-only preservation/PIN is not Engine host readiness.
@@ -195,4 +196,80 @@ operation replay are bounded. A full active budget refuses new control work;
 inference continues. Acknowledge drained intents to reclaim operation history.
 Lifecycle replay/task tombstones intentionally refuse new state at their limits;
 they cannot be silently discarded to accept stale incarnations. This is one
-Router owner in memory; durable/multi-Router ownership and P7 recovery are separate.
+Router owner in memory; durable/multi-Router ownership and publisher/indexer replay
+are separate from the polling recovery described below.
+
+
+## Engine feedback polling (P7c)
+
+Polling is enabled by trusted Engine capabilities `feedback.query=events`,
+`version=1.0`, and `recovery=query_known_scopes`. No publisher socket or global
+placement mirror is created. Each registered owner has a bounded cursor and one
+native cache watermark. A background tick refreshes/polls one current healthy
+owner, and scoped residency/claim queries have feedback polls around them. Each
+page requests at most `min(queue_capacity,256)` events and obeys
+`max_engine_bytes`. Owner entries are bounded by `max_workers`; exhausted metadata
+refuses new feedback-dependent readiness rather than discarding an active fence.
+
+The Router binds journal and native cache source IDs/incarnations from discovery.
+A page cannot rebind an owner just by arriving later. It validates Engine epoch,
+namespace, caller, cursor bounds and ordered event sequences. Caller filtering can
+skip sequence numbers, so skipped numbers alone do not imply a gap. Retention
+loss/explicit gaps require current queries of known scopes, operations and claims.
+An empty page never certifies a complete Engine snapshot. Old recorder history
+inside a current journal is consumed conservatively as unknown and cannot change
+the discovered source or install a location.
+
+Native cache `generation/version` comparisons apply only within the same cache
+source ID/incarnation. They are independent of journal sequence, operation
+`public_result.state_version`, outcome sequence, arrival order and wall clock.
+A newer native mutation invalidates older preparation evidence even when its
+journal page has no new caller-visible events. The Router polls after a residency
+query as well: a delayed response older than that watermark is rejected. A query
+crossing a gap/invalidation/source failure is also rejected even if its native
+version happens to be equal. Current matching queries recover only their requested
+scopes; no global completeness state is created. Late operation events remain
+historical outcomes and cannot assert current residency.
+
+Journal source changes, capability loss, owner/cache generation changes, polling
+failures and explicit invalidations clear affected advisory/claim observations.
+An Engine that never advertised feedback retains legacy scoped-query fallback.
+Once advertised, disappearing capabilities cannot silently downgrade it to
+unfenced legacy confirmation; feedback discovery/polling must recover first.
+Both chat routing paths consume the same fenced publication and retain normal
+policy/admission control.
+
+Storage attachment invalidation suppresses positive L3 claim views while keeping
+claim identities, interests and cleanup available. A cached backend-owner receipt
+cannot prove that an invalidated storage attachment is still usable. Those old
+claim views remain unknown pending external object/domain reconciliation; polling
+the same cached receipt cannot restore positive protection. Other owner-local L2
+claim snapshots remain independent of storage-only invalidation. A new authoritative
+claim query is needed after owner-local protection changes; journal claim payloads
+are not installed as current protection.
+
+Authenticated diagnostic inspection uses:
+
+```json
+{"kind":"feedback"}
+```
+
+`POST /v1/kv/control` returns owner cursors/native watermarks/errors,
+`rejected_scope_queries`, last recovery cause, and bounded association/request-use
+facts. Retention uses at most `max_operations` diagnostic records and
+`max_engine_bytes` aggregate encoded bytes; older diagnostics can be dropped, with
+an explicit dropped count. Only bounded identity, accounting and provenance fields
+are retained; committed token material is excluded. The response always says
+`coverage=requested_scopes_only`, `recovery=query_known_scopes`, and
+`global_snapshot_complete=false`.
+
+These are diagnostics, with `task_authority=none`. Missing provenance stays
+`unknown`; even supplied branch/session labels do not create or resurrect a task,
+claim or branch, infer a latest branch, or extend P5 associations. The journal HTTP
+API filters to the configured caller plus owner-wide invalidations. Ordinary
+unhinted Engine requests use caller `request`, so a Router polling as its configured
+control caller does **not** automatically receive their `request_use` events.
+Privileged subscribers or an explicitly authorized `request` poller could observe
+those facts separately; this adapter does neither. P6's concrete rendered/input-token
+association remains the ordinary Router association path. No automatic association
+completion from unhinted request-use feedback is claimed.
