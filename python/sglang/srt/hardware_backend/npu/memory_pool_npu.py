@@ -143,46 +143,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            pages = self.size // self.page_size + 1
-            if self.is_modelslim_mxfp8:
-                shape = (self.layer_num, pages, self.head_num, self.page_size)
-            else:
-                shape = (self.layer_num, pages, self.page_size, self.head_num)
-            k_buffer = torch.zeros(
-                (*shape, self.head_dim), dtype=self.store_dtype, device=self.device
-            )
-            v_buffer = torch.zeros(
-                (*shape, self.v_head_dim), dtype=self.store_dtype, device=self.device
-            )
-            if self.is_modelslim_mxfp8:
-                self._mxfp8_scales_initialized = False
-                # QFA uses PA_BNBD, with pairs of per-32 UE8M0 scales.
-                self.k_buffer = list(k_buffer.unbind(0))
-                self.v_buffer = list(v_buffer.unbind(0))
-                self.k_scale_buffer = list(
-                    torch.full(
-                        (*shape, self.head_dim // 64, 2),
-                        127,
-                        dtype=torch.uint8,
-                        device=self.device,
-                    ).unbind(0)
-                )
-                self.v_scale_buffer = list(
-                    torch.empty(
-                        (
-                            self.layer_num,
-                            pages,
-                            self.head_num,
-                            self.page_size // 64,
-                            self.v_head_dim,
-                            2,
-                        ),
-                        dtype=torch.uint8,
-                        device=self.device,
-                    ).unbind(0)
-                )
-                return
-
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
@@ -191,8 +151,28 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # capture does not retain the full multi-layer tensor. HiCache's
             # NPU exchange operator still requires the original contiguous
             # [layer, page, token, head, dim] allocation.
-            self._hicache_k_buffer = k_buffer
-            self._hicache_v_buffer = v_buffer
+            self._hicache_k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self._hicache_v_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.v_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
             # Keep a reference to the contiguous tensor for HiCache
             # D2H/H2D transfers (transfer_kv_dim_exchange expects a
             # tensor, not the per-layer list used in FIA mode below).
@@ -217,6 +197,37 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     )
                     for i in range(self.layer_num)
                 ]
+
+            if self.is_modelslim_mxfp8:
+                self._mxfp8_scales_initialized = False
+                if not self.use_fia:
+                    self.k_buffer = list(self.k_buffer.unbind(0))
+                    self.v_buffer = list(self.v_buffer.unbind(0))
+                pages = self.size // self.page_size + 1
+                shape = (self.layer_num, pages, self.page_size, self.head_num)
+                # QFA uses PA_BBND, with pairs of per-32 UE8M0 scales.
+                self.k_scale_buffer = list(
+                    torch.full(
+                        (*shape, self.head_dim // 64, 2),
+                        127,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    ).unbind(0)
+                )
+                self.v_scale_buffer = list(
+                    torch.empty(
+                        (
+                            self.layer_num,
+                            pages,
+                            self.page_size // 64,
+                            self.head_num,
+                            self.v_head_dim,
+                            2,
+                        ),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    ).unbind(0)
+                )
 
     def get_hicache_transfer_buffers(self):
         """Return contiguous all-layer KV tensors for NPU HiCache IO."""
@@ -276,7 +287,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             self.get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        if self.use_fia and not self.is_modelslim_mxfp8:
+        if self.use_fia:
             kv_item_lens = [
                 self.get_key_buffer(i)[0].nbytes * self.page_size
                 for i in range(self.start_layer, self.start_layer + self.layer_num)
@@ -333,27 +344,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if self.is_modelslim_mxfp8:
-            # Map logical token slots to complete D rows in PA_BNBD storage.
-            loc = loc.reshape(-1)
-            heads = torch.arange(self.head_num, device=loc.device, dtype=loc.dtype)
-            pages = torch.div(loc, self.page_size, rounding_mode="floor")
-            slots = loc.remainder(self.page_size)
-            indices = (
-                (pages[:, None] * self.head_num + heads[None, :]) * self.page_size
-                + slots[:, None]
-            ).reshape(-1, 1)
-            offset = layer_id - self.start_layer
-            for dst, src, width in (
-                (self.k_buffer[offset], cache_k, self.head_dim),
-                (self.v_buffer[offset], cache_v, self.v_head_dim),
-                (self.k_scale_buffer[offset], k_scale, self.head_dim // 32),
-            ):
-                torch_npu.npu_scatter_nd_update_(
-                    dst.view(-1, width), indices, src.contiguous().view(-1, width)
-                )
-            return
-
         # Both FIA and paged-attention buffers share the same physical layout.
         # Opt in at pool initialization, keeping environment reads outside graph
         # capture. Otherwise retain the original writers and their memory usage.
@@ -362,7 +352,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             and hasattr(torch_npu, "npu_scatter_pa_kv_cache")
             and self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
         )
-        if self.use_fia or use_scatter_pa:
+        if self.use_fia or use_scatter_pa or self.is_modelslim_mxfp8:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
             num_rows = loc.numel()
@@ -410,6 +400,16 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     loc_indices,
                     cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
                 )
+                if self.is_modelslim_mxfp8:
+                    torch_npu.npu_scatter_nd_update_(
+                        self.k_scale_buffer[layer_id - self.start_layer].view(
+                            -1, self.head_num, self.head_dim // 32
+                        ),
+                        loc_indices,
+                        k_scale.contiguous().view(
+                            num_rows, self.head_num, self.head_dim // 32
+                        ),
+                    )
         else:
             loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(

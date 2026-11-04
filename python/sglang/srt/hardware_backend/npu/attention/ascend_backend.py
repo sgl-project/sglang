@@ -915,9 +915,12 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """Dispatch device metadata preparation for eager execution or graph capture."""
+        if self.use_quant_flash_attn:
+            self._init_quant_flash_attn_metadata(forward_batch)
+
+    def _init_quant_flash_attn_metadata(self, forward_batch: ForwardBatch):
         """Refresh device metadata eagerly or as part of the captured graph."""
-        if not self.use_in_graph_metadata:
-            return
         metadata = self.forward_metadata
         bs = metadata.block_tables.shape[0]
         if bs == 0:
@@ -974,7 +977,7 @@ class AscendAttnBackend(AttentionBackend):
             mask_mode=0 if forward_batch.forward_mode.is_decode_or_idle() else 3,
             layout_q="TND",
             layout_q_descale=metadata.fa_layout_q_descale,
-            layout_kv="PA_BNBD",
+            layout_kv="PA_BBND",
             layout_out="TND",
         )
 
@@ -1121,6 +1124,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
+        # Initialize QFA's fixed metadata buffers and skip FIA-specific initialization.
         if self.use_quant_flash_attn:
             if forward_mode.is_draft_extend_v2():
                 query_len = out_cache_loc.shape[0] // bs
@@ -2104,8 +2108,12 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_output, _ = self.quant_flash_attn(
                         query,
-                        k_cache,
-                        v_cache,
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
                         q_scale.view(torch.float8_e8m0fnu),
                         k_scale.view(torch.float8_e8m0fnu),
                         v_scale.view(torch.float8_e8m0fnu),
@@ -2121,7 +2129,7 @@ class AscendAttnBackend(AttentionBackend):
                         max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                         layout_q="TND",
                         layout_q_descale=self.forward_metadata.fa_layout_q_descale,
-                        layout_kv="PA_BNBD",
+                        layout_kv="PA_BBND",
                         layout_out="TND",
                     )
                 attn_output = attn_output.view(
@@ -3023,8 +3031,12 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_output, _ = self.quant_flash_attn(
                         query,
-                        k_cache,
-                        v_cache,
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
                         q_scale.view(torch.float8_e8m0fnu),
                         k_scale.view(torch.float8_e8m0fnu),
                         v_scale.view(torch.float8_e8m0fnu),
@@ -3040,7 +3052,7 @@ class AscendAttnBackend(AttentionBackend):
                         max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                         layout_q="TND",
                         layout_q_descale=self.forward_metadata.fa_layout_q_descale,
-                        layout_kv="PA_BNBD",
+                        layout_kv="PA_BBND",
                         layout_out="TND",
                     )
                 attn_output = attn_output.view(
@@ -3536,8 +3548,10 @@ class AscendAttnBackend(AttentionBackend):
             k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             attn_output, _ = self.quant_flash_attn(
                 query,
-                k_cache,
-                v_cache,
+                k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                ),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
                 q_scale.view(torch.float8_e8m0fnu),
                 k_scale.view(torch.float8_e8m0fnu),
                 v_scale.view(torch.float8_e8m0fnu),
@@ -3553,7 +3567,7 @@ class AscendAttnBackend(AttentionBackend):
                 max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                 layout_q="TND",
                 layout_q_descale=self.forward_metadata.fa_layout_q_descale,
-                layout_kv="PA_BNBD",
+                layout_kv="PA_BBND",
                 layout_out="TND",
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -3944,8 +3958,12 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_output, _ = self.quant_flash_attn(
                         query,
-                        k_cache,
-                        v_cache,
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
                         q_scale.view(torch.float8_e8m0fnu),
                         k_scale.view(torch.float8_e8m0fnu),
                         v_scale.view(torch.float8_e8m0fnu),
@@ -3961,7 +3979,7 @@ class AscendAttnBackend(AttentionBackend):
                         max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                         layout_q="TND",
                         layout_q_descale=self.forward_metadata.fa_layout_q_descale,
-                        layout_kv="PA_BNBD",
+                        layout_kv="PA_BBND",
                         layout_out="TND",
                     )
                 attn_output = attn_output.view(
