@@ -974,7 +974,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        q_rope, k_rope = self._apply_rotary_emb(positions, q_rope, k_rope)
 
         self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
@@ -1042,7 +1042,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dummy_q_rope = torch.empty_like(k_rope)
         else:
             dummy_q_rope = k_rope
-        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
+        _, k_rope = self._apply_rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         if apply_hadamard:
             key = rotate_activation(key)
@@ -1189,6 +1189,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
+
+    def _apply_rotary_emb(
+        self, positions: torch.Tensor, q_rope: torch.Tensor, k_rope: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # SGLang's native rope variants (used instead of aiter's when LeRoPE
+        # rewrites the cos/sin table) need an explicit head axis on both inputs;
+        # aiter's rope infers it from the flat layout.
+        if hasattr(self.rotary_emb, "cos_cache"):
+            return self.rotary_emb(positions, q_rope, k_rope)
+        squeeze_q = q_rope.dim() == 2
+        squeeze_k = k_rope.dim() == 2
+        q_out, k_out = self.rotary_emb(
+            positions,
+            q_rope.unsqueeze(1) if squeeze_q else q_rope,
+            k_rope.unsqueeze(1) if squeeze_k else k_rope,
+        )
+        return (
+            q_out.squeeze(1) if squeeze_q else q_out,
+            k_out.squeeze(1) if squeeze_k else k_out,
+        )
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:

@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     _BLOCK_FP8_ALGOS,
     ModelOptMixedPrecisionConfig,
 )
+from sglang.srt.layers.rotary_embedding.factory import native_rope_only
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
@@ -235,7 +236,10 @@ class MistralLarge4Model(DeepseekV2Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, quant_config, prefix=prefix)
+        # LeRoPE rewrites the cos/sin table in place once the checkpoint is loaded;
+        # aiter's rope (ROCm) has no such table, so build sglang's own.
+        with native_rope_only():
+            super().__init__(config, quant_config, prefix=prefix)
         self.lerope_alpha: Optional[nn.Parameter] = None
         if config.lerope:
             self.lerope_alpha = nn.Parameter(
