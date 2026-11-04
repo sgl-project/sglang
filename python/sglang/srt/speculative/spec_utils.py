@@ -1123,12 +1123,15 @@ def _verify_commit_step_indices(
             if batch.mamba_track_indices is not None
             else 0
         )
-        return fused_commit_track_indices(
+        last_correct_step_indices, mamba_steps_to_track = fused_commit_track_indices(
             accept_index,
             accept_lens,
             batch.seq_lens if track_grid > 0 else None,
             draft_token_num,
             track_grid,
+        )
+        return last_correct_step_indices, _drop_untracked_steps(
+            batch, mamba_steps_to_track
         )
     accept_indices_offset = torch.arange(
         0,
@@ -1160,7 +1163,22 @@ def _verify_commit_step_indices(
         candidate_track_steps,
         torch.full_like(candidate_track_steps, -1),
     )
-    return last_correct_step_indices, mamba_steps_to_track
+    return last_correct_step_indices, _drop_untracked_steps(batch, mamba_steps_to_track)
+
+
+def _drop_untracked_steps(
+    batch: ScheduleBatch, mamba_steps_to_track: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """A row with no track destination (-1: freed, or a lazy crossing that got
+    no slot) commits no snapshot even when it crosses, so a backend never sees
+    a crossing with nowhere to write."""
+    if mamba_steps_to_track is None:
+        return None
+    return torch.where(
+        batch.mamba_track_indices >= 0,
+        mamba_steps_to_track,
+        torch.full_like(mamba_steps_to_track, -1),
+    )
 
 
 def commit_mamba_states_after_verify(

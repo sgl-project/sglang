@@ -150,6 +150,52 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             )
         )
 
+    def test_crossing_without_track_destination_commits_no_snapshot(self):
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = self._make_mock_target_worker()
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        # Both requests cross 256; the second has no track slot (-1).
+        batch.mamba_track_indices = torch.tensor([100, -1], dtype=torch.int64)
+        batch.seq_lens = torch.tensor([253, 254], dtype=torch.int32)
+        accept_lens = torch.tensor([4, 3], dtype=torch.int32)
+        accept_index = torch.tensor(
+            [
+                [0, 1, 2, 3, -1],
+                [5, 6, 7, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                return_value=256,
+            ),
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=5,
+            )
+
+        call_kwargs = target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify.call_args[
+            1
+        ]
+        self.assertTrue(
+            torch.equal(
+                call_kwargs["mamba_steps_to_track"],
+                torch.tensor([2, -1], dtype=torch.int32),
+            )
+        )
+
 
 class TestPPReplaySSMVerifySourceRows(CustomTestCase):
     @staticmethod

@@ -2141,8 +2141,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
+            # A row with no track destination (-1) commits no snapshot.
+            can_track_mask = (
+                to_track_mask
+                & (to_track_ith < commit_lens.to(to_track_ith.dtype))
+                & (batch.mamba_track_indices >= 0)
             )
             mamba_steps_to_track = torch.where(
                 can_track_mask,
