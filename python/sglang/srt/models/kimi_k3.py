@@ -3087,8 +3087,13 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
-        # (matching the idle skip in other DP-attention models).
-        if forward_batch.forward_mode.is_idle():
+        # (matching the idle skip in other DP-attention models). Hybrid
+        # speculative sync temporarily rewrites IDLE to TARGET_VERIFY, so use
+        # the saved logical mode as well as the physical routing mode.
+        original_mode = getattr(forward_batch, "_original_forward_mode", None)
+        if forward_batch.forward_mode.is_idle() or (
+            original_mode is not None and original_mode.is_idle()
+        ):
             return hidden_states
 
         # MLA layers with q_lora_rank read their latent inputs from the
