@@ -8,15 +8,16 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
-    ALLOC_MEMORY_FUNCS,
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
 from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context, get_memory
@@ -291,12 +292,11 @@ class TestHiCacheAutoSize(CustomTestCase):
 
     def test_deepseek_v4_host_pools_book_the_snapshot(self):
         alloc = Mock(return_value=torch.empty(1, dtype=torch.uint8))
-        state_pools = [
-            SimpleNamespace(
+        state_infos = [
+            DSV4StateBufferInfo(
+                pages=torch.empty((4, 3), dtype=torch.uint8),
                 ring_size=2,
-                kv_score_buffer=SimpleNamespace(
-                    kv_score=torch.empty((4, 3), dtype=torch.uint8)
-                ),
+                dtype=torch.float32,
             )
             for _ in range(2)
         ]
@@ -315,7 +315,7 @@ class TestHiCacheAutoSize(CustomTestCase):
             self.assertEqual(base.host_memory_budget_bytes(), 1000 - 132)
             state = DeepSeekV4StateHostPool(
                 pool_name="state",
-                state_pools=state_pools,
+                state_infos=state_infos,
                 num_host_pages=4,
                 swa_page_size=2,
             )
