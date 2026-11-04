@@ -302,8 +302,9 @@ def all_gather_q_fp8_for_mla_verify(
     # so this matches casting the gathered bf16 query bit for bit.
     local[..., :d_nope].copy_(q_nope_out.transpose(0, 1))
     local[..., d_nope:].copy_(q_pe.transpose(0, 1))
-    # The custom all-gather moves only 16- and 32-bit floats.
-    gathered = group.all_gather(local.view(torch.bfloat16), dim=0)
+    # The custom all-gather moves only 16- and 32-bit floats; pair bytes when the row allows.
+    wire = torch.bfloat16 if local.shape[-1] % 2 == 0 else torch.uint8
+    gathered = group.all_gather(local.view(wire), dim=0)
     return gathered.view(fp8_dtype).transpose(0, 1).contiguous()
 
 

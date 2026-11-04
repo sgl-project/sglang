@@ -778,8 +778,10 @@ class DeepseekMLARocmForwardMixin:
         if self.dcp_size > 1:
             if self.is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
+                    # Only the _use_aiter DCP branch of forward_absorb_rocm_core reads it.
                     if (
-                        forward_batch.forward_mode.is_target_verify()
+                        _use_aiter
+                        and forward_batch.forward_mode.is_target_verify()
                         and llama_4_scaling is None
                         and get_attn_backend().takes_fp8_dcp_verify_q()
                     ):
@@ -980,7 +982,7 @@ class DeepseekMLARocmForwardMixin:
             )
             if (
                 forward_batch.forward_mode.is_target_verify()
-                and dcp_verify_q_fp8 is None
+                and not get_attn_backend().takes_fp8_dcp_verify_q()
             ):
                 k_window = torch.cat([k_nope, k_pe], dim=-1)
                 v_window = k_nope
