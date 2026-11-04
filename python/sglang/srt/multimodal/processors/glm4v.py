@@ -7,9 +7,10 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -504,67 +505,6 @@ def _passthrough_video_metadata(video, video_config):
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
-    npu_image_decode = True
-
-    def _get_npu_image_decode_mode(self):
-        mode = super()._get_npu_image_decode_mode()
-        if self.server_args.device != "npu" or self.npu_image_decode is not True:
-            return mode
-        hf = self._processor
-        if (
-            type(self) is not Glm4vImageProcessor
-            or getattr(self.hf_config, "model_type", None) != "glm4v"
-            or type(hf).__module__ != "transformers.models.glm4v.processing_glm4v"
-            or type(hf).__name__ != "Glm4vProcessor"
-        ):
-            return mode
-        img = getattr(hf, "image_processor", None)
-        image_type = (type(img).__module__, type(img).__name__)
-        if image_type not in (
-            ("transformers.models.glm4v.image_processing_glm4v", "Glm4vImageProcessor"),
-            (
-                "transformers.models.glm4v.image_processing_pil_glm4v",
-                "Glm4vImageProcessorPil",
-            ),
-        ):
-            return mode
-        mean = getattr(img, "image_mean", None)
-        std = getattr(img, "image_std", None)
-        size = getattr(img, "size", None)
-        if (
-            (
-                image_type
-                == (
-                    "transformers.models.glm4v.image_processing_glm4v",
-                    "Glm4vImageProcessor",
-                )
-                and getattr(img, "backend", None) == "torchvision"
-                or image_type
-                == (
-                    "transformers.models.glm4v.image_processing_pil_glm4v",
-                    "Glm4vImageProcessorPil",
-                )
-                and getattr(img, "backend", None) == "pil"
-            )
-            and getattr(size, "shortest_edge", None) == 12544
-            and getattr(size, "longest_edge", None) == 9633792
-            and getattr(img, "patch_size", None) == 14
-            and getattr(img, "temporal_patch_size", None) == 2
-            and getattr(img, "merge_size", None) == 2
-            and getattr(img, "do_resize", None) is True
-            and getattr(img, "do_rescale", None) is True
-            and getattr(img, "do_normalize", None) is True
-            and getattr(img, "do_convert_rgb", None) is True
-            and isinstance(mean, (list, tuple))
-            and tuple(mean) == (0.48145466, 0.4578275, 0.40821073)
-            and isinstance(std, (list, tuple))
-            and tuple(std) == (0.26862954, 0.26130258, 0.27577711)
-            and getattr(img, "rescale_factor", None) == 1 / 255
-            and not self.image_config
-        ):
-            return True
-        return mode
-
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
     models = [

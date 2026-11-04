@@ -158,7 +158,8 @@ class VPCJPEGDecoder:
                     failure,
                 )
 
-    def decode(self, data: bytes):
+    def decode(self, data):
+        """Decode bytes or a contiguous CPU uint8 tensor through JPEGD/VPC."""
         d = self.decoder
         with d.lock:
             self.torch.npu.set_device(self.device)

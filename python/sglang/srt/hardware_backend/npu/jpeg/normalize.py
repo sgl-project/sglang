@@ -11,9 +11,11 @@ class UnsupportedSOF(ValueError):
     """A valid frame outside the supported baseline 4:2:0 contract."""
 
 
-def inspect_420_sof(data: bytes, width: int, height: int) -> int:
+def inspect_420_sof(
+    data: bytes | bytearray | memoryview, width: int, height: int
+) -> int:
     """Return the SOF0 height-field offset, without decoding or copying pixels."""
-    if not data.startswith(b"\xff\xd8"):
+    if data[:2] != b"\xff\xd8":
         raise ValueError("SOF normalization requires JPEG SOI")
     position = 2
     while position < len(data):
@@ -79,12 +81,12 @@ def inspect_420_sof(data: bytes, width: int, height: int) -> int:
     raise ValueError("JPEG has no complete frame header")
 
 
-def normalize_420_sof(data: bytes, width: int, height: int) -> bytes:
+def normalize_420_sof(
+    data: bytes | bytearray | memoryview, width: int, height: int
+) -> bytes | bytearray | memoryview:
     if not (width % 2 or height % 2):
         return data
     offset = inspect_420_sof(data, width, height)
-    return (
-        data[:offset]
-        + struct.pack(">HH", height + height % 2, width + width % 2)
-        + data[offset + 4 :]
-    )
+    normalized = bytearray(data)
+    struct.pack_into(">HH", normalized, offset, height + height % 2, width + width % 2)
+    return normalized

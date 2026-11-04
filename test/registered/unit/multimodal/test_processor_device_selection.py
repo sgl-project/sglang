@@ -9,7 +9,7 @@ device has to come from what the worker was handed.
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.runtime_context import publish, reset_context
@@ -89,16 +89,55 @@ class TestFastImageProcessorDevice(CustomTestCase):
         self.assertEqual(self._device(processor, _is_cpu=True), "cpu")
         self.assertEqual(self._device(processor, _is_xpu=True), "xpu")
 
-    def test_npu_glm4v_explicitly_uses_cpu_preprocessing(self):
+    def test_npu_glm4v_preprocesses_on_cpu_with_decoding_on_or_off(self):
         class Glm4vProcessor:
             pass
 
         processor = _make(base_gpu_id=3)
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
-            device = processor._fast_image_processor_device(Glm4vProcessor())
-        # Leaving placement unset lets an NPU-decoded input select NPU, where
-        # GLM4v's high-dimensional patch extraction is unsupported.
-        self.assertEqual(device, "cpu")
+            for enabled in (False, True):
+                with self.subTest(decode=enabled):
+                    processor.npu_image_decode = enabled
+                    device = processor._fast_image_processor_device(Glm4vProcessor())
+                    self.assertEqual(device, "cpu")
+
+    def test_npu_device_follows_each_instance_with_decoding_on_or_off(self):
+        hooks = {
+            "qwen_vl_processor": ["npu_apply_qwen_image_preprocess_patch"],
+            "glm46v_processor": ["npu_apply_glm46v_image_preprocess_patch"],
+            "minimax_m3_processor": [
+                "npu_apply_minimax_m3_image_preprocess_patch",
+                "npu_apply_minimax_m3_video_preprocess_patch",
+            ],
+        }
+        modules = {
+            f"sglang.srt.hardware_backend.npu.modules.{name}": SimpleNamespace(
+                **{hook: Mock() for hook in names}
+            )
+            for name, names in hooks.items()
+        }
+        first, second = _make(base_gpu_id=1), _make(base_gpu_id=3)
+        with (
+            patch.dict("sys.modules", modules),
+            patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True),
+        ):
+            for name in ("Qwen2VLProcessor", "Glm46VProcessor", "MiniMaxVLProcessor"):
+                hf_processor = type(name, (), {})()
+                hf_processor.image_processor = object()
+                hf_processor.video_processor = object()
+                for processor, expected in ((first, "npu:1"), (second, "npu:3")):
+                    for enabled in (False, True):
+                        with self.subTest(name=name, device=expected, decode=enabled):
+                            processor.npu_image_decode = enabled
+                            self.assertEqual(
+                                processor._fast_image_processor_device(hf_processor),
+                                expected,
+                            )
+        for name, names in hooks.items():
+            for hook in names:
+                getattr(
+                    modules[f"sglang.srt.hardware_backend.npu.modules.{name}"], hook
+                ).assert_called()
 
     def test_platform_respects_cuda_compatibility(self):
         processor = _make(base_gpu_id=3)
@@ -210,52 +249,6 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             events,
             ["enter", ("call", "cuda:0"), ("copy", "cpu"), "exit"],
         )
-
-    def test_only_pil_preprocessing_moves_tensor_inputs_to_cpu(self):
-        class InputTensor:
-            device = SimpleNamespace(type="npu")
-
-            def cpu(self):
-                copies.append(self)
-                return cpu_copy
-
-        class Processor:
-            image_processor = object()
-            tokenizer = SimpleNamespace(bos_token=None)
-
-            def __call__(self, **kwargs):
-                captured.append(kwargs["images"])
-                return {}
-
-        for use_pil, device_type in (
-            (False, "npu"),
-            (True, "npu"),
-            (True, "cuda"),
-            (True, "cpu"),
-        ):
-            with self.subTest(use_pil=use_pil, device_type=device_type):
-                copies, captured = [], []
-                cpu_copy, non_tensor = object(), object()
-                decoded = InputTensor()
-                decoded.device = SimpleNamespace(type=device_type)
-                original_images = [decoded, non_tensor]
-                processor = self._processor()
-                processor._processor = Processor()
-                processor._tokenizer = processor._processor.tokenizer
-                processor._tokenizer_auto_adds_specials = False
-                processor.disable_fast_image_processor = use_pil
-                processor.image_config = {}
-                processor.video_config = {}
-                processor.audio_config = {}
-                processor.FEATURE_NAMES = []
-                with patch(f"{BASE}.torch.Tensor", InputTensor):
-                    processor.process_mm_data("test", images=original_images)
-                should_copy = use_pil and device_type == "npu"
-                self.assertEqual(copies, [decoded] if should_copy else [])
-                self.assertIs(captured[0][0], cpu_copy if should_copy else decoded)
-                self.assertIs(captured[0][1], non_tensor)
-                # A CPU staging copy must not replace the caller's decoded input.
-                self.assertIs(original_images[0], decoded)
 
 
 if __name__ == "__main__":

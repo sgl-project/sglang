@@ -6,10 +6,10 @@ finalizes the caller's runtime; failures are not converted into CPU success.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import threading
 from dataclasses import dataclass
-from io import BytesIO
 
 from PIL import Image, JpegImagePlugin
 
@@ -97,15 +97,41 @@ class JPEGInfo:
         return self.width_stride * self.height_stride * 3 // 2
 
 
-def inspect_jpeg(data: bytes):
+class _BufferReader:
+    """Let Pillow read encoded headers without copying the entire input."""
+
+    def __init__(self, data):
+        self.data = memoryview(data)
+        self.position = 0
+
+    def tell(self):
+        return self.position
+
+    def seek(self, offset, whence=0):
+        if whence not in (0, 1, 2):
+            raise ValueError("invalid whence")
+        position = (0, self.position, len(self.data))[whence] + offset
+        if position < 0:
+            raise ValueError("negative seek")
+        self.position = position
+        return position
+
+    def read(self, size=-1):
+        end = len(self.data) if size < 0 else self.position + size
+        chunk = self.data[self.position : end].tobytes()
+        self.position += len(chunk)
+        return chunk
+
+
+def inspect_jpeg(data: bytes | bytearray | memoryview):
     """Read device eligibility and metadata without CPU pixel decoding."""
-    if not isinstance(data, bytes):
-        raise TypeError("encoded input must be bytes")
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError("encoded input must be a byte buffer")
     if not data:
         raise ValueError("encoded input must not be empty")
     if len(data) > 32 * 1024 * 1024:
         raise UnsupportedJPEG("encoded input exceeds the 32 MiB device-path limit")
-    with Image.open(BytesIO(data)) as im:
+    with Image.open(_BufferReader(data)) as im:
         if im.format != "JPEG":
             raise UnsupportedJPEG("not JPEG")
         w, h = im.size
@@ -206,34 +232,43 @@ class JPEGDecoder:
             raise RuntimeError("decoder is closed")
         check(self.acl.rt.set_context(self.context), "acl.rt.set_context")
 
-    def decode(self, data: bytes) -> DeviceFrame:
-        info = inspect_jpeg(data)
-        data = normalize_420_sof(data, info.width, info.height)
+    def decode(self, data) -> DeviceFrame:
+        # Public Tensor callers supply contiguous CPU uint8; bytes callers
+        # retain the original direct API. Both owners stay alive through sync.
+        encoded = memoryview(data if isinstance(data, bytes) else data.numpy())
+        info = inspect_jpeg(encoded)
+        normalized = normalize_420_sof(encoded, info.width, info.height)
+        size_in = len(normalized)
         with self.lock:
             self._activate()
             a = self.acl
-            host_ptr = a.util.bytes_to_ptr(data)  # keep data alive through sync
+            if normalized is encoded:
+                host_ptr = (
+                    a.util.bytes_to_ptr(data)
+                    if isinstance(data, bytes)
+                    else data.data_ptr()
+                )
+            else:
+                host_ptr = ctypes.addressof(ctypes.c_ubyte.from_buffer(normalized))
             w, h, components, fmt, ret = a.media.dvpp_jpeg_get_image_info_v2(
-                host_ptr, len(data)
+                host_ptr, size_in
             )
             check(ret, "dvpp_jpeg_get_image_info_v2")
             if (w, h, components) != (info.decode_width, info.decode_height, 3):
                 raise ACLFailure("PIL header and DVPP header disagree")
-            size, ret = a.media.dvpp_jpeg_predict_dec_size(
-                host_ptr, len(data), 1
-            )  # NV12
+            size, ret = a.media.dvpp_jpeg_predict_dec_size(host_ptr, size_in, 1)  # NV12
             check(ret, "dvpp_jpeg_predict_dec_size")
             size = max(size, info.nv12_bytes)
             inp = out = desc = None
             submitted = False
             failure = None
             try:
-                inp, ret = a.media.dvpp_malloc(len(data))
+                inp, ret = a.media.dvpp_malloc(size_in)
                 check(ret, "dvpp_malloc input")
                 out, ret = a.media.dvpp_malloc(size)
                 check(ret, "dvpp_malloc output")
                 check(
-                    a.rt.memcpy(inp, len(data), host_ptr, len(data), 1),
+                    a.rt.memcpy(inp, size_in, host_ptr, size_in, 1),
                     "memcpy H2D JPEG",
                 )
                 desc = a.media.dvpp_create_pic_desc()
@@ -256,7 +291,7 @@ class JPEGDecoder:
                 submitted = True
                 check(
                     a.media.dvpp_jpeg_decode_async(
-                        self.channel, inp, len(data), desc, self.stream
+                        self.channel, inp, size_in, desc, self.stream
                     ),
                     "dvpp_jpeg_decode_async",
                 )

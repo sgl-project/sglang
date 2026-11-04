@@ -45,35 +45,6 @@ This document provides a list of commonly used environment variables and aims to
   </tbody>
 </table>
 
-## Device JPEG decoding on NPU
-
-On Linux Ascend systems, Qwen2.5-VL, Gemma3, and GLM4v enable V1 JPEGD + VPC for verified Hugging Face processor types and configurations. Other processors use CPU/PIL. The independent `npu_image_decode` policy defaults to `False`; `gpu_image_decode` continues to control CUDA decoding. Qwen2.5-VL accepts its default image configuration or the single override `max_pixels=1003520`.
-
-### Install and run
-
-Follow the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for compatible CANN, `torch`, and `torch_npu` dependencies. CANN must expose the Python `acl.media` JPEGD and VPC color-conversion APIs. This path was validated on Ascend910_9362 with CANN 9.1.0. Install your source checkout from the repository root:
-
-```bash
-SGLANG_BUILD_RUST_EXTS=none python -m pip install --no-deps --no-build-isolation -e python
-```
-
-Set `MODEL_PATH` to your local Qwen2.5-VL-3B-Instruct directory and start a single-NPU service:
-
-```bash
-python -m sglang.launch_server \
-  --model-path "$MODEL_PATH" --served-model-name jpeg-study \
-  --device npu --attention-backend ascend --mm-attention-backend ascend_attn \
-  --dtype bfloat16 --host 127.0.0.1 --port 30000
-```
-
-Send requests using the [multimodal chat example](/docs/basic_usage/openai_api_vision), with `model` set to `jpeg-study`. To disable NPU image decoding, set `SGLANG_DISABLE_NPU_IMAGE_DECODE=1` before starting the service. Its default is `false`; restart the service after changing it. The setting affects image decoding, while model inference stays on the configured device. Direct `load_image` and `_load_image` calls use their explicit `npu_image_decode` argument independently of this service setting.
-
-### Supported inputs
-
-- Eligible inputs are 8-bit baseline YCbCr 4:2:0 JPEGs, 32–4096 pixels per dimension and at most 32 MiB. Other inputs, including PNG, progressive JPEG, and images with EXIF/ICC metadata, use PIL.
-- The loader enables V1 only for the known A2/A3 device names listed in the implementation. Ascend 950 and unknown devices use PIL before DVPP resources are created. Only Ascend910_9362 was hardware-tested.
-- JPEGD + VPC returns a synchronized, Torch-owned, contiguous NPU `uint8 CHW` RGB tensor. GLM4v patch extraction and PIL image processors retain CPU preprocessing. Device execution failures remain visible as request errors.
-
 ## Used in DeepEP Ascend
 
 <table>

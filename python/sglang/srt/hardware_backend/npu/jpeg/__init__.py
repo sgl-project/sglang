@@ -1,10 +1,16 @@
 """DVPP JPEGD/VPC decoding; unsupported images retain PIL semantics."""
 
+from __future__ import annotations
+
 import atexit
 import os
 import threading
 import weakref
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 from sglang.srt.hardware_backend.npu.jpeg.dvpp import (
     ACLFailure,
@@ -135,25 +141,43 @@ def close_decoders():
 atexit.register(close_decoders)
 
 
-def decode_jpeg(data: bytes):
-    """Return uint8 CHW on the current NPU, or None for supported PIL fallback.
+def decode_jpeg(
+    data: bytes | torch.Tensor, device: str | torch.device = "npu"
+) -> torch.Tensor | None:
+    """Decode encoded CPU uint8 data to contiguous CHW RGB on an NPU.
 
-    No device work is performed for ineligible headers. Runtime failures and
-    malformed inputs remain errors rather than hidden CPU success.
+    Accept a one-dimensional CPU uint8 tensor, or bytes for direct callers.
+    Contiguous tensors share their encoded storage with the decoder. Strided
+    inputs are made contiguous; SOF changes use a private input buffer.
+    An unindexed device uses the calling thread's current NPU.
+    Unsupported images/devices return None for PIL fallback before creating
+    resources. Execution errors propagate; the caller's device is restored.
     """
+    import torch
+
     if not isinstance(data, bytes):
-        raise TypeError("NPU JPEG input must be bytes")
-    if not (data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")):
+        if not isinstance(data, torch.Tensor):
+            raise TypeError("NPU JPEG input must be bytes or a CPU uint8 tensor")
+        if data.ndim != 1 or data.dtype != torch.uint8 or data.device.type != "cpu":
+            raise ValueError("NPU JPEG tensor input must be one-dimensional CPU uint8")
+        data = data.contiguous()
+    encoded = memoryview(data if isinstance(data, bytes) else data.numpy())
+    if not (encoded[:2] == b"\xff\xd8" and encoded[-2:] == b"\xff\xd9"):
         return None
     try:
-        inspect_jpeg(data)
+        inspect_jpeg(encoded)
     except UnsupportedJPEG:
         return None
-    import torch
     import torch_npu  # noqa: F401 - registers the NPU device backend
 
-    device = torch.npu.current_device()
+    target = torch.device(device)
+    if target.type != "npu":
+        raise ValueError("NPU JPEG decoding requires an NPU device")
+    device_index = target.index
+    if device_index is None:
+        device_index = torch.npu.current_device()
     # Check the actual worker before constructing any DVPP resources.
-    if torch.npu.get_device_name(device) not in _V1_DEVICE_NAMES:
+    if torch.npu.get_device_name(device_index) not in _V1_DEVICE_NAMES:
         return None
-    return _decoder(device).decode(data)
+    with torch.npu.device(device_index):
+        return _decoder(device_index).decode(data)

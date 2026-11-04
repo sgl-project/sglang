@@ -25,17 +25,13 @@ from PIL import Image
 from transformers import BaseImageProcessor
 
 from sglang.srt import platforms
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -240,12 +236,8 @@ def _forget_parent_executor_wakeups():
 
 class BaseMultimodalProcessor(ABC):
     models = []
-    gpu_image_decode = True  # Enable GPU decoding by default.
-    npu_image_decode = False  # Only verified NPU processor paths opt in.
-
-    def _get_npu_image_decode_mode(self):
-        return False
-
+    gpu_image_decode = True  # Enable GPU decoding by default
+    npu_image_decode = True  # Enable NPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
@@ -284,9 +276,6 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        # Capture the service setting before the processor fingerprint is built.
-        if envs.SGLANG_DISABLE_NPU_IMAGE_DECODE.get():
-            self.npu_image_decode = False
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
@@ -512,12 +501,13 @@ class BaseMultimodalProcessor(ABC):
             if isinstance(self._processor, PreprocessFingerprintProvider)
             else None
         )
-        payload = {
+        return {
             "wrapper_class": (
                 f"{type(self._processor).__module__}."
                 f"{type(self._processor).__qualname__}"
             ),
             "gpu_image_decode": self.gpu_image_decode,
+            "npu_image_decode": self.npu_image_decode,
             "image_processor_backend": self.image_processor_backend,
             "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
@@ -525,10 +515,6 @@ class BaseMultimodalProcessor(ABC):
             "audio_config": self.audio_config,
             "wrapped_processor": wrapped_processor,
         }
-        # Keep the existing CPU/CUDA cache identity unchanged.
-        if getattr(getattr(self, "server_args", None), "device", None) == "npu":
-            payload["npu_image_decode"] = self._get_npu_image_decode_mode()
-        return payload
 
     def clear_preprocess_cache(self) -> None:
         """Drop artifacts and reject cache writes from pre-flush work.
@@ -844,7 +830,7 @@ class BaseMultimodalProcessor(ABC):
                 and processor.video_processor is not None
             ):
                 npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
-            return "npu"
+            return f"npu:{server_args.base_gpu_id}"
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.
@@ -853,17 +839,15 @@ class BaseMultimodalProcessor(ABC):
             )
 
             npu_apply_qwen_image_preprocess_patch()
-            return "npu"
+            return f"npu:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "Glm46VProcessor":
             from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
                 npu_apply_glm46v_image_preprocess_patch,
             )
 
             npu_apply_glm46v_image_preprocess_patch()
-            return "npu"
-        # Glm4v's patchify reshapes exceed Ascend's 8-dimension limit. PIL
-        # inputs previously kept this work on CPU; device-decoded tensors
-        # need the same explicit placement before the HF processor runs.
+            return f"npu:{server_args.base_gpu_id}"
+        # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
         return "cpu"
 
     @contextmanager
@@ -900,18 +884,6 @@ class BaseMultimodalProcessor(ABC):
         processor, tokenizer = self._resolve_processor(processor)
 
         if images:
-            if (
-                self.disable_fast_image_processor
-                or getattr(getattr(processor, "image_processor", None), "backend", None)
-                == "pil"
-            ):
-                # auto can resolve to PIL too; only NPU tensors need staging.
-                images = [
-                    image.cpu()
-                    if isinstance(image, torch.Tensor) and image.device.type == "npu"
-                    else image
-                    for image in images
-                ]
             kwargs["images"] = images
             if self.image_config:
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)
@@ -1044,8 +1016,6 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
-        *,
-        npu_image_decode=False,
     ):
         """
         Load a single multimodal data.
@@ -1059,10 +1029,12 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(
-                    data, cls.gpu_image_decode, npu_image_decode=npu_image_decode
+                    data,
+                    gpu_image_decode=cls.gpu_image_decode,
+                    npu_image_decode=cls.npu_image_decode,
                 )
                 if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded to a device tensor.
+                    return img  # JPEG already decoded to a device tensor
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:
@@ -1131,25 +1103,6 @@ class BaseMultimodalProcessor(ABC):
                     return False
         return has_mm_data
 
-    def _load_single_item_for_processor(self, data, modality, *args):
-        # Current device is thread-local; IO workers need this instance's device.
-        npu_mode = self._get_npu_image_decode_mode()
-        bind_npu = (
-            modality == Modality.IMAGE
-            and npu_mode is True
-            and self.server_args.device == "npu"
-            and not self._is_preprocessed_input(data)
-        )
-        if not bind_npu:
-            return self.__class__._load_single_item(data, modality, *args)
-        with torch.npu.device(self.server_args.base_gpu_id):
-            return self.__class__._load_single_item(
-                data,
-                modality,
-                *args,
-                npu_image_decode=True,
-            )
-
     def _submit_mm_data_loading_tasks_simple(
         self,
         data_list: Optional[list],
@@ -1180,7 +1133,7 @@ class BaseMultimodalProcessor(ABC):
                 type(data),
             )
             future = self.io_executor.submit(
-                self._load_single_item_for_processor,
+                self.__class__._load_single_item,
                 data,
                 modality,
                 None,  # frame_count_limit: no consider for fast path
@@ -1240,7 +1193,7 @@ class BaseMultimodalProcessor(ABC):
 
                 futures.append(
                     self.io_executor.submit(
-                        self._load_single_item_for_processor,
+                        self.__class__._load_single_item,
                         data,
                         modality,
                         frame_count_limit,

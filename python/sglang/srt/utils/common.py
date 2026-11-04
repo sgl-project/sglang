@@ -102,10 +102,6 @@ from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
-    get_context,
-)
-from sglang.srt.runtime_context import get_device as get_runtime_device
-from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_model,
@@ -143,7 +139,7 @@ torch_release = pkg_version.parse(torch.__version__).release
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
 def is_hip() -> bool:
-    return torch.version.hip is not None
+    return torch.version.hip is not None and torch.cuda.is_available()
 
 
 if is_hip():
@@ -1245,7 +1241,7 @@ def is_gfx95_supported():
 
     False on every non-HIP build, so callers do not need their own is_hip().
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
@@ -1257,9 +1253,21 @@ def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx115_supported():
+    """
+    Returns whether the current platform is AMD RDNA3.5 (gfx115x, e.g. gfx1150, gfx1151).
+    """
+    if torch.version.hip and torch.cuda.is_available():
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return gcn_arch.startswith("gfx115")
     else:
         return False
 
@@ -1269,7 +1277,7 @@ def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx1250"])
     else:
@@ -2089,6 +2097,15 @@ def is_jpeg_with_cuda(
     return False
 
 
+def is_jpeg_with_npu(image_bytes: bytes = b"", npu_image_decode: bool = True) -> bool:
+    """Check whether NPU JPEG decoding is enabled and the input has JPEG markers."""
+    if not is_npu() or not npu_image_decode:
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
+
+
 @lru_cache(maxsize=16)
 def _warn_fancy_jpeg_fallback(error: str) -> None:
     logger.warning(
@@ -2098,45 +2115,21 @@ def _warn_fancy_jpeg_fallback(error: str) -> None:
     )
 
 
-def _image_decode_backend() -> str:
-    """Resolve the serving backend; standalone loaders use available hardware."""
-    if get_context().is_config_namespace_published("device"):
-        return get_runtime_device().device
-    if is_cpu():
-        return "cpu"
-    if is_cuda():
-        return "cuda"
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        return "npu"
-    return "cpu"
-
-
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
     gpu_image_decode: GPUImageDecodeMode = True,
     *,
-    npu_image_decode: bool = False,
+    npu_image_decode: bool = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
-    Try to decode eligible JPEGs with nvJPEG or Ascend DVPP to a device tensor,
+    Try device JPEG decoding and return a torch device tensor,
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    # Avoid an additional backend lookup when both policies are off.
-    backend = _image_decode_backend() if gpu_image_decode or npu_image_decode else "cpu"
-    if backend == "npu":
-        # NPU and GPU policies are independent. Unsupported NPU inputs use PIL;
-        # execution errors propagate, and never try a different accelerator.
-        if npu_image_decode:
-            from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
-
-            image_tensor = decode_jpeg(image_bytes)
-            if image_tensor is not None:
-                return image_tensor
-    elif is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             if gpu_image_decode == "nvjpeg_fancy":
                 from sglang.srt.utils.nvjpeg_decoder import (
@@ -2157,6 +2150,14 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
+    elif is_jpeg_with_npu(image_bytes, npu_image_decode):
+        from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
+
+        encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+        image_tensor = decode_jpeg(encoded_image, device="npu")
+        if image_tensor is not None:
+            return image_tensor
+        # Unsupported devices/images return None; execution errors propagate.
     try:
         image = Image.open(BytesIO(image_bytes))
     except (OSError, SyntaxError) as e:
@@ -2177,7 +2178,7 @@ def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
     gpu_image_decode: GPUImageDecodeMode = True,
     *,
-    npu_image_decode: bool = False,
+    npu_image_decode: bool = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -3656,7 +3657,7 @@ def build_model_info_fields(model_config, server_args) -> Dict[str, Any]:
 
     Shared by the HTTP server and the Rust frontend's launch configuration.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.model_override_base import resolving_view
     from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 
     result = {

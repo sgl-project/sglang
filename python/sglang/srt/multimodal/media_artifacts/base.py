@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -33,7 +32,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
     CacheMiss,
@@ -43,6 +41,7 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import load_image
 
 
@@ -158,18 +157,11 @@ class MediaArtifactCacheMixin:
         if isinstance(data, Image.Image):
             data.load()
             return data
-        server_args = getattr(self, "server_args", None)
-        get_npu_mode = getattr(self, "_get_npu_image_decode_mode", None)
-        npu_mode = get_npu_mode() if get_npu_mode is not None else False
-        context = (
-            torch.npu.device(server_args.base_gpu_id)
-            if npu_mode and server_args is not None and server_args.device == "npu"
-            else nullcontext()
+        image, _ = load_image(
+            data,
+            gpu_image_decode=self.gpu_image_decode,
+            npu_image_decode=self.npu_image_decode,
         )
-        with context:
-            image, _ = load_image(
-                data, self.gpu_image_decode, npu_image_decode=npu_mode
-            )
         if isinstance(image, Image.Image):
             image.load()
         return image

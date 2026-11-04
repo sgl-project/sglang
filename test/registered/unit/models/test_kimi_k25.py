@@ -19,8 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
@@ -47,6 +46,7 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
@@ -672,7 +672,6 @@ def test_kimi_k25_fingerprint_includes_gpu_preprocessing_options():
 )
 def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
     server_args = SimpleNamespace(
-        device="cpu",
         base_gpu_id=0,
         rl_on_policy_target=None,
         tp_size=1,
