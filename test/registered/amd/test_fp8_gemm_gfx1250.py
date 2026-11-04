@@ -16,6 +16,8 @@ import torch
 from sglang.kernels.ops.gemm.fp8_gfx1250 import (
     gfx1250_fp8_scaled_mm,
     gfx1250_fp8_scaled_mm_supported,
+)
+from sglang.kernels.ops.quantization.per_token_quant_fp8_gfx1250 import (
     per_token_quant_fp8_gfx1250,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (

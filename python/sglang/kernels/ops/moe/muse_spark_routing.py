@@ -5,7 +5,7 @@ This module provides a single fused Triton kernel that replaces the multi-kernel
 implementation of MuseSpark routing. The fused kernel performs all routing
 operations in a single pass:
 1. Optional multiply by router_output_multiplier
-2. Sigmoid or softmax normalization
+2. Sigmoid normalization
 3. Add bias for selection scoring
 4. Iterative top-k selection
 5. Gather normalized scores for selected experts
@@ -38,25 +38,6 @@ from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 from sglang.srt.environ import envs
 from sglang.srt.utils import fast_topk
 from sglang.srt.utils.custom_op import register_custom_op
-
-
-@triton.jit
-def _compute_normalized_scores(
-    gating_scores,
-    expert_mask,
-    NORMALIZATION_MODE: tl.constexpr,
-):
-    """Compute normalized scores (sigmoid or softmax)."""
-    if NORMALIZATION_MODE == 0:
-        # Sigmoid normalization
-        return tl.sigmoid(gating_scores)
-    else:
-        # Softmax normalization with numerical stability
-        max_score = tl.max(tl.where(expert_mask, gating_scores, -float("inf")), axis=0)
-        exp_scores = tl.exp(gating_scores - max_score)
-        exp_scores = tl.where(expert_mask, exp_scores, 0.0)
-        sum_exp = tl.sum(exp_scores, axis=0)
-        return exp_scores / sum_exp
 
 
 @triton.jit
@@ -112,7 +93,6 @@ def fused_muse_spark_routing_kernel_topk8(
     route_scale,
     division_eps,
     NUM_EXPERTS_PADDED: tl.constexpr,
-    NORMALIZATION_MODE: tl.constexpr,
     HAS_MULTIPLIER: tl.constexpr,
     HAS_EPS: tl.constexpr,
     USE_GDC: tl.constexpr,
@@ -157,9 +137,7 @@ def fused_muse_spark_routing_kernel_topk8(
     if HAS_MULTIPLIER:
         gating_scores = gating_scores * router_output_multiplier
 
-    normalized_scores = _compute_normalized_scores(
-        gating_scores, expert_mask, NORMALIZATION_MODE
-    )
+    normalized_scores = tl.sigmoid(gating_scores)
 
     bias_values = tl.load(bias_ptr + expert_offs, mask=expert_mask, other=0.0)
 
@@ -305,7 +283,6 @@ def fused_muse_spark_routing_kernel(
     # Compile-time constants
     TOPK: tl.constexpr,
     NUM_EXPERTS_PADDED: tl.constexpr,
-    NORMALIZATION_MODE: tl.constexpr,  # 0=sigmoid, 1=softmax
     HAS_MULTIPLIER: tl.constexpr,
     HAS_EPS: tl.constexpr,
     USE_GDC: tl.constexpr,
@@ -318,7 +295,7 @@ def fused_muse_spark_routing_kernel(
     Each program handles one token (row). The algorithm:
     1. Load all expert scores for this token
     2. Apply optional multiplier
-    3. Apply sigmoid or softmax normalization
+    3. Apply sigmoid normalization
     4. Add bias for top-k selection
     5. Iterative top-k: loop TOPK times, finding max and masking
     6. Gather normalized scores for selected experts
@@ -360,17 +337,8 @@ def fused_muse_spark_routing_kernel(
     if HAS_MULTIPLIER:
         gating_scores = gating_scores * router_output_multiplier
 
-    # Step 2: Apply normalization (sigmoid or softmax)
-    if NORMALIZATION_MODE == 0:
-        # Sigmoid normalization
-        normalized_scores = tl.sigmoid(gating_scores)
-    else:
-        # Softmax normalization
-        max_score = tl.max(tl.where(expert_mask, gating_scores, -float("inf")), axis=0)
-        exp_scores = tl.exp(gating_scores - max_score)
-        exp_scores = tl.where(expert_mask, exp_scores, 0.0)
-        sum_exp = tl.sum(exp_scores, axis=0)
-        normalized_scores = exp_scores / sum_exp
+    # Step 2: Apply sigmoid normalization
+    normalized_scores = tl.sigmoid(gating_scores)
 
     # Step 3: Load bias and add for selection scoring
     bias_values = tl.load(bias_ptr + expert_offs, mask=expert_mask, other=0.0)
@@ -459,7 +427,6 @@ def fused_muse_spark_routing_op(
     route_scale: float,
     multiplier_val: float,
     eps_val: float,
-    normalization_mode: int,
     has_multiplier: bool,
     has_eps: bool,
     launch_pdl: bool = False,
@@ -507,7 +474,6 @@ def fused_muse_spark_routing_op(
             route_scale,
             eps_val,
             NUM_EXPERTS_PADDED=num_experts_padded,
-            NORMALIZATION_MODE=normalization_mode,
             HAS_MULTIPLIER=has_multiplier,
             HAS_EPS=has_eps,
             USE_GDC=launch_pdl,
@@ -537,7 +503,6 @@ def fused_muse_spark_routing_op(
             eps_val,
             TOPK=topk,
             NUM_EXPERTS_PADDED=num_experts_padded,
-            NORMALIZATION_MODE=normalization_mode,
             HAS_MULTIPLIER=has_multiplier,
             HAS_EPS=has_eps,
             USE_GDC=launch_pdl,
@@ -566,7 +531,6 @@ def fused_muse_spark_routing(
     topk: int,
     route_scale: float,
     router_output_multiplier: Optional[float] = None,
-    router_score_normalization: str = "sigmoid",
     router_score_division_eps: Optional[float] = None,
     topk_weights: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
@@ -587,7 +551,6 @@ def fused_muse_spark_routing(
         topk: Number of experts to select per token
         route_scale: Scaling factor for final weights
         router_output_multiplier: Optional multiplier for gating output
-        router_score_normalization: "sigmoid" or "softmax"
         router_score_division_eps: Optional epsilon for division stability
         topk_weights: Pre-allocated output buffer for weights [num_tokens, topk]
         topk_ids: Pre-allocated output buffer for expert IDs [num_tokens, topk]
@@ -608,17 +571,6 @@ def fused_muse_spark_routing(
 
     num_tokens, num_experts = gating_output.shape
     assert bias.shape[0] == num_experts, "bias size must match num_experts"
-
-    # Validate normalization mode
-    if router_score_normalization == "sigmoid":
-        normalization_mode = 0
-    elif router_score_normalization == "softmax":
-        normalization_mode = 1
-    else:
-        raise ValueError(
-            f"Invalid router_score_normalization: {router_score_normalization}. "
-            "Expected 'sigmoid' or 'softmax'."
-        )
 
     # Allocate output buffers if not provided
     if topk_weights is None:
@@ -668,7 +620,6 @@ def fused_muse_spark_routing(
         route_scale,
         multiplier_val,
         eps_val,
-        normalization_mode,
         router_output_multiplier is not None,
         router_score_division_eps is not None,
         launch_pdl=is_arch_support_pdl(),
@@ -710,14 +661,12 @@ class FusedMuseSparkRouting(BaseFusedOp):
         route_scale: float,
         router_output_multiplier: Optional[float] = None,
         router_score_division_eps: Optional[float] = None,
-        router_score_normalization: str = "sigmoid",
     ):
         super().__init__()
         self.expert_bias = expert_bias
         self.route_scale = route_scale
         self.router_output_multiplier = router_output_multiplier
         self.router_score_division_eps = router_score_division_eps
-        self.router_score_normalization = router_score_normalization
         self.local_expert_mapping: Optional[torch.Tensor] = None
         # SoL activated-expert capture. When set (by the owning MuseSparkMoE on decode-class
         # forwards), the fused router writes its topk_ids into this buffer so the SoL reporter
@@ -758,14 +707,10 @@ class FusedMuseSparkRouting(BaseFusedOp):
             return False
         if backend is not KernelBackend.JIT:
             return True
-        # The warp router covers sigmoid scoring with num_experts a multiple of
-        # 32 (up to 512); softmax and other expert counts stay on Triton.
-        return (
-            self.router_score_normalization == "sigmoid"
-            and gating_output.dtype == torch.float32
-            and muse_spark_route_warp_covered(
-                gating_output.shape[1], topk, gating_output.device.index
-            )
+        # The warp router covers num_experts a multiple of 32 (up to 512);
+        # other expert counts stay on Triton.
+        return gating_output.dtype == torch.float32 and muse_spark_route_warp_covered(
+            gating_output.shape[1], topk
         )
 
     def forward_jit(
@@ -936,7 +881,6 @@ class FusedMuseSparkRouting(BaseFusedOp):
             topk,
             self.route_scale,
             router_output_multiplier=self.router_output_multiplier,
-            router_score_normalization=self.router_score_normalization,
             router_score_division_eps=self.router_score_division_eps,
             topk_ids=cap,
             local_expert_mapping=self.local_expert_mapping,
