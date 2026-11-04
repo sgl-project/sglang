@@ -1,6 +1,7 @@
 """SGLANG_SIMULATE_ACC_LEN draws ignore the process RNG, so TP ranks draw alike."""
 
 import random
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -68,3 +69,7 @@ def test_ranks_draw_alike_whatever_else_reads_the_process_rng(make_draw, monkeyp
             draws[rank].append(draw())
     assert draws[0] == draws[1]
     assert len(set(draws[0])) > 1
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
