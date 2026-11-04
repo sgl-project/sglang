@@ -11,7 +11,7 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
 
 
 class StateType(str, enum.Enum):

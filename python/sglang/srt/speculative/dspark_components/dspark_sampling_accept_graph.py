@@ -72,7 +72,6 @@ def sampling_accept_commit_lens(
     draft_sampler,
     epilogue: DsparkVerifyEpilogue,
     tp_sync: SpecTpSync,
-    fused_argmax: bool,
     block_verification: bool,
     rejection_noise: Optional[RejectionNoise],
 ) -> Optional[torch.Tensor]:
@@ -99,7 +98,6 @@ def sampling_accept_commit_lens(
         draft_input=None,
         gamma=stride - 1,
         verify_num_draft_tokens=stride,
-        fused_argmax=fused_argmax,
         block_verification=block_verification,
         rejection_noise=rejection_noise,
     )
@@ -140,7 +138,6 @@ class DsparkSamplingAcceptGraph:
         epilogue: DsparkVerifyEpilogue,
         resolve_draft_sampler: Callable[[], Optional[object]],
         tp_sync: SpecTpSync,
-        fused_argmax: bool,
         block_verification: bool,
         device,
         rejection_noise: Optional[RejectionNoise] = None,
@@ -148,7 +145,6 @@ class DsparkSamplingAcceptGraph:
         self._epilogue = epilogue
         self._resolve_draft_sampler = resolve_draft_sampler
         self._tp_sync = tp_sync
-        self._fused_argmax = fused_argmax
         self._block_verification = block_verification
         self._rejection_noise = rejection_noise
         # The region always commits; padded rows are gated by verify_lens.
@@ -195,7 +191,6 @@ class DsparkSamplingAcceptGraph:
                 draft_sampler=draft_sampler,
                 epilogue=epilogue,
                 tp_sync=self._tp_sync,
-                fused_argmax=self._fused_argmax,
                 block_verification=self._block_verification,
                 rejection_noise=self._rejection_noise,
             ),
