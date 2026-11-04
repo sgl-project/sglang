@@ -1,5 +1,7 @@
 # Session KV 实验脚本
 
+0.8 长测后的优化与评估计划见 [Session KV 生命周期优化实施计划](../../SESSION_KV_OPTIMIZATION_PLAN.zh-CN.md)。该计划定义 PIN/PREFETCH/DEMOTE 消融、预测误差、共享前缀和有效 rollout 指标；新增实验模式待实现，当前可执行入口仍以本目录各脚本说明为准。
+
 `session_kv_bench.py` 对已运行的两个 SGLang Engine 发 HTTP 请求，比较普通 HiCache 按需恢复与独立 L3→L2 PREFETCH。脚本不启动或停止服务，不安装依赖，不修改服务配置。两个 Engine 使用同一权重 namespace、相同 layout、page size、模型、缓存容量与负载配置，共享同一个 Mooncake。A 产生 KV，B 恢复请求。
 
 脚本与验证用例位于开发分支的 benchmark/session_kv_control 目录。

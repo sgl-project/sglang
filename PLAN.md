@@ -2,6 +2,8 @@
 
 日期：2026-11-04。状态：首轮 P0–P8 已实现；0.8 显存预算下的 TP=1 FULL/Mooncake 持续压力测试已完成。强化测试对照快照为 `f65f0393c4`，优化快照为 `ff764308fb`，含有界 native host read 流水与排队需求复用。P9 配置扩展保留为后续工作。功能测试通过后分别提交。当前实测与边界见 `benchmark/session_kv_control/results/2026-11-04-mem08/FINAL_ACCEPTANCE.zh-CN.md`；原 0.45 配置验收保留于 `benchmark/session_kv_control/results/2026-11-04/FINAL_ACCEPTANCE.md`，过程证据见 `PLAN-REVIEW-LOG.md`。
 
+本轮后续优化见 [Session KV 生命周期优化实施计划](SESSION_KV_OPTIMIZATION_PLAN.zh-CN.md)。该文档基于 0.8 长测结果，定义成本观测、需求优先的预取预算与时机、L2→L3 DEMOTE、自动 PIN、共享前缀及 RL 验证，使用 O0–O7 阶段编号；其中新增能力尚待实现，不改变本文 P0–P8 的历史验收状态。
+
 目标是在保留 `rfc-kvc` 引擎控制实现的基础上，接入 Router 侧的 session 编排，完成 `PREFETCH`、`DEMOTE`、`PIN`、Mooncake 执行适配及结果反馈。主要验证场景是：应用等待工具期间，将已存在于 Mooncake 的上下文准备到另一个 Engine 的 L2，并在恢复推理时实际复用。
 
 本文配套于 [RFC 中文稿](/home/youwei/bzh/project/TokenCake/RFC/docs/sglang/session-kv-orchestrator-rfc.zh-CN.md)和[架构设计稿](/home/youwei/bzh/project/TokenCake/RFC/docs/sglang/session-kv-orchestrator-design.zh-CN.md)，细化代码改动、协议建议、生命周期约束、实施依赖和验收条件。外部需求来源为 [SGLang issue #45189](https://github.com/sgl-project/sglang/issues/45189)。
