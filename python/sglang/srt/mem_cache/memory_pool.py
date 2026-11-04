@@ -515,6 +515,7 @@ class ReqToTokenPool:
 
 class MambaPool:
     host_capacity_tokens: Optional[int] = None
+    host_capacity_bytes: Optional[int] = None
 
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
