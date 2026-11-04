@@ -385,6 +385,47 @@ class LifecycleHTTPTests(unittest.TestCase):
         self.assertGreater(drain["wall_ms"], 30)
         self.assertLess(row["dispatch_lateness_ms"], 100)
 
+    def test_completed_preparation_does_not_keep_polling_through_consumption(self):
+        args = self.make_args()
+        case = {
+            "id": 0,
+            "family": 0,
+            "branch": 0,
+            "prefix": list(range(64)),
+            "salt": "ready-stop",
+        }
+        self.prepare_source(case)
+        controls = lb.AsyncControls(1, 2)
+        row = lb.resume_task(
+            args,
+            self.a,
+            self.b,
+            self.router,
+            case,
+            {
+                "id": "ready",
+                "trial": "ready",
+                "arm": "lifecycle",
+                "tool_wait_s": 0.2,
+                "predicted_wait_s": 0.2,
+                "cancelled": False,
+                "route_change": False,
+            },
+            controls,
+            self.journal,
+        )
+        drained = controls.drain()
+        self.assertTrue(row["valid"], row)
+        self.assertFalse(drained["errors"])
+        self.assertTrue(row["ready_before_resume"])
+        self.assertIsNotNone(row["preparation_observation_age_ms"])
+        queries = [
+            body
+            for body in self.state.calls
+            if body.get("kind") == "query" and body.get("message_id") == "prepare"
+        ]
+        self.assertLessEqual(len(queries), 4)
+
     def test_unknown_router_owner_keeps_completed_response(self):
         args = self.make_args(via_router=True)
         self.state.omit_header = True

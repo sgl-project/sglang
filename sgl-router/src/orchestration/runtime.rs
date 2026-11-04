@@ -1769,7 +1769,25 @@ impl Actor {
             return;
         };
         let cancel = self.book.job(id).is_some_and(|b| b.cancel_requested);
-        let result = self.advance(&mut job, cancel).await;
+        // Explicit queries and the background pump can observe the same job
+        // within one poll period. Reuse its timestamped advisory observation;
+        // cancellation and child protection still advance independently below.
+        let fresh = self.preparation_costs.is_some()
+            && !cancel
+            && job.quiescent
+            && job.last_error.is_none()
+            && job.action == "sglang.prefetch"
+            && job.ready_end == job.prefix.end_token
+            && job
+                .ready_at
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(self.config.poll_ms))
+            && self.feedback.current(&job.url, &job.cache_watermark)
+            && self.workers().iter().any(|worker| worker.url == job.url);
+        let result = if fresh {
+            Ok(())
+        } else {
+            self.advance(&mut job, cancel).await
+        };
         if let Err(e) = result {
             job.last_error = Some(e);
             job.ready_end = 0;
@@ -1777,6 +1795,14 @@ impl Actor {
             job.claim_view = Value::Null;
         }
         self.poll_ready_pin(&mut job, cancel).await;
+        if job
+            .ready_pin
+            .as_ref()
+            .is_some_and(|pin| pin.pin_refused() && pin.result["update"]["status"] == "missing")
+        {
+            job.ready_end = 0;
+            job.ready_at = None;
+        }
         if self.job_quiescent(&job) {
             let _ = self.book.mark_quiescent(id);
         }

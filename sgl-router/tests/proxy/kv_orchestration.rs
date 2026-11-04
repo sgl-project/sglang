@@ -1713,3 +1713,53 @@ async fn measured_lifecycle_keeps_host_copy_when_resumption_is_close() {
         .iter()
         .any(|command| { command["envelope"]["actions"][0]["action_type"] == "sglang.demote" }));
 }
+
+#[tokio::test]
+async fn measured_completed_observation_is_reused_only_within_its_poll_window() {
+    let engine = Engine::start().await;
+    let mut cfg = orchestration();
+    cfg.poll_ms = 1000;
+    cfg.preparation_policy = Some(Default::default());
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "observed").await;
+    submit(
+        &router,
+        "observed",
+        "prepare",
+        prefix(vec![1, 2, 3, 4]),
+        &engine,
+    )
+    .await;
+    ready(&router, "observed", "prepare").await;
+    let count = || {
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|command| command["kind"] == "residency")
+            .count()
+    };
+    let initial = count();
+    for _ in 0..5 {
+        let view = query(&router, "observed", "prepare").await;
+        assert_eq!(view["operations"][0]["ready_scope"]["end_token"], 4);
+        assert!(view["operations"][0]["observation_age_ms"].is_number());
+    }
+    assert_eq!(count(), initial);
+    engine.state.lock().unwrap().fail_residency = true;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let view = query(&router, "observed", "prepare").await;
+    assert!(view["operations"][0]["ready_scope"].is_null());
+    assert!(count() > initial);
+    api(
+        &router,
+        json!({"kind":"cancel","task":task("observed"),"message_id":"prepare"}),
+    )
+    .await;
+    assert_eq!(
+        query(&router, "observed", "prepare").await["quiescent"],
+        true
+    );
+}

@@ -41,6 +41,17 @@ from session_kv_bench import (
 from stress_bench import output_equal, parity, publish
 
 ARMS = ("on_demand", "fixed_prefetch", "lifecycle")
+ARM_EVIDENCE_FIELDS = {
+    "rows",
+    "server_before",
+    "server_after",
+    "costs_before",
+    "costs_after",
+}
+
+
+def arm_metrics(arm):
+    return {key: value for key, value in arm.items() if key not in ARM_EVIDENCE_FIELDS}
 
 
 def write_json(path, value):
@@ -380,6 +391,7 @@ class Preparation:
         self.deadline, self.journal = deadline, journal
         self.pressure = pressure
         self.done = threading.Event()
+        self.request_started = threading.Event()
         self.lock = threading.Lock()
         self.observed = {}
 
@@ -469,13 +481,18 @@ class Preparation:
                 result["policy_fallback"] = not admitted
                 result["decision"] = copy.deepcopy(view)
                 while True:
-                    inspect_ready(view, self.b, len(self.case["prefix"]))
+                    prepared = inspect_ready(view, self.b, len(self.case["prefix"]))
                     with self.lock:
                         self.observed = {
                             "view": copy.deepcopy(view),
                             "observed_monotonic": time.monotonic(),
                         }
-                    if self.done.wait(self.router.poll_ms / 1000) or not admitted:
+                    if (
+                        prepared
+                        or self.request_started.is_set()
+                        or self.done.wait(self.router.poll_ms / 1000)
+                        or not admitted
+                    ):
                         break
                     view = self.router.query(self.task, "prepare", trial)
                 result["child_statuses"] = [
@@ -569,7 +586,14 @@ def resume_task(args, a, b, router, case, spec, controls, journal, pressure=None
         row["control_backpressure_ms"] = controls.submit(preparation.run)
         # A saturated control backlog can delay injection; retain that lateness.
         sleep_until(deadline)
+        preparation.request_started.set()
         row["preparation_at_resume"] = preparation.snapshot()
+        observed = row["preparation_at_resume"].get("observed_monotonic")
+        row["preparation_observation_age_ms"] = (
+            max(0, (time.monotonic() - observed) * 1000)
+            if observed is not None
+            else None
+        )
         if not spec["cancelled"]:
             destination = a if spec["route_change"] else b
             context = {
@@ -733,7 +757,7 @@ def summarize(arms):
                 }
             )
     return {
-        "arms": [{k: v for k, v in arm.items() if k != "rows"} for arm in arms],
+        "arms": [arm_metrics(arm) for arm in arms],
         "paired": pairs,
         "paired_block_throughput_ci_percent": {
             name: bootstrap_mean_ci(
@@ -984,11 +1008,9 @@ def run(args):
             }
             write_json(root / (spec["id"] + ".json"), arm)
             arms.append(arm)
-            journal.emit(
-                "lifecycle_arm", **{k: v for k, v in arm.items() if k != "rows"}
-            )
+            journal.emit("lifecycle_arm", **arm_metrics(arm))
             write_json(root / "lifecycle-summary.json", summarize(arms))
-            print(json.dumps({k: v for k, v in arm.items() if k != "rows"}), flush=True)
+            print(json.dumps(arm_metrics(arm)), flush=True)
         return (
             0
             if all(

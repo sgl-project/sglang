@@ -4994,3 +4994,11 @@ parent 阅读完整差异与测试，要求将无 claim 查询的拒绝快捷路
 新增最小预期冷层驻留窗口 min_cold_residency_ms，默认 3000ms。新策略仅在 host 来源的生命周期 tool_wait 中，比较剩余等待减准备提前量；窗口不足则保留 host 副本。显式 submit 指令及旧策略保持原行为。该门槛避免仅因压力就 DEMOTE 随即 PREFETCH 同一短期上下文。
 
 parent 独立 HTTP 回归 28 项通过；新增测试同时验证近恢复跳过、较长等待提交实际 DEMOTE，包含保护及旧行为回归。日志：lifecycle-opt/o5-cold-window-parent-tests.log。
+
+### O5 — 有效观测去重与消费期轮询
+
+4-case 启动观察保留了普通/候选组的数字输出差异和负性能结果。GPU 字节证明与暖路径对照已通过；三组重启统一启用上游 deterministic inference，继续保持 0.8、Mooncake、TP1、自然缓存容量，后续配置另列，不与旧非确定性结果混作代码净收益。
+
+启动 trace 显示完整 ready 后仍有重复 query 与正式 decode 重叠。新策略在原 poll freshness、反馈水位及 worker 健康条件内复用已完成观测，取消及 PIN 子操作仍独立推进；PIN missing 明确撤销父 readiness。harness 完整观测或请求开始后停止主动轮询，消费结束再收尾，保留观测年龄。大段服务/成本快照仅保留逐组证据文件，汇总和 console 不重复展开。
+
+parent 独立 HTTP orchestration 29 项通过，4.71s；harness 15 项通过，8.777s。覆盖窗口内去重、过期/失败后重新查询、取消推进，以及完整准备后无持续轮询。日志：lifecycle-opt/o5-observation-parent-tests.log、o5-observation-harness-tests.log。正式性能使用 release Router，源码与配置另行记录。
