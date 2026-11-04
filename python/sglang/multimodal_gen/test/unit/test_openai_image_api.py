@@ -27,14 +27,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _get_response_resize,
     _raise_if_image_variant_not_found,
     _runtime_sampling_quality,
-    _select_image_variant_cloud_url,
-    _select_image_variant_path,
     edits,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    request_model_kwargs,
+    select_output_variant,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 
@@ -298,8 +299,8 @@ def test_select_image_variant_path_reads_indexed_file_paths():
         "file_paths": ["first.png", "second.png"],
     }
 
-    assert _select_image_variant_path(item, None) == "first.png"
-    assert _select_image_variant_path(item, "1") == "second.png"
+    assert select_output_variant(item, None, "file_paths", "file_path") == "first.png"
+    assert select_output_variant(item, "1", "file_paths", "file_path") == "second.png"
 
 
 def test_raise_if_image_variant_not_found_handles_out_of_range_variant():
@@ -324,8 +325,8 @@ def test_select_image_variant_path_returns_none_for_cloud_only_variant():
         "urls": ["https://cdn.example/first.png"],
     }
 
-    assert _select_image_variant_path(item, "0") is None
-    assert _select_image_variant_path(item, "1") == "second.png"
+    assert select_output_variant(item, "0", "file_paths", "file_path") is None
+    assert select_output_variant(item, "1", "file_paths", "file_path") == "second.png"
 
 
 def test_select_image_variant_cloud_url_keeps_variant_alignment():
@@ -339,25 +340,35 @@ def test_select_image_variant_cloud_url_keeps_variant_alignment():
     }
 
     assert (
-        _select_image_variant_cloud_url(item, None) == "https://cdn.example/first.png"
+        select_output_variant(item, None, "urls", "url")
+        == "https://cdn.example/first.png"
     )
-    assert _select_image_variant_cloud_url(item, "1") is None
-    assert _select_image_variant_cloud_url(item, "2") == "https://cdn.example/third.png"
+    assert select_output_variant(item, "1", "urls", "url") is None
+    assert (
+        select_output_variant(item, "2", "urls", "url")
+        == "https://cdn.example/third.png"
+    )
 
 
 def test_select_image_variant_cloud_url_falls_back_to_single_url():
     item = {"url": "https://cdn.example/only.png"}
 
-    assert _select_image_variant_cloud_url(item, None) == "https://cdn.example/only.png"
-    assert _select_image_variant_cloud_url(item, "0") == "https://cdn.example/only.png"
-    assert _select_image_variant_cloud_url(item, "1") is None
+    assert (
+        select_output_variant(item, None, "urls", "url")
+        == "https://cdn.example/only.png"
+    )
+    assert (
+        select_output_variant(item, "0", "urls", "url")
+        == "https://cdn.example/only.png"
+    )
+    assert select_output_variant(item, "1", "urls", "url") is None
 
 
 def test_select_image_variant_path_falls_back_to_single_file_path():
     item = {"file_path": "only.png"}
 
-    assert _select_image_variant_path(item, None) == "only.png"
-    assert _select_image_variant_path(item, "0") == "only.png"
+    assert select_output_variant(item, None, "file_paths", "file_path") == "only.png"
+    assert select_output_variant(item, "0", "file_paths", "file_path") == "only.png"
 
 
 def test_request_validation_errors_are_client_errors(monkeypatch):

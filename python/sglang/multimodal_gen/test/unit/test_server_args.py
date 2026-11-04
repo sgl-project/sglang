@@ -67,7 +67,6 @@ from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
-    is_known_non_diffusers_multimodal_model,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -1256,7 +1255,6 @@ class TestMiniMaxH3Routing(unittest.TestCase):
         actual = _get_config_info("MiniMax/MiniMax-H3")
         self.assertIsNotNone(expected)
         self.assertIs(actual, expected)
-        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
         self.assertEqual(
             get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
             "MiniMaxH3Pipeline",

@@ -533,7 +533,6 @@ import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
     get_adapter_class,
-    registered_model_types,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
@@ -604,8 +603,6 @@ def test_worker_transformer_options_drop_comfy_objects() -> None:
 
 
 def test_minimax_h3_is_registered() -> None:
-    types = registered_model_types()
-    assert "minimax_h3" in types
     assert get_adapter_class("minimax_h3") is MiniMaxH3Adapter
     assert get_adapter_class("minimax_h3").pipeline_class_name == "MiniMaxH3Pipeline"
 
