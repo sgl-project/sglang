@@ -109,13 +109,13 @@ class CohereCommand4Detector(BaseFormatDetector):
             self._buffer = ""
             return StreamingParseResult(normal_text=current)
 
-        # ``bot_token`` is somewhere in the buffer. Stream out anything before
-        # it as normal text exactly once.
+        # Emit leading text together with a complete block, since a final
+        # increment has no subsequent chunk to drain the buffered call.
+        normal_text = ""
         if bot_pos > 0:
-            head = current[:bot_pos]
+            normal_text = current[:bot_pos]
             self._buffer = current[bot_pos:]
             current = self._buffer
-            return StreamingParseResult(normal_text=head)
 
         # Buffer starts with bot_token. Wait for the closing token, then
         # parse and emit the full call list. Anything past <|END_ACTION|>
@@ -123,12 +123,12 @@ class CohereCommand4Detector(BaseFormatDetector):
         # increment to handle.
         eot_pos = current.find(self.eot_token, len(self.bot_token))
         if eot_pos == -1:
-            return StreamingParseResult()
+            return StreamingParseResult(normal_text=normal_text)
 
         block_end = eot_pos + len(self.eot_token)
         result = self.detect_and_parse(current[:block_end], tools)
         self._buffer = current[block_end:]
-        return result
+        return StreamingParseResult(normal_text=normal_text, calls=result.calls)
 
     def supports_structural_tag(self) -> bool:
         return False
