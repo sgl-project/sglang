@@ -4526,3 +4526,7 @@ test/registered/unit/mem_cache/test_kv_control_transfers.py
 ### P1 independent review and proof
 
 Reviewed public normalization, capability gating, timeout cancellation/drain, result projection, shared schemas and Rust validation. Independent Python proof: 72 passed, 66 subtests passed (13.55 s); independent locked Rust protocol proof: 4 passed. Source logs: /tmp/sglang-rfc-build/p1-parent-tests.log and p1-parent-rust.log. PIN remains unsupported until its executor is integrated. Public state_version currently orders operation evidence, not KV location-stream observations; P7 must attach an actual cache-state watermark before cross-stream reconciliation. P1 approved for commit.
+
+### P4a L2 protection foundation — independent review
+
+Added owner-thread FULL host-prefix protection with split-aware native receipts, shared physical-slot budgets, per-caller/task/incarnation claim revisions, finite TTL, tombstones and reset invalidation. Public PIN execution is still pending. Independently reviewed both new files; protection/cache/transfer regression: 33 passed, 18 subtests passed (12.14 s). After integration with P1, focused protection suite: 12 passed. Logs: /tmp/sglang-rfc-build/p4a-parent-regression.log and p4a-integrated-tests.log. Approved for feature commit; runtime wiring follows separately.
