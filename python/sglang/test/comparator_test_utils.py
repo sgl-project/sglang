@@ -1,4 +1,4 @@
-"""Shared test helpers for comparator tests."""
+"""Shared helpers for the debug_utils comparator tests."""
 
 from __future__ import annotations
 
@@ -7,15 +7,6 @@ from io import StringIO
 from typing import Optional
 
 from rich.console import Console
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(
-    est_time=0,
-    stage="weekly",
-    runner_config="cpu",
-    disabled="helper module, no tests",
-)
 
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,

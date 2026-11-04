@@ -49,7 +49,6 @@
     "registered/unit/mem_cache/test_unified_hicache_strided_state.py",
     "registered/unit/mem_cache/test_unified_radix_allocation_eviction.py",
     "registered/unit/mem_cache/test_unified_radix_hicache_dispatch.py",
-    "registered/unit/mem_cache/test_unified_radix_lock_ref.py",
     "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_core.py",
     "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_hicache.py",
     "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_insert_walk.py",

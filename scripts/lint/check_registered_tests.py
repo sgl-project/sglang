@@ -99,6 +99,9 @@ def main() -> int:
     ci_register = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci_register)
     cuda = ci_register.HWBackend.CUDA
+    # No CUDA/CPU workflow passes `run_suite.py --nightly`, so a nightly=True
+    # registration on these backends is filtered out of every run.
+    no_nightly_flag = (cuda, ci_register.HWBackend.CPU)
 
     # Same exclusion as run_suite.py: pytest+package structure files.
     files = sorted(
@@ -112,6 +115,7 @@ def main() -> int:
     missing = []
     legacy_shape = []  # (file, suite, stage, runner_config) -- has a -test- split
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
+    nightly_flagged = []  # (file, backend, suite) -- nightly=True on CUDA/CPU
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     taxonomy_violations = []
     for f in files:
@@ -130,6 +134,8 @@ def main() -> int:
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
+            if r.nightly and r.backend in no_nightly_flag:
+                nightly_flagged.append((f, r.backend.name, r.effective_suite))
             # Pure legacy form on a CUDA registry: suite set, stage/runner unset.
             if not (
                 r.backend == cuda
@@ -178,6 +184,17 @@ def main() -> int:
         )
         for f, suite in non_dispatchable:
             print(f'  {f}\n    suite="{suite}"  ->  stage="...", runner_config="..."')
+        print()
+        exit_code = 1
+    if nightly_flagged:
+        print(
+            "ERROR: CUDA/CPU test(s) register with nightly=True. No CUDA/CPU "
+            "workflow passes `run_suite.py --nightly`, so these tests never run. "
+            'Drop nightly=True; `stage="nightly"` (or "weekly") alone selects '
+            "the scheduled suite:\n"
+        )
+        for f, backend, suite in nightly_flagged:
+            print(f'  {f}\n    {backend} suite="{suite}"')
         print()
         exit_code = 1
     if dead_tests:
