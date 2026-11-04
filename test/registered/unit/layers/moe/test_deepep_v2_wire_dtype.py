@@ -13,7 +13,14 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_deepep_v2_dispatcher_output_dtype,
 )
-from sglang.srt.runtime_context import get_context, get_exec, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_flags,
+    get_parallel,
+    override_platform,
+    reset_context,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -127,6 +134,70 @@ class _DeepEPv2WireDtypeBase(CustomTestCase):
 
 
 class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
+    @override_platform(is_sm100=True, device_sm=103)
+    def test_kimi_k3_mxfp4_routes_keep_the_global_scale(self):
+        from sglang.srt.configs.kimi_linear import KimiLinearConfig
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe import topk as topk_module
+        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
+        from sglang.srt.models.kimi_k3 import KimiK3MoE
+
+        config = KimiLinearConfig(
+            hidden_size=HIDDEN,
+            routed_expert_hidden_size=HIDDEN,
+            moe_intermediate_size=512,
+            num_experts=NUM_EXPERTS,
+            num_experts_per_token=TOPK,
+            hidden_act="situ",
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+            routed_scaling_factor=2.5,
+        )
+        with (
+            set_default_torch_dtype(torch.bfloat16),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.DEEP_GEMM,
+                a2a_backend=MoeA2ABackend.DEEPEP_V2,
+            ),
+            get_parallel().override(
+                tp_size=4,
+                tp_rank=0,
+                attn_tp_size=4,
+                attn_tp_rank=0,
+                attn_dp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_size=4,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                tp_group=SimpleNamespace(device_group=_FakeGroup()),
+            ),
+            patch.object(deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
+            patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True),
+            patch.object(
+                topk_module,
+                "kimi_k2_biased_topk_impl",
+                topk_module.kimi_k2_biased_topk_impl._torchdynamo_orig_callable,
+            ),
+        ):
+            moe = KimiK3MoE(config, Mxfp4Config(is_checkpoint_mxfp4_serialized=True))
+            moe.gate.e_score_correction_bias.data.zero_()
+            hidden = torch.ones((2, HIDDEN), dtype=torch.bfloat16)
+            logits = torch.arange(NUM_EXPERTS, dtype=torch.float32).expand(2, -1)
+            routes = moe.topk.forward_native(hidden, logits)
+            dispatcher = moe.experts.dispatcher
+            dispatcher._impl.num_max_dispatch_tokens_per_rank = NUM_MAX_TOKENS
+            with patch.object(deepep_v2, "get_is_extend_in_batch", return_value=False):
+                dispatched = dispatcher._impl.dispatch(hidden, routes)
+            scores = logits.sigmoid()[:, -TOPK:]
+            expected = scores / scores.sum(-1, keepdim=True) * 2.5
+            actual = dispatched.topk_weights.reshape(2, TOPK).sort(-1).values
+            torch.testing.assert_close(actual, expected.sort(-1).values)
+            self.assertEqual(dispatched.activation_scale_block_size, 128)
+            self.assertEqual(dispatched.hidden_states.dtype, torch.float8_e4m3fn)
+
     def test_mxfp8_scale_group_survives_both_dispatch_layouts(self):
         for is_extend in (True, False):
             with self.subTest(is_extend=is_extend):

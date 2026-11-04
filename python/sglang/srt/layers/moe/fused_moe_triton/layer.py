@@ -80,6 +80,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_global_dwdp_manager,
     get_parallel,
+    get_platform,
     get_server_args,
     process_model_config,
 )
@@ -310,14 +311,66 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
 
 
 def _deepep_v2_experts_are_fp8(quant_method) -> bool:
-    # All other supported quantization methods are blockwise FP8.
+    # This selects the activation wire dtype. Native MXFP4 W4A8 also needs
+    # FP8 activations (group 128), despite using group-32 FP4 weight scales.
     return not isinstance(quant_method, UnquantizedFusedMoEMethod)
 
 
-def _validate_deepep_v2_quant_method(quant_method) -> None:
+def _validate_deepep_v2_quant_method(
+    quant_method, runner_config: Optional[MoeRunnerConfig] = None
+) -> None:
     """Validate the expert formats the DeepEP v2 adapter can feed."""
     if not get_moe_a2a_backend().is_deepep_v2():
         return
+
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    if isinstance(quant_method, Mxfp4MoEMethod):
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if not quant_method.use_deep_gemm:
+            raise ValueError("DeepEP v2 MXFP4 requires --moe-runner-backend deep_gemm")
+        if (
+            get_platform().device_sm not in (100, 103)
+            or not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            raise ValueError(
+                "DeepEP v2 MXFP4 requires SM100/SM103 and native DeepGEMM "
+                "FP8 x FP4 kernels with UE8M0 scales"
+            )
+        if runner_config is None:
+            raise ValueError("DeepEP v2 MXFP4 requires a K3 SiTU runner config")
+        if (
+            runner_config.activation != "situ"
+            or not runner_config.is_gated
+            or runner_config.gate_up_interleaved
+            or runner_config.apply_router_weight_on_input
+            or runner_config.no_combine
+            or runner_config.silu_mul_keep_fp32
+            or runner_config.swiglu_limit is not None
+            or runner_config.gemm1_alpha is None
+            or not (0 < runner_config.gemm1_alpha < float("inf"))
+            or runner_config.gemm1_clamp_limit is None
+            or not (0 < runner_config.gemm1_clamp_limit < float("inf"))
+        ):
+            raise ValueError(
+                "DeepEP v2 K3 SiTU requires split gated weights, finite positive "
+                "beta/linear_beta, output router weighting and normal combine"
+            )
+        if (
+            runner_config.hidden_size % 128
+            or runner_config.intermediate_size_per_partition % 512
+        ):
+            raise ValueError(
+                "DeepEP v2 MXFP4 requires hidden_size divisible by 128 and "
+                "intermediate_size_per_partition divisible by 512 for packed "
+                "group-128 SiTU activation scales"
+            )
+        return
+
+    if runner_config is not None and runner_config.activation == "situ":
+        raise ValueError("DeepEP v2 SiTU currently requires native MXFP4 experts")
 
     if isinstance(quant_method, UnquantizedFusedMoEMethod):
         return
@@ -341,7 +394,8 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
     if reason is not None:
         raise ValueError(
             "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 or 1x32 MXFP8 "
-            "experts with dynamic activation scaling or unquantized BF16 "
+            "experts with dynamic activation scaling, native K3 MXFP4/SiTU "
+            "with DeepGEMM on SM100/SM103, or unquantized BF16 "
             f"experts, but this layer {reason}. Use a compatible checkpoint or "
             "--moe-a2a-backend deepep."
         )
@@ -574,7 +628,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         _validate_hpc_ops_quant_method(self.quant_method)
-        _validate_deepep_v2_quant_method(self.quant_method)
+        _validate_deepep_v2_quant_method(self.quant_method, self.moe_runner_config)
         if (
             get_moe_a2a_backend().is_deepep_v2()
             and isinstance(self.quant_method, Fp8MoEMethod)

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers import linear
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.models import kimi_k3
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -47,17 +47,13 @@ class _Gate(torch.nn.Module):
         self.e_score_correction_bias = None
 
 
-def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
+def build_shared_experts(
+    *, ep_a2a=True, width=16, shared=1, quant_config=None, backend=None
+):
     # Routed experts and their router do not participate in this placement
     # test. The real MoE constructor still builds its real shared MLP.
-    backend = SimpleNamespace(
-        is_megamoe=lambda: False,
-        is_flashinfer_megamoe=lambda: False,
-        is_deepep=lambda: ep_a2a,
-        is_mooncake=lambda: False,
-        is_ascend_fuseep=lambda: False,
-        is_mori=lambda: False,
-    )
+    if backend is None:
+        backend = MoeA2ABackend.DEEPEP if ep_a2a else MoeA2ABackend.NONE
     config = SimpleNamespace(
         hidden_size=width,
         moe_intermediate_size=2 * width,
@@ -214,12 +210,15 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                 attn_tp = 4 // dp
                 attn = SimpleNamespace(world_size=attn_tp, rank_in_group=rank % attn_tp)
                 shared = SimpleNamespace(world_size=2, rank_in_group=rank % 2)
-                for ep, requested, enabled, expected_size in (
-                    (False, None, False, 4),
-                    (True, None, False, 1),
-                    (True, 1, False, 1),
-                    (True, 2, False, 2),
-                    (True, None, True, attn_tp),
+                for backend, requested, enabled, expected_size in (
+                    (MoeA2ABackend.NONE, None, False, 4),
+                    (MoeA2ABackend.DEEPEP, None, False, 1),
+                    (MoeA2ABackend.DEEPEP, 1, False, 1),
+                    (MoeA2ABackend.DEEPEP, 2, False, 2),
+                    (MoeA2ABackend.DEEPEP, None, True, attn_tp),
+                    (MoeA2ABackend.DEEPEP_V2, None, False, 1),
+                    (MoeA2ABackend.DEEPEP_V2, 2, False, 2),
+                    (MoeA2ABackend.DEEPEP_V2, None, True, attn_tp),
                 ):
                     with parallel_scope(
                         shared_experts_tp_size=requested,
@@ -227,7 +226,8 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                         shared_experts_tp_group=shared,
                         attn_tp_group=attn,
                     ):
-                        owner, module = build_shared_experts(ep_a2a=ep)
+                        owner, module = build_shared_experts(backend=backend)
+                        ep = backend != MoeA2ABackend.NONE
                         comm = ep and expected_size > 1
                         self.assertEqual(owner._shared_experts_tp_comm, comm)
                         self.assertEqual(

@@ -407,6 +407,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # The v2 combine consumes the router weights as supplied; unlike the
+        # standard DeepGEMM gather it does not multiply routed_scaling_factor.
+        # Ask K3's TopK to fold that factor in exactly once before dispatch.
+        self.fuse_routed_scaling_factor_in_topk = (
+            self.use_deep_gemm and get_moe_a2a_backend().is_deepep_v2()
+        )
         # MegaMoE calls DeepGEMM directly instead of going through the selected
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
