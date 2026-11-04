@@ -1,0 +1,28 @@
+{
+  "caller_id": "router-p6-owner",
+  "control_bearer": "local-p6-control",
+  "queue_capacity": 64,
+  "max_operations": 128,
+  "max_workers": 8,
+  "max_engine_bytes": 8388608,
+  "rpc_timeout_ms": 5000,
+  "poll_ms": 100,
+  "operation_ttl_ms": 60000,
+  "initial_prefetch_ms_per_token": 0.15,
+  "lead_margin_ms": 250,
+  "max_resume_prefetch_ms": 500,
+  "limits": {
+    "max_sessions": 128,
+    "max_branches": 512,
+    "max_history_revisions": 2048,
+    "max_requests": 2048,
+    "max_content_nodes": 32768,
+    "max_token_material_bytes": 67108864,
+    "max_tombstones": 1024,
+    "max_claims": 512,
+    "max_intents": 256,
+    "max_identifier_bytes": 128,
+    "max_components": 64
+  },
+  "backend_owner": null
+}

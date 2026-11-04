@@ -194,6 +194,18 @@ fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppC
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let router = Router::new()
+        .route(
+            "/v1/kv/capabilities",
+            get(crate::server::routes::kv_control::capabilities),
+        )
+        .route(
+            "/v1/kv/control",
+            post(crate::server::routes::kv_control::control).layer(DefaultBodyLimit::max(1 << 20)),
+        )
+        .route(
+            "/v1/kv/session/events",
+            post(crate::server::routes::kv_control::events).layer(DefaultBodyLimit::max(1 << 20)),
+        )
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))

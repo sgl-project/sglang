@@ -50,6 +50,7 @@ impl ChatRouting {
 }
 
 pub struct AppContext {
+    pub orchestration: Option<Arc<crate::orchestration::Runtime>>,
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
     pub proxy: Arc<Proxy>,
@@ -131,7 +132,16 @@ impl AppContext {
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
+        let orchestration = config.server.orchestration.clone().map(|cfg| {
+            crate::orchestration::Runtime::start(
+                cfg,
+                registry.clone(),
+                ModelId(config.model.id.clone()),
+                config.server.worker_auth.clone(),
+            )
+        });
         Self {
+            orchestration,
             config,
             tokenizers,
             proxy,
@@ -205,6 +215,7 @@ impl AppContext {
     #[cfg(test)]
     pub fn stub() -> Self {
         Self {
+            orchestration: None,
             config: Config {
                 server: crate::config::ServerConfig {
                     host: "x".into(),

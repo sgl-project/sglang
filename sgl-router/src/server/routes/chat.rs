@@ -113,8 +113,14 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
+    let (body, kv_context) = match &ctx.orchestration {
+        Some(runtime) => runtime.extract(body).map_err(ApiError::BadRequest)?,
+        None => (body, None),
+    };
     let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    routing.dispatch(&ctx, request, headers, start).await
+    routing
+        .dispatch(&ctx, request, headers, start, kv_context)
+        .await
 }
 
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
@@ -204,7 +210,7 @@ async fn prepare<'a>(
             let model =
                 ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
-            let needs_tokens = routing.needs_request_tokens(ctx);
+            let needs_tokens = routing.needs_request_tokens(ctx) || ctx.orchestration.is_some();
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
@@ -299,6 +305,7 @@ impl<'a> ModelRouting<'a> {
         mut request: PreparedRequest,
         headers: HeaderMap,
         start: Instant,
+        kv_context: Option<crate::orchestration::KvContext>,
     ) -> Result<Response<Body>, ApiError> {
         let mut excluded = Vec::new();
         let mut failed = None;
@@ -330,9 +337,36 @@ impl<'a> ModelRouting<'a> {
             }
             let duration = duration
                 .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
-            let attempt =
+            let selected_url = workers.prefill.url.clone();
+            if let (Some(runtime), Some(context)) = (&ctx.orchestration, &kv_context) {
+                if let Some(tokens) = request.tokens.as_ref().filter(|_| {
+                    !request.cache_namespace.ambiguous
+                        && request.cache_namespace.lora_name.is_none()
+                        && request
+                            .tokens
+                            .as_ref()
+                            .is_some_and(|tokens| tokens.ids.len() <= 65_536)
+                }) {
+                    runtime.associate(
+                        context.clone(),
+                        tokens.ids.clone(),
+                        request.cache_namespace.cache_salt.clone(),
+                        selected_url.clone(),
+                    );
+                }
+                runtime.routed(context.clone(), selected_url.clone());
+            }
+            let mut attempt =
                 forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
                     .await?;
+            if ctx.orchestration.is_some() {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&selected_url) {
+                    attempt
+                        .response
+                        .headers_mut()
+                        .insert("x-sgl-worker-url", value);
+                }
+            }
             if attempt.retry_excluding.is_empty() {
                 return Ok(attempt.response);
             }
@@ -630,6 +664,18 @@ async fn lookup_prefix_matches(
             .zip(tokens)
             .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids, namespace)),
     };
+    if let (Some(runtime), Some(tokens)) = (&ctx.orchestration, tokens) {
+        if !namespace.ambiguous && namespace.lora_name.is_none() {
+            let prepared = runtime.prepared_depths(&tokens.ids, namespace.cache_salt.as_deref());
+            if !prepared.is_empty() {
+                return Ok(crate::orchestration::merge_prepared(
+                    signal.as_ref(),
+                    &prepared,
+                    tokens.ids.len(),
+                ));
+            }
+        }
+    }
     Ok(signal)
 }
 

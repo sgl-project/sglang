@@ -118,6 +118,9 @@ pub struct ModelArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ServerArgs {
+    /// JSON file for optional bounded KV orchestration (trusted caller and control bearer).
+    #[arg(long, value_name = "FILE")]
+    pub kv_orchestration_config: Option<std::path::PathBuf>,
     /// Address to bind the HTTP server to.
     #[arg(long, default_value_t = default_host())]
     pub host: String,
@@ -640,6 +643,18 @@ impl Cli {
             .transpose()?;
         let config = Config {
             server: ServerConfig {
+                orchestration: self
+                    .server
+                    .kv_orchestration_config
+                    .map(
+                        |path| -> Result<crate::orchestration::OrchestrationConfig> {
+                            let config: crate::orchestration::OrchestrationConfig =
+                                serde_json::from_slice(&std::fs::read(path)?)?;
+                            config.validate()?;
+                            Ok(config)
+                        },
+                    )
+                    .transpose()?,
                 host: self.server.host,
                 port: self.server.port,
                 grpc_port: self.server.grpc_port,

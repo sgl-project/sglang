@@ -30,7 +30,8 @@ pub enum IndexError {
 
 /// Every variable-size collection has an explicit bound. No runtime defaults.
 /// Identifier bounds apply to compatibility strings, request/resource IDs and digests too.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionLimits {
     pub max_sessions: usize,
     pub max_branches: usize,
@@ -490,6 +491,22 @@ impl SessionIndex {
     }
     pub fn session_revision(&self, id: &SessionIdentity) -> Option<u64> {
         self.sessions.get(id).map(|s| s.revision)
+    }
+    /// Business lifecycle signals share the task's monotone revision domain.
+    pub fn advance_revision(
+        &mut self,
+        id: &SessionIdentity,
+        revision: u64,
+    ) -> Result<(), IndexError> {
+        let task = self
+            .sessions
+            .get_mut(id)
+            .ok_or(IndexError::UnknownSession)?;
+        if revision <= task.revision || revision > MAX_INTEGER {
+            return Err(IndexError::StaleRevision);
+        }
+        task.revision = revision;
+        Ok(())
     }
     pub(crate) fn branch_ids(&self, id: &SessionIdentity) -> Option<Vec<SnapshotId>> {
         self.sessions

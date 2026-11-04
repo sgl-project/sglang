@@ -58,7 +58,17 @@ pub(super) async fn select_workers(
             None,
         ));
     }
-    let prefix = crate::policies_reorg::cache_aware::PrefixMemo::default();
+    let prepared = ctx
+        .orchestration
+        .as_ref()
+        .zip(request.tokens.as_ref())
+        .filter(|_| {
+            !request.cache_namespace.ambiguous && request.cache_namespace.lora_name.is_none()
+        })
+        .map_or_else(Vec::new, |(runtime, tokens)| {
+            runtime.prepared_depths(&tokens.ids, request.cache_namespace.cache_salt.as_deref())
+        });
+    let prefix = crate::policies_reorg::cache_aware::PrefixMemo::with_prepared(prepared);
     let bucket_request = BucketRequest {
         prefix: Some(&prefix),
         model: &request.model,

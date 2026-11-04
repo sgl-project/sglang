@@ -1,7 +1,8 @@
-//! Versioned KV protocol, bounded session associations, and backend protection.
+//! Versioned KV protocol, bounded Router state, and backend protection.
 pub mod backend_protection;
 pub mod models;
 pub mod observations;
+pub mod operations;
 pub mod protocol;
 pub mod session_index;
 pub mod target_resolver;

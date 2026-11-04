@@ -4818,3 +4818,9 @@ Reviewed indexed exact-prefix demand joins, owner publication/quiescence, cancel
 ### P8 reproducible benchmark harness
 
 Added paired Engine HTTP benchmark with actual cache-tier checks, raw failure retention, deterministic outputs, trace provenance, historical cost EMA, bootstrap intervals and optional background/host-pressure load. PIN readiness uses current claim contract, not transfer ready_scope. Independently ran8tests including local two-engine mock HTTP and recorded real SSE replay; all passed. New load/trace options are mock-validated only until separate real runs. Script files and input fixture committed; real P2 matrices remain immutable under /tmp/sglang-rfc-build and will be included in final result artifacts.
+
+## P6 Router orchestration acceptance — 2026-11-04
+
+Optional authenticated Router control/lifecycle actor, bounded exact-job/shared-interest bookkeeping, immutable global selectors, both HTTP routing paths, live scoped-residency advisory, finite L2 claim cleanup and actual Mooncake L3 owner/resolver are integrated. Normal selection retains load/admission/affinity ownership. Source/operation completion alone cannot mark current residency. Configuration/runbook: sgl-router/KV_ORCHESTRATION.md.
+
+Parent independent checks: 12 real HTTP proxy tests passed; 44 orchestrator tests passed with 1 optional live backend test skipped. Builder complete serial proxy proof: 236 passed/1 existing ignored; Router unit proof: 1113 passed. Parent independent unit rerun logged p6-parent-unit-tests.log. Parent reviewed contracts, actor admission/refresh/cancel/claim paths and routing hooks. Real model Router B3 and final event-watermark integration remain P7/P8 work. Evidence: /tmp/sglang-rfc-build/p6-report.md and p6-parent-*.log.
