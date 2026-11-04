@@ -260,6 +260,26 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
         )
         assert_metrics(self, metrics)
 
+    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        metrics = run_bench_serving(
+            host=self.host,
+            port=self.port,
+            model_path=self.model_config.get("model_path"),
+            dataset_name="generated-shared-prefix",
+            input_len=32000,
+            output_len=1024,
+            max_concurrency=32,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
+            seed=100,
+            warmup_requests=16,
+            cache_report=True,
+        )
+        assert_metrics(self, metrics)
+
 
 if __name__ == "__main__":
     unittest.main()
