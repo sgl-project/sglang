@@ -109,12 +109,19 @@ class LoRAManager:
                 "across DP ranks or disable overlap loading"
             )
         # LoRA routing knows only DP-local and TP-global token layouts. A wider
-        # attention TP/CP group can scatter one DP rank's tokens across ranks.
+        # attention TP/CP group can scatter one DP rank's tokens across ranks,
+        # unless the model declares its LoRA inputs stay whole under attention TP.
+        inputs_whole = getattr(base_model, "lora_inputs_whole_under_attn_tp", None)
         if self.attn_dp_enabled and (
-            self.attn_tp_size != 1 or get_parallel().attn_cp_size != 1
+            get_parallel().attn_cp_size != 1
+            or (
+                self.attn_tp_size != 1
+                and not (inputs_whole is not None and inputs_whole())
+            )
         ):
             raise ValueError(
-                "LoRA with DP attention requires --attn-dp-size equal to --tp-size "
+                "LoRA with DP attention requires --attn-dp-size equal to --tp-size, "
+                "or a model whose LoRA inputs stay whole under attention TP "
                 f"(got attention TP size {self.attn_tp_size} and attention CP "
                 f"size {get_parallel().attn_cp_size})"
             )

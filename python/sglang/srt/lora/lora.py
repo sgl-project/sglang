@@ -29,14 +29,13 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
-from sglang.srt.lora.utils import get_normalized_target_modules
+from sglang.srt.lora.utils import (
+    get_normalized_target_modules,
+    is_routed_expert_weight,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
-# Matches both per-expert keys ("...experts.0.<module>...") and shared-outer
-# keys ("...experts.<module>..."), while excluding "shared_experts." (where the
-# preceding char is "_", not ".").
-_ROUTED_EXPERT_PATTERN = re.compile(r"\.experts\.")
 _MOE_EXPERT_PATTERN = re.compile(r"\.(?:experts|shared_experts?)\.")
 
 logger = logging.getLogger(__name__)
@@ -140,7 +139,7 @@ class LoRAAdapter(nn.Module):
         - shared-outer: ``...experts.<module>...`` (3D tensor with the expert
           dim baked into the shape)
         """
-        if not _ROUTED_EXPERT_PATTERN.search(weight_name):
+        if not is_routed_expert_weight(weight_name):
             return False
         layer_id = get_layer_id(weight_name)
         if layer_id is None:

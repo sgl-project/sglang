@@ -128,16 +128,21 @@ class BaseTopkCapturer:
         device: str,
         name: str,
         device_topk_size: Optional[int] = None,
+        keeps_host_rows: bool = True,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
         are dropped before writing to host_cache via [:topk_size] truncation.
+        keeps_host_rows=False skips the host buffer and the D2H on a rank whose
+        rows are never read; get_topk then returns None.
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
 
-        self.host_cache = BaseHostCache(
-            num_tokens, num_layers, topk_size, name=name, device=device
+        self.host_cache = (
+            BaseHostCache(num_tokens, num_layers, topk_size, name=name, device=device)
+            if keeps_host_rows
+            else None
         )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
@@ -151,7 +156,8 @@ class BaseTopkCapturer:
         self.device_cache.capture(layer_id, topk_indices)
 
     def destroy(self):
-        self.host_cache.destroy()
+        if self.host_cache is not None:
+            self.host_cache.destroy()
 
     def _get_local_slice(
         self,
@@ -176,9 +182,11 @@ class BaseTopkCapturer:
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         if start_len < 0:
             raise ValueError(f"{start_len=} must be non-negative")
+        if self.host_cache is None:
+            return None
         start_len = min(start_len, seqlen - 1)
         cache_pool_idx = (
             req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
@@ -198,6 +206,8 @@ class BaseTopkCapturer:
         the overlap thread can do non-blocking D2H + finalize itself. Otherwise sync
         D2H inline and return None (legacy non-overlap path).
         """
+        if self.host_cache is None:
+            return None
         slice_gpu = self._get_local_slice(
             forward_batch, can_run_graph, cuda_graph_batch
         )

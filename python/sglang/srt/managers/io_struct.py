@@ -2286,6 +2286,10 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     # sync), so the quant unpack/repack round-trip is skipped and a base-named
     # tensor arriving in-session is an error.
     sync_base: bool = True
+    # end_weight_update will carry a sha256 manifest of every streamed adapter
+    # tensor, so a rank that keeps only its experts' rows of a stack hashes the
+    # whole stack on arrival.
+    verify_lora_checksums: bool = False
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):

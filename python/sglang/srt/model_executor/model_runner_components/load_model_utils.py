@@ -53,7 +53,9 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+# A node reading a 1.5 TB checkpoint from a cold network-FS cache finished loading more than 8 min
+# after nodes with a warm cache (Kimi-K3.1, 32 ranks on 4 nodes).
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 3600
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:

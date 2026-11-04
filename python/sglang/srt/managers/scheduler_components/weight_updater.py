@@ -114,6 +114,7 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
     selector: str
     loaded_weights: bool = False
     sync_base: bool = True
+    verify_lora_checksums: bool = False
     pending_version: Optional[str] = None
 
 
@@ -131,6 +132,11 @@ class SchedulerWeightUpdaterManager:
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
+    # whole-stack digest of each stashed tensor reduced to this rank's experts; None when the
+    # session did not announce a manifest
+    _lora_stash_digests: Dict[str, Dict[str, Optional[str]]] = field(
+        default_factory=dict
+    )
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
 
@@ -426,6 +432,7 @@ class SchedulerWeightUpdaterManager:
                 "call end_weight_update() first",
             )
         self._lora_stash = {}
+        self._lora_stash_digests = {}
         if recv_req.sync_base:
             for _, runner in self._select_runners(recv_req.selector):
                 runner.weight_updater.begin_weight_update()
@@ -433,7 +440,9 @@ class SchedulerWeightUpdaterManager:
         # overlapped forward running
         torch.get_device_module().synchronize()
         self._session = _WeightUpdateSession(
-            selector=recv_req.selector, sync_base=recv_req.sync_base
+            selector=recv_req.selector,
+            sync_base=recv_req.sync_base,
+            verify_lora_checksums=recv_req.verify_lora_checksums,
         )
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
@@ -451,6 +460,7 @@ class SchedulerWeightUpdaterManager:
                 runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         if recv_req.abort:
             self._lora_stash = {}
+            self._lora_stash_digests = {}
             success, message = True, "Aborted: streamed adapters discarded"
         else:
             success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
@@ -475,14 +485,36 @@ class SchedulerWeightUpdaterManager:
             assert isinstance(tensor, torch.Tensor), (
                 f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
             )
-            if copy_tensors:
-                # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
+            rows = self._local_rows_of_routed_expert_stack(hf_key, tensor)
+            if rows is not None:
+                # under EP this rank installs only its experts; the manifest hashes the whole stack
+                verify = (
+                    self._session is not None and self._session.verify_lora_checksums
+                )
+                self._lora_stash_digests.setdefault(lora_name, {})[hf_key] = (
+                    _sha256_tensor(tensor) if verify else None
+                )
+                tensor = tensor[rows]
+            if copy_tensors or rows is not None:
+                # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies,
+                # and a row slice would pin the whole stack
                 tensor = tensor.clone()
                 if tensor.is_cuda:
                     copied_devices.add(tensor.device)
             self._lora_stash.setdefault(lora_name, {})[hf_key] = tensor
         for device in copied_devices:
             torch.cuda.current_stream(device).synchronize()
+
+    def _local_rows_of_routed_expert_stack(
+        self, hf_key: str, tensor: torch.Tensor
+    ) -> Optional[slice]:
+        # The attribute only exists when LoRA is enabled at server start.
+        lora_manager = getattr(self.tp_worker.model_runner, "lora_manager", None)
+        if lora_manager is None:
+            return None
+        return lora_manager.memory_pool.local_rows_of_routed_expert_stack(
+            hf_key, tensor
+        )
 
     def _apply_lora_stash(
         self, expected_checksums: Optional[Dict[str, Dict[str, str]]]
@@ -512,8 +544,18 @@ class SchedulerWeightUpdaterManager:
                         f"[LORA-CHECK] adapter {lora_name!r}: streamed tensor names "
                         f"do not match the expected manifest"
                     )
+                whole_digests = self._lora_stash_digests.get(lora_name, {})
                 for name in sorted(tensors):
-                    if _sha256_tensor(tensors[name]) != expected[name]:
+                    if name in whole_digests:
+                        digest = whole_digests[name]
+                        if digest is None:
+                            return False, (
+                                f"[LORA-CHECK] adapter {lora_name!r}: {name!r} kept only this rank's "
+                                "experts, but the session did not declare verify_lora_checksums"
+                            )
+                    else:
+                        digest = _sha256_tensor(tensors[name])
+                    if digest != expected[name]:
                         return False, (
                             f"[LORA-CHECK] adapter {lora_name!r}: checksum mismatch for {name!r}"
                         )
@@ -528,6 +570,7 @@ class SchedulerWeightUpdaterManager:
                 return False, result.error_message
             self._lora_applied_names[lora_name] = names
         self._lora_stash = {}
+        self._lora_stash_digests = {}
         return True, "Success"
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):

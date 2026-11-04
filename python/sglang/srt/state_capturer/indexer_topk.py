@@ -5,7 +5,9 @@ import numpy as np
 import pybase64
 import torch
 
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -25,15 +27,26 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         index_topk: int,
         max_running_requests: int,
         device: str,
+        layer_ids: Optional[list[int]] = None,
     ):
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
+        # None: stream i is layer i; otherwise stream i is layer_ids[i].
+        self._stream_of_layer = (
+            None
+            if layer_ids is None
+            else {layer: i for i, layer in enumerate(layer_ids)}
+        )
 
-        attn_tp_size = get_parallel().attn_tp_size
-        assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
+        # Plain TP attention runs the replicated indexer over the whole batch on every
+        # rank, so each rank's capture is already complete; attention TP inside DP
+        # attention would need a gather that is not implemented.
+        assert get_parallel().attn_tp_size == 1 or not is_dp_attention_enabled(), (
+            "IndexerTopkCapturer supports DP attention with attn_tp_size 1 or plain TP attention"
+        )
 
-        # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
-        # to its own device_cache, so the buffer only needs to fit one rank's batch.
+        # Capture is per-rank-local: each rank writes [:local_batch, ...] to its own
+        # device_cache, so the buffer only needs to fit one rank's batch.
         max_batch_size = max(get_schedule().chunked_prefill_size, max_running_requests)
 
         super().__init__(
@@ -43,7 +56,18 @@ class IndexerTopkCapturer(BaseTopkCapturer):
             topk_size=self.index_topk,
             device=device,
             name="indexer_topk",
+            # Every attention-TP rank attends rank 0's broadcast top-k; only rank 0's rows
+            # reach the client.
+            keeps_host_rows=get_parallel().attn_tp_rank == 0,
         )
+
+    def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        stream = (
+            layer_id
+            if self._stream_of_layer is None
+            else self._stream_of_layer[layer_id]
+        )
+        super().capture(layer_id=stream, topk_indices=topk_indices)
 
 
 def get_global_indexer_capturer() -> Optional[IndexerTopkCapturer]:
@@ -107,7 +131,16 @@ def create_indexer_capturer(
         return None
 
     hf_text_config = model_config.hf_text_config
-    num_indexer_layers = get_num_indexer_layers(hf_text_config)
+    # Kimi-K3.1 has indexers only on its DSA layers, so only those get a stream.
+    if (
+        isinstance(hf_text_config, KimiLinearConfig)
+        and hf_text_config.dsa_config is not None
+    ):
+        layer_ids = hf_text_config.dsa_layer_ids()
+        num_indexer_layers = len(layer_ids)
+    else:
+        layer_ids = None
+        num_indexer_layers = get_num_indexer_layers(hf_text_config)
     index_topk = getattr(hf_text_config, "index_topk", 0)
     return _create_indexer_capturer_raw(
         enable=enable,
@@ -116,6 +149,7 @@ def create_indexer_capturer(
         num_tokens=num_tokens,
         max_running_requests=max_running_requests,
         device=device,
+        layer_ids=layer_ids,
     )
 
 
@@ -126,6 +160,7 @@ def _create_indexer_capturer_raw(
     num_tokens: int,
     max_running_requests: int,
     device: str,
+    layer_ids: Optional[list[int]] = None,
 ) -> Optional[IndexerTopkCapturer]:
     if not enable:
         return None
@@ -143,4 +178,5 @@ def _create_indexer_capturer_raw(
         index_topk=index_topk,
         max_running_requests=max_running_requests,
         device=device,
+        layer_ids=layer_ids,
     )

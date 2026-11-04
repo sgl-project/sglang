@@ -178,17 +178,16 @@ def test_layout_selects_routing_without_shape_inference():
     assert _routes(backend._sgemm_info()) == [1, 0]
 
 
-@pytest.mark.parametrize(
-    "attention_widths",
-    [
-        {"attn_tp_size": 2, "attn_cp_size": 1},
-        {"attn_tp_size": 1, "attn_cp_size": 2},
-    ],
-    ids=["attn-tp", "attn-cp"],
-)
-def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
-    attention_widths,
-):
+def _base_model(inputs_whole):
+    """A base model that declares, or not (None), whether its LoRA inputs stay
+    whole under attention TP."""
+    model = torch.nn.Linear(2, 2)
+    if inputs_whole is not None:
+        model.lora_inputs_whole_under_attn_tp = lambda: inputs_whole
+    return model
+
+
+def _make_manager(*, base_model, attention_widths):
     with (
         get_context().override_server_args(
             tp_size=4, attn_dp_size=2, enable_lora_overlap_loading=False
@@ -196,10 +195,9 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
         get_parallel().override(
             tp_size=4, attn_dp_size=2, moe_tp_size=4, **attention_widths
         ),
-        pytest.raises(ValueError, match="requires --attn-dp-size equal to --tp-size"),
     ):
-        LoRAManager(
-            base_model=torch.nn.Linear(2, 2),
+        return LoRAManager(
+            base_model=base_model,
             base_hf_config=SimpleNamespace(),
             max_loras_per_batch=2,
             load_config=None,
@@ -207,6 +205,33 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
             server_args=args,
             lora_backend="triton",
         )
+
+
+@pytest.mark.parametrize(
+    "attention_widths, inputs_whole",
+    [
+        ({"attn_tp_size": 2, "attn_cp_size": 1}, None),
+        ({"attn_tp_size": 2, "attn_cp_size": 1}, False),
+        ({"attn_tp_size": 1, "attn_cp_size": 2}, True),
+    ],
+    ids=["attn-tp", "attn-tp-inputs-split", "attn-cp"],
+)
+def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
+    attention_widths, inputs_whole
+):
+    with pytest.raises(ValueError, match="requires --attn-dp-size equal to --tp-size"):
+        _make_manager(
+            base_model=_base_model(inputs_whole), attention_widths=attention_widths
+        )
+
+
+def test_manager_accepts_attention_tp_when_lora_inputs_stay_whole(monkeypatch):
+    monkeypatch.setattr(LoRAManager, "init_state", lambda self, **kwargs: None)
+    manager = _make_manager(
+        base_model=_base_model(True),
+        attention_widths={"attn_tp_size": 2, "attn_cp_size": 1},
+    )
+    assert manager.attn_dp_enabled and manager.attn_tp_size == 2
 
 
 @pytest.mark.parametrize("gathered_over_dp", [True, False])

@@ -39,6 +39,7 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
+    is_routed_expert_weight,
     shared_experts_count,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -188,6 +189,7 @@ class LoRAMemoryPool:
         # silently truncate experts.
         self.moe_ep_size, self.moe_ep_rank = _get_moe_ep_context()
         num_experts_global = self._get_num_experts(base_model)
+        self._num_experts_global: int = num_experts_global
         self.moe_use_local_expert_ids = (
             self.moe_ep_size > 1
             and not _moe_runner_keeps_global_expert_ids()
@@ -432,6 +434,22 @@ class LoRAMemoryPool:
         local = global_eid - self.moe_ep_rank * self._num_experts_local
         return local if 0 <= local < self._num_experts_local else None
 
+    def local_rows_of_routed_expert_stack(
+        self, hf_key: str, tensor: torch.Tensor
+    ) -> Optional[slice]:
+        """The rows of a streamed routed-expert stack `[num_experts, ...]` this
+        rank will install, or None when it installs the whole tensor; a sender
+        streaming every expert can reduce the stack on arrival instead of
+        staging it whole."""
+        if not self.moe_use_local_expert_ids or tensor.dim() != 3:
+            return None
+        if not is_routed_expert_weight(hf_key):
+            return None
+        if tensor.shape[0] != self._num_experts_global:
+            return None
+        start = self.moe_ep_rank * self._num_experts_local
+        return slice(start, start + self._num_experts_local)
+
     def _iter_local_expert_weights(
         self,
         weights: Union[torch.Tensor, Dict[int, torch.Tensor]],
@@ -463,13 +481,18 @@ class LoRAMemoryPool:
             total = weights.shape[0]
             if self.moe_use_local_expert_ids and localize:
                 start = self.moe_ep_rank * self._num_experts_local
-                count = max(0, min(self._num_experts_local, total - start))
+                if total == self._num_experts_local:
+                    # already reduced to this rank's rows (local_rows_of_routed_expert_stack)
+                    offset, count = 0, total
+                else:
+                    offset = start
+                    count = max(0, min(self._num_experts_local, total - start))
             else:
-                start, count = 0, total
+                start, offset, count = 0, 0, total
             for i in range(count):
                 yield (
                     i,
-                    weights[start + i],
+                    weights[offset + i],
                     append_cache_key_suffix(cache_keys, f"expert{start + i}"),
                 )
             return

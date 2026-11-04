@@ -238,6 +238,7 @@ def _make_pool(
         pool._num_experts_local = num_experts_global // moe_ep_size
     else:
         pool._num_experts_local = num_experts_global
+    pool._num_experts_global = num_experts_global
     pool.num_layer = 1
     pool.tp_rank = 0
     pool.max_lora_rank = 2
@@ -686,6 +687,78 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
         # Note: this is 2D, not 3D -> should raise (sanity check).
         with self.assertRaises(TypeError):
             list(pool._iter_local_expert_weights(weights, "weights"))
+
+    def test_already_local_stack_is_not_resliced(self):
+        """A stack reduced on arrival (`local_rows_of_routed_expert_stack`) has
+        `num_experts_local` rows: rank 1 of EP=2 reads them from row 0, while its
+        cache keys still carry the global ids 2 and 3."""
+        pool = _make_pool(
+            num_experts_global=4,
+            moe_ep_size=2,
+            moe_ep_rank=1,
+            moe_use_local_expert_ids=True,
+        )
+        weights = torch.arange(2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 3)
+        got = list(pool._iter_local_expert_weights(weights, "weights"))
+        self.assertEqual([lid for lid, _, _ in got], [0, 1])
+        self.assertTrue(torch.equal(got[0][1], weights[0]))
+        self.assertTrue(torch.equal(got[1][1], weights[1]))
+        self.assertEqual(
+            [cache_key for _, _, cache_key in got],
+            ["weights#expert2", "weights#expert3"],
+        )
+
+
+class TestLocalRowsOfRoutedExpertStack(unittest.TestCase):
+    """Which streamed tensors a rank may reduce on arrival: a routed-expert stack
+    carrying every global expert, only while the pool keys experts locally."""
+
+    ROUTED_B = "model.layers.0.block_sparse_moe.experts.w1.lora_B.weight"
+
+    def test_rank_owns_its_contiguous_block(self):
+        pool = _make_pool(
+            num_experts_global=4,
+            moe_ep_size=2,
+            moe_ep_rank=1,
+            moe_use_local_expert_ids=True,
+        )
+        rows = pool.local_rows_of_routed_expert_stack(
+            self.ROUTED_B, torch.zeros(4, 2, 3)
+        )
+        self.assertEqual(rows, slice(2, 4))
+
+    def test_whole_tensor_when_experts_are_globally_keyed(self):
+        pool = _make_pool(
+            num_experts_global=4,
+            moe_ep_size=2,
+            moe_ep_rank=1,
+            moe_use_local_expert_ids=False,
+        )
+        self.assertIsNone(
+            pool.local_rows_of_routed_expert_stack(self.ROUTED_B, torch.zeros(4, 2, 3))
+        )
+
+    def test_only_a_full_routed_stack_is_reduced(self):
+        """The shared-outer A (one row), a shared-expert tensor and a 2D attention
+        weight are installed whole on every rank."""
+        pool = _make_pool(
+            num_experts_global=4,
+            moe_ep_size=2,
+            moe_ep_rank=1,
+            moe_use_local_expert_ids=True,
+        )
+        shared_outer_a = self.ROUTED_B.replace("lora_B", "lora_A")
+        shared_expert = self.ROUTED_B.replace(".experts.", ".shared_experts.")
+        attention = "model.layers.0.self_attn.q_proj.lora_B.weight"
+        self.assertIsNone(
+            pool.local_rows_of_routed_expert_stack(shared_outer_a, torch.zeros(1, 2, 3))
+        )
+        self.assertIsNone(
+            pool.local_rows_of_routed_expert_stack(shared_expert, torch.zeros(4, 2, 3))
+        )
+        self.assertIsNone(
+            pool.local_rows_of_routed_expert_stack(attention, torch.zeros(4, 3))
+        )
 
 
 @mock.patch.dict(

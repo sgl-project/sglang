@@ -33,6 +33,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import BumpAllocator, next_power_of_2
 
 if TYPE_CHECKING:
@@ -112,7 +113,10 @@ def forward_dsa_indexer_for_mha(
         positions=positions,
         forward_batch=forward_batch,
         layer_id=layer_id,
-        return_indices=seed_buf is not None,
+        # the top-k capturer records every forward's rows; skipping them here
+        # leaves the prefill tokens with whatever the buffer held before
+        return_indices=seed_buf is not None
+        or get_global_indexer_capturer() is not None,
     )
     if seed_buf is None:
         return

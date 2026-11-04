@@ -655,7 +655,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         and not get_platform().is_hip
     )
 
-    if kimi_k31:
+    # BF16 KV takes the generic BF16 DSA backends below; flashmla_kv reads fp8_ds_mla only.
+    if kimi_k31 and (view.enable_hisparse or kv_cache_dtype != "bfloat16"):
         return _kimi_k31_dsa_backends(view)
 
     if getattr(hf_config, "learnable_sink", False):
@@ -767,10 +768,13 @@ _KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
     if get_platform().is_hip:
         raise ValueError("Kimi-K3.1 DSA requires CUDA (FlashMLA / DeepGEMM).")
+    if view.kv_cache_dtype in ("bf16", "bfloat16"):
+        # RL rollouts keep MLA attention at the trainer's BF16 precision.
+        return {"kv_cache_dtype": "bfloat16"} if view.kv_cache_dtype == "bf16" else {}
     if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
         raise ValueError(
             "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
-            f"fp8_ds_mla format); got {view.kv_cache_dtype!r}."
+            f"fp8_ds_mla format) or bfloat16; got {view.kv_cache_dtype!r}."
         )
     if view.kv_cache_dtype != "fp8_e4m3":
         logger.warning("Setting KV cache dtype to fp8_e4m3 for Kimi-K3.1.")

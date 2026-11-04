@@ -3130,13 +3130,9 @@ class DeepseekSparseAttnBackend(
         need_padding = num_heads % required_padding != 0
 
         if need_padding:
-            assert required_padding % num_heads == 0, (
-                f"num_heads {num_heads} cannot be padded to {required_padding}. "
-                f"TP size may be too large for this model."
-            )
-
-            # Pad q to required size
-            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+            # Zero heads up to the next multiple, e.g. Kimi-K3.1's 96 heads at TP8 (12 -> 64)
+            padded_heads = -(-num_heads // required_padding) * required_padding
+            q_padded = q_all.new_zeros((num_tokens, padded_heads, head_dim))
             q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
         else:
@@ -3144,10 +3140,10 @@ class DeepseekSparseAttnBackend(
 
         sink_input = attn_sink
         if need_padding and attn_sink is not None:
-            key = (attn_sink.data_ptr(), required_padding)
+            key = (attn_sink.data_ptr(), padded_heads)
             sink_input = self._sink_pad_cache.get(key)
             if sink_input is None:
-                sink_input = attn_sink.new_zeros(required_padding)
+                sink_input = attn_sink.new_zeros(padded_heads)
                 self._sink_pad_cache[key] = sink_input
             sink_input[:num_heads].copy_(attn_sink)
 
@@ -3800,6 +3796,10 @@ class DeepseekSparseAttnBackend(
         cu_seqlens_k = metadata.cu_seqlens_k
         max_seqlen_k = metadata.max_seq_len_k
         causal = True
+        # Drop the rows past cu_seqlens_k[-1] (the MLP-sync padding of DP attention): FA3 loads the
+        # last sequence's final K/V tile past its end, and P == 0 times a non-finite padded V row is NaN.
+        num_k_rows = int(forward_batch.seq_lens_cpu.sum())
+        k, v = k[:num_k_rows], v[:num_k_rows]
 
         # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
         assert len(cu_seqlens_q) == len(cu_seqlens_k), (

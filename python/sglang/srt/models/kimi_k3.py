@@ -33,7 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
+from sglang.srt.layers.attn_residual import aggregate_stream, refresh_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -101,6 +101,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
@@ -159,7 +160,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, make_pp_layers
+from sglang.srt.utils import bind_or_assign, is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -2097,8 +2098,8 @@ class KimiK3DeltaAttention(nn.Module):
         weights [4, seg], dense fp32 conv bias, fp32 output-norm weight. Stashed on the
         attention layer for the KDA backend; when the shapes do not match
         the compiled kernel the stash stays unset and decode keeps the
-        unfused chain. Called once from load_weights (after all weights are
-        loaded, before cuda graph capture)."""
+        unfused chain. Called from load_weights after the weights are loaded,
+        before cuda graph capture, and again on every weight reload."""
         if _is_hip:
             from sglang.kernels.ops.attention import (
                 kda_fused_decode_aiter_hip,
@@ -2188,7 +2189,7 @@ class KimiK3DeltaAttention(nn.Module):
             if bias is not None
             else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
         )
-        layer._k3_fused_decode_args = (
+        args = (
             wt[:, :seg].contiguous(),
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
@@ -2197,6 +2198,11 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
+        previous = getattr(layer, "_k3_fused_decode_args", None)
+        if previous is not None:
+            # Keep the buffer addresses stable for graph replay after weight reloads
+            args = (*map(bind_or_assign, previous[:-1], args[:-1]), args[-1])
+        layer._k3_fused_decode_args = args
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(
@@ -3293,6 +3299,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
+        self._dsa_indexer_load_checked = False
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -3623,6 +3630,11 @@ class KimiK3LinearForCausalLM(nn.Module):
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
         if getattr(self.config, "dsa_config", None) is None:
             return
+        # Only the first (full) load must carry every indexer weight; RL weight
+        # updates arrive in buckets that each hold a subset of the parameters.
+        if self._dsa_indexer_load_checked:
+            return
+        self._dsa_indexer_load_checked = True
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
         }
@@ -3681,8 +3693,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            # Reloads copy into the captured buffers (decode graphs read them by address)
+            self_attn.w_kc = bind_or_assign(
+                self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            )
+            self_attn.w_vc = bind_or_assign(
+                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+            )
             if getattr(self_attn, "_dcp_v_weights", None) is not None:
                 self_attn._prepare_dcp_v_weights(get_parallel().dcp_group)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
@@ -3705,20 +3722,16 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
-        # multiply into every replay). Warm both dtypes (bf16 fast kernel,
-        # fp32 triton fallback).
-        def _warm_cw(proj, norm):
-            get_cw(proj, norm, dtype=torch.bfloat16)
-            get_cw(proj, norm)
-
+        # multiply into every replay), and refresh them on every reload. Both
+        # dtypes (bf16 fast kernel, fp32 triton fallback).
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
             if layer.use_attn_residuals:
-                _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
-                _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
+                refresh_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
+                refresh_cw(layer.mlp_res_proj, layer.mlp_res_norm)
         if hasattr(self.model, "output_attn_res_proj"):
-            _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
+            refresh_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
         # Post-load: merge the horizontally-fused decode weights (views of the
         # merged buffers, ~0 extra memory); must run before cuda graph capture.
@@ -3813,6 +3826,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
             "block_sparse_moe": "mlp",
         },
     )
+
+    @staticmethod
+    def lora_inputs_whole_under_attn_tp() -> bool:
+        """Under DP attention, whether every LoRA module reads either its DP
+        rank's rows, whole on each attention-TP rank, or the TP-global rows.
+        A MoE input scattered over DP ranks is split over attention TP."""
+        return not is_moe_input_scattered_across_dp_ranks()
 
     @staticmethod
     def get_lora_target_module_name(name: str) -> str:

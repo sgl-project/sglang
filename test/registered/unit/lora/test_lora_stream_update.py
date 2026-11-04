@@ -33,11 +33,16 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 BASE_NAME = "model.layers.0.self_attn.q_proj.weight"
 LORA_A = "model.layers.0.self_attn.q_proj.lora_A.weight"
 LORA_B = "model.layers.0.self_attn.q_proj.lora_B.weight"
+# shared-outer routed experts: one A per layer, a [num_experts, ...] stack of B
+EXPERT_A = "model.layers.0.block_sparse_moe.experts.w1.lora_A.weight"
+EXPERT_B = "model.layers.0.block_sparse_moe.experts.w1.lora_B.weight"
 
 
 def _make_manager(**overrides) -> SchedulerWeightUpdaterManager:
+    tp_worker = MagicMock()
+    tp_worker.model_runner.lora_manager = None
     kwargs = dict(
-        tp_worker=MagicMock(),
+        tp_worker=tp_worker,
         draft_worker=None,
         memory_saver_adapter=MagicMock(),
         flush_cache=Mock(return_value=True),
@@ -104,6 +109,42 @@ class TestLoraStash(CustomTestCase):
             torch.equal(mgr._lora_stash["miles_lora"][LORA_A], rank_tensors[1])
         )
 
+    def test_routed_expert_stack_keeps_this_ranks_rows(self):
+        """Under EP a rank installs only its experts, so the stash keeps their rows
+        of a streamed stack plus the whole-stack digest the sender's manifest will
+        name; tensors the pool installs whole stay as they arrived."""
+        mgr = _make_manager()
+        pool = MagicMock()
+        pool.local_rows_of_routed_expert_stack.side_effect = lambda key, t: (
+            slice(2, 4) if key == EXPERT_B else None
+        )
+        mgr.tp_worker.model_runner.lora_manager = MagicMock(memory_pool=pool)
+        mgr._session = _WeightUpdateSession(selector="all", verify_lora_checksums=True)
+        stack = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
+        shared, attn = torch.ones(1, 2, 3), torch.ones(2, 3)
+        mgr._stash_lora_tensors(
+            [(f"a:{EXPERT_B}", stack), (f"a:{EXPERT_A}", shared), (f"a:{LORA_A}", attn)]
+        )
+        self.assertTrue(torch.equal(mgr._lora_stash["a"][EXPERT_B], stack[2:4]))
+        self.assertIs(mgr._lora_stash["a"][EXPERT_A], shared)
+        self.assertIs(mgr._lora_stash["a"][LORA_A], attn)
+        self.assertEqual(
+            mgr._lora_stash_digests, {"a": {EXPERT_B: _sha256_tensor(stack)}}
+        )
+
+    def test_undeclared_manifest_skips_the_whole_stack_hash(self):
+        """Hashing the whole stack costs a pass over the full adapter (49 GB per rank
+        for Kimi-K3.1 at r=32), so a session that announced no manifest records
+        None; end_weight_update then refuses a manifest instead of comparing the
+        rows alone."""
+        mgr = _make_manager()
+        pool = MagicMock()
+        pool.local_rows_of_routed_expert_stack.return_value = slice(0, 2)
+        mgr.tp_worker.model_runner.lora_manager = MagicMock(memory_pool=pool)
+        mgr._session = _WeightUpdateSession(selector="all")
+        mgr._stash_lora_tensors([(f"a:{EXPERT_B}", torch.zeros(4, 2, 3))])
+        self.assertEqual(mgr._lora_stash_digests, {"a": {EXPERT_B: None}})
+
 
 class TestApplyLoraStash(CustomTestCase):
     def _manager_with_lora(self, apply_result=None):
@@ -112,6 +153,7 @@ class TestApplyLoraStash(CustomTestCase):
         lora_manager.apply_streamed_adapter.return_value = (
             apply_result if apply_result is not None else LoRAUpdateOutput(success=True)
         )
+        lora_manager.memory_pool.local_rows_of_routed_expert_stack.return_value = None
         mgr.tp_worker.model_runner.lora_manager = lora_manager
         return mgr, lora_manager
 
@@ -167,6 +209,38 @@ class TestApplyLoraStash(CustomTestCase):
         )
         self.assertFalse(success)
         self.assertIn("checksum mismatch", message)
+        lora_manager.apply_streamed_adapter.assert_not_called()
+
+    def test_reduced_stack_verifies_against_the_whole_stack_digest(self):
+        """The sender hashes the stack it streamed; a rank keeping two of its four
+        experts must match that digest, not a digest of its own rows, and must
+        hand the loader only its rows."""
+        mgr, lora_manager = self._manager_with_lora()
+        lora_manager.memory_pool.local_rows_of_routed_expert_stack.return_value = slice(
+            2, 4
+        )
+        mgr._session = _WeightUpdateSession(selector="all", verify_lora_checksums=True)
+        stack = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
+        mgr._stash_lora_tensors([(f"a:{EXPERT_B}", stack)])
+        success, _ = mgr._apply_lora_stash({"a": {EXPERT_B: _sha256_tensor(stack)}})
+        self.assertTrue(success)
+        tensors = lora_manager.apply_streamed_adapter.call_args.args[1]
+        self.assertTrue(torch.equal(tensors[EXPERT_B], stack[2:4]))
+        self.assertEqual(mgr._lora_stash_digests, {})
+
+    def test_reduced_stack_without_declared_manifest_fails(self):
+        mgr, lora_manager = self._manager_with_lora()
+        lora_manager.memory_pool.local_rows_of_routed_expert_stack.return_value = slice(
+            0, 2
+        )
+        mgr._session = _WeightUpdateSession(selector="all")
+        stack = torch.zeros(4, 2, 3)
+        mgr._stash_lora_tensors([(f"a:{EXPERT_B}", stack)])
+        success, message = mgr._apply_lora_stash(
+            {"a": {EXPERT_B: _sha256_tensor(stack)}}
+        )
+        self.assertFalse(success)
+        self.assertIn("verify_lora_checksums", message)
         lora_manager.apply_streamed_adapter.assert_not_called()
 
     def test_checksum_name_set_mismatch_fails(self):

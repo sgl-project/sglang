@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -9,6 +10,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
+
+# Matches both per-expert keys ("...experts.0.<module>...") and shared-outer
+# keys ("...experts.<module>..."), while excluding "shared_experts." (where the
+# preceding char is "_", not ".").
+_ROUTED_EXPERT_PATTERN = re.compile(r"\.experts\.")
+
+
+def is_routed_expert_weight(name: str) -> bool:
+    return _ROUTED_EXPERT_PATTERN.search(name) is not None
 
 
 def warn_if_adapter_targets_embeddings(

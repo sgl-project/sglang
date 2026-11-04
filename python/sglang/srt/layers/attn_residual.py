@@ -24,7 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import bind_or_assign, is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -81,6 +81,17 @@ def get_cw(
         cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
         cw = cache[dtype] = cw.to(dtype)
     return cw
+
+
+def refresh_cw(proj: ReplicatedLinear, norm: RMSNorm) -> None:
+    """Recompute both get_cw dtypes from the current weights. A weight reload
+    writes into the cached buffers, which captured graphs read by address."""
+    cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+    cache = getattr(proj, "_attn_res_cw_cache", None)
+    if cache is None:
+        cache = proj._attn_res_cw_cache = {}
+    for dtype in (torch.bfloat16, torch.float32):
+        cache[dtype] = bind_or_assign(cache.get(dtype), cw.to(dtype))
 
 
 def _aggregate_fast(

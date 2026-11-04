@@ -16,7 +16,7 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
-from sglang.srt.layers.layer_boundary import BatchVariant, layer_stack
+from sglang.srt.layers.layer_boundary import BatchVariant, TokenAxis, layer_stack
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input, keep_output
 from sglang.srt.layers.layer_boundary.residual import attn_bank
@@ -26,6 +26,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBankOutputRead,
 )
 from sglang.srt.models import kimi_k3
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -158,6 +159,67 @@ class TestKimiK3StageKernels(CustomTestCase):
         self.assertIs(entry, comm_ops._reduce_update_read)
         self.assertEqual(fusions, (kimi_k3._k3_all_reduce_add,))
         self.assertIsNone(gather)
+
+
+class TestKimiK3LoRARowsUnderDpAttention(CustomTestCase):
+    """LoRA routing knows two row layouts: a DP rank's rows, whole on each
+    attention-TP rank, and the TP-global rows. Under DP attention with
+    attention TP > 1, K3 declares its LoRA inputs stay in them exactly when its
+    FFN stages keep their input off attention-TP slices."""
+
+    def declared_rows(self, *, a2a):
+        parallel = fixture.parallel_of(
+            attn_dp=4, attn_tp=8, enable_dense_mlp_attn_tp=False
+        )
+        config = SimpleNamespace(**{**vars(CONFIG), "attn_res_block_size": None})
+        # Layer 0 is CONFIG's dense layer, layer 1 a MoE.
+        layers = {
+            idx: moe_layer(bank=False, sp_moe=a2a and idx > 0, all_reduce_fusion=False)
+            for idx in (0, 1)
+        }
+        with (
+            get_context().override_server_args(),
+            patch.object(k3_sp_collective, "enabled", return_value=False),
+            patch.object(k3_ar_fusion, "enabled", return_value=False),
+            patch.object(kimi_k3, "_shards_moe_rows", return_value=a2a),
+            patch.object(kimi_k3, "_uses_ep_a2a", return_value=a2a),
+            patch.object(kimi_k3, "_carries_bank_slices", return_value=False),
+            patch.object(kimi_k3, "is_dp_attention_enabled", return_value=True),
+            # The dense MLP is built over the full TP group.
+            patch.object(
+                kimi_k3,
+                "resolve_linear_parallel_group",
+                return_value=(0, parallel.tp_size),
+            ),
+            k3_planning(parallel, a2a=a2a, boundary_reduction="ar"),
+            layer_stack(final_read=None),
+        ):
+            for idx, layer in layers.items():
+                layer._declare_stages(config, idx, AttnBank())
+            inputs_whole = (
+                kimi_k3.KimiK3ForConditionalGeneration.lora_inputs_whole_under_attn_tp()
+            )
+
+        def rows(boundary):
+            return boundary.plan.paths[BatchVariant.ORDINARY].entry.input_rows.sharded
+
+        return {
+            idx: (rows(layer.attn_boundary), rows(layer.ffn_boundary))
+            for idx, layer in layers.items()
+        }, inputs_whole
+
+    def test_ffns_read_tp_global_rows_without_a2a(self):
+        rows, inputs_whole = self.declared_rows(a2a=False)
+        for idx, (attention, ffn) in rows.items():
+            with self.subTest(layer=idx):
+                self.assertNotIn(TokenAxis.ATTN_TP, attention)
+                self.assertEqual(ffn, frozenset())
+        self.assertTrue(inputs_whole)
+
+    def test_an_a2a_moe_reads_attention_tp_slices(self):
+        rows, inputs_whole = self.declared_rows(a2a=True)
+        self.assertIn(TokenAxis.ATTN_TP, rows[1][1])
+        self.assertFalse(inputs_whole)
 
 
 class TestKimiK3BankOnShards(CustomTestCase):

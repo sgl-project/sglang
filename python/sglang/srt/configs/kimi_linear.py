@@ -174,6 +174,10 @@ class KimiLinearConfig(PretrainedConfig):
     def is_dsa_layer(self, layer_idx: int) -> bool:
         return self.dsa_config is not None and (layer_idx + 1) in self.dsa_layers
 
+    def dsa_layer_ids(self) -> list[int]:
+        # dsa_layers is 1-based, and a partial checkpoint keeps the full model's list.
+        return [n - 1 for n in sorted(self.dsa_layers) if n <= self.num_hidden_layers]
+
     @property
     def is_mla(self):
         return (

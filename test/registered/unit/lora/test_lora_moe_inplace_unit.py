@@ -89,6 +89,20 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
         self.assertIs(layer.moe_runner_config, base_layer.moe_runner_config)
         self.assertFalse(layer.moe_runner_config.inplace)
 
+    def test_wrapper_exposes_the_base_runner(self):
+        # Kimi-K3's MoE reads `self.experts.runner` to pick its front layout; with a
+        # LoRA-wrapped experts layer that read raised AttributeError at graph capture.
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        base_layer = _make_base_layer()
+        base_layer.runner = types.SimpleNamespace(
+            runner_backend=MoeRunnerBackend.TRITON
+        )
+
+        layer = FusedMoEWithLoRA(base_layer, types.SimpleNamespace(name="triton"))
+        self.assertIs(layer.runner, base_layer.runner)
+
     def test_marlin_lora_runner_core_sees_non_inplace_config(self):
         # The marlin LoRA runner core is the code that aliases its output onto
         # hidden_states when inplace=True; make sure the core the layer builds

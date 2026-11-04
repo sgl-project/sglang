@@ -236,7 +236,12 @@ def _broadcast_indexer_topk_from_rank0(
 ) -> Optional[torch.Tensor]:
     # Sync only the finalized indexer output. Internal topk_transform calls can
     # be chunked differently across ranks, which would make collectives diverge.
-    if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+    # A top-k capture returns rank 0's selection for every head, so while one is
+    # installed all ranks must attend that selection, not their own.
+    if topk_indices is None or not (
+        envs.SGLANG_DSA_TOPK_BROADCAST.get()
+        or get_global_indexer_capturer() is not None
+    ):
         return topk_indices
 
     if is_in_tc_piecewise_cuda_graph():
@@ -625,7 +630,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         n, k = self.head_dim + self.n_heads, self.wk.weight.shape[1]
         if not can_use_tiny_gemm(n, k, max_m=_MERGED_K_GATE_MAX_M):
             return
-        merged = torch.cat([self.wk.weight.data, self.weights_proj.weight.data])
+        merged = self._wk_gate_weight
+        if merged is None:
+            merged = torch.cat([self.wk.weight.data, self.weights_proj.weight.data])
+        else:
+            # Keep the buffer address stable for graph replay after weight reloads;
+            # a reload normally writes through the views already
+            for dst, src in (
+                (merged[: self.head_dim], self.wk.weight.data),
+                (merged[self.head_dim :], self.weights_proj.weight.data),
+            ):
+                if dst.data_ptr() != src.data_ptr():
+                    dst.copy_(src)
         self.wk.weight.data = merged[: self.head_dim]
         self.weights_proj.weight.data = merged[self.head_dim :]
         self._wk_gate_weight = merged
@@ -1595,7 +1611,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         raw_result = None
         if dcp_size > 1:
             if capture:
-                raise ValueError("DSA indexer top-k capture does not support --dcp-size > 1.")
+                raise ValueError(
+                    "DSA indexer top-k capture does not support --dcp-size > 1."
+                )
             # block_tables and seqlens_32_2d are this rank's: the page ids of
             # its index-K shard and its share of each sequence.
             topk_result = dcp_global_topk(
@@ -2107,7 +2125,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             or forward_batch.forward_mode.is_target_verify()
         ):
             if get_global_indexer_capturer() is not None:
-                raise ValueError("DSA indexer top-k capture does not support --dcp-size > 1.")
+                raise ValueError(
+                    "DSA indexer top-k capture does not support --dcp-size > 1."
+                )
             # Widened slots of every visible position; verify rows pass their
             # per-row (causal) global lengths.
             raw_topk_result = dcp_all_visible(

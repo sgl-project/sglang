@@ -2566,6 +2566,63 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {},
         )
 
+    def test_kimi_k31_bf16_kv_takes_generic_dsa_backends(self):
+        """RL rollouts pass --kv-cache-dtype bfloat16; the fp8_ds_mla default stays."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_kv_cache_dtype_default,
+            _dsa_split_backend_resolution,
+        )
+
+        def _view(**kw):
+            hf = SimpleNamespace(architectures=["KimiK31ForConditionalGeneration"])
+            defaults = dict(
+                kv_cache_dtype="auto",
+                dsa_prefill_backend=None,
+                dsa_decode_backend=None,
+                enable_hisparse=False,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            )
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("sglang.srt.configs.model_config.is_kimi_k31", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view()), {"kv_cache_dtype": "fp8_e4m3"}
+            )
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="bf16")),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            with self.assertRaisesRegex(ValueError, "bfloat16"):
+                _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp8_e5m2"))
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="fp8_e4m3")),
+                {
+                    "dsa_prefill_backend": "flashmla_kv",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
+                {
+                    "dsa_prefill_backend": "flashmla_sparse",
+                    "dsa_decode_backend": "fa3",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "hisparse"):
+                _dsa_split_backend_resolution(
+                    _view(kv_cache_dtype="bfloat16", enable_hisparse=True)
+                )
+
     def test_dsa_split_backend_resolution_pass(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,

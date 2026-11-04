@@ -1124,7 +1124,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Forward for the model's own forward-path dispatch — the outer model
         # reads several FusedMoE attributes (e.g. `self.experts.moe_runner_config`,
         # `self.experts.dispatcher`, `self.experts.num_local_experts`,
-        # `self.experts.quant_method`) directly on the wrapper. Quant
+        # `self.experts.quant_method`, `self.experts.runner`) directly on the wrapper. Quant
         # post-processing iterators skip LoRA wrappers via
         # `isinstance(module, BaseLayerWithLoRA)` so the packed params on the
         # inner FusedMoE get processed there, not here.
@@ -1136,6 +1136,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # losing that race corrupts long generations.
         self.moe_runner_config.inplace = False
         self.dispatcher = base_layer.dispatcher
+        self.runner = base_layer.runner
         self.num_local_experts = base_layer.num_local_experts
         self.should_fuse_routed_scaling_factor_in_topk = (
             base_layer.should_fuse_routed_scaling_factor_in_topk
