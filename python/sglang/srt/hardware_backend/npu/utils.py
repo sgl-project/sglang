@@ -333,6 +333,51 @@ def get_indexer_weight_stream():
     return indexer_weight_stream
 
 
+def prewarm_aicpu():
+    """Start custom AiCPU after HCCL is ready and before MemFabric maps memory."""
+    from sglang.srt.runtime_context import get_parallel
+
+    tp_group = get_parallel().tp_group
+    device = tp_group.device
+    logger.info("AiCPU prewarm: initializing HCCL on the TP group")
+    # Group creation is lazy. Materialize the formal communicator first so
+    # later HCCL startup cannot restart HCCP after custom AiCPU has started.
+    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(warmup_tensor, group=tp_group.device_group)
+    tp_group.device_module.synchronize()
+
+    # Use a fixed, valid single-token metadata input, independent of the
+    # model's attention dimensions or TP sharding, to start custom AiCPU.
+    # No model weights or KV buffers are needed. Delaying this until MemFabric
+    # maps host memory can make custom AiCPU startup fail in halMemBindSibling.
+    if is_npu_arch35():
+        metadata_op = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata
+        quant_kwargs = dict(kv_quant_mode=1, tile_size=64, rope_head_dim=64)
+    else:
+        metadata_op = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
+        quant_kwargs = {}
+    _metadata = metadata_op(
+        batch_size=1,
+        num_heads_q=64,
+        num_heads_kv=1,
+        head_dim=512,
+        has_ori_kv=True,
+        has_cmp_kv=False,
+        cu_seqlens_q=torch.arange(2, dtype=torch.int32, device=device),
+        seqused_kv=torch.ones(1, dtype=torch.int32, device=device),
+        cmp_ratio=1,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+        ori_win_left=127,
+        ori_win_right=0,
+        layout_q="TND",
+        layout_kv="PA_ND",
+        **quant_kwargs,
+    )
+    torch.npu.synchronize(device)
+    logger.info("AiCPU prewarm complete")
+
+
 def init_zbal(world_size, gpu_id, world_rank, do_check=True):
     """
     init zbal, if is mix alloc mode, only register for sma & comm

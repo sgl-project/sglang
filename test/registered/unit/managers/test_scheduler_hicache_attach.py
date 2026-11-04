@@ -1,4 +1,4 @@
-"""Runtime HiCache attach/detach lands on the config bags.
+"""HiCache startup gating and runtime attach/detach configuration.
 
 The attach RPC used to mutate the scheduler's ServerArgs so the readback would
 show the change; the namespace readers never saw it. Both now go through
@@ -8,6 +8,7 @@ and the published instance stays as the launcher left it.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
@@ -40,6 +41,23 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
             detach_storage_backend=lambda: (True, "detached"),
         )
         return scheduler
+
+    def test_scheduler_only_prewarms_npu_memcache(self):
+        for is_npu in (False, True):
+            for storage in (None, "file", "mooncake", "npu_memcache"):
+                scheduler = SimpleNamespace(
+                    server_args=SimpleNamespace(hicache_storage_backend=storage)
+                )
+                with (
+                    self.subTest(is_npu=is_npu, storage=storage),
+                    patch("sglang.srt.managers.scheduler._is_npu", is_npu),
+                    patch("sglang.srt.hardware_backend.npu.utils.prewarm_aicpu") as op,
+                ):
+                    Scheduler.prewarm_aicpu_on_npu(scheduler)
+                    if is_npu and storage == "npu_memcache":
+                        op.assert_called_once_with()
+                    else:
+                        op.assert_not_called()
 
     def test_attach_reaches_the_namespace_readers(self):
         scheduler = self._scheduler(hicache_storage_backend=None)

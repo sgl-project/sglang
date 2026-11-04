@@ -580,6 +580,7 @@ class Scheduler(
             dist_port=self.nccl_port,
         )
         bootstrap.init_layer_runtime(model_config=self.model_config)
+        self.prewarm_aicpu_on_npu()
 
         # Init metrics stats
         self.init_metrics_collector()
@@ -848,6 +849,12 @@ class Scheduler(
             init_zbal(
                 get_parallel().tp_size, get_device().gpu_id, get_parallel().tp_rank
             )  # only switch allocator if is mix mode
+
+    def prewarm_aicpu_on_npu(self):
+        if _is_npu and self.server_args.hicache_storage_backend == "npu_memcache":
+            from sglang.srt.hardware_backend.npu.utils import prewarm_aicpu
+
+            prewarm_aicpu()
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)

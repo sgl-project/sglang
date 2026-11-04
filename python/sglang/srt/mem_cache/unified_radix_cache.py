@@ -122,7 +122,7 @@ from sglang.srt.runtime_context import (
     get_observability,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
-from sglang.srt.utils.common import ceil_align, get_device_module
+from sglang.srt.utils.common import ceil_align, get_device_module, is_npu
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -2383,6 +2383,23 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    def _align_c128_storage_prefetch(
+        self, last_host_node_id: NodeId, prefetch_key: RadixKey
+    ) -> RadixKey:
+        """Align C128 storage groups on NPU only; return the key unchanged otherwise."""
+        if not is_npu():
+            return prefetch_key
+        c128_component = self.components.get(ComponentType.C128)
+        if c128_component is None:
+            return prefetch_key
+        prefetch_length = min(
+            len(prefetch_key),
+            c128_component.align_storage_prefetch_length(
+                last_host_node_id, len(prefetch_key)
+            ),
+        )
+        return prefetch_key[:prefetch_length]
+
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
@@ -2446,6 +2463,9 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
         ).page_aligned(self.page_size)
+        prefetch_key = self._align_c128_storage_prefetch(
+            last_host_node_id, prefetch_key
+        )
         assume_stored = (
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
         )
@@ -3233,7 +3253,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 pool_page_size = (
                     entry.host_pool.page_size if entry is not None else self.page_size
                 )
-                num_tokens = min(len(transfer.keys or ()), hit_pages) * pool_page_size
+                hit_objects = hit_pages // transfer.logical_pages_per_object
+                num_tokens = min(len(transfer.keys or ()), hit_objects) * pool_page_size
                 if num_tokens == 0:
                     continue
                 host_indices = self.components[ct].alloc_prefetch_staging(num_tokens)
@@ -3418,7 +3439,11 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=True,
+                # A coarse pool cannot restore a partially covered group.
+                allow_partial=all(
+                    transfer.logical_pages_per_object == 1
+                    for transfer in operation.pool_transfers or []
+                ),
                 min_tokens=self.prefetch_threshold,
                 evict_host=self.evict_host,
             )

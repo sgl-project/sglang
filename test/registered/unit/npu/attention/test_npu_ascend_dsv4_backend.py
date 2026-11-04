@@ -78,6 +78,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.srt.hardware_backend.npu.utils import prewarm_aicpu
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -718,6 +719,91 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
         self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
         self.assertEqual(kwargs, {})
+
+
+class TestAicpuPrewarm(unittest.TestCase):
+    def setUp(self):
+        self.tp_group = SimpleNamespace(
+            device="cpu", device_group=object(), device_module=MagicMock()
+        )
+        self.parallel = SimpleNamespace(tp_group=self.tp_group)
+        patcher = patch(
+            "sglang.srt.runtime_context.get_parallel", return_value=self.parallel
+        )
+        self.get_parallel = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_hccl_finishes_before_metadata_on_a3_and_a5(self):
+        for arch35 in (False, True):
+            events = []
+            self.tp_group.device_module.synchronize.side_effect = lambda: events.append(
+                "hccl_sync"
+            )
+            with (
+                self.subTest(arch35=arch35),
+                patch(
+                    "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                    return_value=arch35,
+                ),
+                patch("torch.ops.custom", MagicMock(), create=True) as ops,
+                patch("torch.npu", MagicMock(), create=True) as npu,
+                patch("torch.distributed.all_reduce") as all_reduce,
+            ):
+                op_name = (
+                    "npu_kv_quant_sparse_attn_sharedkv_metadata"
+                    if arch35
+                    else "npu_sparse_attn_sharedkv_metadata"
+                )
+                metadata_op = getattr(ops, op_name)
+                metadata_op.side_effect = lambda **kw: events.append("metadata")
+                all_reduce.side_effect = lambda *a, **kw: events.append("hccl")
+                npu.synchronize.side_effect = lambda device: events.append("aicpu_sync")
+
+                prewarm_aicpu()
+
+                self.assertEqual(
+                    events, ["hccl", "hccl_sync", "metadata", "aicpu_sync"]
+                )
+                all_reduce.assert_called_once()
+                self.assertIs(
+                    all_reduce.call_args.kwargs["group"], self.tp_group.device_group
+                )
+                metadata_op.assert_called_once()
+                kwargs = metadata_op.call_args.kwargs
+                self.assertEqual(kwargs["num_heads_q"], 64)
+                self.assertEqual(kwargs["num_heads_kv"], 1)
+                self.assertEqual(kwargs["head_dim"], 512)
+                self.assertEqual(kwargs["batch_size"], 1)
+                self.assertEqual(kwargs["cu_seqlens_q"].tolist(), [0, 1])
+                self.assertEqual(kwargs["seqused_kv"].tolist(), [1])
+                self.assertEqual(kwargs["ori_win_left"], 127)
+                self.assertEqual(kwargs["cmp_ratio"], 1)
+                self.assertFalse(kwargs["has_cmp_kv"])
+                if arch35:
+                    self.assertEqual(kwargs["kv_quant_mode"], 1)
+                    self.assertEqual(kwargs["tile_size"], 64)
+                    self.assertEqual(kwargs["rope_head_dim"], 64)
+                    ops.npu_sparse_attn_sharedkv_metadata.assert_not_called()
+                else:
+                    self.assertNotIn("kv_quant_mode", kwargs)
+                    ops.npu_kv_quant_sparse_attn_sharedkv_metadata.assert_not_called()
+                npu.synchronize.assert_called_once_with("cpu")
+
+    def test_hccl_failure_prevents_aicpu_startup(self):
+        for fail_sync in (False, True):
+            with (
+                self.subTest(fail_sync=fail_sync),
+                patch("torch.distributed.all_reduce") as all_reduce,
+                patch("torch.ops.custom", MagicMock(), create=True) as ops,
+            ):
+                failed_call = (
+                    self.tp_group.device_module.synchronize if fail_sync else all_reduce
+                )
+                failed_call.side_effect = RuntimeError("HCCL initialization failed")
+                with self.assertRaisesRegex(RuntimeError, "HCCL initialization failed"):
+                    prewarm_aicpu()
+                ops.npu_sparse_attn_sharedkv_metadata.assert_not_called()
+                ops.npu_kv_quant_sparse_attn_sharedkv_metadata.assert_not_called()
 
 
 class TestSparseAttentionMetadata(unittest.TestCase):
