@@ -4,13 +4,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_ocr import (
     _REL_POS_CACHE,
     DeepseekOCRForCausalLM,
     _cached_rel_pos,
-    get_rel_pos,
 )
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
 from sglang.srt.models.unlimited_ocr_v2 import (
@@ -171,7 +171,8 @@ class TestUnlimitedOCRPageSlices(CustomTestCase):
         """Pickling a page's crop view used to serialize the whole document's
         crop tensor, so request bytes and TTFT grew with pages squared."""
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.multimodal.processors.unlimited_ocr_v2 import (
             UnlimitedOCRV2Processor,
         )
@@ -188,6 +189,7 @@ class TestUnlimitedOCRPageSlices(CustomTestCase):
         self.assertEqual(len(items), pages)
 
         processor = object.__new__(UnlimitedOCRV2Processor)
+        processor.processor_fingerprint = "test-unlimited-ocr-page-slices"
         items = processor._postprocess_mm_items_before_transport(items, images=None)
 
         page_bytes = 2 * 3 * 64 * 64 * 4

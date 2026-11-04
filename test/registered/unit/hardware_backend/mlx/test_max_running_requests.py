@@ -126,10 +126,7 @@ def _hybrid_stub_for_initialize(
 
 
 def _fake_req():
-    return SimpleNamespace(
-        inflight_middle_chunks=0,
-        kv=ReqKvInfo(),
-    )
+    return SimpleNamespace(kv=ReqKvInfo())
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
