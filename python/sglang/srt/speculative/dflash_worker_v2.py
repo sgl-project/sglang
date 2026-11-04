@@ -144,7 +144,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils import async_h2d, is_cuda, is_cuda_alike, is_hip, is_npu, is_xpu
+from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
 
 _is_npu = is_npu()
 
@@ -1042,7 +1042,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
                     )
-            if is_cuda_alike() and capture_decode_cuda_graph:
+            if (is_cuda() or is_hip()) and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
                     self.device,

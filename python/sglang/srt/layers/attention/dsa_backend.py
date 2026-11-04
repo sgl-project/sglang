@@ -2649,8 +2649,12 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            # DCP target verify, like decode, returns this rank's partial.
-            if self.attn_dcp_size > 1 and forward_batch.forward_mode.is_target_verify():
+            # On ROCm, DCP target verify, like decode, returns this rank's partial.
+            if (
+                _is_hip
+                and self.attn_dcp_size > 1
+                and forward_batch.forward_mode.is_target_verify()
+            ):
                 from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
                     forward_triton_dcp_partial,
                 )
@@ -3008,7 +3012,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if self.attn_dcp_size > 1:
+            if _is_hip and self.attn_dcp_size > 1:
                 from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
                     forward_triton_dcp_partial,
                 )
