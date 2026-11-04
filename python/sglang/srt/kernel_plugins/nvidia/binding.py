@@ -1095,7 +1095,11 @@ def megakernel_disable_reasons(
     ]
     one_of = [
         ("tp_size", cfg.tp_size, req.tp_sizes),
-        ("decode CUDA graphs", cfg.cuda_graph_config.decode.backend, req.decode_graph_backends),
+        (
+            "decode CUDA graphs",
+            cfg.cuda_graph_config.decode.backend,
+            req.decode_graph_backends,
+        ),
     ] + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
     exactly = [
         # another model's config may not have the field at all
@@ -1530,8 +1534,8 @@ class _Dispatch:
 
 
 class _CaptureCheck:
-    """Once every decode graph is captured, log the ones that run the megakernel
-    and refuse a runner none of whose graphs do."""
+    """Once every decode graph is captured, log the ones that run the megakernel and
+    refuse a runner none of whose graphs do."""
 
     def __init__(self, *, spec: MegakernelSpec, dispatch: _Dispatch):
         self.spec, self.dispatch = spec, dispatch
@@ -1539,7 +1543,7 @@ class _CaptureCheck:
 
     def __call__(
         self,
-        runner: Any,
+        runner: DecodeCudaGraphRunner,
         out: Any,
         forward_batch: ForwardBatch,
         num_tokens: int,
@@ -1551,15 +1555,15 @@ class _CaptureCheck:
         if isinstance(self.dispatch.binding, MegakernelBinding):
             self.dispatch.binding.seal_capture_buffers(runner)
         self.dispatch.binding.assert_live()
-        routed = sorted(k for k, step in captured.items() if step is not None)
+        routed = sorted(bs for bs, step in captured.items() if step is not None)
         if not routed:
             raise ValueError(
                 f"{FLAG}: none of the {len(captured)} captured decode graphs "
                 f"(batch sizes {sorted(captured)}) runs {self.spec.name}"
             )
         logger.info(
-            "NVIDIA megakernel: %s runs the decode graphs of batch sizes %s (%d of %d);"
-            " every other step runs the standard forward",
+            "NVIDIA megakernel: %s runs the decode graphs of batch sizes %s (%d of "
+            "%d); every other step runs the standard forward",
             self.spec.name,
             routed,
             len(routed),

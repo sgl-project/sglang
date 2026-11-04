@@ -467,5 +467,6 @@ class TestMegakernelRuntime(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "decode_graph_aux_hidden_states"):
             lm.context.binding.assert_live()
 
+
 if __name__ == "__main__":
     unittest.main()

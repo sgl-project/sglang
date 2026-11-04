@@ -51,5 +51,6 @@ class TestMegakernelGuards(CustomTestCase):
         self.assertTrue(tp_reasons("_fakes:SPEC"))
         self.assertEqual(tp_reasons("_fakes:ANY_TP"), [])
 
+
 if __name__ == "__main__":
     unittest.main()
