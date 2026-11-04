@@ -4934,3 +4934,7 @@ root 阅读全部生产与测试差异并独立运行 transfers、cache、servic
 CPU123测试/96子测试、工具41测试、真实GPU/file/Mooncake2测试/2子测试通过。实际CPU file-store前后独立重放3query/3GET→2/2，span相同。0.8实际GPU证明在旧矩阵完成且队列为空后执行；优化runtime正确性通过后启动。结束捕获idle/caps/serverinfo，停止且核实本任务Engine/Master及采样器；端口51801/51803/52091/52092/52093无监听，GPU0/1回到130/78MiB，GPU2/3未操作。
 
 归档共8正式矩阵与启动观察、4570条完整2s监控，以9个gzip parts无损重建原SHA；各cell保留原始与压缩后checksum，CPU进程树计数、全部命令/环境/源hash/正确性日志、静态PNG/SVG/CSV均保存。verify_acceptance.py实际通过：所有文件hash、5724调用、4656输出、已知1+4未完成控制及4570采样无损重建。32并发p95回退、CPU成本、N3与合成轨迹/单机TCP限制写入最终报告。性能原始数据与限制见 benchmark/session_kv_control/results/2026-11-04-mem08/FINAL_ACCEPTANCE.zh-CN.md。按授权分功能提交，未推送。
+
+### 生成归档格式核查
+
+CSV 标准 CRLF、matplotlib SVG path 换行及一份原始测试输出含生成器/捕获空白。通过结果目录局部 .gitattributes 标明 CSV 的 cr-at-eol，保留生成 SVG 和原始 .log 字节，未放宽源码或测试检查。补充物理 SHA 后，归档 diff whitespace 检查与 SHA256SUMS 通过；性能数据未改写。
