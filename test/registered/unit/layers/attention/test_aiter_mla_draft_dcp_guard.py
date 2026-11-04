@@ -14,10 +14,10 @@ from unittest.mock import patch
 
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _reject(*, dsa_draft_shards=False, **overrides):
@@ -25,7 +25,7 @@ def _reject(*, dsa_draft_shards=False, **overrides):
         use_mla=True,
         dcp_world_size=2,
         is_draft_worker=True,
-        hf_config=SimpleNamespace(),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
     )
     kwargs.update(overrides)
     with patch.object(
@@ -42,9 +42,11 @@ class TestAiterMlaDraftDcpGuard(CustomTestCase):
         self.assertIn("MLA draft", str(ctx.exception))
 
     def test_inert_for_targets_non_mla_drafts_and_dcp1(self):
-        _reject(is_draft_worker=False)
-        _reject(use_mla=False)
-        _reject(dcp_world_size=1)
+        # These never read hf_config, so a model config without one still builds.
+        bare = SimpleNamespace()
+        _reject(is_draft_worker=False, model_config=bare)
+        _reject(use_mla=False, model_config=bare)
+        _reject(dcp_world_size=1, model_config=bare)
 
     def test_inert_for_a_dsa_draft_that_shards_like_the_target(self):
         _reject(dsa_draft_shards=True)

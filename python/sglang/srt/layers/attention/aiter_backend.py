@@ -425,7 +425,7 @@ class AiterAttnBackend(AttentionBackend):
             use_mla=self.use_mla,
             dcp_world_size=self.dcp_world_size,
             is_draft_worker=model_runner.is_draft_worker,
-            hf_config=model_runner.model_config.hf_config,
+            model_config=model_runner.model_config,
         )
         self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
         if self.mla_decode_backend not in ("gluon", "asm"):
@@ -3663,28 +3663,22 @@ class AiterAttnBackend(AttentionBackend):
 
     @staticmethod
     def _reject_mla_draft_under_dcp(
-        *, use_mla, dcp_world_size, is_draft_worker, hf_config
+        *, use_mla, dcp_world_size, is_draft_worker, model_config
     ):
-        """Reject an MLA draft model under decode context parallelism.
+        """Reject an MLA draft model whose KV is replicated under DCP.
 
-        A draft that does not shard its KV like the target (all but a ROCm DSA
-        draft) keeps a replicated pool, but the MLA model code still sends its
-        draft extend through the DCP decode branch without the step's keys. This
-        backend's extend cannot take that and failed at startup with an opaque
-        ``AttributeError``. Fail loudly instead. Inert for targets, non-MLA
-        drafts and DCP 1.
+        The MLA model code still routes such a draft's extend through its DCP
+        decode branch without the step's keys, which this backend cannot run.
         """
-        if (
-            use_mla
-            and is_draft_worker
-            and dcp_world_size > 1
-            and not dsa_draft_shards_under_dcp(hf_config, dcp_world_size)
-        ):
-            raise ValueError(
-                f"aiter cannot run an MLA draft model with --dcp-size {dcp_world_size}: "
-                "its draft extend has no DCP path. Use --dcp-size 1, or a draft "
-                "model without MLA attention (for example DSpark)."
-            )
+        if not (use_mla and is_draft_worker and dcp_world_size > 1):
+            return
+        if dsa_draft_shards_under_dcp(model_config.hf_config, dcp_world_size):
+            return
+        raise ValueError(
+            f"aiter cannot run an MLA draft model with --dcp-size {dcp_world_size}: "
+            "its draft extend has no DCP path. Use --dcp-size 1, or a draft model "
+            "without MLA attention."
+        )
 
     @staticmethod
     def _reject_target_verify_cross_layer_kv(k, v):
