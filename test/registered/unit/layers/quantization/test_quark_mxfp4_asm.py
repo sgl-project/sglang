@@ -125,12 +125,17 @@ class TestAfp4wfp4EvenKBlock(CustomTestCase):
         self.assertEqual(_afp4wfp4_even_k_block(block_k=1024, k=768), 256)
         self.assertEqual(_afp4wfp4_even_k_block(block_k=512, k=4224), 128)
 
-    def test_keeps_even_or_unnarrowable_blocks(self):
-        self.assertIsNone(_afp4wfp4_even_k_block(block_k=1024, k=7168))
-        # A block wider than K is already shrunk to K by the kernel wrapper.
-        self.assertIsNone(_afp4wfp4_even_k_block(block_k=2048, k=1024))
+    def test_keeps_even_blocks(self):
+        self.assertEqual(_afp4wfp4_even_k_block(block_k=1024, k=7168), 1024)
+        # A block wider than K is shrunk to K, as the kernel wrapper does.
+        self.assertEqual(_afp4wfp4_even_k_block(block_k=2048, k=1024), 1024)
+        # A block below the minimum is raised to it, as the kernel wrapper does.
+        self.assertEqual(_afp4wfp4_even_k_block(block_k=64, k=768), 128)
+
+    def test_no_even_block(self):
         # No power-of-two divisor of K at or above the minimum block.
         self.assertIsNone(_afp4wfp4_even_k_block(block_k=256, k=160))
+        self.assertIsNone(_afp4wfp4_even_k_block(block_k=512, k=2880))
 
 
 class TestAfp4wfp4EvenKConfig(CustomTestCase):
@@ -175,9 +180,11 @@ class TestAfp4wfp4EvenKConfig(CustomTestCase):
         split_k = {"BLOCK_SIZE_K": 512, "NUM_KSPLIT": 4}
         self.assertIsNone(self._config(mock.Mock(return_value=(split_k, False))))
 
-    def test_cache_is_bounded(self):
-        self.assertIsNotNone(
-            quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_info().maxsize
+    def test_k_without_an_even_block_keeps_the_default_path(self):
+        aiter_config = {"BLOCK_SIZE_K": 1024, "NUM_KSPLIT": 1}
+        # gpt-oss hidden size: 2880 % 128 == 64.
+        self.assertIsNone(
+            self._config(mock.Mock(return_value=(aiter_config, False)), k_packed=1440)
         )
 
 

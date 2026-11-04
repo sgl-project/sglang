@@ -44,11 +44,9 @@ _AFP4WFP4_MIN_BLOCK_K = 128
 
 
 def _afp4wfp4_even_k_block(block_k: int, k: int) -> Optional[int]:
-    """Narrowed BLOCK_SIZE_K for ``k`` FP4 elements, or None to keep ``block_k``."""
+    """BLOCK_SIZE_K that divides ``k`` FP4 elements, or None when none at or above the minimum does."""
     # gemm_afp4wfp4 itself shrinks a block wider than K to K's next power of two.
-    block_k = min(block_k, 1 << (k - 1).bit_length())
-    if k % block_k == 0:
-        return None
+    block_k = min(max(block_k, _AFP4WFP4_MIN_BLOCK_K), 1 << (k - 1).bit_length())
     while block_k > _AFP4WFP4_MIN_BLOCK_K and k % block_k:
         block_k //= 2
     return block_k if k % block_k == 0 else None
@@ -65,6 +63,16 @@ if _is_hip:
         pass
 
 
+@functools.cache
+def _warn_no_even_k_block(k: int) -> None:
+    logger.warning(
+        "MXFP4 gemm_afp4wfp4: K=%d has no power-of-two BLOCK_SIZE_K >= %d dividing it; "
+        "it keeps the masked K-tail path of triton-lang/triton#11256.",
+        k,
+        _AFP4WFP4_MIN_BLOCK_K,
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
     # None keeps AITER's own config selection.
@@ -76,10 +84,15 @@ def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
         # No config file or M bucket for this shape.
         return None
     if config["NUM_KSPLIT"] != 1:
-        # Split-K configs are left to AITER's get_splitk, which searches for an even K split.
+        # Split-K configs are left to AITER's get_splitk;
+        # the stale-LDS NaN did not reproduce on the M <= 8 split-K defaults on MI355X.
         return None
-    block_k = _afp4wfp4_even_k_block(block_k=config["BLOCK_SIZE_K"], k=2 * k_packed)
-    return config if block_k is None else {**config, "BLOCK_SIZE_K": block_k}
+    k = 2 * k_packed
+    even_block_k = _afp4wfp4_even_k_block(block_k=config["BLOCK_SIZE_K"], k=k)
+    if even_block_k is None:
+        _warn_no_even_k_block(k)
+        return None
+    return {**config, "BLOCK_SIZE_K": even_block_k}
 
 
 # Keep this path opt-in while the AITER ASM integration is validated across the
@@ -236,7 +249,7 @@ if _is_hip:
             w_scales,
             y.dtype,
             y,
-            config=None if config is None else dict(config),
+            config=config,
         )
 
     def _aiter_gemm_afp4wfp4_fake(

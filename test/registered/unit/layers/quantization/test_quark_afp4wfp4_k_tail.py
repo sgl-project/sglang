@@ -72,11 +72,15 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
 
     def _assert_matches_reference(self):
         from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            _aiter_afp4wfp4_get_config,
             gemm_afp4wfp4,
         )
 
         for m, (x_q, x_s, ref) in self.inputs.items():
             with self.subTest(m=m):
+                aiter_config, _ = _aiter_afp4wfp4_get_config(m, N, K // 2)
+                # Guard the premise: once AITER tunes this shape to an even block, pick another.
+                self.assertNotEqual(K % aiter_config["BLOCK_SIZE_K"], 0)
                 y = torch.zeros((m, N), dtype=torch.bfloat16, device="cuda")
                 # 0xFF is a NaN E8M0 scale; a K-tail that reads stale LDS turns it into NaN.
                 self.lds_fill(0xFF)
