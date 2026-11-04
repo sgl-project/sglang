@@ -6,11 +6,10 @@ import ctypes
 import logging
 import os
 import subprocess
-import tempfile
 
 import torch
 
-from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
+from sglang.kernels.jit.utils.hipcc import HipKernel, build_gfx950_module
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
@@ -61,12 +60,8 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
             torch.zeros(64 * 17, dtype=torch.int32, device=x.device),
         )
     if not _kernels:
-        co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_router_"), "r.co")
-        cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            mod = ctypes.c_void_p()
-            check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
+            mod = build_gfx950_module(_SRC, "sglang_smallm_router_")
             _kernels.update({r: HipKernel(mod, f"smallm_router_r{r}") for r in (1, 2)})
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
             logger.warning("smallm_router disabled: %s", e)

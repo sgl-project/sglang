@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
+import tempfile
 
 import torch
 
@@ -84,6 +86,20 @@ class HipKernel:
 
 def hipcc_path():
     return os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc")
+
+
+def build_gfx950_module(src: str, prefix: str) -> ctypes.c_void_p:
+    """Compile ``src`` for gfx950 with hipcc into a fresh temp dir and load it.
+
+    Raises OSError / subprocess.CalledProcessError (with text stderr) when hipcc
+    fails, and RuntimeError when the code object does not load.
+    """
+    co = os.path.join(tempfile.mkdtemp(prefix=prefix), "k.co")
+    cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, src]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    mod = ctypes.c_void_p()
+    check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "hipModuleLoad")
+    return mod
 
 
 def hip_version():

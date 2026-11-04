@@ -4,11 +4,15 @@ import ctypes
 import logging
 import os
 import subprocess
-import tempfile
 
 import torch
 
-from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
+from sglang.kernels.jit.utils.hipcc import (
+    HipKernel,
+    build_gfx950_module,
+    check_hip,
+    hip_lib,
+)
 from sglang.srt.environ import envs
 
 _SRC = os.path.join(os.path.dirname(__file__), "smallm_fp8_blockscale_gemm.hip")
@@ -51,12 +55,8 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
     ):
         return None
     if _mod is None:
-        co = os.path.join(tempfile.mkdtemp(), "k.co")
-        cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            _mod = ctypes.c_void_p()
-            check_hip(hip_lib().hipModuleLoad(ctypes.byref(_mod), co.encode()), "load")
+            _mod = build_gfx950_module(_SRC, "sglang_smallm_fp8_bs_")
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
             _mod = False
             logger.warning("smallm_fp8_bs disabled: %s", e)
