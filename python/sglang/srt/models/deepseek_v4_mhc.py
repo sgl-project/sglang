@@ -373,8 +373,13 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     ):
         parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
 
+    bf16_decode_grid = (
+        bf16_parts is not None
+        and get_platform().is_blackwell
+        and x_flat.shape[0] < 4096
+    )
     use_bf16_projection = bf16_parts is not None and (
-        hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+        hopper_medium or bf16_decode_grid or 4096 <= x_flat.shape[0] <= 65536
     )
     hopper_fused_stats = get_platform().is_sm90 and (
         x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
@@ -400,6 +405,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.sinkhorn_iters,
                 cfg.rms_eps,
                 cfg.eps,
+                decode_grid=bf16_decode_grid,
             )
         elif parts is not None:
             from sglang.kernels.ops.layernorm.mhc import (
