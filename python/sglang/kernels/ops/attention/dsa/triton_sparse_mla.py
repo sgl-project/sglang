@@ -18,6 +18,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_core_count, is_gfx95_supported, print_info_once
 
 _ASYNC_COPY_OFF_ARCHES = frozenset({"gfx950"})
@@ -1311,6 +1312,15 @@ def _triton_sparse_mla_fwd_splitk(
 # ---------------------------------------------------------------------------
 
 
+# Verify-sized batches (target verify at TP8: bs x 6 rows) of [16, 512] rows go to the gfx950
+# HIP kernel's split-K form (MI355X, 12 heads, top-2048, us Triton -> HIP: 24 rows 28.6 -> 20.5,
+# 96 rows 89.5 -> 31.2, 192 rows 239 -> 46.3, 288 rows 103 (single-CTA HIP) -> 70.8); at 6 / 12
+# rows the Triton split-K is faster (12.8 / 17.8 vs 18.4 / 19.5), and above 512 the single-CTA
+# HIP kernel fills the GPU on its own.
+_HIP_SPLIT_MIN_ROWS = 16
+_HIP_SPLIT_MAX_ROWS = 512
+
+
 def triton_sparse_mla_fwd(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -1373,6 +1383,28 @@ def triton_sparse_mla_fwd(
                 use_topk_length=True,
                 return_lse=return_lse,
                 bf16_dot=bf16_dot,
+            )
+    if (
+        _HIP_SPLIT_MIN_ROWS <= seq <= _HIP_SPLIT_MAX_ROWS
+        and envs.SGLANG_ROCM_SPARSE_MLA_DECODE_HIP.get()
+        and is_gfx95_supported()
+    ):
+        from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_gfx950 import (
+            sparse_mla_decode_splits,
+            sparse_mla_split_gfx950,
+            supports_sparse_mla_prefill_gfx950,
+        )
+
+        if supports_sparse_mla_prefill_gfx950(q_nope, q_rope, kv, d_v):
+            return sparse_mla_split_gfx950(
+                q_nope,
+                q_rope,
+                kv,
+                indices,
+                sm_scale,
+                sparse_mla_decode_splits(seq),
+                d_v=d_v,
+                return_lse=return_lse,
             )
     if base_ctas > num_cu and is_gfx95_supported():
         from sglang.kernels.ops.attention.dsa.sparse_mla_prefill_gfx950 import (

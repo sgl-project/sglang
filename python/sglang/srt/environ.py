@@ -994,6 +994,10 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # triton_sparse_mla_fwd calls of 16..512 query rows (TP8 target verify, bs x 6 rows;
+    # H <= 16) on that HIP kernel's split-K form: each row's top-k over
+    # sparse_mla_decode_splits(rows) CTAs and an fp32 log-sum-exp combine.
+    SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
     # gfx950 DSA sparse MLA decode / verify over fp8_ds_mla KV with the MXFP8 kernel ported
     # from aiter's opus decode (Q quantized to MXFP8) instead of the Triton split-K kernel.
     SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
