@@ -37,6 +37,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (  # noqa: E402
     _handle_output_by_index,
+    _handle_output_by_indices,
 )
 from sglang.srt.managers.scheduler_components.output_streamer import (  # noqa: E402
     OutputSink,
@@ -132,6 +133,10 @@ class TestCacheWriteTransport(CacheWriteTransportTestCase):
             with self.subTest(payload=type(payload).__name__):
                 received = msgpack_decode(msgpack_encode(payload))
                 self.assertEqual(received.cache_write_tokens, [None, 0, 16])
+                grouped = _handle_output_by_indices(received, [2, 0, 1])
+                grouped = msgpack_decode(msgpack_encode(grouped))
+                self.assertEqual(grouped.rids, ["cache-2", "cache-0", "cache-1"])
+                self.assertEqual(grouped.cache_write_tokens, [16, None, 0])
                 for index, value in enumerate([None, 0, 16]):
                     routed = _handle_output_by_index(received, index)
                     routed = msgpack_decode(msgpack_encode(routed))

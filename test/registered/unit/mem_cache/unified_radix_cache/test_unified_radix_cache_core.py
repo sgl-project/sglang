@@ -7,10 +7,8 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-)
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -37,18 +35,18 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     UpdatePendingBackupOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    EvictLayer,
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeNode,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceLeafResult,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,
-    UnifiedLRUList,
     UnifiedRadixCache,
-    UnifiedTreeNode,
     _OngoingWriteThrough,
 )
 from sglang.srt.runtime_context import (
