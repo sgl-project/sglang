@@ -9,24 +9,28 @@ pause word, so a foreground bracket stops every transfer on the link at the
 next chunk boundary and restarts it without resubmitting anything::
 
     chain = TransferChain(Link.PCIE_H2D)  # once per owner, on its device
-    chain.run(copy_chunks(dst, src, 16 << 20))  # after the current stream
+    landed = chain.run(copy_chunks(dst, src, 16 << 20))  # returns at once
     ...
     with paused_background_transfers(Link.PCIE_H2D):
         latency_critical_op()  # the chunks wait at their next boundary
     ...
-    chain.wait()  # the current stream waits for the transfer to land
+    chain.wait(landed)  # the current stream waits for the transfer to land
 
 A chunk is any callable ``chunk(stream)`` (``ChunkOp``), run with ``stream``
 current: it may enqueue its work through any API that uses the current
 stream (``tensor.copy_``, ``PyNcclCommunicator`` calls, the HiCache transfer
 kernels) or through ``stream`` itself, and ``copy_chunks`` builds copy-engine
-chunks. A chunk must not allocate, sync or wait on the host, since it may be
-enqueued behind a paused gate. The chunk size bounds how long a pause takes
-to land. Chunks that are NCCL calls pause only this rank's side: a peer
-whose chunk already passed its gate waits inside NCCL for the whole pause
-(on SMs for kernel collectives), so prefer copy-engine collectives, small
-chunks, and a communicator no foreground op uses (NCCL orders every op of a
-communicator).
+chunks. A chunk may run after ``run`` returned, on the chain's feeder thread
+(below), so it must not depend on state its caller scopes around ``run``
+(a chunk calling NCCL enters ``change_state`` itself). It must not allocate,
+sync or wait on the host, since it may be enqueued behind a paused gate, and
+should enqueue little (a copy, a collective): the chain bounds the ops it
+keeps queued, not what each one enqueues. The chunk size bounds how long a
+pause takes to land. Chunks that are NCCL calls
+pause only this rank's side: a peer whose chunk already passed its gate
+waits inside NCCL for the whole pause (on SMs for kernel collectives), so
+prefer copy-engine collectives, small chunks, and a communicator no
+foreground op uses (NCCL orders every op of a communicator).
 
 How it works:
 - Gate: one pause word per link and device, in pinned, device-mapped host
@@ -34,21 +38,35 @@ How it works:
   resume, with ``cuStreamWriteValue32`` in the order of the bracketed op's
   stream. Only the thread that paused a gate resumes it; a bracket on
   another thread leaves that gate alone. A bracket pauses only gates on the
-  current device with a run in flight (a host flag keeps the drained case
-  free). A run issued once the bracketed op is enqueued, after the
-  bracketing stream (the default ``after``), starts behind the op; a run
-  issued meanwhile from another thread, or after another stream, may
-  overlap a bracket that found its gate drained.
+  current device with a run that has not landed. A run issued once the
+  bracketed op is enqueued, after the bracketing stream (the default
+  ``after``), starts behind the op; a run issued meanwhile from another
+  thread, or after another stream, may overlap a bracket that found its gate
+  drained.
 - Chain: a stream may evaluate a wait ahead of the work queued before it,
   which would let several chunks pass their gates before a pause lands.
   Chunks alternate between the chain's two streams and each waits for an
-  event of what precedes it (the first chunk: the setup ops and the whole
-  previous run), so a gate is read only once the work before it retired and
-  at most one chunk per chain drains after a pause. The chain creates its
-  streams (``cuStreamCreate``; a pooled ``torch.cuda.Stream`` may be the
-  forward's own stream) and never destroys them: torch may still record
-  events on a stream a chunk used (freeing a pinned block a ``tensor.copy_``
-  used), so a chain lives as long as the process.
+  event of the op before it (the first chunk of a run: its setup ops and the
+  whole previous run), so a gate is read only once the work before it
+  retired and at most one chunk per chain drains after a pause. The chain
+  creates its streams (``cuStreamCreate``; a pooled ``torch.cuda.Stream`` may
+  be the forward's own stream) and never destroys them: torch may still
+  record events on a stream a chunk used (freeing a pinned block a
+  ``tensor.copy_`` used), so a chain lives as long as the process.
+- Submission: a chain keeps at most ``_WINDOW`` ops queued on the GPU, since
+  a stream queue full of chunks parked behind a pause blocks the thread
+  that enqueues more. ``run`` enqueues at most a window of ops itself, and
+  the chain's feeder thread enqueues the rest, in order, as earlier ops
+  retire: ``run`` never waits for the GPU, and does not push back on a
+  caller that outruns its link either (its runs queue up on the host).
+  After a run's last op the GPU writes the run's ticket to a host-mapped
+  word, which ``query`` reads. ``wait`` makes a stream wait for it only
+  once the whole run is enqueued: a stream waiting on work not enqueued yet
+  can hold a hardware queue, or the driver, that the rest of the run needs.
+  So ``wait`` blocks the host while a run longer than the window is still
+  queued, behind a pause or a busy link: issue whatever its ops wait on
+  first. If the chain's own driver calls fail, it fails for good: its
+  pending runs are dropped and raise instead of landing.
 
 Hazards: a parked gate wait holds its stream's hardware queue, and later
 work of every stream mapped to that queue (``CUDA_DEVICE_MAX_CONNECTIONS``)
@@ -59,13 +77,10 @@ load (a kernel's first launch, an NCCL lazy connect) or a device-wide sync
 (``cudaFree`` when an allocation misses the cache) inside a bracket, or a
 stream waiting on the paused transfer inside the bracket (``wait`` refuses
 that on the pausing thread). So bracket only the communication call, after
-its outputs exist. ``run`` enqueues all its chunks at once, and a chain's
-streams hold about a thousand parked chunks (single copies, B200); past
-that, ``run`` blocks the host until the pause ends, so a run issued inside
-a bracket of its own link must stay well below that. A watchdog thread
-(``SGLANG_GATED_TRANSFER_WATCHDOG_MS``) forces open, with a host store, a
-gate whose same pause has been held that long, and logs it: the transfer
-then overlaps the foreground op, a slowdown instead of a hang.
+its outputs exist. A watchdog thread (``SGLANG_GATED_TRANSFER_WATCHDOG_MS``)
+forces open, with a host store, a gate whose same pause has been held that
+long, and logs it: the transfer then overlaps the foreground op, a slowdown
+instead of a hang.
 
 Brackets are eager-only: no-ops under ``torch.compile`` tracing and stream
 capture. Chains refuse capture (a captured chain loses the drain bound).
@@ -73,13 +88,15 @@ capture. Chains refuse capture (a captured chain loses the drain bound).
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import enum
+import functools
 import logging
 import threading
 import time
 from contextlib import nullcontext
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Deque, List, NoReturn, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -92,7 +109,13 @@ except ImportError:  # a build without cuda-python: no transfer can run
 
 logger = logging.getLogger(__name__)
 
-_WAIT_EQ = 0x1  # cuda.h: CU_STREAM_WAIT_VALUE_EQ
+# cuda.h CUstreamWaitValue_flags: EQ, and GEQ ((int32_t)(*addr - value) >= 0).
+_WAIT_EQ = 0x1
+_WAIT_GEQ = 0x0
+# Ops a chain keeps queued on the GPU. Its streams take about a thousand
+# single-copy chunks before enqueueing more blocks the host (B200); this
+# leaves room for chunks that enqueue more work. Arbitrary below that.
+_WINDOW = 64
 
 
 class Link(enum.Flag):
@@ -110,31 +133,40 @@ class Link(enum.Flag):
 ChunkOp = Callable[[torch.cuda.Stream], None]
 
 
-def _create_event():
+def _create_event(blocking: bool = False):
+    flags = cu.CUevent_flags.CU_EVENT_DISABLE_TIMING
+    if blocking:  # a host wait sleeps instead of spinning a core
+        flags |= cu.CUevent_flags.CU_EVENT_BLOCKING_SYNC
+    return check_drv(cu.cuEventCreate(flags), "cuEventCreate")
+
+
+def _relax_capture_mode():
+    """Let this thread query and wait on events while another thread runs a
+    global-mode capture, which those calls would otherwise invalidate.
+    Returns the previous mode."""
     return check_drv(
-        cu.cuEventCreate(cu.CUevent_flags.CU_EVENT_DISABLE_TIMING), "cuEventCreate"
-    )
-
-
-def _events_done(events) -> bool:
-    """Whether every event has completed. Queries in relaxed capture mode: a
-    query is otherwise an unsafe call that invalidates a global capture
-    running on another thread."""
-    mode = check_drv(
         cu.cuThreadExchangeStreamCaptureMode(
             cu.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
         ),
         "capture mode",
     )
+
+
+def _event_done(event) -> bool:
+    mode = _relax_capture_mode()
     try:
-        for event in events:
-            result = cu.cuEventQuery(event)
-            if result[0] == cu.CUresult.CUDA_ERROR_NOT_READY:
-                return False
-            check_drv(result, "cuEventQuery")
+        result = cu.cuEventQuery(event)
+        if result[0] == cu.CUresult.CUDA_ERROR_NOT_READY:
+            return False
+        check_drv(result, "cuEventQuery")
         return True
     finally:
         cu.cuThreadExchangeStreamCaptureMode(mode)
+
+
+def _reached(ticket: int, target: int) -> bool:
+    """Whether the 32-bit run ticket ``ticket`` is at or past ``target``."""
+    return (ticket - target) & 0xFFFFFFFF < 0x80000000
 
 
 def _bind_context(device: int) -> None:
@@ -150,6 +182,24 @@ def _bind_context(device: int) -> None:
     check_drv(cu.cuCtxSetCurrent(context), "cuCtxSetCurrent")
 
 
+def _host_word() -> Tuple[ctypes.c_uint32, int]:
+    """A zeroed uint32 in pinned, device-mapped host memory, never freed, and
+    its device address: streams wait on it or write it, the host reads or
+    writes it directly. Needs the device's context current."""
+    host = check_drv(
+        cu.cuMemHostAlloc(
+            64, cu.CU_MEMHOSTALLOC_PORTABLE | cu.CU_MEMHOSTALLOC_DEVICEMAP
+        ),
+        "cuMemHostAlloc",
+    )
+    address = check_drv(
+        cu.cuMemHostGetDevicePointer(host, 0), "cuMemHostGetDevicePointer"
+    )
+    word = ctypes.c_uint32.from_address(host)
+    word.value = 0
+    return word, int(address)
+
+
 # ---- gates --------------------------------------------------------------------
 
 
@@ -159,27 +209,12 @@ class _Gate:
     def __init__(self, link: Link, device: int):
         self.link = link
         self.device = device
-        # Host memory the GPU waits on, so the watchdog can open it with a
-        # plain store. Never freed: gates live as long as the process. Made
-        # by a chain, with its device's context current.
-        host = check_drv(
-            cu.cuMemHostAlloc(
-                64, cu.CU_MEMHOSTALLOC_PORTABLE | cu.CU_MEMHOSTALLOC_DEVICEMAP
-            ),
-            "cuMemHostAlloc",
-        )
-        address = check_drv(
-            cu.cuMemHostGetDevicePointer(host, 0), "cuMemHostGetDevicePointer"
-        )
-        self.address = int(address)
-        self._word = ctypes.c_uint32.from_address(host)
-        self._word.value = 0
+        # The watchdog opens it with a plain host store.
+        self._word, self.address = _host_word()
         self._seq = 0
+        # Replaced, never mutated: brackets read it without the lock.
+        self._chains: Tuple[TransferChain, ...] = ()
         self._lock = threading.Lock()
-        # Every chain's last-run event, and whether one may be in flight: set
-        # by a run, cleared by a query that sees them all retired.
-        self._chain_events = []
-        self._maybe_pending = False
         # The bracket that paused the gate: its thread resumes it, on the
         # stream that paused it.
         self._pause_thread: Optional[int] = None
@@ -213,19 +248,12 @@ class _Gate:
         """Open the gate from the host, behind every stream's back."""
         self._word.value = 0
 
-    def note_run(self) -> None:
-        with self._lock:
-            self._maybe_pending = True
-
-    def has_pending(self) -> bool:
-        """Whether a chain on this gate may still have a run in flight."""
-        if not self._maybe_pending:
-            return False
-        with self._lock:
-            # A chain notes a run under this lock once it has recorded it, so
-            # no run noted meanwhile is cleared.
-            self._maybe_pending = not _events_done(self._chain_events)
-            return self._maybe_pending
+    def busy(self) -> bool:
+        """Whether a chain on this gate has a run that has not landed."""
+        for chain in self._chains:
+            if chain._landed.value != chain._issued:
+                return True
+        return False
 
 
 # Brackets and the watchdog iterate this tuple without the lock; it is
@@ -234,15 +262,17 @@ _gates: Tuple[_Gate, ...] = ()
 _registry_lock = threading.Lock()
 
 
-def _get_gate(link: Link, device: int) -> _Gate:
+def _add_chain(link: Link, device: int, chain: TransferChain) -> _Gate:
+    """The gate of ``link`` on ``device``, created on first use, with
+    ``chain`` added to it."""
     global _gates
     with _registry_lock:
-        for gate in _gates:
-            if gate.link == link and gate.device == device:
-                return gate
-        gate = _Gate(link, device)
-        _gates = _gates + (gate,)
-        _start_watchdog()
+        gate = next((g for g in _gates if g.link == link and g.device == device), None)
+        if gate is None:
+            gate = _Gate(link, device)
+            _gates = _gates + (gate,)
+            _start_watchdog()
+        gate._chains = gate._chains + (chain,)
         return gate
 
 
@@ -313,15 +343,26 @@ def _check_held(gate: _Gate, now: float, timeout: float) -> bool:
 # ---- chains -----------------------------------------------------------------------
 
 
+class _Run:
+    """A run's ops, enqueued in order: the wait for its ``after`` work, the
+    setup ops, the chunks (``gated``), the finish ops, the ticket write."""
+
+    __slots__ = ("ops", "gated", "ticket", "next")
+
+    def __init__(self, ops: List[ChunkOp], gated: range, ticket: int):
+        self.ops, self.gated, self.ticket = ops, gated, ticket
+        self.next = 0  # the next op to enqueue
+
+
 class TransferChain:
     """Runs background transfers (any ``ChunkOp`` chunks) on the chain's own
     streams, each chunk behind the pause word of ``link``; ``link=None``
     never pauses (one plain transfer stream).
 
-    One chain per transfer owner, for the life of the process (its streams
-    and events are never released). It belongs to the device current at
-    construction: call ``run`` and ``wait`` with that device current, from
-    one host thread at a time.
+    One chain per transfer owner, for the life of the process (its streams,
+    events and feeder thread are never released). It belongs to the device
+    current at construction: call ``run`` and ``wait`` with that device
+    current, and ``run`` from one host thread at a time.
     """
 
     def __init__(self, link: Optional[Link]):
@@ -342,16 +383,35 @@ class TransferChain:
             torch.cuda.ExternalStream(int(h), device=torch.device("cuda", self.device))
             for h in self._handles
         )
-        # _chunk_done[i]: after the last chunk on stream i; the next chunk,
-        # on the other stream, waits for it.
-        self._chunk_done = (_create_event(), _create_event())
-        self._after = _create_event()
-        self._last = _create_event()
-        self._gate = None
-        if link is not None:
-            self._gate = _get_gate(link, self.device)
-            with self._gate._lock:
-                self._gate._chain_events.append(self._last)
+        # _ring[j % _WINDOW] is recorded after op j: the next op, on the
+        # other stream, waits for it, and op j + _WINDOW is enqueued once it
+        # has completed. Only the events _make_room waits on block: recording
+        # a blocking event costs ~1 us more on the host (B200).
+        half = _WINDOW // 2
+        self._ring = tuple(
+            _create_event(blocking=j % half == half - 1) for j in range(_WINDOW)
+        )
+        self._spare_events: List = []  # `after` events whose waits are enqueued
+        # The ticket of the last run that landed, written by the GPU.
+        self._landed, self._landed_address = _host_word()
+        self._issued = 0  # the last run's ticket
+        self._enqueued_run = 0  # the last run with all its ops enqueued
+        self._enqueued = 0  # ops enqueued on the GPU
+        self._retired = 0  # of which known to have completed
+        self._stream = 0  # the stream of the last op enqueued
+        self._pending: Deque[_Run] = collections.deque()  # not fully enqueued
+        # _pending, _issued, _enqueued_run, _error, _failed, the wakeups.
+        self._lock = threading.Lock()
+        self._more = threading.Condition(self._lock)
+        self._run_enqueued = threading.Condition(self._lock)
+        self._submitting = threading.Lock()  # held while enqueuing ops
+        self._error: Optional[BaseException] = None  # an op's, raised once
+        self._failed: Optional[BaseException] = None  # the chain's, for good
+        self._gate = None if link is None else _add_chain(link, self.device, self)
+        self._feeder = threading.Thread(
+            target=self._feed, name="gated-transfer-feeder", daemon=True
+        )
+        self._feeder.start()
 
     def run(
         self,
@@ -359,122 +419,264 @@ class TransferChain:
         *,
         setup: Sequence[ChunkOp] = (),
         finish: Sequence[ChunkOp] = (),
-        done: Optional[torch.cuda.Event] = None,
         after: Optional[torch.cuda.Stream] = None,
-    ) -> None:
+    ) -> int:
         """Enqueue one transfer behind the work queued so far on ``after``
         (default: the current stream): the ``setup`` ops, the ``chunks``
         (each behind the gate), then the ``finish`` ops, all ungated but the
-        chunks; then record ``done``. ``after`` only gets an event recorded.
+        chunks. Returns its ticket for ``wait`` and ``query``: a 32-bit
+        count, valid for the next 2^31 runs.
 
-        If an op raises, the work enqueued before it stays tracked: ``done``
-        is still recorded, and ``wait`` and the brackets still see it.
+        Never waits for the GPU or the feeder thread, and enqueues at most a
+        window of ops itself: the feeder thread enqueues the rest, in order,
+        as earlier ones retire. An op that raises skips the rest of its run,
+        whose ticket still lands once the work enqueued before has run; the
+        error is raised here, or by the next ``run`` or ``wait`` if the
+        feeder thread hit it.
         """
         self._use_device()
+        self._raise_feeder_error()
         caller = torch.cuda.current_stream(self.device)
         after_handle = (caller if after is None else after).cuda_stream
         if check_drv(cu.cuStreamIsCapturing(after_handle), "cuStreamIsCapturing"):
             raise RuntimeError("background transfers cannot be graph-captured")
-        primary = self._streams[0]
-        check_drv(cu.cuEventRecord(self._after, after_handle), "cuEventRecord")
-        check_drv(
-            cu.cuStreamWaitEvent(self._handles[0], self._after, 0),
-            "cuStreamWaitEvent",
-        )
-        gated = self._gate is not None and bool(chunks)
         try:
-            # Every op runs with its stream current, so ops written against
-            # the current stream need no adapting.
-            torch.cuda.set_stream(primary)
-            for op in setup:
-                op(primary)
-            if gated:
-                self._run_gated(chunks)
-            else:
-                for op in chunks:
-                    op(primary)
-            for op in finish:
-                op(primary)
-        finally:
-            torch.cuda.set_stream(caller)
-            check_drv(cu.cuEventRecord(self._last, self._handles[0]), "cuEventRecord")
-            # Before done: brackets must see the run even if done.record raises.
-            if gated:
-                self._gate.note_run()
-            if done is not None:
-                done.record(primary)
-
-    def _run_gated(self, chunks: Sequence[ChunkOp]) -> None:
-        handles, streams, chunk_done = self._handles, self._streams, self._chunk_done
-        wait_event, record, wait32 = (
-            cu.cuStreamWaitEvent,
-            cu.cuEventRecord,
-            cu.cuStreamWaitValue32,
+            event = self._spare_events.pop()
+        except IndexError:
+            event = _create_event()
+        check_drv(cu.cuEventRecord(event, after_handle), "cuEventRecord")
+        ticket = (self._issued + 1) & 0xFFFFFFFF
+        first = 1 + len(setup)
+        run = _Run(
+            [
+                functools.partial(self._wait_after, event),
+                *setup,
+                *chunks,
+                *finish,
+                functools.partial(self._write_ticket, ticket),
+            ],
+            range(first, first + len(chunks) if self._gate is not None else first),
+            ticket,
         )
-        word = self._gate.address
-        # Chunk k runs on stream (k + 1) % 2 behind the event of what
-        # precedes it, so chunk 0 (on the second stream) waits for the setup
-        # ops and the whole previous run, which all ran on the primary.
-        check_drv(record(chunk_done[0], handles[0]), "chunk chain (cuEventRecord)")
-        i = 0
-        try:
-            for k, op in enumerate(chunks):
-                i = (k + 1) & 1
-                handle = handles[i]
-                result = wait_event(handle, chunk_done[i ^ 1], 0)
-                if result[0]:
-                    check_drv(result, "chunk chain (cuStreamWaitEvent)")
-                result = wait32(handle, word, 0, _WAIT_EQ)
-                if result[0]:
-                    check_drv(result, "pause gate (cuStreamWaitValue32)")
-                torch.cuda.set_stream(streams[i])
-                op(streams[i])
-                result = record(chunk_done[i], handle)
-                if result[0]:
-                    check_drv(result, "chunk chain (cuEventRecord)")
-        finally:
-            torch.cuda.set_stream(streams[0])
-            # The last chunk ran on the second stream: join that stream at
-            # its end (also when the chunk raised after enqueuing work, so
-            # never recorded its event).
-            if i:
-                check_drv(
-                    record(chunk_done[1], handles[1]), "chunk chain (cuEventRecord)"
-                )
-                check_drv(
-                    wait_event(handles[0], chunk_done[1], 0),
-                    "chunk chain (cuStreamWaitEvent)",
-                )
+        with self._lock:
+            if self._failed is not None:
+                self._raise_failed()
+            self._issued = ticket
+            self._pending.append(run)
+        error = None
+        if self._submitting.acquire(blocking=False):  # else the feeder is at it
+            try:
+                error = self._enqueue_pending(block=False, budget=_WINDOW)
+            finally:
+                self._submitting.release()
+                torch.cuda.set_stream(caller)
+        if self._pending:
+            with self._lock:
+                self._more.notify()
+        if error is not None:
+            raise error
+        return ticket
 
     def wait(
         self,
-        done: Optional[torch.cuda.Event] = None,
+        ticket: Optional[int] = None,
         *,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        """Make ``stream`` (default: the current stream) wait for ``done``
-        (a run's ``done`` event; default: the last run). Refused inside a
-        bracket of this thread that paused this chain: the stream would wait
-        on chunks parked behind its own pause."""
+        """Make ``stream`` (default: the current stream) wait until the run
+        of ``ticket`` (default: the last run) has landed. Blocks the host
+        until that run is fully enqueued (see the module docstring). Refused
+        inside a bracket of this thread that paused this chain: the stream
+        would wait on chunks parked behind its own pause."""
         if self._gate is not None and self._gate._pause_thread == threading.get_ident():
             raise RuntimeError(
                 "waiting on a gated transfer inside the bracket that paused it "
                 "would deadlock"
             )
         self._use_device()
+        ticket = self._issued if ticket is None else ticket
+        with self._lock:
+            if not _reached(self._issued, ticket):
+                raise ValueError(f"ticket {ticket} is not one of the last 2^31 runs")
+            while not _reached(self._enqueued_run, ticket):
+                if self._failed is not None:
+                    self._raise_failed()
+                self._run_enqueued.wait()
+        self._raise_feeder_error()
         if stream is None:
             stream = torch.cuda.current_stream(self.device)
-        if done is not None:
-            stream.wait_event(done)
-        else:
-            check_drv(
-                cu.cuStreamWaitEvent(stream.cuda_stream, self._last, 0),
-                "cuStreamWaitEvent",
-            )
+        check_drv(
+            cu.cuStreamWaitValue32(
+                stream.cuda_stream, self._landed_address, ticket, _WAIT_GEQ
+            ),
+            "cuStreamWaitValue32",
+        )
+
+    def query(self, ticket: Optional[int] = None) -> bool:
+        """Whether the run of ``ticket`` (default: the last run) has landed."""
+        ticket = self._issued if ticket is None else ticket
+        if _reached(self._landed.value, ticket):
+            return True
+        if self._failed is not None and not _reached(self._enqueued_run, ticket):
+            self._raise_failed()
+        return False
 
     def _use_device(self) -> None:
         assert torch.cuda.current_device() == self.device, "use a chain on its device"
         _bind_context(self.device)
+
+    def _raise_failed(self) -> NoReturn:
+        raise RuntimeError(
+            "the gated transfer chain failed and dropped its pending runs"
+        ) from self._failed
+
+    def _raise_feeder_error(self) -> None:
+        if self._error is None:
+            return
+        with self._lock:
+            error, self._error = self._error, None
+        if error is not None:
+            raise RuntimeError(
+                "a gated transfer op failed on the feeder thread"
+            ) from error
+
+    def _enqueue_pending(
+        self, block: bool, budget: Optional[int] = None
+    ) -> Optional[BaseException]:
+        """Enqueue pending ops, oldest first, while the window has room
+        (``block``: wait for room; the feeder thread) and ``budget`` lasts.
+        An op that raises skips the rest of its run but the ticket write; the
+        first such error is returned, or on the feeder thread recorded before
+        the run counts as enqueued. If the chain's own driver calls fail, or
+        an interrupt leaves its state unknown, the chain fails (``_fail``)
+        and the error is raised."""
+        error = None
+        try:
+            while self._pending:
+                run = self._pending[0]
+                ops, last = run.ops, len(run.ops) - 1
+                while run.next <= last:
+                    if budget is not None:
+                        if budget == 0:
+                            return error
+                        budget -= 1
+                    full = self._enqueued - self._retired >= _WINDOW
+                    if full and not self._make_room(block):
+                        return error
+                    i = run.next
+                    run.next = i + 1
+                    failed = self._enqueue(ops[i], i in run.gated)
+                    if failed is None:
+                        continue
+                    if i == 0 or i == last:  # the chain's own driver calls
+                        raise failed
+                    if block:
+                        with self._lock:
+                            self._error = self._error or failed
+                        logger.error(
+                            "Gated transfer: an op failed on the feeder thread",
+                            exc_info=failed,
+                        )
+                    error = error or failed
+                    run.next = last
+                with self._lock:
+                    self._pending.popleft()
+                    self._enqueued_run = run.ticket
+                    self._run_enqueued.notify_all()
+            return error
+        except BaseException as e:
+            self._fail(e)
+            raise
+
+    def _fail(self, error: BaseException) -> None:
+        """Fail the chain for good (the caller holds ``_submitting``): drop
+        every pending run; ``run`` raises from now on, and so do ``wait``
+        and ``query`` on a dropped run. No stream waits on a dropped run:
+        ``wait`` enqueues only behind a fully enqueued one."""
+        with self._lock:
+            self._failed = self._failed or error
+            self._pending.clear()
+            self._run_enqueued.notify_all()
+
+    def _make_room(self, block: bool) -> bool:
+        """Whether the oldest half of the window has completed (``block``:
+        wait for it). The window fills at a whole number of halves, so the
+        op waited on is the last of a half, whose event blocks."""
+        target = self._enqueued - _WINDOW // 2 - 1
+        event = self._ring[target % _WINDOW]
+        if block:
+            check_drv(cu.cuEventSynchronize(event), "cuEventSynchronize")
+        elif not _event_done(event):
+            return False
+        self._retired = target + 1
+        return True
+
+    def _enqueue(self, op: ChunkOp, gated: bool) -> Optional[BaseException]:
+        """Enqueue one op: chunks alternate between the two streams and wait
+        at the gate, the other ops run on the primary stream. An op on
+        another stream than the op before it first waits for that op, so a
+        gate is read only once the work before it retired. Returns what the
+        op raised; the chain's own driver calls raise."""
+        i = 1 - self._stream if gated else 0
+        handle, ring, j = self._handles[i], self._ring, self._enqueued
+        if i != self._stream:
+            result = cu.cuStreamWaitEvent(handle, ring[(j - 1) % _WINDOW], 0)
+            if result[0]:
+                check_drv(result, "chain (cuStreamWaitEvent)")
+            self._stream = i
+        if gated:
+            result = cu.cuStreamWaitValue32(handle, self._gate.address, 0, _WAIT_EQ)
+            if result[0]:
+                check_drv(result, "pause gate (cuStreamWaitValue32)")
+        stream = self._streams[i]
+        torch.cuda.set_stream(stream)
+        failed = None
+        try:
+            op(stream)
+        except BaseException as e:  # SystemExit too: it would kill the feeder
+            failed = e
+        # Also after an op that raised: the work it enqueued is tracked.
+        result = cu.cuEventRecord(ring[j % _WINDOW], handle)
+        if result[0]:
+            check_drv(result, "chain (cuEventRecord)")
+        self._enqueued = j + 1
+        return failed
+
+    def _wait_after(self, event, stream: torch.cuda.Stream) -> None:
+        result = cu.cuStreamWaitEvent(stream.cuda_stream, event, 0)
+        if result[0]:
+            check_drv(result, "after (cuStreamWaitEvent)")
+        self._spare_events.append(event)
+
+    def _write_ticket(self, ticket: int, stream: torch.cuda.Stream) -> None:
+        result = cu.cuStreamWriteValue32(
+            stream.cuda_stream, self._landed_address, ticket, 0
+        )
+        if result[0]:
+            check_drv(result, "ticket (cuStreamWriteValue32)")
+
+    def _feed(self) -> None:
+        """The feeder thread: enqueues what ``run`` left pending, waiting for
+        the window to drain. Ops run here with the chain's stream current."""
+        try:
+            torch.cuda.set_device(self.device)
+            _bind_context(self.device)
+            _relax_capture_mode()
+        except BaseException as e:
+            logger.error("Gated transfer: the feeder thread failed", exc_info=e)
+            with self._submitting:
+                self._fail(e)
+            return
+        while True:
+            with self._lock:
+                while not self._pending:
+                    self._more.wait()
+            with self._submitting:
+                try:
+                    self._enqueue_pending(block=True)
+                except BaseException as e:  # the chain failed
+                    logger.error("Gated transfer: the feeder thread failed", exc_info=e)
+                    return
 
 
 # ---- foreground brackets ------------------------------------------------------
@@ -498,15 +700,15 @@ class _PausedTransfers:
                 # enclosing one on this thread, or one on another thread.
                 if (
                     not gate.link & self._links
-                    or not gate._maybe_pending
                     or gate._pause_thread is not None
+                    or not gate.busy()
                 ):
                     continue
                 if device is None:
                     if torch.cuda.is_current_stream_capturing():
                         return
                     device = torch.cuda.current_device()
-                if gate.device != device or not gate.has_pending():
+                if gate.device != device:
                     continue
                 if stream is None:
                     stream = torch.cuda.current_stream(device)
@@ -548,7 +750,7 @@ def _release(paused: List[_Gate]) -> None:
 
 def paused_background_transfers(links: Link) -> Union[_PausedTransfers, nullcontext]:
     """Bracket a latency-critical op issued on the current stream: every
-    background transfer on ``links`` with chunks in flight on this device
+    background transfer on ``links`` with a run in flight on this device
     stops at its next chunk boundary for the op's duration.
 
     Bracket only the communication call: nothing inside may allocate (unless
@@ -595,8 +797,8 @@ def copy_chunks(
 ) -> List[CopyChunk]:
     """Chunks copying ``src`` into ``dst``, ``chunk_bytes`` each (one chunk if
     None): contiguous tensors of equal size, in any direction (H2D, D2H, D2D,
-    P2P); host tensors must be pinned. Keep both alive until the transfer is
-    done."""
+    P2P); host tensors must be pinned. Keep both alive until the transfer
+    has landed."""
     nbytes = dst.numel() * dst.element_size()
     assert nbytes == src.numel() * src.element_size(), "size mismatch"
     assert dst.is_contiguous() and src.is_contiguous()
