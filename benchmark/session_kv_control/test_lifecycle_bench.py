@@ -225,6 +225,60 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(reported, [7000])
         self.assertTrue(result["quiescent"])
 
+    def test_scheduled_job_without_engine_receipt_remains_unknown(self):
+        holder = {}
+
+        def event(task, name, revision, event_id, trial, **fields):
+            if name == "resume_expected":
+                holder["preparation"].done.set()
+                return {
+                    "state": "scheduled",
+                    "known_scope": [{"branch": "main", "end_token": 1}],
+                    "operations": [
+                        {
+                            "action": "sglang.prefetch",
+                            "worker_url": "http://b",
+                            "engine_id": "b",
+                            "owner_epoch": "epoch",
+                            "result": None,
+                            "ready_scope": None,
+                        }
+                    ],
+                }
+            return {}
+
+        router = SimpleNamespace(
+            event=event,
+            poll_ms=1,
+            command=lambda *args: {"acknowledged": True},
+            query=lambda *args: {"quiescent": True, "operations": []},
+        )
+        preparation = lb.Preparation(
+            args_for(),
+            router,
+            SimpleNamespace(
+                http=SimpleNamespace(url="http://b"),
+                cap={"engine_id": "b", "engine_epoch": "epoch"},
+            ),
+            {"session_id": "task"},
+            {"prefix": [1], "salt": "salt"},
+            {
+                "trial": "scheduled",
+                "arm": "lifecycle",
+                "tool_wait_s": 10,
+                "predicted_wait_s": 10,
+            },
+            time.monotonic() + 10,
+            SimpleNamespace(emit=lambda *args, **kwargs: None),
+        )
+        holder["preparation"] = preparation
+        result = preparation.run()
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["child_statuses"], ["unknown"])
+        self.assertFalse(result["strict_preparation_complete"])
+        self.assertEqual(result["prepared_tokens_observed"], 0)
+        self.assertTrue(result["quiescent"])
+
     def test_block_statistics_include_incomplete_and_invalid_responses(self):
         args = args_for(min_arm_seconds=10, min_arm_resumes=3)
         signatures = {}

@@ -5026,3 +5026,9 @@ parent 审阅完整四文件差异，并独立复测 lifecycle/Router 工具 25 
 C8 压力筛选三组 384 次恢复输出一致，生命周期组合组工作吞吐降低 21.6%。注册前等待均值 1143ms，对照为 84ms；task_started 的 HTTP 均值 990ms，对照为 41ms。生命周期组与固定预取组 GET payload 完全相同；Engine 请求总量明显增加，证据支持先减少 actor 串行 RPC 等待，不能将退化直接归因于容量或带宽。
 
 新策略下复用已终结且 quiescent 的操作回执，仍独立验证当前 capabilities、feedback、residency/claim；QUEUED 即使 quiescent 也继续查询。首次提交和 PIN release 新消息至少查询一次。parent 阅读完整差异并独立 HTTP 回归 32 项通过，2.79s；精确 Rust 1.92 格式检查通过。日志：lifecycle-opt/terminal-parent-http-tests.log。正在运行的 C16/C32 保留旧二进制，后续版本重新评估，不混合为同一配置结果。
+
+### O7 — 尚未获得 Engine 回执的计划任务
+
+C16 首轮筛选出现六次工具观测异常：合法 scheduled Job 的 result 为 null，客户端统计 child status 时调用了 dict.get。恢复输出仍全部一致，控制最终均 quiescent；这些原始异常及该轮未通过验收的状态保留。
+
+修正为将未获得回执的 child status 记为 unknown，完整准备保持 false，消费后仍按原路径清理。parent 新增直接覆盖该真实边界的回归，独立 lifecycle 工具 18 项通过，14.824s；selected Ruff、格式及 diff 检查通过。日志：lifecycle-opt/null-receipt-parent-tests.log。正在执行的旧进程不改写，后续新进程采用修复。

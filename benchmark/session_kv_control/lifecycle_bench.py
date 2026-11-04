@@ -508,7 +508,7 @@ class Preparation:
                         break
                     view = self.router.query(self.task, "prepare", trial)
                 result["child_statuses"] = [
-                    op.get("result", {}).get("update", {}).get("status", "unknown")
+                    (op.get("result") or {}).get("update", {}).get("status", "unknown")
                     for op in view.get("operations", [])
                     if op.get("action") == "sglang.prefetch"
                 ]
