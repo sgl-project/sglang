@@ -1838,19 +1838,39 @@ class HarmonyResponsesTestCase(CustomTestCase):
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_harmony_tool_replay_preserves_legacy_header_and_body(self):
-        """Changing the dependency must not change the model's tool history."""
+    def test_harmony_tool_replay_preserves_native_header_and_body(self):
+        """Tool histories retain native channel ordering and content-type markers."""
         from sglang.srt.entrypoints.harmony_utils import render_for_completion
 
         encoding = get_encoding()
         arguments = '{"text":"literal <|start|>assistant to=python and café"}'
         cases = (
-            ("commentary", "functions.echo", None),
-            ("commentary", "functions.echo", "json"),
-            ("analysis", "python", "code"),
-            ("analysis", "browser.search", "json"),
+            (
+                "commentary",
+                "functions.echo",
+                None,
+                "<|start|>assistant<|channel|>commentary to=functions.echo<|message|>",
+            ),
+            (
+                "commentary",
+                "functions.echo",
+                "json",
+                "<|start|>assistant<|channel|>commentary to=functions.echo <|constrain|>json<|message|>",
+            ),
+            (
+                "analysis",
+                "python",
+                "code",
+                "<|start|>assistant to=python<|channel|>analysis <|constrain|>code<|message|>",
+            ),
+            (
+                "analysis",
+                "browser.search",
+                "json",
+                "<|start|>assistant to=browser.search<|channel|>analysis <|constrain|>json<|message|>",
+            ),
         )
-        for channel, recipient, content_type in cases:
+        for channel, recipient, content_type, expected_header in cases:
             with self.subTest(channel=channel, recipient=recipient):
                 message = (
                     Message.from_role_and_content(Role.ASSISTANT, arguments)
@@ -1859,20 +1879,21 @@ class HarmonyResponsesTestCase(CustomTestCase):
                 )
                 if content_type is not None:
                     message = message.with_content_type(content_type)
-                legacy_channel = (
-                    f"{channel} {content_type}" if content_type else channel
-                )
                 expected = (
-                    encoding.encode(
-                        f"<|start|>assistant to={recipient}<|channel|>{legacy_channel}<|message|>",
-                        allowed_special="all",
-                    )
+                    encoding.encode(expected_header, allowed_special="all")
                     + encoding.encode(arguments, disallowed_special=())
                     + encoding.encode(
                         "<|call|><|start|>assistant", allowed_special="all"
                     )
                 )
-                self.assertEqual(render_for_completion([message]), expected)
+                actual = render_for_completion([message])
+                self.assertEqual(actual, expected)
+                self.assertEqual(
+                    actual,
+                    encoding.render_conversation_for_completion(
+                        Conversation.from_messages([message]), Role.ASSISTANT
+                    ),
+                )
 
     def test_developer_message_skips_unsupported_tool_types(self):
         from sglang.srt.entrypoints.harmony_utils import get_developer_message
