@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import sys
 
 import msgspec
+import ninja as ninja_package
 import pytest
 
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -557,6 +559,36 @@ def test_relative_sources_resolve_against_csrc():
         str(KERNEL_PATH / "csrc" / "elementwise" / "activation.cuh"),
     )
     assert resolve_sources(["/usr/include/stdio.h"]) == ("/usr/include/stdio.h",)
+
+
+# --------------------------------------------------------------------------
+# Finding ninja
+# --------------------------------------------------------------------------
+
+
+def test_ninja_path_falls_back_to_the_ninja_package(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    expected = shutil.which("ninja", path=ninja_package.BIN_DIR)
+    assert expected is not None
+    assert toolchain.ninja_path() == expected
+
+
+def test_ninja_path_names_where_it_looked(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "ninja", None)
+    with pytest.raises(RuntimeError, match="ninja on PATH"):
+        toolchain.ninja_path()
+
+
+def test_build_runs_ninja_that_is_not_on_path(tmp_path, monkeypatch):
+    """An environment used without activation has the package, not the PATH entry."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    spec = _spec()
+    build_dir = tmp_path / "build"
+    library = ninja.build(
+        spec=spec, build_dir=build_dir, build_file="build all: phony\ndefault all\n"
+    )
+    assert library == build_dir / f"{spec.module_name}.so"
 
 
 if __name__ == "__main__":
