@@ -35,7 +35,7 @@ fn fixtures_match_sglang() {
 fn check(fixture: &Value) {
     let model = fixture["model"].as_str().unwrap();
     let revision = fixture["revision"].as_str().unwrap();
-    let formatter = formatter(model, fixture);
+    let default_formatter = formatter(model, fixture);
     let tokenizer = cached_tokenizer(model, revision);
     // Formatters that encode their own prompts (DeepSeek) need the checkpoint's tokenizer.
     let encoder = tokenizer.as_ref().and_then(|_| {
@@ -48,8 +48,13 @@ fn check(fixture: &Value) {
     });
     for case in fixture["cases"].as_array().unwrap() {
         let name = format!("{model} {}", case["name"]);
+        let override_formatter = case.get("chat_template").map(|template| {
+            let mut config = fixture.clone();
+            config["chat_template"] = template.clone();
+            formatter(model, &config)
+        });
         let outcome = check_case(
-            &formatter,
+            override_formatter.as_ref().unwrap_or(&default_formatter),
             tokenizer.as_ref(),
             encoder.as_ref(),
             &fixture["bos_token_id"],

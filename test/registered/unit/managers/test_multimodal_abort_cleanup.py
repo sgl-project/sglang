@@ -16,8 +16,12 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
-from sglang.srt.managers.schedule_batch import MultimodalInputs, Req
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.modality import Modality
@@ -88,7 +92,7 @@ def _rank(rank):
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
     empty_request_lists(scheduler)
-    scheduler.waiting_queue = [req]
+    scheduler.waiting_queue.join([req])
     scheduler.mm_receiver = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.tree_cache = MagicMock()
@@ -97,6 +101,8 @@ def _queued_scheduler(req):
     scheduler.rust_server = None
     scheduler.output_streamer = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.hisparse_coordinator = None
+    scheduler.init_request_retirer()
     return scheduler
 
 
@@ -109,7 +115,7 @@ def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
             scheduler = _queued_scheduler(req)
             with _rank(rank):
                 scheduler.abort_request(AbortReq(rid=req.rid))
-            assert scheduler.waiting_queue == []
+            assert list(scheduler.waiting_queue) == []
         vmm_pool._recycle_chunks()
         assert not vmm_pool.occupied_chunks
 
