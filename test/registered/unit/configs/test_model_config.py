@@ -357,8 +357,10 @@ class TestReasoningTokenFields(CustomTestCase):
 
 
 class TestDecisionCheckpointConfig(CustomTestCase):
-    def _checkpoint(self, directory, **decision):
-        Qwen3_5Config(architectures=["Qwen3_5Model"]).save_pretrained(directory)
+    def _checkpoint(self, directory, tie_word_embeddings=False, **decision):
+        Qwen3_5Config(
+            architectures=["Qwen3_5Model"], tie_word_embeddings=tie_word_embeddings
+        ).save_pretrained(directory)
         decision = {"format_version": 1, "codes": ["A"], "token_ids": [32], **decision}
         with open(os.path.join(directory, "decision_config.json"), "w") as f:
             json.dump(decision, f)
@@ -380,9 +382,31 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 else:
                     self.assertIs(config.hf_text_config.is_causal, False)
 
+    def test_joint_prompt_format_is_loaded(self):
+        """Version 2 reads the version 1 readout at a marker after each question."""
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint, format_version=2, attention_mode="noncausal_full_attention"
+            )
+            config = ModelConfig(model_path=checkpoint)
+        self.assertEqual(config.decision_config["format_version"], 2)
+        self.assertIs(config.hf_text_config.is_causal, False)
+
+    def test_tied_backbone_keeps_its_embeddings(self):
+        """Loading the readout into a tied LM head overwrote the embedding table."""
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(checkpoint, tie_word_embeddings=True)
+            config = ModelConfig(model_path=checkpoint)
+        self.assertIs(config.hf_config.tie_word_embeddings, False)
+        self.assertIs(config.hf_text_config.tie_word_embeddings, False)
+
     def test_unsupported_decision_fields_are_refused(self):
-        """An attention mode or pooling the server does not honor must not be served."""
-        for decision in ({"attention_mode": "bidirectional"}, {"pooling": "mean"}):
+        """A format, attention mode, or pooling the server does not honor must not be served."""
+        for decision in (
+            {"format_version": 3},
+            {"attention_mode": "bidirectional"},
+            {"pooling": "mean"},
+        ):
             with self.subTest(decision=decision), TemporaryDirectory() as checkpoint:
                 self._checkpoint(checkpoint, **decision)
                 with self.assertRaisesRegex(ValueError, "is not supported"):
