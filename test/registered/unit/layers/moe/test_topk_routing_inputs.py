@@ -37,13 +37,14 @@ from sglang.srt.layers.moe.utils import (
     initialize_moe_config,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     get_context,
@@ -149,6 +150,41 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(draft_ids.tolist(), [[0, 1], [0, 1], [-1, -1], [-1, -1]])
         self.assertFalse(draft.topk_config.allow_routed_experts_capture)
         self.assertTrue(target.topk_config.allow_routed_experts_capture)
+
+    def test_precomputed_routes_match_ordinary_routing(self):
+        """The fused front must apply the same placement and live batch mask."""
+        for draft in (False, True):
+            with self.subTest(draft=draft):
+                if draft:
+                    with draft_model_build_scope():
+                        router = self._router()
+                else:
+                    router = self._router()
+                batch = _batch(2)
+                with forward_context(
+                    ForwardContext(attn_backend=object()), forward_batch=batch
+                ):
+                    for real in (2, 3):
+                        batch.num_token_non_padded.fill_(real)
+                        expected = router.forward_native(self.hidden, self.logits)
+                        weights, logical_ids = fused_topk_torch_native(
+                            self.hidden, self.logits, topk=2, renormalize=True
+                        )
+                        num_valid, dispatch = router.routing_inputs()
+                        actual = topk_module.build_precomputed_topk_output(
+                            weights,
+                            logical_ids,
+                            router.topk_config,
+                            router.layer_id,
+                            num_token_non_padded=num_valid,
+                            expert_location_dispatch_info=dispatch,
+                        )
+                        torch.testing.assert_close(
+                            actual.topk_ids, expected.topk_ids, rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            actual.topk_weights, expected.topk_weights, rtol=0, atol=0
+                        )
 
     def test_late_preparation_and_in_place_rebalance(self):
         """Forward preparation and rebalance must be observed after scope entry."""

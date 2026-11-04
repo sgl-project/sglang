@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -310,10 +310,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    draft_kv_size = int(
-                        self._cell_size * draft_num_layers / int(num_layers)
+                    # Under DCP a non-DSA draft pool spans the allocator's widened
+                    # ids (KVCacheConfigurator.loc_space_scale) but keeps its KV
+                    # heads unreplicated (ModelConfig.get_num_kv_heads).
+                    draft_cell_size = (
+                        self._compute_cell_size(kvc, num_layers, dcp_size=1)
+                        if dcp_size > 1
+                        else self._cell_size
                     )
-                    self._cell_size += draft_kv_size * draft_loc_space_scale
+                    draft_kv_size = int(
+                        draft_cell_size * draft_num_layers / int(num_layers)
+                    )
+                    self._cell_size += draft_kv_size * draft_loc_space_scale * dcp_size
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
@@ -339,8 +347,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
-    def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
-        """Compute per-token KV cache cost in bytes."""
+    def _compute_cell_size(
+        self,
+        kvc: KVCacheConfigurator,
+        num_layers: int,
+        dcp_size: Optional[int] = None,
+    ) -> int:
+        """Compute per-token KV cache cost in bytes.
+
+        ``dcp_size`` is the DCP degree the KV heads replicate over, the runner's by
+        default; an EAGLE draft does not replicate its heads and passes 1.
+        """
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
@@ -356,7 +373,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
-        dcp_size = get_parallel().attn_dcp_size
+        if dcp_size is None:
+            dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
@@ -380,14 +398,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            cell_size = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config,
-                    kv_cache_dtype=kv_cache_dtype,
+            if kvc.modelslim_cache_layout is not None:
+                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
+            else:
+                per_layer_bytes = (
+                    calculate_mla_kv_cache_dim(
+                        model_config=model_config,
+                        kv_cache_dtype=kv_cache_dtype,
+                    )
+                    * kv_size
                 )
-                * effective_num_layers
-                * kv_size
-            )
+            cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -496,10 +517,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Mirrors _build_unlimited_ocr_v2_kv_pool: main K+V on every layer
             # plus the DASH router's single-head index K (never a V).
             sparse_cfg = get_unlimited_ocr_v2_sparse_config(model_config.hf_config)
-            kv_heads = model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size,
-                get_parallel().attn_dcp_size,
-            )
+            kv_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
             main_bytes = (
                 effective_num_layers * 2 * kv_heads * model_config.head_dim * kv_size
             )
