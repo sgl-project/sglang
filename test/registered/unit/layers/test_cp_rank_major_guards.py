@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -123,7 +124,7 @@ def build():
     )
 
 
-class Guards(unittest.TestCase):
+class Guards(CustomTestCase):
     def test_cp_degrees(self):
         for cp_size in (2, 4, 8):
             s = build()

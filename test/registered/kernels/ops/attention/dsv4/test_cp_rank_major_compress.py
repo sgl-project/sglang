@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.compress import (
     compress_forward,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 
@@ -31,7 +32,7 @@ def packed_plan(rows, width):
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.version.hip is None, "CUDA required"
 )
-class TestCPRankMajorCompress(unittest.TestCase):
+class TestCPRankMajorCompress(CustomTestCase):
     def test_output_and_state(self):
         for cp_size in map(int, os.environ.get("CP_SIZE", "2,4,8").split(",")):
             with self.subTest(cp_size=cp_size):
