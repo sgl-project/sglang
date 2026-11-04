@@ -467,7 +467,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                         element_dim=self.element_dim,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_per_layer")
                     transfer_kv_per_layer(
                         src_k=self.k_buffer[host_layer_id],
                         dst_k=device_k,
@@ -476,6 +475,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_per_layer", device_is_src=False
+                        ),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -493,7 +495,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                         element_dim=self.element_dim,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_per_layer_pf_lf")
                     transfer_kv_per_layer_pf_lf(
                         src_k=self.k_buffer,
                         dst_k=device_k,
@@ -504,6 +505,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                         layer_id=host_layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_per_layer_pf_lf", device_is_src=False
+                        ),
                     )
             elif self.layout == "page_unified":
                 # Both directions read one byte order, so a loaded page is the
@@ -628,7 +632,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                         element_size=self.element_dim * self.dtype.itemsize,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_all_layer")
                     transfer_kv_all_layer(
                         src_k_layers=device_k_data_ptrs,
                         dst_k_layers=self.k_data_ptrs,
@@ -638,6 +641,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_all_layer", device_is_src=True
+                        ),
                     )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
@@ -668,7 +674,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                         element_size=self.element_dim * self.dtype.itemsize,
                     )
                 else:
-                    self._require_packed_device_rows("transfer_kv_all_layer_lf_pf")
                     transfer_kv_all_layer_lf_pf(
                         src_k_layers=device_k_data_ptrs,
                         dst_k=self.k_buffer,
@@ -679,6 +684,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
+                        **self._device_row_stride_kwargs(
+                            "transfer_kv_all_layer_lf_pf", device_is_src=True
+                        ),
                     )
             elif self.layout == "page_unified":
                 jit_transfer_hicache_all_layer_staged_lf_page_unified(
