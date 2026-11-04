@@ -41,7 +41,9 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
-    batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
+    batch.tree_cache = SimpleNamespace(
+        page_size=TRACK_INTERVAL, supports_mamba=lambda: False
+    )
     batch.device = "cpu"
     batch.model_config = SimpleNamespace(is_encoder_decoder=False)
     batch.enable_overlap = True

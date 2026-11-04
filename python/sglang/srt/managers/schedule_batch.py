@@ -124,6 +124,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    EvictParams,
     TreeLock,
 )
 from sglang.srt.mem_cache.common import (
@@ -3058,6 +3059,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def _take_tracking_slot_or_evict(self, storage, req, position: int) -> bool:
+        """take_tracking_slot, retried once after evicting one cached state
+        slot from the tree (locked nodes are never evicted)."""
+        if storage.take_tracking_slot(req, position):
+            return True
+        if not self.tree_cache.supports_mamba():
+            return False
+        self.tree_cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+        return storage.take_tracking_slot(req, position)
+
     def mamba_lazy_prealloc_at_boundary(self, track_mask_cpu: torch.Tensor):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
@@ -3080,12 +3091,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             other_idx = 1 - req.kv.mamba_next_track_idx
             # A held other slot means the previous boundary's post-processing
             # (which frees it) has not run yet under overlap.
-            # No evict-retry: a transient slot is not worth evicting a cached
-            # checkpoint for.
             took = (
                 req.kv.mamba_ping_pong_empty[other_idx]
                 and not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get()
-                and storage.take_tracking_slot(req, other_idx)
+                and self._take_tracking_slot_or_evict(storage, req, other_idx)
             )
             if took:
                 req.kv.mamba_next_track_idx = other_idx
@@ -3132,10 +3141,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             other_idx = 1 - req.kv.mamba_next_track_idx
             has_pending = not req.kv.mamba_ping_pong_empty[other_idx]
             if not has_pending:
-                # No evict-retry: a transient slot is not worth evicting a
-                # cached checkpoint for.
                 has_pending = not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get() and (
-                    storage.take_tracking_slot(req, other_idx)
+                    self._take_tracking_slot_or_evict(storage, req, other_idx)
                 )
             # On failure the verify skips this crossing's snapshot (-1), so the
             # keep slot still holds the checkpoint at mamba_last_track_seqlen.
