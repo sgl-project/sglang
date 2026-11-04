@@ -3,7 +3,7 @@ import sys
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
 import torch
@@ -13,25 +13,21 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import (  # noqa: E402
-    DisaggregationMode,
-    pre_alloc_fill_len,
-)
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    FINISH_ABORT,
-    Req,
-    ReqKvInfo,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.managers.scheduler_components.deferred_responses import (
-    DeferredResponses,
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
@@ -40,6 +36,11 @@ from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    decode_queue,
+    empty_request_lists,
+)
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -65,7 +66,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.enable_hicache_storage = False
         scheduler.enable_unified_cache_external_linker = False
         scheduler.processed_tokens_counter = 0
-        scheduler.waiting_queue = []
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler._prefetch_kvcache = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler._abort_on_queued_limit = MagicMock(return_value=False)
@@ -132,7 +133,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = self._new_req(priority=10)
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         ):
             scheduler._add_request_to_queue(req)
@@ -152,7 +153,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 req = self._new_req(priority=10)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(req)
@@ -161,7 +162,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                     req.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 scheduler._prefetch_kvcache.assert_not_called()
-                self.assertEqual(scheduler.waiting_queue, [])
+                self.assertEqual(list(scheduler.waiting_queue), [])
                 scheduler.disagg_prefill_bootstrap_queue.add.assert_not_called()
                 scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
 
@@ -176,11 +177,11 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler.beam_coordinator = MagicMock()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
-                scheduler.waiting_queue = [queued]
+                scheduler.waiting_queue.join([queued])
                 incoming = self._new_req(priority=priority)
 
                 with patch(
-                    "sglang.srt.managers.scheduler.get_serving",
+                    "sglang.srt.managers.utils.get_serving",
                     return_value=SimpleNamespace(weight_version="v0"),
                 ):
                     scheduler._add_request_to_queue(incoming)
@@ -190,10 +191,10 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                     rejected.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 if priority == 0:
-                    self.assertEqual(scheduler.waiting_queue, [queued])
+                    self.assertEqual(list(scheduler.waiting_queue), [queued])
                     scheduler._prefetch_kvcache.assert_not_called()
                 else:
-                    self.assertEqual(scheduler.waiting_queue, [incoming])
+                    self.assertEqual(list(scheduler.waiting_queue), [incoming])
                     scheduler._prefetch_kvcache.assert_called_once_with(incoming)
 
 
@@ -240,7 +241,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             processed_tokens_counter=0,
         )
         queue.ensure_metadata_buffer = MagicMock(return_value=True)
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="req",
             disagg_kv_sender=object(),
             prefill_attempt_count=0,
@@ -249,7 +250,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             kv=SimpleNamespace(cache_protected_len=2),
             time_stats=MagicMock(),
         )
-        queue.queue = [req]
+        queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
+        queue.queue.join([req])
 
         with (
             patch(
@@ -269,7 +271,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue, req, result = self._pop_bootstrapping_swa_branch("write_through")
 
         self.assertEqual(result, [])
-        self.assertEqual(queue.queue, [req])
+        self.assertEqual(list(queue.queue), [req])
         self.assertEqual(req.prefill_attempt_count, 0)
         queue.ensure_metadata_buffer.assert_not_called()
 
@@ -279,7 +281,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 queue, req, result = self._pop_bootstrapping_swa_branch(write_policy)
 
                 self.assertEqual(result, [req])
-                self.assertEqual(queue.queue, [])
+                self.assertEqual(list(queue.queue), [])
                 self.assertEqual(req.prefill_attempt_count, 1)
                 queue.ensure_metadata_buffer.assert_called_once_with(req)
 
@@ -301,7 +303,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             "write_through", queue_cls=_Eager, is_retracted=True
         )
         self.assertEqual(result, [])
-        self.assertEqual(queue.queue, [req])
+        self.assertEqual(list(queue.queue), [req])
         queue.ensure_metadata_buffer.assert_not_called()
 
     def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
@@ -437,14 +439,9 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
-            output_streamer=None,
-            send_abort=None,
-        )
-        scheduler.chunked_req = None
+        empty_request_lists(scheduler)
         scheduler.mm_receiver = None
-        scheduler.waiting_queue = [MagicMock(rid="req")]
+        scheduler.waiting_queue.join([MagicMock(rid="req")])
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
@@ -452,15 +449,11 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.output_streamer = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
-        scheduler.dllm_config = None
-        scheduler.grammar_manager = MagicMock()
-        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        scheduler.disagg_prefill_transfer_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
 
         with (
-            patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
+            patch("sglang.srt.managers.utils.get_serving") as get_serving,
             patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
         ):
             get_serving.return_value.weight_version = None
@@ -479,7 +472,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
-        req = SimpleNamespace(
+        req = FakeReq(
             rid=rid,
             priority=priority,
             origin_input_ids=[1, 2, 3],
@@ -502,7 +495,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
-        queue.queue = list(decode_reqs)
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
@@ -540,7 +533,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+        )
         queue.kv_manager = SimpleNamespace(
             kv_args=SimpleNamespace(state_types=[]),
         )
@@ -586,9 +581,13 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                 queue.token_to_kv_pool_allocator.page_size = 64
                 queue.token_to_kv_pool.page_size = 64
                 queue.draft_token_to_kv_pool = None
-                queue.transfer_queue.queue = [
-                    SimpleNamespace(host_staged=False) for _ in range(pending)
-                ]
+                queue.transfer_queue.queue = decode_queue(
+                    ListKind.PD_RECEIVING,
+                    [
+                        SimpleNamespace(req=FakeReq(), host_staged=False)
+                        for _ in range(pending)
+                    ],
+                )
                 queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
                 queue._uses_swa_reservation = MagicMock(return_value=False)
                 queue._send_kv_metadata = MagicMock()
@@ -597,7 +596,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
 
                 self.assertEqual(failed, [])
                 self.assertEqual(preallocated, reqs[:admitted])
-                self.assertEqual(queue.queue, reqs[admitted:])
+                self.assertEqual(list(queue.queue.items()), reqs[admitted:])
 
     def test_prealloc_lora_slots_cover_inflight_microbatches_and_queues(self):
         """In-flight requests retain their adapter slots."""
@@ -617,7 +616,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
 
         queue = self._new_queue(reqs)
         queue.pp_size = 2
-        queue.transfer_queue.queue = [transferring]
+        queue.transfer_queue.queue = decode_queue(ListKind.PD_RECEIVING, [transferring])
         scheduler = queue.scheduler
         scheduler.running_batch.reqs = [finished.req]
         scheduler.running_mbs = [
@@ -643,7 +642,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
 
         self.assertEqual(preallocated, [reqs[0], reqs[2]])
         self.assertEqual(failed, [])
-        self.assertEqual(queue.queue, [reqs[1]])
+        self.assertEqual(list(queue.queue.items()), [reqs[1]])
         self.assertEqual(
             [call.args[0] for call in queue._pre_alloc.call_args_list],
             [reqs[0].req, reqs[2].req],
@@ -703,7 +702,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             [decode_req.req.rid for decode_req in preallocated], ["healthy-high"]
         )
         self.assertEqual([decode_req.req.rid for decode_req in failed], ["failed-low"])
-        self.assertEqual(queue.queue, [])
+        self.assertEqual(list(queue.queue.items()), [])
         queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
@@ -729,7 +728,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                     fill_len=3, prefix_len=0
                 )
                 self.assertEqual(preallocated, [decode_req] if fits else [])
-                self.assertEqual(queue.queue, [] if fits else [decode_req])
+                self.assertEqual(
+                    list(queue.queue.items()), [] if fits else [decode_req]
+                )
                 self.assertEqual(failed, [])
 
 
@@ -967,7 +968,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
-        scheduler.waiting_queue = []
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
@@ -983,18 +984,18 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.schedule_stream = MagicMock()
         scheduler.forward_stream = MagicMock()
         scheduler.ngram_embedding_manager = MagicMock()
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         return scheduler
 
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
         scheduler = self._new_scheduler(enable_overlap=False)
         original_waiting_queue = [MagicMock(rid="low"), MagicMock(rid="high")]
-        scheduler.waiting_queue = original_waiting_queue
+        scheduler.waiting_queue.join(original_waiting_queue)
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
         scheduler.enable_priority_scheduling = True
-        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
-            waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: sorted(
+            waiting_queue, key=lambda req: -req.priority
         )
 
         new_batch = MagicMock()
@@ -1016,7 +1017,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         self.assertIs(ret, new_batch)
         scheduler.policy.calc_priority.assert_called_once_with(
-            original_waiting_queue, scheduler.running_batch
+            ANY, scheduler.running_batch
         )
         selected_reqs = init_new.call_args.args[0]
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
@@ -1024,7 +1025,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
-        scheduler.waiting_queue = [MagicMock(rid="request")]
+        scheduler.waiting_queue.join([MagicMock(rid="request")])
 
         call_order = []
         new_batch = MagicMock()

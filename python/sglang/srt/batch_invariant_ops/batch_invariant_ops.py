@@ -1240,16 +1240,30 @@ def disable_batch_invariant_mode():
 
 @contextlib.contextmanager
 def set_batch_invariant_mode(enabled: bool = True):
-    global _batch_invariant_MODE, _batch_invariant_LIB
-    old_data = (_batch_invariant_MODE, _batch_invariant_LIB)
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
+    # enable_batch_invariant_mode() also replaces torch.bmm; restore it on exit,
+    # or every later torch.bmm in the process stays batch-invariant.
+    old_data = (
+        _batch_invariant_MODE,
+        _batch_invariant_LIB,
+        _original_torch_bmm,
+        torch.bmm,
+    )
     if enabled:
         enable_batch_invariant_mode()
     else:
         disable_batch_invariant_mode()
-    yield
-    if _batch_invariant_LIB is not None:
-        _batch_invariant_LIB._destroy()
-    _batch_invariant_MODE, _batch_invariant_LIB = old_data
+    try:
+        yield
+    finally:
+        if _batch_invariant_LIB is not None:
+            _batch_invariant_LIB._destroy()
+        (
+            _batch_invariant_MODE,
+            _batch_invariant_LIB,
+            _original_torch_bmm,
+            torch.bmm,
+        ) = old_data
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])
