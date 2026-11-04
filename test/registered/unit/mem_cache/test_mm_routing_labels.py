@@ -11,6 +11,7 @@ its own routing representation. The default format ignores labels.
 
 import functools
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import msgspec
@@ -20,12 +21,21 @@ from sglang.srt.disaggregation.kv_events import BlockStored, EventBatch
 from sglang.srt.managers.io_struct import (
     MAX_MM_ROUTING_LABEL_BYTES,
     GenerateReqInput,
+    TokenizedGenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.mem_cache import events
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -109,15 +119,34 @@ class TestMmRoutingLabels(CustomTestCase):
         self.registry.register((31_000_000_001,), "ffff000000000001")
         self.assertIsNone(self.registry.get(X[0]))  # least recently used
 
-    def test_register_maps_each_labeled_item_pad_value(self):
+    def test_processor_output_registers_labels_after_msgpack(self):
+        # The moved request types must retain labels across tokenizer IPC and
+        # register the scheduler's final pad values for event recording.
         labeled = MultimodalDataItem(
             modality=Modality.IMAGE, hash=0xDEADBEEF, routing_label=LABEL_U
         )
         unlabeled = MultimodalDataItem(modality=Modality.IMAGE, hash=0xFEEDFACE)
-        for item in (labeled, unlabeled):
-            item.set_pad_value()
+        req = TokenizedGenerateReqInput(
+            input_text="",
+            input_ids=array("q", [1, 2]),
+            input_embeds=None,
+            mm_inputs=MultimodalProcessorOutput(mm_items=[labeled, unlabeled]),
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            mm_routing_labels={"image": [LABEL_U, ""]},
+        )
+        decoded = msgpack_decode(msgpack_encode(req))
+        self.assertEqual(decoded.mm_routing_labels, {"image": [LABEL_U, ""]})
         events.enable_mm_routing_labels()
-        events.register_mm_routing_labels([labeled, unlabeled])
+        mm_inputs = MultimodalInputs.from_processor_output(decoded.mm_inputs)
+        labeled, unlabeled = mm_inputs.mm_items
+        self.assertEqual(labeled.routing_label, LABEL_U)
+        self.assertIsNone(unlabeled.routing_label)
         for value in labeled.padding_values():
             self.assertEqual(self.registry.get(value), LABEL_U)
         for value in unlabeled.padding_values():
@@ -191,6 +220,25 @@ class TestMmRoutingLabels(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             req.normalize_batch_and_arguments()
+
+    def test_parallel_samples_keep_labels_with_all_media(self):
+        req = GenerateReqInput(
+            text="Compare these",
+            image_data=["a.jpg", "b.jpg"],
+            video_data=["a.mp4", "b.mp4"],
+            audio_data=["a.wav", "b.wav"],
+            mm_routing_labels=["I1", "I2", "V1", "V2", "A1", "A2"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        for sample in (req[0], req[1]):
+            self.assertEqual(sample.image_data, ["a.jpg", "b.jpg"])
+            self.assertEqual(sample.video_data, ["a.mp4", "b.mp4"])
+            self.assertEqual(sample.audio_data, ["a.wav", "b.wav"])
+            self.assertEqual(
+                sample.mm_routing_labels_by_modality(),
+                {"image": ["I1", "I2"], "video": ["V1", "V2"], "audio": ["A1", "A2"]},
+            )
 
     def test_label_count_must_match_media_inputs(self):
         # Every modality counts: labels for the image alone, or a label on a

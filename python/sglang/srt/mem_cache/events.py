@@ -120,8 +120,7 @@ class KvEventLoraNames(LoRANameTable):
         )
 
 
-# schedule_batch.MM_PAD_SHIFT_VALUE; schedule_batch imports this module
-# (through base_prefix_cache), so it cannot be imported here.
+# Matches the multimodal pad-value offset in req_types.MM_PAD_SHIFT_VALUE.
 _MM_PAD_SHIFT_VALUE = 1_000_000
 
 
@@ -192,7 +191,7 @@ def attach_mm_routing_labels(mm_items, labels_by_modality) -> None:
     """
     if not labels_by_modality or not mm_items:
         return
-    from sglang.srt.managers.schedule_batch import MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
 
     items_by_modality = {}
     for item in mm_items:
