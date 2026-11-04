@@ -59,6 +59,7 @@ class CacheLimits(Value):
     max_query_nodes: int = 4096
     max_result_targets: int = 4096
     max_prepared_prefixes: int = 128
+    max_concurrent_storage_reads: Annotated[int, msgspec.Meta(ge=1, le=64)] = 4
 
 
 class ServiceConfig(Value):

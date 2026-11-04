@@ -25,6 +25,7 @@ class CacheControlConfig:
     max_result_targets: int = 4096
     max_policy_claims_per_copy: int = 4
     max_prepared_prefixes: int = 128
+    max_concurrent_storage_reads: int = 4
 
     def __post_init__(self):
         validated(self.namespace, Identifier)
@@ -41,6 +42,13 @@ class CacheControlConfig:
                 or not 1 <= getattr(self, name) <= 1 << 24
             ):
                 raise ValueError(f"{name} must be a positive bounded integer")
+        if (
+            type(self.max_concurrent_storage_reads) is not int
+            or not 1 <= self.max_concurrent_storage_reads <= 64
+        ):
+            raise ValueError(
+                "max_concurrent_storage_reads must be an integer in [1, 64]"
+            )
 
 
 @dataclass(frozen=True)

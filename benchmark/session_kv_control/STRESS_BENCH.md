@@ -78,3 +78,9 @@ cd benchmark/session_kv_control
 /home/youwei/bzh/project/TokenCake/RFC/sglang-rfc/.venv/bin/python \
   -W error::ResourceWarning -m unittest -v test_stress_bench test_session_kv_bench
 ```
+
+## Native read pipeline setting
+
+Engine `--kv-control-config` accepts `"cache_limits":{"max_concurrent_storage_reads":4}` (default 4, range 1–64). Different effective cache salts may pipeline native storage-to-host reads. Same-salt scopes retain serialization and exact identical scopes share one physical read. GPU destinations retain exclusive admission; an older live GPU waiter blocks newer cold jobs until its turn, cancellation or expiry. Complete host-resident targets can finish immediately. Setting 1 serializes the cold stage for comparisons. This does not add Mooncake GET worker threads or widen supported topology.
+
+Queries reserve their full missing host span before asynchronous allocation; after real allocation, free-pool accounting owns that space. Cancellation retains the reservation until physical drain. PIN and native references still constrain host reclamation. More admitted reads can increase scratch occupancy and contention; report readiness, total cycle and throughput against the same setting-1 or previous-source control. A larger admission bound alone does not establish a gain.

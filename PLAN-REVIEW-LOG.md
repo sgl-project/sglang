@@ -4884,3 +4884,11 @@ Docs PLAN.md, Router runbook and final report now describe completed P0–P8 fir
 ### 0.8 压力口径补充：自然 GPU 驱逐
 
 显式 DEMOTE 会释放 GPU 前缀，无法单独证明大 L1 KV 池受到容量压力，因此补充 `--retention-mode natural`。L2 热点仍按工具等待语义 DEMOTE/PIN，冷压力仅 COPY 到 host、保留 GPU KV；L3 正式请求后不主动回收 GPU，让原生 LRU 与 write_through 工作。默认 demote 保留已有口径，manifest/arm/summary 明确标记模式。root 审阅全部变更并独立测试：23 项通过（日志 harness-natural-tests-root.log）。运行中的 L2 demote 对照继续使用已加载的 08be8787e6 工具，不改动其解释器或 Engine。后续主矩阵使用 natural，按实际 GPU/host 使用量证明压力。
+
+### 有界 native L3→L2 流水
+
+固定规格 `/tmp/sglang-rfc-build/mem08/spec/NATIVE_PIPELINE_PLAN.md`；隔离实现后由 root 阅读全部生产与测试 diff。`max_concurrent_storage_reads` 默认 4，范围 1–64；不同有效 salt 可流水，同 salt 串行、GPU 目标独占，完整 host resident 目标直接完成。查询阶段预留完整缺口，真实 host allocation 后停止重复计账，取消/超时保留到实际 drain；PIN、原生引用和 eviction backoff 不变。
+
+root 审阅发现较早 GPU waiter 可能被后续 host job 持续填充挤占，补固定 admission 顺序与 live-interest 屏障；取消及过期解除屏障，已有完整 host 目标仍可完成。未增加底层 GET worker。CPU fake-driver fixture 的注销路径按模拟 CUDA 注册配对，运行环境用不存在的 CUDA 设备 999 隐藏 GPU；仓库 test_utils 不能接受空 CUDA_VISIBLE_DEVICES。
+
+root 独立 proof：最终 transfers 42 passed、25 subtests，16.19s；cache/service/protection/feedback/controller 76 passed、68 subtests，22.29s。测试涵盖并发上限、相同 salt、容量重复批准、allocation 后不重复扣减、PIN 压力与退避、取消/期限/query miss/partial、精确共享与 demand 所有权、GPU DMA fence 及 FIFO 饥饿边界。日志 native-fifo-transfers-root.log、native-regressions-root-v2.log。当前性能长测仍由不可变 f65 源执行；本提交的真实收益待同配置长测比较。按用户授权测试通过后提交，不推送。

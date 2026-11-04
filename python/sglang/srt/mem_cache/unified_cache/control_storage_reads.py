@@ -47,6 +47,8 @@ class _Read:
     demands: set[CacheRequestHandle] = field(default_factory=set)
     retired: bool = False
     loaded_span: tuple[int, int | None] = (0, None)
+    reserved_host_tokens: int = 0
+    admission_order: int = 0
 
 
 @dataclass
@@ -67,9 +69,9 @@ class _Interest:
 class StorageCacheReads:
     """Shared one-prefix restores with complete-scope approval and real fences.
 
-    Different scopes serialize their cold stage and recheck current host hits
-    before starting. An existing prefix is counted once, and compatible readers
-    of the same destination share one interest-independent physical job.
+    Cold host scopes pipeline across independent salt domains with bounded
+    admission. A domain serializes until publication; GPU destinations remain
+    exclusive. Compatible readers share one interest-independent physical job.
     """
 
     def __init__(self, executor):
@@ -80,6 +82,7 @@ class StorageCacheReads:
         self.demands: dict[CacheRequestHandle, _Demand] = {}
         self._joinable: dict[tuple, _Read] = {}
         self._host_reclaim_retry_at = 0.0
+        self._next_admission_order = 0
         self.stats = dict(
             demand_coalesced=0,
             demand_consumed=0,
@@ -220,7 +223,14 @@ class StorageCacheReads:
         ).digest()
         job = self.jobs.get(key)
         if job is None:
-            job = _Read(key, work, tokens, compatibility)
+            job = _Read(
+                key,
+                work,
+                tokens,
+                compatibility,
+                admission_order=self._next_admission_order,
+            )
+            self._next_admission_order += 1
             self._rows(job)
             self.jobs[key] = job
         interest = _Interest(work, job)
@@ -232,12 +242,6 @@ class StorageCacheReads:
 
     def _start(self, job):
         try:
-            if any(
-                other is not job and (other.operation is not None or other.loading)
-                for other in self.jobs.values()
-            ):
-                job.waiting = "shared_prefix_serialization"
-                return
             pool = self.cache.cache_controller.mem_pool_host
             if len(job.tokens) > pool.size or (
                 job.work.payload.dst.tier == "gpu"
@@ -259,7 +263,17 @@ class StorageCacheReads:
             self._hold(job)
             host_length = self._length(job, "host")
             gpu_length = self._length(job, "gpu")
-            if self._length(job, job.work.payload.dst.tier) == len(job.tokens):
+            # A complete host prefix needs no cold-stage turn. GPU targets
+            # retain the exclusive admission/fence behavior below.
+            if job.work.payload.dst.tier == "host" and host_length == len(job.tokens):
+                self._retire(job)
+                return
+            waiting = self._admission_wait(job)
+            if waiting is not None:
+                job.waiting = waiting
+                self._release(job)
+                return
+            if gpu_length == len(job.tokens) and job.work.payload.dst.tier == "gpu":
                 self._retire(job)
                 return
             if (
@@ -280,6 +294,9 @@ class StorageCacheReads:
                 job.waiting = "whole_scope_capacity"
                 self._release(job)
                 return
+            # The query has not allocated rows yet. Charge its complete missing
+            # span until the owner observes real allocation or quiescence.
+            job.reserved_host_tokens = len(job.tokens) - host_length
             anchor = next(
                 (n for n, _, end in rows if end == host_length),
                 self.cache.tree_core.root_node,
@@ -299,6 +316,7 @@ class StorageCacheReads:
             )
             info = self.cache.ongoing_prefetch.get(job.handle)
             if info is None:
+                job.reserved_host_tokens = 0
                 job.waiting = "storage_rate_limit"
                 self._release(job)
                 return
@@ -318,6 +336,62 @@ class StorageCacheReads:
             if job.operation is None and not job.loading:
                 self._retire(job)
 
+    def _admission_wait(self, job):
+        # Polling rotates the job dictionary. Use immutable admission order so
+        # newer host arrivals cannot keep refilling ahead of a GPU waiter.
+        if any(
+            other.admission_order < job.admission_order
+            and other.work.payload.dst.tier == "gpu"
+            and other.operation is None
+            and not other.loading
+            and self._has_live_interest(other)
+            for other in self.jobs.values()
+        ):
+            return "shared_prefix_serialization"
+        active = [
+            other
+            for other in self.jobs.values()
+            if other is not job and (other.operation is not None or other.loading)
+        ]
+        if len(active) >= self.executor.config.max_concurrent_storage_reads:
+            return "storage_concurrency_limit"
+        if any(
+            job.work.payload.dst.tier == "gpu"
+            or other.work.payload.dst.tier == "gpu"
+            or other.loading
+            or job.compatibility.cache_salt == other.compatibility.cache_salt
+            for other in active
+        ):
+            return "shared_prefix_serialization"
+        return None
+
+    def _has_live_interest(self, job):
+        if job.demands:
+            return True
+        control = self.cache.kv_control_service.control
+        now = control._clock()
+        return any(
+            not self.interests[identity].cancelled
+            and (
+                (pending := control._pending.get(identity)) is None
+                or pending.deadline is None
+                or now < pending.deadline
+            )
+            for identity in job.interests
+        )
+
+    def _unallocated_reservations(self, job):
+        # Allocated scratch is already absent from pool.available_size(). A
+        # cancelled query keeps its promise until its owner-observed drain.
+        return sum(
+            other.reserved_host_tokens
+            for other in self.jobs.values()
+            if other is not job
+            and other.operation is not None
+            and other.operation.host_indices is None
+            and not getattr(other.operation, "native_quiescent", False)
+        )
+
     def _host_capacity(self, job, needed):
         """Approve the full missing span, reclaiming only its current shortfall.
 
@@ -326,7 +400,8 @@ class StorageCacheReads:
         whole radix nodes may make its actual reclamation exceed the shortfall.
         """
         pool = self.cache.cache_controller.mem_pool_host
-        available = pool.available_size()
+        reserved = self._unallocated_reservations(job)
+        available = pool.available_size() - reserved
         if needed <= available:
             return True
         control = self.cache.kv_control_service.control
@@ -336,21 +411,10 @@ class StorageCacheReads:
         # begin_poll precedes controller deadline handling. Do not introduce
         # host eviction for an expired caller; a live coalesced sibling or
         # ordinary demand still authorizes the shared physical preparation.
-        if not job.demands:
-            live = False
-            for identity in job.interests:
-                pending = control._pending.get(identity)
-                if not self.interests[identity].cancelled and (
-                    pending is None
-                    or pending.deadline is None
-                    or now < pending.deadline
-                ):
-                    live = True
-                    break
-            if not live:
-                return False
+        if not self._has_live_interest(job):
+            return False
         self.cache.evict_host(needed - available)
-        if needed > pool.available_size():
+        if needed + reserved > pool.available_size():
             # Shared across jobs on this host pool: pinned pressure must not
             # cause a full eviction walk on every owner idle poll/joiner.
             self._host_reclaim_retry_at = now + 0.1
@@ -498,6 +562,7 @@ class StorageCacheReads:
                     target_outcomes=tuple(outcomes),
                 )
         finally:
+            job.reserved_host_tokens = 0
             job.loaded_span = self.cache.pop_prefetch_loaded_span(job.handle)
             job.retired = True
             key = self._demand_key(

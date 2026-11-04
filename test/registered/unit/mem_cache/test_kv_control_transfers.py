@@ -20,7 +20,12 @@ from sglang.srt.managers.kv_control.contracts import (
     SessionTarget,
     Status,
 )
-from sglang.srt.managers.kv_control.service import KVControlService, ServiceConfig
+from sglang.srt.managers.kv_control.service import (
+    CacheLimits,
+    KVControlService,
+    ServiceConfig,
+    parse_config,
+)
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.l2_transfer import TransferCompletion
@@ -142,14 +147,16 @@ def current(service, result):
     return service.control.registry.get(result.ref)
 
 
-def seed(cache, tokens=(1, 2, 3, 4), value=7):
+def seed(cache, tokens=(1, 2, 3, 4), value=7, *, salt=None):
     slots = cache.token_to_kv_pool_allocator.alloc(len(tokens))
     assert slots is not None
     pool = cache.token_to_kv_pool_allocator.get_kvcache()
     pool.k_buffer[0][slots] = value
     pool.v_buffer[0][slots] = value + 1
     executor = cache.kv_control_service.control.executor
-    compatibility = executor._compatibility(cache_fixtures.target(tokens))
+    compatibility = executor._compatibility(
+        cache_fixtures.target(tokens, cache_salt=salt)
+    )
     for node, start, _, matched in executor._walk(tokens, compatibility):
         cd = node.component_data[ComponentType.FULL]
         old = cd.value if cd.value is not None else cd.host_value
@@ -266,7 +273,10 @@ def hicache(case, config=None, *, storage=False, namespace_keys=False):
             if storage:
                 cache._storage_attachment.shutdown()
             host_pool.pin_memory = registered
-            cache.release_host_resources()
+            # The registered driver above is simulated even with all CUDA
+            # devices hidden; exercise its matching unregister path too.
+            with patch("sglang.srt.mem_cache.pool_host.base._is_cuda", True):
+                cache.release_host_resources()
             assert not registrations.live, "Host registrations leaked during teardown"
     finally:
         driver.stop()
@@ -275,14 +285,22 @@ def hicache(case, config=None, *, storage=False, namespace_keys=False):
 
 
 def public_transfer(
-    service, kind, source, destination, message, *, tokens=(1, 2, 3, 4), caller="router"
+    service,
+    kind,
+    source,
+    destination,
+    message,
+    *,
+    tokens=(1, 2, 3, 4),
+    caller="router",
+    salt=None,
 ):
     from sglang.srt.managers.kv_control.contracts import HASH_SCHEME
 
     caps = service.capabilities()["public_protocol"]
     compatibility = msgspec.json.decode(msgspec.json.encode(caps["prefix"]))
     compatibility.pop("token_material")
-    compatibility["cache_salt"] = None
+    compatibility["cache_salt"] = salt
     assert compatibility["hash_scheme"] == HASH_SCHEME
     return service.control.submit(
         KvHintsEnvelope(
@@ -1217,6 +1235,662 @@ def assert_retired(cache, service):
 
 
 class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
+
+    def _cold_scopes(self, owner, scopes):
+        _, cache, service, dma = owner
+        for index, target in enumerate(scopes):
+            seed(cache, target.token_ids, value=7 + index * 2, salt=target.cache_salt)
+            result = transfer(
+                service,
+                kind="move_to",
+                dst="storage",
+                selection=target,
+                message=f"publish-{index}",
+            )
+            stage(service, dma)
+            self.assertEqual(wait(service, result).status, Status.COMPLETED)
+            self.assertEqual(
+                cache.evict_host(len(target.token_ids)), len(target.token_ids)
+            )
+
+    def _restore(self, service, target, message, *, dst="host"):
+        return transfer(
+            service,
+            src="storage",
+            dst=dst,
+            selection=target,
+            message=message,
+        )
+
+    def test_storage_pipeline_config_defaults_bounds_and_public_wiring(self):
+        from sglang.srt.mem_cache.unified_cache.priority_claims import (
+            CacheControlConfig,
+        )
+
+        self.assertEqual(
+            ServiceConfig(namespace="ns").cache_config().max_concurrent_storage_reads, 4
+        )
+        for bound in (1, 64):
+            config = parse_config(
+                {
+                    "namespace": "ns",
+                    "cache_limits": {"max_concurrent_storage_reads": bound},
+                }
+            )
+            self.assertEqual(config.cache_config().max_concurrent_storage_reads, bound)
+        for invalid in (0, 65, True, 1.5):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises((ValueError, msgspec.ValidationError)):
+                    CacheControlConfig(
+                        namespace="ns", max_concurrent_storage_reads=invalid
+                    )
+                with self.assertRaises((ValueError, msgspec.ValidationError)):
+                    parse_config(
+                        {
+                            "namespace": "ns",
+                            "cache_limits": {"max_concurrent_storage_reads": invalid},
+                        }
+                    )
+
+    def test_different_salts_pipeline_queries_while_get_blocks_and_bound_is_enforced(
+        self,
+    ):
+        for bound in (1, 2):
+            config = ServiceConfig(
+                namespace="ns",
+                engine_id="engine",
+                cache_limits=CacheLimits(max_concurrent_storage_reads=bound),
+            )
+            with (
+                self.subTest(bound=bound),
+                hicache(self, config, namespace_keys=True) as owner,
+            ):
+                _, cache, service, _ = owner
+                scopes = [
+                    cache_fixtures.target(cache_salt=f"salt-{i}") for i in range(3)
+                ]
+                self._cold_scopes(owner, scopes)
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                get, query = cc.page_get_func, cc._storage_hit_query
+                queries = []
+
+                def blocked_get(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(5)
+                    return get(*args, **kwargs)
+
+                def counted_query(operation):
+                    queries.append(operation)
+                    return query(operation)
+
+                results = []
+                try:
+                    with (
+                        patch.object(cc, "page_get_func", blocked_get),
+                        patch.object(cc, "_storage_hit_query", counted_query),
+                    ):
+                        results.append(self._restore(service, scopes[0], "restore-0"))
+                        wait_for(service, entered.is_set)
+                        results.extend(
+                            self._restore(service, target, f"restore-{i}")
+                            for i, target in enumerate(scopes[1:], 1)
+                        )
+                        wait_for(service, lambda: len(queries) == bound)
+                        for _ in range(5):
+                            service.progress()
+                        reads = service.control.executor.storage_reads
+                        self.assertEqual(
+                            sum(j.operation is not None for j in reads.jobs.values()),
+                            bound,
+                        )
+                        self.assertEqual(len(queries), bound)
+                        self.assertEqual(
+                            current(service, results[-1]).update.code,
+                            "storage_concurrency_limit",
+                        )
+                        release.set()
+                        for result in results:
+                            self.assertEqual(
+                                wait(service, result).status, Status.COMPLETED
+                            )
+                        self.assertEqual(len(queries), 3)
+                finally:
+                    release.set()
+                for index, target in enumerate(scopes):
+                    path = service.control.executor._walk(
+                        target.token_ids,
+                        service.control.executor._compatibility(target),
+                    )
+                    host = cache.host_pool_group.anchor_entry.host_pool
+                    for node, _, _, _ in path:
+                        cd = node.component_data[FULL]
+                        self.assertTrue(
+                            torch.all(host.k_buffer[0][cd.host_value] == 7 + index * 2)
+                        )
+                        self.assertEqual((cd.lock_ref, cd.host_lock_ref), (0, 0))
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_same_salt_serializes_while_resident_other_host_scope_finishes(self):
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [
+                cache_fixtures.target(cache_salt="shared"),
+                cache_fixtures.target((10, 11, 12, 13), cache_salt="shared"),
+                cache_fixtures.target(cache_salt="resident"),
+            ]
+            self._cold_scopes(owner, scopes)
+            self.assertEqual(
+                wait(service, self._restore(service, scopes[2], "resident")).status,
+                Status.COMPLETED,
+            )
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get = cc.page_get_func
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            try:
+                with patch.object(cc, "page_get_func", blocked_get):
+                    first = self._restore(service, scopes[0], "cold-first")
+                    wait_for(service, entered.is_set)
+                    second = self._restore(service, scopes[1], "same-domain")
+                    self.assertEqual(
+                        current(service, second).update.code,
+                        "shared_prefix_serialization",
+                    )
+                    resident = self._restore(service, scopes[2], "resident-again")
+                    self.assertEqual(resident.status, Status.COMPLETED)
+                    self.assertEqual(len(cache.ongoing_prefetch), 1)
+                    release.set()
+                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                    self.assertEqual(wait(service, second).status, Status.COMPLETED)
+            finally:
+                release.set()
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_query_stage_host_reservation_prevents_double_approval_and_cancellation_waits(
+        self,
+    ):
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [
+                cache_fixtures.target(range(1, 41), cache_salt=f"capacity-{i}")
+                for i in range(2)
+            ]
+            self._cold_scopes(owner, scopes)
+            pressure = self._host_pressure(owner, leave_free=60)
+            self._pin_pressure(service, pressure)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            query = cc._storage_hit_query
+            queries = []
+
+            def blocked_query(operation):
+                queries.append(operation)
+                entered.set()
+                assert release.wait(5)
+                return query(operation)
+
+            try:
+                with (
+                    patch.object(cc, "_storage_hit_query", blocked_query),
+                    patch.object(
+                        cache, "evict_host", wraps=cache.evict_host
+                    ) as evictions,
+                ):
+                    first = self._restore(service, scopes[0], "capacity-first")
+                    wait_for(service, entered.is_set)
+                    second = self._restore(service, scopes[1], "capacity-second")
+                    reads = service.control.executor.storage_reads
+                    second_job = reads.interests[second.ref.operation_id].job
+                    self.assertEqual(
+                        current(service, second).update.code, "whole_scope_capacity"
+                    )
+                    self.assertEqual(reads._unallocated_reservations(second_job), 40)
+                    self.assertEqual(evictions.call_args.args, (20,))
+                    self.assertEqual(
+                        service.control.cancel(first.ref).status, Status.CANCELLING
+                    )
+                    for _ in range(10):
+                        service.progress()
+                    self.assertEqual(len(queries), 1)
+                    self.assertEqual(evictions.call_count, 1)
+                    self.assertEqual(reads._unallocated_reservations(second_job), 40)
+                    release.set()
+                    self.assertEqual(wait(service, first).status, Status.CANCELLED)
+                    self.assertEqual(wait(service, second).status, Status.COMPLETED)
+                    self.assertEqual(len(queries), 2)
+            finally:
+                release.set()
+                self._pin_pressure(service, pressure, mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_allocated_job_does_not_double_count_reservation(self):
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [
+                cache_fixtures.target(range(1, 41), cache_salt=f"allocated-{i}")
+                for i in range(2)
+            ]
+            self._cold_scopes(owner, scopes)
+            pressure = self._host_pressure(owner, leave_free=80)
+            self._pin_pressure(service, pressure)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get, query = cc.page_get_func, cc._storage_hit_query
+            queries = []
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            def counted_query(operation):
+                queries.append(operation)
+                return query(operation)
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cc, "_storage_hit_query", counted_query),
+                    patch.object(
+                        cache,
+                        "evict_host",
+                        side_effect=AssertionError("unexpected eviction"),
+                    ),
+                ):
+                    first = self._restore(service, scopes[0], "allocated-first")
+                    wait_for(service, entered.is_set)
+                    self.assertEqual(cc.mem_pool_host.available_size(), 40)
+                    second = self._restore(service, scopes[1], "allocated-second")
+                    wait_for(service, lambda: len(queries) == 2)
+                    second_job = service.control.executor.storage_reads.interests[
+                        second.ref.operation_id
+                    ].job
+                    self.assertIsNotNone(second_job.operation)
+                    release.set()
+                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                    self.assertEqual(wait(service, second).status, Status.COMPLETED)
+            finally:
+                release.set()
+                self._pin_pressure(service, pressure, mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_gpu_destination_is_exclusive_through_storage_and_dma_fences(self):
+        for first_dst in ("host", "gpu"):
+            with (
+                self.subTest(first_dst=first_dst),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                _, cache, service, dma = owner
+                scopes = [
+                    cache_fixtures.target(cache_salt=f"gpu-exclusive-{i}")
+                    for i in range(3)
+                ]
+                self._cold_scopes(owner, scopes)
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                get = cc.page_get_func
+
+                def blocked_get(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(5)
+                    return get(*args, **kwargs)
+
+                try:
+                    with patch.object(cc, "page_get_func", blocked_get):
+                        first = self._restore(
+                            service, scopes[0], "exclusive-first", dst=first_dst
+                        )
+                        wait_for(service, entered.is_set)
+                        second = self._restore(
+                            service,
+                            scopes[1],
+                            "exclusive-second",
+                            dst="gpu" if first_dst == "host" else "host",
+                        )
+                        self.assertEqual(
+                            current(service, second).update.code,
+                            "shared_prefix_serialization",
+                        )
+                        reads = service.control.executor.storage_reads
+                        self.assertIsNone(
+                            reads.interests[second.ref.operation_id].job.operation
+                        )
+                        release.set()
+                        wait_for(service, lambda: service.blocks_prefill)
+                        wait_for(service, lambda: bool(dma.pending))
+                        third = self._restore(service, scopes[2], "exclusive-third")
+                        self.assertEqual(
+                            current(service, third).update.code,
+                            "shared_prefix_serialization",
+                        )
+                        for _ in range(3):
+                            service.progress()
+                        self.assertIsNone(
+                            reads.interests[third.ref.operation_id].job.operation
+                        )
+                        dma.finish()
+                        for result in (first, second, third):
+                            self.assertEqual(
+                                wait(service, result).status, Status.COMPLETED
+                            )
+                finally:
+                    release.set()
+                self.assertFalse(service.blocks_prefill)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_older_gpu_waiter_fences_new_host_jobs_until_drained_or_cancelled(self):
+        for finish in ("complete", "cancel", "expire"):
+            with (
+                self.subTest(finish=finish),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                _, cache, service, dma = owner
+                scopes = [
+                    cache_fixtures.target(cache_salt=f"fifo-{i}") for i in range(4)
+                ]
+                self._cold_scopes(owner, scopes)
+                self.assertEqual(
+                    wait(service, self._restore(service, scopes[3], "resident")).status,
+                    Status.COMPLETED,
+                )
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                query, get = cc._storage_hit_query, cc.page_get_func
+                queries = []
+
+                def counted_query(operation):
+                    queries.append(operation.token_ids.cache_salt)
+                    return query(operation)
+
+                def blocked_get(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(5)
+                    return get(*args, **kwargs)
+
+                try:
+                    with (
+                        patch.object(cc, "_storage_hit_query", counted_query),
+                        patch.object(cc, "page_get_func", blocked_get),
+                    ):
+                        first = self._restore(service, scopes[0], "host-first")
+                        wait_for(service, entered.is_set)
+                        exclusive = public_transfer(
+                            service,
+                            "prefetch",
+                            "storage",
+                            "gpu",
+                            "gpu-second",
+                            salt=scopes[1].cache_salt,
+                        )
+                        later = self._restore(service, scopes[2], "host-third")
+                        reads = service.control.executor.storage_reads
+                        later_job = reads.interests[later.ref.operation_id].job
+                        self.assertIsNone(later_job.operation)
+                        self.assertEqual(
+                            current(service, later).update.code,
+                            "shared_prefix_serialization",
+                        )
+                        for _ in range(3):
+                            service.progress()
+                        self.assertIsNone(later_job.operation)
+                        # A read requiring no new work still bypasses the barrier.
+                        resident = self._restore(service, scopes[3], "resident-later")
+                        self.assertEqual(resident.status, Status.COMPLETED)
+                        expected = [service.cache_salt(scopes[0].cache_salt)]
+                        if finish == "complete":
+                            release.set()
+                            wait_for(service, lambda: bool(dma.pending))
+                            expected.append(service.cache_salt(scopes[1].cache_salt))
+                            self.assertEqual(queries, expected)
+                            self.assertTrue(service.blocks_prefill)
+                            self.assertIsNone(later_job.operation)
+                            dma.finish()
+                            self.assertEqual(
+                                wait(service, exclusive).status, Status.COMPLETED
+                            )
+                        else:
+                            if finish == "cancel":
+                                self.assertEqual(
+                                    service.control.cancel(exclusive.ref).status,
+                                    Status.CANCELLED,
+                                )
+                            else:
+                                self.clock.now += 5.1
+                            wait_for(service, lambda: len(queries) == 2)
+                            self.assertEqual(
+                                current(service, exclusive).status, Status.CANCELLED
+                            )
+                            self.assertIsNotNone(later_job.operation)
+                            self.assertFalse(service.blocks_prefill)
+                            self.assertFalse(dma.pending)
+                            release.set()
+                        self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                        self.assertEqual(wait(service, later).status, Status.COMPLETED)
+                        expected.append(service.cache_salt(scopes[2].cache_salt))
+                        self.assertEqual(queries, expected)
+                finally:
+                    release.set()
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_pipelined_job_keeps_exact_coalescing_and_demand_cancellation_ownership(
+        self,
+    ):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [
+                cache_fixtures.target(),
+                cache_fixtures.target(cache_salt="independent"),
+            ]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get, query = cc.page_get_func, cc._storage_hit_query
+            queries, gets = [], []
+
+            def blocked_get(operation, *args, **kwargs):
+                gets.append(operation)
+                entered.set()
+                assert release.wait(5)
+                return get(operation, *args, **kwargs)
+
+            def counted_query(operation):
+                queries.append(operation)
+                return query(operation)
+
+            demand = CacheRequestHandle("pipelined-demand", 0)
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cc, "_storage_hit_query", counted_query),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    first = self._restore(service, scopes[0], "coalesced-first")
+                    wait_for(service, entered.is_set)
+                    sibling = self._restore(service, scopes[0], "coalesced-sibling")
+                    other = self._restore(service, scopes[1], "independent")
+                    wait_for(service, lambda: len(queries) == 2)
+                    reads = service.control.executor.storage_reads
+                    job = reads.interests[first.ref.operation_id].job
+                    self.assertIs(reads.interests[sibling.ref.operation_id].job, job)
+                    self.assertEqual(
+                        service.control.cancel(first.ref).status, Status.CANCELLED
+                    )
+                    self.assertFalse(job.operation.is_terminated())
+                    self.assertTrue(
+                        reads.join_demand(
+                            demand,
+                            [],
+                            cache_fixtures.RadixKey(
+                                cache_fixtures.array("q", [1, 2, 3, 4])
+                            ),
+                            None,
+                            service.cache_salt(None),
+                        )
+                    )
+                    self.assertEqual(
+                        service.control.cancel(sibling.ref).status, Status.CANCELLING
+                    )
+                    self.assertFalse(job.operation.is_terminated())
+                    release.set()
+                    self.assertEqual(wait(service, sibling).status, Status.CANCELLED)
+                    self.assertEqual(wait(service, other).status, Status.COMPLETED)
+                    self.assertEqual(reads.release_demand(demand), (4, 0))
+                    self.assertEqual(len(queries), 2)
+                    self.assertEqual(len(gets), 2)
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_query_miss_or_partial_get_releases_pipeline_turn_for_waiting_scope(self):
+        for failure in ("miss", "partial"):
+            config = ServiceConfig(
+                namespace="ns",
+                engine_id="engine",
+                cache_limits=CacheLimits(max_concurrent_storage_reads=1),
+            )
+            with (
+                self.subTest(failure=failure),
+                hicache(self, config, namespace_keys=True) as owner,
+            ):
+                _, cache, service, _ = owner
+                scopes = [
+                    cache_fixtures.target(cache_salt=f"failure-{i}") for i in range(2)
+                ]
+                self._cold_scopes(owner, scopes)
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                query, get = cc._storage_hit_query, cc.page_get_func
+                first_operation = []
+
+                def failed_query(operation):
+                    if not first_operation:
+                        first_operation.append(operation)
+                        if failure == "miss":
+                            entered.set()
+                            assert release.wait(5)
+                            return [], 0
+                    return query(operation)
+
+                def partial_get(operation, hashes, indices, extra_info=None):
+                    if operation is first_operation[0] and failure == "partial":
+                        entered.set()
+                        assert release.wait(5)
+                        return get(operation, hashes[:2], indices[:2], extra_info)
+                    return get(operation, hashes, indices, extra_info)
+
+                try:
+                    with (
+                        patch.object(cc, "_storage_hit_query", failed_query),
+                        patch.object(cc, "page_get_func", partial_get),
+                    ):
+                        first = self._restore(service, scopes[0], "failing-first")
+                        wait_for(service, entered.is_set)
+                        second = self._restore(service, scopes[1], "after-failure")
+                        self.assertEqual(
+                            current(service, second).update.code,
+                            "storage_concurrency_limit",
+                        )
+                        self.assertIsNone(
+                            service.control.executor.storage_reads.interests[
+                                second.ref.operation_id
+                            ].job.operation
+                        )
+                        release.set()
+                        self.assertEqual(
+                            wait(service, first).status,
+                            Status.MISSING if failure == "miss" else Status.FAILED,
+                        )
+                        self.assertEqual(wait(service, second).status, Status.COMPLETED)
+                finally:
+                    release.set()
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_deadline_keeps_pipeline_turn_until_query_or_get_actually_drains(self):
+        for phase in ("query", "get"):
+            config = ServiceConfig(
+                namespace="ns",
+                engine_id="engine",
+                cache_limits=CacheLimits(max_concurrent_storage_reads=1),
+            )
+            with (
+                self.subTest(phase=phase),
+                hicache(self, config, namespace_keys=True) as owner,
+            ):
+                _, cache, service, _ = owner
+                scopes = [
+                    cache_fixtures.target(),
+                    cache_fixtures.target(cache_salt="after-deadline"),
+                ]
+                self._cold_scopes(owner, scopes)
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                query, get = cc._storage_hit_query, cc.page_get_func
+                first_operation, queries = [], []
+
+                def blocked_query(operation):
+                    queries.append(operation)
+                    if not first_operation:
+                        first_operation.append(operation)
+                        if phase == "query":
+                            entered.set()
+                            assert release.wait(5)
+                    return query(operation)
+
+                def blocked_get(operation, *args, **kwargs):
+                    if operation is first_operation[0] and phase == "get":
+                        entered.set()
+                        assert release.wait(5)
+                    return get(operation, *args, **kwargs)
+
+                try:
+                    with (
+                        patch.object(cc, "_storage_hit_query", blocked_query),
+                        patch.object(cc, "page_get_func", blocked_get),
+                    ):
+                        first = public_transfer(
+                            service, "prefetch", "storage", "host", "deadline-first"
+                        )
+                        wait_for(service, entered.is_set)
+                        second = self._restore(service, scopes[1], "after-deadline")
+                        self.clock.now += 5.1
+                        service.progress()
+                        self.assertEqual(
+                            current(service, first).status, Status.CANCELLING
+                        )
+                        for _ in range(5):
+                            service.progress()
+                        reads = service.control.executor.storage_reads
+                        self.assertIsNone(
+                            reads.interests[second.ref.operation_id].job.operation
+                        )
+                        self.assertFalse(first_operation[0].native_quiescent)
+                        self.assertEqual(len(queries), 1)
+                        release.set()
+                        self.assertEqual(wait(service, first).status, Status.CANCELLED)
+                        self.assertEqual(wait(service, second).status, Status.COMPLETED)
+                        self.assertEqual(len(queries), 2)
+                finally:
+                    release.set()
+                assert_retired(cache, service)
+                cache.sanity_check()
+
     def _host_pressure(self, owner, *, leave_free=0):
         """Fill real host rows via CPU DMA and native MOVE; keep GPU empty."""
         _, cache, service, dma = owner
