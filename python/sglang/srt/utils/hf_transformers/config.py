@@ -70,8 +70,8 @@ _TEXT_SUB_CONFIG_ATTRS = (
 )
 
 
+# Unlike get_hf_text_config, selects the sub-config without normalizing its RoPE.
 def _resolve_text_sub_config(config) -> Optional[PretrainedConfig]:
-    """Select the language sub-config without normalizing its RoPE settings."""
     for attr in _TEXT_SUB_CONFIG_ATTRS:
         sub = getattr(config, attr, None)
         if isinstance(sub, dict):
@@ -90,7 +90,6 @@ def _resolve_text_sub_config(config) -> Optional[PretrainedConfig]:
 
 
 def _merged_rope_override(config, key: str, value):
-    """Merge a rope override dict over the config's existing rope dict."""
     existing = getattr(config, key, None)
     if not isinstance(value, dict):
         return value
@@ -106,7 +105,6 @@ def _merged_rope_override(config, key: str, value):
 
 
 def _sub_config_for_override(config, key: str, value):
-    """The sub-config a dict override updates in place, or None."""
     existing = getattr(config, key, None)
     if (
         key in _TEXT_SUB_CONFIG_ATTRS
@@ -121,16 +119,13 @@ def _sub_config_for_override(config, key: str, value):
 
 
 def _mirror_rope_overrides(config, rope_overrides: dict) -> None:
-    """Merge flat RoPE dict overrides into the language sub-config.
-
-    Only dicts: a non-dict value (null) would replace the sub-config's whole
-    RoPE dict, rope_theta included.
-    """
     text_config = _resolve_text_sub_config(config)
     if text_config is None:
         return
     for key, value in rope_overrides.items():
-        text_config.update({key: _merged_rope_override(text_config, key, value)})
+        text_config.update(
+            {key: _merged_rope_override(config=text_config, key=key, value=value)}
+        )
 
 
 def apply_model_override_args(config, model_override_args: dict) -> None:
@@ -138,13 +133,17 @@ def apply_model_override_args(config, model_override_args: dict) -> None:
     flat_overrides = {}
     rope_overrides = {}
     for key, value in model_override_args.items():
-        sub_config = _sub_config_for_override(config, key, value)
+        sub_config = _sub_config_for_override(config=config, key=key, value=value)
         if sub_config is not None:
-            apply_model_override_args(sub_config, value)
+            apply_model_override_args(config=sub_config, model_override_args=value)
         elif key in _ROPE_OVERRIDE_KEYS:
             # One key at a time: under transformers v5 both keys share one
             # dict, so each merge has to see the previous one.
-            config.update({key: _merged_rope_override(config, key, value)})
+            config.update(
+                {key: _merged_rope_override(config=config, key=key, value=value)}
+            )
+            # Mirror only dicts: a null would replace the language sub-config's
+            # whole RoPE dict, rope_theta included.
             if isinstance(value, dict):
                 rope_overrides[key] = value
         else:
@@ -152,7 +151,7 @@ def apply_model_override_args(config, model_override_args: dict) -> None:
     if flat_overrides:
         config.update(flat_overrides)
     if rope_overrides:
-        _mirror_rope_overrides(config, rope_overrides)
+        _mirror_rope_overrides(config=config, rope_overrides=rope_overrides)
 
 
 def _apply_deepseek_ocr_overrides(config, model):
@@ -503,7 +502,9 @@ def get_config(
     if model_override_args:
         if isinstance(config, DeepseekV41Config):
             model_override_args = normalize_deepseek_v41_config(model_override_args)
-        apply_model_override_args(config, model_override_args)
+        apply_model_override_args(
+            config=config, model_override_args=model_override_args
+        )
 
     if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

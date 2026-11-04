@@ -1124,14 +1124,18 @@ class TestApplyModelOverrideArgs(CustomTestCase):
     def test_flat_update_on_pure_text_config(self):
         cfg = PretrainedConfig()
         cfg.num_hidden_layers = 2
-        apply_model_override_args(cfg, {"num_hidden_layers": 4})
+        apply_model_override_args(
+            config=cfg, model_override_args={"num_hidden_layers": 4}
+        )
         self.assertEqual(cfg.num_hidden_layers, 4)
 
     def test_flat_rope_scaling_mirrors_rope_parameters(self):
         # Qwen3.5 v5 keeps checkpoint keys under rope_parameters while the
         # documented flat override still uses rope_scaling.
         cfg, text_cfg = self._make_composite_config("rope_parameters")
-        apply_model_override_args(cfg, {"rope_scaling": dict(self.YARN)})
+        apply_model_override_args(
+            config=cfg, model_override_args={"rope_scaling": dict(self.YARN)}
+        )
         self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
         self.assertEqual(text_cfg.rope_parameters["factor"], 4.0)
         self.assertEqual(text_cfg.rope_parameters["rope_theta"], 1e7)
@@ -1139,7 +1143,9 @@ class TestApplyModelOverrideArgs(CustomTestCase):
 
     def test_flat_rope_parameters_mirrors_and_merges(self):
         cfg, text_cfg = self._make_composite_config("rope_parameters")
-        apply_model_override_args(cfg, {"rope_parameters": dict(self.YARN)})
+        apply_model_override_args(
+            config=cfg, model_override_args={"rope_parameters": dict(self.YARN)}
+        )
         self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
         self.assertEqual(text_cfg.rope_parameters["factor"], 4.0)
         self.assertEqual(text_cfg.rope_parameters["rope_theta"], 1e7)
@@ -1149,7 +1155,8 @@ class TestApplyModelOverrideArgs(CustomTestCase):
         # Nested rope updates retain the existing config object and keys.
         cfg, text_cfg = self._make_composite_config()
         apply_model_override_args(
-            cfg, {"text_config": {"rope_parameters": dict(self.YARN)}}
+            config=cfg,
+            model_override_args={"text_config": {"rope_parameters": dict(self.YARN)}},
         )
         self.assertIsInstance(cfg.text_config, PretrainedConfig)
         self.assertIs(cfg.text_config, text_cfg)
@@ -1159,7 +1166,9 @@ class TestApplyModelOverrideArgs(CustomTestCase):
 
     def test_nested_non_rope_override(self):
         cfg, text_cfg = self._make_composite_config()
-        apply_model_override_args(cfg, {"text_config": {"num_attention_heads": 16}})
+        apply_model_override_args(
+            config=cfg, model_override_args={"text_config": {"num_attention_heads": 16}}
+        )
         self.assertEqual(text_cfg.num_attention_heads, 16)
         self.assertEqual(text_cfg.rope_parameters["rope_type"], "default")
 
@@ -1172,7 +1181,9 @@ class TestApplyModelOverrideArgs(CustomTestCase):
                 "rope_theta": 1e7,
             },
         }
-        apply_model_override_args(cfg, {"rope_parameters": dict(self.YARN)})
+        apply_model_override_args(
+            config=cfg, model_override_args={"rope_parameters": dict(self.YARN)}
+        )
         self.assertIsInstance(cfg.llm_config, PretrainedConfig)
         self.assertEqual(cfg.llm_config.rope_parameters["rope_type"], "yarn")
         self.assertEqual(cfg.llm_config.rope_parameters["rope_theta"], 1e7)
@@ -1188,7 +1199,9 @@ class TestApplyModelOverrideArgs(CustomTestCase):
             "rope_parameters": {"rope_type": "default", "rope_theta": 1e6}
         }
         cfg.thinker_config = thinker
-        apply_model_override_args(cfg, {"rope_parameters": dict(self.YARN)})
+        apply_model_override_args(
+            config=cfg, model_override_args={"rope_parameters": dict(self.YARN)}
+        )
         inner = cfg.thinker_config.text_config
         self.assertIsInstance(inner, PretrainedConfig)
         self.assertEqual(inner.rope_parameters["rope_type"], "yarn")
@@ -1202,7 +1215,10 @@ class TestApplyModelOverrideArgs(CustomTestCase):
             "rope_parameters": {"rope_type": "default", "rope_theta": 1e7},
         }
         apply_model_override_args(
-            cfg, {"text_config": {"rope_parameters": {"rope_theta": 2e7}}}
+            config=cfg,
+            model_override_args={
+                "text_config": {"rope_parameters": {"rope_theta": 2e7}}
+            },
         )
         self.assertIsInstance(cfg.text_config, PretrainedConfig)
         self.assertEqual(cfg.text_config.num_attention_heads, 8)
@@ -1216,7 +1232,9 @@ class TestApplyModelOverrideArgs(CustomTestCase):
         # as a dict) is still a plain flat update.
         cfg = PretrainedConfig()
         cfg.vision_config = {"hidden_size": 10, "patch": 14}
-        apply_model_override_args(cfg, {"vision_config": {"hidden_size": 20}})
+        apply_model_override_args(
+            config=cfg, model_override_args={"vision_config": {"hidden_size": 20}}
+        )
         self.assertEqual(cfg.vision_config, {"hidden_size": 20})
 
     def test_legacy_type_alias_override_sets_rope_type(self):
@@ -1236,7 +1254,7 @@ class TestApplyModelOverrideArgs(CustomTestCase):
     def test_override_dict_is_not_shared_between_configs(self):
         cfg, text_cfg = self._make_composite_config()
         override = {"rope_parameters": dict(self.YARN)}
-        apply_model_override_args(cfg, override)
+        apply_model_override_args(config=cfg, model_override_args=override)
         self.assertIsNot(cfg.rope_parameters, override["rope_parameters"])
         self.assertIsNot(text_cfg.rope_parameters, override["rope_parameters"])
         self.assertIsNot(cfg.rope_parameters, text_cfg.rope_parameters)
@@ -1261,7 +1279,7 @@ class TestApplyModelOverrideArgs(CustomTestCase):
             "rope_parameters": {"rope_theta": 20000.0},
         }
         llama = LlamaConfig()
-        apply_model_override_args(llama, override)
+        apply_model_override_args(config=llama, model_override_args=override)
         model = self._qwen3_5_config_dir()
         config = get_config(
             model, trust_remote_code=False, model_override_args=override
