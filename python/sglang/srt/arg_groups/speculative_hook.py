@@ -1123,12 +1123,15 @@ def _fall_back_xpu_draft_attention_for_head_size(server_args: ServerArgs) -> Non
         or attention_backends_of(resolved_view(server_args))[0] != "intel_xpu"
     ):
         return
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.utils.hf_transformers_utils import get_config, get_hf_text_config
 
-    draft_hf_config = get_config(
-        cfg.speculative_draft_model_path,
-        trust_remote_code=cfg.trust_remote_code,
-        revision=cfg.speculative_draft_model_revision,
+    # Composite configs (e.g. Qwen3_5Config) keep the attention dims in a text sub-config.
+    draft_hf_config = get_hf_text_config(
+        get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+        )
     )
     # head_dim is optional in HF configs; without it the head size is hidden / heads.
     head_dim = getattr(draft_hf_config, "head_dim", None) or (
