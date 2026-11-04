@@ -241,6 +241,12 @@ pub struct ServerArgs {
     pub metrics: Option<MetricsConfig>,
     /// Request logging (`--log-requests`); `None` logs no requests.
     pub request_log: Option<RequestLogConfig>,
+    /// `--crash-dump-folder` is set: keep the requests a crash dump writes
+    /// (Python owns the folder and the file; see `Server::crash_dump_snapshot`).
+    pub crash_dump: bool,
+    /// `sampling_params.custom_params` keys the server itself adds to a
+    /// request (none from a client); request logs and crash dumps leave them out.
+    pub server_added_custom_params: Vec<String>,
 }
 
 #[pyo3::pymethods]
@@ -300,6 +306,8 @@ impl ServerArgs {
         num_accelerators,
         metrics,
         request_log,
+        crash_dump,
+        server_added_custom_params,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -357,6 +365,8 @@ impl ServerArgs {
         num_accelerators: u32,
         metrics: Option<MetricsConfig>,
         request_log: Option<RequestLogConfig>,
+        crash_dump: bool,
+        server_added_custom_params: Vec<String>,
     ) -> Self {
         Self {
             model_path,
@@ -413,6 +423,8 @@ impl ServerArgs {
             num_accelerators,
             metrics,
             request_log,
+            crash_dump,
+            server_added_custom_params,
         }
     }
 }
@@ -476,6 +488,8 @@ impl Default for ServerArgs {
             num_accelerators: 0,
             metrics: None,
             request_log: None,
+            crash_dump: false,
+            server_added_custom_params: Vec::new(),
         }
     }
 }
@@ -646,9 +660,6 @@ pub struct RequestLogConfig {
     pub headers: Vec<String>,
     /// A finished request faster than this (ms) is not logged; `<= 0` logs all.
     pub exceeded_ms: i64,
-    /// `sampling_params.custom_params` keys the server itself adds to a
-    /// request before it is logged (none from a client); left out of the lines.
-    pub omit_custom_params: Vec<String>,
 }
 
 #[pyo3::pymethods]
@@ -664,7 +675,6 @@ impl RequestLogConfig {
         batch_shared_fields,
         headers,
         exceeded_ms,
-        omit_custom_params = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
@@ -677,7 +687,6 @@ impl RequestLogConfig {
         batch_shared_fields: Vec<String>,
         headers: Vec<String>,
         exceeded_ms: i64,
-        omit_custom_params: Vec<String>,
     ) -> Self {
         Self {
             max_length,
@@ -689,7 +698,6 @@ impl RequestLogConfig {
             batch_shared_fields,
             headers,
             exceeded_ms,
-            omit_custom_params,
         }
     }
 }

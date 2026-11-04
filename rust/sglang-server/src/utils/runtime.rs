@@ -64,6 +64,11 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
+    /// The crash dump's requests (`None` without `--crash-dump-folder`).
+    pub fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
+        self.core.crash_dump_snapshot()
+    }
+
     /// Build the family context from `spec` and spawn `workers`
     /// `mm-worker-{i}` threads into the shutdown join set — late, once Python
     /// has built the mm spec (`Server.start_mm_workers`).

@@ -50,7 +50,7 @@ impl CoreHandle {
             body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST.into();
             body["bootstrap_room"] = 0.into();
         }
-        let received = ReceivedAs::Body(self.snapshot_body(&body, &http::HeaderMap::new()));
+        let received = ReceivedAs::Body(self.snapshot_body(&body, None, &http::HeaderMap::new()));
         let probe = GenerateRequest {
             rid,
             input_ids: Some(vec![0]),

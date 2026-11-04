@@ -59,7 +59,7 @@ def _build_server_args(
     health_generate_headers: Optional[Dict[str, str]] = None,
     default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
     request_class: Optional[type] = None,
-    omit_custom_params: Tuple[str, ...] = (),
+    server_added_custom_params: Tuple[str, ...] = (),
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -228,11 +228,12 @@ def _build_server_args(
                 **request_log_settings(
                     get_observability().log_requests_level, request_class
                 ),
-                omit_custom_params=list(omit_custom_params),
             )
             if get_observability().log_requests
             else None
         ),
+        crash_dump=bool(get_observability().crash_dump_folder),
+        server_added_custom_params=list(server_added_custom_params),
     )
 
 

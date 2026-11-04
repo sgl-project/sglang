@@ -43,7 +43,7 @@ pub(crate) struct CoreConfig {
     pub(crate) metadata: CoreMetadata,
     /// Request metrics, when `--enable-metrics` is on.
     pub(crate) metrics: Option<Arc<FrontendMetrics>>,
-    /// Request logging, when `--log-requests` is on.
+    /// Request logging and crash-dump recording, when either is on.
     pub(crate) request_log: Option<Arc<RequestLog>>,
     /// The targets answering for the DP ranks this process does not host,
     /// which every multi-rank control operation fans out to alongside the

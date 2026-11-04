@@ -300,6 +300,21 @@ impl Server {
             .map_err(|e| value_error("mm spec", e))
     }
 
+    /// The requests a crash dump writes, as JSON: the finished requests of the
+    /// last five minutes and every unfinished one (see
+    /// `RustServer.dump_requests_before_crash`). `None` without
+    /// `--crash-dump-folder`.
+    pub fn crash_dump_snapshot<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        let snapshot = py.detach(|| self.rt.crash_dump_snapshot())?;
+        Some(PyBytes::new(py, &snapshot))
+    }
+
+    /// Write out the request-log lines still buffered (a crash dump does,
+    /// before the process goes down).
+    pub fn flush_request_log(&self, py: Python<'_>) {
+        py.detach(crate::api_server::core::flush_request_log);
+    }
+
     /// Begin the graceful drain, the Rust side of Python's SIGTERM handling:
     /// health answers 503 at once, requests are still admitted, and the
     /// listeners close once none is left in flight (see [`Server::drain_complete`]).

@@ -1,6 +1,8 @@
 //! Python `TokenizerManager`'s request log (`--log-requests`, text format to
-//! stdout), taken at the same request boundaries: `Receive` before any
-//! preprocessing, `Finish` on the terminal output (scheduler aborts included).
+//! stdout) and crash-dump recording (`--crash-dump-folder`), taken at the same
+//! request boundaries: `Receive` before any preprocessing, `Finish` on the
+//! terminal output (scheduler aborts included), and, for a dump, the finished
+//! requests of the last five minutes plus every unfinished one.
 //!
 //! A request is described in Python's `GenerateReqInput` terms: a native
 //! `/generate` body as the client sent it, with the values Python's
@@ -10,13 +12,18 @@
 //! settings Python hands over ([`RequestLogConfig`]). Strings print as
 //! Python's `repr` does, except that non-ASCII characters print as they are
 //! (Python escapes the rare non-printable ones).
+//!
+//! The crash dump itself is written by Python (`RustServer
+//! .dump_requests_before_crash`), from [`RequestLog::crash_dump_snapshot`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use serde_json::{Map, Value};
 
 use super::frame::CoreOutput;
@@ -25,9 +32,16 @@ use crate::message::multimodal::MmItem;
 use crate::message::request::GenerateRequest;
 use crate::message::response::ResponseItem;
 
-/// Request logging (`--log-requests`).
+/// Python's `record_request_for_crash_dump` keeps a finished request this long.
+const CRASH_DUMP_WINDOW_SECS: f64 = 300.0;
+
+/// Request logging and crash-dump recording, whichever is enabled.
 pub(crate) struct RequestLog {
-    logger: RequestLogger,
+    logger: Option<RequestLogger>,
+    recorder: Option<CrashRecorder>,
+    /// `sampling_params.custom_params` keys the server adds itself, which the
+    /// log lines leave out (a crash dump's recorder holds its own copy).
+    server_added_custom_params: Vec<String>,
     /// Python `_set_default_priority` runs before the request is logged.
     default_priority: Option<i64>,
     /// The launch weight version the core stamps on every output.
@@ -42,10 +56,12 @@ pub(crate) type LoggedHeaders = Arc<Vec<(String, String)>>;
 
 /// A native `/generate` body captured before the launch-time sampling defaults
 /// are merged into it (Python merges them into a copy), for the request's log
-/// lines.
+/// lines and crash-dump record.
 pub(crate) struct BodySnapshot {
-    /// The top-level fields the log shows.
+    /// The top-level fields the log shows (empty when not logging).
     fields: Map<String, Value>,
+    /// The whole body for a crash dump (`None` when not recording).
+    dump: Option<Arc<DumpBody>>,
     headers: LoggedHeaders,
     /// When an HTTP layer started the request before `/generate` ran (work
     /// an `HttpLayer` does before the handler), so the `Finish` latency
@@ -58,6 +74,15 @@ impl BodySnapshot {
         self.started_at = at;
         self
     }
+}
+
+/// A native `/generate` body's bytes as received, and the header overrides
+/// written into the parsed body (`None` when overrides are off). A crash
+/// dump keeps both and applies the overrides only when it is written, rather
+/// than serializing every request's body again.
+pub(crate) struct RawBody {
+    pub(crate) bytes: Bytes,
+    pub(crate) overrides: Option<Map<String, Value>>,
 }
 
 /// How a generation request reached the core.
@@ -77,11 +102,20 @@ impl ReceivedAs {
 }
 
 impl RequestLog {
-    /// `None` when `--log-requests` is not set.
+    /// `None` when neither `--log-requests` nor `--crash-dump-folder` is set.
     pub(crate) fn from_server_args(args: &ServerArgs) -> Option<Arc<Self>> {
-        let config = args.request_log.clone()?;
+        if args.request_log.is_none() && !args.crash_dump {
+            return None;
+        }
         Some(Arc::new(Self {
-            logger: RequestLogger::new(config, LogSink::Stdout),
+            logger: args
+                .request_log
+                .clone()
+                .map(|config| RequestLogger::new(config, LogSink::Stdout)),
+            recorder: args
+                .crash_dump
+                .then(|| CrashRecorder::omitting(args.server_added_custom_params.clone())),
+            server_added_custom_params: args.server_added_custom_params.clone(),
             default_priority: args.default_priority_value,
             weight_version: args.weight_version.as_deref().map(Arc::from),
             incremental_streaming_output: args.incremental_streaming_output,
@@ -90,9 +124,23 @@ impl RequestLog {
 
     /// Lines kept in memory instead of printed.
     #[cfg(test)]
-    pub(crate) fn for_test(config: RequestLogConfig) -> Arc<Self> {
+    pub(crate) fn for_test(config: Option<RequestLogConfig>, crash_dump: bool) -> Arc<Self> {
+        Self::for_test_omitting(config, crash_dump, &[])
+    }
+
+    /// [`Self::for_test`] for a server that adds `omitted` to `custom_params`.
+    #[cfg(test)]
+    pub(crate) fn for_test_omitting(
+        config: Option<RequestLogConfig>,
+        crash_dump: bool,
+        omitted: &[&str],
+    ) -> Arc<Self> {
+        let omitted: Vec<String> = omitted.iter().map(|key| key.to_string()).collect();
         Arc::new(Self {
-            logger: RequestLogger::new(config, LogSink::Memory(Mutex::default())),
+            logger: config
+                .map(|config| RequestLogger::new(config, LogSink::Memory(Mutex::default()))),
+            recorder: crash_dump.then(|| CrashRecorder::omitting(omitted.clone())),
+            server_added_custom_params: omitted,
             default_priority: None,
             weight_version: Some(Arc::from("default")),
             incremental_streaming_output: false,
@@ -101,47 +149,63 @@ impl RequestLog {
 
     #[cfg(test)]
     pub(crate) fn logged_lines(&self) -> Vec<String> {
-        match &self.logger.sink {
+        match &self.logger.as_ref().expect("logging").sink {
             LogSink::Memory(lines) => std::mem::take(&mut *lock(lines)),
             LogSink::Stdout => unreachable!("tests log to memory"),
         }
     }
 
+    /// `raw` is what a crash dump keeps of a body that came over HTTP instead
+    /// of serializing `body`; `None` for a body built in process.
     pub(crate) fn snapshot_body(
         &self,
         body: &Value,
+        raw: Option<RawBody>,
         headers: &http::HeaderMap,
     ) -> Option<BodySnapshot> {
         let object = body.as_object()?;
-        let fields = object
-            .iter()
-            .filter_map(|(name, value)| {
-                let value = if !self.logger.skip_names.contains(name.as_str()) {
-                    let mut value = value.clone();
-                    if name == "sampling_params" {
-                        self.logger.omit_custom_params(&mut value);
-                    }
-                    value
-                } else if name == "image_data" {
-                    // Its layout, for a batch's `modalities`.
-                    image_layout(value)
-                } else {
-                    return None;
-                };
-                Some((name.clone(), value))
-            })
-            .collect();
+        let fields = match &self.logger {
+            Some(logger) => object
+                .iter()
+                .filter_map(|(name, value)| {
+                    let value = if !logger.skip_names.contains(name.as_str()) {
+                        let mut value = value.clone();
+                        if name == "sampling_params" {
+                            omit_custom_params(&mut value, &self.server_added_custom_params);
+                        }
+                        value
+                    } else if name == "image_data" {
+                        // Its layout, for a batch's `modalities`.
+                        image_layout(value)
+                    } else {
+                        return None;
+                    };
+                    Some((name.clone(), value))
+                })
+                .collect(),
+            None => Map::new(),
+        };
+        let dump = self.recorder.as_ref().map(|recorder| {
+            recorder.body(raw.unwrap_or_else(|| RawBody {
+                bytes: Bytes::from(serde_json::to_vec(body).expect("a JSON value serializes")),
+                overrides: None,
+            }))
+        });
         Some(BodySnapshot {
             fields,
+            dump,
             headers: self.logged_headers(headers),
             started_at: None,
         })
     }
 
-    /// The whitelisted headers present on `headers`.
+    /// The whitelisted headers present on `headers` (none when not logging).
     pub(crate) fn logged_headers(&self, headers: &http::HeaderMap) -> LoggedHeaders {
+        let Some(logger) = &self.logger else {
+            return LoggedHeaders::default();
+        };
         Arc::new(
-            self.logger
+            logger
                 .config
                 .headers
                 .iter()
@@ -154,39 +218,63 @@ impl RequestLog {
     }
 
     /// Log `Receive` for `requests` (one line for a whole batch) and start one
-    /// record per request, which logs `Finish`.
+    /// record per request, which logs `Finish` and keeps the crash-dump entry.
     pub(crate) fn receive(
         self: &Arc<Self>,
         requests: &[GenerateRequest],
         received: ReceivedAs,
         batch: bool,
+        log_metrics: bool,
     ) -> Vec<RequestRecord> {
         let created_at = match &received {
             ReceivedAs::Body(Some(snapshot)) => snapshot.started_at,
             _ => None,
         }
         .unwrap_or_else(Instant::now);
-        let (obj, items, headers) = match received {
+        let created_time = unix_time();
+        let (obj, items, dumps, headers) = match received {
             ReceivedAs::Body(Some(snapshot)) => self.body_views(snapshot, requests, batch),
             // A body that is not a JSON object fails to decode before this.
             ReceivedAs::Body(None) => self.typed_views(requests, batch, LoggedHeaders::default()),
             ReceivedAs::Typed(headers) => self.typed_views(requests, batch, headers),
         };
-        self.logger.received(&obj.into(), &headers);
+        if let Some(logger) = &self.logger {
+            logger.received(&obj.into(), &headers);
+        }
         items
             .into_iter()
+            .zip(dumps)
             .zip(requests)
-            .map(|(obj, request)| RequestRecord {
-                log: self.clone(),
-                obj,
-                headers: headers.clone(),
-                rid: request.rid.client_facing().to_owned(),
-                created_at,
-                incremental: request.stream && self.incremental_streaming_output,
-                output: CoreOutput {
+            .map(|((obj, dump), request)| {
+                let output = Arc::new(Mutex::new(CoreOutput {
                     weight_version: self.weight_version.clone(),
                     ..Default::default()
-                },
+                }));
+                let rid = request.rid.client_facing().to_owned();
+                let in_flight = match (&self.recorder, dump) {
+                    (Some(recorder), Some((body, batch_index))) => Some(recorder.register(
+                        DumpRequest {
+                            body,
+                            batch_index,
+                            rid: rid.clone(),
+                        },
+                        created_time,
+                        output.clone(),
+                    )),
+                    _ => None,
+                };
+                RequestRecord {
+                    log: self.clone(),
+                    obj,
+                    headers: headers.clone(),
+                    rid,
+                    created_at,
+                    incremental: request.stream && self.incremental_streaming_output,
+                    output,
+                    in_flight,
+                    log_metrics,
+                    admitted: false,
+                }
             })
             .collect()
     }
@@ -201,40 +289,49 @@ impl RequestLog {
         batch: bool,
     ) -> Views {
         let BodySnapshot {
-            fields, headers, ..
+            fields,
+            dump,
+            headers,
+            ..
         } = snapshot;
+        let logging = self.logger.is_some();
         // Held once for the whole batch, as Python's items share them.
-        let shared = Arc::new(if batch {
-            self.logger.batch_shared(&fields)
-        } else {
-            Map::new()
+        let shared = Arc::new(match &self.logger {
+            Some(logger) if batch => logger.batch_shared(&fields),
+            _ => Map::new(),
         });
         let mut items = Vec::with_capacity(requests.len());
+        let mut dumps = Vec::with_capacity(requests.len());
         for (i, request) in requests.iter().enumerate() {
-            let mut item = if batch {
-                let mut item = self.logger.batch_item(&fields, i);
-                // Python's batch normalization: a single `bootstrap_room`
-                // counts up per item, as the normalized requests carry it,
-                // and each item's images become a list with their modality.
-                item.insert("bootstrap_room".into(), request.bootstrap_room.into());
-                if let Some((images, modality)) = fields
-                    .get("image_data")
-                    .and_then(|images| batch_images(images, i))
-                {
-                    item.insert("image_data".into(), images);
-                    item.insert("modalities".into(), modality);
+            let mut item = Map::new();
+            if let Some(logger) = &self.logger {
+                if batch {
+                    item = logger.batch_item(&fields, i);
+                    // Python's batch normalization: a single `bootstrap_room`
+                    // counts up per item, as the normalized requests carry it,
+                    // and each item's images become a list with their modality.
+                    item.insert("bootstrap_room".into(), request.bootstrap_room.into());
+                    if let Some((images, modality)) = fields
+                        .get("image_data")
+                        .and_then(|images| batch_images(images, i))
+                    {
+                        item.insert("image_data".into(), images);
+                        item.insert("modalities".into(), modality);
+                    }
+                } else {
+                    item = fields.clone();
                 }
-                item
-            } else {
-                fields.clone()
-            };
-            self.normalize(&mut item, request);
+                self.normalize(&mut item, request);
+            }
             items.push(PyObj {
                 own: item,
                 shared: shared.clone(),
             });
+            dumps.push(dump.clone().map(|body| (body, batch.then_some(i))));
         }
-        let obj = if batch {
+        let obj = if !logging {
+            Map::new()
+        } else if batch {
             // Python's batch object holds these as per-item lists.
             let mut obj = fields;
             for name in [
@@ -251,7 +348,7 @@ impl RequestLog {
         } else {
             items[0].own.clone()
         };
-        (obj, items, headers)
+        (obj, items, dumps, headers)
     }
 
     /// Python's single-request normalization of the fields the request
@@ -289,7 +386,8 @@ impl RequestLog {
         );
     }
 
-    /// The Python object of a request an adapter or the core built.
+    /// The Python object of a request an adapter or the core built. Its
+    /// fields are all known, so the log and the crash dump read one map.
     fn typed_views(
         &self,
         requests: &[GenerateRequest],
@@ -297,6 +395,19 @@ impl RequestLog {
         headers: LoggedHeaders,
     ) -> Views {
         let items: Vec<Map<String, Value>> = requests.iter().map(typed_fields).collect();
+        let dumps = items
+            .iter()
+            .map(|item| {
+                self.recorder.as_ref().map(|recorder| {
+                    let json = serde_json::to_vec(item).expect("a JSON map serializes");
+                    let body = recorder.body(RawBody {
+                        bytes: Bytes::from(json),
+                        overrides: None,
+                    });
+                    (body, None)
+                })
+            })
+            .collect();
         let obj = if batch {
             let mut obj = items.first().cloned().unwrap_or_default();
             obj.insert(
@@ -307,12 +418,31 @@ impl RequestLog {
         } else {
             items.first().cloned().unwrap_or_default()
         };
-        (obj, items.into_iter().map(PyObj::from).collect(), headers)
+        (
+            obj,
+            items.into_iter().map(PyObj::from).collect(),
+            dumps,
+            headers,
+        )
+    }
+
+    /// The crash dump's requests as JSON (see `CrashRecorder::snapshot`);
+    /// `None` when not recording.
+    pub(crate) fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
+        self.recorder
+            .as_ref()
+            .map(|recorder| recorder.snapshot(unix_time()))
     }
 }
 
-/// `(Receive object, per-request Finish objects, headers)`.
-type Views = (Map<String, Value>, Vec<PyObj>, LoggedHeaders);
+/// `(Receive object, per-request Finish objects, per-request dump sources,
+/// headers)`.
+type Views = (
+    Map<String, Value>,
+    Vec<PyObj>,
+    Vec<Option<(Arc<DumpBody>, Option<usize>)>>,
+    LoggedHeaders,
+);
 
 /// A request's Python object: its own fields over the ones its batch shares,
 /// which every item references as Python's `obj[i]` does.
@@ -442,48 +572,61 @@ fn media_item(item: &MmItem) -> Value {
     }
 }
 
-/// One request's log state, carried by its core call.
+/// One request's log and crash-dump state, carried by its core call.
 pub(crate) struct RequestRecord {
     log: Arc<RequestLog>,
-    /// The Python object of its `Finish` line.
+    /// The Python object of its `Finish` line (empty when not logging).
     obj: PyObj,
     headers: LoggedHeaders,
     rid: String,
     created_at: Instant,
     /// An incremental stream, whose `Finish` shows the last delta.
     incremental: bool,
-    /// The output so far (only the completion-token count when incremental).
-    output: CoreOutput,
+    /// The output so far, shared with the crash recorder's in-flight entry.
+    output: Arc<Mutex<CoreOutput>>,
+    /// Its in-flight entry, until it finishes or is dropped.
+    in_flight: Option<u64>,
+    /// Python's `log_metrics`: false for the health probe, which a crash dump
+    /// leaves out.
+    log_metrics: bool,
+    /// TM intake accepted the request: if its call is dropped unfinished (the
+    /// client went away), Python still records it once the abort lands.
+    admitted: bool,
 }
 
 impl RequestRecord {
+    /// TM intake accepted the request (its core call exists).
+    pub(crate) fn admit(&mut self) {
+        self.admitted = true;
+    }
+
     /// Observe one runtime item of the call.
     pub(crate) fn observe(&mut self, item: &ResponseItem) {
         match item {
-            ResponseItem::Frame(chunk) if self.incremental => {
-                self.output.completion_tokens += chunk.completion_tokens;
-            }
             ResponseItem::Frame(chunk) => {
                 let delta = CoreOutput::from(chunk.clone());
-                self.output.append_delta(&delta);
+                lock(&self.output).append_delta(&delta);
             }
             ResponseItem::Done(chunk) => {
                 let delta = CoreOutput::from(chunk.clone());
-                let output = if self.incremental {
-                    // The stream's terminal frame: the last delta, with the
-                    // cumulative completion-token count.
-                    CoreOutput {
-                        completion_tokens: self.output.completion_tokens + delta.completion_tokens,
-                        weight_version: self.output.weight_version.take(),
-                        ..delta
+                let output = {
+                    let mut output = lock(&self.output);
+                    output.append_delta(&delta);
+                    if self.incremental {
+                        // The stream's terminal frame: the last delta, with
+                        // the cumulative completion-token count.
+                        CoreOutput {
+                            completion_tokens: output.completion_tokens,
+                            weight_version: output.weight_version.clone(),
+                            ..delta
+                        }
+                    } else {
+                        output.clone()
                     }
-                } else {
-                    self.output.append_delta(&delta);
-                    std::mem::take(&mut self.output)
                 };
                 self.finish(output);
             }
-            _ => {}
+            _ => self.unregister(),
         }
     }
 
@@ -491,9 +634,34 @@ impl RequestRecord {
     fn finish(&mut self, output: CoreOutput) {
         let e2e_latency = self.created_at.elapsed().as_secs_f64();
         let out = python_out(output, &self.rid, e2e_latency);
-        self.log
-            .logger
-            .finished(&self.obj, &self.headers, &out, e2e_latency);
+        if let Some(logger) = &self.log.logger {
+            logger.finished(&self.obj, &self.headers, &out, e2e_latency);
+        }
+        if let (Some(recorder), Some(id)) = (&self.log.recorder, self.in_flight.take()) {
+            recorder.finish(id, self.log_metrics, &out, unix_time());
+        }
+    }
+
+    fn unregister(&mut self) {
+        if let (Some(recorder), Some(id)) = (&self.log.recorder, self.in_flight.take()) {
+            recorder.unregister(id);
+        }
+    }
+}
+
+impl Drop for RequestRecord {
+    fn drop(&mut self) {
+        let (Some(recorder), Some(id)) = (&self.log.recorder, self.in_flight.take()) else {
+            return;
+        };
+        if self.admitted {
+            // Dropped unfinished: kept with what it generated, unlogged.
+            let output = lock(&self.output).clone();
+            let out = python_out(output, &self.rid, self.created_at.elapsed().as_secs_f64());
+            recorder.finish(id, self.log_metrics, &out, unix_time());
+        } else {
+            recorder.unregister(id);
+        }
     }
 }
 
@@ -518,6 +686,12 @@ fn python_out(output: CoreOutput, rid: &str, e2e_latency: f64) -> Map<String, Va
     }
     out.extend(frame);
     out
+}
+
+fn unix_time() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
 // --- the log lines ----------------------------------------------------------
@@ -545,28 +719,6 @@ impl RequestLogger {
             batch_shared_fields: set(&config.batch_shared_fields),
             config,
             sink,
-        }
-    }
-
-    /// Drop the server-added `custom_params` keys from a request's (or a
-    /// batch's per-item) `sampling_params`.
-    fn omit_custom_params(&self, sampling_params: &mut Value) {
-        if self.config.omit_custom_params.is_empty() {
-            return;
-        }
-        let strip = |params: &mut Value| {
-            if let Some(custom) = params
-                .get_mut("custom_params")
-                .and_then(Value::as_object_mut)
-            {
-                for key in &self.config.omit_custom_params {
-                    custom.remove(key);
-                }
-            }
-        };
-        match sampling_params {
-            Value::Array(items) => items.iter_mut().for_each(strip),
-            params => strip(params),
         }
     }
 
@@ -734,8 +886,9 @@ impl StdoutWriter {
     }
 }
 
-/// Write out the buffered request-log lines and stop the writer. Called once
-/// a server shuts down; a line logged afterwards starts a new writer.
+/// Write out the buffered request-log lines and stop the writer. Called when
+/// a server shuts down or dumps before a crash; a line logged afterwards
+/// starts a new writer.
 pub(crate) fn flush_request_log() {
     // Held while the old writer drains, so no line can overtake its lines.
     drop(lock(&STDOUT).take());
@@ -963,10 +1116,265 @@ fn write_float(out: &mut String, f: f64) {
     }
 }
 
-/// A poisoned lock still holds whole lines (nothing panics halfway through
-/// an update).
+/// Drop `keys` (the server-added ones) from a request's, or each batch item's,
+/// `sampling_params.custom_params`.
+fn omit_custom_params(sampling_params: &mut Value, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    let strip = |params: &mut Value| {
+        if let Some(custom) = params
+            .get_mut("custom_params")
+            .and_then(Value::as_object_mut)
+        {
+            for key in keys {
+                custom.remove(key);
+            }
+        }
+    };
+    match sampling_params {
+        Value::Array(items) => items.iter_mut().for_each(strip),
+        params => strip(params),
+    }
+}
+
+// --- crash-dump recording ---------------------------------------------------
+
+/// A poisoned lock still holds whole records (nothing panics halfway through
+/// an update), and a crash dump must not lose them.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The finished requests of the last five minutes and every unfinished one,
+/// as Python's `crash_dump_request_list` and `rid_to_state` hold them. One
+/// lock covers both, so a request moves from one to the other atomically and
+/// a snapshot sees it exactly once; JSON is written outside the lock.
+#[derive(Default)]
+struct CrashRecorder {
+    state: Mutex<RecorderState>,
+    next_id: AtomicU64,
+    /// Server-added `custom_params` keys, left out of the bodies it writes.
+    omit_custom_params: Vec<String>,
+}
+
+#[derive(Default)]
+struct RecorderState {
+    finished: VecDeque<FinishedRequest>,
+    in_flight: HashMap<u64, InFlightRequest>,
+}
+
+/// The JSON object Python rebuilds requests from: a native body, shared by
+/// the items of a batch, or the fields the core knows of a request it built.
+pub(crate) struct DumpBody {
+    id: u64,
+    json: RawBody,
+}
+
+impl DumpBody {
+    /// The body's JSON. With header overrides it is the parsed body with the
+    /// overrides written in, serialized: what the request decoded. The
+    /// server-added `omit` keys are left out of its `custom_params`.
+    fn write(&self, out: &mut Vec<u8>, omit: &[String]) {
+        let RawBody { bytes, overrides } = &self.json;
+        // A body none of the keys can appear in is written as it came.
+        let mentions =
+            |key: &String| !key.is_empty() && bytes.windows(key.len()).any(|w| w == key.as_bytes());
+        if overrides.is_none() && !omit.iter().any(mentions) {
+            out.extend_from_slice(bytes);
+            return;
+        }
+        let mut body: Value = serde_json::from_slice(bytes).expect("parsed when received");
+        if let Some(fields) = body.as_object_mut() {
+            if let Some(overrides) = overrides {
+                fields.extend(overrides.clone());
+            }
+            if let Some(sampling_params) = fields.get_mut("sampling_params") {
+                omit_custom_params(sampling_params, omit);
+            }
+        }
+        serde_json::to_writer(out, &body).expect("a JSON value serializes");
+    }
+}
+
+/// One request of a [`DumpBody`]: its batch item and the rid the client sees.
+#[derive(Clone)]
+struct DumpRequest {
+    body: Arc<DumpBody>,
+    batch_index: Option<usize>,
+    rid: String,
+}
+
+struct FinishedRequest {
+    request: DumpRequest,
+    out: Bytes,
+    created_time: f64,
+    finished_time: f64,
+}
+
+struct InFlightRequest {
+    request: DumpRequest,
+    created_time: f64,
+    output: Arc<Mutex<CoreOutput>>,
+}
+
+impl CrashRecorder {
+    fn omitting(omit_custom_params: Vec<String>) -> Self {
+        Self {
+            omit_custom_params,
+            ..Self::default()
+        }
+    }
+
+    fn body(&self, json: RawBody) -> Arc<DumpBody> {
+        Arc::new(DumpBody {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            json,
+        })
+    }
+
+    fn register(
+        &self,
+        request: DumpRequest,
+        created_time: f64,
+        output: Arc<Mutex<CoreOutput>>,
+    ) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        lock(&self.state).in_flight.insert(
+            id,
+            InFlightRequest {
+                request,
+                created_time,
+                output,
+            },
+        );
+        id
+    }
+
+    fn unregister(&self, id: u64) {
+        lock(&self.state).in_flight.remove(&id);
+    }
+
+    /// Move a finished request to the window, evicting what finished five
+    /// minutes before it (Python `record_request_for_crash_dump`).
+    fn finish(&self, id: u64, log_metrics: bool, out: &Map<String, Value>, now: f64) {
+        let out = log_metrics
+            .then(|| Bytes::from(serde_json::to_vec(out).expect("a JSON map serializes")));
+        let mut state = lock(&self.state);
+        let Some(entry) = state.in_flight.remove(&id) else {
+            return;
+        };
+        let Some(out) = out else {
+            return;
+        };
+        state.finished.push_back(FinishedRequest {
+            request: entry.request,
+            out,
+            created_time: entry.created_time,
+            finished_time: now,
+        });
+        while state
+            .finished
+            .front()
+            .is_some_and(|oldest| now - oldest.finished_time >= CRASH_DUMP_WINDOW_SECS)
+        {
+            state.finished.pop_front();
+        }
+    }
+
+    /// `{"bodies": {id: body}, "finished": [record], "unfinished": [record]}`,
+    /// each record `{"body", "batch_index", "rid", "out", "created_time",
+    /// "finished_time"}` and each body written once, however many items of a
+    /// batch name it.
+    fn snapshot(&self, now: f64) -> Vec<u8> {
+        // Capture under the lock (reference counts and the partial outputs),
+        // write outside it.
+        let (finished, unfinished) = {
+            let state = lock(&self.state);
+            let finished: Vec<(DumpRequest, Bytes, f64, f64)> = state
+                .finished
+                .iter()
+                .map(|r| {
+                    (
+                        r.request.clone(),
+                        r.out.clone(),
+                        r.created_time,
+                        r.finished_time,
+                    )
+                })
+                .collect();
+            let unfinished: Vec<(DumpRequest, Map<String, Value>, f64)> = state
+                .in_flight
+                .values()
+                .map(|e| {
+                    (
+                        e.request.clone(),
+                        partial_out(&lock(&e.output)),
+                        e.created_time,
+                    )
+                })
+                .collect();
+            (finished, unfinished)
+        };
+        let mut bodies = std::collections::BTreeMap::new();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\"finished\":[");
+        for (i, (request, out, created, finished)) in finished.iter().enumerate() {
+            if i > 0 {
+                buf.push(b',');
+            }
+            bodies.insert(request.body.id, request.body.clone());
+            write_record(&mut buf, request, out, *created, *finished);
+        }
+        buf.extend_from_slice(b"],\"unfinished\":[");
+        for (i, (request, out, created)) in unfinished.iter().enumerate() {
+            if i > 0 {
+                buf.push(b',');
+            }
+            bodies.insert(request.body.id, request.body.clone());
+            let out = serde_json::to_vec(out).expect("a JSON map serializes");
+            write_record(&mut buf, request, &out, *created, now);
+        }
+        buf.extend_from_slice(b"]}");
+
+        let mut snapshot = b"{\"bodies\":{".to_vec();
+        for (i, (id, body)) in bodies.iter().enumerate() {
+            if i > 0 {
+                snapshot.push(b',');
+            }
+            write!(snapshot, "\"{id}\":").expect("writes to a Vec");
+            body.write(&mut snapshot, &self.omit_custom_params);
+        }
+        snapshot.extend_from_slice(b"},");
+        snapshot.extend_from_slice(&buf);
+        snapshot
+    }
+}
+
+/// Python's `ReqState.get_crash_dump_output`: what was generated so far.
+fn partial_out(output: &CoreOutput) -> Map<String, Value> {
+    let mut out = Map::new();
+    if !output.text.is_empty() {
+        out.insert("text".into(), output.text.clone().into());
+    }
+    if !output.token_ids.is_empty() {
+        out.insert("output_ids".into(), output.token_ids.clone().into());
+    }
+    out
+}
+
+fn write_record(buf: &mut Vec<u8>, request: &DumpRequest, out: &[u8], created: f64, finished: f64) {
+    write!(buf, "{{\"body\":{},\"batch_index\":", request.body.id).expect("writes to a Vec");
+    serde_json::to_writer(&mut *buf, &request.batch_index).expect("serializes");
+    buf.extend_from_slice(b",\"rid\":");
+    serde_json::to_writer(&mut *buf, &request.rid).expect("serializes");
+    buf.extend_from_slice(b",\"out\":");
+    buf.extend_from_slice(out);
+    buf.extend_from_slice(b",\"created_time\":");
+    serde_json::to_writer(&mut *buf, &created).expect("serializes");
+    buf.extend_from_slice(b",\"finished_time\":");
+    serde_json::to_writer(&mut *buf, &finished).expect("serializes");
+    buf.push(b'}');
 }
 
 #[cfg(test)]
