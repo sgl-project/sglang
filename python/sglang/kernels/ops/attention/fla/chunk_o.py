@@ -143,10 +143,14 @@ def chunk_fwd_kernel_o_grouped_three_head(
 ):
     # head groups vary before chunks across the grid, so the programs running at once read
     # the same token rows ([T, H, D] puts each head's row of a chunk 4 KB apart)
-    i_v, i_hg, i_tg = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_v, i_hg, i_tg = (
+        tl.program_id(0),
+        tl.program_id(1).to(tl.int64),
+        tl.program_id(2).to(tl.int64),
+    )
     i_n, i_t = (
         tl.load(chunk_indices + i_tg * 2).to(tl.int32),
-        tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int32),
+        tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int64),
     )
     bos, eos = (
         tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -154,21 +158,24 @@ def chunk_fwd_kernel_o_grouped_three_head(
     )
     T = eos - bos
 
-    # This kernel is dispatched only for Hg=16, H=48, and K=V=128.
+    # This kernel is dispatched only for Hg=16, H=48, and K=V=128 (BK and BV divide 128).
     q += (bos * 16 + i_hg) * 128
     k += (bos * 16 + i_hg) * 128
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
+    o_v = i_v * BV + tl.arange(0, BV)
 
     # Compute the raw QK product once for the three value heads that share q/k.
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(128, BK)):
-        p_q = tl.make_block_ptr(
-            q, (T, 128), (16 * 128, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+        o_k = i_k * BK + tl.arange(0, BK)
+        b_q = tl.load(
+            q + o_t[:, None] * (16 * 128) + o_k[None, :], mask=m_t[:, None], other=0.0
         )
-        p_k = tl.make_block_ptr(
-            k, (128, T), (1, 16 * 128), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
+        b_k = tl.load(
+            k + o_k[:, None] + o_t[None, :] * (16 * 128), mask=m_t[None, :], other=0.0
         )
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
         b_A += tl.dot(b_q, b_k)
 
     o_i = tl.arange(0, BT)
@@ -178,58 +185,26 @@ def chunk_fwd_kernel_o_grouped_three_head(
     for j in tl.static_range(3):
         i_h = i_hg * 3 + j
         b_o = tl.zeros([BT, BV], dtype=tl.float32)
+        p_h = h + (i_tg * 48 + i_h) * 128 * 128
         for i_k in range(tl.cdiv(128, BK)):
-            p_q = tl.make_block_ptr(
-                q,
-                (T, 128),
-                (16 * 128, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
+            o_k = i_k * BK + tl.arange(0, BK)
+            b_q = tl.load(
+                q + o_t[:, None] * (16 * 128) + o_k[None, :],
+                mask=m_t[:, None],
+                other=0.0,
             )
-            p_h = tl.make_block_ptr(
-                h + (i_tg * 48 + i_h).to(tl.int64) * 128 * 128,
-                (128, 128),
-                (128, 1),
-                (i_v * BV, i_k * BK),
-                (BV, BK),
-                (1, 0),
-            )
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_h = tl.load(p_h, boundary_check=(0, 1))
+            b_h = tl.load(p_h + o_v[:, None] * 128 + o_k[None, :])
             b_o += tl.dot(b_q, tl.trans(b_h))
 
-        p_g = tl.make_block_ptr(
-            g + bos * 48 + i_h,
-            (T,),
-            (48,),
-            (i_t * BT,),
-            (BT,),
-            (0,),
-        )
-        b_g = tl.load(p_g, boundary_check=(0,))
+        b_g = tl.load(g + bos * 48 + i_h + o_t * 48, mask=m_t, other=0.0)
         b_o *= exp(b_g)[:, None]
         b_A_gated = b_A * safe_exp(b_g[:, None] - b_g[None, :])
 
-        p_v = tl.make_block_ptr(
-            v + (bos * 48 + i_h) * 128,
-            (T, 128),
-            (48 * 128, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * 48 + i_h) * 128,
-            (T, 128),
-            (48 * 128, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        p_v = v + (bos * 48 + i_h) * 128 + o_t[:, None] * (48 * 128) + o_v[None, :]
+        p_o = o + (bos * 48 + i_h) * 128 + o_t[:, None] * (48 * 128) + o_v[None, :]
+        b_v = tl.load(p_v, mask=m_t[:, None], other=0.0)
         b_o = b_o * scale + tl.dot(b_A_gated.to(b_v.dtype), b_v) * scale
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None])
 
 
 def _use_grouped_three_head(
