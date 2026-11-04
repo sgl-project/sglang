@@ -79,7 +79,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.managers.req_types import MultimodalInputs
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -549,6 +550,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # True for synthetic capture batches; init_new snapshots real request ranges.
     # Running decode rows do not complete a prefill.
     contains_last_prefill_chunk: bool = True
+    # Per-request completion of an extend (including resumed/retracted prompts).
+    # None for decode and synthetic capture batches. Running decode requests in
+    # a mixed batch also end at a prediction boundary.
+    extend_is_final_cpu: Optional[List[bool]] = None
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
@@ -948,11 +953,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         contains_last_prefill_chunk = False
+        extend_is_final_cpu = None
         if batch.forward_mode.is_extend_without_speculative():
             decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
-            contains_last_prefill_chunk = any(
-                req.extend_end == len(req.full_untruncated_fill_ids)
+            extend_is_final_cpu = [
+                id(req) in decoding_req_ids
+                or req.extend_end == len(req.full_untruncated_fill_ids)
                 for req in batch.reqs
+            ]
+            contains_last_prefill_chunk = any(
+                final
+                for req, final in zip(batch.reqs, extend_is_final_cpu)
                 if id(req) not in decoding_req_ids
             )
 
@@ -1016,6 +1027,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
+            extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

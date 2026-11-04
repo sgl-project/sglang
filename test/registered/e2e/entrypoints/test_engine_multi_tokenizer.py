@@ -1,6 +1,6 @@
 """Engine API with --tokenizer-worker-num > 1 (issue #15157).
 
-The parent Engine keeps generate() working through an in-process TokenizerWorker,
+The parent Engine keeps generate() working through an in-process tokenizer worker,
 and other processes join the same engine with Engine.attach_tokenizer_worker().
 """
 
