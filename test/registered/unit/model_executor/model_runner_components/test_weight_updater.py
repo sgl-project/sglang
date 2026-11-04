@@ -114,6 +114,24 @@ class TestDiskWeightUpdate(CustomTestCase):
                 self.assertEqual(self.config.model_path, "original")
                 self.assertEqual(self.model().item(), 5.0)
 
+    def test_unsupported_rollback_loader_rejects_before_writing_weights(self):
+        """Specialized startup loaders must not leave a refit partially applied."""
+        for load_format in ("sharded_state", "dummy", "bitsandbytes", "gguf", "remote"):
+            for path in ("replacement", "broken"):
+                with self.subTest(load_format=load_format, path=path):
+                    self.model = _Model()
+                    self.config.model_path = "original"
+                    original_load_config = LoadConfig(load_format=load_format)
+                    self.runner.load_config = original_load_config
+
+                    success, message = self.updater.update_weights_from_disk(path, "pt")
+
+                    self.assertFalse(success)
+                    self.assertIn("rollback", message.lower())
+                    self.assertEqual(self.model().item(), 5.0)
+                    self.assertEqual(self.config.model_path, "original")
+                    self.assertIs(self.runner.load_config, original_load_config)
+
     def test_successful_refit_commits_checkpoint_for_later_rollback(self):
         """A second failed refit must restore the latest successfully loaded checkpoint."""
         success, message = self.updater.update_weights_from_disk("replacement", "pt")

@@ -204,6 +204,18 @@ class WeightUpdater:
             message = f"Failed to get model loader: {loader}."
             return False, message
 
+        # Validate rollback support before the candidate can overwrite any weights.
+        original_load_config = copy(self.get_model_runner().load_config)
+        original_load_config.load_group = load_config.load_group
+        original_loader = get_model_loader(original_load_config, self.model_config)
+        if not isinstance(original_loader, DefaultModelLoader):
+            message = (
+                "Cannot update weights from disk: rollback requires a "
+                "DefaultModelLoader-compatible loader, but the current checkpoint "
+                f"uses {type(original_loader).__name__}."
+            )
+            return False, message
+
         def get_weight_iter(loader, config):
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.get_model())
@@ -235,11 +247,6 @@ class WeightUpdater:
                 )
                 del iter
                 gc.collect()
-                original_load_config = copy(self.get_model_runner().load_config)
-                original_load_config.load_group = load_config.load_group
-                original_loader = get_model_loader(
-                    original_load_config, self.model_config
-                )
                 iter = get_weight_iter(original_loader, self.model_config)
                 model_load_weights(self.get_model(), iter, original_loader)
                 return False, message
