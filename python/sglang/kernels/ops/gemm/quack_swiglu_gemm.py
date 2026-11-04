@@ -13,10 +13,8 @@ import torch
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.utils.common import ceil_div, get_device_core_count
 
-# quack 0.6.4's SM120 GEMM launches with PDL but never waits on the prior grid, so it
-# may read its input early; fixed in 0.6.5 (Dao-AILab/quack@60d8808), drop then.
-_POST_INIT_ATTRS = (("use_pdl", False),)
-# quack 0.6.4's SM120 cooperative tile widths, widest first so ties keep it.
+# quack 0.6.4's SM120 cooperative tile widths, widest first so ties keep it; 0.6.5
+# also accepts other multiples of 32, which were not measured here.
 _TILE_N_CHOICES = (192, 160, 128)
 
 
@@ -83,6 +81,5 @@ def quack_swiglu_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         persistent=True,
         is_dynamic_persistent=True,
         concat_layout=("B",),
-        post_init_attrs=_POST_INIT_ATTRS,
     )
     return out
