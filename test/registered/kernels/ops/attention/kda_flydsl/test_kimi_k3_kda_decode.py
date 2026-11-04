@@ -482,6 +482,10 @@ def test_f_b_api_rejects_invalid_projection_inputs() -> None:
 def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
+    with mock.patch.dict(os.environ):
+        envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.clear()
+        os.environ.pop("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", None)
+        assert not kda_fused_decode_aiter_hip.enabled()
     with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
         assert not kda_fused_decode_aiter_hip.enabled()
     with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):

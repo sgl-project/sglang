@@ -27,12 +27,16 @@ def enabled() -> bool:
     return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "gfx950"
 
 
-def available(device: torch.device | None, state_dtype: torch.dtype) -> bool:
-    """Whether the kernel runs on ``device`` over a ``state_dtype`` pool."""
+def _runs_here() -> bool:
     if not is_hip() or not enabled() or not torch.cuda.is_available():
         return False
     hip = current_arch().hip
-    if hip is None or hip.gcn_arch != "gfx950":
+    return hip is not None and hip.gcn_arch == "gfx950"
+
+
+def available(device: torch.device | None, state_dtype: torch.dtype) -> bool:
+    """Whether the kernel runs on ``device`` over a ``state_dtype`` pool."""
+    if not _runs_here():
         return False
     if state_dtype != torch.float32:
         print_warning_once(
@@ -61,7 +65,7 @@ def covered(
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> bool:
-    if not available(f_a.device, state_dtype=state.dtype) or f_a.ndim != 2:
+    if not _runs_here() or f_a.ndim != 2:
         return False
     batch = f_a.shape[0]
     return (
