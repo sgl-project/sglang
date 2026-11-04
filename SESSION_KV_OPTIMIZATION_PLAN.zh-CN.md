@@ -1,6 +1,6 @@
 # Session KV 生命周期优化：方案、实施计划与性能验收
 
-日期：2026-11-04。状态：待实现的参考方案。本文件记录本轮讨论后的实施建议；新增配置、字段、模块和验收阈值均为设计提案，不能作为当前已支持的接口或已取得的性能结果。
+日期：2026-11-04。状态：实施及评估中。本文保留设计目标，已落地接口与提交见第 10 节实施记录。设计候选不等同于已支持的配置；正式性能结果需以冻结配置后的配对评估为准。
 
 代码基线为 `rfc-kvc` 的 `d1a689121c`，保留原分支及上游合入历史。运行代码的长测快照为 `ff764308fb`；其后提交主要归档实验与文档。原有 P0–P8 实现和 P9 配置扩展继续由 [PLAN.md](PLAN.md) 管理，本轮使用 O0–O7 编号。外部语义来源为 [RFC #45189](https://github.com/sgl-project/sglang/issues/45189)。
 
@@ -50,7 +50,7 @@ L2 PIN 两种口径执行于 `f65f0393c4`，表中的优化后 L3 数据执行�
 | `sgl-router/src/orchestration/runtime.rs` | 生命周期输入、延迟提交、全局 ms/token EWMA、操作及 claim 管理、准备位置反馈 | 接入独立策略决策、分组成本估计、预算观测、失效与消费后释放 |
 | `sgl-router/src/orchestration/mod.rs` | 严格配置校验、准备信息合入路由 | 新策略开关与有界参数；保留普通路由的最终选择权 |
 | `sgl-router/sgl-kv-orchestrator/src/{session_index,target_resolver,operations,observations}.rs` | 会话/分支关联、冻结范围、精确 job 合并、位置观察 | 增加策略输入快照、决策原因、跨事件重新评估；不合并不同权重或内容身份 |
-| `sgl-router/sgl-kv-orchestrator/src/policy.rs`、`cost_model.rs`（拟新增） | 无对应独立模块 | 可注入 clock 的纯决策与分组统计，避免继续把策略细节堆入 runtime |
+| `sgl-router/sgl-kv-orchestrator/src/preparation.rs`（本轮新增） | 独立、有界的分组准备成本统计 | 纯统计与提前量计算；生命周期与异步 owner 交互保留在现有 runtime |
 | `python/sglang/srt/mem_cache/unified_cache/control_storage_reads.py` | 默认最多 4 个 native read；不同有效 salt 流水；同 salt 串行；精确 demand 复用；完整缺口预留；GPU FIFO 屏障 | 字节/容量预算、真实 demand 提升、等待原因、时限调度；后期评估重叠范围共享 |
 | `python/sglang/srt/managers/cache_controller.py` | HiCache 查询、GET/写回队列、缓冲分配、完成处理 | 同时覆盖普通恢复与控制读取的观测和调度入口；不假设增加 native job 数会增加 GET worker 数 |
 | `python/sglang/srt/mem_cache/unified_cache/{control_storage,storage_execution,control_transfers,unified_tree_core}.py` | storage COPY 与 GPU→storage MOVE；host 叶节点回收；write_back 下另有 FULL host 重复副本回收 | L2→L3 保存后定向回收、作用范围反馈；复用或提取安全 helper |
@@ -307,7 +307,7 @@ RL 分别覆盖 ready 队列充足、ready 队列不足、同步批次接近完�
 
 ## 10. 实施阶段与提交计划
 
-依赖关系为 `O0 → O1 → O2 → O4 → O5`；`O0 → O3a → O5`。O3b、O6 后置，由观测结果决定是否值得实现。O7 在各功能阶段做小规模验证，在组合策略完成后执行正式矩阵。本节没有已完成的新功能勾选。
+依赖关系为 `O0 → O1 → O2 → O4 → O5`；`O0 → O3a → O5`。O3b、O6 后置，由观测结果决定是否值得实现。O7 在各功能阶段做小规模验证，在组合策略完成后执行正式矩阵。
 
 | 阶段 | 交付内容 | 必要测试与完成条件 | 建议提交拆分 |
 | --- | --- | --- | --- |
@@ -324,6 +324,25 @@ RL 分别覆盖 ready 队列充足、ready 队列不足、同步批次接近完�
 每个提交只包含对应功能、必要测试和文档；提交前复核 diff，不混入无关改动。性能开关的正式启用依赖其验收，不因单个热点 TTFT 显著下降就整体启用。新阶段完成后更新本表状态、源码提交和证据路径。
 
 关闭策略开关时停止创建新的自动意图，撤回无真实需求的兴趣，释放本策略可释放的 claim；已在途传输继续由原 owner drain，普通 demand 及其他调用者的保护保持各自生命周期。关闭开关不能清空物理账本或直接释放内存。回退旧版本前确认新版本操作收尾与协议兼容；结果未知时记录并按恢复规则处理。
+
+### 实施记录
+
+以下为本轮新增实现，详细审阅与独立复测记录见 [PLAN-REVIEW-LOG.md](PLAN-REVIEW-LOG.md)。这些功能均已分别测试并提交，正式压力性能验收仍在进行。
+
+| 阶段 | 已实现范围与提交 | 保留的边界 |
+| --- | --- | --- |
+| O0 | `6d102ac4b8`：普通/native query 与 GET 调用、耗时、anchor payload tokens/bytes、native job 和容量 gauge | wire bytes 为 null；没有新增完整物理 PUT、H2D 或跨 job 使用归因账本 |
+| O1 | `acc163e3a0`：可选在途 token 预算、speculative 准入余量、真实 demand 优先及有界背景机会 | 普通 demand 保留原恢复路径；预算约束在途读取，不承诺限制所有已经发布且尚未消费的自然缓存；不抢占后端已提交 GET |
+| O2 | `f5640888af`：按实际 worker/epoch/兼容布局/backend namespace/大小分组的准备成本分位、有限提前量、早到推进 | 成本包含控制与发布耗时，未单列负载档或学习预测概率；缺少样本时回退既有斜率 |
+| O3a | `d4bade6739`：host-only 叶节点/合法后缀保存后定向回收；`0265dcc4b4`：真实 GPU/Mooncake K/V 逐元素恢复证明 | GPU 驻留重复副本、共享祖先、PIN 和在途引用继续阻止回收；不扩大 GPU 驱逐范围 |
+| O4 | `8897e68356`：准备后一次有限 L2 PIN 子操作，有界保守预算、未知结果保留、共享兴趣清理 | 默认关闭；Router 重叠范围可能重复预留，Engine 仍按物理范围审批；未新增自动 L3 候选排序，已有显式 backend soft-pin 继续使用原 owner |
+| O5 | `7e7962ffa0`：每次新生命周期使用新 wire 身份，避免重放旧 COMPLETED；`92e45056e6`：最小冷层驻留窗口；`e35f78493b`：新鲜准备观测复用 | 不将历史完成视为当前驻留，不提前释放消费中的保护；同 salt 和 GPU FIFO 安全约束保留 |
+| O7 | `534f71fd20`、`57c87c2f60`、`ae25af0c99`：固定工作量三组重放、异步控制收尾、完整前缀恢复、可选轮内不可变源复用及离线核验 | 模拟 rollout；未接入真实 trainer，训练等待为 unknown；L3 竞争实验保留逐组发布 |
+| 工程检查 | `43aa45efaa`：精确 Rust 1.92.0 core 全目标 Clippy 与测试通过 | 不代替完整上游 CI 或未测试硬件/缓存模式的兼容性证明 |
+
+可用配置以代码和对应 README 为准：Engine `cache_limits` 新增 `max_storage_read_inflight_tokens`、`max_speculative_storage_read_tokens`、`demand_host_reserve_tokens`、`storage_demand_priority`，默认均不启用限制/优先策略。前三项按 page 对齐的 anchor tokens 计量，不可填入 byte 数；当前 FULL pool 的 `native_host_bytes_per_token` 用于解释对应 payload 大小。已分配空间与未分配预留分开计数，取消后的预留等到物理 drain 才释放。
+
+Router 新增可选 `preparation_policy`。省略该字段保留旧时机策略；设置后使用有界分组统计，`ready_pin_ttl_ms=0` 默认不申请自动保护。`auto_pin_max_tokens` 是该 Router 的保守保护预留上限，不能替代 Engine 的物理去重审批。`min_cold_residency_ms` 约束生命周期 host DEMOTE，显式三动作调用仍遵循原语义。O3b、O6、O1b 及完整未消费准备账本均未实现，是否扩展由压力证据决定。
 
 ## 11. 正确性矩阵、复现入口与交付物
 
