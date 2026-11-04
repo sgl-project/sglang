@@ -695,6 +695,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             seed_dsa_topk_from_draft_extend=False,
             mtp_model_runner=lambda step: model_runner,
             megakernel=None,
+            use_rejection_sampling=False,
         )
         runtime = SimpleNamespace(
             mamba=SimpleNamespace(enable_mamba_extra_buffer=tracking),
