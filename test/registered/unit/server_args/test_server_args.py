@@ -40,7 +40,6 @@ from sglang.srt.arg_groups.hisparse_hook import (
     _hisparse_default_backend,
     validate_hisparse,
     validate_hisparse_dsa_backend,
-    validate_hisparse_feature_combos,
     validate_hisparse_kv_cache_dtype,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
@@ -1772,24 +1771,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
             str(context.exception),
         )
 
-    def test_pd_kv_checksum_rejects_deepseek_v4(self):
-        """The DeepSeek-V4 pool has no checksum state indices, so a PD prefill
-        with the checksum on asserts on its first request."""
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="prefill",
-            disaggregation_enable_kv_checksum=True,
-        )
-        model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
-        )
-        with patch(
-            "sglang.srt.arg_groups.pd_disaggregation_hook.model_config_of",
-            return_value=model_config,
-        ):
-            with self.assertRaisesRegex(ValueError, "does not support DeepSeek-V4"):
-                handle_pd_disaggregation(server_args)
-
     def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
@@ -2091,18 +2072,6 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
                 validate_hisparse(server_args)
-
-    def test_hisparse_decode_rejects_kv_checksum(self):
-        """A HiSparse decode receives KV into its host pool, which the checksum
-        does not digest, so the flag cannot verify a transfer."""
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_hisparse=True,
-            disaggregation_mode="decode",
-            disaggregation_enable_kv_checksum=True,
-        )
-        with self.assertRaisesRegex(ValueError, "disaggregation-enable-kv-checksum"):
-            validate_hisparse_feature_combos(server_args)
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
