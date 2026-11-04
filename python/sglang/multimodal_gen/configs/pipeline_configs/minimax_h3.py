@@ -14,13 +14,11 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )

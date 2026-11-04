@@ -104,7 +104,7 @@ class TestDraftExtendLengths(CustomTestCase):
 
 class TestGlueCaptureFailure(CustomTestCase):
     def _run_through_capture(self, glue):
-        backend = mock.Mock(attn_backend_list=None)
+        backend = mock.Mock(attn_backend_list=None, requires_eager_metadata=False)
         with (
             mock.patch("torch.cuda.Stream"),
             mock.patch("torch.cuda.CUDAGraph"),
