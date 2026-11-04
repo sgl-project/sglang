@@ -1344,7 +1344,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (
                 is_target_verify
                 or not self.kernel_dispatcher.extend_kernel.extend_reads_strided_qkv(
-                    query, key
+                    q=query, k=key
                 )
             )
         ):

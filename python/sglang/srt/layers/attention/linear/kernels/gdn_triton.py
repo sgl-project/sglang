@@ -47,7 +47,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
     supports_strided_target_verify_qkv: bool = True
 
     def extend_reads_strided_qkv(self, q: torch.Tensor, k: torch.Tensor) -> bool:
-        return is_cuda() and chunk_gated_delta_rule_reads_strided_qk(q, k)
+        return is_cuda() and chunk_gated_delta_rule_reads_strided_qk(q=q, k=k)
 
     def packed_decode(
         self,

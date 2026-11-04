@@ -149,8 +149,9 @@ def l2norm_fwd_strided_supported(x: torch.Tensor) -> bool:
     """Whether l2norm_fwd_strided(x) matches l2norm_fwd(x.contiguous()) bit for bit.
 
     x is a [1, T, H, D] view whose H heads are contiguous rows of D and whose
-    tokens are x.stride(1) apart, e.g. a split of a packed projection. The
-    16-element alignment keeps the vectorized load layout of the contiguous copy.
+    tokens are x.stride(1) apart, e.g. a split of a packed projection. A token
+    stride that is a multiple of 16 elements and a 16-byte-aligned base pointer
+    keep the vectorized load layout of the contiguous copy.
     """
     return (
         x.dim() == 4
