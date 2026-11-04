@@ -13,6 +13,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
@@ -169,14 +170,32 @@ def _dequant(linear) -> torch.Tensor:
     return linear.weight.float() * linear.weight_scale.view(-1, 1)
 
 
-def _kda_inproj_linears(b_proj=None) -> dict:
+class _QuarkFp8Config:
+    """Resolves every linear to Quark per-channel FP8 unless its prefix is excluded."""
+
+    def __init__(self, excluded=()):
+        self.excluded = excluded
+
+    def get_quant_method(self, layer, prefix):
+        if prefix in self.excluded:
+            return UnquantizedLinearMethod()
+        layer.scheme = _quark_fp8_linear(1).scheme
+        return QuarkLinearMethod(None)
+
+
+def _kda_inproj_linears(b_proj=None, quant_config=None) -> dict:
     """[q,k,v,g] = 32 rows plus the tail k3_kda_inproj_fp8_tail_rows reserves."""
     mods = dict(
         f_a_proj=_quark_fp8_linear(8),
         b_proj=_quark_fp8_linear(3) if b_proj is None else b_proj,
         f_b_proj=_quark_fp8_linear(16, in_features=8),
     )
-    tail = k3_kda_inproj_fp8_tail_rows(wide_rows=32, **mods)
+    tail = k3_kda_inproj_fp8_tail_rows(
+        wide_rows=32,
+        quant_config=quant_config or _QuarkFp8Config(),
+        qkvg_prefix="fused_qkvg_proj",
+        **mods,
+    )
     return dict(qkvg_proj=_quark_fp8_linear(32 + tail), qkvg_sizes=[24, 8], **mods)
 
 
@@ -244,6 +263,13 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         }
         self.assertIsNone(k3_merge_kda_inproj_fp8(qkvg_sizes=[24, 8], **mods))
 
+    def test_no_tail_when_qkvg_is_excluded_from_quantization(self):
+        """[q,k,v,g] kept BF16 while f_a/b/f_b are FP8: loading must keep the split
+        projection instead of failing on a tail the merge cannot fill."""
+        quant_config = _QuarkFp8Config(excluded=("fused_qkvg_proj",))
+        mods = _kda_inproj_linears(quant_config=quant_config)
+        self.assertEqual(mods["qkvg_proj"].weight.shape[0], 32)
+
     def test_env_disables_the_tail(self):
         with envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.override(False):
             mods = _kda_inproj_linears()
@@ -275,6 +301,15 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         self.assertIsNone(f_b)
         self.assertIs(mods["qkvg_proj"].weight, weight)
         torch.testing.assert_close(weight.float(), before, rtol=0, atol=0)
+
+    def test_processed_tail_that_was_never_merged_raises(self):
+        """A state saved without the tail loads into a narrowed view and leaves the
+        reserved rows uninitialized; serving them would corrupt f_a and beta."""
+        mods = self._restored_processed_state()
+        mods["qkvg_proj"].weight_scale[32:].normal_()
+
+        with self.assertRaisesRegex(RuntimeError, "same"):
+            k3_merge_kda_inproj_fp8(**mods)
 
     def test_processed_narrow_b_proj_dequantized_to_bf16(self):
         mods = self._restored_processed_state()

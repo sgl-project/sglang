@@ -1624,6 +1624,7 @@ class KimiK3DeltaAttention(nn.Module):
                 parallel_group="attn_tp",
                 prefix=f"{prefix}.f_b_proj",
             )
+            qkvg_prefix = f"{prefix}.fused_qkvg_proj"
             qkvg_output_sizes = [projection_size] * 4
             if _is_hip:
                 from sglang.srt.models.kimi_k3_rocm_quant import (
@@ -1633,6 +1634,8 @@ class KimiK3DeltaAttention(nn.Module):
                 # Quark FP8: rows the post-load merge fills with [f_a | b | pad].
                 tail_rows = k3_kda_inproj_fp8_tail_rows(
                     wide_rows=4 * projection_size // self.attn_tp_size,
+                    quant_config=quant_config,
+                    qkvg_prefix=qkvg_prefix,
                     f_a_proj=f_a_proj,
                     b_proj=b_proj,
                     f_b_proj=f_b_proj,
@@ -1651,7 +1654,7 @@ class KimiK3DeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 parallel_group="attn_tp",
-                prefix=f"{prefix}.fused_qkvg_proj",
+                prefix=qkvg_prefix,
             )
             self.split_sizes = [
                 3 * projection_size // self.attn_tp_size,
@@ -2122,15 +2125,12 @@ class KimiK3DeltaAttention(nn.Module):
                 # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
                 # tail rides the wide projection's bandwidth (~30% of the
                 # in-proj at decode on gfx950, SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ).
-                fused_states = self.fused_qkvg_proj.quant_method.apply(
-                    (
-                        self.fused_qkvg_proj
-                        if self._qkvgbfa_in_qkvg_proj
-                        else self._qkvgbfa_layer
-                    ),
-                    hidden_states,
-                    None,
-                )
+                if self._qkvgbfa_in_qkvg_proj:
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                else:
+                    fused_states = self.fused_qkvg_proj.quant_method.apply(
+                        self._qkvgbfa_layer, hidden_states, None
+                    )
                 qkv, g_proj_states, f_a, beta, _pad = torch.split(
                     fused_states, self._qkvgbfa_sizes, dim=-1
                 )

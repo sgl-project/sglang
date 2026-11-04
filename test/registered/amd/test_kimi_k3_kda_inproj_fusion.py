@@ -190,6 +190,16 @@ class _QuarkFp8Linear(torch.nn.Module):
         return self.quant_method.apply(self, x, None), None
 
 
+class _QuarkFp8Config:
+    """Resolves every linear to Quark per-channel FP8 with dynamic activations."""
+
+    def get_quant_method(self, layer, prefix):
+        layer.scheme = QuarkW8A8Fp8(
+            {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
+        )
+        return QuarkLinearMethod(None)
+
+
 def _relative_error(got: torch.Tensor, want: torch.Tensor) -> float:
     return ((got.float() - want.float()).norm() / want.float().norm()).item()
 
@@ -223,6 +233,8 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
         # fused_qkvg_proj with the [f_a | b | pad] rows reserved at init.
         tail = k3_kda_inproj_fp8_tail_rows(
             wide_rows=WIDE,
+            quant_config=_QuarkFp8Config(),
+            qkvg_prefix="fused_qkvg_proj",
             f_a_proj=merged.f_a_proj,
             b_proj=merged.b_proj,
             f_b_proj=merged.f_b_proj,

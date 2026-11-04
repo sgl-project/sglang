@@ -24,18 +24,17 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
 def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
     """Dequantize a per-output-channel FP8 weight to dense bf16.
 
-    The aiter batched absorb GEMM takes ``w_scale`` as a single scalar (the
-    Triton kernel documents it as "per-batch scale for WQ with shape (1,)"), so
-    a per-channel vector cannot reach it. Requantizing to one per-tensor scale
-    would fit, but the scale axis is the GEMM's *contraction* axis, and on real
-    K3 weights that second quantization costs ~2.3% relative error against the
-    checkpoint (worst channel ~3.8%). Dequantizing instead costs ~0.12% and
-    lets the absorb run its bf16 path with w_scale left at the 1.0 default.
+    The aiter batched absorb GEMM takes ``w_scale`` as a single scalar, so a
+    per-channel vector cannot reach it. This dequant (~0.12% weight error on K3)
+    is the absorb's BF16 path; k3_kv_b_for_absorb picks it or the per-tensor
+    FP8 requant (~2.3%, worst channel ~3.8%).
 
     Must run while dim 0 is still the channel axis weight_scale indexes, i.e.
     before the kv_b_proj head split.
@@ -105,7 +104,13 @@ def _is_quark_channel_fp8(module: nn.Module) -> bool:
 
 
 def k3_kda_inproj_fp8_tail_rows(
-    *, wide_rows: int, f_a_proj: nn.Module, b_proj: nn.Module, f_b_proj: nn.Module
+    *,
+    wide_rows: int,
+    quant_config: Optional[QuantizationConfig],
+    qkvg_prefix: str,
+    f_a_proj: nn.Module,
+    b_proj: nn.Module,
+    f_b_proj: nn.Module,
 ) -> int:
     """Rows fused_qkvg_proj reserves after [q,k,v,g] for [f_a | b | pad], or 0.
 
@@ -117,6 +122,16 @@ def k3_kda_inproj_fp8_tail_rows(
     if not envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.get():
         return 0
     if not all(_is_quark_channel_fp8(m) for m in (f_a_proj, b_proj, f_b_proj)):
+        return 0
+    # fused_qkvg_proj does not exist yet (its size is this answer), so resolve
+    # its quant method on a weightless probe; [q,k,v,g] may be excluded alone.
+    qkvg_probe = LinearBase(
+        f_a_proj.weight.shape[1],
+        wide_rows,
+        quant_config=quant_config,
+        prefix=qkvg_prefix,
+    )
+    if not _is_quark_channel_fp8_scheme(qkvg_probe):
         return 0
     rows = f_a_proj.weight.shape[0] + b_proj.weight.shape[0]
     # N % 64 == 0 keeps AITER's preshuffled FP8 GEMM (use_aiter_bpreshuffle_gemm).
@@ -200,7 +215,8 @@ def _kda_inproj_fp8_processed_sizes(
 ) -> Optional[tuple[list[int], None]]:
     """Split sizes of a qkvg_proj whose merged tail was restored already processed."""
     in_dim, rows = qkvg_proj.weight.shape
-    tail = rows - sum(qkvg_sizes)
+    wide = sum(qkvg_sizes)
+    tail = rows - wide
     if tail == 0:
         return None
     n_fa, n_b = f_a_proj.weight.shape[1], b_proj.weight.shape[1]
@@ -212,5 +228,17 @@ def _kda_inproj_fp8_processed_sizes(
         raise RuntimeError(
             "fused_qkvg_proj has a processed [f_a | b] tail but the KDA in-proj "
             "weights are not the processed Quark per-channel FP8 layout it holds."
+        )
+    # A state saved without the tail loads into a narrowed view and leaves the
+    # tail uninitialized. The weight may be preshuffled; the scales never are.
+    scale = qkvg_proj.weight_scale.reshape(-1)
+    if not (
+        torch.equal(scale[wide : wide + n_fa], f_a_proj.weight_scale.reshape(-1))
+        and bool((scale[wide + n_fa + n_b :] == 1.0).all())
+    ):
+        raise RuntimeError(
+            "The restored fused_qkvg_proj tail does not hold the merged [f_a | b] "
+            "rows. Save and load the state with the same "
+            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ setting."
         )
     return [*qkvg_sizes, n_fa, n_b, tail - n_fa - n_b], None
