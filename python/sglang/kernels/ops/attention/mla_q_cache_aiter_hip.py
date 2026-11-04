@@ -10,7 +10,8 @@ import torch
 _KV_LORA_RANK = 512
 _PE_DIM = 64
 _HEAD_DIM = _KV_LORA_RANK + _PE_DIM
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+# The op takes only AITER_DTYPE_fp8, which is e4m3fn on gfx950.
+_FP8_DTYPE = torch.float8_e4m3fn
 
 
 @functools.cache
@@ -88,7 +89,7 @@ def covered(
         and all(x.device == q_nope.device for x in tensors)
         and kv_cache.ndim in (3, 4)
         and kv_cache.shape[-1] == _HEAD_DIM
-        and kv_cache.dtype in (torch.bfloat16, *_FP8_DTYPES)
+        and kv_cache.dtype in (torch.bfloat16, _FP8_DTYPE)
         and slot_mapping.shape == (tokens,)
         # AITER's gfx950 kernels take one int64 slot and position per token.
         and slot_mapping.dtype == torch.int64
@@ -154,10 +155,39 @@ def run(
         q_scale=q_scale,
     ):
         raise ValueError("unsupported inputs for fused MLA Q/cache")
-    op = _op()
-    if op is None:
-        raise RuntimeError("fused MLA Q/cache AITER operator is unavailable")
-    op(
+    return launch(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        k_nope=k_nope,
+        k_pe=k_pe,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        positions=positions,
+        k_scale=k_scale,
+        cos_cache=cos_cache,
+        sin_cache=sin_cache,
+        out=out,
+        q_scale=q_scale,
+    )
+
+
+def launch(
+    *,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    k_scale: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    out: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """run() without its checks, for callers that already passed covered()."""
+    _op()(
         q_nope,
         q_pe,
         k_nope,

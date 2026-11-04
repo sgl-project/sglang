@@ -15,6 +15,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.models import kimi_k3_rocm_mla
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
@@ -171,6 +172,15 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                 attention_backend="aiter", is_target_verify=False, k_scale_float=2.0
             )
         )
+
+    def test_missing_triton_fallback_keeps_the_split_chain(self):
+        """Off gfx950, an AITER build without the no-RoPE Triton kernel must fall
+        back to the split chain instead of failing the decode step."""
+        self.writer._write_aiter = lambda **_: None
+        with mock.patch.object(kimi_k3_rocm_mla, "_triton_q_cache_op", lambda: None):
+            self.assertIsNone(
+                self._write(attention_backend="aiter", is_target_verify=False)
+            )
 
     def test_other_backends_keep_the_split_chain(self):
         for verify in (False, True):

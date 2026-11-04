@@ -18,7 +18,8 @@ one-row identity cos/sin tables with all-zero positions; the Triton fallback use
 AITER's no-RoPE kernel.
 """
 
-from typing import Optional, Tuple
+import functools
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -31,6 +32,18 @@ from sglang.srt.utils.common import is_device_stream_capturing, print_warning_on
 # Triton target-verify runs its extend kernel, which also reads k.
 _DECODE_BACKENDS = frozenset({"aiter", "triton"})
 _TARGET_VERIFY_BACKENDS = frozenset({"aiter"})
+
+
+@functools.cache
+def _triton_q_cache_op() -> Optional[Callable]:
+    """AITER's no-RoPE Triton Q/cache kernel, or None where it cannot run."""
+    if torch.cuda.get_device_properties().gcnArchName.startswith("gfx1250"):
+        return None
+    try:
+        from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_cat_and_cache_mla
+    except ImportError:
+        return None
+    return fused_qk_cat_and_cache_mla
 
 
 class _ZeroPositions:
@@ -122,6 +135,8 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
         q = self._write_aiter(kernel_args=kernel_args, num_heads=num_heads)
         if q is None:
             q = self._write_triton(kernel_args=kernel_args)
+        if q is None:
+            return None
         # The KV cache is already written; attention reads only the shape of k.
         k_placeholder = torch.empty(
             (tokens, 1, self._head_dim), dtype=k_nope.dtype, device=k_nope.device
@@ -181,11 +196,16 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
                 "Triton kernel instead."
             )
             return None
-        return mla_q_cache_aiter_hip.run(**aiter_args)
+        return mla_q_cache_aiter_hip.launch(**aiter_args)
 
-    def _write_triton(self, *, kernel_args: dict) -> torch.Tensor:
-        from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_cat_and_cache_mla
-
+    def _write_triton(self, *, kernel_args: dict) -> Optional[torch.Tensor]:
+        fused_qk_cat_and_cache_mla = _triton_q_cache_op()
+        if fused_qk_cat_and_cache_mla is None:
+            print_warning_once(
+                "Kimi-K3 MLA Q/cache fusion: no AITER Triton fused_qk_cat_and_cache_mla "
+                "for this device or AITER build; keeping the split chain."
+            )
+            return None
         q, _, _, _ = fused_qk_cat_and_cache_mla(
             kernel_args["q_nope"],
             kernel_args["q_pe"],
