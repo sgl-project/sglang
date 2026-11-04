@@ -20,8 +20,9 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
@@ -33,22 +34,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# A5 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
+# Ascend 950 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
 # stored unquantized, so the kernels need both dimensions spelled out.
 _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
-def _sparse_attn_ops():
+def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
-    A5 reads a quantized KV cache, which is a different kernel rather than a
-    flag on the pre-A5 one.
+    ``is_dspark`` selects the DSpark draft-worker pair: it reads its sequence
+    lengths from CPU mirrors (host metadata) and, on Ascend 950, uses a dedicated
+    quantized sparse-attention kernel rather than a flag on the pre-Ascend 950 one.
     """
     if is_npu_arch35():
+        if is_dspark:
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_attn_sharedkv,
+                kv_quant_sparse_attn_sharedkv_metadata_host,
+            )
+
+            return (
+                kv_quant_sparse_attn_sharedkv_metadata_host,
+                kv_quant_sparse_attn_sharedkv,
+            )
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
+        )
+    if is_dspark:
+        return (
+            torch.ops.npu.sparse_attn_sharedkv_metadata_host,
+            torch.ops.npu.sparse_attn_sharedkv,
         )
     return (
         torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
@@ -57,7 +74,7 @@ def _sparse_attn_ops():
 
 
 def _sparse_attn_kv_quant_kwargs() -> dict:
-    """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout."""
+    """Extra kwargs the Ascend 950 kv-quant kernels need to interpret the KV layout."""
     if not is_npu_arch35():
         return {}
     return {
@@ -136,15 +153,15 @@ def _build_explicit_state_block_table(
 
 
 def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
-    """Build the Atlas A5 cache_mode=2 request-bank table.
+    """Build the Ascend 950 cache_mode=2 request-bank table.
 
-    A5 interprets this input as one bank id per request and computes the
+    Ascend 950 interprets this input as one bank id per request and computes the
     in-bank ring offset itself.  It must never receive the A3 explicit
     per-token location table.
     """
     if req_pool_indices.ndim != 1:
         raise ValueError(
-            "Atlas A5 compressor requires a 1-D request-bank table, got "
+            "Ascend 950 compressor requires a 1-D request-bank table, got "
             f"shape={tuple(req_pool_indices.shape)}"
         )
     return req_pool_indices.to(dtype=torch.int32).contiguous()
@@ -440,7 +457,7 @@ class CompressorAscendBackendMixin:
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
         if is_npu_arch35():
-            # A5 cache_mode=2 is CYCLE: one request bank per row.  The
+            # Ascend 950 cache_mode=2 is CYCLE: one request bank per row.  The
             # compressor derives the in-bank offset from start_pos; passing
             # the A3 explicit [B, width] table here would be an ABI violation.
             state_block_table = fm.dsv4_cycle_state_block_table
@@ -470,7 +487,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
+        # TODO: torch.ops.npu.compressor does not support Ascend 950 yet.
         compressor_op = (
             torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
         )
@@ -543,7 +560,7 @@ class CompressorAscendBackendMixin:
     ) -> None:
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
-        # A5 quantizes and scatters in one fused kernel, so the dequant scale is
+        # Ascend 950 quantizes and scatters in one fused kernel, so the dequant scale is
         # produced inside indexer_compress_epilog rather than here.
         fused_fp8_indexer_write = li_kv_dtype == "float8" and compressor.is_in_indexer
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
@@ -582,8 +599,8 @@ class CompressorAscendBackendMixin:
 
         # Eager verify keeps no row when no request completed a compression block
         # this step (loc is then all-zero, the skip sentinel), and prefill can hand
-        # us an empty chunk. Nothing to write: the pre-A5 scatter treated that as a
-        # no-op, while both A5 fused epilog kernels reject a zero-row input. Unlike
+        # us an empty chunk. Nothing to write: the pre-Ascend 950 scatter treated that as a
+        # no-op, while both Ascend 950 fused epilog kernels reject a zero-row input. Unlike
         # the `loc is None` check below (missing metadata = a bug), an empty write is
         # a legitimate step outcome. Static shape read, so graph capture is unaffected.
         if kv.shape[0] == 0:
@@ -592,7 +609,7 @@ class CompressorAscendBackendMixin:
         if fused_fp8_indexer_write:
             if loc is None:
                 raise RuntimeError(
-                    "DSV4 A5 fused indexer epilog needs a slot mapping, but "
+                    "DSV4 Ascend 950 fused indexer epilog needs a slot mapping, but "
                     f"loc is None (mode={forward_batch.forward_mode}, "
                     f"ratio={compressor.ratio}). Writing nothing here would "
                     "leave the indexer KV cache stale."
@@ -794,7 +811,7 @@ class C4IndexerAscendBackendMixin:
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        # A5's lightning indexer consumes FP8 K + fp32 scales; pre-A5 stays int8.
+        # Ascend 950's lightning indexer consumes FP8 K + fp32 scales; pre-Ascend 950 stays int8.
         c4_indexer.compressor.li_kv_dtype = "float8" if is_npu_arch35() else "int8"
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
@@ -839,7 +856,7 @@ class C4IndexerAscendBackendMixin:
         import torch_npu
 
         if k.dtype == torch.float8_e4m3fn:
-            # A5: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
+            # Ascend 950: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
             # stay fp32 and the kernel wants one scale per (token, head).
             q_quant, q_scale = torch_npu.npu_dynamic_block_quant(
                 q.view(-1, q.shape[-1]), dst_type=k.dtype
@@ -1005,7 +1022,6 @@ class DeepseekV4AscendAttnBackend(
         [T, N_kv, K], where K must be 128-aligned.
         """
         fm = self.forward_metadata
-        fm.ori_sparse_indices = None
         fm.ori_win_left = self._dsv4_sliding_window_size - 1
         fm.ori_win_right = 0
 
@@ -1197,9 +1213,6 @@ class DeepseekV4AscendAttnBackend(
             bs=local_t,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
-            block_tables=fm.block_tables,
-            max_seqlen_q=1,
-            is_nextn=False,
         )
         if self._dsv4_has_c4:
             fm.c4_topk_indices = torch.full(
@@ -1810,9 +1823,6 @@ class DeepseekV4AscendAttnBackend(
             bs=ctx.bs,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
-            block_tables=fm.block_tables,
-            max_seqlen_q=ctx.tokens_per_bs,
-            is_nextn=False,
         )
         for key in (
             "c1a_metadata",
@@ -1947,24 +1957,10 @@ class DeepseekV4AscendAttnBackend(
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            max_seqlen_q = (
-                int(forward_batch.spec_info.draft_token_num)
-                if forward_batch.forward_mode.is_target_verify()
-                else self.speculative_num_draft_tokens
-            )
-        else:
-            max_seqlen_q = 1
         return self._kernel_metadata_from_parts(
             bs=forward_batch.batch_size,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
-            block_tables=fm.block_tables,
-            max_seqlen_q=max_seqlen_q,
-            is_nextn=False,
         )
 
     def _kernel_metadata_from_parts(
@@ -1973,12 +1969,8 @@ class DeepseekV4AscendAttnBackend(
         bs: int,
         actual_seq_lengths_q_pa: torch.Tensor,
         actual_seq_lengths_kv: torch.Tensor,
-        block_tables: torch.Tensor,
-        max_seqlen_q: int,
-        is_nextn: bool,
     ) -> dict:
         fm = self.forward_metadata
-        metadata_op, _ = _sparse_attn_ops()
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
@@ -2004,20 +1996,27 @@ class DeepseekV4AscendAttnBackend(
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
-            if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
+            seq_kv_cpu = fm.seq_lens_cpu_int
+            if (
+                cu_q_cpu is None
+                or seq_kv_cpu is None
+                or cu_q_cpu.device.type != "cpu"
+                or seq_kv_cpu.device.type != "cpu"
+            ):
+                raise RuntimeError(
+                    "DSpark host metadata requires CPU query and KV length mirrors"
+                )
+            if cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
-            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
-            if cu_q_cpu is not None:
-                host_inputs["cu_seqlens_q"] = cu_q_cpu
-            c1a_kwargs = c1a_kwargs | host_inputs
-            metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
-        else:
-            c1a_kwargs = c1a_kwargs | {
-                "cu_seqlens_q": actual_seq_lengths_q_pa,
-                "seqused_kv": actual_seq_lengths_kv,
+            host_inputs = {
+                "seqused_kv": seq_kv_cpu[:bs].to(dtype=torch.int32).contiguous()
             }
+            host_inputs["cu_seqlens_q"] = cu_q_cpu.to(dtype=torch.int32).contiguous()
+            metadata_op, _ = _sparse_attn_ops(is_dspark=True)
+            c1a_metadata = metadata_op(**(c1a_kwargs | host_inputs))
+        else:
             metadata_op, _ = _sparse_attn_ops()
-        c1a_metadata = metadata_op(**c1a_kwargs)
+            c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
@@ -2121,14 +2120,11 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        _, attn_op = _sparse_attn_ops()
-        if self._is_dspark_draft_worker:
-            attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
-            attn_op = torch.ops.npu.sparse_attn_sharedkv
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
+        _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
         out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 

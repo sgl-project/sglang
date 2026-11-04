@@ -24,13 +24,12 @@ from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_modu
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
-    get_forward,
     get_model,
     get_parallel,
 )
@@ -433,6 +432,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         ),
                         forward_context(ForwardContext(None), forward_batch=batch),
                         patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+                        patch.object(mega_moe, "_mega_moe_buffer"),
                         # The fused padded-row fill requires Triton/GPU.
                         patch(
                             "sglang.srt.multimodal.dsv41.vl_routing.is_cuda",
@@ -471,7 +471,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             # The collective boundary owns the result even on an idle rank.
             return x.new_empty((0, kwargs["hidden_size"]))
 
-        with patch.object(mega_moe, "run_mega_routed_experts", run_experts):
+        with (
+            patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+            patch.object(mega_moe, "_mega_moe_buffer"),
+        ):
             out = mega_moe._run_mega_routed(
                 moe, hidden, None, torch.empty(0, dtype=torch.long), num_tokens=0
             )
@@ -577,26 +580,22 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 self.assertFalse(use(moe, hidden, decode))
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True):
                 self.assertTrue(use(moe, hidden, decode))
-                self.assertTrue(
+                for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.EXTEND):
+                    self.assertTrue(
+                        use(moe, hidden, SimpleNamespace(forward_mode=mode))
+                    )
+                self.assertFalse(
                     use(
                         moe,
                         hidden,
-                        SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+                        SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2),
                     )
                 )
                 self.assertFalse(use(moe, hidden.float(), decode))
-                self.assertFalse(
-                    use(moe, torch.zeros((4096, 256), dtype=torch.bfloat16), decode)
-                )
-                # Prefill graph capture runs with is_extend_in_batch cleared.
-                with get_forward().scoped(is_extend_in_batch=False):
-                    self.assertFalse(
-                        use(
-                            moe,
-                            hidden,
-                            SimpleNamespace(forward_mode=ForwardMode.EXTEND),
-                        )
-                    )
+                with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                    16
+                ):
+                    self.assertFalse(use(moe, hidden, decode))
                 self.assertFalse(use(moe, hidden, None))
 
     def test_mega_gate_routes_vision_hash_and_padding(self):
@@ -883,13 +882,18 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 tp_rank=0,
             ),
         ):
-            return fused_moe_layer_module.FusedMoE(
+            experts = fused_moe_layer_module.FusedMoE(
                 num_experts=2,
                 hidden_size=4,
                 intermediate_size=8,
                 layer_id=0,
                 quant_method=method,
             )
+
+        experts.w13_weight = torch.nn.Parameter(
+            torch.zeros(0, dtype=torch.uint8), requires_grad=False
+        )
+        return experts
 
     def _get_test_buffer(self, group):
         with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):

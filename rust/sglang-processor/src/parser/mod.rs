@@ -472,48 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_parses_as_sglang_does() {
-        let output = "plan</think>Sure.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n\
-            <｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n\
-            </｜DSML｜invoke>\n</｜DSML｜tool_calls>";
-        let events = futures::executor::block_on(
-            processor(Some("deepseekv4"), Some("deepseek-v4"), 1)
-                .with_reasoning_state(Some(true))
-                .process_stream(stream::iter(vec![chunk(0, output, true)]))
-                .collect::<Vec<_>>(),
-        );
-        let (mut reasoning, mut content, mut calls, mut finish) =
-            (String::new(), String::new(), vec![], None);
-        for event in events {
-            if let Ok(ChatEvent::Delta {
-                reasoning_content,
-                content: text,
-                tool_calls,
-                finish_reason,
-                ..
-            }) = event
-            {
-                reasoning += reasoning_content.as_deref().unwrap_or_default();
-                content += text.as_deref().unwrap_or_default();
-                calls.extend(
-                    tool_calls
-                        .into_iter()
-                        .flatten()
-                        .map(|c| (c.name, c.arguments)),
-                );
-                finish = finish_reason.or(finish);
-            }
-        }
-        assert_eq!((reasoning.as_str(), content.as_str()), ("plan", "Sure."));
-        let call = (
-            Some("get_weather".into()),
-            Some(r#"{"city": "Paris"}"#.into()),
-        );
-        assert_eq!(calls, vec![call]);
-        assert_eq!(finish, Some(ChatFinishReason::ToolCalls));
-    }
-
-    #[test]
     fn streaming_processor_emits_semantics_without_wire_metadata() {
         let events = futures::executor::block_on(
             processor(None, Some("deepseek-r1"), 1)

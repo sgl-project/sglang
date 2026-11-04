@@ -21,7 +21,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -143,9 +143,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
 
 
 class VocabShard(msgspec.Struct, frozen=True):
-    """Where a rank's vocab slice starts, and the gather over its group."""
+    """A rank's vocab slice [start, start + width), and the gather over its group."""
 
     start: int
+    width: int
     gather: VocabGather
 
 
@@ -233,7 +234,7 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         )
         if group.rank_in_group == 0:
             logger.info(f"DSpark markov_w2 vocab gather: {type(gather).__name__}")
-        self.vocab_shard = VocabShard(start=start, gather=gather)
+        self.vocab_shard = VocabShard(start=start, width=end - start, gather=gather)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -510,6 +511,11 @@ def build_confidence_head(config) -> Optional[nn.Module]:
 _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
+def _has_mla_layers(layers) -> bool:
+    # MLA layers have no qkv_proj to slice; they write their own latent rows.
+    return any(isinstance(layer.self_attn, DFlashMLAAttention) for layer in layers)
+
+
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
     # Drafts whose base logits leave the vocab-parallel lm_head via a TP-sharded
@@ -705,7 +711,7 @@ class DSparkDraftMixin:
 
     def _build_fused_kv_write_bundle(self, pool) -> Optional[FusedKvWriteBundle]:
         layers = list(self.layers)
-        if not layers:
+        if not layers or _has_mla_layers(layers):
             return None
         weights = []
         for layer in layers:
@@ -766,8 +772,8 @@ class DSparkDraftMixin:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
-            k_buf = pool.get_key_buffer(attn.attn.layer_id)
-            v_buf = pool.get_value_buffer(attn.attn.layer_id)
+            k_buf = pool.layer_router.read(attn.attn.layer_id).key()
+            v_buf = pool.layer_router.read(attn.attn.layer_id).value()
             nh = kv_size // head_dim
             # A bf16 pool stores K/V unscaled (set_kv_buffer applies k/v scales
             # only when quantizing), so layer scales do not gate the fused write.
@@ -803,7 +809,7 @@ class DSparkDraftMixin:
         Cached; None (per-layer fallback) when a QKV weight cannot be sliced
         (quantized) or layers disagree on norm epsilon / bias presence.
         """
-        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get():
+        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get() or _has_mla_layers(self.layers):
             return None
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
@@ -891,6 +897,16 @@ class DSparkDraftMixin:
             )
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=pool,
+                    positions=positions,
+                    hidden_states=ctx_hidden,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+                continue
             if stacked is not None:
                 k = k_all[i]
                 v = v_all[i]
@@ -913,7 +929,7 @@ class DSparkDraftMixin:
             else:
                 # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
                 # already in the ids the draft pool indexes.
-                pool.set_kv_buffer(
+                pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
                     KVWriteLoc(cache_loc, physical=True),
                     k,
