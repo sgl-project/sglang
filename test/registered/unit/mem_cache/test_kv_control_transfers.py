@@ -1217,6 +1217,283 @@ def assert_retired(cache, service):
 
 
 class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
+    def _host_pressure(self, owner, *, leave_free=0):
+        """Fill real host rows via CPU DMA and native MOVE; keep GPU empty."""
+        _, cache, service, dma = owner
+        pool = cache.cache_controller.mem_pool_host
+        nodes = []
+        while pool.available_size() > leave_free:
+            count = min(
+                2 if not nodes else cache.token_to_kv_pool_allocator.size,
+                pool.available_size() - leave_free,
+            )
+            tokens = tuple(
+                range(1000 + len(nodes) * 100, 1000 + len(nodes) * 100 + count)
+            )
+            node = seed(cache, tokens, value=11 + len(nodes))
+            result = transfer(
+                service, kind="move_to", tokens=tokens, message=f"pressure-{len(nodes)}"
+            )
+            stage(service, dma)
+            self.assertEqual(wait(service, result).status, Status.COMPLETED)
+            self.assertIsNone(node.component_data[FULL].value)
+            self.assertIsNotNone(node.component_data[FULL].host_value)
+            nodes.append((node, tokens))
+        self.assertEqual(pool.available_size(), leave_free)
+        return nodes
+
+    def _pin_pressure(self, service, rows, *, mode="acquire"):
+        for node, tokens in rows:
+            payload = {
+                "target": msgspec.json.decode(
+                    msgspec.json.encode(cache_fixtures.target(tokens))
+                ),
+                "location": {"tier": "host"},
+                "mode": mode,
+                "claim_id": f"pressure-{node.id}",
+                "revision": 1 if mode == "acquire" else 2,
+            }
+            if mode == "acquire":
+                payload["ttl_seconds"] = 10
+            result = self.submit(service.control, "pin", payload, caller="keeper")
+            self.assertEqual(result.status, Status.COMPLETED)
+
+    def test_storage_prefetch_reclaims_only_shortfall_and_holds_existing_prefix(self):
+        """A full host cache must not strand a valid cold prefix behind admission."""
+        for existing in (0, 2):
+            with (
+                self.subTest(existing=existing),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                cache, service, _ = cold_prefix(owner)
+                prefix = None
+                if existing:
+                    restored = transfer(
+                        service,
+                        src="storage",
+                        dst="host",
+                        tokens=(1, 2),
+                        message="prefix",
+                    )
+                    self.assertEqual(wait(service, restored).status, Status.COMPLETED)
+                    prefix = prefix_path(cache, service)[0][0]
+                pool = cache.cache_controller.mem_pool_host
+                rows = self._host_pressure(owner, leave_free=2 - existing)
+                first = rows[0][0]
+                source_indices = (
+                    prefix.component_data[FULL].host_value.clone()
+                    if prefix is not None
+                    else None
+                )
+                gpu_free = cache.token_to_kv_pool_allocator.available_size()
+                with patch.object(
+                    cache, "evict_host", wraps=cache.evict_host
+                ) as evictions:
+                    result = transfer(
+                        service, src="storage", dst="host", message="restore"
+                    )
+                    self.assertIsNotNone(
+                        next(
+                            iter(service.control.executor.storage_reads.jobs.values())
+                        ).operation
+                    )
+                    self.assertEqual(evictions.call_args_list[0].args, (2,))
+                    done = wait(service, result)
+                self.assertEqual(done.status, Status.COMPLETED)
+                self.assertEqual(evictions.call_count, 1)
+                self.assertIsNone(first.component_data[FULL].host_value)
+                self.assertTrue(
+                    all(
+                        node.component_data[FULL].host_value is not None
+                        for node, _ in rows[1:]
+                    )
+                )
+                self.assertEqual(pool.available_size(), 0)
+                self.assertEqual(
+                    cache.token_to_kv_pool_allocator.available_size(), gpu_free
+                )
+                if prefix is not None:
+                    self.assertTrue(
+                        torch.equal(
+                            prefix.component_data[FULL].host_value, source_indices
+                        )
+                    )
+                host = cache.host_pool_group.anchor_entry.host_pool
+                for node, _, _, _ in prefix_path(cache, service):
+                    cd = node.component_data[FULL]
+                    self.assertTrue(torch.all(host.k_buffer[0][cd.host_value] == 7))
+                    self.assertEqual(cd.host_lock_ref, 0)
+                    self.assertEqual(cd.lock_ref, 0)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_pinned_capacity_waits_without_idle_rescans_and_live_sibling_outlives_first_timeout(
+        self,
+    ):
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, _ = cold_prefix(owner)
+            rows = self._host_pressure(owner)
+            self._pin_pressure(service, rows)
+            held = {
+                node.id: node.component_data[FULL].host_value.clone()
+                for node, _ in rows
+            }
+            cc = cache.cache_controller
+            with (
+                patch.object(cache, "evict_host", wraps=cache.evict_host) as evictions,
+                patch.object(
+                    cc, "_storage_hit_query", wraps=cc._storage_hit_query
+                ) as queries,
+            ):
+                first = public_transfer(
+                    service, "prefetch", "storage", "host", "first", caller="A"
+                )
+                second = transfer(
+                    service, src="storage", dst="host", caller="B", message="second"
+                )
+                other = transfer(
+                    service,
+                    src="storage",
+                    dst="host",
+                    caller="C",
+                    message="other",
+                    tokens=(1, 2),
+                )
+                for _ in range(20):
+                    service.progress()
+                self.assertEqual(evictions.call_count, 1)
+                self.assertEqual(queries.call_count, 0)
+                self.assertEqual(
+                    current(service, first).update.code, "whole_scope_capacity"
+                )
+                self.assertEqual(
+                    cache.cache_controller.mem_pool_host.available_size(), 0
+                )
+                self.assertTrue(
+                    all(
+                        torch.equal(node.component_data[FULL].host_value, held[node.id])
+                        for node, _ in rows
+                    )
+                )
+                self.assertEqual(
+                    service.control.cancel(other.ref).status, Status.CANCELLED
+                )
+                # Expire only A's operation. B still owns the shared physical
+                # preparation; native PIN deadlines remain at t=110.
+                self._pin_pressure(service, rows[1:2], mode="release")
+                self.clock.now = 105.1
+                service.progress()
+                self.assertEqual(current(service, first).status, Status.CANCELLED)
+                self.assertEqual(wait(service, second).status, Status.COMPLETED)
+                self.assertEqual(evictions.call_count, 2)
+                self.assertEqual(queries.call_count, 1)
+                self.assertTrue(
+                    all(
+                        torch.equal(node.component_data[FULL].host_value, held[node.id])
+                        for node, _ in rows[:1] + rows[2:]
+                    )
+                )
+            self._pin_pressure(service, rows[:1] + rows[2:], mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_storage_prefetch_checks_destination_and_transfer_budgets_before_host_eviction(
+        self,
+    ):
+        for blocker in ("gpu", "transfer"):
+            with (
+                self.subTest(blocker=blocker),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                cache, service, _ = cold_prefix(owner)
+                rows = self._host_pressure(owner)
+                gpu_free = cache.token_to_kv_pool_allocator.available_size()
+                held = {
+                    node.id: node.component_data[FULL].host_value.clone()
+                    for node, _ in rows
+                }
+                if blocker == "gpu":
+                    service.control.executor.gpu_copy_capacity = lambda: 0
+                cc = cache.cache_controller
+                with (
+                    patch.object(
+                        cache,
+                        "evict_host",
+                        side_effect=AssertionError("unapproved host eviction"),
+                    ),
+                    patch.object(
+                        cc, "prefetch_rate_limited", return_value=blocker == "transfer"
+                    ),
+                ):
+                    result = transfer(
+                        service, src="storage", dst="gpu", message="blocked"
+                    )
+                    for _ in range(3):
+                        service.progress()
+                    self.assertEqual(current(service, result).status, Status.QUEUED)
+                    self.assertEqual(
+                        service.control.cancel(result.ref).status, Status.CANCELLED
+                    )
+                self.assertEqual(
+                    cache.cache_controller.mem_pool_host.available_size(), 0
+                )
+                self.assertEqual(
+                    cache.token_to_kv_pool_allocator.available_size(), gpu_free
+                )
+                self.assertTrue(
+                    all(
+                        torch.equal(node.component_data[FULL].host_value, held[node.id])
+                        for node, _ in rows
+                    )
+                )
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_waiting_prefetch_uses_freed_capacity_before_scan_retry_deadline(self):
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, _ = cold_prefix(owner)
+            rows = self._host_pressure(owner)
+            self._pin_pressure(service, rows)
+            with patch.object(cache, "evict_host", wraps=cache.evict_host) as evictions:
+                result = transfer(service, src="storage", dst="host", message="waiting")
+                self.assertEqual(current(service, result).status, Status.QUEUED)
+                self.assertEqual(evictions.call_count, 1)
+                self._pin_pressure(service, rows[1:2], mode="release")
+                count = len(rows[1][1])
+                self.assertEqual(cache.evict_host(count), count)
+                # Native memory may become available without clock advance;
+                # backoff limits scans, not use of already released capacity.
+                self.assertEqual(wait(service, result).status, Status.COMPLETED)
+                self.assertEqual(self.clock.now, 100)
+                self.assertEqual(evictions.call_count, 2)
+            self._pin_pressure(service, rows[:1] + rows[2:], mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_expired_waiting_prefetch_does_not_evict_newly_unpinned_host_rows(self):
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, _ = cold_prefix(owner)
+            rows = self._host_pressure(owner)
+            self._pin_pressure(service, rows)
+            with patch.object(cache, "evict_host", wraps=cache.evict_host) as evictions:
+                result = public_transfer(
+                    service, "prefetch", "storage", "host", "expired"
+                )
+                self.assertEqual(evictions.call_count, 1)
+                self._pin_pressure(service, rows, mode="release")
+                self.clock.now = 106
+                service.progress()
+                self.assertEqual(current(service, result).status, Status.CANCELLED)
+                self.assertEqual(evictions.call_count, 1)
+            self.assertEqual(cache.cache_controller.mem_pool_host.available_size(), 0)
+            self.assertTrue(
+                all(
+                    node.component_data[FULL].host_value is not None for node, _ in rows
+                )
+            )
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_native_demand_coalesces_backend_io(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 

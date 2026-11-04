@@ -79,6 +79,7 @@ class StorageCacheReads:
         self.interests: dict[str, _Interest] = {}
         self.demands: dict[CacheRequestHandle, _Demand] = {}
         self._joinable: dict[tuple, _Read] = {}
+        self._host_reclaim_retry_at = 0.0
         self.stats = dict(
             demand_coalesced=0,
             demand_consumed=0,
@@ -261,10 +262,11 @@ class StorageCacheReads:
             if self._length(job, job.work.payload.dst.tier) == len(job.tokens):
                 self._retire(job)
                 return
-            if len(job.tokens) - host_length > pool.available_size() or (
+            if (
                 job.work.payload.dst.tier == "gpu"
                 and len(job.tokens) - gpu_length > self.host._gpu_available()
             ):
+                job.waiting = "whole_scope_capacity"
                 self._release(job)
                 return
             if host_length == len(job.tokens):
@@ -272,6 +274,10 @@ class StorageCacheReads:
                 return
             if self.cache.cache_controller.prefetch_rate_limited():
                 job.waiting = "storage_rate_limit"
+                self._release(job)
+                return
+            if not self._host_capacity(job, len(job.tokens) - host_length):
+                job.waiting = "whole_scope_capacity"
                 self._release(job)
                 return
             anchor = next(
@@ -311,6 +317,46 @@ class StorageCacheReads:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
             if job.operation is None and not job.loading:
                 self._retire(job)
+
+    def _host_capacity(self, job, needed):
+        """Approve the full missing span, reclaiming only its current shortfall.
+
+        The caller holds the requested existing prefix and has checked device
+        and transfer budgets. Native eviction honors PIN/transfer references;
+        whole radix nodes may make its actual reclamation exceed the shortfall.
+        """
+        pool = self.cache.cache_controller.mem_pool_host
+        available = pool.available_size()
+        if needed <= available:
+            return True
+        control = self.cache.kv_control_service.control
+        now = control._clock()
+        if now < self._host_reclaim_retry_at:
+            return False
+        # begin_poll precedes controller deadline handling. Do not introduce
+        # host eviction for an expired caller; a live coalesced sibling or
+        # ordinary demand still authorizes the shared physical preparation.
+        if not job.demands:
+            live = False
+            for identity in job.interests:
+                pending = control._pending.get(identity)
+                if not self.interests[identity].cancelled and (
+                    pending is None
+                    or pending.deadline is None
+                    or now < pending.deadline
+                ):
+                    live = True
+                    break
+            if not live:
+                return False
+        self.cache.evict_host(needed - available)
+        if needed > pool.available_size():
+            # Shared across jobs on this host pool: pinned pressure must not
+            # cause a full eviction walk on every owner idle poll/joiner.
+            self._host_reclaim_retry_at = now + 0.1
+            return False
+        self._host_reclaim_retry_at = 0.0
+        return True
 
     def _load_work(self, job):
         return msgspec.structs.replace(
