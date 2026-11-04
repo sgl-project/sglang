@@ -120,6 +120,12 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
+    quant_config = getattr(model, "quant_config", None)
+    if _is_npu and quant_config is not None and quant_config.get_name() == "modelslim":
+        # This helper loads a separate --quantization-param-path calibration file.
+        # ModelSlim loads KV scales from the checkpoint with model weights.
+        return
+
     if kv_cache_dtype == "fp8_e4m3":
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):

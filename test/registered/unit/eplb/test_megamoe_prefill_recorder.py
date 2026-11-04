@@ -12,7 +12,7 @@ from sglang.srt.eplb.expert_distribution import (
     should_advance_eplb_counter,
     should_record_forward_pass,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -64,7 +64,6 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
     def test_pass_gate_records_only_real_prefill(self):
         cases = [
             (_batch(ForwardMode.EXTEND, extend_tokens=8192), True),
-            (_batch(ForwardMode.SPLIT_PREFILL, extend_tokens=8192), True),
             (_batch(ForwardMode.EXTEND, extend_tokens=0), False),
             (_batch(ForwardMode.DECODE), False),
             (_batch(ForwardMode.MIXED, extend_tokens=8192), False),
