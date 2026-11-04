@@ -36,6 +36,7 @@ struct EngineState {
     resident: u64,
     partial: Option<u64>,
     running: bool,
+    queued: bool,
     cancelled: bool,
     claims: BTreeMap<String, Value>,
     claim_deadlines: BTreeMap<String, Instant>,
@@ -224,7 +225,7 @@ fn command_now(
             .unwrap()
             .len() as u64;
         let mut result = json!({"ref":{"context":body["context"],"message_id":id,"action_id":"transfer","operation_id":format!("op-{id}")},
-            "sequence":1,"update":{"status":if s.running{"running"}else{"completed"},"quiescent":!s.running},"public_result":{"state_version":99_999}});
+            "sequence":1,"update":{"status":if s.queued{"queued"}else if s.running{"running"}else{"completed"},"quiescent":!s.running},"public_result":{"state_version":99_999}});
         if action["action_type"] == "sglang.pin" {
             let payload = &action["payload"];
             if payload["mode"] == "release" && s.fail_pin_release {
@@ -253,7 +254,7 @@ fn command_now(
         }
         let fresh = !s.operations.contains_key(&id);
         s.operations.entry(id).or_insert(result);
-        if fresh && !s.running && action["action_type"] == "sglang.prefetch" {
+        if fresh && !s.running && !s.queued && action["action_type"] == "sglang.prefetch" {
             s.resident = s.partial.unwrap_or(count);
         }
         if s.lose_submit_once || (s.lose_pin_submit_once && action["action_type"] == "sglang.pin") {
@@ -936,6 +937,168 @@ async fn pin_view(router: &TestRouter, id: &str, expected: &str) -> Value {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn measured_policy_reuses_terminal_receipt_but_refreshes_current_residency() {
+    for measured in [false, true] {
+        let engine = Engine::start().await;
+        let mut cfg = orchestration();
+        if measured {
+            cfg.preparation_policy = Some(Default::default());
+        }
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "receipt").await;
+        submit(
+            &router,
+            "receipt",
+            "prepare",
+            prefix(vec![1, 2, 3, 4]),
+            &engine,
+        )
+        .await;
+        ready(&router, "receipt", "prepare").await;
+        let count = |kind: &str| {
+            engine
+                .state
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .filter(|command| command["kind"] == kind)
+                .count()
+        };
+        let queries = count("query");
+        let residency = count("residency");
+        assert!(queries > 0);
+        for _ in 0..3 {
+            // Cross the existing advisory freshness interval, so advance must
+            // obtain a current scoped query instead of its short cached view.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert_eq!(
+                query(&router, "receipt", "prepare").await["operations"][0]["ready_scope"]
+                    ["end_token"],
+                4
+            );
+        }
+        assert!(count("residency") >= residency + 3);
+        if measured {
+            assert_eq!(count("query"), queries);
+        } else {
+            assert!(count("query") >= queries + 3);
+        }
+        engine.state.lock().unwrap().resident = 0;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let absent = query(&router, "receipt", "prepare").await;
+        assert_eq!(
+            absent["operations"][0]["result"]["update"]["status"],
+            "completed"
+        );
+        assert!(absent["operations"][0]["ready_scope"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn measured_policy_keeps_querying_queued_quiescent_receipts() {
+    let engine = Engine::start().await;
+    engine.state.lock().unwrap().queued = true;
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(Default::default());
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "queued").await;
+    submit(
+        &router,
+        "queued",
+        "prepare",
+        prefix(vec![1, 2, 3, 4]),
+        &engine,
+    )
+    .await;
+    let queued = query(&router, "queued", "prepare").await;
+    assert_eq!(
+        queued["operations"][0]["result"]["update"]["status"],
+        "queued"
+    );
+    assert_eq!(
+        queued["operations"][0]["result"]["update"]["quiescent"],
+        true
+    );
+    assert!(queued["operations"][0]["ready_scope"].is_null());
+    let queries;
+    {
+        let mut state = engine.state.lock().unwrap();
+        queries = state
+            .commands
+            .iter()
+            .filter(|command| command["kind"] == "query")
+            .count();
+        state.queued = false;
+        state.resident = 4;
+        let result = state.operations.values_mut().next().unwrap();
+        result["sequence"] = json!(2);
+        result["update"] = json!({"status":"completed","quiescent":true});
+    }
+    let completed = ready(&router, "queued", "prepare").await;
+    assert_eq!(completed["operations"][0]["result"]["sequence"], 2);
+    assert_eq!(completed["operations"][0]["ready_scope"]["end_token"], 4);
+    assert!(
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|command| command["kind"] == "query")
+            .count()
+            > queries
+    );
+}
+
+#[tokio::test]
+async fn measured_pin_receipt_reuse_keeps_claim_queries_and_new_release_query() {
+    let engine = Engine::start().await;
+    let router = router_with(&[&engine], false, Some(auto_pin_config(3000, 4))).await;
+    start(&router, "pin-receipt").await;
+    lifecycle_prepare(&router, &engine, "pin-receipt", vec![1, 2, 3, 4]).await;
+    let active = pin_view(&router, "pin-receipt", "active").await;
+    let pin_id = active["operations"][0]["auto_pin"]["child_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let count = |kind: &str, id: Option<&str>| {
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|command| {
+                command["kind"] == kind && id.is_none_or(|id| command["message_id"] == id)
+            })
+            .count()
+    };
+    let queries = count("query", Some(&pin_id));
+    let claims = count("claim", None);
+    assert!(queries > 0);
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            query(&router, "pin-receipt", "prepare").await["operations"][0]["auto_pin"]["state"],
+            "active"
+        );
+    }
+    assert_eq!(count("query", Some(&pin_id)), queries);
+    assert!(count("claim", None) >= claims + 3);
+    event(&router, "pin-receipt", "task_finished", 3, "finish").await;
+    let released = pin_view(&router, "pin-receipt", "released").await;
+    assert_eq!(released["quiescent"], true);
+    let release_id = format!("{pin_id}-release");
+    assert!(engine.state.lock().unwrap().commands.iter().any(|command| {
+        command["kind"] == "submit"
+            && command["envelope"]["message_id"] == release_id
+            && command["envelope"]["actions"][0]["payload"]["mode"] == "release"
+    }));
+    assert!(count("query", Some(&release_id)) > 0);
 }
 
 #[tokio::test]

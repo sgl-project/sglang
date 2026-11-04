@@ -5020,3 +5020,9 @@ parent 阅读完整差异，并用仓库要求的精确 Rust 1.92.0 独立执行
 新增默认关闭的 reuse-published-sources：轮内共用 salt、源输出参考和一次实际发布，轮间重新隔离，后续组只重置目标 B。历史引用明确标记 reference_only，不伪造重复 RPC 或当前 L3 驻留。源 GPU 调用及执行墙钟按实际计数，公共准备成本等分进入完整作业口径；恢复请求数、输入和压力门槛保持原定义。L3 容量竞争与保护继承实验继续使用逐组发布。
 
 parent 审阅完整四文件差异，并独立复测 lifecycle/Router 工具 25 项通过，23.186s；格式和 selected Ruff 通过。新增 64-case、两轮、三组测试核对 256 次真实源调用与 384 次恢复、各组成本分摊及篡改来源检测。日志：lifecycle-opt/source-reuse-parent-tests.log。正在运行的原 C8 筛选沿用已加载的逐组发布代码。
+
+### O5 — 终态回执复用
+
+C8 压力筛选三组 384 次恢复输出一致，生命周期组合组工作吞吐降低 21.6%。注册前等待均值 1143ms，对照为 84ms；task_started 的 HTTP 均值 990ms，对照为 41ms。生命周期组与固定预取组 GET payload 完全相同；Engine 请求总量明显增加，证据支持先减少 actor 串行 RPC 等待，不能将退化直接归因于容量或带宽。
+
+新策略下复用已终结且 quiescent 的操作回执，仍独立验证当前 capabilities、feedback、residency/claim；QUEUED 即使 quiescent 也继续查询。首次提交和 PIN release 新消息至少查询一次。parent 阅读完整差异并独立 HTTP 回归 32 项通过，2.79s；精确 Rust 1.92 格式检查通过。日志：lifecycle-opt/terminal-parent-http-tests.log。正在运行的 C16/C32 保留旧二进制，后续版本重新评估，不混合为同一配置结果。

@@ -1962,6 +1962,25 @@ impl Actor {
         }
         self.poll_feedback(&job.url, &live).await?;
         job.caps.generation = live.generation;
+        // Reuse a drained terminal receipt, not its historical location/claim.
+        // New submissions (including PIN release) still query their new ID.
+        let reuse_result = self.preparation_costs.is_some()
+            && job.submitted
+            && job.quiescent
+            && matches!(
+                job.result["update"]["status"].as_str(),
+                Some(
+                    "completed"
+                        | "partial"
+                        | "deferred"
+                        | "missing"
+                        | "unsupported"
+                        | "rejected"
+                        | "failed"
+                        | "cancelled"
+                        | "unconsumed"
+                )
+            );
         if !job.submitted {
             if !job.attempted && !job.releasing_pin && Instant::now() >= job.deadline {
                 job.quiescent = true;
@@ -1991,14 +2010,16 @@ impl Actor {
                 }
             }
         }
-        let reply = self
-            .client
-            .command(
-                &job.url,
-                &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
-            )
-            .await?;
-        self.update_result(job, reply)?;
+        if !reuse_result {
+            let reply = self
+                .client
+                .command(
+                    &job.url,
+                    &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
+                )
+                .await?;
+            self.update_result(job, reply)?;
+        }
         job.ready_end = 0;
         job.ready_at = None;
         if job.action == "sglang.pin" {
