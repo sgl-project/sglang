@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -537,3 +538,7 @@ def test_selective_state_update_cpu_mamba1_layout(dtype):
     rtol, atol = (1e-1, 1e-1) if dtype == torch.bfloat16 else (5e-3, 3e-2)
     torch.testing.assert_close(state, state_ref, rtol=3e-4, atol=1e-3)
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
