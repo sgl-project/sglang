@@ -106,6 +106,13 @@ class PixtralForConditionalGeneration(nn.Module):
             return 0
         return MistralLarge3ForCausalLM.num_fusable_shared_experts(text_config)
 
+    @staticmethod
+    def get_hf_to_sglang_mapper(hf_config):
+        # Quark names modules by checkpoint tensor; the text model maps them.
+        if getattr(hf_config.text_config, "model_type", "") == "mistral_large_4":
+            return MistralLarge4ForCausalLM.get_hf_to_sglang_mapper(hf_config)
+        return None
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):

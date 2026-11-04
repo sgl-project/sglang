@@ -27,6 +27,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV3ForCausalLM,
 )
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 from sglang.srt.utils import add_prefix, set_weight_attrs
@@ -297,6 +298,36 @@ MISTRAL_LARGE_4_REMAPPING = {
 }
 # fmt: on
 
+# A Quark export names modules by checkpoint tensor (``layers.1.attention.wq``) in
+# ``exclude`` and ``layer_quant_config``; QuarkConfig matches module prefixes, so
+# both are renamed to this model's modules. Names a rule leaves alone (MTP draft and
+# vision modules) are dropped: the draft ships BF16 and the vision tower is built
+# without a quant config.
+MISTRAL_LARGE_4_QUARK_MAPPER = WeightsMapper(
+    orig_to_new_substr={".attention.indexer.": ".self_attn.indexer."},
+    orig_to_new_prefix={
+        "layers.": "model.layers.",
+        "output": "lm_head",
+        "mtp_dspark.": None,
+        "vision_encoder.": None,
+        "patch_merger.": None,
+        "vision_language_adapter.": None,
+    },
+    orig_to_new_suffix={
+        ".attention.wq": ".self_attn.q_proj",
+        ".attention.wo": ".self_attn.o_proj",
+        ".attention.wkv_a_with_mqa": ".self_attn.kv_a_proj_with_mqa",
+        ".attention.wkv_b": ".self_attn.kv_b_proj",
+        ".feed_forward.w1": ".mlp.gate_proj",
+        ".feed_forward.w2": ".mlp.down_proj",
+        ".feed_forward.w3": ".mlp.up_proj",
+        ".shared_experts.w1": ".mlp.shared_experts.gate_proj",
+        ".shared_experts.w2": ".mlp.shared_experts.down_proj",
+        ".shared_experts.w3": ".mlp.shared_experts.up_proj",
+        ".gate": ".mlp.gate",
+    },
+)
+
 _ROUTED_EXPERTS = re.compile(r"layers\.(\d+)\.experts")
 _PACKED_SHARDS = {".gate_proj": ".gate_up_proj", ".up_proj": ".gate_up_proj"}
 
@@ -397,8 +428,29 @@ def _check_context_parallel_layout() -> None:
         )
 
 
+def _is_quark_checkpoint(hf_config: PretrainedConfig) -> bool:
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    quant_config = getattr(text_config, "quantization_config", None) or getattr(
+        hf_config, "quantization_config", None
+    )
+    if quant_config is not None and not isinstance(quant_config, dict):
+        quant_config = quant_config.to_dict()
+    return bool(quant_config) and quant_config.get("quant_method") == "quark"
+
+
 class MistralLarge4ForCausalLM(DeepseekV3ForCausalLM):
     model_cls = MistralLarge4Model
+    # Fused modules a Quark config must unfuse to find the per-shard layer specs.
+    # Own dict: the DeepSeek base mutates its class-level mapping.
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
+    @classmethod
+    def get_hf_to_sglang_mapper(
+        cls, hf_config: PretrainedConfig
+    ) -> Optional[WeightsMapper]:
+        # ModelOpt and FP8 configs already carry this model's module names (see
+        # mistral_large_4_modelopt_layers and _remap_mistral_large_4_args).
+        return MISTRAL_LARGE_4_QUARK_MAPPER if _is_quark_checkpoint(hf_config) else None
 
     def __init__(
         self,
@@ -445,6 +497,10 @@ class MistralLarge4ForCausalLM(DeepseekV3ForCausalLM):
             and getattr(quant_config, "weight_block_size", None) is not None
         )
         mixed_precision = isinstance(quant_config, ModelOptMixedPrecisionConfig)
+        # Quark names every scale ``weight_scale``; block-FP8 modules (attention,
+        # shared experts, dense layer) keep theirs in ``weight_scale_inv``, while
+        # the routed MXFP4 experts keep ``weight_scale``.
+        is_block_fp8_layer = getattr(quant_config, "is_block_fp8_layer", None)
         for name, tensor in weights:
             target = mistral_large_4_weight_name(
                 name, kv_sources=kv_sources, block_quant=block_quant
@@ -461,6 +517,14 @@ class MistralLarge4ForCausalLM(DeepseekV3ForCausalLM):
                 # ModelOpt stores block-FP8 scales as [out_blocks, 1, in_blocks, 1].
                 target = target.removesuffix(".weight_scale") + ".weight_scale_inv"
                 tensor = tensor.squeeze(-1).squeeze(1)
+            if (
+                is_block_fp8_layer is not None
+                and target is not None
+                and target.endswith(".weight_scale")
+                and ".mlp.experts." not in target
+                and is_block_fp8_layer(target.removesuffix(".weight_scale"))
+            ):
+                target = target.removesuffix(".weight_scale") + ".weight_scale_inv"
             if target is not None:
                 loaded_names.add(target)
                 yield target, tensor

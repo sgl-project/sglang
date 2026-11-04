@@ -379,7 +379,11 @@ class QuarkConfig(QuantizationConfig):
         # which describes the requantization *source*. `weight_block_size`
         # selects block vs per-tensor FP8 within `Fp8LinearMethod`.
         self.excluded_fp8_config = excluded_fp8_config
-        self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
+        # Quark exports do not record it; the model supplies it through
+        # update_packed_modules_mapping once it knows its fused modules.
+        self.packed_modules_mapping = (
+            self.quant_config.get("packed_modules_mapping") or {}
+        )
         self._online_quantized_layers = set()
 
         if isinstance(self.dequantization_config, Fp8Config):
@@ -469,6 +473,23 @@ class QuarkConfig(QuantizationConfig):
             weight_block_size=block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+        )
+
+    def is_block_fp8_layer(self, prefix: str) -> bool:
+        """Whether a non-excluded linear loads through the block-FP8 method, whose
+        scales live in ``weight_scale_inv`` rather than ``weight_scale``."""
+        if not self.quant_config.get("layer_quant_config"):
+            return False
+        if should_ignore_layer(
+            prefix,
+            ignore=self.exclude_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return False
+        matched_config = self._find_matched_config(prefix, torch.nn.Module())
+        return (
+            self._get_block_fp8_config(matched_config, self.packed_modules_mapping)
+            is not None
         )
 
     def is_linear_unquantized(self, prefix: str) -> bool:
