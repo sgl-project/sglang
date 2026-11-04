@@ -30,7 +30,12 @@ from sglang.test.kernels.deepseek_v4.common import (
 )
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=75, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=75,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_dpsk_v4_block_amax_false_fp32_t_fp32_t",
+)
 
 _is_xpu = is_xpu()
 if _is_xpu:

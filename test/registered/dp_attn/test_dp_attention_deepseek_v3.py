@@ -17,7 +17,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=78, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=135, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(
+    est_time=135,
+    stage="extra-a",
+    runner_config="2-gpu-large-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")

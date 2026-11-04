@@ -15,7 +15,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=35, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=35,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AttributeError: 'types.SimpleNamespace' object has no attribute '_qkvgbfa_sizes'",
+)
 
 _H = 7168
 _QKVG = 6144  # q,k,v,g slices per rank at TP8

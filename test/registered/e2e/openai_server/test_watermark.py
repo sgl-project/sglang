@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=157, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=221, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=247, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 _KEY_A = "0123456789abcdef"

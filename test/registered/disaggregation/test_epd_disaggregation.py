@@ -25,7 +25,7 @@ KIMI_VL_MODEL = "moonshotai/Kimi-VL-A3B-Instruct"
 
 
 register_cuda_ci(est_time=242, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=363, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(est_time=682, stage="extra-b", runner_config="4-gpu-amd")
 
 
 class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):

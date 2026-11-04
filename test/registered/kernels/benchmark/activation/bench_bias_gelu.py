@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=18, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=9, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 def torch_bias_gelu(input: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:

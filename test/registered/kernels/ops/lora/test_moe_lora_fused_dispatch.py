@@ -20,7 +20,12 @@ from sglang.srt.lora.moe.base_gemm_provider.base import (  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=23, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=23,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: per_token_group_quant bakes the torch.float8_e4m3fnuz quant range in at (-448.0, 448.0), got (",
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused LoRA stages require CUDA"

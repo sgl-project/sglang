@@ -15,7 +15,12 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
 register_cuda_ci(est_time=199, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=299, stage="extra-a", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=299,
+    stage="extra-a",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 _UNIFIED_COMMON_ARGS = [
     "--enable-unified-memory",

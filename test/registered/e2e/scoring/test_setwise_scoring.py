@@ -30,7 +30,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=91, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=144, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=144,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): Exception: flashinfer_python with minimum required version 0.7.2 is not installed.",
+)
 
 _SEQCLS_MODEL = os.environ.get(
     "TEST_CLASSIFICATION_BASE_MODEL",

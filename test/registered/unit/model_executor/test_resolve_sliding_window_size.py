@@ -37,7 +37,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=18,
+    stage="extra-a",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ModuleNotFoundError: No module named 'cutlass'",
+)
 
 
 def _head(*, depth, local_layer_ids=(1,), local_extent=64, window=128):

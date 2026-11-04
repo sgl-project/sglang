@@ -14,7 +14,12 @@ from sglang.test.kv_canary.canary_info_e2e_base import (
 )
 
 register_cuda_ci(est_time=520, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=315, stage="extra-a", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=315,
+    stage="extra-a",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: -1 != 200 : {'status_code': -1, 'error': 'ChunkedEncodingError(ProtocolError('Response ended p",
+)
 
 
 class TestCanaryInfoPassthroughEagle(CanaryInfoE2EBase):

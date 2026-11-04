@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=15, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=12, stage="jit-kernel-benchmark", runner_config="amd")
 
 NUM_DRAFT_TOKENS = 7
 

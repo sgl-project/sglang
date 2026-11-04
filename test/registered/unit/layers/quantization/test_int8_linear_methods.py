@@ -23,7 +23,12 @@ from sglang.test.layer_ut_utils import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=24, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=24,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): NameError: name 'int8_scaled_mm' is not defined",
+)
 
 INT8_MAX = 127.0
 

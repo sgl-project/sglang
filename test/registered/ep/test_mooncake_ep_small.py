@@ -22,7 +22,12 @@ register_cuda_ci(
     stage="base-c",
     runner_config="4-gpu-h100",
 )
-register_amd_ci(est_time=284, stage="stage-c", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=284,
+    stage="stage-c",
+    runner_config="4-gpu-amd",
+    disabled="Mooncake EP is not built in the ROCm image (rocm.Dockerfile has no -DWITH_EP=ON); lmsys/sglang-ci-dsv3-test is also not accessible from AMD CI",
+)
 
 ib_devices = get_rdma_devices_args()
 

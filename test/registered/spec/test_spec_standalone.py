@@ -12,7 +12,12 @@ from sglang.test.test_utils import CustomTestCase
 # numerics live in attention/unittests/dense/test_{triton,flashinfer}.py.
 # Non-V2 backends moved to test_spec_standalone_extra.py.
 register_cuda_ci(est_time=86, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=137, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=137,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestStandaloneV2SpeculativeDecodingBase(

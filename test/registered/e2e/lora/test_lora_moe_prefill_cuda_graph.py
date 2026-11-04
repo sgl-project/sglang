@@ -27,7 +27,12 @@ from sglang.test.kits.lora_prefill_graph_kit import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=155, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=233, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=233,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): Exception: flashinfer_python with minimum required version 0.7.2 is not installed.",
+)
 
 
 class TestMoELoRAPrefillCudaGraph(CustomTestCase):

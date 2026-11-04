@@ -11,7 +11,7 @@ from sglang.kernels.ops.embeddings.engram_gather import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=23, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=5, stage="jit-kernel-unit", runner_config="amd")
 
 _DIM = 256
 _BLOCK = 32

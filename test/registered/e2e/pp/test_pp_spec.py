@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=449, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=693, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(est_time=1123, stage="extra-b", runner_config="4-gpu-amd")
 
 # topk=1 chains and a topk=2 tree: the relayed topology is constant for the
 # former and data-dependent for the latter, so both shapes are covered.

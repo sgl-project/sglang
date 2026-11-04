@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=306, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=470, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(est_time=1344, stage="extra-b", runner_config="4-gpu-amd")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}

@@ -13,7 +13,7 @@ else:
     from sgl_kernel import verify_tree_greedy
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=23, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 
 def test_verify_tree_greedy():

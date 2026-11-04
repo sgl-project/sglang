@@ -10,7 +10,12 @@ from sglang.test.kernels.qknorm import torch_impl_qknorm
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=15, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=15,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ModuleNotFoundError: No module named 'flashinfer'",
+)
 
 alt_stream = torch.cuda.Stream()
 

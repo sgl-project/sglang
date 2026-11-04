@@ -33,7 +33,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=146, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=227, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=227,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ValueError: InklingForConditionalGeneration has no SGlang implementation and the Transformers implementation i",
+)
 
 # Defaults to the HF `test` revision; override MODEL/REVISION to point at a
 # local checkpoint. Empty REVISION drops the flag (for local paths).

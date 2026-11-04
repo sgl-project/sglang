@@ -16,7 +16,12 @@ from sglang.srt.model_executor.runner_utils import pool
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=23, stage="stage-b", runner_config="2-gpu-large-amd")
+register_amd_ci(
+    est_time=23,
+    stage="stage-b",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError",
+)
 
 
 def _run_rank(rank, rendezvous):

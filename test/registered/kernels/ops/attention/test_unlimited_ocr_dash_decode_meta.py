@@ -41,7 +41,7 @@ from sglang.test.kernels.unlimited_ocr_dash import (
 )
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 BS, IMG, PAGE, MM_PAD = 128, 99, 7, 1_000_000
 NUM_BLOCKS, WIDTH = 64, 12

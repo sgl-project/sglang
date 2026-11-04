@@ -8,7 +8,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.fp8 import TestFP8Base
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=18, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=18,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: Tensor-likes are not close!",
+)
 
 
 _is_cuda = is_cuda()

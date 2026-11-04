@@ -10,7 +10,12 @@ import triton
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=17, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=26, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=26,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AttributeError: '_OpNamespace' 'sgl_kernel' object has no attribute 'concat_mla_absorb_q'",
+)
 
 
 def torch_concat_mla_k(

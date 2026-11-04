@@ -13,7 +13,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import popen_with_error_check, try_cached_model
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-b300")
-register_amd_ci(est_time=809, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=809,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 COMMON_ARGS = [
     "--dsa-prefill-backend",

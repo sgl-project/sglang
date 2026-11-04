@@ -41,7 +41,12 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=24, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=24,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ModuleNotFoundError: No module named 'flashinfer'",
+)
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {

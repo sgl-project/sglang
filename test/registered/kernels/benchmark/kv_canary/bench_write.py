@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=30, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=24, stage="jit-kernel-benchmark", runner_config="amd")
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
 # Note: amd_ci_exec.sh sets SGLANG_IS_IN_CI, so this runs the CI-reduced range
 # (build_fast_matrix_cases via get_benchmark_range), same as CUDA nightly.

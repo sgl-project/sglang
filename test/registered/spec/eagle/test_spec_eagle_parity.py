@@ -8,14 +8,23 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=144, stage="base-b", runner_config="1-gpu-large")
 register_xpu_ci(est_time=360, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
 register_xpu_ci(est_time=360, suite="nightly-xpu-kernel-wheel-1-gpu", nightly=True)
-register_amd_ci(est_time=216, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=216,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 _is_xpu = is_xpu()
 

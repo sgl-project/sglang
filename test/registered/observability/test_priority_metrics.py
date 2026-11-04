@@ -8,7 +8,11 @@ from prometheus_client.samples import Sample
 
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,7 +26,7 @@ register_cuda_ci(
     runner_config="1-gpu-small",
 )
 register_cpu_ci(est_time=49, suite="stage-b-test-cpu-intel")
-register_amd_ci(est_time=84, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=118, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 

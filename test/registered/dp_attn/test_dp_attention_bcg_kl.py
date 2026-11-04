@@ -29,7 +29,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=186, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=279, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(
+    est_time=279,
+    stage="extra-a",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 PREFILL_GRAPH_REPLAY_PATTERN = re.compile(r"Prefill batch.*cuda graph: True")
 CACHED_PREFIX_GRAPH_REPLAY_PATTERN = re.compile(

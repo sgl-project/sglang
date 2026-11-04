@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # CI registration - PD disaggregation requires 2 GPUs
 register_cuda_ci(est_time=69, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=105, stage="stage-b", runner_config="2-gpu-large-amd")
+register_amd_ci(est_time=140, stage="stage-b", runner_config="2-gpu-large-amd")
 
 
 class TestTraceDisaggregation(CustomTestCase):

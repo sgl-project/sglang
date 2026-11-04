@@ -33,7 +33,7 @@ register_cuda_ci(
     stage="extra-b",
     runner_config="8-gpu-h200",
 )
-register_amd_ci(est_time=87, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(est_time=54, stage="extra-b", runner_config="large-8-gpu-amd")
 
 # ---------------------------------------------------------------------------
 # Test parameters

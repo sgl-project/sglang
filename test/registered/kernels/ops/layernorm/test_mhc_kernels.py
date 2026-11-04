@@ -9,7 +9,12 @@ from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_p
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=24, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=24,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): TypeError: super(type, obj): obj must be an instance or subtype of type",
+)
 
 
 @pytest.fixture

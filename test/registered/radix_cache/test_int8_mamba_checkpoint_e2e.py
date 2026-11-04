@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=167, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=228, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(est_time=487, stage="extra-b", runner_config="4-gpu-amd")
 
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):

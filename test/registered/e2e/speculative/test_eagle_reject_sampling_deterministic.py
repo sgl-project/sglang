@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=110, stage="stage-b", runner_config="2-gpu-large-amd")
+register_amd_ci(est_time=103, stage="stage-b", runner_config="2-gpu-large-amd")
 
 QWEN35_MODEL = "Qwen/Qwen3.5-9B"
 SERVER_LAUNCH_TIMEOUT = 600

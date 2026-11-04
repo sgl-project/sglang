@@ -21,7 +21,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=114, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=171, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=171,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestDPSpecPrefillCoordinationMixed(CustomTestCase):

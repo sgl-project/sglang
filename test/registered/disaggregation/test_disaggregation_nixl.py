@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=331, stage="extra-b", runner_config="8-gpu-h20")
-register_amd_ci(est_time=497, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(est_time=529, stage="extra-b", runner_config="large-8-gpu-amd")
 # base-c 8-GPU runner is required for TP4 prefill + TP4 decode.
 
 NIXL_PREFILL_TP_SIZE = 4

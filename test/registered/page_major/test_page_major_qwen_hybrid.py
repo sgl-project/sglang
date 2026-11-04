@@ -16,7 +16,12 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=259, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=395, stage="extra-a", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=395,
+    stage="extra-a",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 _UNIFIED_COMMON_ARGS = [
     "--trust-remote-code",

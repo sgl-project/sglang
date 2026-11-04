@@ -21,7 +21,12 @@ from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 # the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
 # benchmark is not portable as-is; keep it off AMD CI rather than register-and-skip.
 register_cuda_ci(est_time=335, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=518, stage="extra-a", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=518,
+    stage="extra-a",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: 18.777328560491394 not less than 3.0 : [canary self-bench] qwen3-30b-a3b/decode_bs1_isl512_osl",
+)
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"

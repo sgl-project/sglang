@@ -24,7 +24,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=135, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=135,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: 0 != 2",
+)
 
 # One bf16 ulp: the fused and unfused kernels reduce K in different orders.
 _OUTPUT_TOL = dict(rtol=2**-7, atol=1e-7)

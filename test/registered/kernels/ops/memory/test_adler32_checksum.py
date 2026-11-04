@@ -9,7 +9,7 @@ from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=23, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=9, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _ref_adler32(tensor: torch.Tensor) -> int:

@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=679, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=1025, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(est_time=2700, stage="extra-b", runner_config="4-gpu-amd")
 
 MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64

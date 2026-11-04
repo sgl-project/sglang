@@ -14,7 +14,12 @@ from sglang.utils import is_in_ci
 register_cuda_ci(
     est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=10, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=10,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_awq_dequantize_fp16_t",
+)
 
 IS_CI = is_in_ci()
 

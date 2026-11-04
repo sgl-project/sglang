@@ -19,7 +19,7 @@ from sglang.test.kits.spec_server_kits import (
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=195, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=290, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=254, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class TestEagle3Triton(

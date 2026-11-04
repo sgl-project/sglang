@@ -40,7 +40,12 @@ register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")
-register_amd_ci(est_time=27, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=27,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_qknorm_64_false_bf16_t_true",
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

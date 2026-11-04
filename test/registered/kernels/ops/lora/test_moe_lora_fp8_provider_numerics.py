@@ -17,7 +17,12 @@ register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
 # its four GPUs are allocation granularity, not multi-GPU coverage.
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_amd_ci(est_time=120, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=120,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ModuleNotFoundError: No module named 'cuda'",
+)
 
 _E = 4
 _H = 512

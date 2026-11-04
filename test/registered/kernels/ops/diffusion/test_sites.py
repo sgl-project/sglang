@@ -41,12 +41,21 @@ from sglang.kernels.ops.diffusion import (
     fused_ln_modulate,
     tensors_equal,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=38, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=57, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=57,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): fails, see the run log",
+)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required"

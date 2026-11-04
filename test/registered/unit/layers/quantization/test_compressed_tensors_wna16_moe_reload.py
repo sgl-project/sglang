@@ -22,7 +22,12 @@ from sglang.test.layer_ut_utils import assert_output_close, init_single_process_
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=20,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: <class 'sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe",
+)
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
 GROUP_SIZE, PACK_FACTOR = 128, 8

@@ -13,7 +13,12 @@ register_cuda_ci(
     stage="base-b",
     runner_config="1-gpu-small",
 )
-register_amd_ci(est_time=14, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=14,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 def cdiv(a: int, b: int) -> int:

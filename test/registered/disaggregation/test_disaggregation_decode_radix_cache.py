@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=155, stage="extra-b", runner_config="8-gpu-h20")
-register_amd_ci(est_time=233, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(est_time=373, stage="extra-b", runner_config="large-8-gpu-amd")
 
 
 def _has_mooncake():

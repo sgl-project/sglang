@@ -20,7 +20,12 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=36, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=36,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 @unittest.skipIf(

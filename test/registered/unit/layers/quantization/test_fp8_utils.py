@@ -26,7 +26,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=18, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=18,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: CUDA error: HIPBLAS_STATUS_NOT_SUPPORTED when calling `HIPBLAS_STATUS_NOT_SUPPORTED`",
+)
 
 
 class TestMxfp8MoeScaleLayout(CustomTestCase):

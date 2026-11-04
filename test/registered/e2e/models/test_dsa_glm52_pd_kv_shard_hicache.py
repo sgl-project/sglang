@@ -30,7 +30,12 @@ from sglang.test.simple_eval_mixed_prefix_gsm8k import (
 from sglang.utils import download_and_cache_file, read_jsonl
 
 register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-gb300")
-register_amd_ci(est_time=900, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=900,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 PAGE_SIZE = 64
 PREFILL_POOL_TOKENS = 4096  # Per rank: CP2 has 8192 logical GPU slots.

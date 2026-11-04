@@ -20,7 +20,12 @@ GLM52_MODEL = os.environ.get("SGLANG_LINKER_GLM52_MODEL", "zai-org/GLM-5.2-FP8")
 GLM52_LAUNCH_TIMEOUT = 3600
 
 register_cuda_ci(est_time=266, stage="extra-b", runner_config="8-gpu-h200")
-register_amd_ci(est_time=539, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=539,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Mooncake store service exited with code -6",
+)
 
 
 class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):

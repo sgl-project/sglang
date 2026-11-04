@@ -49,7 +49,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=77, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=116, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(est_time=145, stage="stage-b", runner_config="1-gpu-large-amd")
 
 # Healthy 0.865-0.880 (static pool 0.870); a died-mid-run server scores
 # 0.05-0.21. 1 sigma over 200 examples is ~0.024.

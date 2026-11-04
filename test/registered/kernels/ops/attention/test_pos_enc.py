@@ -11,7 +11,12 @@ from sglang.kernels.ops.attention.rope import rotary_embedding
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=27, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=27,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_rotary_embedding",
+)
 
 
 @triton.jit

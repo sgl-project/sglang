@@ -10,7 +10,12 @@ from sglang.test.kernels.sam import make_windows, window_unpartition_add_referen
 register_cuda_ci(
     est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=12, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=12,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Tensor match failed for Tensor<1, 40, 40, 768>[strides=<1228800, 30720, 768, 1>, dtype=bfloat16,",
+)
 
 
 @marker.parametrize("batch", [1, 2, 4, 8], [1, 8])

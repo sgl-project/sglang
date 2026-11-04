@@ -14,7 +14,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=38, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=38,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_moe_route_radix_false",
+)
 
 NUM_EXPERTS = 896
 

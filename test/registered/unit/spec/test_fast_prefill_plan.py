@@ -28,7 +28,12 @@ except ImportError:
     _HAS_FLASHINFER = False
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=20,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 # Draft-extend layout: constant qo (num_tokens_per_req per req), page_size 1.
 # Non-uniform seq_lens make cumsum non-trivial, so a wrong per-row kv split is

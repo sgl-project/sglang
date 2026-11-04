@@ -21,7 +21,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=72, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=114, stage="stage-b", runner_config="2-gpu-large-amd")
+register_amd_ci(
+    est_time=114,
+    stage="stage-b",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 # Qwen3 dense (architecture "Qwen3ForCausalLM") is the SP allowlist entry.
 LAYERNORM_SP_MODEL = "Qwen/Qwen3-8B"

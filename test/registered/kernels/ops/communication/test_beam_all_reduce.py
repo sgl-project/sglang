@@ -28,7 +28,12 @@ from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=180, stage="extra-b", runner_config="8-gpu-h200")
-register_amd_ci(est_time=179, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=179,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_beam_all_reduce_norm_2_5120_1_1",
+)
 
 ROWS = (1, 8, 16, 32, 64, 128)
 

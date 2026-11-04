@@ -34,7 +34,12 @@ from sglang.test.test_utils import (
 # OSS FA4 coverage requires Blackwell. The PP test uses two GPUs; the other
 # tests use one GPU.
 register_cuda_ci(est_time=258, stage="extra-b", runner_config="4-gpu-b200")
-register_amd_ci(est_time=387, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=387,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 def _prefill_graph_count(base_url: str) -> float:

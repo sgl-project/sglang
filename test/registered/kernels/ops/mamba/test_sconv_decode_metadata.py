@@ -16,7 +16,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=5, stage="jit-kernel-unit", runner_config="amd")
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 

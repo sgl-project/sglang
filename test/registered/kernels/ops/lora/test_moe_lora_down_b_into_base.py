@@ -27,7 +27,7 @@ from sglang.test.kits.moe_lora_down_b_kit import (
 # H100 only: the shipped SM100 plan table selects no fold row (overrides and
 # the default table still can).
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=38, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 cuda_only = pytest.mark.skipif(

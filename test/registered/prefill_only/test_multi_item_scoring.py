@@ -29,7 +29,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=137, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=209, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=209,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): Exception: flashinfer_python with minimum required version 0.7.2 is not installed.",
+)
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(

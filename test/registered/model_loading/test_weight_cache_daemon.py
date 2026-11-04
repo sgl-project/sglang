@@ -31,7 +31,7 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # visible (i.e. on the 1-gpu runner).
 register_cuda_ci(est_time=390, stage="extra-a", runner_config="2-gpu-large")
 register_cuda_ci(est_time=71, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=110, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=142, stage="stage-b", runner_config="1-gpu-small-amd")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).

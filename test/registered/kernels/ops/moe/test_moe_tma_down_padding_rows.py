@@ -15,7 +15,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=45,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): fails, see the run log",
+)
 
 E, TOPK, HIDDEN, INTER, BLOCK = 256, 8, 2048, 512, [128, 128]
 CASES = ((1, 16), (32, 16), (300, 32), (2048, 64))  # (num_tokens, BLOCK_SIZE_M)

@@ -12,7 +12,12 @@ from sglang.test.test_utils import (
 # Hybrid attention backend tests (FA3 prefill + FlashInfer decode, requires SM 90+ / H100)
 # Multiple test classes: base, MLA, TorchCompile, SpecDecode variants
 register_cuda_ci(est_time=370, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=570, stage="extra-a", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=570,
+    stage="extra-a",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestHybridAttnBackendMLA(TestHybridAttnBackendBase):

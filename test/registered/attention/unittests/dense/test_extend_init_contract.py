@@ -37,7 +37,12 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(
+    est_time=20,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): NameError: name 'BatchPrefillWithRaggedKVCacheWrapper' is not defined",
+)
 
 _EXTEND_CASE = DenseAttentionCase(
     name="extend_no_prefix_smoke",

@@ -25,7 +25,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=214, stage="extra-b", runner_config="4-gpu-b200")
-register_amd_ci(est_time=309, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=309,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 DCP_SIZE = 4

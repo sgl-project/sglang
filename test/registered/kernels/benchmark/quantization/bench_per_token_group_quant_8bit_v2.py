@@ -17,7 +17,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=10, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=10,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AttributeError: '_OpNamespace' 'sgl_kernel' object has no attribute 'sgl_per_token_group_quant_8bit_v2'",
+)
 
 G = 128
 HIDDEN = 4096

@@ -15,7 +15,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=30, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=30,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_timestep_embedding_fp32_t",
+)
 
 BATCHES = [1, 2, 8, 63, 256, 512, 613, 1024, 1536]
 DIMS = [32, 64, 128, 256, 512, 1024, 2048, 4096]

@@ -12,7 +12,12 @@ from sglang.utils import is_in_ci
 register_cuda_ci(
     est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=45, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=45,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: unsupported input for residual_gate_add CUDA",
+)
 
 
 @dataclass(frozen=True)

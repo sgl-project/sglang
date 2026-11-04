@@ -9,7 +9,7 @@ register_cuda_ci(
     stage="base-b-kernel-benchmark",
     runner_config="1-gpu-large",
 )
-register_amd_ci(est_time=18, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=9, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 def _split(q: torch.Tensor, k: torch.Tensor, freqs: torch.Tensor) -> None:

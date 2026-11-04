@@ -33,7 +33,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 
 register_cuda_ci(est_time=105, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=162, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(
+    est_time=162,
+    stage="extra-a",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

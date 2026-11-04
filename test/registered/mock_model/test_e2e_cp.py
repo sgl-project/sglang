@@ -7,7 +7,12 @@ from sglang.test.mock_model.utils import run_mock_model_bench_serving
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=53, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=75, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(
+    est_time=75,
+    stage="extra-a",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestE2EContextParallel(CustomTestCase):

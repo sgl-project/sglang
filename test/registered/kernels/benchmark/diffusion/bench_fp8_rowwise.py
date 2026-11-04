@@ -9,7 +9,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=15, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=15,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ValueError: fp8_rowwise requires contiguous 2D FP32/FP16/BF16 on SM89+, K in [1, 16384]",
+)
 
 
 @marker.parametrize("rows", [32, 340, 2720, 3173], [3173])

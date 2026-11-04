@@ -29,7 +29,12 @@ register_cuda_ci(
     # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
     runner_config="4-gpu-h100",
 )
-register_amd_ci(est_time=165, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=165,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Mooncake store service exited with code -6",
+)
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

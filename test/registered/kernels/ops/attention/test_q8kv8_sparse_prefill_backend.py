@@ -40,7 +40,12 @@ from sglang.test.kernels.deepseek_v4.k_cache_reference import (
 )
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=180, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=180,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ModuleNotFoundError: No module named 'flash_mla'",
+)
 
 
 def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value(monkeypatch):

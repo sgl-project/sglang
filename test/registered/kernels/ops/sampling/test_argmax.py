@@ -13,7 +13,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_amd_ci(est_time=270, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=270,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_sampling_argmax_bf16_t_false",
+)
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 

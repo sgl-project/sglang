@@ -48,7 +48,12 @@ register_cuda_ci(
 )
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=110, stage="nightly", runner_config="8-gpu-h200")
-register_amd_ci(est_time=141, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=141,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Custom-all-reduce precompile failed for dtype=torch.bfloat16 world_size=2 (exit 1)",
+)
 
 # ---------------------------------------------------------------------------
 # Test parameters

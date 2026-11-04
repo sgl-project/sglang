@@ -5,7 +5,7 @@ from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=14, stage="jit-kernel-unit", runner_config="amd")
 
 
 def test_small_tensor_hash_is_unchanged():

@@ -130,6 +130,12 @@ jobs:
       require-label: run-ci-amd-extra
     secrets: inherit
 
+  # With continue_on_error every shard runs past failed and hung files, and each
+  # hang costs a full per-file timeout. The step timeout then rises to 180 min so
+  # a few hangs don't kill the step and drop the files not yet run. The extra-b
+  # jobs derive per-file timeouts from est_time, since a few of their files
+  # (e.g. unified_radix_cache_kl_dsv4) run longer than a flat 1800s.
+
   # =============================================== extra-a (1-gpu-small) ===============================================
   # ~1h of tests in total; two shards keep each under the step timeout.
   extra-a-test-1-gpu-small-amd:
@@ -139,7 +145,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -161,9 +167,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: ${{ inputs.continue_on_error == true && 180 || 45 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (1-gpu-large) ===============================================
   # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
@@ -176,7 +182,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5]
+        part: [0, 1, 2, 3]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -196,9 +202,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: ${{ inputs.continue_on_error == true && 180 || 60 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (2-gpu-large) ===============================================
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE
@@ -231,7 +237,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: ${{ inputs.continue_on_error == true && 180 || 60 }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
@@ -239,16 +245,14 @@ jobs:
   # 4-GPU tests that CUDA runs in extra-b. Same container env as the
   # stage-c-test-4-gpu-amd job in pr-test-amd.yml.
   extra-b-test-4-gpu-amd:
-    name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-8gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
+    name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5]
-    # Parity experiment: the 4-GPU pool runs at most 2 jobs at once; the 8-GPU
-    # pool has headroom and the same MI300X GPUs.
-    runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi300') }}
+        part: [0, 1, 2]
+    runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -267,7 +271,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: ${{ inputs.continue_on_error == true && 180 || 60 }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e NCCL_CUMEM_ENABLE=0 \
@@ -275,7 +279,7 @@ jobs:
             -e RCCL_MSCCL_ENABLE=0 \
             -e SGLANG_USE_ROCM700A=1 \
             -w "/sglang-checkout/test" \
-            python3 run_suite.py --hw amd --suite extra-b-test-4-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+            python3 run_suite.py --hw amd --suite extra-b-test-4-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-from-est-time ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-b (8-gpu) ===============================================
   # 8-GPU tests that CUDA runs in extra-b, on the MI300 8-GPU pool.
@@ -306,9 +310,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: ${{ inputs.continue_on_error == true && 180 || 60 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-b-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-b-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-from-est-time ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job

@@ -18,11 +18,15 @@ from sglang.srt.models.qwen4_exp import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import set_weight_attrs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_xpu_ci(est_time=45, suite="stage-b-test-1-gpu-xpu")
-register_amd_ci(est_time=68, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 _accelerator = torch.accelerator.current_accelerator()
 DEVICE = _accelerator.type if _accelerator is not None else None

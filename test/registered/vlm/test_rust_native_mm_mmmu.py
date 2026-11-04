@@ -31,7 +31,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=124, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=194, stage="stage-b", runner_config="1-gpu-large-amd")
+register_amd_ci(
+    est_time=194,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"

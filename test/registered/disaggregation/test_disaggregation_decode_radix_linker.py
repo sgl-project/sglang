@@ -24,7 +24,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import is_in_ci, unified_radix_tree_server_env
 
 register_cuda_ci(est_time=300, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=450, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=450,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Mooncake store service exited with code -6",
+)
 
 MODEL = "yujiepan/kimi-linear-tiny-random"
 TRACK_INTERVAL = 128

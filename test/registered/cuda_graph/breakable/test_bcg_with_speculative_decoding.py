@@ -13,7 +13,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
 register_cuda_ci(est_time=108, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=155, stage="stage-b", runner_config="2-gpu-large-amd")
+register_amd_ci(
+    est_time=155,
+    stage="stage-b",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestBCGWithEAGLE3(PCGSpecBase, unittest.TestCase):

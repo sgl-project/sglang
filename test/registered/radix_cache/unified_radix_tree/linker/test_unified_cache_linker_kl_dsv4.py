@@ -21,7 +21,12 @@ DSV4_FLASH_MODEL = os.environ.get(
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
 register_cuda_ci(est_time=162, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=243, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=243,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Mooncake store service exited with code -6",
+)
 
 
 class TestDeepSeekV4FlashUnifiedCacheLinkerKL(

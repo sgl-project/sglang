@@ -16,7 +16,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 if __name__ == "__main__":
