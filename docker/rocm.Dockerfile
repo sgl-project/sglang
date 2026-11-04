@@ -42,8 +42,8 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.17-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + uTLX docker image, for sglang's TLX kernels):
-# Off by default. BUILD_UTLX=1 builds it on gfx950-rocm1000 and fails on every
-# other flavor.
+# Off by default. BUILD_UTLX=1 builds it on gfx950-rocm1000, gfx1250-rocm1000
+# and gfx1250-rocm1010, and fails on every other flavor.
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm1000 --build-arg BUILD_UTLX=1 -t v0.5.17-rocm10-mi35x -f rocm.Dockerfile .
 
 # Default base images
@@ -417,13 +417,15 @@ ENV TRITON_REPO="${TRITON_REPO:-${TRITON_REPO_DEFAULT:-https://github.com/triton
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
 ARG TRITON_REVERT_COMMITS=""
 ENV TRITON_REVERT_COMMITS="${TRITON_REVERT_COMMITS:-${TRITON_REVERT_COMMITS_DEFAULT}}"
-# uTLX (see the uTLX step), off by default and only on gfx950-rocm1000; checked
-# here, not at the end of the build.
+# uTLX (see the uTLX step), off by default and only on gfx950-rocm1000,
+# gfx1250-rocm1000 and gfx1250-rocm1010; checked here, not at the end of the build.
 ARG BUILD_UTLX="0"
 ENV BUILD_UTLX="${BUILD_UTLX}"
-RUN if [ "${BUILD_UTLX}" = "1" ] && [ "${GPU_ARCH}" != "gfx950-rocm1000" ]; then \
-        echo "[uTLX] BUILD_UTLX=1 is not supported for GPU_ARCH=${GPU_ARCH}"; \
-        exit 1; \
+RUN if [ "${BUILD_UTLX}" = "1" ]; then \
+        case "${GPU_ARCH}" in \
+          gfx950-rocm1000|gfx1250-rocm1000|gfx1250-rocm1010) ;; \
+          *) echo "[uTLX] BUILD_UTLX=1 is not supported for GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
+        esac; \
     fi
 
 # ROCm 7.2 Triton (BUILD_TRITON=1 stages only). Both wheels are the same
@@ -1253,8 +1255,10 @@ RUN if [ "$BUILD_TRITON" = "1" ] || [ "$BUILD_UTLX" = "1" ]; then \
                      commit -q -am "Revert $rev" || exit 1; \
                done \
             && if [ "${BUILD_UTLX}" = "1" ]; then \
-                 # ROCm/triton#983; uncommitted so the version keeps the hash torch pins.
-                 git cherry-pick --no-commit 89c3a46ba4908396313782443229eee3541a08f2 \
+                 # ROCm/triton#983, fetched because the gfx1250 flavors clone upstream
+                 # Triton; uncommitted so the version keeps the hash torch pins.
+                 git fetch -q https://github.com/ROCm/triton.git 89c3a46ba4908396313782443229eee3541a08f2 \
+                 && git cherry-pick --no-commit 89c3a46ba4908396313782443229eee3541a08f2 \
                  && export TRITON_EXT_ENABLED=ON; \
                fi \
             && pip install -r python/requirements.txt \
@@ -1276,11 +1280,11 @@ RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib
 
 # -----------------------
 # uTLX (standalone TLX) for sglang's TLX kernels, built with BUILD_UTLX=1 on
-# gfx950-rocm1000. The Triton step above builds its Triton from source in
-# /sgl-workspace/triton-custom with plugin support (TRITON_EXT_ENABLED=ON) and
-# ROCm/triton#983; this step builds the uTLX plugin against it, from
-# /sgl-workspace/triton-ext. Both stay in the image, with Triton's build tree
-# and LLVM, to rebuild in place.
+# gfx950-rocm1000, gfx1250-rocm1000 and gfx1250-rocm1010. The Triton step above
+# builds its Triton from source in /sgl-workspace/triton-custom with plugin
+# support (TRITON_EXT_ENABLED=ON) and ROCm/triton#983; this step builds the uTLX
+# plugin against it, from /sgl-workspace/triton-ext. Both stay in the image,
+# with Triton's build tree and LLVM, to rebuild in place.
 #
 # Triton release/3.8 does not install the C++ headers uTLX compiles against,
 # so then they come from the build tree, staged outside the source tree
@@ -1288,10 +1292,10 @@ RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib
 # tests are also copied to /sgl-workspace/utlx: triton-ext lists uTLX as
 # disabled, so its conftest.py skips them in the checkout.
 ARG UTLX_REPO="https://github.com/triton-lang/triton-ext.git"
-# triton-ext main at #183. With uTLX loaded, #177 keeps Gluon kernels (e.g.
-# aiter's) compiling, and #183 tl.cat and tensor-returning noinline functions
-# (e.g. MiniMax's sparse-attention indexer).
-ARG UTLX_COMMIT="268252bcc64e13b553b7906e5b69f02fa69054fb"
+# triton-ext main at #185. With uTLX loaded, #177 keeps Gluon kernels (e.g.
+# aiter's) compiling, #183 tl.cat and tensor-returning noinline functions
+# (e.g. MiniMax's sparse-attention indexer), and #185 builds against Triton 3.9.
+ARG UTLX_COMMIT="e02b02f56c2ae2d31fe59f73a133a131800e616b"
 RUN if [ "${BUILD_UTLX}" = "1" ]; then \
         echo "[uTLX] building ${UTLX_COMMIT} against /sgl-workspace/triton-custom"; \
         cd /sgl-workspace/triton-custom \
