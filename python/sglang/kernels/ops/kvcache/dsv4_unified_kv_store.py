@@ -17,7 +17,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
 )
 from sglang.srt.utils import is_gfx1250_supported
 
-# Only the gfx1250 SWA store takes a row-strided kv; elsewhere kv must be contiguous.
+# Callers may pass a row-strided kv only where this is set. TODO: try gfx950/gfx942.
 SWA_STORE_TAKES_ROW_STRIDE = is_gfx1250_supported()
 
 

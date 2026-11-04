@@ -54,7 +54,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx1250_supported
 
-_is_gfx1250_supported = is_gfx1250_supported()
+# Reuse the input as the gather buffer. TODO: try gfx950/gfx942.
+_REUSE_CP_INPUT = is_gfx1250_supported()
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -305,7 +306,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        if _is_gfx1250_supported:
+        if _REUSE_CP_INPUT:
             # Rows past each rank's logical length are never selected below.
             reuse_x = x.shape[0] >= physical_rank_len
         else:
@@ -315,7 +316,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if reuse_x and x.is_contiguous():
             padded_x = x[:physical_rank_len]
         else:
-            new_buf = x.new_empty if _is_gfx1250_supported else x.new_zeros
+            new_buf = x.new_empty if _REUSE_CP_INPUT else x.new_zeros
             padded_x = new_buf((physical_rank_len, *x.shape[1:]))
             padded_x[:local_logical_len] = x[:local_logical_len]
 
@@ -344,7 +345,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         gather_indices = (
             flat_indices % self.cp_size
         ) * physical_rank_len + flat_indices // self.cp_size
-        if _is_gfx1250_supported:
+        if _REUSE_CP_INPUT:
             metadata.gather_index = gather_indices
         return gathered.index_select(0, gather_indices)
 
