@@ -551,7 +551,7 @@ class TestPrepareServerArgs(CustomTestCase):
         handle_load_format(args)
 
     def test_eplb_recorder_mode_compatibility(self):
-        def args(mode):
+        def make_args(mode):
             return ServerArgs(
                 model_path="dummy",
                 tp_size=2,
@@ -567,10 +567,10 @@ class TestPrepareServerArgs(CustomTestCase):
                     ValueError, "needs --expert-distribution-recorder-mode stat"
                 ),
             ):
-                handle_eplb_and_dispatch(args(mode))
+                handle_eplb_and_dispatch(make_args(mode))
         for mode in (None, "stat", "stat_approx"):
             with self.subTest(mode=mode):
-                handle_eplb_and_dispatch(args(mode))
+                handle_eplb_and_dispatch(make_args(mode))
 
     def test_instanttensor_requires_cuda_device(self):
         for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
