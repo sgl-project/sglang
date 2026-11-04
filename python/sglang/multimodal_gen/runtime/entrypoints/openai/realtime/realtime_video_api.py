@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import msgspec.msgpack
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
@@ -145,6 +146,20 @@ def _first_error_line(error: Exception) -> str:
         if line.strip():
             return line
     return type(error).__name__
+
+
+def _rejected_input_message(prefix: str, error: Exception) -> str:
+    """Name what is wrong with a client message; other failures stay in the server log."""
+    if isinstance(error, ValidationError):
+        reason = "; ".join(
+            f"{'.'.join(map(str, item['loc']))}: {item['msg']}"
+            for item in error.errors()
+        )
+    elif isinstance(error, (ValueError, TypeError)):
+        reason = _first_error_line(error)
+    else:
+        return prefix
+    return f"{prefix}: {reason}"
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
@@ -379,7 +394,7 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
             event_kind = data.get("kind") if isinstance(data, dict) else None
             logger.warning("invalid event, kind=%s, error=%s", event_kind, e)
             async with session.output_lock:
-                await write_error_msg("invalid event", ws)
+                await write_error_msg(_rejected_input_message("invalid event", e), ws)
             continue
 
 
@@ -406,7 +421,9 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
                 session.id,
                 e,
             )
-            await write_error_msg("invalid generate request", ws)
+            await write_error_msg(
+                _rejected_input_message("invalid generate request", e), ws
+            )
             continue
 
 
