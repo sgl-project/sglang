@@ -15,7 +15,7 @@ from transformers import (
     Qwen3_5Config,
 )
 
-from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
