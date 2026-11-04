@@ -762,14 +762,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0
                 )
                 if use_quant_indexer:
-                    if not (
-                        16 <= self.index_page_size <= 1024
-                        and self.index_page_size % 16 == 0
-                    ):
-                        raise ValueError(
-                            "Packed NPU DSA requires index_page_size divisible by 16 "
-                            "in [16, 1024]"
-                        )
                     # One allocation per layer: [P*128 FP8 bytes][P FP32 scales].
                     index_shape = (
                         self.num_indexer_layers,
