@@ -1,7 +1,8 @@
-# MI355X GLM-5.2 (MXFP4) 2-node 1P1D disaggregation recipe — DP8 + narrow EP8.
+# MI355X GLM-5.1 (MXFP4) 2-node 1P1D disaggregation recipe — TP8 + MTP.
 #
-# DSA attention is auto-selected (see 1p1d.yaml). DP-attention 8 + within-node
-# EP8, same topology as the DeepSeek-V4 dp8ep8 leg.
+# GLM-5.1 ships a built-in NextN MTP head (num_nextn_predict_layers=1), same
+# mechanism as DeepSeek-V4 — no external draft checkpoint. DSA attention is
+# auto-selected (see 1p1d.yaml).
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
@@ -16,12 +17,12 @@ backend:
   sglang_config:
     prefill:
       tensor-parallel-size: 8
-      expert-parallel-size: 8
-      data-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
     decode:
       tensor-parallel-size: 8
-      expert-parallel-size: 8
-      data-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
 
 # Model-specific docker env + sglang server args (generic launcher path; keeps
 # GLM off the hardcoded DeepSeek-V4 parser branch in launch_mi355x.sh). DSA
@@ -39,7 +40,6 @@ model:
     - --disable-shared-experts-fusion
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260722
   # attention_backend intentionally unset: DSA is auto-selected for
   # GlmMoeDsaForCausalLM.
   # RoCE HCAs MORI uses for cross-node KV transfer.
@@ -50,10 +50,29 @@ runtime:
   decode_bootstrap_port: 9001
   lb_port: 8000
   mem_fraction_static: 0.90
+  # MTP captures three graphs where the non-MTP sibling captures one: target
+  # verify 6.53 GB, draft decode 7.71 GB, draft extend 1.76 GB. At the same
+  # 0.90 that leaves 11.46 GB free after init against the sibling's 25.07 GB.
+  # Concurrency 256 spends the rest, and the DSA metadata kernels, which Triton
+  # first loads onto the device mid-serving, have nothing left to load into.
+  # The module load fails as hipErrorLaunchOutOfResources and ROCr aborts the
+  # queues, killing the schedulers on TP2 and TP3. 0.85 returns about 10 GB on
+  # decode only; prefill and every other emitted value are unchanged.
+  wide_ep:
+    decode_mem_fraction_static: 0.85
   page_size: 256
   max_running_requests: 256
   chunked_prefill_size: 8192
   swa_full_tokens_ratio: 0.1
+
+# MTP / EAGLE speculative decoding (built-in NextN head from the base model).
+# Applied to both prefill and decode. No draft_model: the NextN head lives
+# in the base checkpoint.
+mtp:
+  enabled: true
+  num_steps: 3
+  eagle_topk: 1
+  num_draft_tokens: 4
 
 bench:
   # bench_serving --max-concurrency sweep; one result JSON per concurrency.

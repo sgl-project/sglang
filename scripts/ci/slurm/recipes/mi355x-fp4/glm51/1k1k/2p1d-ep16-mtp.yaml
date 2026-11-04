@@ -1,4 +1,4 @@
-# MI355X GLM-5.2 (MXFP4) 4-node 2P1D disaggregation recipe -- narrow-prefill EP8 + MTP
+# MI355X GLM-5.1 (MXFP4) 4-node 2P1D disaggregation recipe -- narrow-prefill EP8 + MTP
 # + wide-decode EP16 (mirrors the DSV4-Pro / Kimi Oren config: wide EP only helps decode).
 #
 # Two prefill engines (EP8, one node each) + one decode engine (EP16) spanning 2
@@ -35,7 +35,6 @@ model:
     - --disable-shared-experts-fusion
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260810
   # DSA attention auto-selected for GlmMoeDsaForCausalLM (no --attention-backend).
   ib_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
   moe_a2a_backend: mori
