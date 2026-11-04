@@ -154,6 +154,26 @@ class TestSingleRegionSWATransfer(CustomTestCase):
         self.assertEqual(manager.blocks, [(1192, 2448, 128)])
 
 
+class TestDcpKvGeometryMismatchMessage(CustomTestCase):
+    """A PD DCP geometry mismatch must name each side's KV layout, not only two
+    opaque item lengths."""
+
+    def test_dcp_geometry_mismatch_names_both_layouts(self):
+        manager = SimpleNamespace(
+            kv_args=SimpleNamespace(
+                page_size=64,
+                num_draft_entries=0,
+                kv_item_lens=[64 * 352],
+                kv_cache_dtype_str="nvfp4_ds_mla",
+            )
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            CommonKVManager.prepare_dcp_token_item_lens(manager, [64 * 576], 8)
+        message = str(ctx.exception)
+        self.assertIn("src 352 B/token, nvfp4_ds_mla", message)
+        self.assertIn("dst 576 B/token, fp8_e4m3 raw rows", message)
+
+
 class _RecordingAscendManager:
     def __init__(self):
         self.is_hybrid_mla_backend = True

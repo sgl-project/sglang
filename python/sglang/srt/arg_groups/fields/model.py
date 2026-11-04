@@ -210,7 +210,13 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"nvfp4_ds_mla" stores the DSA MLA cache as 352 B/token NVFP4 '
+                "records (E2M1 NoPE with E4M3 block-16 scales, E4M3 RoPE) with "
+                "E4M3 queries; it requires a DSA "
+                "model with the D576 latent, --dsa-prefill-backend and "
+                "--dsa-decode-backend prims_ts, and SM100/SM103. PD prefill and "
+                "decode servers must use the same value. Out-of-tree "
                 "platform plugins can register further values for KV cache formats "
                 "that only their KV pool implements; in-tree platforms reject them."
             ),

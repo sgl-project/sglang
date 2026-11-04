@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.common.utils import describe_mla_kv_token_bytes
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
@@ -666,12 +667,16 @@ class CommonKVManager(BaseKVManager):
             dst_page_scale = page_size * (
                 dst_dcp_size if is_draft_entry and not draft_rows_collapsed else 1
             )
-            if dst_item_len // dst_page_scale != src_token_lens[i]:
+            dst_token_len = dst_item_len // dst_page_scale
+            if dst_token_len != src_token_lens[i]:
                 raise RuntimeError(
                     "PD DCP source/destination KV geometry differs at entry "
-                    f"{i}: src token bytes={src_token_lens[i]}, "
-                    f"dst token bytes={dst_item_len // dst_page_scale} "
-                    f"(dst item_len={dst_item_len}, page scale={dst_page_scale})"
+                    f"{i}: src {describe_mla_kv_token_bytes(src_token_lens[i])} "
+                    f"(--kv-cache-dtype={self.kv_args.kv_cache_dtype_str}), dst "
+                    f"{describe_mla_kv_token_bytes(dst_token_len)} "
+                    f"(dst item_len={dst_item_len}, page scale={dst_page_scale}). "
+                    "Prefill and decode must use the same --kv-cache-dtype "
+                    "(nvfp4_ds_mla 352 B vs fp8_e4m3 576 B per token) and DSA backends."
                 )
         return src_token_lens
 

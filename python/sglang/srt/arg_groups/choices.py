@@ -80,6 +80,7 @@ BUILT_IN_KV_CACHE_DTYPES = (
     "bfloat16",
     "nvfp4",
     "fp4_mx_block16",
+    "nvfp4_ds_mla",
 )
 KV_CACHE_DTYPE_CHOICES = list(BUILT_IN_KV_CACHE_DTYPES)
 

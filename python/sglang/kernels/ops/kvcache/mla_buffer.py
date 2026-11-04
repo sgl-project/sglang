@@ -677,3 +677,198 @@ def get_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
     )
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 D576 sparse-MLA cache rows (FlashInfer Prims-TS "nvfp4.fp8rope")
+# ---------------------------------------------------------------------------
+# One 352-byte record per token (flashinfer-ai/flashinfer#7410):
+#   [0, 256)    512 NoPE values as E2M1, two per byte, even index in the low nibble
+#   [256, 320)  64 RoPE values as unscaled E4M3
+#   [320, 352)  32 E4M3 block scales (one per 16 NoPE values); block b sits at
+#               byte 320 + 8 * (b % 4) + b // 4
+# No global scale. Prims-TS expands value * scale to E4M3 in its loader before
+# the FP8 MMA, so a dequantized element is e4m3(e2m1 * scale).
+NVFP4_DS_MLA_ROW_BYTES = 352
+NVFP4_DS_MLA_NOPE_DIM = 512
+NVFP4_DS_MLA_ROPE_DIM = 64
+# E4M3 subnormal floor for a block scale.
+_NVFP4_MIN_BLOCK_SCALE = 2.0**-9
+
+
+@triton.jit
+def _e2m1_code(v):
+    """Round-to-nearest-even E2M1 code (sign in bit 3) of an fp32 tensor; |v| > 6 saturates."""
+    a = tl.abs(v)
+    c = (
+        (a > 0.25).to(tl.int32)
+        + (a >= 0.75).to(tl.int32)
+        + (a > 1.25).to(tl.int32)
+        + (a >= 1.75).to(tl.int32)
+        + (a > 2.5).to(tl.int32)
+        + (a >= 3.5).to(tl.int32)
+        + (a > 5.0).to(tl.int32)
+    )
+    return tl.where(v < 0, c | 8, c)
+
+
+@triton.jit
+def set_mla_kv_buffer_nvfp4_ds_mla_kernel(
+    kv_buffer_ptr,  # uint8 rows
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    reserved_skip_index,
+    buffer_stride,
+    nope_stride,
+    rope_stride,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    pid = tl.program_id(0)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
+    loc = tl.load(loc_ptr + pid).to(tl.int64)
+    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
+    if is_valid:
+        dst = kv_buffer_ptr + (loc // DCP_WORLD_SIZE) * buffer_stride
+        src = cache_k_nope_ptr + pid.to(tl.int64) * nope_stride
+        # [32 blocks, 8 byte pairs]: block b, pair j holds elements 16b+2j, 16b+2j+1
+        blk = tl.arange(0, 32)[:, None]
+        pair = tl.arange(0, 8)[None, :]
+        offs = blk * 16 + 2 * pair
+        x_even = tl.load(src + offs).to(tl.float32)
+        x_odd = tl.load(src + offs + 1).to(tl.float32)
+        amax = tl.max(tl.maximum(tl.abs(x_even), tl.abs(x_odd)), axis=1)
+        # div_rn: Triton's "/" is approximate; the torch reference rounds.
+        six = tl.full(amax.shape, 6.0, tl.float32)
+        scale_e4m3 = tl.maximum(tl.math.div_rn(amax, six), 0.001953125).to(
+            tl.float8e4nv
+        )
+        scale = scale_e4m3.to(tl.float32)[:, None]
+        code_even = _e2m1_code(tl.math.div_rn(x_even, scale))
+        code_odd = _e2m1_code(tl.math.div_rn(x_odd, scale))
+        tl.store(dst + blk * 8 + pair, (code_even | (code_odd << 4)).to(tl.uint8))
+        b = tl.arange(0, 32)
+        tl.store(
+            dst + 320 + 8 * (b % 4) + b // 4,
+            scale_e4m3.to(tl.uint8, bitcast=True),
+        )
+        r = tl.arange(0, 64)
+        rope = tl.load(cache_k_rope_ptr + pid.to(tl.int64) * rope_stride + r)
+        tl.store(
+            dst + 256 + r,
+            rope.to(tl.float32).to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+        )
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def set_mla_kv_buffer_nvfp4_ds_mla_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    dcp_rank: int,
+    reserved_skip_index: int = 0,
+):
+    """Quantize BF16 (or E4M3) [T, 512] NoPE + [T, 64] RoPE rows to the 352 B
+    NVFP4 D576 record and scatter them, with the same skip-slot and DCP owner
+    rule as ``set_mla_kv_buffer_kernel`` (row ``loc // dcp_world_size`` on the
+    rank with ``loc % dcp_world_size == dcp_rank``)."""
+    rows = kv_buffer.view(torch.uint8).view(kv_buffer.shape[0], -1)
+    assert rows.shape[1] == NVFP4_DS_MLA_ROW_BYTES and rows.stride(1) == 1
+    nope = cache_k_nope.reshape(cache_k_nope.shape[0], -1)
+    rope = cache_k_rope.reshape(cache_k_rope.shape[0], -1)
+    assert nope.shape[1] == NVFP4_DS_MLA_NOPE_DIM and nope.stride(1) == 1
+    assert rope.shape[1] == NVFP4_DS_MLA_ROPE_DIM and rope.stride(1) == 1
+    n_loc = loc.numel()
+    if n_loc == 0:
+        return
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    set_mla_kv_buffer_nvfp4_ds_mla_kernel[(n_loc,)](
+        rows,
+        nope,
+        rope,
+        loc,
+        reserved_skip_index,
+        rows.stride(0),
+        nope.stride(0),
+        rope.stride(0),
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
+        num_warps=1,
+        **pdl_kwargs,
+    )
+
+
+def _e2m1_lut(device) -> torch.Tensor:
+    return torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device=device
+    )
+
+
+def _e2m1_codes_ref(v: torch.Tensor) -> torch.Tensor:
+    a = v.abs()
+    code = (
+        (a > 0.25).int()
+        + (a >= 0.75).int()
+        + (a > 1.25).int()
+        + (a >= 1.75).int()
+        + (a > 2.5).int()
+        + (a >= 3.5).int()
+        + (a > 5.0).int()
+    )
+    return torch.where(v < 0, code | 8, code)
+
+
+def quantize_nvfp4_ds_mla_reference(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> torch.Tensor:
+    """Torch reference of ``set_mla_kv_buffer_nvfp4_ds_mla_kernel``: [T, 352] uint8."""
+    x = k_nope.reshape(-1, 32, 16).float()
+    t = x.shape[0]
+    amax = x.abs().amax(-1)
+    scale_e4m3 = (amax / 6.0).clamp_min(_NVFP4_MIN_BLOCK_SCALE).to(torch.float8_e4m3fn)
+    v = x / scale_e4m3.float()[..., None]
+    code = _e2m1_codes_ref(v).reshape(t, 256, 2)
+    out = torch.empty(t, NVFP4_DS_MLA_ROW_BYTES, dtype=torch.uint8, device=x.device)
+    out[:, :256] = (code[..., 0] | (code[..., 1] << 4)).to(torch.uint8)
+    out[:, 256:320] = (
+        k_rope.reshape(t, 64).float().to(torch.float8_e4m3fn).view(torch.uint8)
+    )
+    out[:, 320:] = (
+        scale_e4m3.view(torch.uint8).unflatten(-1, (8, 4)).transpose(-1, -2).flatten(-2)
+    )
+    return out
+
+
+def dequantize_nvfp4_ds_mla(
+    rows: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[T, 352] uint8 records -> ([T, 512], [T, 64]) as the Prims-TS loader sees
+    them: NoPE is e4m3(e2m1 * block scale), RoPE is the stored E4M3."""
+    rows = rows.reshape(-1, NVFP4_DS_MLA_ROW_BYTES)
+    t = rows.shape[0]
+    packed = rows[:, :256]
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(t, 32, 16)
+    vals = _e2m1_lut(rows.device)[(codes & 7).long()]
+    vals = torch.where((codes & 8) != 0, -vals, vals)
+    scales = (
+        rows[:, 320:]
+        .reshape(t, 4, 8)
+        .transpose(-1, -2)
+        .reshape(t, 32)
+        .contiguous()
+        .view(torch.float8_e4m3fn)
+        .float()
+    )
+    nope = (vals * scales[..., None]).reshape(t, 512).clamp(-448, 448)
+    nope = nope.to(torch.float8_e4m3fn).to(dtype)
+    rope = rows[:, 256:320].contiguous().view(torch.float8_e4m3fn).to(dtype)
+    return nope, rope

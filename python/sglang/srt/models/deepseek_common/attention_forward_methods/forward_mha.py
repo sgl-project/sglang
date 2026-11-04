@@ -19,6 +19,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.mem_cache.kv_cache_dtype import is_fp8_family_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -257,7 +258,7 @@ class DeepseekMHAForwardMixin:
         ):
             if (
                 self.use_dsa
-                and self.kv_cache_dtype == "fp8_e4m3"
+                and is_fp8_family_kv_cache_dtype(self.kv_cache_dtype)
                 and (
                     not uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
                     or not uses_raw_fp8_dsa_kv_layout(

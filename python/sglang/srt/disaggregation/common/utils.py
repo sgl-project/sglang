@@ -135,6 +135,21 @@ class AuxDataCodec:
         return
 
 
+# Bytes per token per layer of the D576 DSA MLA KV row layouts, so a PD
+# item-length mismatch can name the --kv-cache-dtype each side most likely uses.
+_D576_MLA_TOKEN_LAYOUTS = {
+    352: "nvfp4_ds_mla (prims_ts)",
+    576: "fp8_e4m3 raw rows (trtllm / prims_ts)",
+    656: "fp8_e4m3 fp8_ds_mla rows (flashmla_kv)",
+    1152: "bfloat16",
+}
+
+
+def describe_mla_kv_token_bytes(token_bytes: int) -> str:
+    layout = _D576_MLA_TOKEN_LAYOUTS.get(token_bytes, "no known D576 layout")
+    return f"{token_bytes} B/token, {layout}"
+
+
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
 ) -> Tuple[List[npt.NDArray[np.int32]], List[npt.NDArray[np.int32]]]:

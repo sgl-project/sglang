@@ -5,7 +5,10 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    dequantize_nvfp4_ds_mla,
+    quantize_nvfp4_ds_mla_reference,
     set_mla_kv_buffer_naive,
+    set_mla_kv_buffer_nvfp4_ds_mla_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -391,6 +394,104 @@ def test_set_mla_kv_buffer_naive_matches_triton(rope_dim):
     )
 
     torch.testing.assert_close(from_naive, reference, rtol=0.0, atol=0.0)
+
+
+CUDA_FP8_ONLY = pytest.mark.skipif(
+    torch.version.hip is not None
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() < (8, 9),
+    reason="The nvfp4_ds_mla writer converts to E4M3 (CUDA SM89+)",
+)
+NVFP4_ROW_BYTES = 352
+_SENTINEL = 0xAB
+
+
+def _nvfp4_latents(n: int, dtype: torch.dtype):
+    """Heavy-tailed latents (per-channel gains, outlier channels), plus an
+    all-zero token and a token below the 2^-9 block-scale floor."""
+    gen = torch.Generator(device=DEVICE).manual_seed(0)
+    gains = torch.exp(torch.randn(512, device=DEVICE, generator=gen) * 0.7)
+    gains[torch.randperm(512, device=DEVICE, generator=gen)[:3]] *= 12
+    # Inside the E4M3 range, so an E4M3 input holds no NaN.
+    nope = (torch.randn(n, 512, device=DEVICE, generator=gen) * gains).clamp(-440, 440)
+    nope[0] = 0
+    nope[1] *= 1e-5
+    rope = torch.randn(n, 64, device=DEVICE, generator=gen) * 3
+    return nope.to(dtype).unsqueeze(1), rope.to(dtype).unsqueeze(1)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dcp_world_size,dcp_rank", [(1, 0), (8, 3)])
+@CUDA_FP8_ONLY
+def test_nvfp4_ds_mla_writer_matches_reference(input_dtype, dcp_world_size, dcp_rank):
+    """Bytes equal the torch reference quantizer, with the
+    raw-FP8 writer's skip slot and DCP owner rule: only loc % W == rank writes,
+    at row loc // W; slot 0 never writes."""
+    n, rows_per_rank = 2048, 4096
+    nope, rope = _nvfp4_latents(n, input_dtype)
+    loc = torch.randperm(rows_per_rank * dcp_world_size, device=DEVICE)[:n]
+    loc[5] = 0
+    kv_buffer = torch.full(
+        (rows_per_rank, 1, NVFP4_ROW_BYTES), _SENTINEL, dtype=torch.uint8, device=DEVICE
+    )
+    set_mla_kv_buffer_nvfp4_ds_mla_triton(
+        kv_buffer,
+        loc,
+        nope,
+        rope,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+    )
+    expected = torch.full_like(kv_buffer.view(rows_per_rank, -1), _SENTINEL)
+    owned = (loc != 0) & (loc % dcp_world_size == dcp_rank)
+    ref = quantize_nvfp4_ds_mla_reference(nope.squeeze(1), rope.squeeze(1))
+    expected[loc[owned] // dcp_world_size] = ref[owned]
+    assert torch.equal(kv_buffer.view(rows_per_rank, -1), expected)
+
+
+@CUDA_FP8_ONLY
+def test_nvfp4_ds_mla_round_trip_and_byte_layout():
+    """Values on the E2M1 grid times a power-of-two block scale, with |6 * scale|
+    present in each block, survive write + dequantize exactly. The byte
+    positions follow the FlashInfer nvfp4.fp8rope spec:
+    even element in the low nibble, block b's scale at 320 + 8*(b%4) + b//4."""
+    n = 64
+    gen = torch.Generator(device=DEVICE).manual_seed(1)
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=DEVICE)
+    codes = torch.randint(0, 8, (n, 32, 16), device=DEVICE, generator=gen)
+    codes[..., 3] = 7
+    sign = torch.where(
+        torch.rand(n, 32, 16, device=DEVICE, generator=gen) < 0.5, -1.0, 1.0
+    )
+    exps = torch.randint(-6, 4, (n, 32, 1), device=DEVICE, generator=gen)
+    scale = torch.pow(2.0, exps.float())
+    nope = (grid[codes] * sign * scale).reshape(n, 512)
+    rope = (torch.randn(n, 64, device=DEVICE, generator=gen) * 4).to(
+        torch.float8_e4m3fn
+    )
+    kv_buffer = torch.zeros((n, 1, NVFP4_ROW_BYTES), dtype=torch.uint8, device=DEVICE)
+    loc = torch.arange(n, device=DEVICE)
+    set_mla_kv_buffer_nvfp4_ds_mla_triton(
+        kv_buffer,
+        loc,
+        nope.to(torch.bfloat16).unsqueeze(1),
+        rope.unsqueeze(1),
+        dcp_world_size=1,
+        dcp_rank=0,
+        reserved_skip_index=-1,
+    )
+    rows = kv_buffer.view(n, -1)
+    out_nope, out_rope = dequantize_nvfp4_ds_mla(rows, torch.float32)
+    assert torch.equal(out_nope, nope)
+    assert torch.equal(out_rope, rope.float())
+
+    scale_bits = scale.squeeze(-1).to(torch.float8_e4m3fn).view(torch.uint8)
+    for b in range(32):
+        assert torch.equal(rows[:, 320 + 8 * (b % 4) + b // 4], scale_bits[:, b])
+    # -0.0 is stored as code 0, not as a negative zero.
+    signed = torch.where((sign < 0) & (codes != 0), codes | 8, codes).reshape(n, 512)
+    assert torch.equal((rows[:, :256] & 15).long(), signed[:, 0::2])
+    assert torch.equal((rows[:, :256] >> 4).long(), signed[:, 1::2])
 
 
 @CUDA_TMA_ONLY

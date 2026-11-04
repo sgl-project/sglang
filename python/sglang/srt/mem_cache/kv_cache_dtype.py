@@ -35,6 +35,36 @@ _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
 }
 
 
+def is_fp8_family_kv_cache_dtype(kv_cache_dtype: Optional[str]) -> bool:
+    """--kv-cache-dtype values that resolve to E4M3 KV elements and E4M3 queries."""
+    return kv_cache_dtype in ("fp8_e4m3", "nvfp4_ds_mla")
+
+
+def uses_nvfp4_ds_mla_kv(*, hf_config, kv_cache_dtype: Optional[str] = None) -> bool:
+    """Whether this model's DSA MLA pool stores nvfp4_ds_mla records.
+
+    The one source of truth for the pool row width, the pool writer and the DSA
+    backend's Prims-TS cache format; startup validation guarantees prims_ts on
+    every local DSA phase when it holds. ``kv_cache_dtype`` is the runner's KV
+    label (a KV pool configurator passes its own); None reads --kv-cache-dtype.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if kv_cache_dtype is None:
+        from sglang.srt.runtime_context import get_model
+
+        kv_cache_dtype = get_model().kv_cache_dtype
+    return kv_cache_dtype == "nvfp4_ds_mla" and is_deepseek_dsa(hf_config)
+
+
+def _is_dsa_config(hf_config) -> bool:
+    if hf_config is None:
+        return False
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    return is_deepseek_dsa(hf_config)
+
+
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
@@ -44,11 +74,20 @@ def configure_kv_cache_dtype(
     is_dflash: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
+    hf_config=None,
 ) -> tuple[str, torch.dtype]:
     """(label, torch dtype) of a runner's KV cache; a pool in the compute
     dtype is labelled "auto", which backends gate FP8 casts and descales on."""
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
+    if (
+        is_draft_worker
+        and server_args_kv_cache_dtype == "nvfp4_ds_mla"
+        and not _is_dsa_config(hf_config)
+    ):
+        # Only a DSA draft shares the target's prims_ts reader; any other draft
+        # (or one whose config the caller does not pass) keeps raw FP8.
+        server_args_kv_cache_dtype = "fp8_e4m3"
     kv_cache_dtype_str = server_args_kv_cache_dtype
     if server_args_kv_cache_dtype == "auto":
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -67,6 +106,10 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e5m2
+    elif server_args_kv_cache_dtype == "nvfp4_ds_mla":
+        if _is_hip or current_platform.is_cpu():
+            raise ValueError("--kv-cache-dtype nvfp4_ds_mla requires CUDA.")
+        kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype == "fp8_e4m3":
         if _is_hip:  # Using natively supported format
             kv_cache_dtype = fp8_dtype

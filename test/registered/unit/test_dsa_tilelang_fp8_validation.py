@@ -140,6 +140,37 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
             qk_rope_head_dim=64,
         )
 
+    @patch("torch.cuda.get_device_capability", return_value=(10, 3))
+    def test_nvfp4_ds_mla_needs_prims_ts_on_both_phases(self, _capability):
+        # One pool serves both phases, and only Prims-TS reads the 352 B records.
+        _check_tilelang_dsa_fp8_kv(
+            "nvfp4_ds_mla",
+            "prims_ts",
+            "prims_ts",
+            hip=False,
+            dcp_size=8,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        with self.assertRaisesRegex(ValueError, "prims_ts"):
+            _check_tilelang_dsa_fp8_kv(
+                "nvfp4_ds_mla",
+                "prims_ts",
+                "trtllm",
+                hip=False,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+            )
+        with self.assertRaisesRegex(ValueError, "CUDA"):
+            _check_tilelang_dsa_fp8_kv(
+                "nvfp4_ds_mla",
+                "prims_ts",
+                "prims_ts",
+                hip=True,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+            )
+
     def test_cuda_fp8_non_tilelang_allowed(self):
         # fp8-capable backends must pass
         _check_tilelang_dsa_fp8_kv(

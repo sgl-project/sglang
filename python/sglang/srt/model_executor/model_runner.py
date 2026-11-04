@@ -1679,6 +1679,9 @@ class ModelRunner:
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+                hf_config=getattr(
+                    getattr(self, "model_config", None), "hf_config", None
+                ),
             )
         )
 
