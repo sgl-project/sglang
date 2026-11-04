@@ -18,6 +18,7 @@ for name in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.flash_mla",
+    "sgl_kernel_npu.attention.paged_mtp_attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",

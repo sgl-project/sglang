@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch_npu
 from sgl_kernel_npu.attention.flash_mla import flash_mla, flash_mla_metadata
+from sgl_kernel_npu.attention.paged_mtp_attention import (
+    paged_mtp_attention_decode,
+)
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
@@ -1331,10 +1334,6 @@ class AscendAttnBackend(AttentionBackend):
             )
 
     def _forward_paged_mtp(self, q, layer, forward_batch, sinks):
-        from sgl_kernel_npu.attention.paged_mtp_attention import (
-            paged_mtp_attention_decode,
-        )
-
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         padded_tokens = query.shape[0]
         if not self.graph_mode:

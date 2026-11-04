@@ -3,7 +3,6 @@
 import __future__
 
 import ast
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -193,12 +192,8 @@ def test_forward_uses_device_lengths_without_host_attention_and_restores_dp_padd
         else mod.AttentionType.ENCODER_ONLY,
     )
     kernel = Mock(side_effect=lambda **kw: torch.ones_like(kw["query"]))
-    module_name = "sgl_kernel_npu.attention.paged_mtp_attention"
     with (
-        patch.dict(
-            sys.modules,
-            {module_name: SimpleNamespace(paged_mtp_attention_decode=kernel)},
-        ),
+        patch.object(mod, "paged_mtp_attention_decode", kernel),
         patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")),
         patch.object(
             torch.Tensor, "item", side_effect=AssertionError("unexpected scalar sync")
