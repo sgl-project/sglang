@@ -114,6 +114,9 @@ def _verify_commit_outputs_kernel(
     ids,
     DRAFT_WIDTH: tl.constexpr,
     TRACK_INTERVAL: tl.constexpr,
+    relay_seq_lens,
+    relay_rows,
+    WITH_RELAY: tl.constexpr,
 ):
     row = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     valid = row < BS
@@ -153,6 +156,9 @@ def _verify_commit_outputs_kernel(
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
     tl.store(new_seq_lens + row, length + accepted, valid)
     tl.store(bonus + row, token, valid)
+    if WITH_RELAY:
+        slot = tl.load(relay_rows + row, valid, other=0).to(tl.int64)
+        tl.store(relay_seq_lens + slot, length + accepted, valid)
 
 
 def prepare_verify_commit_outputs(
@@ -162,7 +168,10 @@ def prepare_verify_commit_outputs(
     seq_lens,
     num_draft_tokens=0,
     mamba_track_interval=0,
+    relay=None,
 ):
+    """relay: (buffer, rows): also write each request's new length to buffer[row]
+    (the overlap scheduler's relay of the lengths)."""
     bs = accept_lens.numel()
     new_seq_lens = torch.empty(
         (bs,),
@@ -202,6 +211,9 @@ def prepare_verify_commit_outputs(
             ids=ids,
             DRAFT_WIDTH=num_draft_tokens,
             TRACK_INTERVAL=mamba_track_interval,
+            relay_seq_lens=new_seq_lens if relay is None else relay[0],
+            relay_rows=new_seq_lens if relay is None else relay[1],
+            WITH_RELAY=relay is not None,
         )
     if num_draft_tokens:
         return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
@@ -378,8 +390,20 @@ def _build_chain_tree_kernel(
     TABLE_COL: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     WRITE_MROPE: tl.constexpr,
+    prefix_lens,
+    extend_lens,
+    post_lens,
+    start_locs,
+    WRITE_EXTEND_LAYOUT: tl.constexpr,
 ):
     offset = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    if WRITE_EXTEND_LAYOUT:
+        # the draft extend's lengths over the same window (prepare_draft_extend_layout)
+        base = tl.load(seq + offset * SEQ_STRIDE, offset < BS, other=0).to(tl.int64)
+        tl.store(prefix_lens + offset, base, offset < BS)
+        tl.store(extend_lens + offset, WIDTH, offset < BS)
+        tl.store(post_lens + offset, base + WIDTH, offset < BS)
+        tl.store(start_locs + offset, offset * WIDTH, offset < BS)
     row = offset // WIDTH
     col = offset % WIDTH
     valid = offset < BS * WIDTH
@@ -417,7 +441,11 @@ def build_chain_tree(
     req_pool_indices=None,
     req_to_token=None,
     with_mrope=False,
+    with_extend_layout=False,
 ):
+    """The verify tree of top-1 chains in one launch. with_extend_layout: one more
+    output, the draft extend's layout over the same window, as
+    prepare_draft_extend_layout returns it."""
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
@@ -442,6 +470,15 @@ def build_chain_tree(
     )
     if req_to_token is not None:
         assert req_pool_indices is not None and req_pool_indices.numel() == bs
+    layout = None
+    if with_extend_layout:
+        prefix = torch.empty((bs,), dtype=torch.int32, device=seq_lens.device)
+        layout = (
+            prefix,
+            torch.empty_like(prefix),
+            torch.empty((bs,), dtype=seq_lens.dtype, device=seq_lens.device),
+            (positions, torch.empty_like(prefix), mrope),
+        )
     if bs:
         _build_chain_tree_kernel[(triton.cdiv(bs * width * width, 128),)](
             bonus_tokens,
@@ -469,8 +506,13 @@ def build_chain_tree(
             TABLE_COL=req_to_token.stride(1) if req_to_token is not None else 0,
             WRITE_CACHE=req_to_token is not None,
             WRITE_MROPE=with_mrope,
+            prefix_lens=positions if layout is None else layout[0],
+            extend_lens=positions if layout is None else layout[1],
+            post_lens=positions if layout is None else layout[2],
+            start_locs=positions if layout is None else layout[3][1],
+            WRITE_EXTEND_LAYOUT=with_extend_layout,
         )
-    return (
+    outputs = (
         mask,
         positions,
         retrieve[0],
@@ -480,3 +522,4 @@ def build_chain_tree(
         out_cache_loc,
         mrope,
     )
+    return outputs + (layout,) if with_extend_layout else outputs

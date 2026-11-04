@@ -6,7 +6,12 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
@@ -19,6 +24,7 @@ _TRITON_KERNELS = [
     ("dflash", "compute_dflash_correct_drafts_and_bonus"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
+    ("chain_verify", "greedy_chain_verify"),
     ("gather_spec_extras", "gather_spec_extras"),
     ("multi_layer_eagle", "rotate_input_ids"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
@@ -51,7 +57,7 @@ register_kernel(
         op="speculative.simulated_accept",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
-        capabilities=CUDA_ONLY,
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
 
