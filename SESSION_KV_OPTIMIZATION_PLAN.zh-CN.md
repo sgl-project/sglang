@@ -336,13 +336,17 @@ RL 分别覆盖 ready 队列充足、ready 队列不足、同步批次接近完�
 | O2 | `f5640888af`：按实际 worker/epoch/兼容布局/backend namespace/大小分组的准备成本分位、有限提前量、早到推进 | 成本包含控制与发布耗时，未单列负载档或学习预测概率；缺少样本时回退既有斜率 |
 | O3a | `d4bade6739`：host-only 叶节点/合法后缀保存后定向回收；`0265dcc4b4`：真实 GPU/Mooncake K/V 逐元素恢复证明 | GPU 驻留重复副本、共享祖先、PIN 和在途引用继续阻止回收；不扩大 GPU 驱逐范围 |
 | O4 | `8897e68356`：准备后一次有限 L2 PIN 子操作，有界保守预算、未知结果保留、共享兴趣清理 | 默认关闭；Router 重叠范围可能重复预留，Engine 仍按物理范围审批；未新增自动 L3 候选排序，已有显式 backend soft-pin 继续使用原 owner |
-| O5 | `7e7962ffa0`：每次新生命周期使用新 wire 身份，避免重放旧 COMPLETED；`92e45056e6`：最小冷层驻留窗口；`e35f78493b`：新鲜准备观测复用 | 不将历史完成视为当前驻留，不提前释放消费中的保护；同 salt 和 GPU FIFO 安全约束保留 |
-| O7 | `534f71fd20`、`57c87c2f60`、`ae25af0c99`：固定工作量三组重放、异步控制收尾、完整前缀恢复、可选轮内不可变源复用及离线核验 | 模拟 rollout；未接入真实 trainer，训练等待为 unknown；L3 竞争实验保留逐组发布 |
+| O5 | `7e7962ffa0`：新 wire episode；`92e45056e6`：最小冷层驻留；`e35f78493b`：新鲜观测复用；`d44946b5de`：终态回执复用；`5a683b6667`、`61284379d0`：协商只读批量观察 | 保留当前 scope/claim、epoch 和反馈水位验证；旧 Engine 回退单查询；同 salt 和 GPU FIFO 安全约束保留 |
+| O7 | `534f71fd20`、`57c87c2f60`、`ae25af0c99`：固定重放及不可变源复用；`26516932c9`：成本/资源复算；`bbecfd0a23`、`394ef5b481`：尚无回执与显式零命中计量 | 模拟 rollout；未接入真实 trainer，训练等待为 unknown；L3 竞争实验保留逐组发布；原工具异常证据不改写 |
 | 工程检查 | `43aa45efaa`：精确 Rust 1.92.0 core 全目标 Clippy 与测试通过 | 不代替完整上游 CI 或未测试硬件/缓存模式的兼容性证明 |
 
 可用配置以代码和对应 README 为准：Engine `cache_limits` 新增 `max_storage_read_inflight_tokens`、`max_speculative_storage_read_tokens`、`demand_host_reserve_tokens`、`storage_demand_priority`，默认均不启用限制/优先策略。前三项按 page 对齐的 anchor tokens 计量，不可填入 byte 数；当前 FULL pool 的 `native_host_bytes_per_token` 用于解释对应 payload 大小。已分配空间与未分配预留分开计数，取消后的预留等到物理 drain 才释放。
 
 Router 新增可选 `preparation_policy`。省略该字段保留旧时机策略；设置后使用有界分组统计，`ready_pin_ttl_ms=0` 默认不申请自动保护。`auto_pin_max_tokens` 是该 Router 的保守保护预留上限，不能替代 Engine 的物理去重审批。`min_cold_residency_ms` 约束生命周期 host DEMOTE，显式三动作调用仍遵循原语义。O3b、O6、O1b 及完整未消费准备账本均未实现，是否扩展由压力证据决定。
+
+只读 `read_batch` 版本 1.0 在单个 Engine owner turn 内按序执行最多八个既有查询，客户端必须先协商能力。`Events` 可推进 owner 状态，批量回复仍按原反馈 ticket、epoch 和水位验证；日志分页未追上或批内发生失效时撤销 readiness 并重新查询。该接口没有合并三动作，也不承诺全局原子快照。
+
+压力筛选另发现预计恢复窗口会被 Router 排队及 worker 发现耗时延长，出现请求已开始恢复后再发 speculative GET 的情况。修复方向是在 Router 入口冻结本地绝对窗口，按存活兴趣合并时限，过期且未尝试的准备安全退回；已尝试动作继续原 wire 身份收尾。该项尚在实现与回归，不代表已取得正式性能收益。普通恢复发布后至 GPU 准入的保留窗口也需继续观察；暂不扩大 GPU 或重复 host 副本的驱逐范围。
 
 ## 11. 正确性矩阵、复现入口与交付物
 
