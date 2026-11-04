@@ -136,10 +136,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                     self.first_routed_layer_id = routed_layer_ids[0]
                     self.gather_layer_id = routed_layer_ids[-1]
                     self.local_cache = BaseDeviceCache(
-                        max_batch_size // parallel.attn_tp_size,
-                        num_layers,
-                        self.device_topk_size,
-                        device,
+                        max_batch_size=max_batch_size // parallel.attn_tp_size,
+                        num_layers=num_layers,
+                        topk_size=self.device_topk_size,
+                        device=device,
                         name="routed_experts_local",
                     )
                     if self.device_cache is None:
