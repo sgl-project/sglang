@@ -136,6 +136,16 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
             fb.prefix_chunk_seq_lens.sum(dim=1).tolist(),
         )
 
+    def test_hip_keeps_request_major_when_packing_saves_no_chunk(self):
+        # Equal prefixes need 4 chunks either way; packing would only add keyless
+        # rows, which keep aiter off its fp8 PS prefill.
+        prefix_lens, capacity = [64, 64, 64], 48
+        with mock.patch.object(mix, "_is_hip", True):
+            fb = _prepare(prefix_lens, capacity)
+        self.assertEqual(fb.num_prefix_chunks, 4)
+        self.assertEqual(fb.prefix_chunk_len, capacity // len(prefix_lens))
+        self.assertFalse(any(fb.prefix_chunk_has_zero_kv))
+
 
 if __name__ == "__main__":
     unittest.main()

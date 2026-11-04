@@ -8,7 +8,8 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import get_device, is_hip
 from sglang.test.test_utils import CustomTestCase
 
-# HIP checks the "rocm" tables, the packed layout of forward_batch_deepseek_mha_rocm.py.
+# HIP checks the "rocm" tables, the packed layout of forward_batch_deepseek_mha_rocm.py,
+# where packing saves chunks; the others keep the request-major layout.
 TEST_CASES = [
     # Sequence with same prefix lens
     {
@@ -35,28 +36,6 @@ TEST_CASES = [
             ],
             dtype=torch.int32,
         ),
-        "rocm": {
-            "prefix_chunk_len": 48,
-            "num_prefix_chunks": 4,
-            "prefix_chunk_starts": torch.tensor(
-                [
-                    [0, 0, 0],
-                    [48, 0, 0],
-                    [64, 32, 0],
-                    [64, 64, 16],
-                ],
-                dtype=torch.int32,
-            ),
-            "prefix_chunk_seq_lens": torch.tensor(
-                [
-                    [48, 0, 0],
-                    [16, 32, 0],
-                    [0, 32, 16],
-                    [0, 0, 48],
-                ],
-                dtype=torch.int32,
-            ),
-        },
     },
     # Sequence with different prefix lens
     {
@@ -295,7 +274,7 @@ class TestPrefixChunkInfo(CustomTestCase):
             set_forward_context(ForwardContext(attn_backend=mock_backend))
 
             forward_batch.prepare_chunked_prefix_cache_info(self.device)
-            expected = test_case["rocm"] if is_hip() else test_case
+            expected = test_case.get("rocm", test_case) if is_hip() else test_case
             assert forward_batch.get_max_chunk_capacity() == max_chunk_capacity
             assert forward_batch.prefix_chunk_len == expected["prefix_chunk_len"]
             assert forward_batch.num_prefix_chunks == expected["num_prefix_chunks"]

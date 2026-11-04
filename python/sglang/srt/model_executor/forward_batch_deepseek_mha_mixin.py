@@ -33,7 +33,8 @@ class ForwardBatchDeepSeekMHAMixin:
     num_prefix_chunks: Optional[int] = None
     # Index of current chunk, used by attention backend
     prefix_chunk_idx: Optional[int] = None
-    # Maximum number of tokens in each chunk per sequence. Computed from maximum chunk capacity
+    # Maximum number of tokens in each chunk per sequence. Computed from maximum chunk capacity.
+    # The ROCm packed layout sets it to the whole chunk capacity instead.
     prefix_chunk_len: Optional[int] = None
     # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
     prefix_chunk_starts: Optional[torch.Tensor] = None
@@ -220,13 +221,17 @@ class ForwardBatchDeepSeekMHAMixin:
         ) // self.prefix_chunk_len
         compute_prefix_chunk_seq_lens = self.get_prefix_chunk_seq_lens
         if _is_hip and not single_chunk:
-            # ROCm lays all prefixes end to end and fills each chunk to capacity.
-            self.prefix_chunk_len = chunk_capacity
-            self.num_prefix_chunks = get_num_packed_prefix_chunks(
+            # ROCm may lay all prefixes end to end and fill each chunk to capacity.
+            num_packed_prefix_chunks = get_num_packed_prefix_chunks(
                 prefix_lens_cpu=self.extend_prefix_lens_cpu,
                 chunk_capacity=chunk_capacity,
             )
-            compute_prefix_chunk_seq_lens = get_packed_prefix_chunk_seq_lens
+            # Packing leaves keyless rows, which keep aiter off its fp8 PS prefill;
+            # take it only when it saves chunks.
+            if num_packed_prefix_chunks < self.num_prefix_chunks:
+                self.prefix_chunk_len = chunk_capacity
+                self.num_prefix_chunks = num_packed_prefix_chunks
+                compute_prefix_chunk_seq_lens = get_packed_prefix_chunk_seq_lens
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
