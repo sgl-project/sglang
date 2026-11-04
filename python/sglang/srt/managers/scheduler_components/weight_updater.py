@@ -16,7 +16,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,

@@ -26,7 +26,7 @@ register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-
 register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
-    not is_deep_select_supported(), reason="requires CUDA SM90, SM100, or SM103"
+    not is_deep_select_supported(), reason="requires CUDA SM90, SM100, SM103, or SM107"
 )
 
 DEFAULT_IDX_FILL = 2147483647
