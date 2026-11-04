@@ -1125,7 +1125,8 @@ def _fall_back_xpu_draft_attention_for_head_size(server_args: ServerArgs) -> Non
         or attention_backends_of(resolved_view(server_args))[0] != "intel_xpu"
     ):
         return
-    from sglang.srt.utils.hf_transformers_utils import get_config, get_hf_text_config
+    from sglang.srt.utils.hf_transformers.common import get_hf_text_config
+    from sglang.srt.utils.hf_transformers.config import get_config
 
     # Composite configs (e.g. Qwen3_5Config) keep the attention dims in a text sub-config.
     draft_hf_config = get_hf_text_config(
