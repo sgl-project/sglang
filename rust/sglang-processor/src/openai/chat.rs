@@ -1673,10 +1673,10 @@ mod tests {
         assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
     }
 
-    /// `_reported_cached_tokens`, over the cases of its Python tests: a K3 cache
-    /// hit reaching the generation stub left out of `prompt_tokens` is capped at
-    /// `prompt_tokens`; one ending before the stub, and other models, keep the
-    /// engine's count. Unary, final-usage and continuous-usage replies agree.
+    /// A K3 cache hit reaching the generation stub left out of `prompt_tokens`
+    /// is capped at `prompt_tokens`; one ending before the stub, and other
+    /// models, keep the engine's count. Unary, final-usage and continuous-usage
+    /// replies agree.
     #[test]
     fn kimi_k3_cached_tokens_exclude_the_generation_stub() {
         let k3 = ChatModel {
