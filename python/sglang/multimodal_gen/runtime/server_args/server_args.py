@@ -613,6 +613,7 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
+    disagg_encode_only: bool = False
     disagg_instance_id: int = 0
     disagg_max_slots_per_instance: int = 8
     disagg_transfer_redundancy: float = 1.25
@@ -2232,6 +2233,7 @@ class ServerArgs(DisaggServerArgsMixin):
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        self._validate_disagg_encode_only()
         self._validate_disagg_capability()
         self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 
@@ -3908,7 +3910,20 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        self._validate_disagg_encode_only()
         self._validate_disagg_capability()
+
+    def _validate_disagg_encode_only(self) -> None:
+        if self.disagg_encode_only and self.disagg_role not in (
+            RoleType.SERVER,
+            RoleType.ENCODER,
+            RoleType.PROMPT_ENCODER,
+            RoleType.IMAGE_ENCODER,
+        ):
+            raise ValueError(
+                "--disagg-encode-only applies to the server and encoder roles, "
+                f"got {self.disagg_role.value!r}"
+            )
 
     def _validate_disagg_capability(self) -> None:
         if self.pipeline_config is None:

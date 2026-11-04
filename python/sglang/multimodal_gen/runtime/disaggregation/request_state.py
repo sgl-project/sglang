@@ -44,14 +44,17 @@ _ACTIVE_STATES = set(RequestState) - _TERMINAL_STATES
 _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
     RequestState.PENDING: {RequestState.ENCODER_WAITING, RequestState.ENCODER_RUNNING},
     RequestState.ENCODER_WAITING: {RequestState.ENCODER_RUNNING},
-    RequestState.ENCODER_RUNNING: {RequestState.ENCODER_DONE},
+    RequestState.ENCODER_RUNNING: {RequestState.ENCODER_DONE, RequestState.DONE},
     RequestState.ENCODER_DONE: {
         RequestState.IMAGE_ENCODER_WAITING,
         RequestState.DENOISING_WAITING,
         RequestState.DENOISING_RUNNING,
     },
     RequestState.IMAGE_ENCODER_WAITING: {RequestState.IMAGE_ENCODER_RUNNING},
-    RequestState.IMAGE_ENCODER_RUNNING: {RequestState.IMAGE_ENCODER_DONE},
+    RequestState.IMAGE_ENCODER_RUNNING: {
+        RequestState.IMAGE_ENCODER_DONE,
+        RequestState.DONE,
+    },
     RequestState.IMAGE_ENCODER_DONE: {RequestState.DENOISING_WAITING},
     RequestState.DENOISING_WAITING: {RequestState.DENOISING_RUNNING},
     RequestState.DENOISING_RUNNING: {

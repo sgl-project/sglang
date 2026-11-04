@@ -111,6 +111,8 @@ class TransferRegisterMsg:
     work_endpoint: str = ""
     # Pre-allocated receive slots: [{"offset": int, "size": int, "slot_id": int, "addr": int}]
     preallocated_slots: list = field(default_factory=list)
+    # --disagg-encode-only on the worker; the head refuses a mismatch.
+    encode_only: bool = False
 
 
 def encode_transfer_msg(msg: Any) -> list[bytes]:

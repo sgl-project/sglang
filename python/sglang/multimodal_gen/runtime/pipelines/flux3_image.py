@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     Flux3ImageConditionEncodeStage,
     Flux3ImageDecodeStage,
     Flux3ImageDenoiseStage,
+    Flux3ImageTargetEncodeStage,
     Flux3ImageTextEncodeStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -171,6 +172,15 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "flux3_condition_encode",
         )
+        if server_args.disagg_encode_only:
+            self.add_stage_factory(
+                RoleType.IMAGE_ENCODER,
+                lambda: Flux3ImageTargetEncodeStage(
+                    vae=self.get_module("vae"),
+                    package_config=package_config,
+                ),
+                "flux3_target_encode",
+            )
         self.add_stage_factory(
             RoleType.DENOISER,
             lambda: Flux3ImageDenoiseStage(
