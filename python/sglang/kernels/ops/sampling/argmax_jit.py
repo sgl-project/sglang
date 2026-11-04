@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -31,12 +32,6 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 @cache_once
-def _max_vec_bytes(device_index: int) -> int:
-    # Mirrors `kMaxVecBytes`: 256-bit vectors on Blackwell, 128-bit before
-    return 32 if torch.cuda.get_device_capability(device_index)[0] >= 10 else 16
-
-
-@cache_once
 def _is_cuda_platform() -> bool:
     from sglang.kernels.spec import PlatformInfo
 
@@ -49,7 +44,8 @@ def can_argmax(logits: torch.Tensor) -> bool:
         return False
     if logits.dtype not in _SUPPORTED_DTYPES or logits.ndim != 2:
         return False
-    vec_bytes = _max_vec_bytes(logits.device.index)
+    # Mirrors `kMaxVecBytes` in `argmax.cuh`
+    vec_bytes = current_arch().cuda.max_vec_bytes
     vec_size = vec_bytes // logits.element_size()
     return (
         logits.size(1) % vec_size == 0

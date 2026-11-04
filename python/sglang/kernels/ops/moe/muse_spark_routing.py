@@ -710,7 +710,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
         # The warp router covers num_experts a multiple of 32 (up to 512);
         # other expert counts stay on Triton.
         return gating_output.dtype == torch.float32 and muse_spark_route_warp_covered(
-            gating_output.shape[1], topk, gating_output.device.index
+            gating_output.shape[1], topk
         )
 
     def forward_jit(

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -72,16 +73,9 @@ def _jit_softmax_module(
     )
 
 
-@cache_once
-def _device_info() -> tuple[int, int]:
-    device_index = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device_index)
-    return props.major, props.multi_processor_count
-
-
-def _vec_size(major: int) -> int:
-    # 256-bit vectors on Blackwell, 128-bit on Hopper; mirrors `kMaxVecBytes`
-    return 8 if major >= 10 else 4
+def _vec_size() -> int:
+    # fp32 elements per vector; mirrors `kMaxVecBytes`
+    return current_arch().cuda.max_vec_bytes // 4
 
 
 _INPUT_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
@@ -95,7 +89,7 @@ def can_softmax(logits: torch.Tensor, out: Optional[torch.Tensor] = None) -> boo
             return False
     if logits.dtype not in _INPUT_DTYPES or logits.ndim != 2:
         return False
-    vec_size = _vec_size(_device_info()[0])
+    vec_size = _vec_size()
     _, vocab_size = logits.shape
     return (
         0 < vocab_size <= _MAX_SUPPORTED_VOCAB_SIZE
@@ -110,7 +104,7 @@ def can_softmax(logits: torch.Tensor, out: Optional[torch.Tensor] = None) -> boo
 def _cluster_capacity(cluster_size: int, blocks_per_sm: int) -> int:
     """Clusters resident at once with `blocks_per_sm` CTAs per SM; GPC placement included."""
     if cluster_size == 1:
-        return _device_info()[1] * blocks_per_sm
+        return current_arch().num_sms * blocks_per_sm
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
@@ -124,10 +118,9 @@ def _cluster_capacity(cluster_size: int, blocks_per_sm: int) -> int:
 
 def _candidates(vocab_size: int) -> list[_Config]:
     """Every (threads, cluster size) whose CTAs hold the row in registers with no idle thread."""
-    major, _ = _device_info()
-    max_cluster = _MAX_CLUSTER if major >= 9 else 1  # clusters start at Hopper
-    num_vecs = vocab_size // _vec_size(major)
-    max_vecs_per_thread = _MAX_ELEMS_PER_THREAD // _vec_size(major)
+    max_cluster = _MAX_CLUSTER if current_arch().cuda.supports_cluster else 1
+    num_vecs = vocab_size // _vec_size()
+    max_vecs_per_thread = _MAX_ELEMS_PER_THREAD // _vec_size()
     configs = []
     for threads in _THREADS_OPTIONS:
         for cluster in range(1, max_cluster + 1):
@@ -165,10 +158,7 @@ def _config_cost(
     )
     layers = (waves - 1) * occupancy + tail_layers
     factor = _SHARED_SM_FACTOR[min(layers, occupancy, len(_SHARED_SM_FACTOR)) - 1]
-    if (
-        input_bytes < 4
-        and vecs_per_thread * _vec_size(_device_info()[0]) <= _PAIRED_ELEMS
-    ):
+    if input_bytes < 4 and vecs_per_thread * _vec_size() <= _PAIRED_ELEMS:
         factor *= _HALF_INPUT_PAIRED_FACTOR
     return (waves * _WAVE_OVERHEAD + layers * vecs_per_thread * threads / 512) * factor
 

@@ -4,14 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.utils.common import is_blackwell_supported, is_sm90_supported
-
-# Import SGLang's standard PDL support detection
-
 
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.Tensor] = {}
 
@@ -242,7 +239,7 @@ def _fused_moe_lora_shrink(
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
 
-    use_gdc = is_sm90_supported() or is_blackwell_supported()
+    use_gdc = current_arch().supports_pdl
     shrink_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
@@ -351,7 +348,7 @@ def _fused_moe_lora_expand(
         -1, a_intermediate_cache1.shape[3]
     )
 
-    use_gdc = is_sm90_supported() or is_blackwell_supported()
+    use_gdc = current_arch().supports_pdl
     expand_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
