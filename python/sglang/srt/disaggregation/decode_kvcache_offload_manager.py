@@ -112,7 +112,6 @@ class DecodeKVCacheOffloadManager:
             self.decode_host_mem_pool = build_kv_host_pool(
                 kv_pool=self.kv_cache,
                 page_size=self.page_size,
-                use_mla=isinstance(self.kv_cache, MLATokenToKVPool),
             )
             self.cache_controller = HiCacheController(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
