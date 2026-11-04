@@ -29,7 +29,7 @@ from manual.ep.test_elastic_scale import (
     TestElasticScaleUp4To6 as _TestElasticScaleUp4To6,
 )
 from manual.ep.test_nixl_ep import (
-    TestNixlMoeMooncakeElasticEP as _TestNixlMoeMooncakeElasticEP,
+    TestNixlEPTP as _TestNixlEPTP,
 )
 
 register_cuda_ci(est_time=1050, stage="base-c", runner_config="8-gpu-h200")
@@ -171,8 +171,8 @@ class TestDeepseekV32TBO(CustomTestCase):
         print(f"{speed=:.2f}")
 
 
-class TestNixlMoeMooncakeElasticEP(_TestNixlMoeMooncakeElasticEP):
-    """CI entry point for the registered NIXL/Mooncake Elastic EP test."""
+class TestNixlEPTP(_TestNixlEPTP):
+    """CI entry point for the registered NIXL EP test."""
 
 
 @unittest.skip("Elastic EP scale test is temporarily disabled in registered CI")
