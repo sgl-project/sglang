@@ -5104,3 +5104,11 @@ HTTPBenchError 在保持 BenchError 兼容的同时携带 HTTP 状态及解析�
 仅新策略、内部 lifecycle 自动 PREFETCH 的规划阶段复用 healthy registry worker 已发现的 capabilities。没有缓存时继续发现；显式调用、旧策略、其他动作保持原路径。缓存只用于冻结目标/身份和估计，不刷新反馈或 readiness。首次实际写与丢响应重试仍执行 fresh 能力及 owner epoch/兼容性检查。生产差异仅 runtime.rs 的 14 行新增、7 行删除，advance 路径未改。
 
 parent 阅读完整差异并独立复测 54 项 HTTP 回归全部通过，24.53s；精确 Rust 1.92.0 release lib Clippy（-D warnings）通过，13.17s；全 workspace fmt 与 diff 检查通过。覆盖 warm resume/tool_done 无额外 GET/反馈/ready、cold discovery、未注册 worker、显式伪 event/旧策略/DEMOTE、epoch/layout 变化首次写拒绝，以及首次执行/丢响应 fresh GET。CPU 验证均在性能采样结束后执行。日志：lifecycle-opt/cached-planning-parent-http-tests.log、cached-planning-parent-clippy.log。
+
+### O5 — 到期准备优先与有界轮转
+
+六轮 poll250/PIN0 筛选的 1,152 次生成及控制全部有效，生命周期工作吞吐 +11.25%，p95 TTFT +23.26%，未通过性能验收。已观测每个 pump 的独立 worker 能力/反馈探测先于 job 推进，部分已到 due 的准备在短恢复窗口内未获首次执行机会。
+
+新策略从 healthy worker、未尝试/未提交、未取消且仍有未来需求的 storage→host PREFETCH 中选择最早 due，在独立 worker probe 前推进。最多连续一次优先，随后一次普通轮转；单独的 RR 游标避免偶数或九任务集合出现固定余数饥饿。每轮仍只推进一个 job，旧策略保留原游标与探测顺序。已尝试含丢回复动作、取消、PIN 到期和收尾继续获得 RR 机会；合法未来兴趣可重新推进从未尝试的 late job。
+
+parent 阅读完整差异并独立复测新增 5 项 unit/本地 HTTP 顺序测试、54 项 HTTP 回归通过（最终 6.42s）。精确 Rust 1.92.0 release Clippy --lib --tests -D warnings 通过（42.75s），fmt/diff 检查通过。扩大 lint 时发现既有 proxy 测试三项诊断，仅改为词法锁作用域、去除多余引用及 Option 匹配，未改生产协议。证据为 lifecycle-opt/due-priority-parent-{unit,http-final,clippy-tests}.log。测试与编译均在 NoPin 测量结束后执行；性能需使用新不可变二进制重新评估，不能沿用筛选结果声明改进。

@@ -116,7 +116,7 @@ fn capabilities_reply(s: &EngineState) -> Value {
     }
     if s.feedback && !s.hide_feedback {
         reply["data"]["feedback"] = json!({"query":"events","version":"1.0","source_id":"control:mock","source_epoch":s.feedback_epoch,
-            "recovery":"query_known_scopes","cache_watermark":cache_watermark(&s)});
+            "recovery":"query_known_scopes","cache_watermark":cache_watermark(s)});
     }
     if s.read_batch {
         reply["data"]["read_batch"] = json!({"version":"1.0","max_queries":8,
@@ -1868,18 +1868,19 @@ async fn read_batch_retains_pin_claim_ttl_and_new_release_messages() {
         pin_view(&router, "batch-pin", "released").await["quiescent"],
         true
     );
-    let s = engine.state.lock().unwrap();
-    assert!(s.commands.iter().any(|c| c["kind"] == "read_batch"
-        && c["queries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|q| q["kind"] == "claim")));
-    assert!(s.commands.iter().any(|c| c["kind"] == "query"
-        && c["message_id"]
-            .as_str()
-            .is_some_and(|id| id.ends_with("-release"))));
-    drop(s);
+    {
+        let s = engine.state.lock().unwrap();
+        assert!(s.commands.iter().any(|c| c["kind"] == "read_batch"
+            && c["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|q| q["kind"] == "claim")));
+        assert!(s.commands.iter().any(|c| c["kind"] == "query"
+            && c["message_id"]
+                .as_str()
+                .is_some_and(|id| id.ends_with("-release"))));
+    }
     start(&router, "batch-ttl").await;
     lifecycle_prepare(&router, &engine, "batch-ttl", vec![5, 6, 7, 8]).await;
     pin_view(&router, "batch-ttl", "active").await;
@@ -2358,19 +2359,19 @@ async fn lifecycle_ready_pin_budget_and_engine_refusals_keep_readiness_distinct(
         } else {
             ready(&router, "task", "prepare").await
         };
-        if refusal.is_none() {
+        if let Some(status) = refusal {
+            let denied = pin_view(&router, "task", "not_acquired").await;
+            assert_eq!(
+                denied["operations"][0]["auto_pin"]["result"]["update"]["status"],
+                status
+            );
+            assert_eq!(denied["quiescent"], true);
+        } else {
             assert_eq!(
                 view["operations"][0]["auto_pin_error"],
                 "auto PIN token capacity"
             );
             assert!(view["operations"][0]["auto_pin"].is_null());
-        } else {
-            let denied = pin_view(&router, "task", "not_acquired").await;
-            assert_eq!(
-                denied["operations"][0]["auto_pin"]["result"]["update"]["status"],
-                refusal.unwrap()
-            );
-            assert_eq!(denied["quiescent"], true);
         }
         if refusal == Some("missing") {
             assert!(

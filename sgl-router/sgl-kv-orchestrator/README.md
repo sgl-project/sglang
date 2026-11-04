@@ -31,6 +31,13 @@ prepare the scope. Attempted work keeps its original wire identity and drain
 requirements. An elapsed prediction also suppresses new automatic PIN claims;
 existing claims retain their normal TTL and cleanup behavior.
 
+The background pump alternates eligible, due storage-to-host preparations with
+ordinary job round-robin. It selects the earliest due preparation with a live
+future interest and polls it before the independent worker probe. Each turn
+still polls at most one job; a separate round-robin cursor preserves progress
+for cancellation, PIN expiry and uncertain I/O, even under continuous due work.
+Omitting the policy retains the original job selection and probe order.
+
 `preparation_policy.ready_pin_ttl_ms` optionally submits a separate finite host
 PIN after confirmed lifecycle storage-to-host preparation. It defaults to zero
 (disabled), and is limited to 60,000ms. `auto_pin_max_tokens` defaults to 65,536

@@ -444,6 +444,8 @@ struct Actor {
     caps: BTreeMap<String, Capabilities>,
     last_route: BTreeMap<SessionIdentity, String>,
     tick_cursor: usize,
+    job_rr_cursor: usize,
+    last_job_priority: bool,
     wire_incarnation: String,
     next_wire_message: u64,
     events: BTreeMap<DemandId, (String, Value)>,
@@ -477,6 +479,8 @@ impl Actor {
             caps: BTreeMap::new(),
             last_route: BTreeMap::new(),
             tick_cursor: 0,
+            job_rr_cursor: 0,
+            last_job_priority: false,
             wire_incarnation: uuid::Uuid::new_v4().to_string(),
             next_wire_message: 0,
             events: BTreeMap::new(),
@@ -1962,17 +1966,58 @@ impl Actor {
             job.ready_at = None;
             job.last_error = Some("worker unavailable".into());
         }
+        let next = self.next_job(&healthy);
+        if let Some((id, true)) = &next {
+            self.poll_job(id).await;
+        }
         let candidates = self.workers();
         if let Some(worker) = candidates.get(self.tick_cursor % candidates.len().max(1)) {
             if let Ok(caps) = self.refresh(&worker.url).await {
                 let _ = self.poll_feedback(&worker.url, &caps).await;
             }
         }
-        let ids: Vec<_> = self.jobs.keys().cloned().collect();
-        if !ids.is_empty() {
-            let id = ids[self.tick_cursor % ids.len()].clone();
+        if let Some((id, false)) = next {
             self.poll_job(&id).await;
         }
+    }
+    fn next_job(&mut self, healthy: &BTreeSet<String>) -> Option<(String, bool)> {
+        let now = Instant::now();
+        let priority = self.preparation_costs.is_some() && !self.last_job_priority;
+        let urgent = self
+            .jobs
+            .values()
+            .filter(|job| {
+                priority
+                    && job.due <= now
+                    && !job.attempted
+                    && !job.submitted
+                    && job.action == "sglang.prefetch"
+                    && job.payload["source"]["tier"] == "storage"
+                    && job.payload["destination"]["tier"] == "host"
+                    && healthy.contains(&job.url)
+                    && self.book.job(&job.id).is_some_and(|b| !b.cancel_requested)
+                    && self.has_future_demand(&job.id)
+            })
+            .min_by_key(|job| job.due)
+            .map(|job| job.id.clone());
+        self.last_job_priority = urgent.is_some();
+        if let Some(id) = urgent {
+            return Some((id, true));
+        }
+        // A separate cursor gives every job a turn despite intervening priority
+        // work, including cancellation, PIN expiry and uncertain I/O drainage.
+        let measured = self.preparation_costs.is_some();
+        let cursor = if measured {
+            self.job_rr_cursor
+        } else {
+            self.tick_cursor
+        };
+        let count = self.jobs.len().max(1);
+        let id = self.jobs.keys().nth(cursor % count)?.clone();
+        if measured {
+            self.job_rr_cursor = self.job_rr_cursor.wrapping_add(1);
+        }
+        Some((id, false))
     }
     async fn poll_job(&mut self, id: &str) {
         let Some(mut job) = self.jobs.remove(id) else {
@@ -2506,6 +2551,9 @@ impl Actor {
         *self.published.write() = Published { ready };
     }
 }
+
+#[cfg(test)]
+mod tests;
 fn task_fn(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     task(value, caller)
 }
