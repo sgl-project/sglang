@@ -1015,6 +1015,12 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Under CUDA-graph capture, stage the aiter custom all-gather / reduce-scatter
+    # inputs through the pre-registered IPC pool instead of registering the
+    # graph-pool tensors, which lets peers read stale data on replay (NaN in
+    # DeepSeek-V4.1 DP attention + TP MoE decode on MI355X). Off by default; the
+    # DeepSeek-V4.1 MI355X DP-attention recipe sets it.
+    SGLANG_AITER_CAPTURE_COPY_IN = EnvBool(False)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
     # INT4 at every size.
@@ -1364,9 +1370,9 @@ class Envs:
     SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
 
     # Torch Compile
-    # Compact extend-attention query-tile grid: AMD/HIP-only optimization
-    # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
-    # explicitly in code; this env var allows override (0=force off, 1=force on).
+    # Compact extend-attention query-tile grid (parity with flash-attn's
+    # ragged-aware launch). HIP only (ignored elsewhere), and used only when it
+    # launches fewer tiles than the legacy grid; 0 turns it off.
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at

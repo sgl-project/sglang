@@ -1878,6 +1878,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_CAPTURE_COPY_IN</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Under CUDA-graph capture, stage the AITER custom all-gather and reduce-scatter inputs through the pre-registered IPC buffer instead of registering the graph-pool tensors. The registered path can let peers read stale data on replay (NaN in DeepSeek-V4.1 DP attention + TP MoE decode on MI355X); the DeepSeek-V4.1 MI355X DP-attention recipe sets it to <code>true</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_UNIFIED_ATTN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the AITER unified attention kernel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
