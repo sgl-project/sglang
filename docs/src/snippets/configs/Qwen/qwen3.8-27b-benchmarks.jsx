@@ -11,7 +11,7 @@
 // commands differ (explicit --kv-cache-dtype fp8_e4m3, strategy flag emitted
 // by the tier row) and the accept lengths are protocol-specific.
 //
-// All six rows are ONE-BATCH measurements (sglang.bench_serving --flush-cache,
+// All six rows are ONE-BATCH measurements (sglang.benchmark.serving --flush-cache,
 // random dataset, ISL=1024 / OSL=1024, --random-range-ratio 1, request-rate inf,
 // max_concurrency 1/16/64, n=64/64/256 respectively) on a single GB300 GPU
 // (Blackwell Ultra SM103, 288GB HBM) on 2026-08-14. SGLang binary:

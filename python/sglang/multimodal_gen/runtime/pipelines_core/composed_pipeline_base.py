@@ -33,8 +33,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_or
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
-    ComponentResidencyStrategy,
     get_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     COMFYUI_REQUIRED_MODULES,

@@ -65,9 +65,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_decode_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     PPProxyTensors,
     _dp_tp_moe_masks_pad_rows,
     compute_local_num_token_non_padded,
@@ -75,6 +73,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -385,6 +384,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else create_attention_graph_variants(model_runner.model_config.hf_config)
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
+            )
+            or self.attn_backend.get_decode_graph_variants(
+                self.capture_forward_mode, self.captured_req_width
             )
         )
 
