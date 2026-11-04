@@ -59,14 +59,6 @@ def can_argmax(logits: torch.Tensor) -> bool:
     )
 
 
-def create_argmax_workspace(num_rows: int, device: torch.device) -> torch.Tensor:
-    """Zeroed scratch for batches past the built-in workspace (`kMaxBatchSize` in `argmax.cuh`).
-
-    The kernel hands every slot back zeroed, so one buffer is reusable across calls.
-    """
-    return torch.zeros(num_rows, dtype=torch.int64, device=device)
-
-
 def argmax(
     logits: torch.Tensor,
     out: Optional[torch.Tensor] = None,
