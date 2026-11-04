@@ -11,6 +11,8 @@ Set `SGLANG_ELASTIC_LIVE_SCALE=split` uniformly on all ranks, including scale an
 `--elastic-ep-reuse-cuda-graph` and a common `--max-ep-size` to retain the original
 decode graphs and capture only joining ranks before admission. Start all joiners
 before posting `/scale_elastic_ep`; a cohort is admitted together after preparation.
+Configure `--admin-api-key` and send it as a bearer token on scale requests, as
+required by the upstream HTTP API.
 
 Without the reuse flag, `split` interleaves expanded eager serving with individual
 CUDA graph capture steps. `SGLANG_ELASTIC_CAPTURE_SERVICE_STEPS` controls the number
@@ -48,9 +50,16 @@ control protocol as the original serving ranks.
   Earlier request deadlines fail the scale operation without terminating serving. An in-flight connection cannot be safely
   cancelled; restart before retrying. Operation metadata remains in TCPStore for
   the process lifetime to avoid early-deletion races with slow participants.
-- This port has CPU protocol tests. Distributed serving/accuracy and failure tests
-  must be rerun on this exact base before claiming production readiness. Results
-  from the earlier development branch are not validation of this rebased branch.
+
+Two-H100-node validation covers live and synchronous 4→8→4 and live 4→5→6
+(job 21188689, source 11be64c35f): 1,941 serving requests without failures.
+After rebasing onto scale-down head `4388af6900`, live 4→8→4→8 passed with
+fresh joiners and distinct operation IDs (job 22162367, source 2d967d286e):
+964 serving requests without failures; growth gaps of 0.381/0.350 s and a
+shrink gap of 2.116 s. All 128 generated-logprob probes were finite. GSM32
+scores were 8→7→8→7, with the same EP8 answer mismatch seen before this rebase.
+These are smoke checks, not full accuracy certification. Fault-injection
+recovery remains unvalidated. Unit/CUDA checks passed 155 tests and 135 subtests.
 
 CPU tests: `test/registered/unit/elastic_ep/test_live_scale.py`.
 Tensor/CUDA regressions: `test/manual/ep/test_live_graph_reuse_tensors.py`.
