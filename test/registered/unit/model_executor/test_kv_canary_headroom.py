@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
+from sglang.srt.mem_cache.runtime_reserve import TransientReserve
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -39,8 +40,10 @@ class TestCanaryHeadroom(CustomTestCase):
         *,
         graph_borrow=False,
         eager_gap=False,
+        running_requests=None,
         pool=None,
         draft_pools=None,
+        transient=None,
     ):
         config = MemoryPoolConfig(max_total_num_tokens=1024)
         if pool is None:
@@ -55,8 +58,9 @@ class TestCanaryHeadroom(CustomTestCase):
             gpu_id=0,
             pre_model_load_memory=32,
             mem_fraction_static=0.875,
-            max_running_requests=16 if eager_gap else None,
-            model_config=SimpleNamespace(is_multimodal=False),
+            max_running_requests=16 if eager_gap else running_requests,
+            model_config=SimpleNamespace(is_multimodal=False, vocab_size=1000),
+            graph_memory_usage={"prefill": 1.5},
             sampling_prewarm_result=SimpleNamespace(sampling_headroom_bytes=6 * _GIB),
             canary_manager=target,
             kv_cache_configurator=Mock(),
@@ -66,13 +70,18 @@ class TestCanaryHeadroom(CustomTestCase):
         )
         runner.kv_cache_configurator.config_from_budget.return_value = config
         runner.kv_cache_configurator.resolve_max_num_reqs.return_value = 16
+        self.transient_reserve = Mock(wraps=kv_pool_runtime.transient_reserve)
+        if transient is not None:
+            self.transient_reserve.return_value = transient
         with (
             get_context().override_server_args(
                 disaggregation_mode="null",
+                chunked_prefill_size=8192,
                 cuda_graph_config=CudaGraphConfig(
                     decode=PhaseConfig(backend=Backend.FULL, max_bs=8)
                 ),
             ),
+            patch.object(kv_pool_runtime, "transient_reserve", self.transient_reserve),
             patch.object(kv_pool_runtime.torch.cuda, "synchronize"),
             get_parallel().override(
                 world_group=SimpleNamespace(world_size=1, cpu_group=None)
@@ -120,6 +129,40 @@ class TestCanaryHeadroom(CustomTestCase):
                     ),
                     (20 - headroom - 1 + 2) * _GIB,
                 )
+
+    def test_graph_bounded_decode_reserves_its_runtime_transients(self):
+        """When every decode batch replays a graph, the sampling state and eager
+        tails for the running cap are reserved above the planned floor and the
+        sampling pre-warm, however large; an eager decode gap keeps the static
+        activation reserve instead."""
+        for transient_gib, headroom in ((2, 6), (7, 7), (12, 12)):
+            with self.subTest(transient_gib=transient_gib):
+                reserve = TransientReserve(
+                    persistent_bytes=0,
+                    decode_bytes=(transient_gib - 1) * _GIB,
+                    prefill_bytes=0,
+                    fragmentation_bytes=0,
+                )
+                self.assertEqual(reserve.total_bytes, transient_gib * _GIB)
+                self.assertEqual(
+                    self._resize(None, transient=reserve),
+                    (20 - headroom - 1 + 2) * _GIB,
+                )
+        # Sized for the resolved running cap, here backed off below the decode
+        # graph ceiling, the prefill chunk and the measured prefill graph pool.
+        self._resize(None, running_requests=4, transient=reserve)
+        self.transient_reserve.assert_called_once_with(
+            vocab_size=1000,
+            max_running_requests=4,
+            chunked_prefill_size=8192,
+            enable_deterministic_inference=False,
+            prefill_graph_bytes=int(1.5 * _GIB),
+        )
+        self.assertEqual(
+            self._resize(None, eager_gap=True, transient=reserve),
+            (20 - 8 - 1 + 2) * _GIB,
+        )
+        self.transient_reserve.assert_not_called()
 
     def test_workspace_is_added_to_other_headroom_at_installed_capacity(self):
         manager = _manager(1_000_000, 3)

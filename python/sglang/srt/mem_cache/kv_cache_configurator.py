@@ -94,6 +94,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
+from sglang.srt.mem_cache.runtime_reserve import graph_bounded_running_cap
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
@@ -3040,9 +3041,12 @@ class KVCacheConfigurator:
 
         return token_capacity
 
-    def resolve_max_num_reqs(self, token_capacity: int) -> int:
+    def resolve_max_num_reqs(
+        self, token_capacity: int, *, kv_budget_bytes: Optional[int] = None
+    ) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
-        token capacity."""
+        token capacity. ``kv_budget_bytes`` lets the decode graph running cap
+        back off on a pool too small to carry its per-request reserve."""
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
@@ -3054,6 +3058,28 @@ class KVCacheConfigurator:
         else:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
+            graph_cap = get_schedule()._decode_graph_running_cap
+            if graph_cap is not None and kv_budget_bytes is not None:
+                ceiling = graph_cap
+                graph_cap = graph_bounded_running_cap(
+                    ceiling=ceiling,
+                    capture_bs=get_exec().graph.cuda_graph_config.decode.bs,
+                    kv_budget_bytes=kv_budget_bytes,
+                    vocab_size=self.model_config.vocab_size,
+                    context_len=self.model_config.context_len,
+                    page_size=self.page_size,
+                )
+                if graph_cap < ceiling:
+                    logger.info(
+                        "Decode CUDA graph running cap backed off from %d to %d "
+                        "requests to keep their runtime reserve within 1/10 of "
+                        "the KV budget.",
+                        ceiling,
+                        graph_cap,
+                    )
+            if graph_cap is not None:
+                # Every decode batch then replays a captured graph.
+                max_num_reqs = min(max_num_reqs, graph_cap)
 
         capped_by_mamba = False
         if self.mambaish_config is not None:
@@ -3106,7 +3132,7 @@ class KVCacheConfigurator:
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(
-            config.max_total_num_tokens
+            config.max_total_num_tokens, kv_budget_bytes=available_bytes
         )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)

@@ -852,6 +852,53 @@ class TestPerWorkerRequestSplit(CustomTestCase):
         )
         self.assertEqual(KVCacheConfigurator.resolve_max_num_reqs(kvc, 1 << 20), 1)
 
+    def test_graph_running_cap_bounds_only_the_default_limit(self):
+        """The planner's cap replaces the 2048-4096 default with the decode graph
+        ceiling, backed off on a small KV budget; an explicit limit is kept."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            CudaGraphConfig,
+            PhaseConfig,
+        )
+
+        capture_bs = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, 512, 16))
+            + [512]
+        )
+        graphs = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=512, bs=capture_bs)
+        )
+        kvc = SimpleNamespace(
+            attn_dp_size=1,
+            mambaish_config=None,
+            page_size=1,
+            model_config=SimpleNamespace(context_len=40960, vocab_size=151936),
+        )
+        resolve = KVCacheConfigurator.resolve_max_num_reqs
+
+        _publish_config(self, cuda_graph_config=graphs)
+        self.assertEqual(resolve(kvc, 400_000), 4096)
+
+        _publish_config(self, _decode_graph_running_cap=512, cuda_graph_config=graphs)
+        self.assertEqual(resolve(kvc, 400_000), 512)
+        self.assertEqual(resolve(kvc, 400_000, kv_budget_bytes=64 << 30), 512)
+        backed_off = resolve(kvc, 100_000, kv_budget_bytes=13 << 30)
+        self.assertLess(backed_off, 512)
+        self.assertIn(backed_off, capture_bs)
+        # The pool still bounds the limit below the cap.
+        self.assertEqual(resolve(kvc, 600, kv_budget_bytes=64 << 30), 300)
+
+        _publish_config(
+            self,
+            max_running_requests=1024,
+            _decode_graph_running_cap=512,
+            cuda_graph_config=graphs,
+        )
+        self.assertEqual(resolve(kvc, 400_000, kv_budget_bytes=13 << 30), 1024)
+
     def test_chunk_cache_cap_sizes_one_request_below_dp_size(self):
         mr = _make_model_runner(
             self,

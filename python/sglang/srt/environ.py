@@ -666,6 +666,9 @@ class Envs:
     SGLANG_AITER_DECODE_PARTITION_BUCKETS = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # Kill switch for the single-GPU decode graph planner: off keeps the
+    # GPU-tier decode graph ceiling and running limit.
+    SGLANG_ENABLE_DECODE_GRAPH_PLANNER = EnvBool(True)
 
     # ===================================================================
     # Scheduler token budgeting and admission

@@ -32,6 +32,12 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of running requests.",
     ] = None
+    # Recorded by memory_hook.plan_decode_graph_coverage: the decode CUDA graph
+    # ceiling that caps the default max_running_requests.
+    _decode_graph_running_cap: A[
+        Optional[int],
+        Arg(no_cli=True),
+    ] = None
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",

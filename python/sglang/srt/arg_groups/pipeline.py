@@ -376,6 +376,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # final resolving view.
     run_hook(handle_kv_cache_sharding, server_args)
 
+    from sglang.srt.arg_groups.memory_hook import plan_decode_graph_coverage
+
+    # Gates on the final graph, parallel, speculative and memory settings.
+    run_hook(plan_decode_graph_coverage, server_args)
+
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
