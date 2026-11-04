@@ -617,6 +617,7 @@ class LTX2TwoStageResidencyController:
         """
         return (
             self.mode == "resident"
+            and self.server_args.lora_merge_mode != "disabled"
             and self.pipeline._distilled_lora_path is not None
             and self.pipeline._stage1_lora_path is None
         )
@@ -676,7 +677,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
 
     @staticmethod
     def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
-        return is_ltx23_native_variant(
+        return server_args.lora_merge_mode != "disabled" and is_ltx23_native_variant(
             server_args.pipeline_config.vae_config.arch_config
         )
 
@@ -1006,6 +1007,13 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 )
             self.set_lora(
                 **set_lora_kwargs,
+                # Preserve the no-snapshot policy despite phase-specific legacy
+                # merge_weights overrides (including merge_weights=False).
+                merge_mode=(
+                    "disabled"
+                    if self.server_args.lora_merge_mode == "disabled"
+                    else None
+                ),
             )
         else:
             # Stage 1 must run on the base transformer weights. If stage 2 left the

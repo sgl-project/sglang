@@ -739,6 +739,8 @@ class WeightsUpdater:
                 fused_sections.setdefault(layer, {})[merge_index] = (lora_a, lora_b)
 
         with lora_pipeline._temporarily_disable_offload(target=target_module):
+            for layer in layer_dict.values():
+                layer.set_merge_disabled(merge_mode == "disabled")
             for lora_a, lora_b, layer in plain_pairs:
                 inferred_rank = int(lora_a.shape[-2])
                 layer.lora_rank = inferred_rank
