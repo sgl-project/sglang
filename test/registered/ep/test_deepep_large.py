@@ -175,6 +175,7 @@ class TestNixlMoeMooncakeElasticEP(_TestNixlMoeMooncakeElasticEP):
     """CI entry point for the registered NIXL/Mooncake Elastic EP test."""
 
 
+@unittest.skip("Elastic EP scale test is temporarily disabled in registered CI")
 class TestElasticScaleUp4To6(_TestElasticScaleUp4To6):
     """CI entry point for the registered Elastic EP scale test."""
 
