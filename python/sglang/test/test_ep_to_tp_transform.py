@@ -11,6 +11,7 @@ Launch with torchrun:
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -32,6 +33,7 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import (
     get_flags,
     get_model,
+    get_parallel,
     override_platform,
     reset_context,
 )
@@ -962,6 +964,23 @@ class TestEpToTpTransform(unittest.TestCase):
         # The dispatcher's snapshot of the EP-load counts must be resynced.
         self.assertEqual(moe.dispatcher.num_local_experts, moe.num_local_experts)
         self.assertEqual(moe.dispatcher.moe_ep_size, 1)
+        del moe, stack
+
+    def test_transform_keeps_all_to_all_off_the_serving_tp_group(self):
+        """The transform must not run all_to_all on the serving TP communicator: NCCL
+        keeps that collective's per-peer buffers for the communicator's lifetime."""
+        tp_device_group = get_parallel().tp_group.device_group
+        with _load_tp_by_experts_config(True):
+            moe = self._make_moe()
+            stack = _FakeDecoderStack([_FakeLayer(_FakeMoEMlp(moe))], 0, 1)
+            with mock.patch(
+                "torch.distributed.all_to_all_single", wraps=dist.all_to_all_single
+            ) as all_to_all:
+                maybe_ep_to_tp_transform_all_layers(stack)
+        groups = [call.kwargs["group"] for call in all_to_all.call_args_list]
+        self.assertTrue(groups)
+        self.assertNotIn(tp_device_group, groups)
+        self.assertFalse(moe._ep_load_for_tp)
         del moe, stack
 
     def test_transform_matches_tp_shape_when_padding_does_not_commute(self):
