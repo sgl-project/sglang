@@ -223,7 +223,7 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
 
 class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
     def test_freed_rows_are_inert_and_live_rows_preserve_mapping(self):
-        for positions, expected in ((None, [-1, 11]), ([1, 1], [-1, 12])):
+        for positions, expected in ((None, [0, 11]), ([1, 1], [0, 12])):
             with self.subTest(positions=positions):
                 mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
                 batch = SimpleNamespace(
@@ -239,7 +239,7 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
                 set_mamba_track_indices_from_reqs(batch, positions)
                 self.assertEqual(batch.mamba_track_indices.tolist(), expected)
 
-    def test_rows_planned_at_minus_one_are_inert(self):
+    def test_rows_planned_at_minus_one_point_at_the_reserved_slot(self):
         mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
         batch = SimpleNamespace(
             reqs=[
@@ -252,7 +252,7 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
             ),
         )
         set_mamba_track_indices_from_reqs(batch, [1, -1])
-        self.assertEqual(batch.mamba_track_indices.tolist(), [8, -1])
+        self.assertEqual(batch.mamba_track_indices.tolist(), [8, 0])
 
 
 class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):

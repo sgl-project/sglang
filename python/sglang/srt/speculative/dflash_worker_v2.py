@@ -107,7 +107,6 @@ from sglang.srt.speculative.spec_utils import (
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
-    mask_rows_without_track_slot,
     simulated_acc_len_generator,
 )
 from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
@@ -2149,9 +2148,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 can_track_mask,
                 to_track_ith.to(torch.int64),
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
-            mamba_steps_to_track = mask_rows_without_track_slot(
-                batch.mamba_track_indices, mamba_steps_to_track
             )
 
         model_runner = self.target_worker.model_runner

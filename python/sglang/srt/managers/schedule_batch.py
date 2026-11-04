@@ -1710,10 +1710,11 @@ def _gather_mamba_track_indices(
     req_pool_indices: torch.Tensor,
     track_positions: torch.Tensor,
 ) -> torch.Tensor:
-    """Each request's ping-pong slot id at its track position, read on the device;
-    a negative position has no slot and gives -1."""
+    """Each request's ping-pong slot id at its track position, read on the device.
+    A negative position has no slot and gives the reserved slot 0, which a
+    forward may write but nothing reads."""
     slots = ping_pong_mapping[req_pool_indices, track_positions.clamp(min=0)]
-    return torch.where(track_positions >= 0, slots, -1)
+    return torch.where(track_positions >= 0, slots, 0)
 
 
 def mamba_lazy_spec_in_window(
@@ -1735,7 +1736,7 @@ def set_mamba_track_indices_from_reqs(
     """Build mamba_track_indices from req objects (authoritative source).
 
     track_positions: optional per-req ping-pong position override (the lazy
-    spec track plan, see mamba_lazy_spec_prepare); -1 writes no track state.
+    spec track plan, see mamba_lazy_spec_prepare); -1 has no slot.
     """
     mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
@@ -1750,7 +1751,7 @@ def set_mamba_track_indices_from_reqs(
         ]
     batch.mamba_track_buffer_indices = list(track_positions)
     # A request whose state was freed under overlap (it may already belong to
-    # another request) has no slot; -1 makes the scatter write nothing.
+    # another request) has no slot.
     positions = async_h2d(
         [
             -1 if req.kv.mamba_next_track_idx is None else position
@@ -3132,8 +3133,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 rows.append((i, req, other_idx))
             track_positions.append(other_idx)
         took = self._alloc_tracking_slots([(req, pos) for _, req, pos in rows])
-        # On failure the verify skips this crossing's snapshot (-1), so the
-        # keep slot still holds the checkpoint at mamba_last_track_seqlen.
+        # On failure the crossing's snapshot has no slot (-1), so the keep slot
+        # still holds the checkpoint at mamba_last_track_seqlen.
         for (i, _, _), ok in zip(rows, took):
             if not ok:
                 track_positions[i] = -1

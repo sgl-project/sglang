@@ -96,16 +96,15 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         )
         update_call.assert_not_called()
 
-    def _commit_with_tracking(self, track_indices, seq_lens):
-        """Run the post-verify commit on two requests with a 256-token tracking
-        interval and return the kwargs the backend hook received."""
+    def test_mamba_verify_update_with_track_indices(self):
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
         target_worker = self._make_mock_target_worker()
         batch = MagicMock()
         batch.forward_mode.is_idle.return_value = False
-        batch.mamba_track_indices = torch.tensor(track_indices, dtype=torch.int64)
-        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+        batch.mamba_track_indices = torch.tensor([100, 200], dtype=torch.int64)
+        # Only the first request crosses the 256-token tracking boundary.
+        batch.seq_lens = torch.tensor([253, 128], dtype=torch.int32)
         accept_lens = torch.tensor([4, 3], dtype=torch.int32)
         accept_index = torch.tensor(
             [
@@ -137,27 +136,13 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
         )
         update_call.assert_called_once()
-        return update_call.call_args[1]
-
-    def test_mamba_verify_update_with_track_indices(self):
-        # Only the first request crosses the 256-token tracking boundary.
-        call_kwargs = self._commit_with_tracking([100, 200], [253, 128])
+        call_kwargs = update_call.call_args[1]
         self.assertTrue(
             torch.equal(
                 call_kwargs["last_correct_step_indices"],
                 torch.tensor([3, 2], dtype=torch.int32),
             )
         )
-        self.assertTrue(
-            torch.equal(
-                call_kwargs["mamba_steps_to_track"],
-                torch.tensor([2, -1], dtype=torch.int32),
-            )
-        )
-
-    def test_crossing_without_track_destination_commits_no_snapshot(self):
-        # Both requests cross 256; the second has no track slot (-1).
-        call_kwargs = self._commit_with_tracking([100, -1], [253, 254])
         self.assertTrue(
             torch.equal(
                 call_kwargs["mamba_steps_to_track"],
