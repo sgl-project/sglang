@@ -481,7 +481,8 @@ struct SparseMlaPrefillGfx950Kernel {
     const DLDevice dev = q_nope.device();
     LaunchKernel(dim3(static_cast<uint32_t>(T), static_cast<uint32_t>(splits)), k::kThreads, dev)(
         k::sparse_mla_prefill_kernel<kStages, true>, p);
-    LaunchKernel(static_cast<uint32_t>(T * H), 128, dev)(k::sparse_mla_split_combine_kernel, p, static_cast<int>(splits));
+    LaunchKernel(static_cast<uint32_t>(T * H), 128, dev)(
+        k::sparse_mla_split_combine_kernel, p, static_cast<int>(splits));
   }
 };
 
