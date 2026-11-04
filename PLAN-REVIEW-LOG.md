@@ -4814,3 +4814,7 @@ before deciding whether this fixes the observed model-level regression.
 ### P8 native/demand coalescing — independent review
 
 Reviewed indexed exact-prefix demand joins, owner publication/quiescence, cancellation/drain, request abort, loaded-span attribution and teardown guards. Independent final CPU proof113passed86subtests(21.46s); independent GPU host/file/live Mooncake join2passed2subtests(18.92s). Prior parent run encountered newly edited fixture using msgspec.replace on dataclass Limits; final corrected fixture proof is recorded, no failed production result hidden. Deterministic before/after I/O count2queries+2GETs ->1query+1GET; model TTFT benefit still awaits snapshot restart. Other scopes/stop policies retain ordinary path. Approved for commit.
+
+### P8 reproducible benchmark harness
+
+Added paired Engine HTTP benchmark with actual cache-tier checks, raw failure retention, deterministic outputs, trace provenance, historical cost EMA, bootstrap intervals and optional background/host-pressure load. PIN readiness uses current claim contract, not transfer ready_scope. Independently ran8tests including local two-engine mock HTTP and recorded real SSE replay; all passed. New load/trace options are mock-validated only until separate real runs. Script files and input fixture committed; real P2 matrices remain immutable under /tmp/sglang-rfc-build and will be included in final result artifacts.
