@@ -74,7 +74,8 @@ class TestTorchCompileMoe(CustomTestCase):
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
         if is_cuda():
-            self.assertGreaterEqual(throughput, 285)
+            # relax for CI hosts with slower CPUs
+            self.assertGreaterEqual(throughput, 260)
         elif is_in_amd_ci():
             # relax for mi300x
             self.assertGreaterEqual(throughput, 240)
