@@ -1410,6 +1410,13 @@ impl Actor {
         if !matches!(action, "sglang.prefetch" | "sglang.demote" | "sglang.pin") {
             return Err("unsupported action".into());
         }
+        let automatic_prefetch = self.preparation_costs.is_some()
+            && lifecycle_event
+            && action == "sglang.prefetch"
+            && matches!(
+                value["event"].as_str(),
+                Some("resume_expected" | "tool_done")
+            );
         let source = value["source"]["tier"].as_str().unwrap_or("storage");
         let destination = value["destination"]["tier"].as_str().unwrap_or("host");
         let pin_tier = value["location"]["tier"].as_str().unwrap_or("host");
@@ -1429,6 +1436,12 @@ impl Actor {
         }
         let mut available = Vec::new();
         for w in workers {
+            // Planning may reuse discovery; the first write still refreshes
+            // and checks the frozen owner epoch and compatibility in advance.
+            if let Some(caps) = self.caps.get(&w.url).filter(|_| automatic_prefetch) {
+                available.push((w.url.clone(), caps.clone()));
+                continue;
+            }
             if let Ok(caps) = self.refresh(&w.url).await {
                 available.push((w.url.clone(), caps));
             }
@@ -1660,13 +1673,7 @@ impl Actor {
         match self.book.attach(demand.clone(), ids.clone()) {
             Ok(()) => {}
             Err(BookError::Conflict)
-                if self.preparation_costs.is_some()
-                    && lifecycle_event
-                    && action == "sglang.prefetch"
-                    && matches!(
-                        value["event"].as_str(),
-                        Some("resume_expected" | "tool_done")
-                    )
+                if automatic_prefetch
                     && self.book.jobs_for(&demand).is_none()
                     && ids
                         .iter()

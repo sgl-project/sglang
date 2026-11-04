@@ -53,6 +53,7 @@ struct EngineState {
     fail_claim: bool,
     fail_pin_release: bool,
     epoch: String,
+    layout_id: Option<String>,
     fail_residency: bool,
     lose_submit_once: bool,
     feedback: bool,
@@ -110,6 +111,9 @@ fn capabilities_reply(s: &EngineState) -> Value {
         "cache_salt_encoding":"owner_assertion","executor":{"cache_generation":1},"public_protocol":{"actions":{"sglang.prefetch":["1.0"],"sglang.demote":["1.0"],"sglang.pin":["1.0"]},
         "paths":{"sglang.prefetch":[["storage","host"],["host","gpu"]],"sglang.demote":[["gpu","storage"],["gpu","host"],["host","storage"]]},
         "storage_backend":"mooncake","backend_namespace":"pool-a","storage_targets":true,"prefix":{"namespace":"weights-v1","layout_id":"full:p1","page_size":1,"components":["full"],"hash_scheme":"sglang.sha256.u32le.i64.v1"}}}});
+    if let Some(layout_id) = &s.layout_id {
+        reply["data"]["public_protocol"]["prefix"]["layout_id"] = json!(layout_id);
+    }
     if s.feedback && !s.hide_feedback {
         reply["data"]["feedback"] = json!({"query":"events","version":"1.0","source_id":"control:mock","source_epoch":s.feedback_epoch,
             "recovery":"query_known_scopes","cache_watermark":cache_watermark(&s)});
@@ -1063,6 +1067,150 @@ fn resume_event(id: &str, wait_ms: u64, engine: &Engine) -> Value {
         "expected_wait_ms":wait_ms,"worker_url":engine.url})
 }
 
+async fn associate_prefix(router: &TestRouter, id: &str, engine: &Engine) {
+    api(
+        router,
+        json!({"kind":"session_event","task":task(id),"event":"request_observed",
+        "event_id":"observed","revision":1,"branch_id":"main","branch_revision":1,
+        "request_id":"r","request_incarnation":"one","input_ids":[1,2,3,4],
+        "worker_url":engine.url}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn automatic_prefetch_planning_reuses_caps_without_observing_or_executing() {
+    for event_name in ["resume_expected", "tool_done"] {
+        let engine = feedback_engine().await;
+        engine.state.lock().unwrap().read_batch = true;
+        let router = router_with(&[&engine], false, Some(window_config())).await;
+        start(&router, "planning").await;
+        // Let the interval's initial tick finish before taking RPC counters.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        associate_prefix(&router, "planning", &engine).await;
+        let before_feedback = feedback_view(&router).await;
+        let (gets, commands) = {
+            let mut s = engine.state.lock().unwrap();
+            s.cache_version += 1;
+            feedback_event(&mut s, "invalidation", json!({"tiers":["host"]}));
+            (s.capability_gets, s.http_commands.len())
+        };
+        let mut body = resume_event("planning", 10_000, &engine);
+        body["event"] = json!(event_name);
+        body["available_ms"] = json!(10_000);
+        let planned = api(&router, body).await;
+        assert_eq!(planned["operations"].as_array().unwrap().len(), 1);
+        assert!(planned["operations"][0]["ready_scope"].is_null());
+        assert!(planned["operations"][0]["result"].is_null());
+        assert_eq!(feedback_view(&router).await, before_feedback);
+        {
+            let s = engine.state.lock().unwrap();
+            assert_eq!(s.capability_gets, gets);
+            assert_eq!(s.http_commands.len(), commands);
+            assert!(s.operations.is_empty());
+        }
+        if event_name == "resume_expected" {
+            // A query before due remains local; execution has its own discovery.
+            let pending = query(&router, "planning", "prepare").await;
+            assert!(pending["operations"][0]["ready_scope"].is_null());
+            assert_eq!(engine.state.lock().unwrap().capability_gets, gets);
+            assert_eq!(engine.state.lock().unwrap().http_commands.len(), commands);
+        }
+        // A cached URL is never a substitute for registry health/registration.
+        router.registry.remove(&WorkerId("engine-0".into()));
+        let mut removed = resume_event("planning", 10_000, &engine);
+        removed["event_id"] = json!("after-removal");
+        removed["revision"] = json!(3);
+        let unavailable = api(&router, removed).await;
+        assert!(unavailable["operations"].as_array().unwrap().is_empty());
+        assert_eq!(engine.state.lock().unwrap().capability_gets, gets);
+    }
+}
+
+#[tokio::test]
+async fn planning_discovery_is_preserved_for_legacy_explicit_and_other_actions() {
+    for mode in ["legacy", "explicit", "spoofed_event", "demote"] {
+        let engine = Engine::start().await;
+        let mut cfg = window_config();
+        if mode == "legacy" {
+            cfg.preparation_policy = None;
+        }
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "discover").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        associate_prefix(&router, "discover", &engine).await;
+        let gets = engine.state.lock().unwrap().capability_gets;
+        let mut body = resume_event("discover", 20_000, &engine);
+        match mode {
+            "explicit" | "spoofed_event" => {
+                body["kind"] = json!("submit");
+                body["message_id"] = json!("prepare");
+                body["action"] = json!("sglang.prefetch");
+                body["source"] = json!({"tier":"storage"});
+                body["destination"] = json!({"tier":"host"});
+                body["delay_ms"] = json!(10_000);
+                if mode == "explicit" {
+                    body.as_object_mut().unwrap().remove("event");
+                }
+            }
+            "demote" => {
+                body["event"] = json!("tool_wait");
+                body["source"] = json!({"tier":"host"});
+                body["pressure"] = json!(true);
+            }
+            _ => {}
+        }
+        let planned = api(&router, body).await;
+        assert_eq!(planned["operations"].as_array().unwrap().len(), 1, "{mode}");
+        let s = engine.state.lock().unwrap();
+        assert_eq!(s.capability_gets, gets + 1, "{mode}");
+        assert!(s.operations.is_empty(), "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn cached_planning_rechecks_owner_and_compatibility_before_first_write() {
+    for owner_changed in [false, true] {
+        let engine = Engine::start().await;
+        let router = router_with(&[&engine], false, Some(window_config())).await;
+        start(&router, "changed").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        associate_prefix(&router, "changed", &engine).await;
+        let gets = engine.state.lock().unwrap().capability_gets;
+        {
+            let mut s = engine.state.lock().unwrap();
+            if owner_changed {
+                s.epoch = "epoch-2".into();
+            } else {
+                s.layout_id = Some("changed-layout".into());
+            }
+        }
+        let planned = api(&router, resume_event("changed", 10_000, &engine)).await;
+        assert_eq!(planned["operations"][0]["owner_epoch"], "epoch-1");
+        assert_eq!(engine.state.lock().unwrap().capability_gets, gets);
+        assert!(query(&router, "changed", "prepare").await["operations"][0]["error"].is_null());
+        assert_eq!(engine.state.lock().unwrap().capability_gets, gets);
+
+        // Advance the existing immutable job through the normal lifecycle path.
+        let mut done = resume_event("changed", 10_000, &engine);
+        done["event"] = json!("tool_done");
+        done["event_id"] = json!("done");
+        done["revision"] = json!(3);
+        done["available_ms"] = json!(10_000);
+        api(&router, done).await;
+        let rejected = query(&router, "changed", "prepare").await;
+        assert!(rejected["operations"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("owner epoch/compatibility changed"));
+        assert!(rejected["operations"][0]["ready_scope"].is_null());
+        let s = engine.state.lock().unwrap();
+        assert_eq!(s.capability_gets, gets + 1);
+        assert!(s.operations.is_empty());
+        assert!(s.commands.iter().all(|command| command["kind"] != "submit"));
+    }
+}
+
 #[tokio::test]
 async fn absolute_resume_window_includes_mailbox_wait_and_keeps_replay_identity() {
     for measured in [false, true] {
@@ -1158,15 +1306,30 @@ async fn absolute_resume_due_does_not_slide_by_mailbox_time() {
 #[tokio::test]
 async fn discovery_delay_expires_unattempted_preparation_without_engine_submit() {
     let engine = Engine::start().await;
-    let router = Arc::new(router_with(&[&engine], false, Some(window_config())).await);
+    let warm_engine = Engine::start().await;
+    let router = Arc::new(router_with(&[&warm_engine], false, Some(window_config())).await);
     start(&router, "discovery").await;
     tokio::time::sleep(Duration::from_millis(20)).await;
+    // Add the target after the initial background discovery: its planning
+    // cache miss must still discover, even when other workers are warm.
+    router
+        .registry
+        .add(WorkerSpec {
+            id: WorkerId("cold-engine".into()),
+            url: engine.url.clone(),
+            model_ids: vec![ModelId(MODEL.into())],
+            mode: WorkerMode::Plain,
+            ..Default::default()
+        })
+        .unwrap();
     let delayed = Arc::new(DelayedQuery::default());
     engine.state.lock().unwrap().delayed_capabilities = Some(delayed.clone());
     let r = router.clone();
     let body = resume_event("discovery", 100, &engine);
     let queued = tokio::spawn(async move { api(&r, body).await });
-    delayed.started.notified().await;
+    tokio::time::timeout(Duration::from_secs(2), delayed.started.notified())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
     delayed.release.notify_one();
     queued.await.unwrap();
@@ -1177,6 +1340,7 @@ async fn discovery_delay_expires_unattempted_preparation_without_engine_submit()
     );
     assert_eq!(late["quiescent"], true);
     assert!(late["operations"][0]["error"].is_null());
+    assert_eq!(engine.state.lock().unwrap().capability_gets, 1);
     assert!(engine.state.lock().unwrap().operations.is_empty());
 }
 
@@ -1465,12 +1629,15 @@ async fn attempted_lost_response_keeps_wire_identity_after_window_and_skips_new_
     start(&router, "attempted").await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     api(&router, resume_event("attempted", 100, &engine)).await;
+    let gets = engine.state.lock().unwrap().capability_gets;
     assert_eq!(
         query(&router, "attempted", "prepare").await["quiescent"],
         false
     );
+    assert_eq!(engine.state.lock().unwrap().capability_gets, gets + 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
     let done = ready(&router, "attempted", "prepare").await;
+    assert_eq!(engine.state.lock().unwrap().capability_gets, gets + 2);
     assert!(done["operations"][0]["auto_pin"].is_null());
     let s = engine.state.lock().unwrap();
     let submits: Vec<_> = s
