@@ -5056,3 +5056,7 @@ parent 阅读完整三个文件差异，并独立 HTTP orchestration 40 项通�
 C32 原始响应中，按需十条、生命周期九条 cached_tokens 明确为整数 0，cached_tokens_details 为 null。上游 output_streamer 的零命中分支返回 None；旧工具将此合法响应标为详情异常，原 repeated_prefill 汇总漏掉对应完整重算。原始 invalid、异常和验收失败状态保持原样，不改写证据。
 
 strict 模式仅将明确整数 0 解释为各层零命中，保留 details_present=false 与 explicit_zero_total 来源；缺少总量、非零或非法类型继续 unknown。非严格旧调用保持兼容。parent 阅读完整差异并独立 session/stress/analyze/lifecycle 62 项通过，17.561s，diff 检查通过；新 HTTP 回归验证完整前缀计入重算。日志：lifecycle-opt/zero-cache-parent-tests.log。只读逐条证明为 zero-cache-c32-proof.json：对应前缀重算至少 163840/147456 tokens，固定预取未出现该类响应；不能继续将旧汇总的零值作为无重算证明。
+
+### Rust Router 静态检查
+
+精确 Rust 1.92.0 release Clippy 检出反馈构造器原有 min/max 形式的 manual_clamp。单行替换为等价 clamp，未改变合法 limit 或协议语义。parent 独立 release lib Clippy（-D warnings）通过，HTTP orchestration 40 项复测通过，3.55s。日志：lifecycle-opt/router-clippy-1.92-final-parent.log、router-clamp-parent-http-tests.log。运行中的压力进程继续使用 61284379d0，后续二进制切换在配对实验边界进行。
