@@ -84,10 +84,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_post_verify_graphs import (
-    EaglePostVerifyGraphs,
-    simulated_acc_len_generator,
-)
+from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     compact_verify_max_top_k,
@@ -113,6 +110,7 @@ from sglang.srt.speculative.spec_utils import (
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
+    simulated_acc_len_generator,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
