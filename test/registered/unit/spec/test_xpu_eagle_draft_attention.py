@@ -8,7 +8,7 @@ import sys
 from unittest.mock import patch
 
 import pytest
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, Qwen3_5Config
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
@@ -51,6 +51,15 @@ def _resolve(draft_config: PretrainedConfig, **overrides):
 )
 def test_unsupported_draft_head_size_falls_back_to_triton(draft_config):
     assert _resolve(draft_config) == "triton"
+
+
+def test_composite_draft_config_reads_the_text_config():
+    # Qwen3_5Config has no top-level attention dims; they live in its text_config.
+    unsupported = Qwen3_5Config(
+        text_config={"head_dim": 80, "hidden_size": 5120, "num_attention_heads": 64}
+    )
+    assert _resolve(unsupported) == "triton"
+    assert _resolve(Qwen3_5Config(text_config={"head_dim": 256})) is None
 
 
 def test_supported_or_explicit_draft_backend_is_kept():
