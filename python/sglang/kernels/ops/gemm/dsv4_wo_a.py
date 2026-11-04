@@ -6,6 +6,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.quantization.mxfp8_epilogue import ue8m0_scale
 
+# Measured on H100 against rope + einsum: wins through 16 tokens, loses from 32.
+WO_A_FUSED_INV_ROPE_MAX_TOKENS = 16
+
 
 @triton.jit
 def _wo_a_bf16_gemv_kernel(X, W, Y, R: tl.constexpr, D: tl.constexpr, BN: tl.constexpr):
@@ -135,3 +138,98 @@ def wo_a_bf16_small_batch_mxfp8(x: torch.Tensor, weight: torch.Tensor):
         x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
     )
     return _quantize_partial(partial)
+
+
+@triton.jit
+def _wo_a_inv_rope_kernel(
+    X, W, F, POS, P, Y, ARRIVALS, M, SX, G: tl.constexpr, BM: tl.constexpr
+):
+    # One program per (64-row N tile, group, head): split-K by head puts each
+    # program's single 64-wide RoPE window in its last K step.
+    tile, group, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    m = tl.arange(0, BM)
+    n = tile * 64 + tl.arange(0, 64)
+    rows = m[:, None] < M
+    x_ptr = X + m[:, None] * SX + group * 4096 + head * 512
+    w_ptr = W + (group * 1024 + n[None, :]) * 4096 + head * 512
+    acc = tl.zeros((BM, 64), tl.float32)
+    for i in range(7):
+        k = i * 64 + tl.arange(0, 64)
+        x = tl.load(x_ptr + k[None, :], rows, 0)
+        acc = tl.dot(x, tl.load(w_ptr + k[:, None]), acc)
+    # Inverse RoPE on interleaved (re, im) pairs, rounded to bf16 like the
+    # standalone fused_rope_inplace(inverse=True) output.
+    pair = 448 + 2 * tl.arange(0, 32)
+    re = tl.load(x_ptr + pair[None, :], rows, 0).to(tl.float32)
+    im = tl.load(x_ptr + pair[None, :] + 1, rows, 0).to(tl.float32)
+    pos = tl.load(POS + m, m < M, 0)
+    freq = F + pos[:, None] * 64 + 2 * tl.arange(0, 32)[None, :]
+    cos = tl.load(freq, rows, 0)
+    sin = tl.load(freq + 1, rows, 0)
+    rot_re = (re * cos + im * sin).to(tl.bfloat16)
+    rot_im = (im * cos - re * sin).to(tl.bfloat16)
+    rot = tl.join(rot_re, rot_im).reshape(BM, 64)
+    k = 448 + tl.arange(0, 64)
+    acc = tl.dot(rot, tl.load(w_ptr + k[:, None]), acc)
+
+    out = (m[:, None] * G + group) * 1024 + n[None, :]
+    split_stride = M * G * 1024
+    tl.store(P + head * split_stride + out, acc, rows)
+    tl.debug_barrier()
+    # The eighth head to arrive reduces the tile. Counters are never reset, so
+    # arrivals are taken mod 8; the mask stays correct across int32 wrap.
+    arrived = tl.atomic_add(ARRIVALS + tile * G + group, 1, sem="acq_rel")
+    if (arrived & 7) == 7:
+        total = tl.zeros((BM, 64), tl.float32)
+        for h in range(8):
+            total += tl.load(P + h * split_stride + out, rows, 0, cache_modifier=".cg")
+        tl.store(Y + out, total.to(tl.bfloat16), rows)
+
+
+_wo_a_arrivals: dict[torch.device, torch.Tensor] = {}
+
+
+def wo_a_bf16_fused_inv_rope(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Inverse RoPE on each head's last 64 dims, then ``einsum('tgd,grd->tgr')``.
+
+    x: [T, G, 4096] bf16, eight [448 nope | 64 rope] heads per group; the token
+    stride may be padded. weight: [G, 1024, 4096] bf16. freqs: [max_pos, 64] fp32,
+    interleaved (cos, sin). Returns [T, G, 1024] bf16.
+
+    Launches on one device must not overlap: they share split-K arrival counters.
+    """
+    m = x.shape[0]
+    groups = weight.shape[0]
+    assert 1 <= m <= WO_A_FUSED_INV_ROPE_MAX_TOKENS and groups <= 8
+    assert x.shape[1:] == (groups, 4096) and weight.shape == (groups, 1024, 4096)
+    assert x.dtype == weight.dtype == torch.bfloat16 and weight.is_contiguous()
+    assert x.stride(2) == 1 and x.stride(1) == 4096
+    assert freqs.dtype == torch.float32 and freqs.shape[1] == 64
+    assert freqs.is_contiguous() and positions.shape == (m,)
+    arrivals = _wo_a_arrivals.get(x.device)
+    if arrivals is None:
+        arrivals = torch.zeros(16 * 8, dtype=torch.int32, device=x.device)
+        _wo_a_arrivals[x.device] = arrivals
+    result = torch.empty((m, groups, 1024), dtype=x.dtype, device=x.device)
+    partial = torch.empty((8, m, groups, 1024), dtype=torch.float32, device=x.device)
+    _wo_a_inv_rope_kernel[(16, groups, 8)](
+        x,
+        weight,
+        freqs,
+        positions,
+        partial,
+        result,
+        arrivals,
+        m,
+        x.stride(0),
+        groups,
+        16,
+        num_warps=4,
+        num_stages=6,
+    )
+    return result
