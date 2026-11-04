@@ -13,8 +13,9 @@
 # ==============================================================================
 """Kimi-K3 ROCm MLA decode: write the query and the latent KV cache in one launch.
 
-K3 MLA applies no RoPE, so the RoPE stage of the fused kernels runs against
-one-row identity cos/sin tables with all-zero positions.
+K3 MLA applies no RoPE. The gfx950 HIP op has only a RoPE form, so it runs against
+one-row identity cos/sin tables with all-zero positions; the Triton fallback uses
+AITER's no-RoPE kernel.
 """
 
 from typing import Optional, Tuple
@@ -114,12 +115,8 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
             k_nope=k_nope,
             k_pe=k_pe,
             kv_cache=kv_cache,
-            slot_mapping=out_cache_loc,
-            # The identity tables have one row and not every kernel clamps positions,
-            # so every token reads row 0.
-            positions=get_buffer("kimi_k3_mla_zero_positions", _ZeroPositions).get(
-                tokens=tokens, device=q_nope.device
-            ),
+            # AITER reads slot_mapping with stride 1, as in the split chain.
+            slot_mapping=out_cache_loc.contiguous(),
             k_scale=self._unit_scale,
         )
         q = self._write_aiter(kernel_args=kernel_args, num_heads=num_heads)
@@ -163,6 +160,11 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
         q_nope = kernel_args["q_nope"]
         aiter_args = dict(
             kernel_args,
+            # The identity tables have one row and not every kernel clamps positions,
+            # so every token reads row 0.
+            positions=get_buffer("kimi_k3_mla_zero_positions", _ZeroPositions).get(
+                tokens=q_nope.shape[0], device=q_nope.device
+            ),
             cos_cache=self._identity_cos,
             sin_cache=self._identity_sin,
             out=torch.empty(
@@ -182,22 +184,16 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
         return mla_q_cache_aiter_hip.run(**aiter_args)
 
     def _write_triton(self, *, kernel_args: dict) -> torch.Tensor:
-        from sglang.srt.layers.rocm_linear_utils import (
-            fused_qk_rope_cat_and_cache_mla,
-        )
+        from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_cat_and_cache_mla
 
-        q, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+        q, _, _, _ = fused_qk_cat_and_cache_mla(
             kernel_args["q_nope"],
             kernel_args["q_pe"],
             kernel_args["k_nope"],
             kernel_args["k_pe"],
             kernel_args["kv_cache"],
             kernel_args["slot_mapping"],
-            kernel_args["positions"],
-            self._identity_cos,
-            self._identity_sin,
             kernel_args["k_scale"],
-            True,  # is_neox
             q_out_dtype=kernel_args["q_nope"].dtype,
         )
         return q

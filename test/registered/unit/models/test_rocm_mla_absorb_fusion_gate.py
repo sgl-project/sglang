@@ -11,6 +11,7 @@ ForwardBatch to evaluate and so is not part of this predicate.
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -18,7 +19,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
 from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter
-from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -122,8 +122,6 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
     and the cache holds the bytes the split chain would have written."""
 
     def setUp(self):
-        # write() registers the shared zero-position buffer on this CPU device.
-        self.addCleanup(get_resources().buffers.pop, "kimi_k3_mla_zero_positions", None)
         self.writer = KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64)
         self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
         # The kernels are the boundary; the gate in front of them is under test.
@@ -180,6 +178,61 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                 self.assertIsNone(
                     self._write(attention_backend="dsa", is_target_verify=verify)
                 )
+
+
+class TestMlaQCacheWriterCallSite(CustomTestCase):
+    """forward_absorb_rocm_core consults the writer only for non-DCP decode
+    and target-verify; every other step keeps the split chain."""
+
+    def _call(self, *, mode, dcp_enabled=False):
+        writer = mock.Mock()
+        attn = SimpleNamespace(
+            rocm_mla_q_cache_writer=writer,
+            attn_mqa=SimpleNamespace(layer_id=0, k_scale_float=1.0),
+            current_attention_backend="aiter",
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: mode == "decode",
+                is_target_verify=lambda: mode == "target_verify",
+            ),
+            out_cache_loc=torch.arange(2),
+        )
+        with (
+            mock.patch.object(
+                forward_mla_rocm,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
+            ),
+            mock.patch.object(forward_mla_rocm, "get_kv_layers"),
+        ):
+            result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
+                attn,
+                q_nope_out=None,
+                q_pe=None,
+                k_nope=None,
+                k_pe=None,
+                forward_batch=forward_batch,
+            )
+        return result, writer.write
+
+    def test_decode_and_target_verify_use_the_writer(self):
+        for mode in ("decode", "target_verify"):
+            with self.subTest(mode=mode):
+                result, write = self._call(mode=mode)
+                write.assert_called_once()
+                self.assertIs(result, write.return_value)
+                self.assertEqual(
+                    write.call_args.kwargs["is_target_verify"], mode == "target_verify"
+                )
+
+    def test_dcp_and_extend_keep_the_split_chain(self):
+        """DCP decode all-gathers q from the split chain, and extend is not covered."""
+        for mode, dcp_enabled in (("decode", True), ("extend", False)):
+            with self.subTest(mode=mode, dcp_enabled=dcp_enabled):
+                result, write = self._call(mode=mode, dcp_enabled=dcp_enabled)
+                self.assertIsNone(result)
+                write.assert_not_called()
 
 
 if __name__ == "__main__":
