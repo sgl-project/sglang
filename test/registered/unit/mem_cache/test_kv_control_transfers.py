@@ -1226,6 +1226,7 @@ def assert_retired(cache, service):
     assert not service.control.executor.storage_reads.jobs
     assert not service.control.executor.storage_reads.interests
     assert not service.control.executor.storage_reads.demands
+    assert not service.control.executor.storage_reads._joinable
     assert not cache.ongoing_prefetch
     assert not cache.prefetch_loaded_tokens_by_reqid
     assert not cache.prefetch_loaded_storage_start_by_reqid
@@ -1261,6 +1262,397 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             selection=target,
             message=message,
         )
+
+    def _ordinary_prefetch(self, cache, service, target, request):
+        cache.prefetch_from_storage(
+            request,
+            cache.tree_core.root_node.id,
+            cache_fixtures.array("q", target.token_ids),
+            matched_prefix_tokens=[],
+            cache_salt=service.cache_salt(target.cache_salt),
+        )
+
+    def _consume_ordinary_prefetch(self, cache, service, request):
+        def ready():
+            cache.drain_storage_control_queues()
+            return cache.check_prefetch_progress(request)
+
+        wait_for(service, ready)
+        span = cache.pop_prefetch_loaded_span(request)
+        cache.discard_storage_prefetch_accounting(request)
+        service.progress()
+        return span
+
+    def test_queued_native_host_job_coalesces_demand_before_any_io(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        for finish in ("complete", "cancel", "expire"):
+            config = ServiceConfig(
+                namespace="ns",
+                engine_id="engine",
+                cache_limits=CacheLimits(max_concurrent_storage_reads=1),
+            )
+            with (
+                self.subTest(finish=finish),
+                hicache(self, config, namespace_keys=True) as owner,
+            ):
+                _, cache, service, _ = owner
+                scopes = [
+                    cache_fixtures.target(cache_salt=f"queued-{i}") for i in range(2)
+                ]
+                self._cold_scopes(owner, scopes)
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                query, get = cc._storage_hit_query, cc.page_get_func
+                queries, gets = [], []
+                demand = CacheRequestHandle("queued-demand", 0)
+
+                def counted_query(operation):
+                    queries.append(operation)
+                    return query(operation)
+
+                def blocked_get(operation, *args, **kwargs):
+                    gets.append(operation)
+                    entered.set()
+                    assert release.wait(5)
+                    return get(operation, *args, **kwargs)
+
+                try:
+                    with (
+                        patch.object(cc, "_storage_hit_query", counted_query),
+                        patch.object(cc, "page_get_func", blocked_get),
+                        patch.object(cache, "prefetch_threshold", 1),
+                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    ):
+                        first = self._restore(service, scopes[0], "queue-first")
+                        wait_for(service, entered.is_set)
+                        queued = public_transfer(
+                            service,
+                            "prefetch",
+                            "storage",
+                            "host",
+                            "queue-second",
+                            salt=scopes[1].cache_salt,
+                        )
+                        reads = service.control.executor.storage_reads
+                        job = reads.interests[queued.ref.operation_id].job
+                        self.assertIsNone(job.operation)
+                        # Queuing changes no exact-scope/namespace/stop-policy rule.
+                        for values, salt, extra_key, policy in (
+                            (
+                                (1, 2),
+                                service.cache_salt(scopes[1].cache_salt),
+                                None,
+                                "wait_complete",
+                            ),
+                            (
+                                (1, 2, 3, 5),
+                                service.cache_salt(scopes[1].cache_salt),
+                                None,
+                                "wait_complete",
+                            ),
+                            (
+                                (1, 2, 3, 4),
+                                service.cache_salt("foreign"),
+                                None,
+                                "wait_complete",
+                            ),
+                            (
+                                (1, 2, 3, 4),
+                                service.cache_salt(scopes[1].cache_salt),
+                                "foreign",
+                                "wait_complete",
+                            ),
+                            (
+                                (1, 2, 3, 4),
+                                service.cache_salt(scopes[1].cache_salt),
+                                None,
+                                "best_effort",
+                            ),
+                        ):
+                            with patch.object(cache, "prefetch_stop_policy", policy):
+                                self.assertFalse(
+                                    reads.join_demand(
+                                        demand,
+                                        [],
+                                        cache_fixtures.RadixKey(
+                                            cache_fixtures.array("q", values)
+                                        ),
+                                        extra_key,
+                                        salt,
+                                    )
+                                )
+                        self._ordinary_prefetch(cache, service, scopes[1], demand)
+                        self.assertIs(reads.demands[demand].job, job)
+                        self.assertIsNone(job.operation)
+                        self.assertNotIn(demand, cache.ongoing_prefetch)
+                        self.assertFalse(cache.check_prefetch_progress(demand))
+                        self.assertEqual((len(queries), len(gets)), (1, 1))
+                        if finish == "cancel":
+                            self.assertEqual(
+                                service.control.cancel(queued.ref).status,
+                                Status.CANCELLING,
+                            )
+                        elif finish == "expire":
+                            self.clock.now += 5.1
+                            service.progress()
+                            self.assertEqual(
+                                current(service, queued).status, Status.CANCELLING
+                            )
+                        self.assertIn(demand, job.demands)
+                        release.set()
+                        self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                        self.assertEqual(
+                            wait(service, queued).status,
+                            (
+                                Status.COMPLETED
+                                if finish == "complete"
+                                else Status.CANCELLED
+                            ),
+                        )
+                        self.assertEqual(
+                            self._consume_ordinary_prefetch(cache, service, demand),
+                            (4, 0),
+                        )
+                        self.assertEqual((len(queries), len(gets)), (2, 2))
+                finally:
+                    release.set()
+                    cache.release_aborted_request(demand)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_aborting_joined_queued_demand_and_native_interest_leaves_no_io(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            cache_limits=CacheLimits(max_concurrent_storage_reads=1),
+        )
+        with hicache(self, config, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [cache_fixtures.target(cache_salt=f"abort-{i}") for i in range(2)]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            query, get = cc._storage_hit_query, cc.page_get_func
+            queries = []
+            demand = CacheRequestHandle("queued-abort", 0)
+
+            def counted_query(operation):
+                queries.append(operation)
+                return query(operation)
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            try:
+                with (
+                    patch.object(cc, "_storage_hit_query", counted_query),
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    first = self._restore(service, scopes[0], "abort-first")
+                    wait_for(service, entered.is_set)
+                    queued = self._restore(service, scopes[1], "abort-queued")
+                    self._ordinary_prefetch(cache, service, scopes[1], demand)
+                    reads = service.control.executor.storage_reads
+                    self.assertIn(demand, reads.demands)
+                    self.assertEqual(
+                        service.control.cancel(queued.ref).status, Status.CANCELLING
+                    )
+                    cache.release_aborted_request(demand)
+                    self.assertEqual(wait(service, queued).status, Status.CANCELLED)
+                    self.assertEqual(len(queries), 1)
+                    self.assertFalse(reads.demands)
+                    release.set()
+                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                    self.assertEqual(len(queries), 1)
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_joined_capacity_wait_defers_and_normal_prefetch_can_continue(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            target = cache_fixtures.target(cache_salt="pinned-fallback")
+            self._cold_scopes(owner, [target])
+            pressure = self._host_pressure(owner)
+            self._pin_pressure(service, pressure)
+            demand = CacheRequestHandle("capacity-fallback", 0)
+            cc = cache.cache_controller
+            queries = []
+            query = cc._storage_hit_query
+
+            def counted_query(operation):
+                queries.append(operation)
+                return query(operation)
+
+            try:
+                with (
+                    patch.object(cc, "_storage_hit_query", counted_query),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    queued = self._restore(service, target, "pinned-native")
+                    self.assertEqual(
+                        current(service, queued).update.code, "whole_scope_capacity"
+                    )
+                    self._ordinary_prefetch(cache, service, target, demand)
+                    self.assertIn(
+                        demand, service.control.executor.storage_reads.demands
+                    )
+                    done = wait(service, queued)
+                    self.assertEqual(done.status, Status.DEFERRED)
+                    self.assertEqual(done.update.code, "whole_scope_capacity")
+                    self.assertFalse(queries)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand),
+                        (0, None),
+                    )
+                    self.assertFalse(service.control.executor.storage_reads._joinable)
+                    self.assertTrue(cache.check_prefetch_progress(demand))
+                    self.assertFalse(cache.has_ongoing_prefetch(demand))
+                    # A fresh ordinary attempt uses its own normal hit-allocation
+                    # fallback; it cannot rejoin the retired native job.
+                    self._ordinary_prefetch(cache, service, target, demand)
+                    self.assertNotIn(
+                        demand, service.control.executor.storage_reads.demands
+                    )
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand),
+                        (0, None),
+                    )
+                    self.assertEqual(len(queries), 1)
+                    self.assertTrue(cache.check_prefetch_progress(demand))
+                    self.assertFalse(cache.has_ongoing_prefetch(demand))
+                    self.assertEqual(cc.mem_pool_host.available_size(), 0)
+            finally:
+                cache.release_aborted_request(demand)
+                self._pin_pressure(service, pressure, mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_gpu_waiter_under_pin_pressure_keeps_ordinary_fallback_independent(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, dma = owner
+            scopes = [
+                cache_fixtures.target(cache_salt=f"gpu-pin-{i}") for i in range(2)
+            ]
+            self._cold_scopes(owner, scopes)
+            pressure = self._host_pressure(owner)
+            self._pin_pressure(service, pressure)
+            demand = CacheRequestHandle("gpu-barrier-fallback", 0)
+            cc = cache.cache_controller
+            query, queries = cc._storage_hit_query, []
+
+            def counted_query(operation):
+                queries.append(operation.request_id)
+                return query(operation)
+
+            try:
+                with (
+                    patch.object(cc, "_storage_hit_query", counted_query),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    gpu = self._restore(service, scopes[0], "gpu-pin-waiter", dst="gpu")
+                    host = self._restore(service, scopes[1], "host-pin-waiter")
+                    self.assertEqual(
+                        current(service, host).update.code,
+                        "shared_prefix_serialization",
+                    )
+                    self._ordinary_prefetch(cache, service, scopes[1], demand)
+                    self.assertNotIn(
+                        demand, service.control.executor.storage_reads.demands
+                    )
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand),
+                        (0, None),
+                    )
+                    self.assertEqual(queries, [demand.rid])
+                    self.assertTrue(cache.check_prefetch_progress(demand))
+                    self.assertFalse(service.blocks_prefill)
+                    self.assertFalse(dma.pending)
+                    self.assertEqual(
+                        service.control.cancel(gpu.ref).status, Status.CANCELLED
+                    )
+                    self.assertEqual(
+                        service.control.cancel(host.ref).status, Status.CANCELLED
+                    )
+            finally:
+                cache.release_aborted_request(demand)
+                self._pin_pressure(service, pressure, mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_joined_waiter_defers_if_gpu_load_becomes_active_after_join(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, dma = owner
+            gpu_target, host_target = [
+                cache_fixtures.target(cache_salt=f"late-gpu-{i}") for i in range(2)
+            ]
+            self._cold_scopes(owner, [gpu_target, host_target])
+            self.assertEqual(
+                wait(service, self._restore(service, gpu_target, "warm-host")).status,
+                Status.COMPLETED,
+            )
+            gpu_path = service.control.executor._walk(
+                gpu_target.token_ids,
+                service.control.executor._compatibility(gpu_target),
+            )
+            gpu_rows = [(gpu_path[-1][0], gpu_target.token_ids)]
+            pressure = self._host_pressure(owner)
+            self._pin_pressure(service, pressure)
+            self._pin_pressure(service, gpu_rows, salt=gpu_target.cache_salt)
+            demand = CacheRequestHandle("late-gpu-fallback", 0)
+            try:
+                with (
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    patch.object(
+                        cache.cache_controller,
+                        "_storage_hit_query",
+                        side_effect=AssertionError("unapproved cold I/O"),
+                    ),
+                ):
+                    host = self._restore(service, host_target, "older-host-queued")
+                    self._ordinary_prefetch(cache, service, host_target, demand)
+                    self.assertIn(
+                        demand, service.control.executor.storage_reads.demands
+                    )
+                    gpu = self._restore(service, gpu_target, "new-gpu-load", dst="gpu")
+                    wait_for(service, lambda: bool(dma.pending))
+                    done = wait(service, host)
+                    self.assertEqual(done.status, Status.DEFERRED)
+                    self.assertEqual(done.update.code, "shared_prefix_serialization")
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand),
+                        (0, None),
+                    )
+                    self.assertTrue(service.blocks_prefill)
+                    self.assertTrue(dma.pending)
+                    dma.finish()
+                    self.assertEqual(wait(service, gpu).status, Status.COMPLETED)
+            finally:
+                cache.release_aborted_request(demand)
+                self._pin_pressure(service, pressure, mode="release")
+                self._pin_pressure(
+                    service, gpu_rows, mode="release", salt=gpu_target.cache_salt
+                )
+            assert_retired(cache, service)
+            cache.sanity_check()
 
     def test_storage_pipeline_config_defaults_bounds_and_public_wiring(self):
         from sglang.srt.mem_cache.unified_cache.priority_claims import (
@@ -1916,11 +2308,11 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         self.assertEqual(pool.available_size(), leave_free)
         return nodes
 
-    def _pin_pressure(self, service, rows, *, mode="acquire"):
+    def _pin_pressure(self, service, rows, *, mode="acquire", salt=None):
         for node, tokens in rows:
             payload = {
                 "target": msgspec.json.decode(
-                    msgspec.json.encode(cache_fixtures.target(tokens))
+                    msgspec.json.encode(cache_fixtures.target(tokens, cache_salt=salt))
                 ),
                 "location": {"tier": "host"},
                 "mode": mode,

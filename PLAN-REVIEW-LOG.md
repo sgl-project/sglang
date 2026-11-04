@@ -4904,3 +4904,11 @@ root 独立 proof：最终 transfers 42 passed、25 subtests，16.19s；cache/se
 自然 L2 首轮两组 flush 分别约 11.9s/59.3s，足以改变整组吞吐。分析器增加全部初始 flush 原始时长、保留 inclusive wall，同时仅扣除实验 flush 计算 work throughput；capability refresh、真实发布/压力/恢复及控制清理仍计入。资源窗口从 raw arm_result 时间减 arm.wall_ms 推导，注明未知 logging/validation gap，防止用 earliest request 加 full wall 把 59s 重置误移到下一组。
 
 root 阅读全部差异并独立验证：40 项通过（analysis-reset-tests-root.log）。新用例两组实际工作均 150s、flush 为 10s/60s，inclusive 吞吐不同而 work 吞吐相同；原始窗口无跨组重叠。已完成显式 L2 的 work 总时长按需 421.662s、PIN 422.218s，仍为约持平，未借调整口径抹去负差异。
+
+### 持续压力发现：排队 native job 与正式请求重复读取
+
+真实 C8 基线首轮 PREFETCH 128 条均有效，提前就绪仅 2 条，整组约 196s；同轮按需组约 157s。受控 CPU file-store 复现确认 queued native job 未加入 _joinable，正式请求会独立恢复，两个范围发生 3 次 query/GET。host exact job 在注册 interest 后立即可发现，保持原有 salt/完整 prefix/extra_key/stop-policy 约束，修复后物理 query/GET 为 2 次，普通 demand 实际 span 同为 (4,0)。
+
+保护边界：全 PIN 空间无法批准时，已有 demand 的 queued job 真实 DEFERRED，正常进度接口消费零新增 storage span 后允许计算；GPU/FIFO barrier 阻止新 join，join 后出现 GPU load 也 DEFERRED，原 DMA/prefill fence 保留。native-only 仍等待，取消/期限不撤销有效 demand，abort 清理后未启动任务不产生 I/O。
+
+root 阅读全部生产与测试差异并独立运行 transfers、cache、service、protection、feedback、controller：123 passed、96 subtests，24.59s（native-queued-regressions-root.log）。生产文件测试 SHA256=daff864598fe3e266ed5a7352d3d6e5e9267c9f3f7255334fcb5fd885160778a；源码、命令、前后机制证据见 native-proof-manifest.json 与 native_queued_demand_repro.py。运行中的基线 f65 不变；更新尚未启动的优化 runtime 后，以相同 0.8/大池配置完成真实 GPU/Mooncake 验证及 8/16/32 长测。按用户授权提交，不推送。

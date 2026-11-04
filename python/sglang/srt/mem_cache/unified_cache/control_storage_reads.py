@@ -112,6 +112,12 @@ class StorageCacheReads:
         job = self._joinable.get(self._demand_key(tokens, extra_key, cache_salt))
         if job is None or job.cancel_requested or job.failure or job.retired:
             return False
+        if job.operation is None and (
+            not self._has_live_interest(job) or self._gpu_barrier(job)
+        ):
+            # Ordinary reads retain their existing fallback if an exclusive
+            # control operation cannot progress. Never bypass its native gate.
+            return False
         self.demands[request] = _Demand(
             job, max(len(prefix or ()), self._length(job, "host"))
         )
@@ -236,6 +242,16 @@ class StorageCacheReads:
         interest = _Interest(work, job)
         self.interests[work.ref.operation_id] = interest
         job.interests.add(work.ref.operation_id)
+        if job.work.payload.dst.tier == "host":
+            # A queued physical job is already a valid exact-scope owner.
+            # Arriving demand must not issue duplicate I/O before it starts.
+            self._joinable[
+                self._demand_key(
+                    job.tokens,
+                    job.compatibility.extra_key,
+                    job.compatibility.cache_salt,
+                )
+            ] = job
         if job.operation is None and not job.loading:
             self._start(job)
         return self._take(interest)
@@ -271,7 +287,10 @@ class StorageCacheReads:
             waiting = self._admission_wait(job)
             if waiting is not None:
                 job.waiting = waiting
-                self._release(job)
+                if job.demands and self._gpu_barrier(job):
+                    self._retire(job, status=Status.DEFERRED, code=waiting)
+                else:
+                    self._release(job)
                 return
             if gpu_length == len(job.tokens) and job.work.payload.dst.tier == "gpu":
                 self._retire(job)
@@ -292,7 +311,12 @@ class StorageCacheReads:
                 return
             if not self._host_capacity(job, len(job.tokens) - host_length):
                 job.waiting = "whole_scope_capacity"
-                self._release(job)
+                if job.demands:
+                    # Ordinary demand must be able to continue computation
+                    # when PIN/host pressure prevents a complete cold restore.
+                    self._retire(job, status=Status.DEFERRED, code=job.waiting)
+                else:
+                    self._release(job)
                 return
             # The query has not allocated rows yet. Charge its complete missing
             # span until the owner observes real allocation or quiescence.
@@ -323,14 +347,6 @@ class StorageCacheReads:
             job.operation = info.operation
             job.operation.native_quiescent = False
             job.operation.native_on_publish = lambda: self._published(job)
-            if job.work.payload.dst.tier == "host":
-                self._joinable[
-                    self._demand_key(
-                        job.tokens,
-                        job.compatibility.extra_key,
-                        job.compatibility.cache_salt,
-                    )
-                ] = job
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
             if job.operation is None and not job.loading:
@@ -339,14 +355,7 @@ class StorageCacheReads:
     def _admission_wait(self, job):
         # Polling rotates the job dictionary. Use immutable admission order so
         # newer host arrivals cannot keep refilling ahead of a GPU waiter.
-        if any(
-            other.admission_order < job.admission_order
-            and other.work.payload.dst.tier == "gpu"
-            and other.operation is None
-            and not other.loading
-            and self._has_live_interest(other)
-            for other in self.jobs.values()
-        ):
+        if self._gpu_barrier(job):
             return "shared_prefix_serialization"
         active = [
             other
@@ -364,6 +373,25 @@ class StorageCacheReads:
         ):
             return "shared_prefix_serialization"
         return None
+
+    def _gpu_barrier(self, job):
+        return any(
+            other is not job
+            and (
+                other.loading
+                or (
+                    other.work.payload.dst.tier == "gpu"
+                    and (
+                        other.operation is not None
+                        or (
+                            other.admission_order < job.admission_order
+                            and self._has_live_interest(other)
+                        )
+                    )
+                )
+            )
+            for other in self.jobs.values()
+        )
 
     def _has_live_interest(self, job):
         if job.demands:
