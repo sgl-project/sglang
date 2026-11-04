@@ -10,7 +10,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -189,6 +189,46 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
             with self.subTest(mrope_positions=positions.dim() == 2):
                 with self.assertRaises(AssertionError):
                     self.call(positions, mrope_axis_map=axis_map_passed)
+
+    def test_tokens_past_int32_offset(self):
+        """Past 2**31 elements of the packed QKV projection, the last tokens must
+        match the same tokens run alone."""
+        num_q_heads, num_kv_heads, head_dim = 16, 4, 256
+        q_gate_dim = 2 * num_q_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
+        width = q_gate_dim + 2 * kv_dim
+        tokens = 2**31 // width + 2
+        # qkv and cos_sin_cache in, then q, k and gate out.
+        required = tokens * (width + self.rotary_dim + q_gate_dim + kv_dim) * 2
+        if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+            self.skipTest("Requires about 9 GiB of free GPU memory")
+        qkv = torch.randn(tokens, width, device="cuda", dtype=torch.bfloat16)
+        q_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+        k_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+        cos_sin_cache = torch.randn(
+            tokens, self.rotary_dim, device="cuda", dtype=torch.bfloat16
+        )
+        positions = torch.arange(tokens, device="cuda", dtype=torch.int64)
+
+        def run(rows):
+            return fused_qk_gemma_rmsnorm_rope_gate(
+                qkv[rows, :q_gate_dim],
+                qkv[rows, q_gate_dim : q_gate_dim + kv_dim],
+                q_weight,
+                k_weight,
+                cos_sin_cache,
+                positions[rows],
+                self.eps,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                self.rotary_dim,
+                has_gate=True,
+            )
+
+        n = 4096
+        for out, tail in zip(run(slice(None)), run(slice(-n, None))):
+            torch.testing.assert_close(out[-n:], tail, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

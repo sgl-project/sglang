@@ -106,7 +106,8 @@ def _layer_norm_fwd_1pass_kernel(
         tl.extra.cuda.gdc_wait()
 
     # Map the program id to the starting row of X and Y it should compute.
-    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    # int64: rows * stride overflows int32.
+    row_start = tl.program_id(0).to(tl.int64) * ROWS_PER_BLOCK
     group = tl.program_id(1)
 
     # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
