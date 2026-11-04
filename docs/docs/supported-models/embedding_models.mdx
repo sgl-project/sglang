@@ -18,15 +18,12 @@ sglang serve \
   --is-embedding
 ```
 
-### EmbeddingGemma
-
-EmbeddingGemma uses bidirectional attention and is auto-detected, so its best default command is simply:
-
-```bash
-sglang serve --model-path google/embeddinggemma-300m
-```
-
-On CUDA, SGLang automatically uses breakable CUDA graph (BCG) for its full encoder prefill and disables incompatible radix-cache and chunked-prefill behavior. Do not add the deprecated piecewise CUDA graph knobs.
+<Note>
+Model-specific setup (prerequisites, performance defaults, launch flags) lives
+in the [SGLang Cookbook](/cookbook/autoregressive/Google/EmbeddingGemma) — for
+example, for EmbeddingGemma, which is auto-detected and served with breakable
+CUDA graph by default.
+</Note>
 
 ### Client Request
 
@@ -138,7 +135,7 @@ print("Embedding:", response["data"][0]["embedding"])
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>EmbeddingGemma</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="/cookbook/autoregressive/Google/EmbeddingGemma">EmbeddingGemma</a></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`google/embeddinggemma-300m`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bidirectional Gemma3 text encoder; auto-detected and served with BCG by default</td>
