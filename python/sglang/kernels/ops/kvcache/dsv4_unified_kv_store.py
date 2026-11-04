@@ -15,10 +15,6 @@ import triton.language as tl
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
     check_two_pool_pair,
 )
-from sglang.srt.utils import is_gfx1250_supported
-
-# Callers may pass a row-strided kv only where this is set. TODO: try gfx950/gfx942.
-SWA_STORE_TAKES_ROW_STRIDE = is_gfx1250_supported()
 
 
 @triton.jit
@@ -85,10 +81,7 @@ def store_swa_into_unified(
 
     has_final = final_pos is not None
     fp_arg = final_pos if has_final else positions
-    if SWA_STORE_TAKES_ROW_STRIDE:
-        assert kv.stride(1) == 1 and kv.dtype == unified_kv.dtype
-    else:
-        assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
+    assert kv.stride(1) == 1 and kv.dtype == unified_kv.dtype
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
     two_pool = kv_rope is not None

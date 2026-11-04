@@ -41,9 +41,6 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
-from sglang.kernels.ops.kvcache.dsv4_unified_kv_store import (
-    SWA_STORE_TAKES_ROW_STRIDE,
-)
 from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
@@ -407,6 +404,8 @@ def _tbo_collective_sizes(
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+# Store the verify kv from the strided qkv_a slice. TODO: try gfx950/gfx942.
+_VERIFY_KV_STRIDED = _is_gfx1250_supported
 
 
 if _use_aiter:
@@ -2349,7 +2348,7 @@ class MQALayer(MqaAttentionBase):
                 # rows are per token (swa_loc is built for verify too) and are
                 # written before attention either way, so the kernel stores them
                 # itself, off the strided kv.
-                if not SWA_STORE_TAKES_ROW_STRIDE:
+                if not _VERIFY_KV_STRIDED:
                     kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
                 swa_page_size, bf16_store = 1, True
