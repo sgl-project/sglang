@@ -157,6 +157,33 @@ def _call_server_info_with(
 
 
 class TestServerInfoTransportParity(CustomTestCase):
+    def test_rust_launch_info_redacts_the_api_keys(self):
+        # Only the API key (or nothing) guards /server_info, so reporting the
+        # keys would hand the admin key to every API-key holder.
+        args = ServerArgs(
+            model_path="dummy", api_key="sk-api", admin_api_key="sk-api admin"
+        )
+        # The command joins argv: a value may hold spaces or contain the other
+        # key, argparse takes an abbreviated flag, and a later flag overrides.
+        args._launch_command = (
+            "python -m sglang.launch_server --admin-api-key old-admin "
+            "--api-key sk-api --admin-api-ke=sk-api admin"
+        )
+        scheduler = SimpleNamespace(
+            server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+        )
+        info = rust_config._launch_server_info(scheduler)
+        for secret in ("sk-api", 'admin"', "old-admin"):
+            self.assertNotIn(secret, info)
+        launch = json.loads(info)
+        self.assertEqual(launch["api_key"], "<redacted>")
+        self.assertEqual(launch["admin_api_key"], "<redacted>")
+        self.assertEqual(
+            launch["launch_command"],
+            "python -m sglang.launch_server --admin-api-key <redacted> "
+            "--api-key <redacted> --admin-api-ke=<redacted>",
+        )
+
     def test_http_and_both_grpc_roles_share_startup_metadata(self):
         for config in (None, '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'):
             with self.subTest(kv_events_config=config):

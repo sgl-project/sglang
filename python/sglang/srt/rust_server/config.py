@@ -6,6 +6,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import socket
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
@@ -143,6 +144,8 @@ def _build_server_args(
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
         grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
+        api_key=get_serving().api_key,
+        admin_api_key=get_serving().admin_api_key,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
@@ -386,7 +389,43 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
     # router reads this key to pick its protocol.
     info["enable_http2"] = False
+    _redact_api_keys(info)
     return json.dumps(info, default=str)
+
+
+_API_KEY_FIELDS = ("api_key", "admin_api_key")
+
+
+def _redact_api_keys(info: Dict[str, Any]) -> None:
+    """Keep the listener's keys out of `/server_info`, which only the API key
+    (or nothing) guards: reporting them would hand the admin key to every
+    API-key holder."""
+    keys = [info[name] for name in _API_KEY_FIELDS if info.get(name)]
+    for name in _API_KEY_FIELDS:
+        if info.get(name) is not None:
+            info[name] = "<redacted>"
+    command = info.get("launch_command")
+    if not command:
+        return
+    # The command joins argv. First each key's value, whole and longest first
+    # (one key may contain the other), which catches a value holding spaces...
+    for key in sorted(keys, key=len, reverse=True):
+        command = re.sub(rf"(?<=[ =]){re.escape(key)}(?= |$)", "<redacted>", command)
+    # ...then whatever follows a key flag, which catches a value a later flag
+    # overrode. argparse takes any unambiguous prefix of a flag.
+    flags = [f"--{name.replace('_', '-')}" for name in _API_KEY_FIELDS]
+    words, redact_next = [], False
+    for word in command.split(" "):
+        flag, eq, _ = word.partition("=")
+        if redact_next:
+            word, redact_next = "<redacted>", False
+        elif len(flag) > 2 and any(f.startswith(flag) for f in flags):
+            if eq:
+                word = f"{flag}=<redacted>"
+            else:
+                redact_next = True
+        words.append(word)
+    info["launch_command"] = " ".join(words)
 
 
 def _tokenizer_model_max_length(tokenizer: Any, context_len: int) -> int:

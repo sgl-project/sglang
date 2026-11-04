@@ -30,17 +30,14 @@ use crate::message::response::{CustomizedInfo, RequestStats};
 use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
     environ,
-    response::{error_response, error_value},
+    response::{error_response, error_value, sse_response},
 };
 use axum::{
     Extension, Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::{get, post},
 };
 use sglang_api_types::api::v1 as api;
@@ -790,7 +787,7 @@ async fn generate_single(
         use futures::StreamExt;
         let s = generation_event_stream(vec![(call, request)], incremental, false)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         // Unary: fold to the terminal and respond once. `CoreCall` disarms
         // itself on a terminal item; truncation leaves it armed for drop cleanup.
@@ -893,7 +890,7 @@ async fn generate_batch(
         let incremental = state.server_args.incremental_streaming_output;
         let s = generation_event_stream(calls, incremental, true)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         // Unary: poll every item concurrently, as Python's gather does. `join_all`
         // preserves input order for the final JSON array, while each drain observes
@@ -1766,6 +1763,12 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap();
             let response = routes().with_state(state).oneshot(request).await.unwrap();
+            if stream {
+                assert_eq!(
+                    response.headers()["content-type"],
+                    crate::utils::response::SSE_CONTENT_TYPE
+                );
+            }
             let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .unwrap();

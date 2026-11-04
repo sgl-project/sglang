@@ -5477,6 +5477,98 @@ class TestLazyReexports(CustomTestCase):
             server_args_module.NotAThing
 
 
+class TestRustServerUnsupportedArgs(CustomTestCase):
+    # A non-default CLI setting for every refused argument.
+    REFUSED = {
+        "ssl_keyfile": ["--ssl-keyfile", "key.pem"],
+        "ssl_certfile": ["--ssl-certfile", "cert.pem"],
+        "ssl_ca_certs": ["--ssl-ca-certs", "ca.pem"],
+        "ssl_keyfile_password": ["--ssl-keyfile-password", "pw"],
+        "enable_ssl_refresh": ["--enable-ssl-refresh"],
+        "allowed_media_domains": ["--allowed-media-domains", "example.com"],
+        "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
+        "enable_cache_report": ["--enable-cache-report"],
+        "enable_trace": ["--enable-trace"],
+        "warmups": ["--warmups", "voice_chat"],
+        "completion_template": ["--completion-template", "deepseek_coder"],
+        "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
+        "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
+        "enable_return_routed_experts": ["--enable-return-routed-experts"],
+        "enable_lora": ["--enable-lora"],
+        "lora_paths": ["--lora-paths", "adapter=/adapters/a"],
+        "tokenizer_mode": ["--tokenizer-mode", "slow"],
+        "tokenizer_backend": ["--tokenizer-backend", "fastokens"],
+        "gc_warning_threshold_secs": ["--gc-warning-threshold-secs", "1"],
+        "tokenizer_metrics_allowed_custom_labels": [
+            "--tokenizer-metrics-allowed-custom-labels",
+            "tenant",
+        ],
+        "return_input_ids": ["--return-input-ids"],
+        "return_output_ids": ["--return-output-ids"],
+    }
+
+    @staticmethod
+    def _resolve(cli_args, rust_server=True):
+        args = prepare_server_args(["--model-path", "dummy", *cli_args])
+        # `override` leaves the variable set when its body raises.
+        with patch.dict(os.environ), envs.SGLANG_RUST_SERVER.override(rust_server):
+            args.resolve_once()
+
+    def test_every_unsupported_arg_is_refused_by_name(self):
+        self.assertEqual(
+            set(self.REFUSED), set(validation_hook.RUST_SERVER_UNSUPPORTED_ARGS)
+        )
+        for name, cli_args in self.REFUSED.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError, f"does not support {cli_args[0]}:"
+                ):
+                    self._resolve(cli_args)
+                # The Python frontend honors them.
+                self._resolve(cli_args, rust_server=False)
+
+    def test_error_names_every_offending_flag(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._resolve([arg for args in self.REFUSED.values() for arg in args])
+        message = str(ctx.exception)
+        for cli_args in self.REFUSED.values():
+            self.assertIn(cli_args[0], message)
+
+    def test_supported_and_default_valued_args_pass(self):
+        self._resolve(
+            [
+                # Accepted in Rust-server mode.
+                "--log-requests",
+                "--log-requests-level",
+                "1",
+                "--crash-dump-folder",
+                "/tmp/dumps",
+                "--trust-remote-code",
+                "--enable-http2",
+                "--enable-request-time-stats-logging",
+                "--skip-server-warmup",
+                # Honored by the Rust server.
+                "--default-chat-template-kwargs",
+                '{"enable_thinking": false}',
+                "--enable-strict-thinking",
+                "--api-key",
+                "sk-test",
+                "--admin-api-key",
+                "sk-admin",
+                # Refused arguments at their default values.
+                "--media-url-max-file-size-mb",
+                "64",
+                "--tokenizer-mode",
+                "auto",
+                "--tokenizer-backend",
+                "huggingface",
+                # Python disables the GC warning when this is not positive.
+                "--gc-warning-threshold-secs",
+                "-1",
+            ]
+        )
+
+
 class TestPrefillWeightVersionCompatibility(CustomTestCase):
     def test_untracked_kv_paths_rejected(self) -> None:
         """Reject paths that load or produce KV without preserving provenance."""

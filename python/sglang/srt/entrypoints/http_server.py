@@ -3167,7 +3167,8 @@ def launch_server(
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here.
+        # 503 until it succeeds, so the main process does not warm up here. A
+        # failed warmup signals this process as a crashed scheduler does.
         from sglang.srt.rust_server.server import drain_notify_name
         from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
 

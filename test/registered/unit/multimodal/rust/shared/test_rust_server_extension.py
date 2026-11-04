@@ -657,6 +657,8 @@ def launch_context(server_cls, cores=(None, None)):
             ),
         ),
         patch.object(server_cls, "_partition_cores", return_value=cores),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(server_cls, "_watch_startup_failure"),
         patch.object(
             server_module,
             "get_mm",
@@ -703,7 +705,10 @@ class TestRustServerExtension(CustomTestCase):
         scheduler = SimpleNamespace(
             processor=sentinel.processor,
             model_config=SimpleNamespace(
-                is_multimodal=True, hf_config=sentinel.config, model_path="test/model"
+                is_multimodal=True,
+                is_generation=True,
+                hf_config=sentinel.config,
+                model_path="test/model",
             ),
             server_args=sentinel.server_args,
         )
@@ -730,6 +735,26 @@ class TestRustServerExtension(CustomTestCase):
         self.assertIsInstance(instance, ModelServer)
         self.assertEqual(instance.http_port, 30001)
         self.assertTrue(instance._multimodal_enabled)
+
+    def test_failed_startup_warmup_signals_the_parent(self):
+        """A failed startup warmup takes the server down as a crashed
+        scheduler does: SIGQUIT to the parent, which kills the process tree;
+        a server that shuts down normally signals nothing."""
+        for failure in ["warmup timed out after 600 s", None]:
+            with self.subTest(failure=failure):
+                server = Mock()
+                server.wait_startup_failure.return_value = failure
+                with patch.object(server_module.psutil, "Process") as process:
+                    RustServer(server, http_port=30000)._watch_startup_failure().join(
+                        timeout=10
+                    )
+                parent = process.return_value.parent.return_value
+                if failure is None:
+                    parent.send_signal.assert_not_called()
+                else:
+                    parent.send_signal.assert_called_once_with(
+                        server_module.signal.SIGQUIT
+                    )
 
     def test_gather_server_endpoints_lists_every_listener_by_dp_rank(self):
         """Every rank joins the collective; only listener ranks contribute an
@@ -1210,6 +1235,7 @@ class TestRustServerExtension(CustomTestCase):
             processor=sentinel.processor,
             model_config=SimpleNamespace(
                 is_multimodal=True,
+                is_generation=False,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
                 model_path="test/model",
             ),
@@ -1221,6 +1247,10 @@ class TestRustServerExtension(CustomTestCase):
                 BuiltinServer, "_build_mm_spec", return_value=sentinel.worker_spec
             ),
         ):
+            with self.assertRaisesRegex(RuntimeError, "serves generation models only"):
+                BuiltinServer.launch(scheduler)
+
+            scheduler.model_config.is_generation = True
             mm_processor.return_value.resolve_spec.return_value = None
             with self.assertRaisesRegex(
                 RuntimeError, "no Rust MM pipeline for model_type='unsupported_vlm'"
@@ -1273,6 +1303,7 @@ class TestRustServerExtension(CustomTestCase):
                 processor=sentinel.processor,
                 model_config=SimpleNamespace(
                     is_multimodal=True,
+                    is_generation=True,
                     hf_config=sentinel.config,
                     model_path="test/model",
                 ),

@@ -9,10 +9,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
 use futures::StreamExt;
@@ -53,6 +50,7 @@ use crate::message::request::GenerateRequest;
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -351,7 +349,7 @@ async fn chat_completions(
             service_tier,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
+        sse_response(event_stream)
     } else {
         unary_chat(
             submitted,

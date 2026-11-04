@@ -374,6 +374,14 @@ class RustServer:
         creates. A model the server cannot serve is refused before the port
         is bound.
         """
+        # The Rust server has generation routes only, and its /model_info
+        # reports every model as generative.
+        if not scheduler.model_config.is_generation:
+            raise RuntimeError(
+                "SGLANG_RUST_SERVER=1 serves generation models only; this is an "
+                "embedding or reward model. Unset SGLANG_RUST_SERVER to serve it."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -475,7 +483,31 @@ class RustServer:
             dp_note,
         )
 
+        instance._watch_startup_failure()
         return instance
+
+    def _watch_startup_failure(self) -> threading.Thread:
+        """Take the server down when its startup warmup fails, as Python's
+        HTTP server does (``_execute_server_warmup``): signal the parent
+        process the way a crashed scheduler does (``run_scheduler_process``),
+        and the parent kills the process tree. A watcher thread, so a hung
+        scheduler loop cannot hold the server up."""
+        parent = psutil.Process().parent()
+
+        def watch() -> None:
+            error = self.server.wait_startup_failure()
+            if error is None:
+                # Shut down, after a warmup that succeeded, was skipped, or
+                # never finished.
+                return
+            logger.error("Rust server startup warmup failed: %s", error)
+            parent.send_signal(signal.SIGQUIT)
+
+        thread = threading.Thread(
+            target=watch, name="rust-server-startup-watch", daemon=True
+        )
+        thread.start()
+        return thread
 
     def install_sigterm_drain(self, notify: Optional[str] = None) -> None:
         """Drain this listener on SIGTERM, which the main process forwards

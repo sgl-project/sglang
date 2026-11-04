@@ -460,6 +460,31 @@ async fn openai_handlers_serve_any_model_name() {
     assert_eq!(model_error("org/model:v1", "org/model:v1"), None);
 }
 
+/// Both OpenAI streams declare UTF-8, as Python's `StreamingResponse` does.
+#[tokio::test]
+async fn openai_streams_declare_utf8_event_stream() {
+    let app = routes().with_state(answering_app_state());
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "stream": true}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages, "stream": true}),
+        ),
+    ] {
+        let response = post_json(app.clone(), path, body).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response.headers()["content-type"],
+            crate::utils::response::SSE_CONTENT_TYPE,
+            "{path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn basic_openai_router_excludes_responses_api() {
     let app = routes().with_state(app_state(core_handle()));
@@ -480,6 +505,10 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        crate::utils::response::SSE_CONTENT_TYPE
+    );
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
