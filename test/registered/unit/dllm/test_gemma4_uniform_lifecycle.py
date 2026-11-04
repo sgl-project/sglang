@@ -373,6 +373,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.runtime_context import get_context, get_parallel
+        from sglang.test.scheduler_test_utils import make_request_retirer
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_session_radix_cache = False
@@ -389,6 +390,10 @@ class TestGemma4RequestValidation(unittest.TestCase):
         sender = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
         scheduler.rust_server = None
+        scheduler.request_retirer = make_request_retirer(
+            output_streamer=scheduler.output_streamer,
+            send_abort_output=scheduler.send_abort_output,
+        )
         recv_req = MagicMock(
             session_params=None,
             session_id=None,

@@ -105,7 +105,7 @@ def _receiver() -> SchedulerRequestReceiver:
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=True),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        reject_request=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
         rust_server_mode=False,
     )

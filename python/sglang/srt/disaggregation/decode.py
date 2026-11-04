@@ -103,7 +103,6 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     is_war_barrier_enabled,
-    make_abort_req,
 )
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -920,7 +919,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.retire_unadmitted_request(req)
+            self.scheduler.request_retirer.retire_unadmitted_request(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             req.time_stats.set_retract_time()
@@ -1063,8 +1062,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
         if message is not None:
             logger.error(message)
-            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            self.scheduler.request_retirer.reject_request(
+                req, message, status_code=HTTPStatus.BAD_REQUEST
+            )
             return True
         return False
 
@@ -1079,22 +1079,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
-            discard_kv_cache_backup(
-                req,
-                self.tree_cache,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
-            self.scheduler.send_abort_output(make_abort_req(req), req)
+            self.scheduler.request_retirer.retire_aborted_retracted(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
             lambda req: recv_req.matches(req.rid)
         ):
-            req.finish_outside_step(FINISH_ABORT())
-            self.scheduler.release_aborted_request(req)
-            self.scheduler.send_abort_output(
-                make_abort_req(req, finished_reason=recv_req.finished_reason), req
+            self.scheduler.request_retirer.retire_aborted_held(
+                req, finished_reason=recv_req.finished_reason
             )
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
@@ -1700,13 +1693,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.unlock(decode_req.req.lock)
                         decode_req.req.lock = None
                     logger.error(reclaim_error)
-                    prepare_abort(
+                    self.scheduler.request_retirer.reject_request(
                         decode_req.req,
                         reclaim_error,
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                    )
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
                     )
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None

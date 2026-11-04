@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Iterable
+from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.deferred_responses import (
@@ -14,6 +15,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -33,6 +35,22 @@ def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> IndexedReqList:
     queue = IndexedReqList(kind, req_of=lambda x: x.req)
     queue.join(decode_reqs)
     return queue
+
+
+def make_request_retirer(**collaborators) -> RequestRetirer:
+    """A `RequestRetirer` over mocks, with `collaborators` replacing them."""
+    return RequestRetirer(
+        **{
+            "tree_cache": MagicMock(),
+            "beam_coordinator": MagicMock(),
+            "hisparse_coordinator": None,
+            "uocr_runtime": None,
+            "output_streamer": MagicMock(),
+            "send_abort_output": MagicMock(),
+            "send_to_tokenizer": MagicMock(),
+            **collaborators,
+        }
+    )
 
 
 def empty_request_lists(scheduler: Scheduler) -> None:

@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import make_request_retirer
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
@@ -1120,7 +1121,7 @@ class TestPrefillAdder(CustomTestCase):
         for shard_size in (2, 4):
             capacity = shard_size * tokens_per_rank
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
-            queue.scheduler = SimpleNamespace(output_streamer=MagicMock())
+            queue.scheduler = SimpleNamespace(request_retirer=make_request_retirer())
             queue.max_input_len = max_bootstrap_input_len(
                 capacity=capacity, page_size=page_size, shard_size=shard_size
             )

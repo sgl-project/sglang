@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.scheduler_test_utils import make_request_retirer
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -917,6 +918,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
         scheduler.send_abort_output = MagicMock()
+        scheduler.request_retirer = make_request_retirer(
+            tree_cache=scheduler.tree_cache,
+            send_abort_output=scheduler.send_abort_output,
+        )
         scheduler.enable_continuous_input_polling = False
         scheduler._engine_paused = True
         aborted, kept = self._make_req("aborted"), self._make_req("kept")

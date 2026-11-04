@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import empty_request_lists, make_request_retirer
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -93,6 +93,12 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
+    s.request_retirer = make_request_retirer(
+        beam_coordinator=s.beam_coordinator,
+        output_streamer=s.output_streamer,
+        send_abort_output=s.send_abort_output,
+        send_to_tokenizer=s.ipc_channels.send_to_tokenizer,
+    )
     return s
 
 
@@ -116,11 +122,11 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
         s.enable_hierarchical_cache = True
-        s.tree_cache = MagicMock(spec=["finish"])
+        s.request_retirer.tree_cache = MagicMock(spec=["finish"])
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
 
-        s.tree_cache.finish.assert_called_once_with(
+        s.request_retirer.tree_cache.finish.assert_called_once_with(
             candidate.cache_request_handle, CacheRequestOutcome.ABORT
         )
         self.assertEqual(list(s.waiting_queue), [])
@@ -173,14 +179,14 @@ class TestQueuedAbort(CustomTestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
-        s.release_aborted_request = MagicMock()
+        s.request_retirer.release_aborted_request = MagicMock()
 
         s.abort_request(AbortReq(rid="queued"))
         s.abort_request(AbortReq(abort_all=True))
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
-        s.release_aborted_request.assert_called_once_with(req)
+        s.request_retirer.release_aborted_request.assert_called_once_with(req)
 
 
 class TestRunningTimeout(CustomTestCase):
