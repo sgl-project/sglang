@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
 from sglang.srt.multimodal.processors.qwen_vl import (

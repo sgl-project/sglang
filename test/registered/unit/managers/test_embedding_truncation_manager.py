@@ -5,12 +5,12 @@ from unittest.mock import AsyncMock, Mock
 import torch
 
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -182,6 +182,7 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
         processor = SimpleNamespace(
             prefer_tokenized_input=True,
             process_mm_data_async=AsyncMock(return_value=original),
+            finalize_cache_identities=Mock(),
         )
         self.manager.mm_processor = processor
         req = self.request(
@@ -198,6 +199,7 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original.input_ids, list(range(12)))
         self.assertEqual(original.token_type_ids.shape, (1, 12))
         processor.process_mm_data_async.assert_awaited_once()
+        processor.finalize_cache_identities.assert_called_once_with(original)
 
     async def test_mm_batch_cannot_skip_processor_when_batch_encoding_enabled(self):
         req = self.request(
