@@ -39,7 +39,8 @@ def _jit_topk_v2_module():
     args = make_cpp_args(is_arch_support_pdl())
     mode = envs.SGLANG_TOPK_V2_MODE.get()
     assert mode in (0, 1, 2), f"SGLANG_TOPK_V2_MODE must be 0, 1 or 2, got {mode}"
-    extra_cuda_cflags = [f"-DSGL_TOPK_MODE={mode}"]
+    # ptxas schedules kernels in parallel; unlike nvcc --split-compile, the SASS is unchanged
+    extra_cuda_cflags = [f"-DSGL_TOPK_MODE={mode}", "-Xptxas=--split-compile=0"]
     # Enable each cluster path only when its occupancy probe reports capacity.
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         for cluster_size, occupancy in ((8, 2), (16, 1)):
