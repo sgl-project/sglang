@@ -79,7 +79,7 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
     (torch.float32, 1024): (_Config(1024, 512, 1, 8192, 4096, 3),),
     (torch.float32, 4096): (_Config(4096, 256, 1, 4096, 4096, 3),),
 }
-SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
+SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3), (10, 7))
 
 
 # (max rows, cluster size), widest first: the most rows each cluster size runs in one wave
