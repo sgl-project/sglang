@@ -328,29 +328,22 @@ def _xpu_gated_resnorm(
     shift: torch.Tensor,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """Bit-exact single-kernel ``r = residual + update * gate; LN(r) * (1 + scale) + shift``."""
-    if (
-        torch.compiler.is_compiling()
-        or _FLUX2_XPU_GATED_RESNORM.disabled
-        or not can_use_xpu_layernorm_modulate(residual.dtype, residual.shape[-1])
+    if torch.compiler.is_compiling() or not can_use_xpu_layernorm_modulate(
+        residual.dtype, residual.shape[-1]
     ):
         return None
     # Exactness depends on the reduction width and row layouts, not on row count.
     sig = (residual.dtype, residual.device, residual.shape[-1], norm.eps)
-    verified = _FLUX2_XPU_GATED_RESNORM.is_verified(sig)
-    if not verified and torch.xpu.is_current_stream_capturing():
+    if not _FLUX2_XPU_GATED_RESNORM.can_attempt(sig):
         return None
-    try:
-        out = xpu_gated_resnorm(residual, update, gate, scale, shift, norm.eps)
-    except Exception as exc:
-        _FLUX2_XPU_GATED_RESNORM.on_exception(exc, logger=logger)
-        return None
-    if verified:
-        return out
-    ref_residual = residual_gate_add(residual, update, gate)
-    ref = (norm(ref_residual) * (1 + scale) + shift, ref_residual)
-    return _FLUX2_XPU_GATED_RESNORM.accept_or_fallback(
-        out,
-        ref,
+
+    def reference():
+        ref_residual = residual_gate_add(residual, update, gate)
+        return norm(ref_residual) * (1 + scale) + shift, ref_residual
+
+    return _FLUX2_XPU_GATED_RESNORM.run(
+        lambda: xpu_gated_resnorm(residual, update, gate, scale, shift, norm.eps),
+        reference,
         sig=sig,
         equal=tensors_equal,
         logger=logger,
