@@ -20,6 +20,8 @@ sglang/kernels/
   fused_op.py    # BaseFusedOp: per-operator multi-backend contract
   kernel_api_logging.py  # kernel API crash-debugging decorator
   numerics.py    # shared numerics helpers for bit-exact Triton kernels
+  arch/          # current_arch(): cached facts about the local GPU (CUDA,
+                 # HIP or a base DeviceArch), shared by kernels and srt
   ops/
     <group>/     # one subpackage per operator group (see list below)
   jit/           # shared JIT build/runtime infra: utils/ (incl. the Helion

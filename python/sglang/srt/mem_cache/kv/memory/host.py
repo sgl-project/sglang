@@ -19,6 +19,8 @@ from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 def page_envelope_pair(plan: KVStoragePlan) -> Optional[Tuple[str, str]]:
     """The owner and the other end sub-pool, owner first, when both lay out
     MHA page envelopes; None otherwise."""
+    if len(plan.sub_pools) < 2:
+        return None
     up, down = plan.sub_pools[0], plan.sub_pools[-1]
     if not all(isinstance(s.spec, MHASubPoolSpec) for s in (up, down)):
         return None
