@@ -1439,7 +1439,9 @@ class TestHostPoolPreflight(CustomTestCase):
 class TestHicacheMambaSizeGb(CustomTestCase):
     @staticmethod
     def _pool(nbytes):
-        return SimpleNamespace(get_kv_size_bytes=lambda: nbytes)
+        return SimpleNamespace(
+            host_capacity_bytes=None, get_kv_size_bytes=lambda: nbytes
+        )
 
     def test_pinned_mamba_share_ignores_device_kv_growth(self):
         mamba = self._pool(6 << 30)
