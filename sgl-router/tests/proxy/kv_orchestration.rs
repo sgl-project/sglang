@@ -1224,6 +1224,202 @@ async fn expired_preparation_can_take_future_or_explicit_shared_interest() {
 }
 
 #[tokio::test]
+async fn automatic_preparation_falls_back_while_cancelled_episode_waits_for_ack() {
+    for event_name in ["resume_expected", "tool_done"] {
+        for drained in [false, true] {
+            let engine = Engine::start().await;
+            engine.state.lock().unwrap().running = true;
+            let router = router_with(&[&engine], false, Some(window_config())).await;
+            start(&router, "old").await;
+            start(&router, "new").await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            submit(&router, "old", "prepare", prefix(vec![1, 2, 3, 4]), &engine).await;
+            query(&router, "old", "prepare").await;
+            api(
+                &router,
+                json!({"kind":"cancel","task":task("old"),"message_id":"prepare"}),
+            )
+            .await;
+            if drained {
+                assert_eq!(query(&router, "old", "prepare").await["quiescent"], true);
+            }
+            let old_wire = engine
+                .state
+                .lock()
+                .unwrap()
+                .operations
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            let before = engine
+                .state
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .filter(|c| c["kind"] == "submit")
+                .count();
+            let mut body = resume_event("new", 1000, &engine);
+            body["event"] = json!(event_name);
+            if event_name == "tool_done" {
+                body["available_ms"] = json!(10000);
+            }
+            let fallback = api(&router, body.clone()).await;
+            assert_eq!(fallback["state"], "on_demand_fallback");
+            assert_eq!(fallback["reason"], "cancelled_preparation_draining");
+            assert_eq!(api(&router, body).await, fallback);
+            let finish = event(&router, "new", "task_finished", 3, "finish").await;
+            assert!(finish["intents"].as_array().unwrap().is_empty());
+            assert_eq!(
+                engine
+                    .state
+                    .lock()
+                    .unwrap()
+                    .commands
+                    .iter()
+                    .filter(|c| c["kind"] == "submit")
+                    .count(),
+                before
+            );
+            let old = query(&router, "old", "prepare").await;
+            assert_eq!(old["quiescent"], true);
+            assert_eq!(
+                old["operations"][0]["result"]["update"]["status"],
+                "cancelled"
+            );
+            api(
+                &router,
+                json!({"kind":"ack","task":task("old"),"message_id":"prepare"}),
+            )
+            .await;
+            engine.state.lock().unwrap().running = false;
+            start(&router, "fresh").await;
+            api(&router, resume_event("fresh", 500, &engine)).await;
+            let fresh = ready(&router, "fresh", "prepare").await;
+            let new_wire = fresh["operations"][0]["result"]["ref"]["message_id"]
+                .as_str()
+                .unwrap();
+            assert_ne!(new_wire, old_wire);
+            assert_eq!(engine.state.lock().unwrap().operations.len(), 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_episode_conflict_stays_an_error_for_explicit_or_legacy_preparation() {
+    for measured in [false, true] {
+        let engine = Engine::start().await;
+        engine.state.lock().unwrap().running = true;
+        let mut cfg = window_config();
+        if !measured {
+            cfg.preparation_policy = None;
+            cfg.initial_prefetch_ms_per_token = 0.5;
+        }
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "old").await;
+        start(&router, "new").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        submit(&router, "old", "prepare", prefix(vec![1, 2, 3, 4]), &engine).await;
+        query(&router, "old", "prepare").await;
+        api(
+            &router,
+            json!({"kind":"cancel","task":task("old"),"message_id":"prepare"}),
+        )
+        .await;
+        let body = if measured {
+            // An explicit caller cannot opt into fallback by adding an event.
+            json!({"kind":"submit","task":task("new"),"message_id":"prepare",
+                "event":"resume_expected","expected_wait_ms":1000,
+                "action":"sglang.prefetch","target":prefix(vec![1,2,3,4]),"worker_url":engine.url,
+                "source":{"tier":"storage"},"destination":{"tier":"host"}})
+        } else {
+            resume_event("new", 1000, &engine)
+        };
+        let reply: Value = reqwest::Client::new()
+            .post(format!("{}/v1/kv/control", router.url))
+            .bearer_auth("test-control")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error"]["reason"], "Conflict");
+        assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_child_fallback_is_atomic_and_cannot_reschedule_other_live_children() {
+    let engine = Engine::start().await;
+    engine.state.lock().unwrap().running = true;
+    let router = router_with(&[&engine], false, Some(window_config())).await;
+    for id in ["cancelled", "live", "fanout"] {
+        start(&router, id).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    submit(
+        &router,
+        "cancelled",
+        "prepare",
+        prefix(vec![1, 2, 3, 4]),
+        &engine,
+    )
+    .await;
+    query(&router, "cancelled", "prepare").await;
+    api(
+        &router,
+        json!({"kind":"cancel","task":task("cancelled"),"message_id":"prepare"}),
+    )
+    .await;
+    let mut live = resume_event("live", 5000, &engine);
+    live["target"] = prefix(vec![5, 6, 7, 8]);
+    api(&router, live).await;
+    for (index, ids) in [vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]]
+        .into_iter()
+        .enumerate()
+    {
+        api(
+            &router,
+            json!({"kind":"session_event","task":task("fanout"),"event":"request_observed",
+            "event_id":format!("observed-{index}"),"revision":index+1,
+            "branch_id":format!("branch-{index}"),"branch_revision":1,
+            "request_id":format!("request-{index}"),"request_incarnation":"one",
+            "input_ids":ids,"worker_url":engine.url}),
+        )
+        .await;
+    }
+    let mut fanout = resume_event("fanout", 1000, &engine);
+    fanout["revision"] = json!(4);
+    fanout["target"] = json!({"kind":"session"});
+    let fallback = api(&router, fanout).await;
+    assert_eq!(fallback["state"], "on_demand_fallback");
+    assert_eq!(fallback["reason"], "cancelled_preparation_draining");
+    let finish = event(&router, "fanout", "task_finished", 5, "finish").await;
+    assert!(finish["intents"].as_array().unwrap().is_empty());
+    // A failed fanout's 1s window must not replace the existing 5s schedule.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(query(&router, "live", "prepare").await["operations"][0]["result"].is_null());
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
+    for id in ["cancelled", "live"] {
+        api(
+            &router,
+            json!({"kind":"cancel","task":task(id),"message_id":"prepare"}),
+        )
+        .await;
+        assert_eq!(query(&router, id, "prepare").await["quiescent"], true);
+        api(
+            &router,
+            json!({"kind":"ack","task":task(id),"message_id":"prepare"}),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn cancelled_preparation_does_not_reopen_for_a_new_predicted_interest() {
     let engine = Engine::start().await;
     engine.state.lock().unwrap().running = true;
@@ -1252,7 +1448,9 @@ async fn cancelled_preparation_does_not_reopen_for_a_new_predicted_interest() {
         .json()
         .await
         .unwrap();
-    assert_eq!(reply["success"], false);
+    assert_eq!(reply["success"], true);
+    assert_eq!(reply["data"]["state"], "on_demand_fallback");
+    assert_eq!(reply["data"]["reason"], "cancelled_preparation_draining");
     assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
 }
 

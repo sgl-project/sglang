@@ -5080,3 +5080,13 @@ parent 审阅完整两文件差异，并独立 lifecycle 工具 20 项通过，1
 离线成本工具为有效单 host pool 的相邻容量样本增加梯形积分，字节比例仅采用同 epoch 且前后相等的实测 native_host_bytes_per_token。缺失、歧义、多池、大间隔和区间边界不推算，积分覆盖秒数独立报告。指标包含 staging 与引用占用，不能解释为纯推测缓存成本。
 
 parent 阅读完整两文件差异，并独立复测成本工具 15 项通过，5.122s；selected Ruff、格式及 diff 检查通过。覆盖手算面积、零占用、缺失/变化/非法单位、pool 歧义及容量越界。日志：lifecycle-opt/host-byte-seconds-parent-tests.log。该变更只读离线数据，未修改正在运行的实验。
+
+### O5 — 取消期间的自动准备退回
+
+五轮正式评估的首组长测发现同范围重复生命周期在旧任务 task_finished 与 ACK 之间返回 Conflict，随后工具无法清理尚未创建的 intent。停止后续组并排空当前固定工作；1,664 条生成与控制记录保留，其中 17 条控制结果出现该错误，整轮不计为性能验收通过。该轮 source/配置/原始日志及中断记录独立归档。
+
+仅新策略的自动 resume_expected/tool_done PREFETCH，在 typed BookError::Conflict、该需求尚未 attach 且确有 cancel_requested 目标时正常 on_demand_fallback。旧 job 不复活、不新增隐藏 intent 或 Engine 动作。私有 lifecycle 标记由内部调用点传递，显式 submit 无法伪装；旧策略、Capacity 和其他错误保持原行为。已有 child 的 due 更新延迟至完整准入成功后应用，防止失败的 fanout 修改其他任务的时间。
+
+parent 阅读完整两文件差异，并独立复测 51 项 HTTP 回归通过，5.74s；精确 Rust 1.92.0 release lib Clippy（-D warnings）通过，16.57s；全 workspace fmt 和 diff 检查通过。日志：lifecycle-opt/cancelled-interest-parent-http-tests.log、cancelled-interest-parent-clippy.log。新增回归覆盖未排空/已排空未 ACK、重放、无 intent 的 task_finished、ACK 后 fresh wire、显式伪 event 与旧策略拒绝，以及多目标退回的原子性。
+
+记录更正：上一节入口窗口诊断中的“新版 C8”应为批量观察版本 C32；原始 cell 为 batch-screen-c32。两版筛选的跨版本绝对速度不作为单因素因果结论。

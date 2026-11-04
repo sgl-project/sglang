@@ -17,7 +17,7 @@ use sgl_kv_orchestrator::backend_protection::{
 };
 use sgl_kv_orchestrator::{
     models::{PrefixTarget, SessionIdentity},
-    operations::{DemandBook, DemandId},
+    operations::{BookError, DemandBook, DemandId},
     preparation::{Estimate, PreparationCosts},
     protocol::{parse_action, Action},
     session_index::{
@@ -1259,7 +1259,9 @@ impl Actor {
                                 task: task.clone(),
                                 id: pin_id,
                             };
-                            let retained = self.submit(pin, task.clone(), pin_demand, None).await;
+                            let retained = self
+                                .submit(pin, task.clone(), pin_demand, None, false)
+                                .await;
                             if !value["pressure"].as_bool().unwrap_or(false) {
                                 return Ok(
                                     json!({"retention":retained.unwrap_or_else(|e|error("unsupported",e)),"demote":"skipped_no_pressure"}),
@@ -1337,7 +1339,8 @@ impl Actor {
                                 }
                             }
                         }
-                        let mut result = self.submit(command, task, demand, resume_at).await?;
+                        let mut result =
+                            self.submit(command, task, demand, resume_at, true).await?;
                         if self.preparation_costs.is_some() {
                             result["preparation_estimate"] = result["operations"]
                                 .as_array()
@@ -1350,7 +1353,7 @@ impl Actor {
                     _ => Err("unsupported lifecycle signal".into()),
                 }
             }
-            "submit" => self.submit(value, task, demand, None).await,
+            "submit" => self.submit(value, task, demand, None, false).await,
             _ => Err("unsupported Router control kind".into()),
         }
     }
@@ -1360,6 +1363,7 @@ impl Actor {
         task: SessionIdentity,
         demand: DemandId,
         resume_at: Option<Instant>,
+        lifecycle_event: bool,
     ) -> Result<Value, String> {
         let admitted_at = Instant::now();
         let fingerprint = digest(&value);
@@ -1452,6 +1456,7 @@ impl Actor {
             }
         }
         let mut planned = BTreeMap::new();
+        let mut due_updates = BTreeMap::new();
         let mut ids = BTreeSet::new();
         let mut missing = Vec::new();
         for resolved in frozen.known_scope() {
@@ -1545,16 +1550,19 @@ impl Actor {
             ids.insert(id.clone());
             let future = self.has_future_demand(&id);
             if self.preparation_costs.is_some() && resume_at.is_none_or(|at| Instant::now() < at) {
-                if let Some(job) = self.jobs.get_mut(&id).filter(|job| {
+                if let Some(job) = self.jobs.get(&id).filter(|job| {
                     !job.attempted
                         && !job.submitted
                         && (job.preparation_estimate.is_some() || job.late_before_submit)
                 }) {
-                    job.due = if future {
-                        job.due.min(job_due)
-                    } else {
-                        job_due
-                    };
+                    due_updates.insert(
+                        id.clone(),
+                        if future {
+                            job.due.min(job_due)
+                        } else {
+                            job_due
+                        },
+                    );
                 }
             }
             if !self.jobs.contains_key(&id) {
@@ -1649,9 +1657,29 @@ impl Actor {
         {
             return Err("Router claim capacity".into());
         }
-        self.book
-            .attach(demand.clone(), ids.clone())
-            .map_err(|e| format!("{e:?}"))?;
+        match self.book.attach(demand.clone(), ids.clone()) {
+            Ok(()) => {}
+            Err(BookError::Conflict)
+                if self.preparation_costs.is_some()
+                    && lifecycle_event
+                    && action == "sglang.prefetch"
+                    && matches!(
+                        value["event"].as_str(),
+                        Some("resume_expected" | "tool_done")
+                    )
+                    && self.book.jobs_for(&demand).is_none()
+                    && ids
+                        .iter()
+                        .any(|id| self.book.job(id).is_some_and(|job| job.cancel_requested)) =>
+            {
+                // A cancelled episode cannot accept new interests. Automatic
+                // preparation falls back while its original owner drains/acks.
+                return Ok(
+                    json!({"state":"on_demand_fallback","reason":"cancelled_preparation_draining"}),
+                );
+            }
+            Err(error) => return Err(format!("{error:?}")),
+        }
         if let Err(e) = self
             .index
             .track_resource(&task, ResourceKind::Intent, demand.id.clone())
@@ -1669,6 +1697,13 @@ impl Actor {
                 .map_err(|e| format!("{e:?}"))?;
         }
         self.jobs.extend(planned);
+        // Admission is atomic across children: a rejected fanout must not
+        // reschedule another task's already admitted preparation.
+        for (id, due) in due_updates {
+            if ids.contains(&id) {
+                self.jobs.get_mut(&id).unwrap().due = due;
+            }
+        }
         if self
             .config
             .preparation_policy
