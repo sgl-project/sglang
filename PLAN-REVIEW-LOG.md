@@ -4870,3 +4870,13 @@ Final hostpressure6/6valid (N3pairs): TTFT591.20->96.41ms(-83.7%), complete fore
 Real P6Router7/7valid; final legacy3/3/reorg2/2valid, formal Router picked preparedB and actualhostreuse verified. Readonly feedback proof confirms both currentowners/nativewatermarks and scoped-only recovery. Real finalL2claimactive/released; two sharedMooncakeclaimsactive, firsttaskreleasepreserves sibling, bothterminal backendquiescent. Startup-before-ready connection refusal produced no trial and is retained. Total238effective scenarios plus independent protection proofs, immutable compressedraw/schedules/manifests, negative results and source/hardware provenance are archived. Offline initial6run verifier and additive36trial/protection verifier both passed; SHA256SUMS fully verified.
 
 Docs PLAN.md, Router runbook and final report now describe completed P0–P8 first profile and deferred P9. Report: benchmark/session_kv_control/results/2026-11-04/FINAL_ACCEPTANCE.md. Captured source/reflog preserve their original whitespace as evidence; newly generated CSV usesLF. Own model/Router/Mooncake ports51801/51803/12910/12911/52091–52093 stopped after idle proofs; externaljobs untouched. Retained scratch worktrees support review. No push performed; commits have no Codex coauthor.
+
+## mem_fraction_static=0.8 — 持续压力测试工具
+
+用户要求提升实际显存预算、扩大任务数量并延长测试。两台任务 Engine 使用 `mem_fraction_static=0.8`、无 `max_total_tokens` 上限、32 请求上限、HiCache ratio=2、Mooncake TCP 每 Engine 128GB。B 实测 L1=346944、L2=693952 tokens；A L1=346688，自动分配差异 0.074%。测试工具只对无显式 cap 的自动容量容许 1% 差异，并保留实际数值。服务源代码保持不可变 `f65f0393c4`，用于后续优化前对照。
+
+沿用 codex-build 工作流；固定任务书 `/tmp/sglang-rfc-build/mem08/spec/STRESS_PLAN.md`。独立工作树实现后，root 阅读全部新增实现与测试，检查 L2 salt 隔离、并发/失败计账、固定恢复截止时间和 PIN 清理。真实冷请求暴露 `cached_tokens=0/details=null` 的工具校验问题，补充回归后通过。root 独立运行 `python -W error::ResourceWarning -m unittest -v test_stress_bench test_session_kv_bench`：20 项通过，2.107s。
+
+真实 Mooncake 双 Engine 冒烟：L3 两组共 4 条恢复请求、L2 两组共 14 条生成请求全部有效，PIN release/query 无清理失败。初次无效 source smoke 和原 calibration 的自动容量预检拒绝保留为启动观察，不混入正式性能结果。资源采样器已实际读取双 Engine metrics/loads、Master metrics 和 GPU0/1 显存/利用率。
+
+正式矩阵采用 64×16K 会话、两次遍历、3 轮配对，扫描 8/16 并发；L2 使用 4×16K 热点和 53×16K 冷数据冲刷、3 轮配对。无每请求 cache flush；L3 两组均在请求完成后 DEMOTE，显式测量 host/storage 行为。收益尚待正式数据判定。按用户已有授权提交工具，不推送。

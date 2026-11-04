@@ -162,3 +162,5 @@ summary 同时提供全部已完成恢复、验证通过、`prefetch_ready_befor
 交付文件：`manifest.json` 保存配置与版本，`schedule.json` 保存完整顺序，`raw.jsonl` 保存 HTTP/生成/warmup/trial 原始记录，`summary.json` 和 `summary.md` 提供可重新计算的统计。退出码 0 表示全部 trial 通过校验；2 表示存在无效/失败 trial；1 表示启动、能力或配置检查失败。
 
 最终执行快照、238 条场景、性能与限制见 [整合验收](results/2026-11-04/FINAL_ACCEPTANCE.md)。初始退化结果保留，容量修复后的实测单独列出。
+
+`mem_fraction_static=0.8` 的多会话、超 L2 工作集和 8/16 并发持续测试使用 [stress_bench.py](STRESS_BENCH.md)。该入口移除显式 KV token cap，并分别比较 L2 PIN 保留和 L3 异步预取，保留失败、压力请求成本与完整周期吞吐。
