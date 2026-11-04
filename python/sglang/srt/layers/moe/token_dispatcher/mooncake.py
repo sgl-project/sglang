@@ -50,6 +50,21 @@ class _ActiveRanksRing:
         return row
 
 
+def _require_xpu_mooncake_build(built_for: str) -> None:
+    """The published wheels are built for CUDA, and Mooncake before v0.3.14 had no
+    XPU EP at all; either one otherwise fails deeper in with a torch.cuda call or an
+    unexpected keyword argument. `mooncake.ep.DEVICE_TYPE` is absent before v0.3.14."""
+    if built_for == "xpu":
+        return
+    raise RuntimeError(
+        f"This Mooncake build has no Intel XPU support (mooncake.ep.DEVICE_TYPE="
+        f"{built_for!r}). The published wheels are CUDA-only, so build Mooncake "
+        "v0.3.14 or newer from source with -DUSE_XPU=ON -DWITH_EP=ON; see "
+        "https://docs.sglang.io/docs/hardware-platforms/xpu"
+        "#expert-parallelism-with-mooncake-ep"
+    )
+
+
 class MooncakeDispatchOutput(NamedTuple):
     """Mooncake EP dispatch output."""
 
@@ -167,6 +182,10 @@ class _MooncakeEPDispatcherImpl:
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "
                 "with EP support to run SGLang with Mooncake EP."
             )
+        if is_xpu():
+            from mooncake import ep as mooncake_ep
+
+            _require_xpu_mooncake_build(getattr(mooncake_ep, "DEVICE_TYPE", "cuda"))
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion

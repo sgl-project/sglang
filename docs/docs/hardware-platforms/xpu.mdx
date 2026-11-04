@@ -152,9 +152,9 @@ through [Mooncake EP](https://github.com/kvcache-ai/Mooncake), which has a
 native SYCL implementation of its low-latency dispatch and combine. Peers
 exchange tokens over Level Zero IPC, with no MPI or ISHMEM.
 
-Mooncake's prebuilt wheels do not include XPU support, so build it from source
-with the oneAPI compiler, after installing its dependencies
-(`sudo bash dependencies.sh`). Mooncake EP runs on PyTorch's SYCL queues, so use
+XPU EP needs Mooncake v0.3.14 or newer, and its prebuilt wheels are built for
+CUDA, so build it from source with the oneAPI compiler, after installing its
+dependencies (`sudo bash dependencies.sh`). Mooncake EP runs on PyTorch's SYCL queues, so use
 a oneAPI release whose SYCL runtime major version (`libsycl.so.N`) matches the
 one PyTorch XPU installs; PyTorch 2.14+xpu ships `libsycl.so.9`, from oneAPI 2026:
 
@@ -189,6 +189,7 @@ sglang serve                         \
 | Dispatch mode | Low latency; `--deepep-mode auto` resolves to it |
 | Batch size | Prefill chunks and running requests are capped at `SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (default 128) times `--tp`, i.e. 512 at TP4. Raise the variable (up to 1024) for larger batches, at the cost of a larger EP buffer |
 | XPU graphs | Not validated with Mooncake EP; they are off by default on XPU |
+| Mooncake | v0.3.14 or newer, built from source with `-DUSE_XPU=ON -DWITH_EP=ON`. A CUDA-built or older Mooncake is rejected at startup |
 | GPUs | Validated on 4x Intel Arc Pro B60 (Xe2 / BMG) with Qwen/Qwen3-30B-A3B. The GPUs need peer-to-peer access, and the ranks must share a host and PID namespace |
 
 ## Benchmarking with Requests

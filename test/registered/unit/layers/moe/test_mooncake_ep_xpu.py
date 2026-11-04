@@ -12,7 +12,10 @@ from sglang.srt.layers.moe.ep_moe.layer import (
     _xpu_masked_activation,
     _xpu_masked_grouped_experts,
 )
-from sglang.srt.layers.moe.token_dispatcher.mooncake import _ActiveRanksRing
+from sglang.srt.layers.moe.token_dispatcher.mooncake import (
+    _ActiveRanksRing,
+    _require_xpu_mooncake_build,
+)
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -94,6 +97,18 @@ class TestActiveRanksRing(CustomTestCase):
                 self.assertEqual(row.data_ptr(), storage[i])
                 self.assertTrue(bool((row == 1).all()), (cycle, i))
                 row[i] = 0
+
+
+class TestRequireXpuMooncakeBuild(CustomTestCase):
+    def test_rejects_every_build_without_xpu_support(self):
+        # The published wheels are CUDA-only and pre-v0.3.14 has no DEVICE_TYPE at
+        # all, so the caller passes "cuda" for it; both must be refused here rather
+        # than failing deeper in on a torch.cuda call.
+        for built_for in ("cuda", "musa", "maca"):
+            with self.subTest(built_for=built_for):
+                with self.assertRaisesRegex(RuntimeError, "no Intel XPU support"):
+                    _require_xpu_mooncake_build(built_for)
+        self.assertIsNone(_require_xpu_mooncake_build("xpu"))
 
 
 if __name__ == "__main__":
