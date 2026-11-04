@@ -310,8 +310,15 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
     ):
         assert isinstance(logical_attn_allocator._kvcache, DeepSeekV4TokenToKVPool)
-        assert isinstance(
-            logical_attn_allocator._kvcache.c4_kv_pool, HiSparseC4DevicePool
+        _c4_pool = logical_attn_allocator._kvcache.c4_kv_pool
+        # Accept any pool that implements the HiSparse C4 interface, not only the
+        # CUDA class: the NPU pool (NPUHiSparseC4DevicePool) is not a subclass.
+        assert isinstance(_c4_pool, HiSparseC4DevicePool) or (
+            getattr(_c4_pool, "compress_ratio", None) == 4
+            and hasattr(_c4_pool, "register_mapping")
+        ), (
+            "DeepSeek V4 HiSparse requires a C4 device pool with the "
+            f"HiSparse interface, got {type(_c4_pool).__name__}."
         )
         self.compress_ratio = 4
 
@@ -328,9 +335,32 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
+        # Re-export DSV4 side attributes: the scheduler detects is_dsv4 via
+        # hasattr(allocator, "c128_attn_allocator") and otherwise never passes
+        # req_pool_indices down, which the NPU DSV4 allocator asserts on.
+        self.c128_attn_allocator = getattr(
+            logical_attn_allocator, "c128_attn_allocator", None
+        )
+        # Proxy the C128 capacity helpers: take_extend calls them directly.
+        self.c128_num_pages_needed = logical_attn_allocator.c128_num_pages_needed
+        self.ensure_c128_capacity = logical_attn_allocator.ensure_c128_capacity
         paged_allocator_cls = (
             current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
         )
+        # Use the native paged allocator on NPU: the in-tree triton
+        # alloc_extend_kernel overflows the Ascend UB at compile time
+        # (requires 1902592 bits, available 1572864).
+        try:
+            from sglang.srt.utils.common import is_npu as _is_npu_fn
+
+            if _is_npu_fn():
+                from sglang.srt.hardware_backend.npu.allocator_npu import (
+                    NPUPagedTokenToKVPoolAllocator as _NPUPagedCls,
+                )
+
+                paged_allocator_cls = _NPUPagedCls
+        except Exception:
+            pass
         self.hisparse_attn_allocator = paged_allocator_cls(
             self._size_hisparse,
             self.hisparse_page_size,
@@ -568,7 +598,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        **kwargs,
     ):
+        # Forward req_pool_indices (extend) to the NPU DSV4 allocator.
         assert self.page_size > 1
 
         num_new_pages_logical = get_num_new_pages(
@@ -590,6 +622,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ):
             return None
 
+        # Forward req_pool_indices for the extend call.
         logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -597,8 +630,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+            **kwargs,
         )
-        assert logical_indices is not None, "Logical allocation failed in alloc_extend"
+        _npu_bundle = logical_indices
+        assert _npu_bundle is not None, "Logical allocation failed in alloc_extend"
+        # The NPU DSV4 allocator returns a DSV4OutCacheLoc bundle: unwrap
+        # out_full_loc for the loc arithmetic, but still return the bundle.
+        logical_indices = getattr(_npu_bundle, "out_full_loc", _npu_bundle)
 
         compressed_logical_indices = (
             self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
@@ -619,16 +657,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
             hisparse_indices.to(torch.int64)
         )
-        return logical_indices
+        # Return the bundle so static_kv_storage can read out_cache_loc_dsv4.
+        return _npu_bundle
 
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        **kwargs,
     ):
+        # Forward req_pool_indices (decode) to the NPU DSV4 allocator.
         return self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
+            seq_lens, seq_lens_cpu, last_loc, **kwargs
         )
 
     def free_compressed(self, compressed_indices: torch.Tensor):
@@ -653,8 +694,33 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = None
         self.full_free_group = []
 
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
+    def __getattr__(self, name):
+        # Delegate unknown attributes to the logical allocator so the NPU
+        # dsv4_req_to_token_pool can reach DSV4-only helpers such as
+        # replace_req_c128_prefix.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        logical = self.__dict__.get("logical_attn_allocator")
+        if logical is not None:
+            return getattr(logical, name)
+        raise AttributeError(name)
+
+    def free(
+        self,
+        free_index: torch.Tensor = None,
+        *,
+        req=None,
+        req_to_token_pool=None,
+    ):
+        # NPU DSV4 releases on request end: hand the req to the logical
+        # allocator, which owns the C128 pages and request-level state (the
+        # core free() only understands free_index).
+        if req is not None:
+            self.logical_attn_allocator.free(
+                req=req, req_to_token_pool=req_to_token_pool
+            )
+            return
+        if free_index is None or free_index.numel() == 0:
             return
 
         if self.free_group is None:
