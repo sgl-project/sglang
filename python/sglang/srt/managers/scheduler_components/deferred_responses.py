@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
 )
 
 if TYPE_CHECKING:
@@ -37,11 +37,11 @@ class DeferredResponses:
         self.output_streamer = output_streamer
         self.send_abort = send_abort
         # (req, completion) per held response.
-        self.held = _RequestList(
+        self.held = IndexedReqList(
             ListKind.DEFERRED, abort=self._abort, req_of=lambda x: x[0]
         )
 
-    def request_lists(self) -> Dict[ListKind, RequestList]:
+    def request_lists(self) -> Dict[ListKind, ReqList]:
         return {ListKind.DEFERRED: self.held}
 
     def defer(self, req: Req, completion: ResponseCompletion) -> None:
@@ -59,7 +59,7 @@ class DeferredResponses:
         if not self.held:
             return
         ready = []
-        for req, completion in self.held.items():
+        for req, completion in list(self.held.items()):
             if not completion.done():
                 continue
             self.held.leave([req])
@@ -89,7 +89,7 @@ class DeferredResponses:
         self.send_abort(req, finished_reason)
 
     def _abort(self, recv_req: AbortReq) -> None:
-        for req, completion in self.held.items():
+        for req, completion in list(self.held.items()):
             if recv_req.matches(req.rid):
                 self.held.leave([req])
                 try:
