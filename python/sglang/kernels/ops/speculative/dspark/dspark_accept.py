@@ -466,33 +466,13 @@ def _num_compute_units(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def softmax_temp_triton(
-    *,
+def _softmax_temp_split_vocab(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
+    out: torch.Tensor,
     rows_per_request: int,
-) -> torch.Tensor:
-    num_rows, vocab = logits.shape[0], logits.shape[-1]
-    bs = num_rows // rows_per_request
-    assert bs * rows_per_request == num_rows, (
-        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
-    )
-    temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
-    out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
-    # One CTA per row leaves most CUs idle when there are few rows; then split
-    # the vocab across CTAs instead.
-    if not (_is_hip and num_rows < _num_compute_units(logits.device)):
-        BLOCK_V = 4096
-        _softmax_temp_kernel[(num_rows,)](
-            logits,
-            temperatures,
-            out,
-            vocab,
-            rows_per_request,
-            logits.stride(0),
-            BLOCK_V=BLOCK_V,
-        )
-        return out
+) -> None:
+    num_rows, vocab = out.shape
     BLOCK_V = 2048
     CHUNK = 4 * BLOCK_V
     n_chunks = triton.cdiv(vocab, CHUNK)
@@ -523,6 +503,35 @@ def softmax_temp_triton(
         CHUNK=CHUNK,
         BLOCK_V=BLOCK_V,
         N_CHUNKS_P2=triton.next_power_of_2(n_chunks),
+    )
+
+
+def softmax_temp_triton(
+    *,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    rows_per_request: int,
+) -> torch.Tensor:
+    num_rows, vocab = logits.shape[0], logits.shape[-1]
+    bs = num_rows // rows_per_request
+    assert bs * rows_per_request == num_rows, (
+        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    )
+    temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
+    out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
+    if _is_hip and num_rows < _num_compute_units(logits.device):
+        # Too few rows to fill the GPU with one program per row.
+        _softmax_temp_split_vocab(logits, temperatures, out, rows_per_request)
+        return out
+    BLOCK_V = 4096
+    _softmax_temp_kernel[(num_rows,)](
+        logits,
+        temperatures,
+        out,
+        vocab,
+        rows_per_request,
+        logits.stride(0),
+        BLOCK_V=BLOCK_V,
     )
     return out
 
