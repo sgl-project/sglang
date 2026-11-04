@@ -69,6 +69,22 @@ class TestMamba(unittest.TestCase):
             "layer_id=1 not in full attention layers:", str(context.exception)
         )
 
+    def test_hybrid_linear_kv_pool_v_head_dim(self):
+        pool = HybridLinearKVPool(
+            size=16,
+            dtype=torch.bfloat16,
+            page_size=1,
+            head_num=4,
+            head_dim=192,
+            v_head_dim=128,
+            full_attention_layer_ids=[3],
+            device=get_device(),
+            enable_memory_saver=False,
+            mamba_pool=None,
+        )
+        self.assertEqual(pool.full_kv_pool.get_key_buffer(0).shape[-1], 192)
+        self.assertEqual(pool.get_v_head_dim(), 128)
+
     def test_hybrid_linear_kv_pool_npu_layer_ids_match_buffer_groups(self):
         pool = object.__new__(HybridLinearKVPool)
         pool.full_attention_layer_id_mapping = {3: 0, 7: 1}

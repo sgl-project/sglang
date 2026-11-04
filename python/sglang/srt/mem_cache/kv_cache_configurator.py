@@ -2568,6 +2568,7 @@ class KVCacheConfigurator:
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
+            extra_args["v_head_dim"] = self.model_config.v_head_dim
         else:
             pool_class = QSATokenToKVPool
             extra_args.update(
