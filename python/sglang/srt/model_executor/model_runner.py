@@ -220,11 +220,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.sampling.watermarking.core import WatermarkState
-from sglang.srt.server_args import (  # noqa: F401  (re-export)
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
-    ServerArgs,
-    add_chunked_prefix_cache_attention_backend,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
@@ -1022,9 +1018,21 @@ class ModelRunner:
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator(draft_parallel_layout)
+        expert_slots = None
+        if get_exec().moe.enable_paged_experts and (
+            get_exec().moe.paged_experts_num_resident in (None, "auto")
+        ):
+            # --paged-experts-num-resident auto: the KV cache first, then the expert slots.
+            from sglang.srt.layers.moe.paged_experts.sizing import ExpertSlotSizing
+
+            expert_slots = ExpertSlotSizing.for_model(
+                self.model, self.kv_cache_configurator, self.pre_model_load_memory
+            )
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
+        if expert_slots is not None:
+            expert_slots.size(result.max_total_num_tokens)
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool

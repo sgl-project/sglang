@@ -14,8 +14,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentVideoURL,
 )
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.minimax_vl_common import _stack_pixel_values
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.minimax_m3_vl import (
     MAX_IMAGE_PIXELS,
