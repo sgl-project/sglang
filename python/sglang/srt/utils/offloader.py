@@ -166,18 +166,19 @@ class OffloaderV1(BaseOffloader):
                 # one module might have some parameters offloaded and some not
                 break
 
-            # `torch.empty_like` does not support `pin_memory` argument
-            cpu_data = torch.empty_strided(
-                size=p.data.size(),
-                stride=p.data.stride(),
-                dtype=p.data.dtype,
-                layout=p.data.layout,
-                device="cpu",
-                pin_memory=pin_memory,
+            # Charge the storage that empty_strided will allocate, including gaps
+            # in non-contiguous parameters, before allocating pinned host memory.
+            param_bytes = (
+                _empty_strided_like(p.data, device="meta").untyped_storage().nbytes()
             )
+            if self._cpu_offload_bytes + param_bytes > self._cpu_offload_max_bytes:
+                # A later, smaller parameter can still fit the remaining budget.
+                continue
+
+            cpu_data = _empty_strided_like(p.data, device="cpu", pin_memory=pin_memory)
             cpu_data.copy_(p.data)
             p.data = cpu_data
-            self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
+            self._cpu_offload_bytes += param_bytes
             offloaded_parameters = True
 
         if offloaded_parameters:
