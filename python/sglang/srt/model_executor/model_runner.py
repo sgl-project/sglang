@@ -1304,6 +1304,7 @@ class ModelRunner:
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
+                stage_start_layer=self.layer_info.start_layer,
                 device=self.device,
             )
         )

@@ -1,5 +1,5 @@
 """RoutedExpertsCapturer: DeepEP-family backend recognition, capture width,
-and the output-rank host cache."""
+the output-rank host cache, and rows relayed between pipeline stages."""
 
 import unittest
 from types import SimpleNamespace
@@ -147,6 +147,7 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
                 model_config=SimpleNamespace(),
                 num_tokens=8,
                 max_running_requests=2,
+                stage_start_layer=0,
                 device="cpu",
             )
         self.assertEqual(seen["num_fused_shared_experts"], 1)
@@ -158,14 +159,17 @@ class TestOutputRankHostCache(CustomTestCase):
     NUM_TOKENS = 16
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
-    def _capturer(self, attn_tp_rank, backend="none"):
+    def _capturer(
+        self, attn_tp_rank, backend="none", pp_rank=0, pp_size=1, stage_start_layer=0
+    ):
         hf_text_config = SimpleNamespace(
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
         with (
             get_parallel().override(
                 num_dp_ranks=1,
-                pp_rank=0,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
                 attn_tp_rank=attn_tp_rank,
                 attn_tp_size=2,
                 attn_cp_rank=0,
@@ -189,17 +193,18 @@ class TestOutputRankHostCache(CustomTestCase):
                 num_tokens=self.NUM_TOKENS,
                 max_running_requests=4,
                 num_fused_shared_experts=0,
+                stage_start_layer=stage_start_layer,
                 device="cpu",
             )
 
-    def _run_forward(self, cap, topk):
+    def _run_forward(self, cap, topk, layer_ids=None):
         with (
             mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=False),
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
             ),
         ):
-            for layer_id in range(self.NUM_LAYERS):
+            for layer_id in layer_ids or range(self.NUM_LAYERS):
                 cap.capture(layer_id=layer_id, topk_indices=topk[:, layer_id])
             return cap.on_forward_end(
                 SimpleNamespace(
@@ -263,6 +268,30 @@ class TestOutputRankHostCache(CustomTestCase):
                     topk_indices=torch.zeros((3, self.K), dtype=torch.int32),
                 )
         self.assertEqual(gathered_shapes, [(6, self.K)] * self.NUM_LAYERS)
+
+    def test_pipeline_stages_relay_rows_instead_of_writing_the_host_cache(self):
+        """Under pipeline parallelism a stage holds only its own layers, so the
+        output rank must not store its partial rows, and every stage rank,
+        including ranks without a host cache, must hand its rows to the relay."""
+        topk = torch.randint(
+            1,
+            64,
+            (len(self.OUT_CACHE_LOC), self.NUM_LAYERS, self.K),
+            dtype=torch.int32,
+        )
+        first_stage = self._capturer(attn_tp_rank=0, pp_rank=0, pp_size=2)
+        later_stage = self._capturer(
+            attn_tp_rank=0, pp_rank=1, pp_size=2, stage_start_layer=1
+        )
+        for cap, layer_ids in ((first_stage, [0]), (later_stage, [1, 2])):
+            with self.subTest(stage_start_layer=layer_ids[0]):
+                out = self._run_forward(cap, topk, layer_ids=layer_ids)
+                expected = torch.zeros_like(topk)
+                expected[:, layer_ids] = topk[:, layer_ids]
+                self.assertTrue(torch.equal(out.topk, expected))
+                self.assertTrue(torch.equal(out.out_cache_loc, self.OUT_CACHE_LOC))
+        self.assertFalse(later_stage.has_host_cache)
+        self.assertEqual(int(first_stage.host_cache.buffer.count_nonzero()), 0)
 
 
 if __name__ == "__main__":
