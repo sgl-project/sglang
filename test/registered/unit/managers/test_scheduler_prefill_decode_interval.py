@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs, prepare_server_args
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -88,6 +89,7 @@ class TestPrefillOverlapBudgets(CustomTestCase):
 
     def _scheduler(self):
         scheduler = Scheduler.__new__(Scheduler)
+        empty_request_lists(scheduler)
         scheduler.require_mlp_sync = False
         scheduler.result_queue = []
         scheduler.device = "cuda"

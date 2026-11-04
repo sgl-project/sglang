@@ -28,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.utils.network import get_open_port
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mock_model.utils import MOCK_MODEL_PATH
+from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -66,6 +67,7 @@ def _consensus_worker(rank: int, port: int) -> None:
             device="cuda", tp_size=2, ranks=dict(world_rank=rank, gpu_id=rank)
         ):
             scheduler = Scheduler.__new__(Scheduler)
+            empty_request_lists(scheduler)
             scheduler.require_mlp_sync = False
             scheduler.result_queue = []
             scheduler.device = "cuda"
