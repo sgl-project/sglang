@@ -509,8 +509,8 @@ class _FakeOutputStore:
         self.puts = []
         self.cleanup_futures = []
 
-    def submit_put(self, collector):
-        self.puts.append(collector)
+    def submit_put(self, collector, **splits):
+        self.puts.append((collector, splits))
         return self.future
 
     def cleanup_after(self, future):
@@ -536,6 +536,7 @@ class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCa
         state.obj.background = False
         state.obj.return_sampling_mask = True
         state.obj.sampling_logprobs_mode = None
+        state.obj.replay_layer_splits = None
         if via_store:
             state.token_output_collector = TokenOutputCollector()
         self.tm.rid_to_state[rid] = state
@@ -570,14 +571,44 @@ class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCa
         self.assertEqual(meta_info["output_token_sampling_logprobs"], [-0.5, -1.0])
         for key in ("routed_experts", "indexer_topk", "output_token_sampling_mask"):
             self.assertNotIn(key, meta_info)
-        (collector,) = self.store.puts
-        stash = collector.to_stash()
-        np.testing.assert_array_equal(stash.routed_experts, self.routed_experts.numpy())
-        np.testing.assert_array_equal(stash.indexer_topk, self.indexer_topk.numpy())
+        ((collector, splits),) = self.store.puts
+        self.assertEqual(
+            splits, {"routed_experts_splits": [], "indexer_topk_splits": []}
+        )
+        stash = collector.to_stash(**splits)
+        np.testing.assert_array_equal(
+            stash.routed_experts[(0, 1)], self.routed_experts.numpy()
+        )
+        np.testing.assert_array_equal(
+            stash.indexer_topk[(0, 3)], self.indexer_topk.numpy()
+        )
         np.testing.assert_array_equal(
             stash.output_token_sampling_mask_token_ids, [5, 6, 7]
         )
         self.assertIsNone(stash.output_token_sampling_logprobs)
+
+    async def test_store_request_splits_indexer_slots_where_it_splits_layers(self):
+        """The request names layers; the indexer top-k is cut at the capturer slots of
+        those layers, which differ from layer ids on DeepSeek-V4."""
+        self.tm.model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"], compress_ratios=[0, 4, 4, 4]
+            )
+        )
+        state = self._state("split_rid", via_store=True)
+        state.obj.replay_layer_splits = [2]
+        stream = self.tm._wait_one_response(state.obj)
+        self.store.future.set_result(_REF)
+
+        await self.tm._handle_batch_output(self._batch("split_rid"))
+        await anext(stream)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
+        ((_, splits),) = self.store.puts
+        self.assertEqual(
+            splits, {"routed_experts_splits": [2], "indexer_topk_splits": [1]}
+        )
 
     async def test_other_requests_on_a_store_server_stay_inline(self):
         """With the store enabled the detokenizer sends tensors, so the tokenizer

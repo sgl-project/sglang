@@ -946,6 +946,7 @@ class ServingChatTestCase(CustomTestCase):
             self.basic_req.sampling_logprobs_mode = "support"
             self.basic_req.return_indexer_topk = True
             self.basic_req.return_outputs_via_store = True
+            self.basic_req.replay_layer_splits = [12, 24]
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
@@ -954,6 +955,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertTrue(adapted.return_indexer_topk)
             self.assertTrue(adapted.return_outputs_via_store)
+            self.assertEqual(adapted.replay_layer_splits, [12, 24])
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
