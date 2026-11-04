@@ -104,6 +104,21 @@ def get_token_ids_logprobs(logits, token_ids):
     return logprobs
 
 
+def _disable_chat_template_rendering(model) -> None:
+    # sentence-transformers >= 6 renders plain text through the backbone's chat
+    # template (the "message" modality); SGLang embeds the raw text.
+    from sentence_transformers import __version__ as st_version
+
+    if int(st_version.split(".")[0]) < 6:
+        return
+    transformer = model[0]
+    if "message" in transformer.modality_config:
+        del transformer.modality_config["message"]
+        transformer.input_formatter.supported_modalities = list(
+            transformer.modality_config.keys()
+        )
+
+
 def _get_sentence_transformer_embedding_model(
     model_path, torch_dtype, matryoshka_dim: Optional[int] = None
 ):
@@ -126,9 +141,16 @@ def _get_sentence_transformer_embedding_model(
         # BOS/EOS behavior matches between the HF reference and SRT.
         _fix_v5_add_bos_eos_token(model.tokenizer, model_path)
     else:  # if no pre-trained sentence-transformers model
+        from sentence_transformers import __version__ as st_version
         from sentence_transformers import models
 
-        word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        # Force causal attention as in the branch above; the kwarg was renamed in v6.
+        config_kw = (
+            "config_kwargs" if int(st_version.split(".")[0]) >= 6 else "config_args"
+        )
+        word_embedding_model = models.Transformer(
+            model_path, **{config_kw: {"is_causal": True}}
+        ).to(dtype=torch_dtype)
         # In transformers v5, composite configs (e.g. Qwen2VLConfig) may not
         # expose hidden_size at the top level.  Patch it from the text sub-config
         # so sentence_transformers' get_word_embedding_dimension() works.
@@ -147,6 +169,7 @@ def _get_sentence_transformer_embedding_model(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
         )
 
+    _disable_chat_template_rendering(model)
     return model.to(get_device())
 
 
