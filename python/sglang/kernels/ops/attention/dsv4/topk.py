@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -36,23 +37,27 @@ def _jit_topk_v2_module():
         get_max_active_clusters,
     )
 
-    args = make_cpp_args(is_arch_support_pdl())
     mode = envs.SGLANG_TOPK_V2_MODE.get()
     assert mode in (0, 1, 2), f"SGLANG_TOPK_V2_MODE must be 0, 1 or 2, got {mode}"
-    # ptxas schedules kernels in parallel; unlike nvcc --split-compile, the SASS is unchanged
-    extra_cuda_cflags = [f"-DSGL_TOPK_MODE={mode}", "-Xptxas=--split-compile=0"]
+    extra_cuda_cflags = [f"-DSGL_TOPK_MODE={mode}"]
+    arch = current_arch()
+    # on CUDA, ptxas schedules kernels in parallel to speed up compilation
+    if arch.cuda is not None:
+        extra_cuda_cflags.append("-Xptxas=--split-compile=0")
     # Enable each cluster path only when its occupancy probe reports capacity.
-    if is_arch_support_pdl():  # set the persistent cluster size after hopper
+    if arch.cuda is not None and arch.cuda.supports_cluster:
         for cluster_size, occupancy in ((8, 2), (16, 1)):
             try:
                 max_active_clusters = get_max_active_clusters(
-                    cluster_size, occupancy=occupancy
+                    cluster_size=cluster_size,
+                    occupancy=occupancy,
                 )
             except NoSchedulableClustersError:
                 max_active_clusters = 0
             extra_cuda_cflags.append(
                 f"-DSGL_TOPK_V2_MAX_C{cluster_size}_OCC{occupancy}={max_active_clusters}"
             )
+    args = make_cpp_args(arch.cuda is not None and arch.supports_pdl)
     kernel = f"TopKKernel<{args}>"
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),

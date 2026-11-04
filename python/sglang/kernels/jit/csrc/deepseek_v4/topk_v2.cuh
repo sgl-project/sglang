@@ -260,7 +260,10 @@ SGL_DEVICE void paged_transform_owned(const TopKProblem& problem, int32_t* out, 
   static_assert(kMode == TopKMode::PAGE_TABLE || kMode == TopKMode::DUAL_OUTPUT);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
   int32_t indices[kNumElems];
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { indices[i] = problem.out[tx]; });
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
+    // load into register at once
+    indices[i] = problem.out[tx];
+  });
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
     if (indices[i] < 0) return;
     out[tx] = transform.page_to_indices(indices[i]);
@@ -530,7 +533,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   const auto bx = blockIdx.x;
   auto problem = params.problem(bx);
   if (problem.seq_len <= problem.topk) {
-    return trivial_transform<kPDLEarly, kMode>(problem, params.template get_transform<kMode>(bx));
+    return trivial_transform<kPDLEarly, kMode>(problem, params.get_transform<kMode>(bx));
   }
   if constexpr (kNeedStaging) {
     problem.out = s_topk_indices;  // write into stage buffer in smem first
@@ -562,9 +565,9 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
           __syncthreads();
           const auto out = problem.out;
           problem.out = s_topk_indices;
-          return paged_transform<kMode>(problem, out, params.template get_transform<kMode>(bx));
+          return paged_transform<kMode>(problem, out, params.get_transform<kMode>(bx));
         }
-        return paged_transform<kMode>(problem, problem.out, params.template get_transform<kMode>(bx));
+        return paged_transform<kMode>(problem, problem.out, params.get_transform<kMode>(bx));
       } else {
         return device::PDLTriggerSecondary<kPDL>();
       }
@@ -574,7 +577,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
-    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
+    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform<kMode>(bx));
   }
 }
 
@@ -606,23 +609,24 @@ constexpr bool kPoolInlineCold = SGL_ARCH_BLACKWELL_OR_GREATER;
 template <bool kPDL, uint32_t kClusterSize>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
-  using ClusterN = impl::TopKCluster<kClusterSize>;
-  __shared__ impl::MaxSmem<typename ClusterN::Smem> smem;
+  using Cluster = impl::TopKCluster<kClusterSize>;
+  __shared__ impl::MaxSmem<typename Cluster::Smem> smem;
   const auto bx = blockIdx.x;
   const auto num_cluster_items = params.global().num_cluster_items;
+  Cluster::init(&smem);  // touches no input: overlaps the producer's tail
   device::PDLWaitPrimary<kPDL>();
   if (bx >= params.batch_size) return;
   device::PDLTriggerSecondary<kPDL>();
-  // Last plan item first: the producer wrote the highest rows last, so they are the likeliest
-  // still in L2.
-  auto idx = static_cast<int32_t>(num_cluster_items - 1 - bx);
-  uint32_t item = 0;
+  // Last plan item first: the producer wrote the highest rows last, so they are the likeliest still in L2.
+  // idx goes through redux.sync, whose result is a uniform register: it stays there across
+  // forward instead of taking one of the kernel's 32 registers (or a stack slot).
+  auto idx = device::warp::reduce_max(static_cast<int32_t>(num_cluster_items - 1 - bx));
 #pragma unroll 1
   while (idx >= 0) {
     const auto it = params.item(idx);
     const auto problem = params.problem(it.batch_id, it.seq_len);
-    ClusterN::template forward</*kUsePDL=*/false, kPoolInlineCold>(problem, &smem, item++);
-    idx -= kNumPersistentClusters;
+    Cluster::template forward</*kUsePDL=*/false, kPoolInlineCold>(problem, &smem);
+    idx = device::warp::reduce_max(idx - static_cast<int32_t>(kNumPersistentClusters));
     if (idx >= 0) __syncthreads();
   }
 }
@@ -635,14 +639,14 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
   const auto by = blockIdx.y;
   auto problem = params.problem(bx);
   __shared__ int32_t s_topk_indices[kMaxTopK];
-  using ClusterN = impl::TopKCluster<kClusterSize>;
-  __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, typename ClusterN::Smem> smem;
+  using Cluster = impl::TopKCluster<kClusterSize>;
+  __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, typename Cluster::Smem> smem;
 
   // randomly elect one worker rank to avoid workload imbalance
   const auto worker_rank = bx % kClusterSize;
   if (problem.seq_len <= problem.topk) {
     if (by != worker_rank) return;
-    return trivial_transform<kPDL, kMode>(problem, params.template get_transform<kMode>(bx));
+    return trivial_transform<kPDL, kMode>(problem, params.get_transform<kMode>(bx));
   }
 
   if constexpr (kNeedStaging) {
@@ -655,36 +659,38 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
   } else if (problem.seq_len <= params.static_cluster_floor) {
     if (by != worker_rank) return;
     Streaming::forward<kPDL>(problem, &smem);
-  } else if constexpr (kMode == TopKMode::PAGE_TABLE || kMode == TopKMode::DUAL_OUTPUT) {
-    // Every rank stages the slots it selects in its own buffer and transforms them
-    // itself, so the row ends without a cluster barrier (every DSMEM write a rank
-    // receives is awaited by that rank's own mbarriers).
-    for_each_item(problem.topk, [&](uint32_t tx, uint32_t) { s_topk_indices[tx] = -1; });
-    ClusterN::forward<kPDL>(problem, &smem);
-    device::PDLTriggerSecondary<kPDL>();
-    __syncthreads();
-    return paged_transform_owned<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
   } else {
+    // Where each rank's selected slots go. INDICES: straight to the output. PAGE_TABLE /
+    // DUAL_OUTPUT: the rank's own buffer, transformed by the rank itself, so the row ends without
+    // a cluster barrier (every DSMEM write a rank receives is awaited by its own mbarriers).
+    // KPOOL: rank 0's buffer, which expands the whole row after a cluster barrier.
+    constexpr bool kOwnTransform = kMode == TopKMode::PAGE_TABLE || kMode == TopKMode::DUAL_OUTPUT;
     auto cluster = cooperative_groups::this_cluster();
-    if constexpr (kNeedStaging) {
+    if constexpr (kOwnTransform) {
+      for_each_item(problem.topk, [&](uint32_t tx, uint32_t) { s_topk_indices[tx] = -1; });
+    } else if constexpr (kNeedStaging) {
       problem.out = cluster.map_shared_rank(s_topk_indices, 0);
     }
-    ClusterN::forward<kPDL>(problem, &smem);
-    if constexpr (kNeedStaging) {
-      device::PDLTriggerSecondary<kPDL>();
+    Cluster::init(&smem);
+    Cluster::forward<kPDL>(problem, &smem);
+    device::PDLTriggerSecondary<kPDL>();
+    if constexpr (kOwnTransform) {
+      __syncthreads();
+      return paged_transform_owned<kMode>(problem, params.get_output_ptr(bx), params.get_transform<kMode>(bx));
+    } else if constexpr (kNeedStaging) {
       cluster.sync();
       if (by != 0) return;
       problem.out = s_topk_indices;
-      return paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
+      return paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform<kMode>(bx));
     } else {
-      return device::PDLTriggerSecondary<kPDL>();
+      return;
     }
   }
 
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
-    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
+    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform<kMode>(bx));
   }
 }
 
@@ -1037,7 +1043,7 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
     if (rank != 0) return;
     __shared__ int32_t s_topk_indices[kNeedStaging ? kMaxTopK : 1];
     if (problem.seq_len <= problem.topk) {
-      return trivial_transform<false, kMode>(problem, params.template get_transform<kMode>(row));
+      return trivial_transform<false, kMode>(problem, params.get_transform<kMode>(row));
     }
     if constexpr (kNeedStaging) problem.out = s_topk_indices;
     if (problem.seq_len <= kReg4MaxSeqLen) {
@@ -1047,7 +1053,7 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
     }
     if constexpr (kNeedStaging) {
       __syncthreads();
-      paged_transform<kMode>(problem, params.get_output_ptr(row), params.template get_transform<kMode>(row));
+      paged_transform<kMode>(problem, params.get_output_ptr(row), params.get_transform<kMode>(row));
     }
     return;
   }
@@ -1067,7 +1073,7 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
     // problem.out is already the destination, and paged_transform reads every
     // slot into registers before writing any, so transforming in place is safe.
     __syncthreads();
-    paged_transform<kMode>(problem, problem.out, params.template get_transform<kMode>(row));
+    paged_transform<kMode>(problem, problem.out, params.get_transform<kMode>(row));
   }
 }
 
