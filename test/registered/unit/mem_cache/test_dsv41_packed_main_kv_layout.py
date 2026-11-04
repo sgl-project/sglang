@@ -133,6 +133,65 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
         ):
             validate_deepseek_v41_features(object())
 
+    def test_hicache_layout_compatibility_validation(self):
+        """Packed Main KV rejects HiCache while existing layouts remain usable."""
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            validate_deepseek_v41_features,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            CudaGraphConfig,
+            PhaseConfig,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        platform = SimpleNamespace(is_sm90=True, is_cuda=True, is_hip=False)
+        for layout, consumer, hicache, backend, rejected in (
+            ("packed_fp4", "direct", True, "flashmla", True),
+            ("packed_fp4", "direct", True, "auto", True),
+            ("packed_fp4", "direct", False, "flashmla", False),
+            ("auto", "auto", True, "flashmla", False),
+            ("flashmla_fp8", "auto", True, "flashmla", False),
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                device="cuda",
+                dsv41_main_kv_layout=layout,
+                dsv41_main_kv_consumer=consumer,
+                dsv4_attn_backend=backend,
+                enable_hierarchical_cache=hicache,
+                enable_decoder_swa_bounded_replay=False,
+                cuda_graph_config=CudaGraphConfig(
+                    prefill=PhaseConfig(backend=Backend.DISABLED)
+                ),
+            )
+            with (
+                self.subTest(layout=layout, hicache=hicache, backend=backend),
+                patch(
+                    "sglang.srt.arg_groups.deepseek_v4_hook.model_config_of",
+                    return_value=model_config,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.deepseek_v4_hook.get_platform",
+                    return_value=platform,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.dsv4.unified_kv_gate."
+                    "is_unified_kv_triton",
+                    return_value=False,
+                ),
+            ):
+                if rejected:
+                    with self.assertRaisesRegex(
+                        ValueError, "packed_fp4.*--enable-hierarchical-cache"
+                    ):
+                        validate_deepseek_v41_features(args)
+                else:
+                    validate_deepseek_v41_features(args)
+
     def test_prefill_page_indices_follow_packed_layout(self):
         """Packed eager prefill must publish physical Main-KV page indices."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -324,6 +383,14 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
             pool.get_extra_key_buffer(1)
         with self.assertRaisesRegex(NotImplementedError, "transfer descriptors"):
             pool.get_contiguous_buf_infos()
+        with self.assertRaisesRegex(NotImplementedError, "HiCache"):
+            pool.get_device_pool_infos()
+        for ratio in (1, 2):
+            with (
+                self.subTest(ratio=ratio),
+                self.assertRaisesRegex(NotImplementedError, "HiCache"),
+            ):
+                pool._compressed_pool_infos(ratio, tuple(pool.sources_by_ratio[ratio]))
 
         packed_pool = pool.kv_pools[2]
         with patch.object(packed_pool, "set_key_buffer_fused") as writer:

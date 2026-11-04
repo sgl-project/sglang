@@ -454,6 +454,11 @@ class DeepSeekV41PackedMainKVPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+    def paged_buffer_info(self) -> DSV4PagedBufferInfo:
+        raise NotImplementedError(
+            "packed Main KV does not support HiCache page transfers yet"
+        )
+
     def get_view(self, local_layer_id: int) -> PackedMainKVView:
         return PackedMainKVView(self.kv_buffer[local_layer_id], self.spec)
 

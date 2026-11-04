@@ -388,6 +388,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "DeepSeek-V4.1 packed Main-KV direct consumption requires the "
                 "FlashMLA attention backend"
             )
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--dsv41-main-kv-layout=packed_fp4 does not support "
+                "--enable-hierarchical-cache yet. Disable HiCache or use "
+                "--dsv41-main-kv-layout=flashmla_fp8."
+            )
     elif cfg.dsv41_main_kv_consumer == "direct":
         raise ValueError(
             "--dsv41-main-kv-consumer=direct requires --dsv41-main-kv-layout=packed_fp4"
