@@ -19,6 +19,7 @@ pub(super) fn batch(events: Vec<KvCacheEvent>) -> KvEventBatch {
         ts: 0.0,
         events,
         attn_dp_rank: None,
+        cache_watermark: None,
     }
 }
 
@@ -100,6 +101,7 @@ pub(super) fn spawn_pump_with_bootstrap(
 
 pub(super) fn stored(parent: Option<i64>, hashes: Vec<i64>) -> KvCacheEvent {
     KvCacheEvent::BlockStored(BlockStored {
+        session_id: None,
         lora_name: None,
         cache_salt: None,
         is_bigram: false,

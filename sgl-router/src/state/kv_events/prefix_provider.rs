@@ -201,6 +201,7 @@ mod tests {
             .block_hashes(tokens, &CacheNamespace::default())
             .expect("hashes");
         let event = BlockStored {
+            session_id: None,
             block_hashes: hashes[..blocks].to_vec(),
             parent_block_hash: None,
             token_ids: tokens[..blocks * BLOCK as usize].to_vec(),

@@ -20,6 +20,7 @@ it; the recorder owns the queue and needs nothing back from its owner.
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
@@ -119,8 +120,7 @@ class KvEventLoraNames(LoRANameTable):
 class KVCacheEventRecorder:
     """Collects KV placement events for one cache.
 
-    ``enabled=False`` makes every ``record_*`` call a no-op and ``take`` return an
-    empty list, so callers never have to guard.
+    ``enabled=False`` suppresses wire events; local mutation ordering remains.
     """
 
     def __init__(
@@ -132,6 +132,9 @@ class KVCacheEventRecorder:
         lora_names: Optional[KvEventLoraNames] = None,
     ):
         self.enabled = enabled
+        self.state_epoch = uuid.uuid4().hex
+        self.state_generation = 0
+        self.state_version = 0
         self.page_size = page_size
         self.dynamo_format = dynamo_format
         self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
@@ -210,12 +213,20 @@ class KVCacheEventRecorder:
             extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
         )
 
+    def _advance_watermark(self, *, cleared: bool = False) -> None:
+        # Local ordering exists even with location publishing disabled. It is
+        # independent of publisher batches, queue coalescing and wall clocks.
+        self.state_version += 1
+        if cleared:
+            self.state_generation += 1
+
     def record_store(
         self, node: Any, medium=None, *, session_id: Optional[str] = None
     ) -> None:
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
         # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
+        self._advance_watermark()
         if not self.enabled:
             return
         if medium is None:
@@ -274,6 +285,7 @@ class KVCacheEventRecorder:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
+        self._advance_watermark()
         if not self.enabled:
             return
         if medium is None:
@@ -303,6 +315,7 @@ class KVCacheEventRecorder:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
 
     def record_all_cleared(self) -> None:
+        self._advance_watermark(cleared=True)
         if not self.enabled:
             return
         self.enqueue(AllBlocksCleared())

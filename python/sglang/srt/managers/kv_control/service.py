@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import atexit
+import hashlib
 import math
 import threading
 import time
@@ -12,6 +14,7 @@ from typing import Annotated
 
 import msgspec
 from sglang.srt.managers.kv_control.contracts import (
+    CacheWatermark,
     ControlContext,
     ControlError,
     Identifier,
@@ -29,6 +32,13 @@ from sglang.srt.managers.kv_control.contracts import (
     validated,
 )
 from sglang.srt.managers.kv_control.controller import KVControl
+from sglang.srt.managers.kv_control.feedback import (
+    FeedbackCursor,
+    FeedbackJournal,
+    FeedbackLimits,
+    FeedbackPublisherConfig,
+    RequestAssociation,
+)
 from sglang.srt.managers.kv_control.index import IndexCursor
 from sglang.srt.managers.kv_control.policy_runtime import (
     PolicyConfig,
@@ -57,6 +67,8 @@ class ServiceConfig(Value):
     limits: Limits = Limits()
     cache_limits: CacheLimits = CacheLimits()
     protection_limits: ProtectionLimits = ProtectionLimits()
+    feedback_limits: FeedbackLimits = FeedbackLimits()
+    feedback_publisher: FeedbackPublisherConfig | None = None
     policies: tuple[PolicyConfig, ...] = ()
     policy_max_wait_seconds: Seconds = 1.0
     max_policy_requests: Annotated[int, msgspec.Meta(ge=1, le=4096)] = 128
@@ -220,6 +232,18 @@ class ClaimEvents(Value, tag="claim_events", tag_field="kind"):
     limit: PageSize = 256
 
 
+class Events(Value, tag="events", tag_field="kind"):
+    context: ControlContext
+    cursor: FeedbackCursor | None = None
+    limit: PageSize = 256
+
+
+class BindRequest(Value, tag="bind_request", tag_field="kind"):
+    context: ControlContext
+    binding_id: Identifier
+    association: RequestAssociation
+
+
 Command = (
     Capabilities
     | Submit
@@ -233,6 +257,8 @@ Command = (
     | Capacity
     | Claim
     | ClaimEvents
+    | Events
+    | BindRequest
 )
 
 
@@ -277,13 +303,67 @@ class KVControlService:
                 "KV control cache is unsupported: " + capabilities["reason"]
             )
         cache.kv_control_service = self
+        self.feedback = None
         self._bind_policy_runtime()
+        if config.feedback_publisher is not None:
+            atexit.register(self.close)
 
     def _bind_policy_runtime(self):
         from sglang.srt.managers.kv_control.policy_runtime import KVPolicyRuntime
 
         self.policy_runtime = KVPolicyRuntime(self) if self.config.policies else None
         self.control.policy_runtime = self.policy_runtime
+        registry = self.control.registry
+        if self.feedback is not None:
+            self.feedback.close()
+        self.feedback = FeedbackJournal(
+            engine_id=registry.engine_id,
+            engine_epoch=registry.engine_epoch,
+            namespace=registry.namespace,
+            limits=self.config.feedback_limits,
+            watermark=self.cache_watermark,
+            publisher_config=self.config.feedback_publisher,
+            clock=self.control._clock,
+        )
+        registry.on_result = self.feedback.operation
+        registry.cache_watermark = self.cache_watermark
+        self.control.association_feedback = self.feedback.association
+        self._feedback_backend = self._backend_identity()
+
+    def _backend_identity(self):
+        controller = self.cache.cache_controller
+        store = controller.storage_backend if controller is not None else None
+        adapter = self.control.executor.storage_adapter
+        return (
+            self.cache.enable_storage,
+            store,
+            adapter.backend_namespace
+            if self.cache.enable_storage
+            and adapter is not None
+            and adapter.store is store
+            else None,
+        )
+
+    def cache_watermark(self):
+        recorder = self.cache.tree_core.kv_events
+        return CacheWatermark(
+            source_id="cache:"
+            + hashlib.sha256(self.control.registry.engine_id.encode()).hexdigest(),
+            source_epoch=recorder.state_epoch,
+            generation=recorder.state_generation,
+            version=recorder.state_version,
+        )
+
+    def _feedback_context(self, req):
+        context = getattr(req, "kv_control_feedback_context", None)
+        if (
+            context is None
+            or context.engine_epoch != self.control.registry.engine_epoch
+        ):
+            context = self.control.context("request", binding_id=uuid.uuid4().hex)
+            req.kv_control_feedback_context = context
+            self.feedback.register_request(context, req.rid)
+        return context
 
     def _bind_executor(self, capacity=None):
         executor = self.cache.create_kv_control_executor(
@@ -312,6 +392,7 @@ class KVControlService:
         return encode_cache_salt(self.config.namespace, original)
 
     def prepare_request(self, req):
+        self._feedback_context(req)
         if self.policy_runtime is not None:
             self.policy_runtime.register_request(req)
         if not self.namespace_keys:
@@ -414,27 +495,31 @@ class KVControlService:
 
         registry = self.control.registry
         executor = self.control.executor.capabilities()
-        return dict(
-            enabled=True,
-            public_protocol=public_capabilities(executor),
-            engine_id=registry.engine_id,
-            engine_epoch=registry.engine_epoch,
-            namespace=registry.namespace,
-            executor=executor,
-            policies=tuple(p.name for p in self.config.policies),
-            topology="single_owner",
-            attached_caller_id="request",
-            weight_updates="guarded_transactions"
+        return {
+            "enabled": True,
+            "public_protocol": public_capabilities(executor),
+            "feedback": {
+                **self.feedback.describe(),
+                "cache_watermark": self.cache_watermark(),
+            },
+            "engine_id": registry.engine_id,
+            "engine_epoch": registry.engine_epoch,
+            "namespace": registry.namespace,
+            "executor": executor,
+            "policies": tuple(p.name for p in self.config.policies),
+            "topology": "single_owner",
+            "attached_caller_id": "request",
+            "weight_updates": "guarded_transactions"
             if self.namespace_keys
             else "unsupported",
-            weight_version=self.weights.version,
-            weight_update_devices=("cpu", "cuda") if self.namespace_keys else (),
-            updating_weights=self.weights.active,
-            cache_salt_namespace=registry.namespace if self.namespace_keys else None,
-            cache_salt_encoding=SALT_ENCODING
+            "weight_version": self.weights.version,
+            "weight_update_devices": ("cpu", "cuda") if self.namespace_keys else (),
+            "updating_weights": self.weights.active,
+            "cache_salt_namespace": registry.namespace if self.namespace_keys else None,
+            "cache_salt_encoding": SALT_ENCODING
             if self.namespace_keys
             else "owner_assertion",
-        )
+        }
 
     @property
     def has_pending(self):
@@ -448,18 +533,45 @@ class KVControlService:
     @property
     def has_background_work(self):
         protection = self.control.executor.protection
-        return self.has_pending or (
-            protection is not None and protection.has_background_work
+        return (
+            self.has_pending
+            or self.feedback.has_outbox
+            or (protection is not None and protection.has_background_work)
         )
 
     @property
     def next_deadline(self):
         protection = self.control.executor.protection
-        return protection.next_deadline if protection is not None else None
+        deadlines = (
+            self.feedback.next_deadline,
+            protection.next_deadline if protection is not None else None,
+        )
+        return min(
+            (deadline for deadline in deadlines if deadline is not None), default=None
+        )
 
     def invalidate_protection(self, *, reason):
         protection = self.control.executor.protection
-        return protection.invalidate(reason=reason) if protection is not None else ()
+        self.feedback.append(
+            "invalidation",
+            None,
+            {
+                "reason": reason,
+                "tiers": ("gpu", "host"),
+                "semantics": "owner_local_only",
+            },
+        )
+        changes = protection.invalidate(reason=reason) if protection is not None else ()
+        for claim in changes:
+            self.feedback.append("claim", claim.caller_id, claim)
+        if reason == "host_cache_detached":
+            self.close()
+        return changes
+
+    def close(self):
+        if self.feedback is not None:
+            self.feedback.close()
+        atexit.unregister(self.close)
 
     @property
     def blocks_prefill(self):
@@ -468,18 +580,39 @@ class KVControlService:
 
     def progress(self):
         executor = self.control.executor
+        backend = self._backend_identity()
+        if (
+            backend[0] != self._feedback_backend[0]
+            or backend[1] is not self._feedback_backend[1]
+            or backend[2] != self._feedback_backend[2]
+        ):
+            self.feedback.append(
+                "invalidation",
+                None,
+                {
+                    "reason": "storage_attachment_changed",
+                    "tiers": ("storage",),
+                    "semantics": "owner_storage_observations_only",
+                    "previous_backend_namespace": self._feedback_backend[2],
+                    "backend_namespace": backend[2],
+                },
+            )
+            self._feedback_backend = backend
         if executor is not None and getattr(executor, "preparations", None):
             revoked = executor.revalidate_preparations()
             if self.policy_runtime is not None:
                 self.policy_runtime.execution.stats["preparations_revoked"] += revoked
         if self.policy_runtime is not None:
             self.policy_runtime.progress()
+
         if self.has_pending:
             self.control.progress()
         if executor.protection is not None:
-            executor.protection.progress()
+            for claim in executor.protection.progress():
+                self.feedback.append("claim", claim.caller_id, claim)
         if self.policy_runtime is not None:
             self.policy_runtime.progress()
+        self.feedback.flush()
 
     def prepare_reset(self):
         if self.policy_runtime is not None:
@@ -500,7 +633,7 @@ class KVControlService:
             a.action_type.startswith("sglang.") for a in envelope.actions
         ):
             return
-        context = self.control.context("request", binding_id=uuid.uuid4().hex)
+        context = self._feedback_context(req)
         # The request retains only a context, never registry/worker objects. A
         # reused rid or another sample gets a different incarnation.
         unsupported = unsupported_request or (
@@ -527,15 +660,18 @@ class KVControlService:
         terminal = aborted or (getattr(req, "finished", lambda: False)())
         if not terminal:
             return
-        if context is None:
+        feedback_context = getattr(req, "kv_control_feedback_context", None)
+        if context is None and feedback_context is None:
             if self.policy_runtime is not None:
                 self.policy_runtime.finish_request(req)
                 self.policy_runtime.execution.request_finished(req, success=False)
             return
         if self.policy_runtime is not None:
             self.policy_runtime.finish_request(req, context)
-        req.kv_control_context = None
-        if context.engine_epoch != self.control.registry.engine_epoch:
+        if context is not None:
+            req.kv_control_context = None
+        active_context = context or feedback_context
+        if active_context.engine_epoch != self.control.registry.engine_epoch:
             return
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
@@ -545,7 +681,14 @@ class KVControlService:
             and not isinstance(req.finished_reason, FINISH_ABORT)
         )
         committed = None
-        if success and committed_len:
+        if (
+            success
+            and committed_len
+            and (
+                context is not None
+                or committed_len <= self.config.limits.max_scope_tokens
+            )
+        ):
             committed = TokensTarget(
                 namespace=self.config.namespace,
                 token_ids=tuple(req.full_untruncated_fill_ids[:committed_len]),
@@ -556,17 +699,32 @@ class KVControlService:
                 is_multimodal=req.multimodal_inputs is not None,
                 allow_clip=True,
             )
-        self.control.request_event(
-            context,
-            "success" if success and not aborted else "abort",
-            committed=committed,
-        )
+        if feedback_context is not None:
+            self.feedback.finish_request(
+                feedback_context,
+                req,
+                checkpointed=success and not aborted,
+                aborted=aborted,
+                committed=committed,
+                committed_tokens=committed_len,
+            )
+            req.kv_control_feedback_context = None
+        if context is not None:
+            self.control.request_event(
+                context,
+                "success" if success and not aborted else "abort",
+                committed=committed,
+            )
         if self.policy_runtime is not None:
             self.policy_runtime.execution.request_finished(
                 req, success=success and not aborted, context=context
             )
 
     def execute(self, command):
+        if threading.get_ident() != self.cache._kv_control_owner_thread:
+            raise ControlError(
+                "wrong_owner", "Control commands must run on the cache owner"
+            )
         control, registry = self.control, self.control.registry
         if isinstance(command, Capabilities):
             return self.capabilities()
@@ -574,6 +732,15 @@ class KVControlService:
             command.ref.context if isinstance(command, Cancel) else command.context
         )
         registry.validate_context(context)
+        if isinstance(command, Events):
+            self.progress()
+            return self.feedback.query(
+                caller_id=context.caller_id, cursor=command.cursor, limit=command.limit
+            )
+        if isinstance(command, BindRequest):
+            return self.feedback.bind_request(
+                context, command.binding_id, command.association
+            )
         if isinstance(command, StorageTargets):
             if self.weights.active:
                 raise ControlError("busy", "Weight update is in progress")
@@ -629,31 +796,36 @@ class KVControlService:
                 limit=command.limit,
             )
         if isinstance(command, Residency):
-            return control.executor.residency(
+            snapshot = control.executor.residency(
                 control.index.resolve(command.target),
                 limit=command.limit,
                 location=command.location,
             )
+            return {
+                **msgspec.to_builtins(snapshot),
+                "cache_watermark": self.cache_watermark(),
+                "coverage_semantics": "requested_scope_only",
+            }
         if isinstance(command, Associations):
             return control.index.query(
                 session_id=command.session_id,
                 cursor=command.cursor,
                 limit=command.limit,
             )
-        return dict(
-            operations=registry.capacity(),
-            associations=control.index.capacity(),
-            copies=control.executor.claims.capacity(),
-            protection=dict(
-                active_claims=control.executor.protection.registry.active_claims,
-                protected_tokens=control.executor.protection.registry.protected_tokens,
-            )
+        return {
+            "operations": registry.capacity(),
+            "associations": control.index.capacity(),
+            "copies": control.executor.claims.capacity(),
+            "protection": {
+                "active_claims": control.executor.protection.registry.active_claims,
+                "protected_tokens": control.executor.protection.registry.protected_tokens,
+            }
             if control.executor.protection is not None
             else None,
-            policies=dict(self.policy_runtime.execution.stats)
+            "policies": dict(self.policy_runtime.execution.stats)
             if self.policy_runtime is not None
             else {},
-        )
+        }
 
     @property
     def guides_requests(self):

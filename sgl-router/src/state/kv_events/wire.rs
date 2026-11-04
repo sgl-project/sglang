@@ -41,6 +41,15 @@ pub struct KvEventBatch {
     /// publisher emitted nil. The decoder also accepts an omitted field for
     /// compatibility.
     pub attn_dp_rank: Option<u32>,
+    pub cache_watermark: Option<CacheWatermark>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CacheWatermark {
+    pub source_id: String,
+    pub source_epoch: String,
+    pub generation: u64,
+    pub version: u64,
 }
 
 /// A single KV cache event. The Python base class `KVCacheEvent` uses
@@ -49,7 +58,7 @@ pub struct KvEventBatch {
 pub enum KvCacheEvent {
     /// `{"type": "BlockStored", "block_hashes", "parent_block_hash",
     /// "token_ids", "block_size", "lora_id", "medium"?, ...}`. Keys the
-    /// gateway does not route on (`session_id`) are ignored.
+    /// unknown future keys are ignored; session attribution is preserved.
     BlockStored(BlockStored),
     /// `{"type": "BlockRemoved", "block_hashes", "medium"?}`.
     BlockRemoved(BlockRemoved),
@@ -72,6 +81,9 @@ pub struct BlockStored {
     pub lora_id: Option<i64>,
     pub lora_name: Option<String>,
     pub cache_salt: Option<String>,
+    /// Attribution only: absence/incarnation/branch remain unknown. A physical
+    /// Stored event is not duplicated for every session sharing that block.
+    pub session_id: Option<String>,
     pub is_bigram: bool,
     /// Storage tier (`"GPU"`, `"CPU_PINNED"`, `"DISK"`, `"EXTERNAL"`).
     /// Optional in the Python schema (`= None` default), so it may be
@@ -361,6 +373,7 @@ impl<'de> Deserialize<'de> for KvEventBatch {
                 // attn_dp_rank may be present-as-nil, present-as-int, or
                 // omitted entirely under msgspec's `omit_defaults`.
                 let attn_dp_rank: Option<u32> = seq.next_element()?.unwrap_or(None);
+                let cache_watermark: Option<CacheWatermark> = seq.next_element()?.unwrap_or(None);
                 // Drain any extra trailing fields a future schema might add
                 // (forward-compat).
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -368,6 +381,7 @@ impl<'de> Deserialize<'de> for KvEventBatch {
                     ts,
                     events,
                     attn_dp_rank,
+                    cache_watermark,
                 })
             }
         }
@@ -382,7 +396,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
         D: Deserializer<'de>,
     {
         /// Map keys of a `KVCacheEvent` the gateway reads. Every other key
-        /// (`session_id`, future additions) is skipped.
+        /// unknown future additions are skipped.
         enum EventField {
             Type,
             BlockHashes,
@@ -392,6 +406,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
             LoraId,
             LoraName,
             CacheSalt,
+            SessionId,
             Medium,
             Other,
         }
@@ -417,6 +432,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                             "lora_id" => EventField::LoraId,
                             "lora_name" => EventField::LoraName,
                             "cache_salt" => EventField::CacheSalt,
+                            "session_id" => EventField::SessionId,
                             "medium" => EventField::Medium,
                             _ => EventField::Other,
                         })
@@ -447,6 +463,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                 let mut lora_id: Option<i64> = None;
                 let mut lora_name: Option<String> = None;
                 let mut cache_salt: Option<String> = None;
+                let mut session_id: Option<String> = None;
                 let mut medium: Option<String> = None;
                 while let Some(field) = map.next_key::<EventField>()? {
                     match field {
@@ -459,6 +476,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         EventField::LoraId => lora_id = map.next_value()?,
                         EventField::LoraName => lora_name = map.next_value()?,
                         EventField::CacheSalt => cache_salt = map.next_value()?,
+                        EventField::SessionId => session_id = map.next_value()?,
                         EventField::Medium => medium = map.next_value()?,
                         EventField::Other => {
                             map.next_value::<IgnoredAny>()?;
@@ -481,6 +499,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         lora_id,
                         lora_name,
                         cache_salt,
+                        session_id,
                         is_bigram,
                         medium,
                     })),
@@ -777,6 +796,7 @@ mod tests {
                 assert_eq!(b.block_size, 4);
                 assert_eq!(b.lora_id, Some(7));
                 assert_eq!(b.medium.as_deref(), Some("GPU"));
+                assert_eq!(b.session_id, None);
             }
             other => panic!("expected BlockStored, got {other:?}"),
         }
@@ -825,6 +845,7 @@ mod tests {
                 assert_eq!(b.block_hashes, vec![10]);
                 assert_eq!(b.parent_block_hash, Some(1));
                 assert_eq!(b.medium.as_deref(), Some("GPU"));
+                assert_eq!(b.session_id.as_deref(), Some("session-a"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -894,6 +915,31 @@ mod tests {
         let batch = decode_event_batch(&bytes).expect("decode");
         assert_eq!(batch.attn_dp_rank, None);
         assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.cache_watermark, None);
+    }
+
+    #[test]
+    fn optional_watermark_tail_is_distinct_from_publisher_sequence() {
+        let mut bytes = build_batch_bytes(5.0, &[build_all_blocks_cleared_bytes()], Some(3), true);
+        bytes[0] = 0x94; // Four slots, with the legacy three preserved verbatim.
+        mp::write_map_len(&mut bytes, 4).unwrap();
+        for (key, value) in [
+            ("source_id", "cache:owner"),
+            ("source_epoch", "cache-epoch"),
+        ] {
+            write_key(&mut bytes, key);
+            mp::write_str(&mut bytes, value).unwrap();
+        }
+        for (key, value) in [("generation", 2), ("version", 9)] {
+            write_key(&mut bytes, key);
+            mp::write_uint(&mut bytes, value).unwrap();
+        }
+        let decoded = decode_event_batch(&bytes).unwrap();
+        assert_eq!(decoded.attn_dp_rank, Some(3));
+        let watermark = decoded.cache_watermark.unwrap();
+        assert_eq!(watermark.source_epoch, "cache-epoch");
+        assert_eq!((watermark.generation, watermark.version), (2, 9));
+        assert_eq!(decoded.events, vec![KvCacheEvent::AllBlocksCleared]);
     }
 
     #[test]

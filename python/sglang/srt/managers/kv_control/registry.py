@@ -198,6 +198,17 @@ class OperationRegistry:
         self._records = 0
         self._active = 0
         self._sequence = 0
+        self.on_result = None
+        self.cache_watermark = None
+
+    def _stamp(self, result):
+        if self.cache_watermark is not None:
+            result = msgspec.structs.replace(
+                result, cache_watermark=self.cache_watermark()
+            )
+        if self.on_result is not None:
+            self.on_result(result)
+        return result
 
     def validate_context(self, context: ControlContext) -> ControlContext:
         context = validated(context, ControlContext)
@@ -227,6 +238,8 @@ class OperationRegistry:
             current,
             public_result=msgspec.structs.replace(current.public_result, claim=claim),
         )
+        message = self._messages[self._key(ref.context, ref.message_id)]
+        message.results[ref.action_id] = self._stamp(message.results[ref.action_id])
 
     def reserve(self, batch: NativeBatch, context: ControlContext) -> Submission:
         key = self._key(context, batch.message_id)
@@ -265,6 +278,7 @@ class OperationRegistry:
                 sequence=self._sequence,
                 update=ExecutionUpdate(status=Status.RECEIVED, quiescent=True),
             )
+        results = {key: self._stamp(value) for key, value in results.items()}
         message = _Message(batch.fingerprint, results)
         self._messages[key] = message
         self._records += count
@@ -374,6 +388,7 @@ class OperationRegistry:
         )
         key = self._key(ref.context, ref.message_id)
         message = self._messages[key]
+        result = self._stamp(result)
         message.results[ref.action_id] = result
         if result.status.terminal:
             self._active -= 1

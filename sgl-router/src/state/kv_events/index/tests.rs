@@ -15,6 +15,7 @@ async fn pump_keeps_lora_tokens_while_bootstrap_holds_batches() {
         worker: id.clone(),
         seq: 6,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             block_hashes: vec![100],
             parent_block_hash: None,
             token_ids: vec![1, 2],
@@ -358,6 +359,7 @@ async fn pump_applies_block_stored_to_tree() {
         worker: id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             lora_name: None,
             cache_salt: None,
             is_bigram: false,
@@ -396,6 +398,7 @@ async fn pump_keeps_host_backed_block_owned_across_device_eviction() {
 
     let stored = |medium: Option<&str>| {
         KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             lora_name: None,
             cache_salt: None,
             is_bigram: false,
@@ -465,6 +468,7 @@ async fn pump_tallies_applied_events_by_medium() {
 
     let stored = |medium: Option<&str>, hashes: Vec<i64>| {
         KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             lora_name: None,
             cache_salt: None,
             is_bigram: false,
@@ -578,6 +582,7 @@ async fn pump_filters_out_of_order_seq() {
         worker: id.clone(),
         seq: 5,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             lora_name: None,
             cache_salt: None,
             is_bigram: false,
@@ -629,6 +634,7 @@ async fn pump_handles_all_blocks_cleared() {
         worker: id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             lora_name: None,
             cache_salt: None,
             is_bigram: false,
@@ -680,6 +686,7 @@ async fn pump_drops_events_from_detached_workers() {
         worker: dead_id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             lora_name: None,
             cache_salt: None,
             is_bigram: false,
@@ -699,6 +706,7 @@ async fn pump_drops_events_from_detached_workers() {
         worker: live_id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            session_id: None,
             lora_name: None,
             cache_salt: None,
             is_bigram: false,

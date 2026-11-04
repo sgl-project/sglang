@@ -121,6 +121,7 @@ class KVControl:
         self._pending: dict[str, _Pending] = {}
         self._requests: dict[tuple[str, str], set[str]] = {}
         self.policy_runtime = None
+        self.association_feedback = None
 
     def context(
         self, caller_id: str, *, binding_id: str | None = None
@@ -451,6 +452,8 @@ class KVControl:
             )
         elif isinstance(payload, Associate):
             record = self.index.associate(payload)
+            if self.association_feedback is not None:
+                self.association_feedback(ref, record)
             change = LogicalChange(
                 index_generation=self.index.generation,
                 session_revision=self.index.session_revision(payload.session_id),

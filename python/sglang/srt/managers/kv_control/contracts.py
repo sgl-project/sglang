@@ -408,12 +408,20 @@ class PublicResult(Value, kw_only=True):
     claim: ClaimState | None = None
 
 
+class CacheWatermark(Value):
+    source_id: Identifier
+    source_epoch: Identifier
+    generation: Position
+    version: Position
+
+
 class OperationResult(Value, omit_defaults=True):
     ref: OperationRef
     action_type: Identifier
     action_version: Identifier
     sequence: Position
     update: ExecutionUpdate
+    cache_watermark: CacheWatermark | None = None
     public_result: PublicResult | None = None
 
     @property

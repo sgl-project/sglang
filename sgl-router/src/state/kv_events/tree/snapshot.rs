@@ -467,6 +467,7 @@ mod tests {
         let worker = KvWorkerId::new("http://worker".into(), 0);
         let other_rank = KvWorkerId::new("http://worker".into(), 1);
         let event = BlockStored {
+            session_id: None,
             block_hashes: vec![100, 101],
             parent_block_hash: None,
             token_ids: vec![1, 2, 3, 4],
