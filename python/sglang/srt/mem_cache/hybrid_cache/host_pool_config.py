@@ -6,7 +6,7 @@ buffer information and never ask a device pool to describe host construction.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import msgspec
 
@@ -57,36 +57,26 @@ def with_packed_draft_layer_mapping(
     }
 
 
-def collect_host_pool_infos(root: Any) -> tuple[DevicePoolInfo, ...]:
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-
-    # Other KV formats still use their existing host constructor.
-    return root.get_device_pool_infos() if isinstance(root, DSATokenToKVPool) else ()
-
-
 def _host_pool_infos(pool: Any) -> tuple[Any, dict[PoolName, DevicePoolInfo]]:
     """The KV device pool and the infos of every pool its host group carries."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if not isinstance(pool, HybridLinearKVPool):
-        return pool, _pool_infos_by_name(collect_host_pool_infos(pool))
-    kv_infos = collect_host_pool_infos(pool.full_kv_pool)
+        return pool, _pool_infos_by_name(pool.get_device_pool_infos())
     # A hybrid pool describes the sidecars it owns beside its full KV child.
-    infos = kv_infos + pool.get_device_pool_infos()
-    return pool.full_kv_pool, _pool_infos_by_name(infos, requires_kv=bool(kv_infos))
+    infos = pool.full_kv_pool.get_device_pool_infos() + pool.get_device_pool_infos()
+    return pool.full_kv_pool, _pool_infos_by_name(infos)
 
 
 def _pool_infos_by_name(
-    infos: tuple[DevicePoolInfo, ...], *, requires_kv: bool = True
+    infos: tuple[DevicePoolInfo, ...],
 ) -> dict[PoolName, DevicePoolInfo]:
     pools = {info.pool_name: info for info in infos}
     if len(pools) != len(infos):
         raise ValueError(
             f"duplicate device pool names: {[info.pool_name for info in infos]}"
         )
-    if not pools:
-        return pools
-    if requires_kv and PoolName.KV not in pools:
+    if PoolName.KV not in pools:
         raise ValueError(f"expected primary KV pool, got {tuple(pools)}")
     for info in infos:
         if info.indices_from_pool != PoolName.KV:
@@ -214,7 +204,6 @@ def prepare_host_pool_config(
             raise ValueError(
                 f"packed draft requires exactly one KV layer per draft pool, got {pool.layer_num}"
             )
-    check_packed_kv_rows(kv_pool=root, drafts=packed_draft_device_pools)
     mapping = with_packed_draft_layer_mapping(
         full_layer_mapping,
         transfer_layer_start=transfer_layer_id_max,
@@ -246,31 +235,3 @@ def prepare_host_pool_config(
         packed_draft_device_pools=packed_draft_device_pools,
         sidecars=sidecars,
     )
-
-
-def is_mla_pool(pool: Any) -> bool:
-    from sglang.srt.mem_cache.kv.memory.views import MLAKVView
-
-    return isinstance(pool, MLAKVView)
-
-
-def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
-    if use_mla:
-        return (pool.kv_cache_dim, pool.store_dtype)
-    return (pool.head_num, pool.head_dim, pool.v_head_dim, pool.store_dtype)
-
-
-def check_packed_kv_rows(
-    *, kv_pool: Any, drafts: tuple[Any, ...], use_mla: Optional[bool] = None
-):
-    if not drafts:
-        return
-    if use_mla is None:
-        use_mla = is_mla_pool(kv_pool)
-    target = _kv_row_signature(kv_pool, use_mla=use_mla)
-    for draft in drafts:
-        row = _kv_row_signature(draft, use_mla=use_mla)
-        if row != target:
-            raise ValueError(
-                f"packed draft KV row {row} differs from target KV row {target}"
-            )
