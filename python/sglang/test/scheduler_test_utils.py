@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 
 if TYPE_CHECKING:
@@ -26,18 +27,30 @@ class FakeReq(SimpleNamespace):
     __hash__ = object.__hash__
 
 
+def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> IndexedReqList:
+    """A PD decode queue of `kind` holding `decode_reqs`, each a wrapper with
+    `.req`."""
+    queue = IndexedReqList(kind, req_of=lambda x: x.req)
+    queue.join(decode_reqs)
+    return queue
+
+
 def empty_request_lists(scheduler: Scheduler) -> None:
     """Give a scheduler built with `Scheduler.__new__` every request list, empty;
     the test then fills the ones it needs."""
-    scheduler.waiting_queue = []
-    scheduler.grammar_manager = SimpleNamespace(
-        grammar_queue=_RequestList(ListKind.GRAMMAR)
+    scheduler.waiting_queue = IndexedReqList(
+        ListKind.WAITING, abort=scheduler._abort_waiting
     )
-    scheduler.chunked_req = None
-    scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
-    scheduler.running_reqs = _RequestList(ListKind.DECODING)
+    scheduler.grammar_manager = SimpleNamespace(
+        grammar_queue=IndexedReqList(ListKind.GRAMMAR)
+    )
+    scheduler.chunked_reqs = IndexedReqList(
+        ListKind.CHUNKED, abort=scheduler._abort_chunked
+    )
+    scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+    scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
     scheduler.disagg_prefill_bootstrap_queue = None
-    scheduler.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
+    scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
     scheduler.dllm_config = None
     scheduler.disagg_decode_prealloc_queue = None
     scheduler.disagg_decode_transfer_queue = None
