@@ -31,10 +31,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     mamba_lazy_spec_in_window,
 )
-from sglang.srt.mem_cache.common import (
-    checkpoint_kv_cache,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
@@ -72,6 +69,9 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
+    )
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
@@ -152,6 +152,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
+    request_retirer: RequestRetirer
     abort_request: Callable
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     # Hands requests out of the scheduler's prefill_launched_reqs.
@@ -167,9 +168,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+                self.request_retirer.release_finished(req, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -449,14 +448,10 @@ class SchedulerBatchResultProcessor:
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        if get_memory().enable_hisparse:
-                            self.hisparse_coordinator.request_finished(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
                             self._prepare_kv_cache_release(req)
-                        release_kv_cache(
-                            req,
-                            self.tree_cache,
-                            checkpoint=discard_finish_reason is None,
+                        self.request_retirer.release_finished(
+                            req, checkpoint=discard_finish_reason is None
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -542,7 +537,7 @@ class SchedulerBatchResultProcessor:
                 if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                    self.request_retirer.release_finished(req, checkpoint=False)
                     req.time_stats.set_completion_time()
                     continue
 
@@ -560,7 +555,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache, checkpoint=True)
+                        self.request_retirer.release_finished(req, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
                         checkpoint_kv_cache(req, self.tree_cache)
@@ -1460,10 +1455,8 @@ class SchedulerBatchResultProcessor:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
-            if get_memory().enable_hisparse:
-                self.hisparse_coordinator.request_finished(req)
             self._prepare_kv_cache_release(req)
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            self.request_retirer.release_finished(req, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1548,15 +1541,13 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
                 self._prepare_kv_cache_release(req)
                 checkpoint = (
                     req.mamba_lazy_checkpoint
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+                self.request_retirer.release_finished(req, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
