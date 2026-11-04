@@ -4035,6 +4035,8 @@ class Scheduler(
         self.release_aborted_request(req)
         # No member rows exist before the leader's prefill ends.
         self.beam_coordinator.retire_group(req)
+        if self.enable_hisparse:
+            self.hisparse_coordinator.request_finished(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
