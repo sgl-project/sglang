@@ -4916,3 +4916,9 @@ root 阅读全部生产与测试差异并独立运行 transfers、cache、servic
 ### 长测监控归档规模
 
 2s 完整 Prometheus/loads 采样持续增长，归档器支持有序 gzip parts 与逐文件 SHA-256，避免单文件超过常用 Git 托管上限。单文件与 parts 同时出现时拒绝，重复/缺失/路径越界/哈希不匹配时拒绝，不丢弃指标。独立测试 41 项通过，新增用例证明两片采样都计入且改写任一片会被检出；原单文件与压缩 cells 保持兼容。
+
+### 0.8 L2 性能阶段归档
+
+两种 L2 口径共 732 次真实生成均有效；完整 HTTP/SSE/control、schedule、manifest、scope/claim/tombstone、启动命令、分阶段测试与 2s 原始监控已压缩归档到 benchmark/session_kv_control/results/2026-11-04-mem08。保留压缩前索引与压缩后物理 SHA，root 对实际打包目录离线重算：2 cells 全部 verified/valid，732 原始调用与完成数一致。SHA256SUMS 全部通过。
+
+结果：natural 热点 TTFT 4552.012→586.192ms（约−87.1%）；仅排除实验 flush 后，全工作耗时 453.716/451.510s，总吞吐约+0.49%。demote 热点 3630.534→573.820ms（约−84.2%），工作耗时 421.662/422.218s，总吞吐约−0.13%。L1/L2 natural 采样分配占用约99.24%/99.75%；热点收益与整体吞吐区分，全部负差异及59.3s flush 干扰保留。N=3配对轮次，热点每组N=12，不能宣称稳定尾延迟或跨环境吞吐。L3长测尚在继续。
