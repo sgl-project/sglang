@@ -39,6 +39,7 @@ mask, so this kernel is valid only for linear draft chains
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -56,6 +57,19 @@ _TILED_COMMIT_BV = 32
 _TILED_COMMIT_HEADS_PER_PROGRAM = 4
 _TILED_COMMIT_STAGES = 2
 _TILED_COMMIT_WARPS = 1
+# Warps of the tiled commit while tiled_commit_warps is active; None keeps _TILED_COMMIT_WARPS. Each element's fold
+# order does not depend on the warp count.
+_TILED_COMMIT_WARPS_OVERRIDE = None
+
+
+@contextlib.contextmanager
+def tiled_commit_warps(num_warps: int):
+    global _TILED_COMMIT_WARPS_OVERRIDE
+    previous, _TILED_COMMIT_WARPS_OVERRIDE = _TILED_COMMIT_WARPS_OVERRIDE, num_warps
+    try:
+        yield
+    finally:
+        _TILED_COMMIT_WARPS_OVERRIDE = previous
 
 
 def _use_tiled_commit(d_cache, k_cache, H, HV, V, K) -> bool:
@@ -1650,7 +1664,7 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
-        num_warps=_TILED_COMMIT_WARPS if tiled else 4,
+        num_warps=(_TILED_COMMIT_WARPS_OVERRIDE or _TILED_COMMIT_WARPS) if tiled else 4,
         num_stages=1 if tiled else 2,
         **extra,
     )

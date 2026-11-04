@@ -299,7 +299,8 @@ struct HcCombineNormDecode {
         .verify(normalized);
     TensorMatcher({10240}).with_dtype<bf16_t>().with_device(dev).verify(weight);
     TensorMatcher({m, 8, 4}).with_dtype<fp32_t>().with_device(dev).verify(partials);
-    CHECK_HOST(m.unwrap() > 0 && m.unwrap() <= 32);
+    // Rows 33..128 come only from SGLANG_HC_FUSED_COMBINE_MAX_ROWS.
+    CHECK_HOST(m.unwrap() > 0 && m.unwrap() <= 128);
     const HcCombineNormDecodeParams p{
         static_cast<const bf16_t*>(block.data_ptr()),
         static_cast<const bf16_t*>(residual.data_ptr()),

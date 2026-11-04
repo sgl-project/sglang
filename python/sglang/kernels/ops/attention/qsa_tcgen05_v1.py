@@ -204,7 +204,7 @@ def _merge(P, MAX, SUM, OUT, NT: tl.constexpr, ST: tl.constexpr):
 
 
 def run(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
-        block_indices, lengths, qpos, scale, width=4):
+        block_indices, lengths, qpos, scale, width=4, store_new_kv=True):
     """Original v11 ABI, chain TARGET_VERIFY M4 only; BF16 [4,24,256].
 
     Native top512-block order, graph padding, page-map, chain fresh/tail and
@@ -225,11 +225,12 @@ def run(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
     maximum = torch.empty((m, h, nt, 16), dtype=torch.float32, device=q.device)
     sums = torch.empty_like(maximum)
     output = torch.empty_like(q, memory_format=torch.contiguous_format)
-    _store[(m, h)](
-        k_pool, v_pool, k_new, v_new, loc,
-        k_pool.stride(0), v_pool.stride(0), k_new.stride(0), v_new.stride(0), h, d,
-        num_warps=4,
-    )
+    if store_new_kv:
+        _store[(m, h)](
+            k_pool, v_pool, k_new, v_new, loc,
+            k_pool.stride(0), v_pool.stride(0), k_new.stride(0), v_new.stride(0), h, d,
+            num_warps=4,
+        )
     partial_tcgen05[(m, nt, h)](
         q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
         block_indices, lengths, qpos, partial, maximum, sums,

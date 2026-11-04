@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+from sglang.kernels.ops.extend_fastpath import GDN_L2NORM_ENABLED as _Q38C_EXTEND_PATH
+
+import os
 from typing import Optional
 
 import torch
@@ -12,6 +15,15 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
+
+# gdn_front: rows-per-program / warps of l2norm_fwd_kernel for large row counts
+# (extend). Each row keeps the same 16-lane x 8-element reduction layout as the
+# stock BT=16 / 8-warp launch, so results are bit-identical; only the number of
+# programs changes. SGLANG_X_GDN_FRONT_DISABLE=1 (or ..._L2NORM_DISABLE=1)
+# restores the stock launch and the separate q / k launches.
+_GDN_FRONT_L2NORM = _Q38C_EXTEND_PATH
+L2NORM_BIG_ROWS = 16384
+L2NORM_BIG_CFG = (64, 8)  # (BT, num_warps)
 
 
 # @triton.autotune(
@@ -70,53 +82,111 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
-def l2norm_fwd(
-    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
-):
-    x_shape_og = x.shape
-    x = x.view(-1, x.shape[-1])
-    # allocate output
-    if output_dtype is None:
-        y = torch.empty_like(x)
-    else:
-        y = torch.empty_like(x, dtype=output_dtype)
-    assert y.stride(-1) == 1
-    T, D = x.shape[0], x.shape[-1]
-    # rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
-    if D > BD:
-        raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+# Import-time selection keeps the disabled entry and launch body stock.
+if _Q38C_EXTEND_PATH:
+    def l2norm_fwd(
+        x: torch.Tensor,
+        eps: float = 1e-6,
+        output_dtype: Optional[torch.dtype] = None,
+        launch_cfg: Optional[tuple] = None,
+    ):
+        x_shape_og = x.shape
+        x = x.view(-1, x.shape[-1])
+        # allocate output
+        if output_dtype is None:
+            y = torch.empty_like(x)
+        else:
+            y = torch.empty_like(x, dtype=output_dtype)
+        assert y.stride(-1) == 1
+        T, D = x.shape[0], x.shape[-1]
+        # rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
+        # Less than 64KB per feature: enqueue fused kernel
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+        if D > BD:
+            raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
-    if D <= 512:
+        if D <= 512:
+            bt, n_warps = 16, 8
+            if launch_cfg is not None:
+                bt, n_warps = launch_cfg
+            elif _GDN_FRONT_L2NORM and D == 128 and T >= L2NORM_BIG_ROWS:
+                bt, n_warps = L2NORM_BIG_CFG
 
-        def grid(meta):
-            return (triton.cdiv(T, meta["BT"]),)
+            def grid(meta):
+                return (triton.cdiv(T, meta["BT"]),)
 
-        l2norm_fwd_kernel[grid](
-            x,
-            y,
-            eps,
-            T=T,
-            D=D,
-            BD=BD,
-            BT=16,
-            num_warps=8,
-            num_stages=3,
-        )
-    else:
-        l2norm_fwd_kernel1[(T,)](
-            x,
-            y,
-            eps=eps,
-            D=D,
-            BD=BD,
-            num_warps=8,
-            num_stages=3,
-        )
+            l2norm_fwd_kernel[grid](
+                x,
+                y,
+                eps,
+                T=T,
+                D=D,
+                BD=BD,
+                BT=bt,
+                num_warps=n_warps,
+                num_stages=3,
+            )
+        else:
+            l2norm_fwd_kernel1[(T,)](
+                x,
+                y,
+                eps=eps,
+                D=D,
+                BD=BD,
+                num_warps=8,
+                num_stages=3,
+            )
 
-    return y.view(x_shape_og)
+        return y.view(x_shape_og)
+else:
+    def l2norm_fwd(
+        x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
+    ):
+        x_shape_og = x.shape
+        x = x.view(-1, x.shape[-1])
+        # allocate output
+        if output_dtype is None:
+            y = torch.empty_like(x)
+        else:
+            y = torch.empty_like(x, dtype=output_dtype)
+        assert y.stride(-1) == 1
+        T, D = x.shape[0], x.shape[-1]
+        # rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
+        # Less than 64KB per feature: enqueue fused kernel
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+        if D > BD:
+            raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+
+        if D <= 512:
+
+            def grid(meta):
+                return (triton.cdiv(T, meta["BT"]),)
+
+            l2norm_fwd_kernel[grid](
+                x,
+                y,
+                eps,
+                T=T,
+                D=D,
+                BD=BD,
+                BT=16,
+                num_warps=8,
+                num_stages=3,
+            )
+        else:
+            l2norm_fwd_kernel1[(T,)](
+                x,
+                y,
+                eps=eps,
+                D=D,
+                BD=BD,
+                num_warps=8,
+                num_stages=3,
+            )
+
+        return y.view(x_shape_og)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -216,68 +286,145 @@ def gdn_prefill_qkv_prepare_kernel(
         tl.store(v_output_block, v_values, boundary_check=(0, 1))
 
 
-def gdn_prefill_qkv_prepare_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
-    if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
-        raise ValueError(
-            "GDN fused prepare requires equal Q/K [T, Hqk, D] shapes and "
-            "V [T, Hv, D], got "
-            f"{q.shape=}, {k.shape=}, {v.shape=}"
-        )
-    if v.shape[0] != q.shape[0] or v.shape[2] != q.shape[2]:
-        raise ValueError(
-            "GDN fused prepare requires common token and head-dim axes, got "
-            f"{q.shape=}, {v.shape=}"
-        )
-    if q.device != k.device or q.device != v.device:
-        raise ValueError("GDN fused prepare requires Q/K/V on the same device")
-    if q.dtype != k.dtype or q.dtype != v.dtype:
-        raise ValueError("GDN fused prepare requires equal Q/K/V dtypes")
+# Import-time selection keeps the disabled entry and launch body stock.
+if _Q38C_EXTEND_PATH:
+    def gdn_prefill_qkv_prepare_fwd(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
+        if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
+            raise ValueError(
+                "GDN fused prepare requires equal Q/K [T, Hqk, D] shapes and "
+                "V [T, Hv, D], got "
+                f"{q.shape=}, {k.shape=}, {v.shape=}"
+            )
+        if v.shape[0] != q.shape[0] or v.shape[2] != q.shape[2]:
+            raise ValueError(
+                "GDN fused prepare requires common token and head-dim axes, got "
+                f"{q.shape=}, {v.shape=}"
+            )
+        if q.device != k.device or q.device != v.device:
+            raise ValueError("GDN fused prepare requires Q/K/V on the same device")
+        if q.dtype != k.dtype or q.dtype != v.dtype:
+            raise ValueError("GDN fused prepare requires equal Q/K/V dtypes")
 
-    T, H_QK, D = q.shape
-    H_V = v.shape[1]
-    if D > 512:
-        raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
-    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
-        return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
+        T, H_QK, D = q.shape
+        H_V = v.shape[1]
+        if D > 512:
+            raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
+        if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+            # gdn_front: q and k produced as adjacent planes of one buffer (see
+            # causal_conv1d_fn_split_qkv) are normalized by a single launch.
+            if (
+                _GDN_FRONT_L2NORM
+                and q.numel() > 0
+                and k.data_ptr() == q.data_ptr() + q.numel() * q.element_size()
+                and q.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+            ):
+                qk = torch.as_strided(q, (2 * T * H_QK, D), (D, 1))
+                y = l2norm_fwd(qk, eps)
+                n = T * H_QK * D
+                return y.view(-1)[:n].view(q.shape), y.view(-1)[n:].view(k.shape), v
+            return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
 
-    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
-    BT = 16
-    BD = triton.next_power_of_2(D)
-    grid = (triton.cdiv(T, BT), H_QK + H_V)
-    gdn_prefill_qkv_prepare_kernel[grid](
-        q,
-        k,
-        v,
-        q_out,
-        k_out,
-        v_out,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        T=T,
-        H_QK=H_QK,
-        H_V=H_V,
-        D=D,
-        BT=BT,
-        BD=BD,
-        num_warps=4,
-        num_stages=2,
-    )
-    return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
+        q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+        v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+        BT = 16
+        BD = triton.next_power_of_2(D)
+        grid = (triton.cdiv(T, BT), H_QK + H_V)
+        gdn_prefill_qkv_prepare_kernel[grid](
+            q,
+            k,
+            v,
+            q_out,
+            k_out,
+            v_out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            T=T,
+            H_QK=H_QK,
+            H_V=H_V,
+            D=D,
+            BT=BT,
+            BD=BD,
+            num_warps=4,
+            num_stages=2,
+        )
+        return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
+else:
+    def gdn_prefill_qkv_prepare_fwd(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
+        if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
+            raise ValueError(
+                "GDN fused prepare requires equal Q/K [T, Hqk, D] shapes and "
+                "V [T, Hv, D], got "
+                f"{q.shape=}, {k.shape=}, {v.shape=}"
+            )
+        if v.shape[0] != q.shape[0] or v.shape[2] != q.shape[2]:
+            raise ValueError(
+                "GDN fused prepare requires common token and head-dim axes, got "
+                f"{q.shape=}, {v.shape=}"
+            )
+        if q.device != k.device or q.device != v.device:
+            raise ValueError("GDN fused prepare requires Q/K/V on the same device")
+        if q.dtype != k.dtype or q.dtype != v.dtype:
+            raise ValueError("GDN fused prepare requires equal Q/K/V dtypes")
+
+        T, H_QK, D = q.shape
+        H_V = v.shape[1]
+        if D > 512:
+            raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
+        if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+            return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
+
+        q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+        v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+        BT = 16
+        BD = triton.next_power_of_2(D)
+        grid = (triton.cdiv(T, BT), H_QK + H_V)
+        gdn_prefill_qkv_prepare_kernel[grid](
+            q,
+            k,
+            v,
+            q_out,
+            k_out,
+            v_out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            T=T,
+            H_QK=H_QK,
+            H_V=H_V,
+            D=D,
+            BT=BT,
+            BD=BD,
+            num_warps=4,
+            num_stages=2,
+        )
+        return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
 
 
 class L2NormFunction(torch.autograd.Function):

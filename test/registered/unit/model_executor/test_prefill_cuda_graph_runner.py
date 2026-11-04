@@ -764,6 +764,7 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
     def _runner(counter, is_full_backend=True):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = is_full_backend
+        runner.use_captured_attn_metadata = False
         runner.model_runner = SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
         )
@@ -785,6 +786,38 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         self.assertTrue(waiter.is_alive())
 
         counter.complete(0, 2)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
+    def test_breakable_captured_linear_extend_waits_for_last_loaded_layer(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        counter.complete(0, 0)
+        counter.complete(0, 1)
+        runner = self._runner(counter, is_full_backend=False)
+        runner.use_captured_attn_metadata = True
+        runner.model_runner.attn_backend = SimpleNamespace(
+            breakable_cuda_graph_captures_linear_extend=True
+        )
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+
+        counter.complete(0, 2)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
+    def test_breakable_captured_metadata_without_linear_extend_keeps_overlap(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        runner = self._runner(counter, is_full_backend=False)
+        runner.use_captured_attn_metadata = True
+        runner.model_runner.attn_backend = SimpleNamespace(
+            breakable_cuda_graph_captures_linear_extend=False
+        )
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
 

@@ -18,18 +18,10 @@ digits:
   then the 64 bins of the threshold group from the leader (two DSMEM loads),
   finds the threshold digit with warp suffix scans, and the round ends.
 
-A round stops early when the threshold bin is taken whole. After the last
-round every key strictly above the threshold is written and exactly
-``topk - #above`` keys equal to it, with slots handed out by one DSMEM atomic
-per CTA. There is no candidate buffer, so nothing can be clipped, and there is
-no global workspace or arrival counter: the kernel is CUDA-graph safe as is
-(grid = rows * C, fixed for a given logits width).
-
-Semantics match ``fast_topk(score, lengths, 512, row_starts=None)``: the
-selected value multiset is the exact top-512, output order within a row is
-unspecified, ties with the 512th value are broken arbitrarily, rows with
-``length <= 512`` get ``0..length-1`` then -1 without reading scores, and a
-row never reads past ``length`` (``length`` is clamped to the logits width).
+A full boundary bucket can end radix refinement early. Counts from contiguous
+CTA shards and ordered within-shard scans select cutoff ties by ascending ID
+and emit in fixed shard/warp/lane/round/vector order, without a global workspace.
+Rows of length <= 512 keep identity IDs followed by -1 without reading scores.
 
 The CUDA source ships in this module and is JIT-compiled for the running GPU.
 """
@@ -42,8 +34,13 @@ import pathlib
 from typing import Optional
 
 import torch
-
-from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    KERNEL_PATH,
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 SPLIT_TOPK_CHUNK = 4096  # kept for API compatibility with v1
 _SUPPORTED_K = (512,)
@@ -56,6 +53,7 @@ _SOURCE = r"""
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include "elementwise/deterministic_topk.cuh"
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -77,8 +75,7 @@ struct Params {
 };
 
 SGL_DEVICE uint32_t to_key(float x) {
-  const uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  return deterministic_topk_detail::ordered_key(x);
 }
 
 SGL_DEVICE uint32_t cluster_rank() {
@@ -103,11 +100,6 @@ SGL_DEVICE uint32_t map_rank(uint32_t addr, uint32_t rank) {
 SGL_DEVICE void remote_red_add(uint32_t addr, uint32_t v) {
   asm volatile("red.relaxed.cluster.shared::cluster.add.u32 [%0], %1;" ::"r"(addr), "r"(v) : "memory");
 }
-SGL_DEVICE uint32_t remote_atom_add(uint32_t addr, uint32_t v) {
-  uint32_t old;
-  asm volatile("atom.relaxed.cluster.shared::cluster.add.u32 %0, [%1], %2;" : "=r"(old) : "r"(addr), "r"(v) : "memory");
-  return old;
-}
 SGL_DEVICE uint32_t remote_ld(uint32_t addr) {
   uint32_t v;
   asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v) : "r"(addr) : "memory");
@@ -129,15 +121,6 @@ SGL_DEVICE uint32_t warp_suffix_sum(uint32_t x, int lane) {
   return x;
 }
 
-SGL_DEVICE uint32_t warp_prefix_sum(uint32_t x, int lane) {
-#pragma unroll
-  for (int o = 1; o < 32; o <<= 1) {
-    const uint32_t t = __shfl_up_sync(0xffffffffu, x, o);
-    if (lane >= o) x += t;
-  }
-  return x;
-}
-
 template <int kThreads, int kCluster, int kIters, bool kVec, bool kUsePDL>
 __global__ __launch_bounds__(kThreads) void cluster_topk_kernel(const Params __grid_constant__ p) {
   constexpr int kItems = kIters * 4;
@@ -145,15 +128,14 @@ __global__ __launch_bounds__(kThreads) void cluster_topk_kernel(const Params __g
   constexpr int kThreadsPerGroup = kGroupBins / kBinsPerThread;
   static_assert(kBins % kThreads == 0 && kThreadsPerGroup >= 1 && kThreadsPerGroup <= 32);
   static_assert(kThreads % 32 == 0);
-  static_assert(kItems <= 64, "packed 16-bit per-warp counts");
+  static_assert(kItems <= 32, "register key capacity");
 
   __shared__ alignas(16) uint32_t s_local[kBins];
   __shared__ alignas(16) uint32_t s_lead_hist[kRounds][kBins];  // read only in rank 0
   __shared__ alignas(16) uint32_t s_lead_group[kRounds][kGroups];
-  __shared__ uint32_t s_lead_count;  // rank 0: packed (#above | #equal << 16)
-  __shared__ uint32_t s_block_count;
-  __shared__ uint32_t s_block_base;
-  __shared__ uint32_t s_res[3];
+  __shared__ unsigned long long s_counts[kIters][kThreads / 32], s_total, s_base;
+  __shared__ uint32_t s_res[3], s_output[kThreads / 32];
+  __shared__ int s_tie_item, s_tie_warp, s_tie_need, s_tie_id;
 
   const int tx = threadIdx.x;
   const int lane = tx & 31;
@@ -166,9 +148,7 @@ __global__ __launch_bounds__(kThreads) void cluster_topk_kernel(const Params __g
   if (rank == 0) {
     for (int i = tx; i < kRounds * kBins; i += kThreads) (&s_lead_hist[0][0])[i] = 0;
     if (tx < kRounds * kGroups) (&s_lead_group[0][0])[tx] = 0;
-    if (tx == 0) s_lead_count = 0;
   }
-  if (tx == 0) s_block_count = 0;
   __syncthreads();
   cluster_arrive();  // released here, waited for right before the first DSMEM access
 
@@ -209,7 +189,6 @@ __global__ __launch_bounds__(kThreads) void cluster_topk_kernel(const Params __g
 
   const uint32_t lead_hist = map_rank(smem_addr(&s_lead_hist[0][0]), 0);
   const uint32_t lead_group = map_rank(smem_addr(&s_lead_group[0][0]), 0);
-  const uint32_t lead_count = map_rank(smem_addr(&s_lead_count), 0);
 
   uint32_t prefix = 0, pmask = 0;
   uint32_t rem = kTopK;  // still to select among keys matching the prefix
@@ -286,52 +265,105 @@ __global__ __launch_bounds__(kThreads) void cluster_topk_kernel(const Params __g
     need = rem;  // final when r == kRounds - 1: ties with the exact threshold key
   }
 
-  // Selected: keys above the prefix (kTopK - need of them) and the first `need`
-  // keys equal to it. Slots: one smem atomic per warp, one DSMEM atomic per CTA.
-  uint32_t mine = 0;
+  uint32_t above_bits = 0, equal_bits = 0;
 #pragma unroll
   for (int j = 0; j < kIters; ++j) {
+    uint32_t above = 0, equal = 0;
 #pragma unroll
     for (int v = 0; v < 4; ++v) {
       const uint32_t mk = key[4 * j + v] & pmask;
-      if (valid(j, v)) mine += (mk > prefix) ? 1u : ((mk == prefix) ? 0x10000u : 0u);
+      const bool a = valid(j, v) && mk > prefix, e = valid(j, v) && mk == prefix;
+      above += a;
+      equal += e;
+      above_bits |= uint32_t(a) << (4 * j + v);
+      equal_bits |= uint32_t(e) << (4 * j + v);
     }
+    above = __reduce_add_sync(0xffffffffu, above);
+    equal = __reduce_add_sync(0xffffffffu, equal);
+    if (lane == 0) s_counts[j][tx / 32] = above | (static_cast<unsigned long long>(equal) << 32);
   }
-  const uint32_t incl = warp_prefix_sum(mine, lane);
-  uint32_t warp_base = 0;
-  // Equal keys past the first kTopK of a warp/CTA can never get a slot: clamp
-  // their contribution so the packed 16-bit counts cannot overflow.
-  if (lane == 31) warp_base = ::atomicAdd(&s_block_count, (incl & 0xFFFFu) | (min(incl >> 16, static_cast<uint32_t>(kTopK)) << 16));
-  warp_base = __shfl_sync(0xffffffffu, warp_base, 31);
   __syncthreads();
+  if (tx < 32) {
+    uint32_t above = 0, equal = 0;
+#pragma unroll
+    for (int j = 0; j < kIters; ++j) if (tx < kThreads / 32) {
+      above += uint32_t(s_counts[j][tx]);
+      equal += uint32_t(s_counts[j][tx] >> 32);
+    }
+    above = __reduce_add_sync(0xffffffffu, above);
+    equal = __reduce_add_sync(0xffffffffu, equal);
+    if (tx == 0) s_total = above | (static_cast<unsigned long long>(equal) << 32);
+  }
+  cluster_arrive();
+  cluster_wait();
   if (tx == 0) {
-    const uint32_t tot = s_block_count;
-    const uint32_t eq = min(tot >> 16, static_cast<uint32_t>(kTopK));  // later equal slots are never used
-    s_block_base = remote_atom_add(lead_count, (tot & 0xFFFFu) | (eq << 16));
+    unsigned long long prior = 0;
+    for (uint32_t r = 0; r < rank; ++r) {
+      const uint2 count = remote_ld2(map_rank(smem_addr(&s_total), r));
+      prior += static_cast<unsigned long long>(count.x) | (static_cast<unsigned long long>(count.y) << 32);
+    }
+    s_base = prior;
   }
   __syncthreads();
-  cluster_arrive();  // this CTA is done with the leader's shared memory
-  const uint32_t base = s_block_base + warp_base + (incl - mine);
-  uint32_t gpos = base & 0xFFFFu;
-  uint32_t epos = base >> 16;
-  const uint32_t gt_total = kTopK - need;
+  const int local_need = int(need) - int(s_base >> 32);
+  if (local_need <= 0) {
+    if (tx == 0) s_tie_id = -1;
+  } else if (local_need >= int(s_total >> 32)) {
+    if (tx == 0) s_tie_id = length;
+  } else {
+    if (tx < 32) {
+      uint32_t carry = 0;
 #pragma unroll
-  for (int j = 0; j < kIters; ++j) {
-#pragma unroll
-    for (int v = 0; v < 4; ++v) {
-      const uint32_t mk = key[4 * j + v] & pmask;
-      if (valid(j, v)) {
-        const int idx = beg + (j * kThreads + tx) * 4 + v;
-        if (mk > prefix) {
-          out[gpos++] = idx;
-        } else if (mk == prefix) {
-          if (epos < need) out[gt_total + epos] = idx;
-          ++epos;
+      for (int j = 0; j < kIters; ++j) {
+        const uint32_t count = tx < kThreads / 32 ? uint32_t(s_counts[j][tx] >> 32) : 0;
+        const uint32_t prior = deterministic_topk_detail::warp_exclusive(count);
+        const uint32_t total = __shfl_sync(0xffffffffu, prior + count, kThreads / 32 - 1);
+        if (carry + total >= uint32_t(local_need)) {
+          const unsigned hit = __ballot_sync(0xffffffffu, tx < kThreads / 32 && carry + prior < uint32_t(local_need) && carry + prior + count >= uint32_t(local_need));
+          const int winner = __ffs(hit) - 1;
+          const int take = local_need - int(carry + __shfl_sync(0xffffffffu, prior, winner));
+          if (tx == 0) { s_tie_item = j; s_tie_warp = winner; s_tie_need = take; }
+          break;
         }
+        carry += total;
+      }
+    }
+    __syncthreads();
+    if (tx / 32 == s_tie_warp) {
+      const unsigned equal = (equal_bits >> (4 * s_tie_item)) & 15u;
+      const uint32_t count = __popc(equal);
+      const uint32_t prior = deterministic_topk_detail::warp_exclusive(count);
+      const int take = s_tie_need - int(prior);
+      if (take > 0 && take <= int(count)) {
+        const unsigned selected = deterministic_topk_detail::lowest_bits(equal, take);
+        s_tie_id = beg + (s_tie_item * kThreads + tx) * 4 + 31 - __clz(selected);
       }
     }
   }
-  if (rank == 0) cluster_wait();  // keep the leader's shared memory alive for its peers
+  __syncthreads();
+  const int delta = s_tie_id - beg - tx * 4;
+  const uint32_t allowed_count = delta < 0 ? 0u : min(uint32_t(kItems), uint32_t((delta / (4 * kThreads)) * 4 + min(delta % (4 * kThreads) + 1, 4)));
+  const uint32_t allowed = allowed_count == 32 ? 0xffffffffu : (1u << allowed_count) - 1u;
+  const uint32_t chosen = above_bits | (equal_bits & allowed);
+  const uint32_t count = __popc(chosen);
+  const uint32_t lane_base = deterministic_topk_detail::warp_exclusive(count);
+  if (lane == 31) s_output[tx / 32] = lane_base + count;
+  __syncthreads();
+  if (tx < 32) {
+    const uint32_t count = tx < kThreads / 32 ? s_output[tx] : 0;
+    const uint32_t prior = deterministic_topk_detail::warp_exclusive(count);
+    if (tx < kThreads / 32) s_output[tx] = prior;
+  }
+  __syncthreads();
+  uint32_t slot = uint32_t(s_base) + min(uint32_t(s_base >> 32), need) + s_output[tx / 32] + lane_base;
+#pragma unroll
+  for (int j = 0; j < kIters; ++j) {
+#pragma unroll
+    for (int v = 0; v < 4; ++v)
+      if (chosen & (1u << (4 * j + v))) out[slot++] = beg + (j * kThreads + tx) * 4 + v;
+  }
+  cluster_arrive();
+  cluster_wait();
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -403,6 +435,7 @@ def _module(threads: int, cluster: int, iters: int, vec: bool):
         "qsa_cluster_topk",
         *args,
         cuda_files=[_source_path()],
+        extra_include_paths=[str(KERNEL_PATH / "csrc")],
         cuda_wrappers=[("cluster_topk", f"QsaClusterTopKKernel<{args}>::run")],
     )
 
@@ -439,7 +472,12 @@ def reserve_split_topk(rows: int, width: int, device) -> None:
 
 
 def split_topk_supported(score: torch.Tensor, topk: int) -> bool:
-    if not (score.is_cuda and score.dtype == torch.float32 and score.dim() == 2 and score.stride(1) == 1):
+    if not (
+        score.is_cuda
+        and score.dtype == torch.float32
+        and score.dim() == 2
+        and score.stride(1) == 1
+    ):
         return False
     if topk not in _SUPPORTED_K or score.shape[1] <= 0:
         return False
@@ -468,4 +506,9 @@ def split_fast_topk(
     return indices
 
 
-__all__ = ["SPLIT_TOPK_CHUNK", "reserve_split_topk", "split_fast_topk", "split_topk_supported"]
+__all__ = [
+    "SPLIT_TOPK_CHUNK",
+    "reserve_split_topk",
+    "split_fast_topk",
+    "split_topk_supported",
+]

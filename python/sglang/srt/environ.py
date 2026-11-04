@@ -330,6 +330,10 @@ class Envs:
     SGLANG_Q38_HC_SMALLM4 = EnvBool(False)
     SGLANG_Q38_HC_SMALLM16 = EnvBool(False)
     SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
+    # TP1: the HC boundary at 33..N rows (N <= 128) takes the side-stream gate and the fused combine and next norm
+    # that the gate rows above use, with the same arithmetic. 0 keeps the default path there.
+    SGLANG_HC_FUSED_COMBINE_MAX_ROWS = EnvInt(0)
+    SGLANG_ENABLE_PLE_STATE_INDEX_MASK = EnvBool(False)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
     # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
@@ -1447,6 +1451,12 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # Qwen NVFP4 TRT-LLM MoE: also tune the routed experts alone at the prefill
+    # buckets during warmup (one MoE call, no whole-model EXTEND pass).
+    SGLANG_ENABLE_QWEN_MOE_PREFILL_AUTOTUNE = EnvBool(False)
+    # JSON tuning file of pinned FlashInfer tactics, keyed by FlashInfer version
+    # and op shape; see layers/moe/flashinfer_tactic_pins.py.
+    SGLANG_FLASHINFER_TACTIC_PIN_FILE = EnvStr(None)
     SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE = EnvBool(False)
     SGLANG_OPT_FLUX3_PRIMS_TS_TUNING_BUCKETS = EnvTuple(tuple())
     SGLANG_USE_SAGE_ATTENTION_IMPL = EnvStr("")
@@ -1516,6 +1526,12 @@ class Envs:
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
+    # SM107, cutedsl backend with split-K: small-M BF16 GEMMs listed in sm107_bf16_smallm.ROUTES run as one kernel
+    # whose output bits equal the stock dispatch's.
+    SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES = EnvBool(False)
+    # With the routes above: the shared expert's act_and_mul at 1-16 rows runs in its gate_up kernel's epilogue,
+    # with the stock JIT act_and_mul's bits.
+    SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1622,6 +1638,13 @@ class Envs:
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
     # GLM-5.2 (H=6144): neutral at 192 on B300 TP8, crossover 192-223 on GB300 TP4.
     SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
+    # Qwen NVFP4 TRT-LLM MoE: largest token count whose finalize is fused with
+    # the shared-expert gate (SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE).
+    SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS = EnvInt(64)
+    # Launch the fused finalize + gate at <= 64 tokens on a (token, column-chunk)
+    # grid of this many columns (128, 256, 512 or 1024); 0 keeps one program per
+    # token. Same arithmetic per element; only the grid changes.
+    SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK = EnvInt(0)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
@@ -1659,6 +1682,10 @@ class Envs:
     SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
+    # Qwen sparse attention prefill: take lengths, max_q and MTP seed rows from
+    # host lists instead of reading them back from the device (same values).
+    # Disable to restore the device reads.
+    SGLANG_ENABLE_QSA_PREFILL_HOST_PATH = EnvBool(False)
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
@@ -1713,6 +1740,10 @@ class Envs:
     SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
     SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
+    # Text-only extend batches repeat ForwardBatch.positions on the device for
+    # their mrope rows instead of copying per-request ranges from pageable host
+    # memory (same values). Disable to restore the host loop.
+    SGLANG_ENABLE_MROPE_TEXT_DEVICE_POSITIONS = EnvBool(False)
 
     # ===================================================================
     # Speculative decoding
@@ -1730,6 +1761,17 @@ class Envs:
     # Experimental: capture the EAGLE verify's sampling, acceptance and state commit
     # in CUDA graphs (speculative/eagle_post_verify_graphs.py).
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(False)
+    # The EAGLE verify's fp32 softmax (vocab >= 65536, <= 64 rows) and target-only tree sampling as multi-CTA
+    # kernels that keep the stock kernels' reduction orders, so outputs are bitwise equal.
+    SGLANG_ENABLE_MULTI_CTA_VERIFY_SAMPLING = EnvBool(False)
+    # With the post-verify CUDA graph: join the side-stream state commit before the next verify or prefill and order
+    # every other reader and writer of that state after it (speculative/post_verify_late_join.py).
+    SGLANG_ENABLE_POST_VERIFY_LATE_JOIN = EnvBool(False)
+    # Post-verify graph sets (batch shape x verify logits buffer) kept before a new one runs eager. Arbitrary.
+    SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
+    # Priority of the CUDA graph capture stream and the forward path's helper streams (named streams, HC gate,
+    # PLE prefetch); None keeps torch's default. Lower is higher.
+    SGLANG_FORWARD_HELPER_STREAM_PRIORITY = EnvInt(None)
     # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300; all off by default.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
@@ -1987,6 +2029,10 @@ class Envs:
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    # Launch tile of the causal_conv1d forward kernel without a block table,
+    # "BLOCK_M,BLOCK_N,num_warps,num_stages"; unset keeps 8,256 at 4 warps and
+    # 2 stages. Only which program computes an output changes, not its value.
+    SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")
     # Opt-in: on the unified radix tree, leave the matched-prefix mamba evictable
     # during decode (it is already COW'd to the request's own slot) and shrink the
     # mamba pool ratio accordingly. Frees one resident slot per running request,
@@ -2484,6 +2530,31 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+
+    # ===================================================================
+    # Qwen sparse attention (QSA) indexer
+    # ===================================================================
+    # CTAs-per-row levels of the paged decode scorer, e.g. "1,256"; unset keeps
+    # (1, 16, 256). Each logit is still written by one CTA running the same
+    # body, so only the launch grid changes.
+    SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS = EnvTuple(tuple())
+    # Request cap of the grouped target-verify scorer (SGLANG_QSA_GROUPED_SCORE);
+    # larger batches score each row on its own.
+    SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS = EnvInt(16)
+    # SM107: score verify batches of 17-144 requests on the grouped4 kernel, which
+    # loads each key tile once for a request's four rows (bit-identical logits).
+    SGLANG_ENABLE_QSA_GROUPED4_VERIFY = EnvBool(False)
+    SGLANG_QSA_GROUPED4_VERIFY_CTAS = EnvInt(32)
+    # Grouped4 rows on the same kernel with the v7 kernel's shorter load chain
+    # (bit-identical logits), at this many CTAs per request group.
+    SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN = EnvBool(False)
+    SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS = EnvInt(512)
+    # Score the MTP draft extend's rows four per request on the grouped4 kernel
+    # (TP1, a window of four per request); other shapes keep per-row scoring.
+    SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND = EnvBool(False)
+    # Fold the relative prefill scorer's 1/sqrt(128) into its store instead of a
+    # separate divide over the logits (bit-identical on CUDA).
+    SGLANG_ENABLE_QSA_PREFILL_SCALE_FOLD = EnvBool(False)
 
     # ===================================================================
     # Symmetric memory

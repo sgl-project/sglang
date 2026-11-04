@@ -19,10 +19,7 @@ namespace sglang {
 // Keep this integer operation in PTX. An FP abs/neg rewrite canonicalizes NaNs
 // differently and invalidates the histogram/scatter agreement (SHARD audit).
 __device__ __forceinline__ uint32_t q38_mk_ordered_key(float value) {
-  uint32_t bits = __float_as_uint(value), result;
-  uint32_t flip = (bits & 0x80000000u) ? 0xffffffffu : 0x80000000u;
-  asm("xor.b32 %0, %1, %2;" : "=r"(result) : "r"(bits), "r"(flip));
-  return result;
+  return deterministic_topk_detail::ordered_key(value);
 }
 
 template <int kItems, int kCluster, bool kPDL, bool kLinear, int kNarrow, bool kSingleLaunch = false>
@@ -55,7 +52,7 @@ __global__ __launch_bounds__(512) void q38_mk_topk_kernel(
     return;
   }
   const int start = starts ? starts[row] : 0;
-  // Contiguous shards keep the final canonical order independent of selection.
+  // Contiguous shards fix cutoff tie membership independently of emission.
   constexpr int kShard = kItems * 512;
   uint32_t keys[kItems];
 #pragma unroll
@@ -68,12 +65,12 @@ __global__ __launch_bounds__(512) void q38_mk_topk_kernel(
   __shared__ uint32_t pivot, need, cursor, ties, done, narrow_count;
   __shared__ uint32_t small_count, small_keys[kNarrow], small_ids[kNarrow];
   __shared__ unsigned long long compact_counts;
-  __shared__ uint32_t total_above, prior_above, prior_ties;
+  __shared__ unsigned long long warp_counts[kItems][16], prior_counts;
+  __shared__ uint32_t total_above, output_warps[16];
+  __shared__ int tie_item, tie_warp, tie_need, tie_id;
   using Scan = cub::BlockScan<uint32_t, 512>;
-  using CountScan = cub::BlockScan<unsigned long long, 512>;
   union Scratch {
     typename Scan::TempStorage cutoff;
-    typename CountScan::TempStorage compact;
   };
   __shared__ Scratch scratch;
   if (tid == 0) { pivot = 0; need = 512; cursor = 0; ties = 0; done = 0; }
@@ -140,46 +137,18 @@ __global__ __launch_bounds__(512) void q38_mk_topk_kernel(
     // entire boundary bucket fits, so the local arrays cannot clip candidates.
     const uint32_t boundary_count = *cluster.map_shared_rank(&narrow_count, 0);
     if (pass == 1 && boundary_count <= kNarrow) {
-      uint32_t above_mask = 0, boundary_mask = 0;
+      if (tid == 0) small_count = 0;
+      __syncthreads();
 #pragma unroll
       for (int i = 0; i < kItems; ++i) {
         const int index = rank * kShard + i * 512 + tid;
-        if (index < length) {
-          const uint32_t coarse = keys[i] & mask;
-          if (coarse > prefix) above_mask |= uint32_t(1) << i;
-          if (coarse == prefix) boundary_mask |= uint32_t(1) << i;
-        }
-      }
-      if (tid == 0) small_count = 0;
-      unsigned long long thread_prefix, block_total;
-      CountScan(scratch.compact).ExclusiveSum(
-          static_cast<unsigned long long>(__popc(above_mask)), thread_prefix, block_total);
-      if (tid == 0) compact_counts = block_total;
-      __syncthreads();
-#pragma unroll
-      for (int i = 0; i < kItems; ++i) {
-        if (boundary_mask & (uint32_t(1) << i)) {
+        if (index < length && (keys[i] & mask) == prefix) {
           const uint32_t slot = atomicAdd(&small_count, 1u);
           small_keys[slot] = keys[i];
-          small_ids[slot] = rank * kShard + i * 512 + tid;
+          small_ids[slot] = index;
         }
       }
-      // One publication serves both the above-prefix compact counts and the
-      // complete small bucket. No all-rank fine-cutoff publication is needed.
       cluster.sync();
-      if (tid == 0) {
-        uint32_t prior = 0;
-#pragma unroll
-        for (int r = 0; r < kCluster; ++r)
-          if (r < rank) prior += uint32_t(*cluster.map_shared_rank(&compact_counts, r));
-        prior_above = prior;
-      }
-      __syncthreads();
-      uint32_t out_slot = prior_above + uint32_t(thread_prefix);
-#pragma unroll
-      for (int i = 0; i < kItems; ++i)
-        if (above_mask & (uint32_t(1) << i))
-          output[row * 512 + out_slot++] = rank * kShard + i * 512 + tid;
       if (rank == 0 && tid < 32) {
         constexpr int kRegs = kNarrow / 32;
         unsigned long long packed[kRegs];
@@ -228,76 +197,105 @@ __global__ __launch_bounds__(512) void q38_mk_topk_kernel(
 #pragma unroll
         for (int i = 0; i < kRegs; ++i) {
           const int position = tid + i * 32;
-          if (position < take)
-            output[row * 512 + (512u - take) + position] = 0xffffffffu - uint32_t(packed[i]);
+          if (position + 1 == take) pivot = uint32_t(packed[i] >> 32);
         }
       }
-      // Keep every DSMEM owner alive through root gather and all output writes.
       cluster.sync();
-      device::PDLTriggerSecondary<kPDL>();
-      return;
+      prefix = *cluster.map_shared_rank(&pivot, 0);
+      mask = 0xffffffffu;
+      break;
     }
   }
-  if constexpr (kLinear) {
-    uint32_t above_mask = 0, equal_mask = 0;
+  uint32_t above_bits = 0, equal_bits = 0;
 #pragma unroll
-    for (int i = 0; i < kItems; ++i) {
-      const int index = rank * kShard + i * 512 + tid;
-      if (index < length) {
-        if (keys[i] > prefix) above_mask |= uint32_t(1) << i;
-        if (keys[i] == prefix) equal_mask |= uint32_t(1) << i;
-      }
+  for (int i = 0; i < kItems; ++i) {
+    const int id = rank * kShard + i * 512 + tid;
+    const uint32_t key = keys[i] & mask;
+    const bool above = id < length && key > prefix, equal = id < length && key == prefix;
+    above_bits |= uint32_t(above) << i;
+    equal_bits |= uint32_t(equal) << i;
+    const unsigned a_mask = __ballot_sync(0xffffffffu, above);
+    const unsigned e_mask = __ballot_sync(0xffffffffu, equal);
+    if ((tid & 31) == 0)
+      warp_counts[i][tid / 32] = uint32_t(__popc(a_mask)) | (static_cast<unsigned long long>(__popc(e_mask)) << 32);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    uint32_t above = 0, equal = 0;
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) if (tid < 16) {
+      above += uint32_t(warp_counts[i][tid]);
+      equal += uint32_t(warp_counts[i][tid] >> 32);
     }
-    const unsigned long long counts = uint32_t(__popc(above_mask)) |
-        (static_cast<unsigned long long>(__popc(equal_mask)) << 32);
-    unsigned long long thread_prefix, block_total;
-    CountScan(scratch.compact).ExclusiveSum(counts, thread_prefix, block_total);
-    if (tid == 0) compact_counts = block_total;
-    // Counts become visible before any rank reads another rank's DSMEM.
-    cluster.sync();
-    if (tid == 0) {
-      unsigned long long total = 0, prior = 0;
+    above = __reduce_add_sync(0xffffffffu, above);
+    equal = __reduce_add_sync(0xffffffffu, equal);
+    if (tid == 0) compact_counts = above | (static_cast<unsigned long long>(equal) << 32);
+  }
+  cluster.sync();
+  if (tid == 0) {
+    unsigned long long total = 0, prior = 0;
 #pragma unroll
-      for (int r = 0; r < kCluster; ++r) {
-        const auto counts_r = *cluster.map_shared_rank(&compact_counts, r);
-        total += counts_r;
-        if (r < rank) prior += counts_r;
+    for (int r = 0; r < kCluster; ++r) {
+      const auto counts = *cluster.map_shared_rank(&compact_counts, r);
+      total += counts;
+      if (r < rank) prior += counts;
+    }
+    total_above = uint32_t(total);
+    prior_counts = prior;
+  }
+  __syncthreads();
+  const uint32_t take_equal = 512u - total_above;
+  const int local_need = int(take_equal) - int(prior_counts >> 32);
+  if (local_need <= 0) {
+    if (tid == 0) tie_id = -1;
+  } else if (local_need >= int(compact_counts >> 32)) {
+    if (tid == 0) tie_id = length;
+  } else {
+    // Only the CTA containing the cutoff tie resolves its original ID.
+    if (tid < 32) {
+      uint32_t carry = 0;
+#pragma unroll
+      for (int i = 0; i < kItems; ++i) {
+        const uint32_t count = tid < 16 ? uint32_t(warp_counts[i][tid] >> 32) : 0;
+        const uint32_t prior = deterministic_topk_detail::warp_exclusive(count);
+        const uint32_t total = __shfl_sync(0xffffffffu, prior + count, 15);
+        if (carry + total >= uint32_t(local_need)) {
+          const unsigned hit = __ballot_sync(0xffffffffu, tid < 16 && carry + prior < uint32_t(local_need) && carry + prior + count >= uint32_t(local_need));
+          const int winner = __ffs(hit) - 1;
+          const int need = local_need - int(carry + __shfl_sync(0xffffffffu, prior, winner));
+          if (tid == 0) { tie_item = i; tie_warp = winner; tie_need = need; }
+          break;
+        }
+        carry += total;
       }
-      total_above = uint32_t(total);
-      prior_above = uint32_t(prior);
-      prior_ties = uint32_t(prior >> 32);
     }
     __syncthreads();
-    uint32_t above = prior_above + uint32_t(thread_prefix);
-    uint32_t equal = prior_ties + uint32_t(thread_prefix >> 32);
-    const uint32_t take_equal = 512u - total_above;
-#pragma unroll
-    for (int i = 0; i < kItems; ++i) {
-      const int index = rank * kShard + i * 512 + tid;
-      if (above_mask & (uint32_t(1) << i)) output[row * 512 + above++] = index;
-      if (equal_mask & (uint32_t(1) << i)) {
-        if (equal < take_equal) output[row * 512 + total_above + equal] = index;
-        ++equal;
-      }
+    if (tid / 32 == tie_warp) {
+      const unsigned equal = __ballot_sync(0xffffffffu, (equal_bits >> tie_item) & 1u);
+      const unsigned chosen = deterministic_topk_detail::lowest_bits(equal, tie_need);
+      if ((tid & 31) == 0) tie_id = rank * kShard + tie_item * 512 + tie_warp * 32 + 31 - __clz(chosen);
     }
-  } else {
-    uint32_t* root_cursor = cluster.map_shared_rank(&cursor, 0);
-    uint32_t* root_ties = cluster.map_shared_rank(&ties, 0);
-    const uint32_t take_ties = *cluster.map_shared_rank(&need, 0);
-#pragma unroll
-    for (int i = 0; i < kItems; ++i) {
-      const int index = rank * kShard + i * 512 + tid;
-      if (index < length) {
-        bool selected = keys[i] > prefix;
-        if (keys[i] == prefix) selected = atomicAdd(root_ties, 1u) < take_ties;
-        if (selected) {
-          const uint32_t slot = atomicAdd(root_cursor, 1u);
-          if (slot < 512) output[row * 512 + slot] = index;
-        }
-      }
-    }
-    cluster.sync();
   }
+  __syncthreads();
+  const int delta = tie_id - (rank * kShard + tid);
+  const uint32_t allowed_count = delta < 0 ? 0u : min(uint32_t(kItems), uint32_t(delta / 512 + 1));
+  const uint32_t allowed = allowed_count == 32 ? 0xffffffffu : (1u << allowed_count) - 1u;
+  const uint32_t chosen = above_bits | (equal_bits & allowed);
+  const uint32_t count = __popc(chosen);
+  const uint32_t lane_base = deterministic_topk_detail::warp_exclusive(count);
+  if ((tid & 31) == 31) output_warps[tid / 32] = lane_base + count;
+  __syncthreads();
+  if (tid < 32) {
+    const uint32_t mine = tid < 16 ? output_warps[tid] : 0;
+    const uint32_t prior = deterministic_topk_detail::warp_exclusive(mine);
+    if (tid < 16) output_warps[tid] = prior;
+  }
+  __syncthreads();
+  uint32_t slot = uint32_t(prior_counts) + min(uint32_t(prior_counts >> 32), take_equal)
+      + output_warps[tid / 32] + lane_base;
+#pragma unroll
+  for (int i = 0; i < kItems; ++i)
+    if (chosen & (1u << i)) output[row * 512 + slot++] = rank * kShard + i * 512 + tid;
   // DSMEM owners must not exit while another rank can access their memory.
   cluster.sync();
   device::PDLTriggerSecondary<kPDL>();

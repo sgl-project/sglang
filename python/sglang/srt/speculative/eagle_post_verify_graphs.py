@@ -15,7 +15,7 @@ import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
-from sglang.srt.speculative import perfll_step2
+from sglang.srt.speculative import perfll_step2, post_verify_late_join
 from sglang.srt.utils import host_trace
 
 if TYPE_CHECKING:
@@ -29,8 +29,8 @@ _FUSED_BS1_ACCEPT = os.environ.get("Q38_MTP_POSTVERIFY_FUSED_ACCEPT", "0") == "1
 # XORed into the server seed so these draws differ from other samplers'.
 _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 # Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
-# past it runs SGLang's eager path.
-_MAX_POST_VERIFY_STATES = 64
+# past it runs SGLang's eager path (SGLANG_POST_VERIFY_MAX_GRAPH_KEYS, default 64).
+_MAX_POST_VERIFY_STATES = post_verify_late_join.max_graph_keys()
 # SGLANG_Q35MF_MKH_N3C: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 _SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
@@ -157,6 +157,21 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    def enable_pool_presize(self) -> None:
+        """With the late join active: presize the graph pool at its first capture."""
+        self._graphs.presize = self._pool_presize_bytes
+
+    def _pool_presize_bytes(self, slot: SimpleNamespace) -> int:
+        """The scratch of the largest batch a verify graph replays; runs once, before the pool's first capture."""
+        post_verify_late_join.release_cached_blocks()
+        graph_sizes = self._target_worker.model_runner.decode_cuda_graph_capture_bs
+        return post_verify_late_join.presize_bytes(
+            max_requests=max([slot.num_requests, *graph_sizes]),
+            tokens_per_request=slot.tokens_per_request,
+            vocab=slot.logits.shape[-1],
+            free_bytes=torch.cuda.mem_get_info()[0],
+        )
 
     def _key(
         self,
@@ -452,6 +467,8 @@ class _PostVerifyGraphs:
         self._sim_rng = sim_rng
         self._states: dict[tuple, SimpleNamespace] = {}
         self._pool = None
+        # slot -> bytes the pool's first capture takes and frees (with the late join)
+        self.presize: Optional[Callable] = None
         self._side_stream = self._main_done = self._commit_done = None
         self._commit_pending = False
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
@@ -503,7 +520,9 @@ class _PostVerifyGraphs:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
                 outputs = self._body(slot)
-                self._commit(slot, outputs)
+                # The side tiling compiles here, never inside a capture.
+                with post_verify_late_join.side_commit_tiling():
+                    self._commit(slot, outputs)
                 return outputs[:6]
             self._capture(slot)
         if not getattr(slot, "replay_attested", False):
@@ -590,10 +609,13 @@ class _PostVerifyGraphs:
     def _capture(self, slot: SimpleNamespace) -> None:
         from sglang.srt.distributed.parallel_state import graph_capture
 
+        presize = 0
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+            if self.presize is not None:
+                presize = self.presize(slot)
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(
@@ -602,15 +624,21 @@ class _PostVerifyGraphs:
                 stream=ctx.stream,
                 capture_error_mode="thread_local",
             ):
+                if presize:
+                    # A private pool never frees a segment: size its first one for the largest key.
+                    post_verify_late_join.presize_pool(presize, device=slot.device)
                 outputs = self._body(slot)
         # Captured after the main graph in the same pool and replayed after it.
         commit_graph = torch.cuda.CUDAGraph()
         self._side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.graph(
-            commit_graph,
-            pool=self._pool,
-            stream=self._side_stream,
-            capture_error_mode="thread_local",
+        with (
+            torch.cuda.graph(
+                commit_graph,
+                pool=self._pool,
+                stream=self._side_stream,
+                capture_error_mode="thread_local",
+            ),
+            post_verify_late_join.side_commit_tiling(),
         ):
             self._commit(slot, outputs)
         torch.cuda.current_stream().wait_stream(self._side_stream)

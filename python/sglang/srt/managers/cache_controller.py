@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.speculative import post_verify_late_join
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -994,6 +995,10 @@ class HiCacheController:
             self.l2_transfer_engine.device_to_host_stream.wait_stream(
                 self.write_fence_stream
             )
+        # A backup may read state a late-joined post-verify commit still writes.
+        post_verify_late_join.wait(
+            "hicache_write", stream=self.l2_transfer_engine.device_to_host_stream
+        )
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
@@ -1139,6 +1144,15 @@ class HiCacheController:
             self.l2_transfer_engine.host_to_device_stream.wait_stream(
                 self.load_fence_stream
             )
+        # A load may write a slot a late-joined post-verify commit still writes; the
+        # engine runs it on its own stream, or on the current one (None).
+        engine = self.l2_transfer_engine
+        post_verify_late_join.wait(
+            "hicache_load",
+            stream=(
+                None if engine._h2d_on_current_stream else engine.host_to_device_stream
+            ),
+        )
 
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),

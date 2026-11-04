@@ -17,6 +17,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -57,6 +58,7 @@ from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
+from sglang.srt.utils.common import async_h2d
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,36 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 _Q38_ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
 _Q38C_ATTN_CORE_TP4 = os.environ.get("SGLANG_Q38C_ATTN_CORE_TP4", "0") == "1"
 _Q38C_GLUE_MERGE = os.environ.get("SGLANG_Q38C_GLUE_MERGE", "0") == "1"
+
+
+def _stream_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _last_rows_of_runs(*, extend_lens, pool_ids, num_rows: int) -> list:
+    """Host twin of ``is_last.nonzero()`` in capture_mtp_sparse_indices.
+
+    Rows are laid out as ``repeat_interleave(arange(bs), extend_lens)`` cut to the
+    first ``num_rows``; a row is last when the next row's request-pool id differs,
+    and the final row always is. Built from host lists, so no device read.
+    """
+    limit = min(int(num_rows), sum(extend_lens))
+    rows = []
+    start = 0
+    # (pool id, last row inside the limit) of the previous non-empty request
+    prev = None
+    for extend_len, pool_id in zip(extend_lens, pool_ids):
+        if extend_len <= 0:
+            continue
+        if start >= limit:
+            break
+        if prev is not None and prev[0] != pool_id:
+            rows.append(prev[1])
+        start += extend_len
+        prev = (pool_id, min(start, limit) - 1)
+    if prev is not None:
+        rows.append(prev[1])
+    return rows
 
 
 # Measured at 4-32 verify rows; larger batches keep fused_kv_prepare + trtllm.
@@ -310,6 +342,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         # (layer_id, k_full, v_full) of the prefill-CP K/V gather prefetch_cp_kv
         # started; that layer's _forward_extend_cp joins it.
         self._cp_kv_pending: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
+        self._prefill_host_path = envs.SGLANG_ENABLE_QSA_PREFILL_HOST_PATH.get()
+        # (indexer metadata, host extend lens, host pool ids) of the last extend
+        # metadata built here; capture_mtp_sparse_indices uses it only for that
+        # same metadata object.
+        self._mtp_anchor_host_src = None
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -706,6 +743,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
+                # A host output_size keeps repeat_interleave from reading its
+                # length back from the device; None keeps that read.
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -713,6 +752,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                         dtype=torch.int32,
                     ),
                     extend_seq_lens.to(torch.long),
+                    output_size=self._host_extend_rows(
+                        forward_batch=forward_batch,
+                        extend_seq_lens=extend_seq_lens,
+                        batch_size=batch_size,
+                    ),
                 )
                 # More mapped rows than physical would index past them;
                 # fewer is fine (DP MAX_LEN padding is trimmed downstream).
@@ -814,12 +858,77 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
+        if self._prefill_host_path and self._mtp_shared_sparse_indices is not None:
+            self._mtp_anchor_host_src = (
+                None
+                if decode_like
+                else self._mtp_anchor_host_source(
+                    forward_batch=forward_batch,
+                    indexer_metadata=indexer_metadata,
+                    batch_size=row_req_pool_indices.shape[0],
+                )
+            )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+        )
+
+    def _host_extend_rows(self, *, forward_batch, extend_seq_lens, batch_size: int):
+        """Total extend rows from the host lens the device lens were copied from;
+        None when the host path is off, the host list does not line up with the
+        device tensor, or a graph is being captured."""
+        host_lens = forward_batch.extend_seq_lens_cpu
+        if (
+            not self._prefill_host_path
+            or host_lens is None
+            or len(host_lens) != batch_size
+            or extend_seq_lens.dim() != 1
+            or extend_seq_lens.shape[0] != batch_size
+            or _stream_capturing()
+        ):
+            return None
+        return sum(int(x) for x in host_lens)
+
+    @staticmethod
+    def _mtp_anchor_host_source(*, forward_batch, indexer_metadata, batch_size: int):
+        """Host copies of what capture_mtp_sparse_indices' eager path reads on the
+        device: the extend lens behind token_to_batch_idx and each request's pool id."""
+        host_lens = forward_batch.extend_seq_lens_cpu
+        host_pool = forward_batch.req_pool_indices_cpu
+        extend_seq_lens = forward_batch.extend_seq_lens
+        if (
+            host_lens is None
+            or host_pool is None
+            or extend_seq_lens is None
+            or len(host_lens) != batch_size
+            or extend_seq_lens.dim() != 1
+            or extend_seq_lens.shape[0] != batch_size
+            or host_pool.dim() != 1
+            or host_pool.shape[0] < batch_size
+        ):
+            return None
+        return (
+            indexer_metadata,
+            tuple(int(x) for x in host_lens),
+            tuple(int(x) for x in host_pool[:batch_size].tolist()),
+        )
+
+    def _mtp_anchor_host_rows(self, metadata, num_rows: int):
+        """The seed rows of capture_mtp_sparse_indices' eager path, from host lists;
+        None unless this metadata's host lists were recorded."""
+        src = self._mtp_anchor_host_src
+        if (
+            not self._prefill_host_path
+            or src is None
+            or src[0] is not metadata
+            or _stream_capturing()
+        ):
+            return None
+        return _last_rows_of_runs(
+            extend_lens=src[1], pool_ids=src[2], num_rows=num_rows
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1284,10 +1393,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         row_req_pool_indices = metadata.req_pool_indices[
             row_to_req[: topk_indices.shape[0]]
         ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
+        host_rows = self._mtp_anchor_host_rows(metadata, topk_indices.shape[0])
+        if host_rows is not None:
+            anchor_rows = async_h2d(
+                host_rows, dtype=torch.long, device=row_req_pool_indices.device
+            )
+        else:
+            is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
+            if row_req_pool_indices.numel() > 1:
+                is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
+            anchor_rows = is_last.nonzero().flatten()
         req_rows = row_req_pool_indices[anchor_rows]
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
         state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
@@ -1514,7 +1629,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             indices, metadata.sequence_lengths, counts, pk[:stride], pv[:stride],
         )
 
-    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices, output_gate=None):
+    def _fused_kv_prefix(self, q, k, v, layer, forward_batch, indices):
+        """Native v1 pool/shape gate shared with the pre-join store."""
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
@@ -1569,6 +1685,106 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = self._resolve_metadata(forward_batch)
         if metadata.sequence_lengths.numel() != rows:
             return None
+        return width, rows, loc, kc, vc, k, v, metadata
+
+    def _prestore_observe(self, layer, forward_batch, rows, result, reason, consumer="none"):
+        from sglang.srt.layers.attention.qsa.observability import observe
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        observe(
+            "KV_PRESTORE", layer.layer_id, forward_batch, rows,
+            result=result, reason=reason, consumer=consumer,
+            graph=get_is_capture_mode(),
+            capturing=torch.cuda.is_current_stream_capturing(),
+        )
+
+    def q38_prestore_new_kv(self, q, k, v, layer, forward_batch, indices, output_gate=None):
+        """Consumer gate for pre-storing the new KV, adapted to FN's TP4 core.
+
+        Return true only when the downstream core/pool can consume kv_prestored.
+        All other paths keep their native persistence, including TRTLLM fallback.
+        """
+        if not forward_batch.forward_mode.is_target_verify():
+            self._prestore_observe(layer, forward_batch, q.shape[0], "FALLBACK", "not_target_verify")
+            return False
+        prefix = self._fused_kv_prefix(q, k, v, layer, forward_batch, indices)
+        if prefix is None:
+            self._prestore_observe(layer, forward_batch, q.shape[0], "FALLBACK", "fused_kv_prefix_ineligible")
+            return False
+        width, rows, loc, kc, vc, k, v, metadata = prefix
+        indexer = metadata.indexer_metadata
+        if not (
+            is_sm100_supported()
+            and kc.dtype == torch.bfloat16
+            and self._uses_block_indices(indices)
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+        ):
+            self._prestore_observe(layer, forward_batch, q.shape[0], "FALLBACK", "dtype_or_indexer_gate")
+            return False
+        row_requests = metadata.row_req_pool_indices
+        if row_requests is None:
+            row_requests = forward_batch.req_pool_indices
+        if row_requests.numel() != rows:
+            self._prestore_observe(layer, forward_batch, q.shape[0], "FALLBACK", "row_request_shape_mismatch")
+            return False
+        # This is the exact specialized-consumer geometry. A pool path is
+        # TP1-only in v1: do not infer that TP4 fallback consumes this flag.
+        core_common = (
+            int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and rows == width == 4
+            and metadata.is_cuda_graph
+            and self.compress_ratio == 4
+            and indices.shape == (4, 512)
+            and layer.head_dim == 256
+        )
+        core_tp4 = (
+            core_common and _Q38C_ATTN_CORE_TP4
+            and layer.tp_q_head_num == 6 and kc.shape[1] == 1
+            and output_gate is not None and output_gate.dtype == torch.bfloat16
+        )
+        core_tp1 = (
+            core_common and _Q38_ATTN_CORE_V1
+            and layer.tp_q_head_num == 24 and kc.shape[1] == 2
+        )
+        pool_tp1 = (
+            get_parallel().tp_size == 1
+            and rows <= _QSA_POOL_DECODE_MAX_ROWS
+            and _qsa_pool_decode_enabled()
+        )
+        if not (core_tp4 or core_tp1 or pool_tp1):
+            self._prestore_observe(layer, forward_batch, q.shape[0], "FALLBACK", "no_eligible_consumer")
+            return False
+        if not getattr(self, "_q38_prestore_logged", False):
+            logger.info("Q38_KV_PRESTORE_ACTIVE rows=%s consumer=%s", rows,
+                        "tp4-core" if core_tp4 else "tp1-core" if core_tp1 else "tp1-pool")
+            self._q38_prestore_logged = True
+        self._prestore_observe(
+            layer, forward_batch, rows, "ACTIVE", "eligible",
+            "tp4-core" if core_tp4 else "tp1-core" if core_tp1 else "tp1-pool",
+        )
+        heads = kc.shape[1]
+        if core_tp4:
+            from sglang.kernels.ops.attention.q38c_attn_core_tp4 import _store_tp4, _PDL_SMALL
+            _store_tp4[(rows, heads)](
+                kc, vc, k, v, loc, kc.stride(0), vc.stride(0), k.stride(0), v.stride(0), heads, 256,
+                num_warps=4, launch_pdl=_PDL_SMALL, PDL_SMALL=_PDL_SMALL,
+            )
+        else:
+            from sglang.kernels.ops.attention.qsa_tcgen05_v1 import _store
+            _store[(rows, heads)](
+                kc, vc, k, v, loc, kc.stride(0), vc.stride(0), k.stride(0), v.stride(0), heads, 256,
+                num_warps=4,
+            )
+        return True
+
+    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices, output_gate=None, kv_prestored=False):
+        prefix = self._fused_kv_prefix(q, k, v, layer, forward_batch, indices)
+        if prefix is None:
+            return None
+        width, rows, loc, kc, vc, k, v, metadata = prefix
+        mode = forward_batch.forward_mode
+        trtllm_decode = _resolve_trtllm_sparse_decode()
         # Fused attention-core path. Preserve FN selection/scheduling,
         # current-KV persistence and chain fresh/tail semantics.
         # Other modes/shapes/precisions keep the existing implementation.
@@ -1603,7 +1819,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     self.req_to_token_pool.req_to_token, row_requests,
                     indices.to(torch.int32).contiguous(), metadata.sequence_lengths,
                     indexer.decode_logical_positions, layer.scaling,
-                    gate=output_gate, width=width,
+                    gate=output_gate, width=width, store_new_kv=not kv_prestored,
                 )
                 return output.reshape(rows, -1), True
         if (
@@ -1645,6 +1861,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     indexer.decode_logical_positions,
                     layer.scaling,
                     width=width,
+                    store_new_kv=not kv_prestored,
                     **gate_kwargs,
                 )
                 if output_gate is not None:
@@ -1685,6 +1902,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 width,
                 layer.scaling,
                 ratio=self.compress_ratio,
+                write_new_kv=not kv_prestored,
             )
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
@@ -1725,6 +1943,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             fused_output = self._try_fused_kv_attention(
                 q, k, v, layer, forward_batch, topk_indices,
                 output_gate=kwargs.get("q38_output_gate"),
+                kv_prestored=bool(kwargs.get("q38_kv_prestored", False)),
             )
             if fused_output is not None:
                 return fused_output
@@ -1784,9 +2003,19 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
-        )
+        max_q = None
+        if self._prefill_host_path and not torch.cuda.is_current_stream_capturing():
+            # Staged in pinned memory, so the copy does not drain the stream; max_q
+            # is the host max of the lens cu_seqlens_q is built from.
+            sequence_lens_tensor = async_h2d(
+                sequence_lens, dtype=torch.int32, device=q.device
+            )
+            if len(extend_lens) == forward_batch.extend_seq_lens.shape[0]:
+                max_q = max(extend_lens)
+        else:
+            sequence_lens_tensor = torch.tensor(
+                sequence_lens, dtype=torch.int32, device=q.device
+            )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         packed_k, packed_v = pack_qsa_prefill_kv(
             k=pool.layer_router.read(layer.layer_id).key(),
@@ -1807,6 +2036,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_q=max_q,
         )
         return self._pad_extend_output(output, num_output_rows)
 
@@ -2165,7 +2395,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
-                q, k, v, layer, forward_batch, topk_indices
+                q, k, v, layer, forward_batch, topk_indices,
+                kv_prestored=bool(kwargs.get("q38_kv_prestored", False)),
             )
             if fused_output is not None:
                 return fused_output

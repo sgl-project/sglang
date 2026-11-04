@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import functools
+import logging
 from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -21,6 +23,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
+    _positive_env_int,
     qsa_mqa_decode,
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
@@ -40,19 +43,41 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm100_supported
 
+logger = logging.getLogger(__name__)
+
 # Decode/verify indexer fast paths (both exact; set to 0 to run the stock kernels):
 # SGLANG_QSA_GROUPED_SCORE scores a request's target-verify rows from one load of
 # each compressed key tile (bit-identical logits) for batches of 1-16 requests;
 # SGLANG_QSA_SPLIT_TOPK runs the cluster-split exact top-k for up to 64 rows.
 # Both were measured at 4-32 rows; larger batches keep the stock kernels.
+# SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS raises the grouped scorer's request cap;
+# above 16 requests the rows need SGLANG_ENABLE_QSA_GROUPED4_VERIFY's kernel.
 _QSA_GROUPED_SCORE_MIN_REQUESTS = 1
-_QSA_GROUPED_SCORE_MAX_REQUESTS = 16
+_QSA_GROUPED_SCORE_MAX_REQUESTS = _positive_env_int(
+    envs.SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS
+)
+_QSA_GROUPED4_DRAFT_EXTEND = envs.SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND.get()
 _QSA_SPLIT_TOPK_MAX_ROWS = 64
 
 
 @functools.lru_cache(maxsize=None)
 def _qsa_env_flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _qpf_enabled() -> bool:
+    from sglang.srt.layers.attention.qsa.prologue_fold import QPF_ENABLED
+
+    return QPF_ENABLED
+
+
+@functools.lru_cache(maxsize=None)
+def _log_grouped_cap_once(requests: int) -> None:
+    logger.debug(
+        "QSA grouped verify scorer: requests=%d max_requests=%d",
+        requests,
+        _QSA_GROUPED_SCORE_MAX_REQUESTS,
+    )
 
 
 _QSA_SHADOW_STATS = {"calls": 0, "rows": 0, "grouped_calls": 0, "logit_rows_diff": 0,
@@ -164,6 +189,7 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        self._qpf_shadow_q_ref = None
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -295,6 +321,167 @@ class QSAIndexer(MultiPlatformOp):
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
+
+    def _qpf_observe(self, forward_batch, metadata, rows, result, reason):
+        if forward_batch is None:
+            return
+        from sglang.srt.layers.attention.qsa.observability import observe
+
+        observe(
+            "QPF", self.layer_id, forward_batch, rows, result=result, reason=reason,
+            graph=metadata.is_cuda_graph,
+            capturing=torch.cuda.is_current_stream_capturing(),
+        )
+
+    def _qpf_metadata_reason(self, hidden_states, pool, state_slots, group_locs, write_locs):
+        # Called only after the unchanged original gate rejected the invocation.
+        if pool is None:
+            return "missing_pool"
+        if state_slots is None:
+            return "missing_state_slots"
+        if group_locs is None:
+            return "missing_graph_ring_group_locs"
+        if write_locs is None:
+            return "missing_graph_write_locs"
+        if hidden_states.shape[0] == 0:
+            return "empty_hidden_rows"
+        return "fused_compress_ineligible"
+
+    def _qpf_shape_reason(self, qk, pool, ring, compressed, out_dtype, group_locs, write_locs):
+        # Tensor metadata only: no device values, reductions or synchronization.
+        if qk.shape[0] == 0:
+            return "empty_projected_rows"
+        if not self._use_fused_prep(qk):
+            return "fused_prep_ineligible"
+        if not qk.is_contiguous():
+            return "qk_not_contiguous"
+        if ring.dtype != qk.dtype or pool.index_state_dtype != qk.dtype:
+            return "ring_dtype_mismatch"
+        if not ring.is_contiguous():
+            return "ring_not_contiguous"
+        if compressed.dtype != out_dtype:
+            return "compressed_dtype_mismatch"
+        if not 0 < self.compress_ratio <= 16:
+            return "compress_ratio_out_of_range"
+        if group_locs.dtype != torch.int32 or write_locs.dtype != torch.int32:
+            return "group_or_write_dtype_mismatch"
+        if group_locs.ndim != 2 or group_locs.shape[1] != self.compress_ratio:
+            return "group_shape_mismatch"
+        if group_locs.shape[0] == 0:
+            return "empty_group_locs"
+        if write_locs.shape != group_locs.shape[:1]:
+            return "write_shape_mismatch"
+        return "group_locs_not_contiguous"
+
+    def _try_prologue_fold(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        metadata,
+        state_slots: torch.Tensor | None,
+        projected_qk: torch.Tensor | None,
+        *,
+        forward_batch=None,
+    ) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+        """h12: rev4's q_prep (project_qk's fused branch) and the graph compression
+        (_compress_decode_cuda_graph's fused branch) as one launch. Returns (q, qk); q is None
+        when the rows do not qualify, and qk (if projected here) is handed to the fallback."""
+        from sglang.srt.layers.attention.qsa import prologue_fold as qpf
+
+        pool = metadata.token_to_kv_pool
+        group_locs = metadata.graph_ring_group_locs
+        write_locs = metadata.graph_write_locs
+        if (
+            pool is None
+            or state_slots is None
+            or group_locs is None
+            or write_locs is None
+            or hidden_states.shape[0] == 0
+            or not self._use_fused_compress(pool)
+        ):
+            self._qpf_observe(
+                forward_batch, metadata, hidden_states.shape[0], "FALLBACK",
+                self._qpf_metadata_reason(hidden_states, pool, state_slots, group_locs, write_locs),
+            )
+            return None, projected_qk
+        qk = projected_qk
+        if qk is None:
+            qk, _ = self.index_qk_proj(hidden_states)
+        key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
+        ring = key_state_buffer.view(key_state_buffer.shape[0], -1)
+        compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        compressed = compressed_buffer.view(compressed_buffer.shape[0], -1)
+        out_dtype = pool.qsa_compressed_dtype
+        if (
+            qk.shape[0] == 0
+            or not self._use_fused_prep(qk)
+            or not qk.is_contiguous()
+            or ring.dtype != qk.dtype
+            or pool.index_state_dtype != qk.dtype
+            or not ring.is_contiguous()
+            or compressed.dtype != out_dtype
+            or not 0 < self.compress_ratio <= 16
+            or group_locs.dtype != torch.int32
+            or write_locs.dtype != torch.int32
+            or group_locs.ndim != 2
+            or group_locs.shape[1] != self.compress_ratio
+            or group_locs.shape[0] == 0
+            or write_locs.shape != group_locs.shape[:1]
+            or not group_locs.is_contiguous()
+        ):
+            self._qpf_observe(
+                forward_batch, metadata, hidden_states.shape[0], "FALLBACK",
+                self._qpf_shape_reason(qk, pool, ring, compressed, out_dtype, group_locs, write_locs),
+            )
+            return None, qk
+        if not get_is_capture_mode() and hasattr(
+            self.rotary_emb, "_ensure_cos_sin_cache_length"
+        ):
+            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+        rope_buffer = pool.qsa_rope_position_buffer
+        kwargs = dict(
+            qk=qk,
+            positions=positions.long(),
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            axis_map=self._rope_axis_map(qk.device),
+            q_weight=self.q_layernorm.weight.data,
+            cache_loc=state_slots[: qk.shape[0]].long(),
+            num_q_heads=self.index_n_heads,
+            rotary_dim=self.rotary_emb.rotary_dim,
+            q_eps=self.q_layernorm.variance_epsilon,
+            is_neox_style=self.rotary_emb.is_neox_style,
+            q_heads_padded=((self.index_n_heads + 7) // 8) * 8,
+            out_dtype=out_dtype,
+            group_locs=group_locs,
+            k_weight=self.k_layernorm.weight.data,
+            write_locs=write_locs,
+            compress_ratio=self.compress_ratio,
+            k_eps=self.k_layernorm.variance_epsilon,
+        )
+        snap = qpf.shadow_snapshot(ring, rope_buffer) if qpf.QPF_SHADOW else None
+        q = qpf.qsa_index_prologue_fold(
+            key_state_buffer=ring,
+            rope_position_buffer=rope_buffer,
+            compressed_k_buffer=compressed,
+            **kwargs,
+        )
+        self._qpf_observe(forward_batch, metadata, hidden_states.shape[0], "ACTIVE", "eligible")
+        if not getattr(self, "_qpf_engaged_logged", False):
+            qpf.logger.info("Q38_QPF_ACTIVE layer=%s rows=%s groups=%s dtype=%s", self.layer_id, qk.shape[0], group_locs.shape[0], qk.dtype)
+            self._qpf_engaged_logged = True
+        if snap is not None:
+            ref = qpf.shadow_reference(snap, **kwargs)
+            qpf.shadow_compare(
+                ref,
+                q=q,
+                key_state_buffer=ring,
+                rope_position_buffer=rope_buffer,
+                compressed_k_buffer=compressed,
+                write_locs=write_locs,
+                compress_ratio=self.compress_ratio,
+            )
+            self._qpf_shadow_q_ref = ref[0]
+        return q, qk
 
     def normalize_compressed_keys(
         self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
@@ -622,6 +809,8 @@ class QSAIndexer(MultiPlatformOp):
         defer_expansion: bool = False,
         score_q4_requests: torch.Tensor | None = None,
         rows_per_group: int = 1,
+        return_logits: bool = False,
+        grouped4_only: bool = False,
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
@@ -641,6 +830,8 @@ class QSAIndexer(MultiPlatformOp):
             and _qsa_env_flag("SGLANG_QSA_GROUPED_SCORE")
         ):
             rows_per_group = 1
+        elif q.shape[0] // rows_per_group > 16:
+            _log_grouped_cap_once(q.shape[0] // rows_per_group)
         use_mk = _Q38C_MK_QSA and score_q4_requests is not None and not is_batch_invariant_mode_enabled()
         if score_q4_requests is not None and not is_batch_invariant_mode_enabled():
             if use_mk:
@@ -661,6 +852,8 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 min_scored_len=self.block_topk if use_fast_topk else 0,
                 rows_per_group=rows_per_group,
+                num_query_heads=self.index_n_heads,
+                grouped4_only=grouped4_only and rows_per_group > 1,
             )
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
@@ -712,14 +905,15 @@ class QSAIndexer(MultiPlatformOp):
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
         if defer_expansion:
-            return block_indices
-        return expand_qsa_block_indices(
+            return (block_indices, logits) if return_logits else block_indices
+        expanded = expand_qsa_block_indices(
             block_indices,
             query_positions,
             sequence_lengths,
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
         )
+        return (expanded, None) if return_logits else expanded
 
     def forward_cuda_cp(
         self,
@@ -887,27 +1081,39 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
-        q, token_k, state_stored = self.project_qk(
-            hidden_states,
-            positions,
-            pool=indexer_metadata.token_to_kv_pool,
-            cache_loc=state_slots,
-            q_heads_padded=(
-                # The tilelang decode MQA kernel needs query heads in multiples of 8.
-                ((self.index_n_heads + 7) // 8) * 8
-                if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
-                else None
-            ),
-            projected_qk=projected_qk,
-        )
-        self.update_key_state_and_compress(
-            token_k,
-            logical_positions,
-            positions,
-            indexer_metadata,
-            state_slots=state_slots,
-            state_stored=state_stored,
-        )
+        is_decode_like = forward_mode.is_decode() or is_target_verify or is_draft_extend
+        q = None
+        if is_decode_like and indexer_metadata.is_cuda_graph and _qpf_enabled():
+            q, projected_qk = self._try_prologue_fold(
+                hidden_states, positions, indexer_metadata, state_slots, projected_qk,
+                forward_batch=forward_batch,
+            )
+        if is_decode_like and not indexer_metadata.is_cuda_graph and _qpf_enabled():
+            self._qpf_observe(forward_batch, indexer_metadata, hidden_states.shape[0], "FALLBACK", "non_graph_path")
+        if is_decode_like and indexer_metadata.is_cuda_graph and not _qpf_enabled():
+            self._qpf_observe(forward_batch, indexer_metadata, hidden_states.shape[0], "FALLBACK", "qpf_disabled")
+        if q is None:
+            q, token_k, state_stored = self.project_qk(
+                hidden_states,
+                positions,
+                pool=indexer_metadata.token_to_kv_pool,
+                cache_loc=state_slots,
+                q_heads_padded=(
+                    # The tilelang decode MQA kernel needs query heads in multiples of 8.
+                    ((self.index_n_heads + 7) // 8) * 8
+                    if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
+                    else None
+                ),
+                projected_qk=projected_qk,
+            )
+            self.update_key_state_and_compress(
+                token_k,
+                logical_positions,
+                positions,
+                indexer_metadata,
+                state_slots=state_slots,
+                state_stored=state_stored,
+            )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
@@ -917,6 +1123,19 @@ class QSAIndexer(MultiPlatformOp):
                 width = int(getattr(forward_batch.spec_info, "draft_token_num", 1) or 1)
                 if width > 1 and num_valid_tokens % width == 0:
                     rows_per_group = width
+            grouped4_only = False
+            if (
+                _QSA_GROUPED4_DRAFT_EXTEND
+                and is_draft_extend
+                and get_parallel().tp_size == 1
+                and forward_batch.req_pool_indices.numel() > 0
+                and num_valid_tokens == 4 * forward_batch.req_pool_indices.numel()
+            ):
+                # Spec-v2 draft extend packs one equal window per request, rows in
+                # position order (qsa/graph_metadata.py mode 2), so a window of four
+                # groups like target verify.
+                rows_per_group = 4
+                grouped4_only = True
             score_q4_requests = None
             if (
                 (_Q38C_SCORE_Q4 or _Q38C_MK_QSA)
@@ -938,7 +1157,7 @@ class QSAIndexer(MultiPlatformOp):
                 and indexer_metadata.req_pool_indices.numel() == 4
             ):
                 score_q4_requests = indexer_metadata.req_pool_indices
-            return self.select_decode_tokens(
+            selected = self.select_decode_tokens(
                 q,
                 compressed_cache,
                 page_table,
@@ -949,7 +1168,39 @@ class QSAIndexer(MultiPlatformOp):
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
                 score_q4_requests=score_q4_requests,
                 rows_per_group=rows_per_group,
+                grouped4_only=grouped4_only,
             )
+
+            q_ref = self._qpf_shadow_q_ref
+            if q_ref is not None:
+                # SGLANG_QSA_QPF_SHADOW: the same selection from rev4's Q.
+                from sglang.srt.layers.attention.qsa import prologue_fold as qpf
+
+                self._qpf_shadow_q_ref = None
+                select_args = (
+                    compressed_cache,
+                    page_table,
+                    compressed_lengths,
+                    max_model_len,
+                    logical_positions,
+                    indexer_metadata.get_seqlens_int32(),
+                )
+                select_kwargs = dict(
+                    defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                    score_q4_requests=score_q4_requests,
+                    rows_per_group=rows_per_group,
+                    grouped4_only=grouped4_only,
+                    return_logits=True,
+                )
+                # rev4's selection from rev4's Q, and rev4's selection rerun on the fused Q (A/A:
+                # the top-k's own choice among tied scores), each with its scorer logits.
+                ref_sel, ref_logits = self.select_decode_tokens(q_ref, *select_args, **select_kwargs)
+                aa_sel, aa_logits = self.select_decode_tokens(q, *select_args, **select_kwargs)
+                qpf.shadow_compare_topk(
+                    selected, ref_sel, aa_sel, aa_logits, ref_logits,
+                    lengths=compressed_lengths, min_scored=self.block_topk,
+                )
+            return selected
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)

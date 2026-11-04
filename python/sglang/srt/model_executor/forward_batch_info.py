@@ -1665,6 +1665,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_mrope_positions_extend(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
+        text_rows = self._text_only_mrope_positions(batch)
+        if text_rows is not None:
+            self.mrope_positions = text_rows
+            return
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
@@ -1718,6 +1722,39 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mrope_positions_list,
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+
+    def _text_only_mrope_positions(
+        self, batch: ScheduleBatch
+    ) -> Optional[torch.Tensor]:
+        """The rows _compute_mrope_positions_extend's loop builds, on the device.
+
+        For a text-only batch that loop gives each row arange(prefix, prefix +
+        extend) on all three sections, in batch order, and copies them from
+        pageable host memory, which blocks the host until the stream drains.
+        compute_position wrote the same values into self.positions from the same
+        host lists, so repeat those. None sends any other batch to the loop.
+        """
+        if not envs.SGLANG_ENABLE_MROPE_TEXT_DEVICE_POSITIONS.get():
+            return None
+        extend_lens = batch.extend_lens
+        prefix_lens = batch.prefix_lens
+        positions = self.positions
+        text_only = get_exec().deterministic.rl_on_policy_target is not None or all(
+            mm_input is None for mm_input in batch.multimodal_inputs
+        )
+        if (
+            batch.dllm_config is not None
+            or not text_only
+            or not isinstance(extend_lens, list)
+            or not isinstance(prefix_lens, list)
+            or self.extend_seq_lens_cpu != extend_lens
+            or self.extend_prefix_lens_cpu != prefix_lens
+            or positions is None
+            or positions.dim() != 1
+            or positions.numel() != sum(extend_lens)
+        ):
+            return None
+        return positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:

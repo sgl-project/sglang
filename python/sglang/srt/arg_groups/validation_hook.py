@@ -371,6 +371,16 @@ def check_server_args(server_args: Any):
                 "When setting gc_threshold, it must contain 1 to 3 integers."
             )
 
+    if cfg.enable_decode_warmup and (
+        not cfg.decode_warmup_batch_sizes
+        or min(cfg.decode_warmup_batch_sizes) < 1
+        or cfg.decode_warmup_prompt_len < 1
+    ):
+        raise ValueError(
+            "--decode-warmup-batch-sizes must be positive integers and "
+            "--decode-warmup-prompt-len at least 1"
+        )
+
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"

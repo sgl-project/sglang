@@ -1,3 +1,5 @@
+from sglang.kernels.ops.extend_fastpath import GDN_CONV_ENABLED as _Q38C_EXTEND_PATH
+
 import logging
 import os
 from typing import Optional, Tuple, Union
@@ -12,6 +14,10 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn as causal_conv1d_fn_triton,
+)
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    GDN_SPLIT_CONV_LAUNCH,
+    causal_conv1d_fn_split_qkv,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
@@ -91,6 +97,12 @@ if is_cuda() or is_hip() or is_xpu():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+
+# gdn_front: on a plain CUDA extend the prefill conv writes contiguous q / k / v
+# planes directly (causal_conv1d_fn_split_qkv), replacing the post-conv
+# strided -> contiguous gdn_prefill_qkv_prepare copy. Bit-identical. Kill
+# switch: SGLANG_X_GDN_FRONT_DISABLE=1 or SGLANG_X_GDN_FRONT_CONV_DISABLE=1.
+_GDN_FRONT_SPLIT_CONV = _Q38C_EXTEND_PATH
 logger = logging.getLogger(__name__)
 _q38_front_engaged: set[int] = set()
 _fused_decode_proj_conv_logged = False
@@ -1214,6 +1226,64 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return (core_attn_out, z) if return_z else core_attn_out
 
+    @staticmethod
+    def _split_conv_ok(layer: RadixLinearAttention, mixed_qkv: torch.Tensor) -> bool:
+        """Whether the extend conv can emit split contiguous q / k / v.
+
+        Mirrors the stock dispatch: causal_conv1d_fn_cuda takes the Triton
+        kernel for a channel-last (strided-token) view, which is what the
+        split kernel implements."""
+        block_n = GDN_SPLIT_CONV_LAUNCH[0]
+        return (
+            _GDN_FRONT_SPLIT_CONV
+            and is_cuda()
+            and mixed_qkv.dim() == 2
+            and mixed_qkv.shape[0] > 1
+            and mixed_qkv.stride(1) == 1
+            and mixed_qkv.stride(0) != 1
+            and mixed_qkv.shape[1] == layer.q_dim + layer.k_dim + layer.v_dim
+            and layer.conv_weights.shape[-1] == 4
+            and layer.q_dim % block_n == 0
+            and (layer.q_dim + layer.k_dim) % block_n == 0
+            and layer.activation in (None, "silu", "swish")
+        )
+
+    @staticmethod
+    def _split_conv_views(layer: RadixLinearAttention, q, k, v):
+        seq_len = q.shape[0]
+        return (
+            q.view(1, seq_len, layer.num_q_heads, layer.head_q_dim),
+            k.view(1, seq_len, layer.num_k_heads, layer.head_k_dim),
+            v.view(1, seq_len, layer.num_v_heads, layer.head_v_dim),
+        )
+
+    def _convolve_prefill_split(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ):
+        """_convolve_prefill + q / k / v split in one conv launch."""
+        block_table = self.forward_metadata.conv_block_table
+        conv_kwargs = {"block_table": block_table} if block_table is not None else {}
+        q, k, v = causal_conv1d_fn_split_qkv(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            conv_states=conv_states,
+            query_start_loc=self.forward_metadata.query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            q_dim=layer.q_dim,
+            k_dim=layer.k_dim,
+            activation=layer.activation,
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            cache_indices=cache_indices,
+            **conv_kwargs,
+        )
+        return self._split_conv_views(layer, q, k, v)
+
     def _convolve_prefill(
         self,
         layer: RadixLinearAttention,
@@ -1268,77 +1338,170 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim),
         )
 
-    def _forward_extend_in_graph(
-        self,
-        *,
-        layer: RadixLinearAttention,
-        mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-    ) -> torch.Tensor:
-        """forward_extend's plain-extend chain on a captured bucket's static
-        tables, so every launch grid depends only on the bucket. Rows past the
-        batch belong to no sequence; chunk_fwd_o leaves them zero."""
-        meta = self.prefill_graph_metadata
-        layer_cache = self.state_layer_cache(layer.layer_id)
-        conv_states = layer_cache.conv[0]
-        ssm_states = layer_cache.temporal
-        if meta.track:
-            # Snapshot the conv windows before the conv kernel updates the cache.
-            gdn_track_conv_window(
-                conv_pool=conv_states,
-                x=mixed_qkv,
-                track_mode=meta.track_mode,
-                track_conv_start=meta.track_conv_start,
-                track_dst=meta.track_dst,
-                num_tokens=meta.num_logical_tokens,
-            )
-        mixed_qkv = causal_conv1d_fn_triton(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            conv_states=conv_states,
-            query_start_loc=meta.cu_seqlens,
-            seq_lens_cpu=None,
-            cache_indices=meta.cache_indices,
-            has_initial_state=meta.has_initial_state,
-            activation=layer.activation,
-            block_table=meta.conv_block_table,
-        ).transpose(0, 1)
-        query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
-        g, beta = self._prefill_gates(layer, a, b)
-        if meta.flashinfer is not None:
-            return self._flashinfer_core_in_graph(
-                meta=meta,
-                query=query,
-                key=key,
-                value=value,
+    # Import-time selection keeps the disabled entry and launch body stock.
+    if _Q38C_EXTEND_PATH:
+        def _forward_extend_in_graph(
+            self,
+            *,
+            layer: RadixLinearAttention,
+            mixed_qkv: torch.Tensor,
+            a: torch.Tensor,
+            b: torch.Tensor,
+        ) -> torch.Tensor:
+            """forward_extend's plain-extend chain on a captured bucket's static
+            tables, so every launch grid depends only on the bucket. Rows past the
+            batch belong to no sequence; chunk_fwd_o leaves them zero."""
+            meta = self.prefill_graph_metadata
+            layer_cache = self.state_layer_cache(layer.layer_id)
+            conv_states = layer_cache.conv[0]
+            ssm_states = layer_cache.temporal
+            if meta.track:
+                # Snapshot the conv windows before the conv kernel updates the cache.
+                gdn_track_conv_window(
+                    conv_pool=conv_states,
+                    x=mixed_qkv,
+                    track_mode=meta.track_mode,
+                    track_conv_start=meta.track_conv_start,
+                    track_dst=meta.track_dst,
+                    num_tokens=meta.num_logical_tokens,
+                )
+            if self._split_conv_ok(layer, mixed_qkv):
+                query, key, value = self._split_conv_views(
+                    layer,
+                    *causal_conv1d_fn_split_qkv(
+                        mixed_qkv.transpose(0, 1),
+                        layer.conv_weights,
+                        layer.bias,
+                        conv_states=conv_states,
+                        query_start_loc=meta.cu_seqlens,
+                        seq_lens_cpu=None,
+                        q_dim=layer.q_dim,
+                        k_dim=layer.k_dim,
+                        cache_indices=meta.cache_indices,
+                        has_initial_state=meta.has_initial_state,
+                        activation=layer.activation,
+                        block_table=meta.conv_block_table,
+                    ),
+                )
+            else:
+                mixed_qkv = causal_conv1d_fn_triton(
+                    mixed_qkv.transpose(0, 1),
+                    layer.conv_weights,
+                    layer.bias,
+                    conv_states=conv_states,
+                    query_start_loc=meta.cu_seqlens,
+                    seq_lens_cpu=None,
+                    cache_indices=meta.cache_indices,
+                    has_initial_state=meta.has_initial_state,
+                    activation=layer.activation,
+                    block_table=meta.conv_block_table,
+                ).transpose(0, 1)
+                query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
+            g, beta = self._prefill_gates(layer, a, b)
+            if meta.flashinfer is not None:
+                return self._flashinfer_core_in_graph(
+                    meta=meta,
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states,
+                )
+            core_attn_out, _, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
                 g=g,
                 beta=beta,
                 ssm_states=ssm_states,
-            )
-        core_attn_out, _, h = self.kernel_dispatcher.extend(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            ssm_states=ssm_states,
-            cache_indices=meta.cache_indices,
-            query_start_loc=meta.cu_seqlens,
-            chunk_indices=meta.chunk_indices,
-            chunk_offsets=meta.chunk_offsets,
-        )
-        if meta.track:
-            gdn_track_ssm_state(
-                ssm_pool=ssm_states,
-                h=h,
-                track_mode=meta.track_mode,
-                track_h_row=meta.track_h_row,
-                track_dst=meta.track_dst,
                 cache_indices=meta.cache_indices,
+                query_start_loc=meta.cu_seqlens,
+                chunk_indices=meta.chunk_indices,
+                chunk_offsets=meta.chunk_offsets,
             )
-        return core_attn_out
+            if meta.track:
+                gdn_track_ssm_state(
+                    ssm_pool=ssm_states,
+                    h=h,
+                    track_mode=meta.track_mode,
+                    track_h_row=meta.track_h_row,
+                    track_dst=meta.track_dst,
+                    cache_indices=meta.cache_indices,
+                )
+            return core_attn_out
+    else:
+        def _forward_extend_in_graph(
+            self,
+            *,
+            layer: RadixLinearAttention,
+            mixed_qkv: torch.Tensor,
+            a: torch.Tensor,
+            b: torch.Tensor,
+        ) -> torch.Tensor:
+            """forward_extend's plain-extend chain on a captured bucket's static
+            tables, so every launch grid depends only on the bucket. Rows past the
+            batch belong to no sequence; chunk_fwd_o leaves them zero."""
+            meta = self.prefill_graph_metadata
+            layer_cache = self.state_layer_cache(layer.layer_id)
+            conv_states = layer_cache.conv[0]
+            ssm_states = layer_cache.temporal
+            if meta.track:
+                # Snapshot the conv windows before the conv kernel updates the cache.
+                gdn_track_conv_window(
+                    conv_pool=conv_states,
+                    x=mixed_qkv,
+                    track_mode=meta.track_mode,
+                    track_conv_start=meta.track_conv_start,
+                    track_dst=meta.track_dst,
+                    num_tokens=meta.num_logical_tokens,
+                )
+            mixed_qkv = causal_conv1d_fn_triton(
+                mixed_qkv.transpose(0, 1),
+                layer.conv_weights,
+                layer.bias,
+                conv_states=conv_states,
+                query_start_loc=meta.cu_seqlens,
+                seq_lens_cpu=None,
+                cache_indices=meta.cache_indices,
+                has_initial_state=meta.has_initial_state,
+                activation=layer.activation,
+                block_table=meta.conv_block_table,
+            ).transpose(0, 1)
+            query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
+            g, beta = self._prefill_gates(layer, a, b)
+            if meta.flashinfer is not None:
+                return self._flashinfer_core_in_graph(
+                    meta=meta,
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states,
+                )
+            core_attn_out, _, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+                cache_indices=meta.cache_indices,
+                query_start_loc=meta.cu_seqlens,
+                chunk_indices=meta.chunk_indices,
+                chunk_offsets=meta.chunk_offsets,
+            )
+            if meta.track:
+                gdn_track_ssm_state(
+                    ssm_pool=ssm_states,
+                    h=h,
+                    track_mode=meta.track_mode,
+                    track_h_row=meta.track_h_row,
+                    track_dst=meta.track_dst,
+                    cache_indices=meta.cache_indices,
+                )
+            return core_attn_out
 
     def _flashinfer_core_in_graph(
         self,
@@ -1443,314 +1606,637 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         return core, z
 
-    def forward_extend(
-        self,
-        layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        a: torch.Tensor,
-        b: torch.Tensor,
-        **kwargs,
-    ):
-        assert isinstance(mixed_qkv, torch.Tensor)
-        q38_conv_applied = kwargs.get("q38_conv_applied", False)
-        seq_len = mixed_qkv.shape[0]
-
-        if _is_hip and seq_len == 0:
-            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
-
-        is_target_verify = forward_batch.forward_mode.is_target_verify()
-        if self.prefill_graph_metadata is not None and not is_target_verify:
-            return self._forward_extend_in_graph(
-                layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
-            )
-        forward_metadata = self.forward_metadata
-
-        query_start_loc = forward_metadata.query_start_loc
-        cache_indices = forward_metadata.mamba_cache_indices
-        retrieve_next_token = forward_metadata.retrieve_next_token
-        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
-        retrieve_parent_token = forward_metadata.retrieve_parent_token
-
-        mamba_cache_params = self.state_layer_cache(layer.layer_id)
-        conv_states = mamba_cache_params.conv[0]
-        ssm_states = mamba_cache_params.temporal
-        if self.mis_metadata is not None:
-            if is_target_verify:
-                raise ValueError("GDN MIS does not support target verify")
-            return self._forward_extend_mis(
-                layer=layer,
-                mixed_qkv=mixed_qkv,
-                a=a,
-                b=b,
-                conv_states=conv_states,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-            )
-        if is_target_verify:
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = (
-                mamba_cache_params.intermediate_conv_window[0]
-            )
-            # PP-off selects the fixed table; do not evaluate its unused mask.
-            intermediate_state_indices = self.verify_intermediate_state_indices
-            if pp_spec_stable_rows_enabled():
-                intermediate_state_indices = select_verify_intermediate_state_indices(
-                    self.verify_intermediate_state_indices,
-                    forward_batch.req_pool_indices,
-                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-                    self.req_to_token_pool.size,
-                )
-            mamba_pool = self.state_pool
-            use_replayssm_fold = (
-                mamba_cache_params.replayssm_rawv is not None
-                and mamba_pool.replayssm_spec_fold
-                and not mamba_pool.replayssm_is_kda
-            )
-            use_replayssm_spec = (
-                mamba_cache_params.replayssm_d is not None
-                and mamba_pool.replayssm_cache_base is not None
-                and not mamba_pool.replayssm_is_kda
-            )
-
-        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
-        # chunk_gated_delta_rule) write state back in place assuming a contiguous
-        # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
-        # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
-        # proper indexed writes and handle non-contiguous pools directly via
-        # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
-        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
-        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
-        # int64 indexing, like packed_decode / causal_conv1d_update already do.
-        needs_state_gather = (
-            self.requires_contiguous_prefill_state
-            and (not is_target_verify)
-            and (not is_cpu())
-            and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
-        )
-        if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
-        else:
-            conv_states_contig = conv_states
-            ssm_states_contig = ssm_states
-            state_cache_indices = cache_indices
-
-        if is_target_verify and not q38_conv_applied:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            conv_update = causal_conv1d_update
-            front_kwargs = {}
-            if os.environ.get("Q38_GDN_FRONT") == "1":
-                from sglang.kernels.ops.attention.q38_gdn_front.conv import conv_update as q35_conv_update
-                assert retrieve_next_token is None and retrieve_next_sibling is None and retrieve_parent_token is None
-                conv_update = q35_conv_update
-                front_kwargs = dict(block_n=128, token_major_out=True, num_warps=2)
-                if layer.layer_id not in _q38_front_engaged:
-                    _q38_front_engaged.add(layer.layer_id)
-                    logger.info("Q38_GDN_FRONT layer=%d heads=%d/%d draft=%d views=1 conv_tile=128 verify_tile=64/w1 source=Q35_plugin pdl=%s", layer.layer_id, layer.num_k_heads, layer.num_v_heads, draft_token_num, os.environ.get("Q38_GDN_PDL", "0"))
-            mixed_qkv_processed = conv_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                **(front_kwargs if front_kwargs else dict(
-                    retrieve_next_token=retrieve_next_token,
-                    retrieve_next_sibling=retrieve_next_sibling,
-                    retrieve_parent_token=retrieve_parent_token,
-                )),
-            )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-        elif not is_target_verify:
-            if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[
-                    forward_metadata.track_conv_indices
-                ].transpose(1, 2)
-                conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
-                )
-
-            mixed_qkv = self._convolve_prefill(
-                layer,
-                forward_batch,
-                mixed_qkv,
-                conv_states_contig,
-                state_cache_indices,
-            )
-
-        actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (
-            (is_cuda() or is_hip() or is_xpu())
-            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-            and not self._use_strided_target_verify_qkv
-            and not (is_target_verify and os.environ.get("Q38_GDN_FRONT") == "1")
+    # Import-time selection keeps the disabled entry and launch body stock.
+    if _Q38C_EXTEND_PATH:
+        def forward_extend(
+            self,
+            layer: RadixLinearAttention,
+            forward_batch: ForwardBatch,
+            mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+            a: torch.Tensor,
+            b: torch.Tensor,
+            **kwargs,
         ):
-            query, key, value = fused_qkv_split_gdn_prefill(
-                mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
-            )
-        else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            assert isinstance(mixed_qkv, torch.Tensor)
+            q38_conv_applied = kwargs.get("q38_conv_applied", False)
+            seq_len = mixed_qkv.shape[0]
 
-        if is_target_verify:
-            # ReplaySSM verify protocols: fold-every-commit (ring-write during
-            # verify, fold on commit), circular ring, or the snapshotting
-            # fallback when neither ring is allocated.
-            if use_replayssm_fold:
-                core_attn_out = self._replayssm_fold_target_verify(
+            if _is_hip and seq_len == 0:
+                return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
+
+            is_target_verify = forward_batch.forward_mode.is_target_verify()
+            if self.prefill_graph_metadata is not None and not is_target_verify:
+                return self._forward_extend_in_graph(
+                    layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
+                )
+            forward_metadata = self.forward_metadata
+
+            query_start_loc = forward_metadata.query_start_loc
+            cache_indices = forward_metadata.mamba_cache_indices
+            retrieve_next_token = forward_metadata.retrieve_next_token
+            retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+            retrieve_parent_token = forward_metadata.retrieve_parent_token
+
+            mamba_cache_params = self.state_layer_cache(layer.layer_id)
+            conv_states = mamba_cache_params.conv[0]
+            ssm_states = mamba_cache_params.temporal
+            if self.mis_metadata is not None:
+                if is_target_verify:
+                    raise ValueError("GDN MIS does not support target verify")
+                return self._forward_extend_mis(
                     layer=layer,
-                    query=query,
-                    key=key,
-                    value=value,
+                    mixed_qkv=mixed_qkv,
                     a=a,
                     b=b,
-                    layer_cache=mamba_cache_params,
+                    conv_states=conv_states,
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    retrieve_parent_token=retrieve_parent_token,
                 )
-            elif use_replayssm_spec:
-                core_attn_out = self._replayssm_target_verify(
-                    layer=layer,
-                    query=query,
-                    key=key,
-                    value=value,
-                    a=a,
-                    b=b,
-                    mamba_pool=mamba_pool,
-                    layer_cache=mamba_cache_params,
-                    cache_indices=cache_indices,
-                    replay_indices=forward_batch.req_pool_indices,
-                    query_start_loc=query_start_loc,
-                    draft_token_num=forward_batch.spec_info.draft_token_num,
-                    wait_for_gate_producer=q38_conv_applied,
-                    packed_qkv=mixed_qkv,
-                    norm_z=kwargs.get("q38_mk_z"),
-                    norm_weight=kwargs.get("q38_mk_norm_weight"),
-                    norm_eps=kwargs.get("q38_mk_norm_eps", 1e-6),
-                    return_normalized=kwargs.get("q38_m32_return_normalized", False),
+            if is_target_verify:
+                assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+                intermediate_state_cache = mamba_cache_params.intermediate_ssm
+                intermediate_conv_window_cache = (
+                    mamba_cache_params.intermediate_conv_window[0]
+                )
+                # PP-off selects the fixed table; do not evaluate its unused mask.
+                intermediate_state_indices = self.verify_intermediate_state_indices
+                if pp_spec_stable_rows_enabled():
+                    intermediate_state_indices = select_verify_intermediate_state_indices(
+                        self.verify_intermediate_state_indices,
+                        forward_batch.req_pool_indices,
+                        cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                        self.req_to_token_pool.size,
+                    )
+                mamba_pool = self.state_pool
+                use_replayssm_fold = (
+                    mamba_cache_params.replayssm_rawv is not None
+                    and mamba_pool.replayssm_spec_fold
+                    and not mamba_pool.replayssm_is_kda
+                )
+                use_replayssm_spec = (
+                    mamba_cache_params.replayssm_d is not None
+                    and mamba_pool.replayssm_cache_base is not None
+                    and not mamba_pool.replayssm_is_kda
+                )
+
+            # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
+            # chunk_gated_delta_rule) write state back in place assuming a contiguous
+            # slot layout, so they silently drop the write to the strided envelope
+            # pool. Run them on contiguous per-sequence copies (identity-indexed) and
+            # scatter the result back. No-op for the default contiguous pool.
+            # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
+            # proper indexed writes and handle non-contiguous pools directly via
+            # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
+            # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
+            # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
+            # int64 indexing, like packed_decode / causal_conv1d_update already do.
+            needs_state_gather = (
+                self.requires_contiguous_prefill_state
+                and (not is_target_verify)
+                and (not is_cpu())
+                and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+            )
+            if needs_state_gather:
+                conv_states_contig = conv_states[cache_indices].contiguous()
+                ssm_states_contig = ssm_states[cache_indices].contiguous()
+                state_cache_indices = torch.arange(
+                    cache_indices.shape[0],
+                    device=cache_indices.device,
+                    dtype=cache_indices.dtype,
                 )
             else:
-                # The recurrent fallback needs the per-draft snapshots, which
-                # the pool gates OFF under --enable-linear-replayssm-spec (the
-                # same flag that makes `use_replayssm_spec` true above), so
-                # this branch is unreachable with a None buffer by
-                # construction -- keep it loud rather than silently frozen.
-                assert intermediate_state_cache is not None, (
-                    "recurrent target_verify fallback requires intermediate_ssm, "
-                    "which is not allocated under --enable-linear-replayssm-spec"
+                conv_states_contig = conv_states
+                ssm_states_contig = ssm_states
+                state_cache_indices = cache_indices
+
+            split_qkv = None
+            if is_target_verify and not q38_conv_applied:
+                batch_size = seq_len // forward_batch.spec_info.draft_token_num
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                mixed_qkv_reshaped = mixed_qkv.view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+                conv_update = causal_conv1d_update
+                front_kwargs = {}
+                if os.environ.get("Q38_GDN_FRONT") == "1":
+                    from sglang.kernels.ops.attention.q38_gdn_front.conv import conv_update as q35_conv_update
+                    assert retrieve_next_token is None and retrieve_next_sibling is None and retrieve_parent_token is None
+                    conv_update = q35_conv_update
+                    front_kwargs = dict(block_n=128, token_major_out=True, num_warps=2)
+                    if layer.layer_id not in _q38_front_engaged:
+                        _q38_front_engaged.add(layer.layer_id)
+                        logger.info("Q38_GDN_FRONT layer=%d heads=%d/%d draft=%d views=1 conv_tile=128 verify_tile=64/w1 source=Q35_plugin pdl=%s", layer.layer_id, layer.num_k_heads, layer.num_v_heads, draft_token_num, os.environ.get("Q38_GDN_PDL", "0"))
+                mixed_qkv_processed = conv_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    **(front_kwargs if front_kwargs else dict(
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )),
                 )
-                core_attn_out = self.kernel_dispatcher.target_verify(
-                    A_log=layer.A_log,
-                    dt_bias=layer.dt_bias,
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            elif not is_target_verify:
+                if forward_metadata.has_mamba_track_mask:
+                    mixed_qkv_to_track = mixed_qkv[
+                        forward_metadata.track_conv_indices
+                    ].transpose(1, 2)
+                    conv_states[forward_metadata.conv_states_mask_indices] = (
+                        mixed_qkv_to_track
+                    )
+
+                if self._split_conv_ok(layer, mixed_qkv):
+                    split_qkv = self._convolve_prefill_split(
+                        layer,
+                        forward_batch,
+                        mixed_qkv,
+                        conv_states_contig,
+                        state_cache_indices,
+                    )
+                else:
+                    mixed_qkv = self._convolve_prefill(
+                        layer,
+                        forward_batch,
+                        mixed_qkv,
+                        conv_states_contig,
+                        state_cache_indices,
+                    )
+
+            actual_seq_len = mixed_qkv.shape[0]
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            if split_qkv is not None:
+                query, key, value = split_qkv
+            elif (
+                (is_cuda() or is_hip() or is_xpu())
+                and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+                and not self._use_strided_target_verify_qkv
+                and not (is_target_verify and os.environ.get("Q38_GDN_FRONT") == "1")
+            ):
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+                key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+                value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+            if is_target_verify:
+                # ReplaySSM verify protocols: fold-every-commit (ring-write during
+                # verify, fold on commit), circular ring, or the snapshotting
+                # fallback when neither ring is allocated.
+                if use_replayssm_fold:
+                    core_attn_out = self._replayssm_fold_target_verify(
+                        layer=layer,
+                        query=query,
+                        key=key,
+                        value=value,
+                        a=a,
+                        b=b,
+                        layer_cache=mamba_cache_params,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )
+                elif use_replayssm_spec:
+                    core_attn_out = self._replayssm_target_verify(
+                        layer=layer,
+                        query=query,
+                        key=key,
+                        value=value,
+                        a=a,
+                        b=b,
+                        mamba_pool=mamba_pool,
+                        layer_cache=mamba_cache_params,
+                        cache_indices=cache_indices,
+                        replay_indices=forward_batch.req_pool_indices,
+                        query_start_loc=query_start_loc,
+                        draft_token_num=forward_batch.spec_info.draft_token_num,
+                        wait_for_gate_producer=q38_conv_applied,
+                        packed_qkv=mixed_qkv,
+                        norm_z=kwargs.get("q38_mk_z"),
+                        norm_weight=kwargs.get("q38_mk_norm_weight"),
+                        norm_eps=kwargs.get("q38_mk_norm_eps", 1e-6),
+                        return_normalized=kwargs.get("q38_m32_return_normalized", False),
+                    )
+                else:
+                    # The recurrent fallback needs the per-draft snapshots, which
+                    # the pool gates OFF under --enable-linear-replayssm-spec (the
+                    # same flag that makes `use_replayssm_spec` true above), so
+                    # this branch is unreachable with a None buffer by
+                    # construction -- keep it loud rather than silently frozen.
+                    assert intermediate_state_cache is not None, (
+                        "recurrent target_verify fallback requires intermediate_ssm, "
+                        "which is not allocated under --enable-linear-replayssm-spec"
+                    )
+                    core_attn_out = self.kernel_dispatcher.target_verify(
+                        A_log=layer.A_log,
+                        dt_bias=layer.dt_bias,
+                        q=query,
+                        k=key,
+                        v=value,
+                        a=a,
+                        b=b,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        intermediate_states_buffer=intermediate_state_cache,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=forward_batch.spec_info.draft_token_num,
+                        retrieve_parent_token=retrieve_parent_token,
+                        stable_rows=pp_spec_stable_rows_enabled(),
+                    )
+            else:
+                g, beta = self._prefill_gates(layer, a, b)
+                h_track_buf = None
+                if (
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                    and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+                ):
+                    # Snapshot-capable kernels can supply just the selected FP32
+                    # checkpoint instead of materializing all per-chunk states.
+                    assert forward_metadata.track_chunk_idx is not None
+                    h_track_buf = torch.empty(
+                        (len(cache_indices), *ssm_states.shape[1:]),
+                        dtype=torch.float32,
+                        device=ssm_states.device,
+                    )
+                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                     q=query,
                     k=key,
                     v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states_contig,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    state_checkpoint_cu_starts=(
+                        forward_metadata.state_checkpoint_cu_starts
+                    ),
+                    num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                    state_checkpoint_every_n_tokens=(
+                        forward_metadata.state_checkpoint_every_n_tokens
+                    ),
+                    output=kwargs.get("linear_attn_output"),
+                    layer_id=layer.layer_id,
+                    extend_prefix_lens=forward_batch.extend_prefix_lens,
+                    track_state=h_track_buf,
+                    track_chunk_idx=(
+                        forward_metadata.track_chunk_idx
+                        if h_track_buf is not None
+                        else None
+                    ),
+                )
+
+                if is_npu() and last_recurrent_state is not None:
+                    last_recurrent_state = last_recurrent_state.to(
+                        ssm_states.dtype, copy=False
+                    )
+                    ssm_states[cache_indices] = last_recurrent_state
+
+                if needs_state_gather:
+                    # Scatter the in-place-updated contiguous copies back to the
+                    # strided envelope pool (advanced indexing handles the strides).
+                    conv_states[cache_indices] = conv_states_contig
+                    ssm_states[cache_indices] = ssm_states_contig
+
+                if forward_metadata.has_mamba_track_mask:
+                    self._track_mamba_state_extend(
+                        forward_batch,
+                        h,
+                        ssm_states,
+                        forward_metadata,
+                        h_track_buf=h_track_buf,
+                    )
+
+            return core_attn_out
+    else:
+        def forward_extend(
+            self,
+            layer: RadixLinearAttention,
+            forward_batch: ForwardBatch,
+            mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+            a: torch.Tensor,
+            b: torch.Tensor,
+            **kwargs,
+        ):
+            assert isinstance(mixed_qkv, torch.Tensor)
+            q38_conv_applied = kwargs.get("q38_conv_applied", False)
+            seq_len = mixed_qkv.shape[0]
+
+            if _is_hip and seq_len == 0:
+                return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
+
+            is_target_verify = forward_batch.forward_mode.is_target_verify()
+            if self.prefill_graph_metadata is not None and not is_target_verify:
+                return self._forward_extend_in_graph(
+                    layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
+                )
+            forward_metadata = self.forward_metadata
+
+            query_start_loc = forward_metadata.query_start_loc
+            cache_indices = forward_metadata.mamba_cache_indices
+            retrieve_next_token = forward_metadata.retrieve_next_token
+            retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+            retrieve_parent_token = forward_metadata.retrieve_parent_token
+
+            mamba_cache_params = self.state_layer_cache(layer.layer_id)
+            conv_states = mamba_cache_params.conv[0]
+            ssm_states = mamba_cache_params.temporal
+            if self.mis_metadata is not None:
+                if is_target_verify:
+                    raise ValueError("GDN MIS does not support target verify")
+                return self._forward_extend_mis(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
                     a=a,
                     b=b,
+                    conv_states=conv_states,
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    intermediate_states_buffer=intermediate_state_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=forward_batch.spec_info.draft_token_num,
-                    retrieve_parent_token=retrieve_parent_token,
-                    stable_rows=pp_spec_stable_rows_enabled(),
                 )
-        else:
-            g, beta = self._prefill_gates(layer, a, b)
-            h_track_buf = None
-            if (
-                forward_metadata.has_mamba_track_mask
-                and forward_metadata.track_ssm_h_src.numel() > 0
-                and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
-            ):
-                # Snapshot-capable kernels can supply just the selected FP32
-                # checkpoint instead of materializing all per-chunk states.
-                assert forward_metadata.track_chunk_idx is not None
-                h_track_buf = torch.empty(
-                    (len(cache_indices), *ssm_states.shape[1:]),
-                    dtype=torch.float32,
-                    device=ssm_states.device,
+            if is_target_verify:
+                assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+                intermediate_state_cache = mamba_cache_params.intermediate_ssm
+                intermediate_conv_window_cache = (
+                    mamba_cache_params.intermediate_conv_window[0]
                 )
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                state_checkpoint_cu_starts=(
-                    forward_metadata.state_checkpoint_cu_starts
-                ),
-                num_state_checkpoints=forward_metadata.num_state_checkpoints,
-                state_checkpoint_every_n_tokens=(
-                    forward_metadata.state_checkpoint_every_n_tokens
-                ),
-                output=kwargs.get("linear_attn_output"),
-                layer_id=layer.layer_id,
-                extend_prefix_lens=forward_batch.extend_prefix_lens,
-                track_state=h_track_buf,
-                track_chunk_idx=(
-                    forward_metadata.track_chunk_idx
-                    if h_track_buf is not None
-                    else None
-                ),
+                # PP-off selects the fixed table; do not evaluate its unused mask.
+                intermediate_state_indices = self.verify_intermediate_state_indices
+                if pp_spec_stable_rows_enabled():
+                    intermediate_state_indices = select_verify_intermediate_state_indices(
+                        self.verify_intermediate_state_indices,
+                        forward_batch.req_pool_indices,
+                        cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                        self.req_to_token_pool.size,
+                    )
+                mamba_pool = self.state_pool
+                use_replayssm_fold = (
+                    mamba_cache_params.replayssm_rawv is not None
+                    and mamba_pool.replayssm_spec_fold
+                    and not mamba_pool.replayssm_is_kda
+                )
+                use_replayssm_spec = (
+                    mamba_cache_params.replayssm_d is not None
+                    and mamba_pool.replayssm_cache_base is not None
+                    and not mamba_pool.replayssm_is_kda
+                )
+
+            # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
+            # chunk_gated_delta_rule) write state back in place assuming a contiguous
+            # slot layout, so they silently drop the write to the strided envelope
+            # pool. Run them on contiguous per-sequence copies (identity-indexed) and
+            # scatter the result back. No-op for the default contiguous pool.
+            # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
+            # proper indexed writes and handle non-contiguous pools directly via
+            # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
+            # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
+            # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
+            # int64 indexing, like packed_decode / causal_conv1d_update already do.
+            needs_state_gather = (
+                self.requires_contiguous_prefill_state
+                and (not is_target_verify)
+                and (not is_cpu())
+                and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
             )
-
-            if is_npu() and last_recurrent_state is not None:
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
-                ssm_states[cache_indices] = last_recurrent_state
-
             if needs_state_gather:
-                # Scatter the in-place-updated contiguous copies back to the
-                # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+                conv_states_contig = conv_states[cache_indices].contiguous()
+                ssm_states_contig = ssm_states[cache_indices].contiguous()
+                state_cache_indices = torch.arange(
+                    cache_indices.shape[0],
+                    device=cache_indices.device,
+                    dtype=cache_indices.dtype,
+                )
+            else:
+                conv_states_contig = conv_states
+                ssm_states_contig = ssm_states
+                state_cache_indices = cache_indices
 
-            if forward_metadata.has_mamba_track_mask:
-                self._track_mamba_state_extend(
+            if is_target_verify and not q38_conv_applied:
+                batch_size = seq_len // forward_batch.spec_info.draft_token_num
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                mixed_qkv_reshaped = mixed_qkv.view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+                conv_update = causal_conv1d_update
+                front_kwargs = {}
+                if os.environ.get("Q38_GDN_FRONT") == "1":
+                    from sglang.kernels.ops.attention.q38_gdn_front.conv import conv_update as q35_conv_update
+                    assert retrieve_next_token is None and retrieve_next_sibling is None and retrieve_parent_token is None
+                    conv_update = q35_conv_update
+                    front_kwargs = dict(block_n=128, token_major_out=True, num_warps=2)
+                    if layer.layer_id not in _q38_front_engaged:
+                        _q38_front_engaged.add(layer.layer_id)
+                        logger.info("Q38_GDN_FRONT layer=%d heads=%d/%d draft=%d views=1 conv_tile=128 verify_tile=64/w1 source=Q35_plugin pdl=%s", layer.layer_id, layer.num_k_heads, layer.num_v_heads, draft_token_num, os.environ.get("Q38_GDN_PDL", "0"))
+                mixed_qkv_processed = conv_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    **(front_kwargs if front_kwargs else dict(
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )),
+                )
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            elif not is_target_verify:
+                if forward_metadata.has_mamba_track_mask:
+                    mixed_qkv_to_track = mixed_qkv[
+                        forward_metadata.track_conv_indices
+                    ].transpose(1, 2)
+                    conv_states[forward_metadata.conv_states_mask_indices] = (
+                        mixed_qkv_to_track
+                    )
+
+                mixed_qkv = self._convolve_prefill(
+                    layer,
                     forward_batch,
-                    h,
-                    ssm_states,
-                    forward_metadata,
-                    h_track_buf=h_track_buf,
+                    mixed_qkv,
+                    conv_states_contig,
+                    state_cache_indices,
                 )
 
-        return core_attn_out
+            actual_seq_len = mixed_qkv.shape[0]
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            if (
+                (is_cuda() or is_hip() or is_xpu())
+                and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+                and not self._use_strided_target_verify_qkv
+                and not (is_target_verify and os.environ.get("Q38_GDN_FRONT") == "1")
+            ):
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+                key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+                value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+            if is_target_verify:
+                # ReplaySSM verify protocols: fold-every-commit (ring-write during
+                # verify, fold on commit), circular ring, or the snapshotting
+                # fallback when neither ring is allocated.
+                if use_replayssm_fold:
+                    core_attn_out = self._replayssm_fold_target_verify(
+                        layer=layer,
+                        query=query,
+                        key=key,
+                        value=value,
+                        a=a,
+                        b=b,
+                        layer_cache=mamba_cache_params,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )
+                elif use_replayssm_spec:
+                    core_attn_out = self._replayssm_target_verify(
+                        layer=layer,
+                        query=query,
+                        key=key,
+                        value=value,
+                        a=a,
+                        b=b,
+                        mamba_pool=mamba_pool,
+                        layer_cache=mamba_cache_params,
+                        cache_indices=cache_indices,
+                        replay_indices=forward_batch.req_pool_indices,
+                        query_start_loc=query_start_loc,
+                        draft_token_num=forward_batch.spec_info.draft_token_num,
+                        wait_for_gate_producer=q38_conv_applied,
+                        packed_qkv=mixed_qkv,
+                        norm_z=kwargs.get("q38_mk_z"),
+                        norm_weight=kwargs.get("q38_mk_norm_weight"),
+                        norm_eps=kwargs.get("q38_mk_norm_eps", 1e-6),
+                        return_normalized=kwargs.get("q38_m32_return_normalized", False),
+                    )
+                else:
+                    # The recurrent fallback needs the per-draft snapshots, which
+                    # the pool gates OFF under --enable-linear-replayssm-spec (the
+                    # same flag that makes `use_replayssm_spec` true above), so
+                    # this branch is unreachable with a None buffer by
+                    # construction -- keep it loud rather than silently frozen.
+                    assert intermediate_state_cache is not None, (
+                        "recurrent target_verify fallback requires intermediate_ssm, "
+                        "which is not allocated under --enable-linear-replayssm-spec"
+                    )
+                    core_attn_out = self.kernel_dispatcher.target_verify(
+                        A_log=layer.A_log,
+                        dt_bias=layer.dt_bias,
+                        q=query,
+                        k=key,
+                        v=value,
+                        a=a,
+                        b=b,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        intermediate_states_buffer=intermediate_state_cache,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=forward_batch.spec_info.draft_token_num,
+                        retrieve_parent_token=retrieve_parent_token,
+                        stable_rows=pp_spec_stable_rows_enabled(),
+                    )
+            else:
+                g, beta = self._prefill_gates(layer, a, b)
+                h_track_buf = None
+                if (
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                    and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+                ):
+                    # Snapshot-capable kernels can supply just the selected FP32
+                    # checkpoint instead of materializing all per-chunk states.
+                    assert forward_metadata.track_chunk_idx is not None
+                    h_track_buf = torch.empty(
+                        (len(cache_indices), *ssm_states.shape[1:]),
+                        dtype=torch.float32,
+                        device=ssm_states.device,
+                    )
+                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states_contig,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    state_checkpoint_cu_starts=(
+                        forward_metadata.state_checkpoint_cu_starts
+                    ),
+                    num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                    state_checkpoint_every_n_tokens=(
+                        forward_metadata.state_checkpoint_every_n_tokens
+                    ),
+                    output=kwargs.get("linear_attn_output"),
+                    layer_id=layer.layer_id,
+                    extend_prefix_lens=forward_batch.extend_prefix_lens,
+                    track_state=h_track_buf,
+                    track_chunk_idx=(
+                        forward_metadata.track_chunk_idx
+                        if h_track_buf is not None
+                        else None
+                    ),
+                )
+
+                if is_npu() and last_recurrent_state is not None:
+                    last_recurrent_state = last_recurrent_state.to(
+                        ssm_states.dtype, copy=False
+                    )
+                    ssm_states[cache_indices] = last_recurrent_state
+
+                if needs_state_gather:
+                    # Scatter the in-place-updated contiguous copies back to the
+                    # strided envelope pool (advanced indexing handles the strides).
+                    conv_states[cache_indices] = conv_states_contig
+                    ssm_states[cache_indices] = ssm_states_contig
+
+                if forward_metadata.has_mamba_track_mask:
+                    self._track_mamba_state_extend(
+                        forward_batch,
+                        h,
+                        ssm_states,
+                        forward_metadata,
+                        h_track_buf=h_track_buf,
+                    )
+
+            return core_attn_out
 
     def _forward_extend_mis(
         self,

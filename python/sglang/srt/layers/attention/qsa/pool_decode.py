@@ -351,6 +351,7 @@ def qsa_pool_sparse_decode(
     fused_merge=False,
     workspace=None,
     pdl=True,
+    write_new_kv=True,
 ):
     """q [rows, QH, 256] bf16 (or [rows, QH*256]); k/v_cache [slots, H, 256];
     k/v_new [rows, H, 256] (row stride arbitrary, inner contiguous); loc [rows] int32;
@@ -387,7 +388,7 @@ def qsa_pool_sparse_decode(
     nv = v_new.reshape(rows, kv_heads * dim) if v_new.dim() == 3 else v_new
     mcode = _MODES[mode]
     pdl_kw = {"launch_pdl": True} if pdl else {}
-    if mcode == 0:
+    if mcode == 0 and write_new_kv:
         _qsa_write_new_kv[(rows, kv_heads)](
             k_cache, v_cache, nk, nv, loc, nk.stride(0), nv.stride(0), kv_heads, dim, pdl, num_warps=1, **pdl_kw
         )

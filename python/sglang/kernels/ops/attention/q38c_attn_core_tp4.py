@@ -201,35 +201,114 @@ def _partial_tp4(
         )
 
 
-@triton.jit
-def _merge_gate_tp4(P, MAX, SUM, OUT, GATE, GS: tl.constexpr, GH: tl.constexpr,
-                    NT: tl.constexpr, ST: tl.constexpr,
-                    QHEADS: tl.constexpr, KVH: tl.constexpr, GROUP: tl.constexpr):
-    # Only independent o_proj weight DMA may run before our output is complete.
-    tl.extra.cuda.gdc_launch_dependents()
-    tl.extra.cuda.gdc_wait()
-    row, head, dim_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    t = tl.arange(0, ST)
-    d = dim_tile * 64 + tl.arange(0, 64)
+@gluon.jit
+def _merge_gate_tp4(P, MAX, SUM, OUT, GATE, GS: gl.constexpr, GH: gl.constexpr,
+                    NT: gl.constexpr, ST: gl.constexpr,
+                    QHEADS: gl.constexpr, KVH: gl.constexpr, GROUP: gl.constexpr):
+    # Keep the production ABI/grid/four-warp launch. Scalar reductions use
+    # a fixed warp tree and one writer per shared partial, never replicated
+    # all-lane writes. The vector reduction is warp-local (no shared scratch).
+    gl.static_assert(ST == 64)
+    gl.static_assert(gl.num_warps() == 4)
+    gl.inline_asm_elementwise(
+        "griddepcontrol.launch_dependents; griddepcontrol.wait; mov.u32 $0, 0;",
+        constraints="=r,~{memory}", args=[], dtype=gl.int32,
+        is_pure=False, pack=1,
+    )
+    row, head, dim_tile = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    scalar_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+    t = gl.arange(0, ST, scalar_layout)
     state = (row * KVH + head // GROUP) * NT + t
     hh = head % GROUP
-    mx = tl.load(MAX + state * 16 + hh, t < NT, -float('inf'))
-    denom = tl.load(SUM + state * 16 + hh, t < NT, 0.)
-    maximum = tl.max(mx, 0)
-    safe_max = tl.where(maximum > -float('inf'), maximum, 0.)
-    weights = tl.exp(mx - safe_max)
-    total = tl.sum(denom * weights, 0)
-    partial = tl.load(P + (state[:, None] * 16 + hh) * 256 + d[None, :],
-                      (t < NT)[:, None], 0.)
-    value = tl.sum(partial * weights[:, None], 0) / tl.where(total > 0, total, 1.)
-    # Preserve the native BF16 attention-output boundary before the gate.
-    rounded = value.to(tl.bfloat16).to(tl.float32)
-    gate = tl.load(GATE + row * GS + head * GH + d).to(tl.float32)
-    tl.store(OUT + (row * QHEADS + head) * 256 + d, rounded * tl.sigmoid(gate))
+    mx = gl.load(MAX + state * 16 + hh, t < NT, -float('inf'))
+    denom = gl.load(SUM + state * 16 + hh, t < NT, 0.)
+    maximum = gl.inline_asm_elementwise(
+        """{
+        .reg .b32 tid, lane, warp, off, ptr, peer;
+        .reg .f32 v, a, b, c, d;
+        .reg .pred owner, active;
+        .shared .align 4 .b32 max_partials[4];
+        mov.u32 tid, %tid.x;
+        and.b32 lane, tid, 31;
+        shr.u32 warp, tid, 5;
+        setp.lt.u32 active, warp, 2;
+        selp.f32 v, $1, 0fFF800000, active;
+        shfl.sync.bfly.b32 peer, v, 16, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 8, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 4, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 2, 31, -1; max.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 1, 31, -1; max.f32 v, v, peer;
+        mov.u32 ptr, max_partials;
+        shl.b32 off, warp, 2;
+        add.u32 off, ptr, off;
+        setp.eq.u32 owner, lane, 0;
+        @owner st.shared.b32 [off], v;
+        bar.sync 0;
+        ld.shared.f32 a, [ptr]; ld.shared.f32 b, [ptr+4];
+        ld.shared.f32 c, [ptr+8]; ld.shared.f32 d, [ptr+12];
+        max.f32 a, a, b; max.f32 c, c, d; max.f32 $0, a, c;
+        // All readers finish before the compiler can reuse this scratch.
+        bar.sync 0;
+        }""", constraints="=f,f,~{memory}", args=[mx], dtype=gl.float32,
+        is_pure=False, pack=1,
+    )
+    safe_max = gl.where(maximum > -float('inf'), maximum, 0.)
+    weights = gl.exp(mx - safe_max)
+    total = gl.inline_asm_elementwise(
+        """{
+        .reg .b32 tid, lane, warp, off, ptr, peer;
+        .reg .f32 v, a, b, c, d;
+        .reg .pred owner, active;
+        .shared .align 4 .b32 sum_partials[4];
+        mov.u32 tid, %tid.x;
+        and.b32 lane, tid, 31;
+        shr.u32 warp, tid, 5;
+        setp.lt.u32 active, warp, 2;
+        mul.rn.f32 v, $1, $2;
+        selp.f32 v, v, 0f00000000, active;
+        shfl.sync.bfly.b32 peer, v, 16, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 8, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 4, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 2, 31, -1; add.rn.f32 v, v, peer;
+        shfl.sync.bfly.b32 peer, v, 1, 31, -1; add.rn.f32 v, v, peer;
+        mov.u32 ptr, sum_partials;
+        shl.b32 off, warp, 2;
+        add.u32 off, ptr, off;
+        setp.eq.u32 owner, lane, 0;
+        @owner st.shared.b32 [off], v;
+        bar.sync 0;
+        ld.shared.f32 a, [ptr]; ld.shared.f32 b, [ptr+4];
+        ld.shared.f32 c, [ptr+8]; ld.shared.f32 d, [ptr+12];
+        add.rn.f32 a, a, b; add.rn.f32 c, c, d; add.rn.f32 $0, a, c;
+        bar.sync 0;
+        }""", constraints="=f,f,f,~{memory}", args=[denom, weights],
+        dtype=gl.float32, is_pure=False, pack=1,
+    )
+    # All 32 lanes in a warp reduce T; the four warps own disjoint D groups.
+    # Convert duplicated scalars to this layout before expanding them.
+    pv_layout: gl.constexpr = gl.BlockedLayout([1, 1], [32, 1], [1, 4], [0, 1])
+    tt = gl.arange(0, ST, gl.SliceLayout(1, pv_layout))
+    dd = dim_tile * 64 + gl.arange(0, 64, gl.SliceLayout(0, pv_layout))
+    states = (row * KVH + head // GROUP) * NT + tt
+    w = gl.convert_layout(weights, gl.SliceLayout(1, pv_layout))
+    partial = gl.load(P + (states[:, None] * 16 + hh) * 256 + dd[None, :],
+                      (tt < NT)[:, None], 0.)
+    # An explicit rounded product prevents asymmetric FMA contraction inside
+    # the warp-local reduction; this alone is not the shared-write repair.
+    product = gl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;", constraints="=f,f,f",
+        args=[partial, w[:, None]], dtype=gl.float32, is_pure=True, pack=1,
+    )
+    total_d = gl.convert_layout(total, gl.SliceLayout(0, pv_layout))
+    value = gl.sum(product, 0) / gl.where(total_d > 0, total_d, 1.)
+    rounded = value.to(gl.bfloat16).to(gl.float32)
+    gate = gl.load(GATE + row * GS + head * GH + dd).to(gl.float32)
+    sigmoid = 1. / (1. + gl.exp(-gate))
+    gl.store(OUT + (row * QHEADS + head) * 256 + dd, rounded * sigmoid)
 
 
 def run_gated(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
-              block_indices, lengths, qpos, scale, gate, width=4):
+              block_indices, lengths, qpos, scale, gate, width=4, store_new_kv=True):
     """TARGET_VERIFY M4/Q6/KV1 only; retain current-KV store and fresh/tail ABI."""
     m, qheads, dim = q.shape
     kvheads = k_pool.shape[1]
@@ -245,13 +324,14 @@ def run_gated(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
     maximum = torch.empty((m, kvheads, nt, 16), dtype=torch.float32, device=q.device)
     sums = torch.empty_like(maximum)
     output = torch.empty_like(q, memory_format=torch.contiguous_format)
-    _store_tp4[(m, kvheads)](
-        k_pool, v_pool, k_new, v_new, loc,
-        k_pool.stride(0), v_pool.stride(0), k_new.stride(0), v_new.stride(0), kvheads, dim,
-        num_warps=4,
-        launch_pdl=_PDL_SMALL,
-        PDL_SMALL=_PDL_SMALL,
-    )
+    if store_new_kv:
+        _store_tp4[(m, kvheads)](
+            k_pool, v_pool, k_new, v_new, loc,
+            k_pool.stride(0), v_pool.stride(0), k_new.stride(0), v_new.stride(0), kvheads, dim,
+            num_warps=4,
+            launch_pdl=_PDL_SMALL,
+            PDL_SMALL=_PDL_SMALL,
+        )
     _partial_tp4[(m, nt, kvheads)](
         q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
         block_indices, lengths, qpos, partial, maximum, sums,

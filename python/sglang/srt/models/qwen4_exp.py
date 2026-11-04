@@ -115,7 +115,19 @@ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 _Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
 _Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
 _Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
+_Q38_QSA_KV_PRESTORE = get_bool_env_var("SGLANG_QSA_QPF_KV_PRESTORE", "False")
 _Q38_MK_MTP = get_bool_env_var("SGLANG_Q38C_MK_MTP", "False")
+
+
+def _mask_state_indices(
+    valid: torch.Tensor, state_indices: torch.Tensor
+) -> torch.Tensor:
+    """state_indices where valid, else 0 (the state pools' reserved dummy slot)."""
+    # A multiply records one kernel in captured CUDA graphs; where() with
+    # zeros_like adds a memset node. Exact for int64 times bool.
+    if envs.SGLANG_ENABLE_PLE_STATE_INDEX_MASK.get():
+        return state_indices * valid
+    return torch.where(valid, state_indices, torch.zeros_like(state_indices))
 
 
 def _ple_table_is_fp8(
@@ -379,10 +391,8 @@ def _prepare_ple_batch(
     out_cache_loc = forward_batch.out_cache_loc
     if use_decode_fast_path:
         if out_cache_loc is not None:
-            state_indices = torch.where(
-                out_cache_loc[:sequence_count].ne(0),
-                state_indices,
-                torch.zeros_like(state_indices),
+            state_indices = _mask_state_indices(
+                out_cache_loc[:sequence_count].ne(0), state_indices
             )
     else:
         valid = lengths.ne(0)
@@ -392,9 +402,7 @@ def _prepare_ple_batch(
             valid = valid & out_cache_loc[:processed_tokens].reshape(
                 sequence_count, row_width
             ).ne(0).any(dim=1)
-        state_indices = torch.where(
-            valid, state_indices, torch.zeros_like(state_indices)
-        )
+        state_indices = _mask_state_indices(valid, state_indices)
 
     ngram_context = None
     if ngram_size is not None:
@@ -1150,8 +1158,10 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         nn.init.zeros_(self.conv1d.weight)
+        from sglang.srt.runtime_context import new_forward_helper_stream
+
         self._prefetch_stream = (
-            torch.cuda.Stream() if config.ple_offload_embedding else None
+            new_forward_helper_stream() if config.ple_offload_embedding else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -1996,6 +2006,7 @@ class Qwen4ExpAttentionDecoderLayer(
         if should_reuse is not None and should_reuse(forward_batch):
             # MTP decode steps reuse the draft-extend's target-aligned
             # selection; the indexer never runs inside the decode graph.
+            self._qpf_bypass_observe(forward_batch, hidden_states.shape[0], "mtp_index_share")
             return sparse_backend.lookup_mtp_sparse_indices(
                 forward_batch, self.layer_id
             )
@@ -2029,6 +2040,25 @@ class Qwen4ExpAttentionDecoderLayer(
                 topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
             )
         return topk_indices
+
+    def _qpf_bypass_observe(self, forward_batch, rows, reason, prestore=False):
+        from sglang.srt.layers.attention.qsa.observability import observe
+        from sglang.srt.layers.attention.qsa.prologue_fold import QPF_ENABLED
+
+        if QPF_ENABLED:
+            observe(
+                "QPF", self.layer_id, forward_batch, rows,
+                result="FALLBACK", reason=reason,
+                graph=get_is_capture_mode(),
+                capturing=torch.cuda.is_current_stream_capturing(),
+            )
+        if prestore and _Q38_QSA_KV_PRESTORE:
+            observe(
+                "KV_PRESTORE", self.layer_id, forward_batch, rows,
+                result="FALLBACK", reason="not_target_verify",
+                graph=get_is_capture_mode(),
+                capturing=torch.cuda.is_current_stream_capturing(),
+            )
 
     def _try_mk_mtp_self_attention(self, positions, hidden_states, forward_batch):
         if not (
@@ -2077,6 +2107,7 @@ class Qwen4ExpAttentionDecoderLayer(
         if _Q38_MK_MTP:
             output = self._try_mk_mtp_self_attention(positions, hidden_states, forward_batch)
             if output is not None:
+                self._qpf_bypass_observe(forward_batch, hidden_states.shape[0], "mtp_front_bypass", prestore=True)
                 return output
         overlap_indexer = (
             self.is_qsa
@@ -2161,6 +2192,18 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch=forward_batch,
         )
 
+        if _Q38_QSA_KV_PRESTORE and self.is_qsa:
+            if not overlap_indexer or not forward_batch.forward_mode.is_target_verify():
+                from sglang.srt.layers.attention.qsa.observability import observe
+
+                observe(
+                    "KV_PRESTORE", self.layer_id, forward_batch, q.shape[0],
+                    result="FALLBACK",
+                    reason="indexer_overlap_inactive" if not overlap_indexer else "not_target_verify",
+                    graph=get_is_capture_mode(),
+                    capturing=torch.cuda.is_current_stream_capturing(),
+                )
+
         if overlap_indexer:
             if projected_qk is not None:
                 # There is no ordinary event between native index projection
@@ -2184,6 +2227,26 @@ class Qwen4ExpAttentionDecoderLayer(
                     topk_indices = self._compute_qsa_topk_indices(
                         hidden_states, positions, forward_batch
                     )
+            if _Q38_QSA_KV_PRESTORE and forward_batch.forward_mode.is_target_verify():
+                # Persist main-QKV before joining the independent indexer.
+                from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+                prestore = getattr(
+                    resolve_qsa_sparse_backend(get_attn_backend()), "q38_prestore_new_kv", None
+                )
+                prestore_gate = gate if (_Q38_ATTN_GATE_V2 and q.shape[0] == 4) else None
+                if prestore is None:
+                    from sglang.srt.layers.attention.qsa.observability import observe
+
+                    observe(
+                        "KV_PRESTORE", self.layer_id, forward_batch, q.shape[0],
+                        result="FALLBACK", reason="missing_consumer_hook",
+                        graph=get_is_capture_mode(),
+                        capturing=torch.cuda.is_current_stream_capturing(),
+                    )
+                if prestore is not None and prestore(
+                    q, k, v, self.attn, forward_batch, topk_indices, output_gate=prestore_gate
+                ):
+                    attention_kwargs["q38_kv_prestored"] = True
             # Preserve all QSA state/store/top-k work before KV preparation.
             current_stream.wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed by attention on the current
@@ -2516,6 +2579,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def wants_prefill_autotune(self) -> bool:
+        from sglang.srt.layers.moe.prefill_autotune import (
+            wants_qwen_moe_prefill_autotune,
+        )
+
+        return wants_qwen_moe_prefill_autotune(self)
+
+    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        from sglang.srt.layers.moe.prefill_autotune import autotune_qwen_moe_prefill
+
+        return autotune_qwen_moe_prefill(self, num_tokens, dtype=dtype)
 
     @torch.no_grad()
     def forward(

@@ -118,6 +118,21 @@ class Disagg(msgspec.Struct):
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
     ] = 1
+    disaggregation_decode_late_cuda_context: A[
+        bool,
+        "On a PD decode server, start a helper process that opens a CUDA context "
+        "on the worker's GPU after the first decode batch and holds it until the "
+        "worker exits. Removes extra per-launch latency inside CUDA graphs seen "
+        "while no other process has opened a context on the GPU since start-up. "
+        "Changes no kernel or output. Disabled by default.",
+    ] = False
+    disaggregation_nosync_qsa_publish: A[
+        bool,
+        "On a PD decode server with SGLANG_TRTL16_PREALLOC_NO_SYNC=1, also send "
+        "the QSA pending and compressed-page state payloads through the deferred "
+        "no-sync metadata publish instead of synchronous host reads. The payloads "
+        "are equal. Disabled by default.",
+    ] = False
     enable_pd_role_switch: A[
         bool,
         "Allow runtime prefill<->decode role switch via /pd_role_switch (PD mode).",

@@ -17,7 +17,10 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
+from sglang.kernels.ops.extend_fastpath import MOE_ENABLED as _Q38C_EXTEND_PATH
 
+
+import functools
 import logging
 import os
 from contextlib import nullcontext
@@ -75,6 +78,7 @@ from sglang.srt.layers.moe.utils import (
     sum_post_experts_output,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.quantization import sm107_shared_expert_act
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -133,8 +137,57 @@ _NVFP4_PREQUANT_OVERLAP = get_bool_env_var(
     "SGLANG_QWEN_MOE_NVFP4_PREQUANT_OVERLAP", "true"
 )
 _FUSED_FINALIZE_GATE = get_bool_env_var("SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE", "true")
-# TRT-LLM uses its small-grid finalize kernel while 10 * tokens < 1184.
-_FUSED_FINALIZE_GATE_MAX_TOKENS = 64
+# Keep the default cap unless explicitly raised for a high-throughput point.
+_FUSED_FINALIZE_GATE_MAX_TOKENS = envs.SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS.get()
+if _FUSED_FINALIZE_GATE_MAX_TOKENS < 1:
+    raise ValueError(
+        "SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS must be a positive "
+        f"integer, got {_FUSED_FINALIZE_GATE_MAX_TOKENS}"
+    )
+# Extend-size counterpart: at prefill sizes run the NVFP4 TRT-LLM experts with
+# do_finalize=False and finalize together with the gated shared-expert add in
+# one gather-reduce kernel (TRT-LLM's finalizeKernelVecLoad keeps only two
+# 16 B gathers in flight per thread at top-k 10). Graphs and eager both; the
+# token floor keeps decode / verify CUDA graphs on their existing path.
+_EXTEND_FUSED_FINALIZE_GATE_DISABLE = get_bool_env_var(
+    "SGLANG_X_MOE_EXTEND_FUSED_FINALIZE_DISABLE", "false"
+)
+_EXTEND_FUSED_FINALIZE_GATE_MIN_TOKENS = int(
+    os.environ.get("SGLANG_X_MOE_EXTEND_FUSED_FINALIZE_MIN_TOKENS", "1024")
+)
+# Register cap (maxnreg) for the extend-size launch; 0 = compiler default.
+_EXTEND_FUSED_FINALIZE_GATE_MAXNREG = int(
+    os.environ.get("SGLANG_X_MOE_EXTEND_FUSED_FINALIZE_MAXNREG", "64")
+)
+
+
+def _extend_fused_finalize_gate(num_tokens: int) -> bool:
+    """Whether an extend-size MoE finalizes together with the gated shared add.
+
+    Same kernel as the low-batch fused finalize: bit-identical to TRT-LLM's
+    finalizeKernelVecLoad followed by fused_gate_sigmoid_mul_add (the routed
+    sum is the same slot-order FP32 FMA chain rounded once to BF16, and the
+    gate reduction uses the stock gate kernel's layout at >= 1024 rows)."""
+    return (
+        not _EXTEND_FUSED_FINALIZE_GATE_DISABLE
+        and num_tokens >= _EXTEND_FUSED_FINALIZE_GATE_MIN_TOKENS
+    )
+
+
+def _fused_finalize_max_registers(num_tokens: int) -> int:
+    return (
+        _EXTEND_FUSED_FINALIZE_GATE_MAXNREG
+        if _extend_fused_finalize_gate(num_tokens)
+        else 0
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _log_fused_finalize_once() -> None:
+    logger.debug(
+        "Qwen MoE fused finalize + shared-expert gate above 64 tokens (max_tokens=%d)",
+        _FUSED_FINALIZE_GATE_MAX_TOKENS,
+    )
 
 
 def get_num_shared_experts(config: PretrainedConfig) -> int:
@@ -257,6 +310,11 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
+        if sm107_shared_expert_act.is_enabled():
+            act = sm107_shared_expert_act.fused_act(self, x)
+            if act is not None:
+                x, _ = self.down_proj(act)
+                return x
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
@@ -892,297 +950,620 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output,
         )
 
-    def forward_normal_dual_stream(
-        self,
-        hidden_states: torch.Tensor,
-        use_fused_gate: bool = False,
-        defer_finalize: bool = False,
-        precomputed_router=None,
-        ordered_finalize_sink=None,
-    ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
+    # Import-time selection keeps the disabled entry and launch body stock.
+    if _Q38C_EXTEND_PATH:
+        def forward_normal_dual_stream(
+            self,
+            hidden_states: torch.Tensor,
+            use_fused_gate: bool = False,
+            defer_finalize: bool = False,
+            precomputed_router=None,
+            ordered_finalize_sink=None,
+        ) -> torch.Tensor:
+            current_stream = torch.cuda.current_stream()
 
-        if defer_finalize:
-            # Keep routed FC2 on the current stream as finalize's PDL dependency;
-            # the shared branch reads the same input and writes a separate output.
-            self.alt_stream.wait_stream(current_stream)
-            router_output = self._forward_router_experts(
-                hidden_states,
-                defer_finalize=True,
-                precomputed_router=precomputed_router,
-            )
-            with torch.cuda.stream(self.alt_stream):
-                shared_output = self._forward_shared_experts(
-                    hidden_states, apply_gate=False
+            if defer_finalize:
+                # Keep routed FC2 on the current stream as finalize's PDL dependency;
+                # the shared branch reads the same input and writes a separate output.
+                self.alt_stream.wait_stream(current_stream)
+                router_output = self._forward_router_experts(
+                    hidden_states,
+                    defer_finalize=True,
+                    precomputed_router=precomputed_router,
                 )
-                if shared_output is not None:
-                    shared_output = self._gate_shared_output_out_of_place(
-                        hidden_states, shared_output
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, apply_gate=False
                     )
-            current_stream.wait_stream(self.alt_stream)
-            return router_output, shared_output
+                    if shared_output is not None:
+                        shared_output = self._gate_shared_output_out_of_place(
+                            hidden_states, shared_output
+                        )
+                current_stream.wait_stream(self.alt_stream)
+                return router_output, shared_output
 
-        self.alt_stream.wait_stream(current_stream)
-        nvfp4_glue = self.tp_size == 1 and self._uses_nvfp4_trtllm_glue()
-        pre_quant = None
-        # FN can already produce router logits and FP4 bytes together. Keep it
-        # authoritative rather than quantizing the same input a second time.
-        fn_router_prequant = precomputed_router is not None or (
-            self._q38_router_front
-            and (
-                hidden_states.shape[0] in self._q38_router_hybrid_splits
-                if self._q38_router_hybrid
-                else 1 <= hidden_states.shape[0] <= 16
+            self.alt_stream.wait_stream(current_stream)
+            nvfp4_glue = self.tp_size == 1 and self._uses_nvfp4_trtllm_glue()
+            pre_quant = None
+            # FN can already produce router logits and FP4 bytes together. Keep it
+            # authoritative rather than quantizing the same input a second time.
+            fn_router_prequant = precomputed_router is not None or (
+                self._q38_router_front
+                and (
+                    hidden_states.shape[0] in self._q38_router_hybrid_splits
+                    if self._q38_router_hybrid
+                    else 1 <= hidden_states.shape[0] <= 16
+                )
+                and not torch.compiler.is_compiling()
+                and not is_in_tc_piecewise_cuda_graph()
             )
-            and not torch.compiler.is_compiling()
-            and not is_in_tc_piecewise_cuda_graph()
-        )
-        if nvfp4_glue and _NVFP4_PREQUANT_OVERLAP and not fn_router_prequant:
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                quantize_nvfp4_routed_input,
-            )
+            if nvfp4_glue and _NVFP4_PREQUANT_OVERLAP and not fn_router_prequant:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    quantize_nvfp4_routed_input,
+                )
 
-            # On the shared-expert stream, beside the router GEMV rather than
-            # after it on the routed stream.
-            pre_quant = quantize_nvfp4_routed_input(
-                hidden_states, self.experts.w13_input_scale_quant
+                # On the shared-expert stream, beside the router GEMV rather than
+                # after it on the routed stream.
+                pre_quant = quantize_nvfp4_routed_input(
+                    hidden_states, self.experts.w13_input_scale_quant
+                )
+            fused_finalize = (
+                nvfp4_glue
+                and use_fused_gate
+                and self.shared_expert is not None
+                and (
+                    (
+                        _FUSED_FINALIZE_GATE
+                        and hidden_states.shape[0] <= _FUSED_FINALIZE_GATE_MAX_TOKENS
+                    )
+                    or _extend_fused_finalize_gate(hidden_states.shape[0])
+                )
             )
-        fused_finalize = (
-            nvfp4_glue
-            and _FUSED_FINALIZE_GATE
-            and use_fused_gate
-            and self.shared_expert is not None
-            and hidden_states.shape[0] <= _FUSED_FINALIZE_GATE_MAX_TOKENS
-        )
-        shared_output = (
-            self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
-            )
-            if self.shared_expert is not None
-            else None
-        )
-
-        # ===== TO BE REFACTORED ====
-        # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
-        # MoE dispatch so it overlaps the down-LoRA shrink on the alt stream.
-        staged = False
-        if shared_output is not None and _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
-                shared_add_overlap_enabled,
-                stage_shared_expert_add,
-                unstage_shared_expert_add,
+            shared_output = (
+                self._forward_shared_experts(
+                    hidden_states.clone(), apply_gate=not use_fused_gate
+                )
+                if self.shared_expert is not None
+                else None
             )
 
-            if shared_add_overlap_enabled():
-                stage_shared_expert_add(shared_output, current_stream)
-                staged = True
-        # ===== END TO BE REFACTORED ====
+            # ===== TO BE REFACTORED ====
+            # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
+            # MoE dispatch so it overlaps the down-LoRA shrink on the alt stream.
+            staged = False
+            if shared_output is not None and _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
+                    shared_add_overlap_enabled,
+                    stage_shared_expert_add,
+                    unstage_shared_expert_add,
+                )
 
-        with torch.cuda.stream(self.alt_stream):
-            if ordered_finalize_sink is not None:
-                from sglang.kernels.ops.moe.q38_finalize_shared import capture_finalize
+                if shared_add_overlap_enabled():
+                    stage_shared_expert_add(shared_output, current_stream)
+                    staged = True
+            # ===== END TO BE REFACTORED ====
 
-                with capture_finalize(ordered_finalize_sink):
+            with torch.cuda.stream(self.alt_stream):
+                if ordered_finalize_sink is not None:
+                    from sglang.kernels.ops.moe.q38_finalize_shared import capture_finalize
+
+                    with capture_finalize(ordered_finalize_sink):
+                        router_output = self._forward_router_experts(
+                            hidden_states, precomputed_router=precomputed_router
+                        )
+                elif self.tp_size == 1:
+                    router_output = self._forward_router_experts(
+                        hidden_states,
+                        precomputed_router=precomputed_router,
+                        pre_quant_input=pre_quant,
+                        fused_finalize=fused_finalize,
+                    )
+                else:
                     router_output = self._forward_router_experts(
                         hidden_states, precomputed_router=precomputed_router
                     )
-            elif self.tp_size == 1:
+
+            current_stream.wait_stream(self.alt_stream)
+
+            if fused_finalize and not isinstance(router_output, torch.Tensor):
+                for tensor in (
+                    router_output.gemm2_out,
+                    router_output.expert_weights,
+                    router_output.expanded_idx_to_permuted_idx,
+                ):
+                    tensor.record_stream(current_stream)
+                final_hidden_states = fused_moe_finalize_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(0),
+                    shared_output,
+                    router_output.gemm2_out,
+                    router_output.expanded_idx_to_permuted_idx,
+                    router_output.expert_weights,
+                    max_registers=_fused_finalize_max_registers(hidden_states.shape[0]),
+                )
+                return final_hidden_states, None
+
+            if staged and unstage_shared_expert_add() is None:
+                # The dispatch consumed the staging (add already enqueued); skip the caller's add.
+                shared_output = None
+
+            return router_output, shared_output
+    else:
+        def forward_normal_dual_stream(
+            self,
+            hidden_states: torch.Tensor,
+            use_fused_gate: bool = False,
+            defer_finalize: bool = False,
+            precomputed_router=None,
+            ordered_finalize_sink=None,
+        ) -> torch.Tensor:
+            current_stream = torch.cuda.current_stream()
+
+            if defer_finalize:
+                # Keep routed FC2 on the current stream as finalize's PDL dependency;
+                # the shared branch reads the same input and writes a separate output.
+                self.alt_stream.wait_stream(current_stream)
                 router_output = self._forward_router_experts(
                     hidden_states,
+                    defer_finalize=True,
                     precomputed_router=precomputed_router,
-                    pre_quant_input=pre_quant,
-                    fused_finalize=fused_finalize,
                 )
-            else:
-                router_output = self._forward_router_experts(
-                    hidden_states, precomputed_router=precomputed_router
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, apply_gate=False
+                    )
+                    if shared_output is not None:
+                        shared_output = self._gate_shared_output_out_of_place(
+                            hidden_states, shared_output
+                        )
+                current_stream.wait_stream(self.alt_stream)
+                return router_output, shared_output
+
+            self.alt_stream.wait_stream(current_stream)
+            nvfp4_glue = self.tp_size == 1 and self._uses_nvfp4_trtllm_glue()
+            pre_quant = None
+            # FN can already produce router logits and FP4 bytes together. Keep it
+            # authoritative rather than quantizing the same input a second time.
+            fn_router_prequant = precomputed_router is not None or (
+                self._q38_router_front
+                and (
+                    hidden_states.shape[0] in self._q38_router_hybrid_splits
+                    if self._q38_router_hybrid
+                    else 1 <= hidden_states.shape[0] <= 16
+                )
+                and not torch.compiler.is_compiling()
+                and not is_in_tc_piecewise_cuda_graph()
+            )
+            if nvfp4_glue and _NVFP4_PREQUANT_OVERLAP and not fn_router_prequant:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    quantize_nvfp4_routed_input,
                 )
 
-        current_stream.wait_stream(self.alt_stream)
-
-        if fused_finalize and not isinstance(router_output, torch.Tensor):
-            for tensor in (
-                router_output.gemm2_out,
-                router_output.expert_weights,
-                router_output.expanded_idx_to_permuted_idx,
-            ):
-                tensor.record_stream(current_stream)
-            final_hidden_states = fused_moe_finalize_gate_sigmoid_mul_add(
-                hidden_states,
-                self.shared_expert_gate.weight.squeeze(0),
-                shared_output,
-                router_output.gemm2_out,
-                router_output.expanded_idx_to_permuted_idx,
-                router_output.expert_weights,
-            )
-            return final_hidden_states, None
-
-        if staged and unstage_shared_expert_add() is None:
-            # The dispatch consumed the staging (add already enqueued); skip the caller's add.
-            shared_output = None
-
-        return router_output, shared_output
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        defer_finalize: bool = False,
-    ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        if defer_finalize and num_tokens == 0:
-            raise RuntimeError("Qwen deferred finalize does not support M=0")
-
-        if self._use_mega_moe:
-            return self._forward_mega_moe(hidden_states, forward_batch)
-
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_deepep_v2()
-            or get_moe_a2a_backend().is_mori()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
-            return self._forward_deepep(hidden_states, forward_batch)
-
-        use_fused_gate = (
-            self.shared_expert_gate is not None
-            and not use_intel_amx_backend(self.shared_expert_gate)
-            and not is_npu()
-        )
-
-        ordered_finalize_sink = None
-        if (os.environ.get("SGLANG_Q38C_FINALIZE_SHARED", "0") == "1"
-            and not defer_finalize and use_fused_gate
-            and self.shared_expert is not None
-            and hidden_dim == 2560 and 1 <= num_tokens <= 7
-            and hidden_states.is_cuda
-            and hidden_states.dtype == torch.bfloat16
-            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
-            and not self.experts.reduce_results
-            and not getattr(self, "_q38_push_shared", False)
-            and not torch.compiler.is_compiling()
-            and not is_in_tc_piecewise_cuda_graph()):
-            ordered_finalize_sink = []
-
-        precomputed_router = None
-        if (
-            self._q38c_router_fused
-            and (num_tokens in (1, 4) or (self._q38c_router_wide and num_tokens in (8, 16)))
-            and not torch.compiler.is_compiling()
-            and not is_in_tc_piecewise_cuda_graph()
-        ):
-            from sglang.kernels.ops.moe.q38_router_fused import produce
-
-            # Static router weights may load during the previous main-stream
-            # kernel. Keep the real alt-stream event and all shared/gate joins.
-            precomputed_router = produce(self, hidden_states)
-
-        if hidden_states.shape[0] == 0:
-            # M=0 guard for idle DP ranks: skip shared_experts and gate
-            # (which crash on empty tensors in FP4 GEMM), but still call
-            # self.experts() to participate in alltoall collective.
-            shared_output = None
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
-            final_hidden_states = self.experts(hidden_states, topk_output)
-        elif (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-            and not torch.compiler.is_compiling()
-            # Paged experts run as an eager break, which must end the segment on the
-            # capture stream.
-            and not (
-                get_exec().moe.enable_paged_experts and is_in_breakable_cuda_graph()
-            )
-        ):
-            final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states,
-                use_fused_gate=use_fused_gate,
-                defer_finalize=defer_finalize,
-                precomputed_router=precomputed_router,
-                ordered_finalize_sink=ordered_finalize_sink,
-            )
-        else:
-            shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate and not defer_finalize
-            )
-            if defer_finalize and shared_output is not None:
-                shared_output = self._gate_shared_output_out_of_place(
-                    hidden_states, shared_output
+                # On the shared-expert stream, beside the router GEMV rather than
+                # after it on the routed stream.
+                pre_quant = quantize_nvfp4_routed_input(
+                    hidden_states, self.experts.w13_input_scale_quant
                 )
-            if ordered_finalize_sink is not None:
-                from sglang.kernels.ops.moe.q38_finalize_shared import capture_finalize
+            fused_finalize = (
+                nvfp4_glue
+                and _FUSED_FINALIZE_GATE
+                and use_fused_gate
+                and self.shared_expert is not None
+                and hidden_states.shape[0] <= _FUSED_FINALIZE_GATE_MAX_TOKENS
+            )
+            shared_output = (
+                self._forward_shared_experts(
+                    hidden_states.clone(), apply_gate=not use_fused_gate
+                )
+                if self.shared_expert is not None
+                else None
+            )
 
-                with capture_finalize(ordered_finalize_sink):
-                    final_hidden_states = self._forward_router_experts(
+            # ===== TO BE REFACTORED ====
+            # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
+            # MoE dispatch so it overlaps the down-LoRA shrink on the alt stream.
+            staged = False
+            if shared_output is not None and _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
+                    shared_add_overlap_enabled,
+                    stage_shared_expert_add,
+                    unstage_shared_expert_add,
+                )
+
+                if shared_add_overlap_enabled():
+                    stage_shared_expert_add(shared_output, current_stream)
+                    staged = True
+            # ===== END TO BE REFACTORED ====
+
+            with torch.cuda.stream(self.alt_stream):
+                if ordered_finalize_sink is not None:
+                    from sglang.kernels.ops.moe.q38_finalize_shared import capture_finalize
+
+                    with capture_finalize(ordered_finalize_sink):
+                        router_output = self._forward_router_experts(
+                            hidden_states, precomputed_router=precomputed_router
+                        )
+                elif self.tp_size == 1:
+                    router_output = self._forward_router_experts(
+                        hidden_states,
+                        precomputed_router=precomputed_router,
+                        pre_quant_input=pre_quant,
+                        fused_finalize=fused_finalize,
+                    )
+                else:
+                    router_output = self._forward_router_experts(
                         hidden_states, precomputed_router=precomputed_router
                     )
-            else:
-                final_hidden_states = self._forward_router_experts(
+
+            current_stream.wait_stream(self.alt_stream)
+
+            if fused_finalize and not isinstance(router_output, torch.Tensor):
+                for tensor in (
+                    router_output.gemm2_out,
+                    router_output.expert_weights,
+                    router_output.expanded_idx_to_permuted_idx,
+                ):
+                    tensor.record_stream(current_stream)
+                final_hidden_states = fused_moe_finalize_gate_sigmoid_mul_add(
                     hidden_states,
+                    self.shared_expert_gate.weight.squeeze(0),
+                    shared_output,
+                    router_output.gemm2_out,
+                    router_output.expanded_idx_to_permuted_idx,
+                    router_output.expert_weights,
+                )
+                return final_hidden_states, None
+
+            if staged and unstage_shared_expert_add() is None:
+                # The dispatch consumed the staging (add already enqueued); skip the caller's add.
+                shared_output = None
+
+            return router_output, shared_output
+
+    # Import-time selection keeps the disabled entry and launch body stock.
+    if _Q38C_EXTEND_PATH:
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            forward_batch: Optional[ForwardBatch] = None,
+            defer_finalize: bool = False,
+        ) -> torch.Tensor:
+            num_tokens, hidden_dim = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_dim)
+            if defer_finalize and num_tokens == 0:
+                raise RuntimeError("Qwen deferred finalize does not support M=0")
+
+            if self._use_mega_moe:
+                return self._forward_mega_moe(hidden_states, forward_batch)
+
+            if (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_deepep_v2()
+                or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+            ):
+                return self._forward_deepep(hidden_states, forward_batch)
+
+            use_fused_gate = (
+                self.shared_expert_gate is not None
+                and not use_intel_amx_backend(self.shared_expert_gate)
+                and not is_npu()
+            )
+
+            ordered_finalize_sink = None
+            if (os.environ.get("SGLANG_Q38C_FINALIZE_SHARED", "0") == "1"
+                and not defer_finalize and use_fused_gate
+                and self.shared_expert is not None
+                and hidden_dim == 2560 and 1 <= num_tokens <= 7
+                and hidden_states.is_cuda
+                and hidden_states.dtype == torch.bfloat16
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and not self.experts.reduce_results
+                and not getattr(self, "_q38_push_shared", False)
+                and not torch.compiler.is_compiling()
+                and not is_in_tc_piecewise_cuda_graph()):
+                ordered_finalize_sink = []
+
+            precomputed_router = None
+            if (
+                self._q38c_router_fused
+                and (num_tokens in (1, 4) or (self._q38c_router_wide and num_tokens in (8, 16)))
+                and not torch.compiler.is_compiling()
+                and not is_in_tc_piecewise_cuda_graph()
+            ):
+                from sglang.kernels.ops.moe.q38_router_fused import produce
+
+                # Static router weights may load during the previous main-stream
+                # kernel. Keep the real alt-stream event and all shared/gate joins.
+                precomputed_router = produce(self, hidden_states)
+
+            if hidden_states.shape[0] == 0:
+                # M=0 guard for idle DP ranks: skip shared_experts and gate
+                # (which crash on empty tensors in FP4 GEMM), but still call
+                # self.experts() to participate in alltoall collective.
+                shared_output = None
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
+                final_hidden_states = self.experts(hidden_states, topk_output)
+            elif (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and not torch.compiler.is_compiling()
+                # Paged experts run as an eager break, which must end the segment on the
+                # capture stream.
+                and not (
+                    get_exec().moe.enable_paged_experts and is_in_breakable_cuda_graph()
+                )
+            ):
+                final_hidden_states, shared_output = self.forward_normal_dual_stream(
+                    hidden_states,
+                    use_fused_gate=use_fused_gate,
                     defer_finalize=defer_finalize,
                     precomputed_router=precomputed_router,
-                )
-
-        if defer_finalize:
-            if shared_output is None:
-                raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
-                MoeDeferredFinalize,
-            )
-
-            return MoeDeferredFinalize.from_flashinfer(
-                final_hidden_states,
-                gated_shared_output=shared_output,
-                m=num_tokens,
-                reduce=sum_post_experts_output,
-            )
-
-        if (getattr(self, "_q38_push_shared", False)
-            and 1 < num_tokens <= 16 and shared_output is not None
-            and use_fused_gate and not self.reduce_results):
-            assert self._q38_shared_pending is None
-            self._q38_shared_pending = (hidden_states, shared_output)
-            return final_hidden_states.view(num_tokens, hidden_dim)
-
-        if shared_output is not None:
-            if ordered_finalize_sink:
-                from sglang.kernels.ops.moe.q38_finalize_shared import finalize_shared
-
-                assert len(ordered_finalize_sink) == 1
-                rows, weights, output = ordered_finalize_sink[0]
-                assert output.data_ptr() == final_hidden_states.data_ptr()
-                # These two buffers were allocated on the producer stream.
-                # Preserve their lifetime through the main-stream consumer.
-                rows.record_stream(torch.cuda.current_stream())
-                weights.record_stream(torch.cuda.current_stream())
-                finalize_shared(hidden_states, self.shared_expert_gate.weight.squeeze(),
-                                shared_output, rows, weights, final_hidden_states,
-                                cols=int(os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_COLS", "256")),
-                                use_pdl=os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_PDL", "1") == "1")
-                if num_tokens not in getattr(self, "_q38_finalize_shared_logged", set()):
-                    logging.getLogger(__name__).info(
-                        "Q38C_FINALIZE_SHARED_ACTIVE rows=%d cols=%s pdl=%s ordered=10 bf16_boundary=1 real_stream_join=1",
-                        num_tokens, os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_COLS", "256"),
-                        os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_PDL", "1"))
-                    if not hasattr(self, "_q38_finalize_shared_logged"):
-                        self._q38_finalize_shared_logged = set()
-                    self._q38_finalize_shared_logged.add(num_tokens)
-            elif use_fused_gate:
-                fused_gate_sigmoid_mul_add(
-                    hidden_states,
-                    self.shared_expert_gate.weight.squeeze(),
-                    shared_output,
-                    final_hidden_states,
+                    ordered_finalize_sink=ordered_finalize_sink,
                 )
             else:
-                final_hidden_states += shared_output
-        if self.reduce_results:
-            final_hidden_states = reduce_moe_output(final_hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, apply_gate=not use_fused_gate and not defer_finalize
+                )
+                if defer_finalize and shared_output is not None:
+                    shared_output = self._gate_shared_output_out_of_place(
+                        hidden_states, shared_output
+                    )
+                extend_fused = (
+                    ordered_finalize_sink is None
+                    and not defer_finalize
+                    and use_fused_gate
+                    and shared_output is not None
+                    and _extend_fused_finalize_gate(hidden_states.shape[0])
+                    and not get_exec().moe.enable_paged_experts
+                    and self._uses_nvfp4_trtllm_glue()
+                )
+                if ordered_finalize_sink is not None:
+                    from sglang.kernels.ops.moe.q38_finalize_shared import capture_finalize
 
-        # Debug removed - was causing issues during CUDA graph capture
+                    with capture_finalize(ordered_finalize_sink):
+                        final_hidden_states = self._forward_router_experts(
+                            hidden_states, precomputed_router=precomputed_router
+                        )
+                else:
+                    final_hidden_states = self._forward_router_experts(
+                        hidden_states,
+                        defer_finalize=defer_finalize,
+                        precomputed_router=precomputed_router,
+                        fused_finalize=extend_fused,
+                    )
+                if extend_fused and not isinstance(final_hidden_states, torch.Tensor):
+                    final_hidden_states = fused_moe_finalize_gate_sigmoid_mul_add(
+                        hidden_states,
+                        self.shared_expert_gate.weight.squeeze(0),
+                        shared_output,
+                        final_hidden_states.gemm2_out,
+                        final_hidden_states.expanded_idx_to_permuted_idx,
+                        final_hidden_states.expert_weights,
+                        max_registers=_EXTEND_FUSED_FINALIZE_GATE_MAXNREG,
+                    )
+                    shared_output = None
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+            if defer_finalize:
+                if shared_output is None:
+                    raise RuntimeError("Qwen deferred finalize requires shared output")
+                from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
+                    MoeDeferredFinalize,
+                )
+
+                return MoeDeferredFinalize.from_flashinfer(
+                    final_hidden_states,
+                    gated_shared_output=shared_output,
+                    m=num_tokens,
+                    reduce=sum_post_experts_output,
+                )
+
+            if (getattr(self, "_q38_push_shared", False)
+                and 1 < num_tokens <= 16 and shared_output is not None
+                and use_fused_gate and not self.reduce_results):
+                assert self._q38_shared_pending is None
+                self._q38_shared_pending = (hidden_states, shared_output)
+                return final_hidden_states.view(num_tokens, hidden_dim)
+
+            if shared_output is not None:
+                if ordered_finalize_sink:
+                    from sglang.kernels.ops.moe.q38_finalize_shared import finalize_shared
+
+                    assert len(ordered_finalize_sink) == 1
+                    rows, weights, output = ordered_finalize_sink[0]
+                    assert output.data_ptr() == final_hidden_states.data_ptr()
+                    # These two buffers were allocated on the producer stream.
+                    # Preserve their lifetime through the main-stream consumer.
+                    rows.record_stream(torch.cuda.current_stream())
+                    weights.record_stream(torch.cuda.current_stream())
+                    finalize_shared(hidden_states, self.shared_expert_gate.weight.squeeze(),
+                                    shared_output, rows, weights, final_hidden_states,
+                                    cols=int(os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_COLS", "256")),
+                                    use_pdl=os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_PDL", "1") == "1")
+                    if num_tokens not in getattr(self, "_q38_finalize_shared_logged", set()):
+                        logging.getLogger(__name__).info(
+                            "Q38C_FINALIZE_SHARED_ACTIVE rows=%d cols=%s pdl=%s ordered=10 bf16_boundary=1 real_stream_join=1",
+                            num_tokens, os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_COLS", "256"),
+                            os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_PDL", "1"))
+                        if not hasattr(self, "_q38_finalize_shared_logged"):
+                            self._q38_finalize_shared_logged = set()
+                        self._q38_finalize_shared_logged.add(num_tokens)
+                elif use_fused_gate:
+                    fused_gate_sigmoid_mul_add(
+                        hidden_states,
+                        self.shared_expert_gate.weight.squeeze(),
+                        shared_output,
+                        final_hidden_states,
+                    )
+                else:
+                    final_hidden_states += shared_output
+            if self.reduce_results:
+                final_hidden_states = reduce_moe_output(final_hidden_states)
+
+            # Debug removed - was causing issues during CUDA graph capture
+
+            return final_hidden_states.view(num_tokens, hidden_dim)
+    else:
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            forward_batch: Optional[ForwardBatch] = None,
+            defer_finalize: bool = False,
+        ) -> torch.Tensor:
+            num_tokens, hidden_dim = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_dim)
+            if defer_finalize and num_tokens == 0:
+                raise RuntimeError("Qwen deferred finalize does not support M=0")
+
+            if self._use_mega_moe:
+                return self._forward_mega_moe(hidden_states, forward_batch)
+
+            if (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_deepep_v2()
+                or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+            ):
+                return self._forward_deepep(hidden_states, forward_batch)
+
+            use_fused_gate = (
+                self.shared_expert_gate is not None
+                and not use_intel_amx_backend(self.shared_expert_gate)
+                and not is_npu()
+            )
+
+            ordered_finalize_sink = None
+            if (os.environ.get("SGLANG_Q38C_FINALIZE_SHARED", "0") == "1"
+                and not defer_finalize and use_fused_gate
+                and self.shared_expert is not None
+                and hidden_dim == 2560 and 1 <= num_tokens <= 7
+                and hidden_states.is_cuda
+                and hidden_states.dtype == torch.bfloat16
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and not self.experts.reduce_results
+                and not getattr(self, "_q38_push_shared", False)
+                and not torch.compiler.is_compiling()
+                and not is_in_tc_piecewise_cuda_graph()):
+                ordered_finalize_sink = []
+
+            precomputed_router = None
+            if (
+                self._q38c_router_fused
+                and (num_tokens in (1, 4) or (self._q38c_router_wide and num_tokens in (8, 16)))
+                and not torch.compiler.is_compiling()
+                and not is_in_tc_piecewise_cuda_graph()
+            ):
+                from sglang.kernels.ops.moe.q38_router_fused import produce
+
+                # Static router weights may load during the previous main-stream
+                # kernel. Keep the real alt-stream event and all shared/gate joins.
+                precomputed_router = produce(self, hidden_states)
+
+            if hidden_states.shape[0] == 0:
+                # M=0 guard for idle DP ranks: skip shared_experts and gate
+                # (which crash on empty tensors in FP4 GEMM), but still call
+                # self.experts() to participate in alltoall collective.
+                shared_output = None
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
+                final_hidden_states = self.experts(hidden_states, topk_output)
+            elif (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and not torch.compiler.is_compiling()
+                # Paged experts run as an eager break, which must end the segment on the
+                # capture stream.
+                and not (
+                    get_exec().moe.enable_paged_experts and is_in_breakable_cuda_graph()
+                )
+            ):
+                final_hidden_states, shared_output = self.forward_normal_dual_stream(
+                    hidden_states,
+                    use_fused_gate=use_fused_gate,
+                    defer_finalize=defer_finalize,
+                    precomputed_router=precomputed_router,
+                    ordered_finalize_sink=ordered_finalize_sink,
+                )
+            else:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, apply_gate=not use_fused_gate and not defer_finalize
+                )
+                if defer_finalize and shared_output is not None:
+                    shared_output = self._gate_shared_output_out_of_place(
+                        hidden_states, shared_output
+                    )
+                if ordered_finalize_sink is not None:
+                    from sglang.kernels.ops.moe.q38_finalize_shared import capture_finalize
+
+                    with capture_finalize(ordered_finalize_sink):
+                        final_hidden_states = self._forward_router_experts(
+                            hidden_states, precomputed_router=precomputed_router
+                        )
+                else:
+                    final_hidden_states = self._forward_router_experts(
+                        hidden_states,
+                        defer_finalize=defer_finalize,
+                        precomputed_router=precomputed_router,
+                    )
+
+            if defer_finalize:
+                if shared_output is None:
+                    raise RuntimeError("Qwen deferred finalize requires shared output")
+                from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
+                    MoeDeferredFinalize,
+                )
+
+                return MoeDeferredFinalize.from_flashinfer(
+                    final_hidden_states,
+                    gated_shared_output=shared_output,
+                    m=num_tokens,
+                    reduce=sum_post_experts_output,
+                )
+
+            if (getattr(self, "_q38_push_shared", False)
+                and 1 < num_tokens <= 16 and shared_output is not None
+                and use_fused_gate and not self.reduce_results):
+                assert self._q38_shared_pending is None
+                self._q38_shared_pending = (hidden_states, shared_output)
+                return final_hidden_states.view(num_tokens, hidden_dim)
+
+            if shared_output is not None:
+                if ordered_finalize_sink:
+                    from sglang.kernels.ops.moe.q38_finalize_shared import finalize_shared
+
+                    assert len(ordered_finalize_sink) == 1
+                    rows, weights, output = ordered_finalize_sink[0]
+                    assert output.data_ptr() == final_hidden_states.data_ptr()
+                    # These two buffers were allocated on the producer stream.
+                    # Preserve their lifetime through the main-stream consumer.
+                    rows.record_stream(torch.cuda.current_stream())
+                    weights.record_stream(torch.cuda.current_stream())
+                    finalize_shared(hidden_states, self.shared_expert_gate.weight.squeeze(),
+                                    shared_output, rows, weights, final_hidden_states,
+                                    cols=int(os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_COLS", "256")),
+                                    use_pdl=os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_PDL", "1") == "1")
+                    if num_tokens not in getattr(self, "_q38_finalize_shared_logged", set()):
+                        logging.getLogger(__name__).info(
+                            "Q38C_FINALIZE_SHARED_ACTIVE rows=%d cols=%s pdl=%s ordered=10 bf16_boundary=1 real_stream_join=1",
+                            num_tokens, os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_COLS", "256"),
+                            os.environ.get("SGLANG_Q38C_FINALIZE_SHARED_PDL", "1"))
+                        if not hasattr(self, "_q38_finalize_shared_logged"):
+                            self._q38_finalize_shared_logged = set()
+                        self._q38_finalize_shared_logged.add(num_tokens)
+                elif use_fused_gate:
+                    fused_gate_sigmoid_mul_add(
+                        hidden_states,
+                        self.shared_expert_gate.weight.squeeze(),
+                        shared_output,
+                        final_hidden_states,
+                    )
+                else:
+                    final_hidden_states += shared_output
+            if self.reduce_results:
+                final_hidden_states = reduce_moe_output(final_hidden_states)
+
+            # Debug removed - was causing issues during CUDA graph capture
+
+            return final_hidden_states.view(num_tokens, hidden_dim)
 
 
 class Qwen2MoeAttention(nn.Module):

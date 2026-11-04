@@ -185,6 +185,15 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
+    # Tactics settled by the Qwen MoE prefill hook or a tuning file must not be
+    # served to a boot without them, nor survive a changed tuning file.
+    if envs.SGLANG_ENABLE_QWEN_MOE_PREFILL_AUTOTUNE.get():
+        model_key_parts.append("qwen_moe_prefill_autotune")
+    pin_file = envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.get()
+    if pin_file:
+        from sglang.srt.layers.moe.flashinfer_tactic_pins import tuning_file_digest
+
+        model_key_parts.append("tactic_pins=" + tuning_file_digest(pin_file))
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)
@@ -375,6 +384,14 @@ def run_flashinfer_autotune_forward(
     """Run flashinfer autotune forward."""
     with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
         forward_fn()
+        if envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.get():
+            from sglang.srt.layers.moe.flashinfer_tactic_pins import (
+                pin_decode_moe_tactics,
+            )
+
+            # Inside the context, so the saved autotune cache holds the pinned
+            # tactics; before any CUDA graph captures them.
+            pin_decode_moe_tactics()
 
 
 def maybe_flashinfer_autotune_speculative_draft(

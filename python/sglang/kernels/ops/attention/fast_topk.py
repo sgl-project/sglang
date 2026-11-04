@@ -49,7 +49,7 @@ def fast_topk(
     Row b selects the `topk` largest values in
     ``score[b, row_starts[b] : row_starts[b] + lengths[b]]`` and returns their
     indices relative to ``row_starts[b]``. Slots beyond ``lengths[b]`` are -1.
-    Output order within a row is unspecified (atomic collection order).
+    Cutoff ties prefer smaller relative IDs; output follows a fixed traversal.
 
     Parameters
     ----------

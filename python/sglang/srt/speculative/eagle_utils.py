@@ -10,6 +10,7 @@ import torch
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.speculative import multi_cta_verify_sampling
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -939,9 +940,20 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
-        )  # (bs * num_draft_tokens, vocab_size)
+        if not use_rejection_sampling and multi_cta_verify_sampling.applies(
+            next_token_logits
+        ):
+            # Bitwise to sampling_softmax (the same division) and the stock tree sampler.
+            target_probs = multi_cta_verify_sampling.softmax(
+                next_token_logits / expanded_temperature
+            )
+            sampling_fn = (
+                multi_cta_verify_sampling.tree_speculative_sampling_target_only
+            )
+        else:
+            target_probs = sampling_softmax(
+                next_token_logits, temperatures=expanded_temperature
+            )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(

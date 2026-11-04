@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.late_cuda_context import maybe_open_late_cuda_context
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -148,6 +149,46 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+# State types the deferred no-sync publish can carry with
+# --disaggregation-nosync-qsa-publish.
+_NOSYNC_QSA_STATES = frozenset(
+    (StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+)
+
+
+def _defers_qsa_publish(state_types, *, enabled: bool) -> bool:
+    """A state set with a QSA type, inside _NOSYNC_QSA_STATES, with the option on."""
+    if not enabled:
+        return False
+    types = set(state_types)
+    return types <= _NOSYNC_QSA_STATES and not types <= {StateType.MAMBA}
+
+
+def _log_nosync_qsa_publish() -> None:
+    """One line at init: engaged, or inert without the deferred publish itself."""
+    if l16_loopstat.prealloc_no_sync():
+        logger.info("QSA state payloads join the deferred no-sync publish")
+    else:
+        logger.warning(
+            "--disaggregation-nosync-qsa-publish has no effect: it needs "
+            "SGLANG_TRTL16_PREALLOC_NO_SYNC=1"
+        )
+
+
+def _deferred_state_indices(state_layout, host) -> list:
+    """send_metadata's state payloads in state_types order, from the landed host
+    copies; each has the type and values of pop_preallocated's synchronous payload."""
+    state_indices = []
+    for state_type, src in state_layout:
+        if state_type == StateType.MAMBA:
+            state_indices.append([host[src].numpy()])  # as _mamba_payload
+        elif state_type == StateType.QSA_COMPRESSED:
+            state_indices.append(host[src].numpy())  # as _full_kv_pages_payload
+        else:
+            state_indices.append(src)  # QSA_PENDING, built on the host
+    return state_indices
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -433,8 +474,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.gloo_group = parallel.attn_tp_group.cpu_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
-        # (decode_req, host index tensors, has_state, metadata kwargs, copy-done event)
+        # (decode_req, host index tensors, has_state, metadata kwargs, copy-done event,
+        # QSA state layout or None)
         self._deferred_sends: deque = deque()
+        self._nosync_qsa_publish = get_disagg().disaggregation_nosync_qsa_publish
+        if self._nosync_qsa_publish:
+            _log_nosync_qsa_publish()
         self.tp_rank = parallel.tp_rank
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
@@ -1830,9 +1875,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
             t_sd = l16_loopstat._now() if ls is not None else 0
+            defer_qsa = _defers_qsa_publish(
+                state_types, enabled=self._nosync_qsa_publish
+            )
             if (
                 l16_loopstat.prealloc_no_sync()
-                and set(state_types) <= {StateType.MAMBA}
+                and (set(state_types) <= {StateType.MAMBA} or defer_qsa)
                 and not self.scheduler.enable_hisparse
                 and not _is_fake_transfer(decode_req.req)
             ):
@@ -1842,6 +1890,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_transfer_page_size,
                     has_state=bool(state_types),
                     metadata_kwargs={"decode_prefix_len": total_prefix_len},
+                    state_sources=(
+                        self._qsa_state_sources(
+                            decode_req, state_types=state_types, seq_len=seq_len
+                        )
+                        if defer_qsa
+                        else None
+                    ),
                 )
                 if ls is not None:
                     ls.add("pp_send", t_sd)
@@ -1914,8 +1969,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return preallocated_reqs, failed_reqs
 
+    def _qsa_state_sources(self, decode_req, *, state_types, seq_len) -> list:
+        """pop_preallocated's state payloads before their host reads, as
+        (state type, device tensor or host array) in state_types order."""
+        req_pool_idx = decode_req.req.kv.req_pool_idx
+        sources = []
+        for state_type in state_types:
+            if state_type == StateType.MAMBA:
+                # _mamba_payload without its .cpu()
+                state_ids = self.token_to_kv_pool_allocator.state_ids(
+                    self.req_to_token_pool.state_sub_pool
+                )
+                src = state_ids.ids(
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        req_pool_idx
+                    ]
+                )
+            elif state_type == StateType.QSA_COMPRESSED:
+                # _full_kv_pages_payload (kv_to_page_indices) without its .cpu()
+                device_page_size = self.token_to_kv_pool.page_size
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req_pool_idx, :seq_len
+                ]
+                src = kv_indices_full[::device_page_size] // device_page_size
+            else:
+                assert state_type == StateType.QSA_PENDING, state_type
+                src = get_qsa_pending_state_indices(decode_req.req)
+            sources.append((state_type, src))
+        return sources
+
     def _defer_kv_metadata(
-        self, decode_req, kv_indices, page_size, *, has_state: bool, metadata_kwargs
+        self,
+        decode_req,
+        kv_indices,
+        page_size,
+        *,
+        has_state: bool,
+        metadata_kwargs,
+        state_sources=None,
     ) -> None:
         """Start non-blocking host copies of the transfer indices; send later.
 
@@ -1928,7 +2019,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         assert decode_req.metadata_buffer_index is not None
         gpu = [kv_indices[::page_size] // page_size]
-        if has_state:
+        state_layout = None
+        if state_sources is not None:
+            # Device payloads join the copies below; a host payload rides as it is.
+            state_layout = []
+            for state_type, src in state_sources:
+                if isinstance(src, torch.Tensor):
+                    state_layout.append((state_type, len(gpu)))
+                    gpu.append(src)
+                else:
+                    state_layout.append((state_type, src))
+        elif has_state:
             gpu.append(
                 self.req_to_token_pool.translate_mamba_indices(
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
@@ -1952,7 +2053,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.bootstrap_room, decode_req
             )
         self._deferred_sends.append(
-            (decode_req, host, has_state, metadata_kwargs, done)
+            (decode_req, host, has_state, metadata_kwargs, done, state_layout)
         )
         self._num_published_destinations += 1
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -1960,17 +2061,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def flush_deferred_sends(self) -> None:
         """Send the metadata whose host index copies have landed (FIFO, one stream)."""
         while self._deferred_sends and self._deferred_sends[0][4].query():
-            decode_req, host, has_state, metadata_kwargs, _ = (
+            decode_req, host, has_state, metadata_kwargs, _, state_layout = (
                 self._deferred_sends.popleft()
             )
             if decode_req.kv_receiver is None or isinstance(
                 decode_req.req.finished_reason, FINISH_ABORT
             ):
                 continue
+            if state_layout is None:
+                state_indices = [[host[1].numpy()]] if has_state else []
+            else:
+                state_indices = _deferred_state_indices(state_layout, host)
             decode_req.kv_receiver.send_metadata(
                 host[0].numpy().astype(np.int32),
                 decode_req.metadata_buffer_index,
-                [[host[1].numpy()]] if has_state else [],
+                state_indices,
                 **metadata_kwargs,
             )
             if (
@@ -3339,6 +3444,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                maybe_open_late_cuda_context()
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -3417,6 +3523,7 @@ class SchedulerDisaggregationDecodeMixin:
                 if ls is not None:
                     ls.gpu_b(self.forward_stream)
                 self.result_queue.append((batch.copy(), batch_result))
+                maybe_open_late_cuda_context()
             else:
                 batch_result = None
                 self._sched_idled = True

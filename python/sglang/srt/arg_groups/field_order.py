@@ -557,5 +557,11 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_layer_partition",
     "engram_config",
     "moe_ascend_ops_config",
+    "disaggregation_decode_late_cuda_context",
+    "disaggregation_nosync_qsa_publish",
+    "enable_decode_warmup",
+    "decode_warmup_batch_sizes",
+    "decode_warmup_prompt_len",
+    "freeze_gc_after_startup",
 )
 # fmt: on

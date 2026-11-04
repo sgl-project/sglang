@@ -6,7 +6,6 @@ register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
 import unittest
 
 import torch
-
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -39,6 +38,36 @@ class TestSpecTopk1Triton(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.device = torch.device("cuda")
+
+    def test_draft_topk1_left_ties_within_and_across_splits(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                logits = torch.zeros((4, 33000), dtype=dtype, device=self.device)
+                for row, ids in enumerate(([17, 19, 8193], [8197, 16387], [3, 32767])):
+                    logits[row, ids] = 4
+                expected = torch.tensor([[17], [8197], [3], [0]], device=self.device)
+                positions = torch.zeros(4, dtype=torch.long, device=self.device)
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        draft_topk1_postprocess(logits, positions)
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    _, output = draft_topk1_postprocess(logits, positions)
+                with torch.cuda.stream(stream):
+                    copies = []
+                    for _ in range(32):
+                        graph.replay()
+                        copies.append(output.clone())
+                stream.synchronize()
+                self.assertTrue(
+                    torch.equal(torch.stack(copies), expected.expand(32, -1, -1))
+                )
+                for _ in range(32):
+                    _, actual = draft_topk1_postprocess(logits, positions)
+                    self.assertTrue(torch.equal(actual, expected))
 
     def test_draft_topk1_postprocess_matches_argmax_and_position_add(self):
         configs = [

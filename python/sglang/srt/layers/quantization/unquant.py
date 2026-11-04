@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -136,6 +137,10 @@ _run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
+# Opt-in router-only dispatch; all other linear shapes retain the v1 paths.
+_nitin_router_on = False
+# SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES: sm107_bf16_smallm serves its keys, bitwise to this dispatch.
+_sm107_smallm_on = False
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -280,6 +285,19 @@ def precompile_splitk_tactics() -> bool:
     so CUDA graph capture never hits a cold kernel."""
     if not _enable_bf16_splitk_gemm:
         return False
+    if _nitin_router_on:
+        from sglang.srt.layers.quantization import nitin_router
+
+        nitin_router.precompile()
+    global _sm107_smallm_on
+    if _sm107_smallm_on:
+        from sglang.srt.layers.quantization import sm107_bf16_smallm
+
+        # Checked against this dispatch with the routes off; a mismatch keeps them off.
+        _sm107_smallm_on = False
+        _sm107_smallm_on = sm107_bf16_smallm.precompile(
+            stock_gemm=lambda x, w: _bf16_gemm_dispatch_impl(x, w, None)
+        )
     device = torch.cuda.current_device()
     for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
@@ -372,6 +390,28 @@ def initialize_bf16_gemm_config() -> None:
         _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
 
+    global _nitin_router_on
+    _nitin_router_on = False
+    if os.environ.get("SGLANG_Q38C_NITIN_ROUTER", "0") == "1":
+        from sglang.srt.layers.quantization import nitin_router
+
+        _nitin_router_on = nitin_router.install(
+            get_platform().device_sm,
+            _enable_bf16_splitk_gemm,
+            _cutedsl_bf16_gemm is not None,
+        )
+
+    global _sm107_smallm_on
+    _sm107_smallm_on = False
+    if envs.SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES.get():
+        from sglang.srt.layers.quantization import sm107_bf16_smallm
+
+        _sm107_smallm_on = sm107_bf16_smallm.install(
+            device_sm=get_platform().device_sm,
+            splitk_enabled=_enable_bf16_splitk_gemm,
+            cutedsl_available=_cutedsl_bf16_gemm is not None,
+        )
+
     _BF16_GEMM_BACKEND = backend
 
 
@@ -425,6 +465,18 @@ def _bf16_gemm_dispatch_impl(
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
+    if _nitin_router_on and bias is None and addend is None:
+        from sglang.srt.layers.quantization import nitin_router
+
+        output = nitin_router.gemm(x, weight)
+        if output is not None:
+            return output
+    if _sm107_smallm_on and bias is None and addend is None:
+        from sglang.srt.layers.quantization import sm107_bf16_smallm
+
+        output = sm107_bf16_smallm.gemm(x, weight)
+        if output is not None:
+            return output
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
     ):

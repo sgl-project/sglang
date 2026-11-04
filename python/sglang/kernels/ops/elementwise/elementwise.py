@@ -1,3 +1,5 @@
+from sglang.kernels.ops.extend_fastpath import MOE_ENABLED as _Q38C_EXTEND_PATH
+
 import torch
 import triton
 import triton.language as tl
@@ -6,10 +8,23 @@ from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip
+from sglang.srt.environ import envs
 
 from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
 
 _is_hip = is_hip()
+
+_FINALIZE_GATE_COLUMN_CHUNKS = (128, 256, 512, 1024)
+_FINALIZE_GATE_COLUMN_CHUNK = envs.SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK.get()
+if _FINALIZE_GATE_COLUMN_CHUNK not in (0,) + _FINALIZE_GATE_COLUMN_CHUNKS:
+    raise ValueError(
+        "SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK must be 0 or one of "
+        f"{_FINALIZE_GATE_COLUMN_CHUNKS}, got {_FINALIZE_GATE_COLUMN_CHUNK}"
+    )
+# The column-chunk grid covers the small-grid range only.
+_FINALIZE_GATE_COLUMN_CHUNK_MAX_TOKENS = 64
+
+
 
 
 @triton.jit
@@ -364,63 +379,255 @@ def _fused_finalize_gate_sigmoid_mul_add_kernel(
     tl.store(output_ptr + row_offset + offsets, result, mask=mask)
 
 
-def fused_moe_finalize_gate_sigmoid_mul_add(
-    hidden_states: torch.Tensor,
-    gate_weight: torch.Tensor,
-    shared_output: torch.Tensor,
-    gemm2_out: torch.Tensor,
-    expanded_idx_to_permuted_idx: torch.Tensor,
-    expert_weights: torch.Tensor,
-) -> torch.Tensor:
-    """TRT-LLM MoE finalize plus the gated shared-expert add in one launch.
+@triton.jit
+def _fused_finalize_gate_sigmoid_mul_add_chunked_kernel(
+    hidden_states_ptr,  # [num_tokens, hidden_dim]
+    gate_weight_ptr,  # [hidden_dim]
+    shared_output_ptr,  # [num_tokens, hidden_dim]
+    output_ptr,  # [num_tokens, hidden_dim]
+    gemm2_out_ptr,  # [num_permuted_rows, gemm2_stride] BF16
+    permuted_idx_ptr,  # [num_tokens * TOP_K] int32, -1 = not local
+    expert_weights_ptr,  # [num_tokens, TOP_K]
+    gemm2_stride,
+    hidden_dim: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    CHUNK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    # _fused_finalize_gate_sigmoid_mul_add_kernel on a (token, column chunk) grid.
+    # Each program recomputes the row's gate with the full-row load and tl.sum at the
+    # same BLOCK_SIZE and num_warps (one reduction tree), then writes its CHUNK
+    # columns with the same per-element FMA chain, rounding and mul-add.
+    pid = tl.program_id(axis=0).to(tl.int64)
+    cid = tl.program_id(axis=1)
+    row_offset = pid * hidden_dim
 
-    Bit-identical to the TRT-LLM finalizeKernel (the small-grid variant, used
-    while 10 * num_tokens < 1184) followed by fused_gate_sigmoid_mul_add.
-    """
-    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
-    assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
-    assert shared_output.is_contiguous(), "shared_output must be contiguous"
-    assert gemm2_out.dtype == torch.bfloat16 and gemm2_out.stride(1) == 1
-    assert expanded_idx_to_permuted_idx.dtype == torch.int32
-    assert expanded_idx_to_permuted_idx.is_contiguous()
-    assert expert_weights.is_contiguous()
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+    cols = cid * CHUNK + tl.arange(0, CHUNK)
+    cmask = cols < hidden_dim
 
-    num_tokens, hidden_dim = hidden_states.shape
-    top_k = expert_weights.shape[1]
-    assert gate_weight.shape == (hidden_dim,)
-    assert shared_output.shape == (num_tokens, hidden_dim)
-    assert expert_weights.shape[0] == num_tokens
-    assert expanded_idx_to_permuted_idx.numel() == num_tokens * top_k
-    assert gemm2_out.shape[1] >= hidden_dim
+    w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
-    output = torch.empty_like(shared_output)
-    # Same launch configuration as _launch_fused_gate_sigmoid_mul.
-    max_warps = 16 if _is_hip else 32
-    config = {
-        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
-        "num_warps": max(
-            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
-        ),
-    }
-    if guard_or_false(num_tokens >= 1024) or is_batch_invariant_mode_enabled():
-        config["num_warps"] = min(config["num_warps"], 8)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Early trigger: a PDL successor must not write global memory before its
+        # griddepcontrol.wait, which also orders its reads after this grid ends.
+        tl.extra.cuda.gdc_launch_dependents()
 
-    use_pdl = is_arch_support_pdl()
-    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
-
-    _fused_finalize_gate_sigmoid_mul_add_kernel[(num_tokens,)](
-        hidden_states,
-        gate_weight,
-        shared_output,
-        output,
-        gemm2_out,
-        expanded_idx_to_permuted_idx,
-        expert_weights,
-        gemm2_out.stride(0),
-        hidden_dim=hidden_dim,
-        TOP_K=top_k,
-        USE_PDL=use_pdl,
-        **config,
-        **pdl_kwargs,
+    h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
     )
-    return output
+    s = tl.load(shared_output_ptr + row_offset + cols, mask=cmask, other=0.0).to(
+        tl.float32
+    )
+    acc = tl.zeros([CHUNK], dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        p = tl.load(permuted_idx_ptr + pid * TOP_K + k)
+        scale = tl.load(expert_weights_ptr + pid * TOP_K + k).to(tl.float32)
+        valid = p >= 0
+        x = tl.load(
+            gemm2_out_ptr + p.to(tl.int64) * gemm2_stride + cols,
+            mask=cmask & valid,
+            other=0.0,
+        ).to(tl.float32)
+        fma = tl.inline_asm_elementwise(
+            "fma.rn.ftz.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            [scale + tl.zeros_like(x), x, acc],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        acc = tl.where(valid, fma, acc)
+
+    f = acc.to(tl.bfloat16).to(tl.float32)
+    gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
+    result = gate_val * s
+    result += f
+    tl.store(output_ptr + row_offset + cols, result, mask=cmask)
+
+
+# Import-time selection keeps the disabled entry and launch body stock.
+if _Q38C_EXTEND_PATH:
+    def fused_moe_finalize_gate_sigmoid_mul_add(
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        shared_output: torch.Tensor,
+        gemm2_out: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        expert_weights: torch.Tensor,
+        max_registers: int = 0,
+    ) -> torch.Tensor:
+        """TRT-LLM MoE finalize plus the gated shared-expert add in one launch.
+
+        Bit-identical to the TRT-LLM finalizeKernel (the small-grid variant, used
+        while 10 * num_tokens < 1184) followed by fused_gate_sigmoid_mul_add.
+        The same holds against finalizeKernelVecLoad at prefill sizes: both
+        finalize kernels run the same slot-order FP32 FMA chain.
+
+        ``max_registers`` > 0 caps registers per thread (CUDA ``maxnreg``). It
+        changes only register allocation, not the arithmetic: at prefill sizes 64
+        lifts occupancy from 3 to 4 CTAs/SM and the gather-bound kernel runs
+        faster at 8.7K-16K rows.
+        """
+        assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+        assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
+        assert shared_output.is_contiguous(), "shared_output must be contiguous"
+        assert gemm2_out.dtype == torch.bfloat16 and gemm2_out.stride(1) == 1
+        assert expanded_idx_to_permuted_idx.dtype == torch.int32
+        assert expanded_idx_to_permuted_idx.is_contiguous()
+        assert expert_weights.is_contiguous()
+
+        num_tokens, hidden_dim = hidden_states.shape
+        top_k = expert_weights.shape[1]
+        assert gate_weight.shape == (hidden_dim,)
+        assert shared_output.shape == (num_tokens, hidden_dim)
+        assert expert_weights.shape[0] == num_tokens
+        assert expanded_idx_to_permuted_idx.numel() == num_tokens * top_k
+        assert gemm2_out.shape[1] >= hidden_dim
+
+        output = torch.empty_like(shared_output)
+        # Same launch configuration as _launch_fused_gate_sigmoid_mul.
+        max_warps = 16 if _is_hip else 32
+        config = {
+            "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+            "num_warps": max(
+                min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+            ),
+        }
+        if guard_or_false(num_tokens >= 1024) or is_batch_invariant_mode_enabled():
+            config["num_warps"] = min(config["num_warps"], 8)
+
+        use_pdl = is_arch_support_pdl()
+        pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+
+        if (
+            _FINALIZE_GATE_COLUMN_CHUNK
+            and num_tokens <= _FINALIZE_GATE_COLUMN_CHUNK_MAX_TOKENS
+        ):
+            chunk = _FINALIZE_GATE_COLUMN_CHUNK
+            _fused_finalize_gate_sigmoid_mul_add_chunked_kernel[
+                (num_tokens, triton.cdiv(hidden_dim, chunk))
+            ](
+                hidden_states,
+                gate_weight,
+                shared_output,
+                output,
+                gemm2_out,
+                expanded_idx_to_permuted_idx,
+                expert_weights,
+                gemm2_out.stride(0),
+                hidden_dim=hidden_dim,
+                TOP_K=top_k,
+                CHUNK=chunk,
+                USE_PDL=use_pdl,
+                **config,
+                **pdl_kwargs,
+            )
+            return output
+
+        _fused_finalize_gate_sigmoid_mul_add_kernel[(num_tokens,)](
+            hidden_states,
+            gate_weight,
+            shared_output,
+            output,
+            gemm2_out,
+            expanded_idx_to_permuted_idx,
+            expert_weights,
+            gemm2_out.stride(0),
+            hidden_dim=hidden_dim,
+            TOP_K=top_k,
+            USE_PDL=use_pdl,
+            **config,
+            **pdl_kwargs,
+            **({"maxnreg": int(max_registers)} if max_registers > 0 and not _is_hip else {}),
+        )
+        return output
+else:
+    def fused_moe_finalize_gate_sigmoid_mul_add(
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        shared_output: torch.Tensor,
+        gemm2_out: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        expert_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """TRT-LLM MoE finalize plus the gated shared-expert add in one launch.
+
+        Bit-identical to the TRT-LLM finalizeKernel (the small-grid variant, used
+        while 10 * num_tokens < 1184) followed by fused_gate_sigmoid_mul_add.
+        """
+        assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+        assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
+        assert shared_output.is_contiguous(), "shared_output must be contiguous"
+        assert gemm2_out.dtype == torch.bfloat16 and gemm2_out.stride(1) == 1
+        assert expanded_idx_to_permuted_idx.dtype == torch.int32
+        assert expanded_idx_to_permuted_idx.is_contiguous()
+        assert expert_weights.is_contiguous()
+
+        num_tokens, hidden_dim = hidden_states.shape
+        top_k = expert_weights.shape[1]
+        assert gate_weight.shape == (hidden_dim,)
+        assert shared_output.shape == (num_tokens, hidden_dim)
+        assert expert_weights.shape[0] == num_tokens
+        assert expanded_idx_to_permuted_idx.numel() == num_tokens * top_k
+        assert gemm2_out.shape[1] >= hidden_dim
+
+        output = torch.empty_like(shared_output)
+        # Same launch configuration as _launch_fused_gate_sigmoid_mul.
+        max_warps = 16 if _is_hip else 32
+        config = {
+            "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+            "num_warps": max(
+                min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+            ),
+        }
+        if guard_or_false(num_tokens >= 1024) or is_batch_invariant_mode_enabled():
+            config["num_warps"] = min(config["num_warps"], 8)
+
+        use_pdl = is_arch_support_pdl()
+        pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+
+        if (
+            _FINALIZE_GATE_COLUMN_CHUNK
+            and num_tokens <= _FINALIZE_GATE_COLUMN_CHUNK_MAX_TOKENS
+        ):
+            chunk = _FINALIZE_GATE_COLUMN_CHUNK
+            _fused_finalize_gate_sigmoid_mul_add_chunked_kernel[
+                (num_tokens, triton.cdiv(hidden_dim, chunk))
+            ](
+                hidden_states,
+                gate_weight,
+                shared_output,
+                output,
+                gemm2_out,
+                expanded_idx_to_permuted_idx,
+                expert_weights,
+                gemm2_out.stride(0),
+                hidden_dim=hidden_dim,
+                TOP_K=top_k,
+                CHUNK=chunk,
+                USE_PDL=use_pdl,
+                **config,
+                **pdl_kwargs,
+            )
+            return output
+
+        _fused_finalize_gate_sigmoid_mul_add_kernel[(num_tokens,)](
+            hidden_states,
+            gate_weight,
+            shared_output,
+            output,
+            gemm2_out,
+            expanded_idx_to_permuted_idx,
+            expert_weights,
+            gemm2_out.stride(0),
+            hidden_dim=hidden_dim,
+            TOP_K=top_k,
+            USE_PDL=use_pdl,
+            **config,
+            **pdl_kwargs,
+        )
+        return output

@@ -1002,7 +1002,11 @@ class RuntimeContext:
                 if self._server_args
                 else "cuda"
             )
-            stream = torch.get_device_module(device).Stream()
+            priority = forward_helper_stream_priority() if device == "cuda" else None
+            if priority is None:
+                stream = torch.get_device_module(device).Stream()
+            else:
+                stream = torch.get_device_module(device).Stream(priority=priority)
             self.resources.streams[name] = stream
         return stream
 
@@ -1182,6 +1186,22 @@ class RuntimeContext:
         Prefer a bag's scoped ``override`` when only existing leaves need changing.
         """
         return _ServerArgsOverride(self, fields)
+
+
+def forward_helper_stream_priority() -> Optional[int]:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_FORWARD_HELPER_STREAM_PRIORITY.get()
+
+
+def new_forward_helper_stream(device=None) -> Any:
+    """A forward-path helper stream, at SGLANG_FORWARD_HELPER_STREAM_PRIORITY when set."""
+    import torch
+
+    priority = forward_helper_stream_priority()
+    if priority is None:
+        return torch.cuda.Stream(device=device)
+    return torch.cuda.Stream(device=device, priority=priority)
 
 
 class _ServerArgsOverride:

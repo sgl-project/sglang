@@ -71,7 +71,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative import eagle_megakernel
+from sglang.srt.speculative import eagle_megakernel, post_verify_late_join
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -1521,6 +1521,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # Initialized with the post-verify graphs; class defaults let unit-test
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
+    # The side-stream commit joins before the next verify or prefill (SGLANG_PLB_COMMIT_LATE_JOIN, or the guarded
+    # SGLANG_ENABLE_POST_VERIFY_LATE_JOIN once activated).
+    _late_join = _PLB_LATE_JOIN
     _simulated_acc_len_rng: Optional[torch.Generator] = None
     # SGLANG_PERFLL_STEP2: counts the decode passes whose draft inputs could be staged
     _step2: Optional[Step2Counter] = None
@@ -1627,6 +1630,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
         ):
             self._init_post_verify_graphs()
+        if post_verify_late_join.LATE_JOIN and self._post_verify_graphs is None:
+            post_verify_late_join.refused("no post-verify graphs to join")
 
     def _init_step2(self) -> None:
         """SGLANG_PERFLL_STEP2: 1 counts the decode passes whose draft inputs could be
@@ -1761,6 +1766,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_worker=self.target_worker,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
         )
+        if post_verify_late_join.LATE_JOIN:
+            refusal = post_verify_late_join.late_join_refusal()
+            if refusal is None:
+                self._late_join = True
+                post_verify_late_join.activate(self._post_verify_graphs._graphs)
+                self._post_verify_graphs.enable_pool_presize()
+            else:
+                post_verify_late_join.refused(refusal)
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
@@ -1802,7 +1815,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if self._step2 is not None:
                 self._step2.forget()
-            if _PLB_LATE_JOIN and self._post_verify_graphs is not None:
+            if self._late_join and self._post_verify_graphs is not None:
                 # a prefill may write a mamba slot the pending commit still folds into
                 self._post_verify_graphs.join()
             if not (
@@ -1923,7 +1936,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                             ),
                             new_seq_lens=batch_output.new_seq_lens,
                         )
-            if self._post_verify_graphs is not None and not _PLB_LATE_JOIN:
+            if self._post_verify_graphs is not None and not self._late_join:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()
 
@@ -2096,7 +2109,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_stage_span("draft_extend"),
         ):
             self.draft_worker._draft_extend_for_decode(batch, result)
-        if self._post_verify_graphs is not None and not _PLB_LATE_JOIN:
+        if self._post_verify_graphs is not None and not self._late_join:
             self._post_verify_graphs.join()
         return result
 
@@ -2405,7 +2418,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)
-        if _PLB_LATE_JOIN and self._post_verify_graphs is not None:
+        if self._late_join and self._post_verify_graphs is not None:
             # the verify reads the GDN checkpoint / ring / cursors the pending commit writes
             self._post_verify_graphs.join()
         return run_eagle_verify(

@@ -6,6 +6,8 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 
+from sglang.kernels.ops.extend_fastpath import GDN_NORM_ENABLED as _Q38C_EXTEND_PATH
+
 import os
 from contextlib import nullcontext
 from functools import lru_cache
@@ -37,6 +39,16 @@ _use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+
+# gdn_front: large-M (extend) launch of the gated RMSNorm for 128-wide groups.
+# The stock launch is 1 warp x 4 rows per program (>130k programs at 11K
+# tokens); more rows/warps per program keep each row on the same 16-lane x 8
+# element reduction layout, so results are bit-identical. Decode / verify
+# (M < NORM_BIG_ROWS) keep the stock launch. Kill switch:
+# SGLANG_X_GDN_FRONT_DISABLE=1 or SGLANG_X_GDN_FRONT_NORM_DISABLE=1.
+_GDN_FRONT_NORM = _Q38C_EXTEND_PATH
+NORM_BIG_ROWS = 32768
+NORM_BIG_CFG = (32, 4)  # (ROWS_PER_BLOCK, num_warps)
 
 
 def rms_norm_ref(
@@ -235,130 +247,269 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     return rows_per_block
 
 
-def _layer_norm_fwd(
-    x,
-    weight,
-    bias,
-    eps,
-    z=None,
-    out=None,
-    group_size=None,
-    norm_before_gate=True,
-    is_rms_norm=False,
-    activation: str = "swish",
-    quant_heads: int = 0,
-):
-    M, N = x.shape
-    if group_size is None:
-        group_size = N
-    assert N % group_size == 0
-    ngroups = N // group_size
-    assert x.stride(-1) == 1
-    z_is_3d = z is not None and z.ndim == 3
-    if z is not None:
-        assert z.stride(-1) == 1
-        if z_is_3d:
-            assert z.shape[0] * z.shape[1] == M
-            assert z.shape[2] == N
-        else:
-            assert z.shape == (M, N)
-    assert weight.shape == (N,)
-    assert weight.stride(-1) == 1
-    if bias is not None:
-        assert bias.stride(-1) == 1
-        assert bias.shape == (N,)
-    # allocate output
-    if out is not None:
-        assert out.shape == x.shape
-    else:
-        out = torch.empty_like(x)
-    assert out.stride(-1) == 1
-    mean = (
-        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
-        else None
-    )
-    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
-    if group_size > BLOCK_N:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK_N // 256, 1), 8)
-    # Calculate rows per block based on SM count
-    rows_per_block = calc_rows_per_block(M, x.device)
-    quant = {}
-    # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
-    if quant_heads:
-        assert ngroups == 1 and M % quant_heads == 0
-        # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
-        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
-        rows_per_block = quant_heads
-        q = torch.empty(
-            (M // quant_heads, quant_heads * N),
-            dtype=torch.float8_e4m3fn,
-            device=x.device,
-        )
-        s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
-        quant = {"Q": q, "S": s, "QUANT": True}
-    # Update grid to use rows_per_block
-    grid = (cdiv(M, rows_per_block), ngroups)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-    # Mature Q35 front_norm ordering: native consumer may prefetch weights,
-    # while its activation DMA still waits for the norm producer to finish.
-    if (
-        pdl_kwargs and os.environ.get("Q38_GDN_NORM_EARLY") == "1"
-        and x.dtype == torch.bfloat16 and is_rms_norm and norm_before_gate
-        and activation == "sigmoid" and M == 192 and N == 128
-        and z_is_3d and z.shape[1] == 48
+# Import-time selection keeps the disabled entry and launch body stock.
+if _Q38C_EXTEND_PATH:
+    def _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=None,
+        out=None,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation: str = "swish",
+        quant_heads: int = 0,
+        launch_cfg=None,
     ):
-        pdl_kwargs["EARLY_DEPENDENTS"] = True
-    # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
-    # in that release — it creates a DynamoConfigPatchProxy that
-    # SourcelessBuilder cannot wrap, causing a hard error under
-    # torch.compile(fullgraph=True).  The device context is a functional no-op
-    # for Triton kernel launches (device is determined by the tensor, not the
-    # surrounding context), so we simply skip it when Dynamo is tracing.
-    # PyTorch main already has the proper fix (XPUDeviceVariable registered in
-    # torch/_dynamo/variables/ctx_manager.py analogous to CUDADeviceVariable).
-    # TODO: remove this branch once we upgrade from PyTorch 2.12.
-    device_ctx = (
-        nullcontext()
-        if x.device.type == "xpu" and torch.compiler.is_compiling()
-        else device_context(x.device)
-    )
-    with device_ctx:
-        _layer_norm_fwd_1pass_kernel[grid](
-            x,
-            out,
-            weight,
-            bias,
-            z,
-            mean,
-            rstd,
-            x.stride(0),
-            out.stride(0),
-            z.stride(0) if z is not None and not z_is_3d else 0,
-            z.stride(0) if z_is_3d else 0,
-            z.stride(1) if z_is_3d else 0,
-            M,
-            group_size,
-            eps,
-            BLOCK_N=BLOCK_N,
-            ROWS_PER_BLOCK=rows_per_block,
-            HAS_BIAS=bias is not None,
-            HAS_Z=z is not None,
-            Z_IS_3D=z_is_3d,
-            Z_HEADS=z.shape[1] if z_is_3d else 1,
-            NORM_BEFORE_GATE=norm_before_gate,
-            IS_RMS_NORM=is_rms_norm,
-            num_warps=num_warps,
-            ACTIVATION=activation,
-            **pdl_kwargs,
-            **quant,
+        M, N = x.shape
+        if group_size is None:
+            group_size = N
+        assert N % group_size == 0
+        ngroups = N // group_size
+        assert x.stride(-1) == 1
+        z_is_3d = z is not None and z.ndim == 3
+        if z is not None:
+            assert z.stride(-1) == 1
+            if z_is_3d:
+                assert z.shape[0] * z.shape[1] == M
+                assert z.shape[2] == N
+            else:
+                assert z.shape == (M, N)
+        assert weight.shape == (N,)
+        assert weight.stride(-1) == 1
+        if bias is not None:
+            assert bias.stride(-1) == 1
+            assert bias.shape == (N,)
+        # allocate output
+        if out is not None:
+            assert out.shape == x.shape
+        else:
+            out = torch.empty_like(x)
+        assert out.stride(-1) == 1
+        mean = (
+            torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+            if not is_rms_norm
+            else None
         )
-    return ((q, s) if quant_heads else out), mean, rstd
+        rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+        # Less than 64KB per feature: enqueue fused kernel
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+        if group_size > BLOCK_N:
+            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        # heuristics for number of warps
+        num_warps = min(max(BLOCK_N // 256, 1), 8)
+        # Calculate rows per block based on SM count
+        rows_per_block = calc_rows_per_block(M, x.device)
+        quant = {}
+        # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
+        if quant_heads:
+            assert ngroups == 1 and M % quant_heads == 0
+            # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+            num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+            rows_per_block = quant_heads
+            q = torch.empty(
+                (M // quant_heads, quant_heads * N),
+                dtype=torch.float8_e4m3fn,
+                device=x.device,
+            )
+            s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+            quant = {"Q": q, "S": s, "QUANT": True}
+        if launch_cfg is not None:
+            rows_per_block, num_warps = launch_cfg
+        elif (
+            _GDN_FRONT_NORM
+            and not quant_heads
+            and ngroups == 1
+            and BLOCK_N == 128
+            and M >= NORM_BIG_ROWS
+            and not is_batch_invariant_mode_enabled()
+        ):
+            rows_per_block, num_warps = NORM_BIG_CFG
+        # Update grid to use rows_per_block
+        grid = (cdiv(M, rows_per_block), ngroups)
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        # Mature Q35 front_norm ordering: native consumer may prefetch weights,
+        # while its activation DMA still waits for the norm producer to finish.
+        if (
+            pdl_kwargs and os.environ.get("Q38_GDN_NORM_EARLY") == "1"
+            and x.dtype == torch.bfloat16 and is_rms_norm and norm_before_gate
+            and activation == "sigmoid" and M == 192 and N == 128
+            and z_is_3d and z.shape[1] == 48
+        ):
+            pdl_kwargs["EARLY_DEPENDENTS"] = True
+        # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
+        # in that release — it creates a DynamoConfigPatchProxy that
+        # SourcelessBuilder cannot wrap, causing a hard error under
+        # torch.compile(fullgraph=True).  The device context is a functional no-op
+        # for Triton kernel launches (device is determined by the tensor, not the
+        # surrounding context), so we simply skip it when Dynamo is tracing.
+        # PyTorch main already has the proper fix (XPUDeviceVariable registered in
+        # torch/_dynamo/variables/ctx_manager.py analogous to CUDADeviceVariable).
+        # TODO: remove this branch once we upgrade from PyTorch 2.12.
+        device_ctx = (
+            nullcontext()
+            if x.device.type == "xpu" and torch.compiler.is_compiling()
+            else device_context(x.device)
+        )
+        with device_ctx:
+            _layer_norm_fwd_1pass_kernel[grid](
+                x,
+                out,
+                weight,
+                bias,
+                z,
+                mean,
+                rstd,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0) if z is not None and not z_is_3d else 0,
+                z.stride(0) if z_is_3d else 0,
+                z.stride(1) if z_is_3d else 0,
+                M,
+                group_size,
+                eps,
+                BLOCK_N=BLOCK_N,
+                ROWS_PER_BLOCK=rows_per_block,
+                HAS_BIAS=bias is not None,
+                HAS_Z=z is not None,
+                Z_IS_3D=z_is_3d,
+                Z_HEADS=z.shape[1] if z_is_3d else 1,
+                NORM_BEFORE_GATE=norm_before_gate,
+                IS_RMS_NORM=is_rms_norm,
+                num_warps=num_warps,
+                ACTIVATION=activation,
+                **pdl_kwargs,
+                **quant,
+            )
+        return ((q, s) if quant_heads else out), mean, rstd
+else:
+    def _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=None,
+        out=None,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation: str = "swish",
+        quant_heads: int = 0,
+    ):
+        M, N = x.shape
+        if group_size is None:
+            group_size = N
+        assert N % group_size == 0
+        ngroups = N // group_size
+        assert x.stride(-1) == 1
+        z_is_3d = z is not None and z.ndim == 3
+        if z is not None:
+            assert z.stride(-1) == 1
+            if z_is_3d:
+                assert z.shape[0] * z.shape[1] == M
+                assert z.shape[2] == N
+            else:
+                assert z.shape == (M, N)
+        assert weight.shape == (N,)
+        assert weight.stride(-1) == 1
+        if bias is not None:
+            assert bias.stride(-1) == 1
+            assert bias.shape == (N,)
+        # allocate output
+        if out is not None:
+            assert out.shape == x.shape
+        else:
+            out = torch.empty_like(x)
+        assert out.stride(-1) == 1
+        mean = (
+            torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+            if not is_rms_norm
+            else None
+        )
+        rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+        # Less than 64KB per feature: enqueue fused kernel
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+        if group_size > BLOCK_N:
+            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        # heuristics for number of warps
+        num_warps = min(max(BLOCK_N // 256, 1), 8)
+        # Calculate rows per block based on SM count
+        rows_per_block = calc_rows_per_block(M, x.device)
+        quant = {}
+        # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
+        if quant_heads:
+            assert ngroups == 1 and M % quant_heads == 0
+            # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+            num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+            rows_per_block = quant_heads
+            q = torch.empty(
+                (M // quant_heads, quant_heads * N),
+                dtype=torch.float8_e4m3fn,
+                device=x.device,
+            )
+            s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+            quant = {"Q": q, "S": s, "QUANT": True}
+        # Update grid to use rows_per_block
+        grid = (cdiv(M, rows_per_block), ngroups)
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        # Mature Q35 front_norm ordering: native consumer may prefetch weights,
+        # while its activation DMA still waits for the norm producer to finish.
+        if (
+            pdl_kwargs and os.environ.get("Q38_GDN_NORM_EARLY") == "1"
+            and x.dtype == torch.bfloat16 and is_rms_norm and norm_before_gate
+            and activation == "sigmoid" and M == 192 and N == 128
+            and z_is_3d and z.shape[1] == 48
+        ):
+            pdl_kwargs["EARLY_DEPENDENTS"] = True
+        # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
+        # in that release — it creates a DynamoConfigPatchProxy that
+        # SourcelessBuilder cannot wrap, causing a hard error under
+        # torch.compile(fullgraph=True).  The device context is a functional no-op
+        # for Triton kernel launches (device is determined by the tensor, not the
+        # surrounding context), so we simply skip it when Dynamo is tracing.
+        # PyTorch main already has the proper fix (XPUDeviceVariable registered in
+        # torch/_dynamo/variables/ctx_manager.py analogous to CUDADeviceVariable).
+        # TODO: remove this branch once we upgrade from PyTorch 2.12.
+        device_ctx = (
+            nullcontext()
+            if x.device.type == "xpu" and torch.compiler.is_compiling()
+            else device_context(x.device)
+        )
+        with device_ctx:
+            _layer_norm_fwd_1pass_kernel[grid](
+                x,
+                out,
+                weight,
+                bias,
+                z,
+                mean,
+                rstd,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0) if z is not None and not z_is_3d else 0,
+                z.stride(0) if z_is_3d else 0,
+                z.stride(1) if z_is_3d else 0,
+                M,
+                group_size,
+                eps,
+                BLOCK_N=BLOCK_N,
+                ROWS_PER_BLOCK=rows_per_block,
+                HAS_BIAS=bias is not None,
+                HAS_Z=z is not None,
+                Z_IS_3D=z_is_3d,
+                Z_HEADS=z.shape[1] if z_is_3d else 1,
+                NORM_BEFORE_GATE=norm_before_gate,
+                IS_RMS_NORM=is_rms_norm,
+                num_warps=num_warps,
+                ACTIVATION=activation,
+                **pdl_kwargs,
+                **quant,
+            )
+        return ((q, s) if quant_heads else out), mean, rstd
 
 
 if _is_npu:

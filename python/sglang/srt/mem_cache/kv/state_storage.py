@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.speculative import post_verify_late_join
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -105,6 +106,8 @@ class StateStorage:
         the table's columns. A request that already holds a slot (a radix hit,
         a continuing chunk) keeps it. ``fresh_rows`` marks rows the requests
         did not hold before: their speculative ReplaySSM cursors restart."""
+        # A row or slot bound here may still be folded into by a late-joined commit.
+        post_verify_late_join.wait("row_bind")
         spec_write_pos = self.pool.replayssm_spec_write_pos
         if spec_write_pos is not None:
             fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]

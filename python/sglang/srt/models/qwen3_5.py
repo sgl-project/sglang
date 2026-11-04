@@ -181,6 +181,18 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+
+
+def _gdn_in_proj_pin_configured() -> bool:
+    # A tuning file may pin the GDN fused in_proj's cuBLASLt algorithm.
+    if not envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.get():
+        return False
+    from sglang.srt.layers.gdn_in_proj_algo_pin import gdn_in_proj_pin_configured
+
+    return gdn_in_proj_pin_configured()
+
+
+_GDN_IN_PROJ_PIN = _gdn_in_proj_pin_configured()
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
@@ -877,6 +889,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # the tuple branch and keep the original control flow below unchanged.
         if _use_aiter and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
+
+        if (
+            _GDN_IN_PROJ_PIN
+            and not _use_aiter
+            and self._fused_in_proj_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] <= 1024
+        ):
+            from sglang.srt.layers.gdn_in_proj_algo_pin import gdn_in_proj_pinned_gemm
+
+            # The fused GEMM below on a pinned cuBLASLt algorithm; None keeps it stock.
+            fused_out = gdn_in_proj_pinned_gemm(hidden_states, self._fused_in_proj_weight)
+            if fused_out is not None:
+                return (
+                    fused_out[:, : self._fused_in_proj_qkvz_width],
+                    fused_out[:, self._fused_in_proj_qkvz_width :],
+                )
 
         if (
             not _use_aiter
