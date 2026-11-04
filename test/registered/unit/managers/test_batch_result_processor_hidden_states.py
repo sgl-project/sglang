@@ -11,7 +11,8 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
