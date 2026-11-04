@@ -53,10 +53,10 @@ def _jit_topk_v2_module():
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_transform_packed", f"{kernel}::transform_packed"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
-        ("topk_transform_packed", f"{kernel}::transform_packed"),
     ]
     return load_jit(
         make_name("topk_v2"),

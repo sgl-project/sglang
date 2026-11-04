@@ -18,6 +18,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -41,6 +42,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
+    batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
     batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
     batch.device = "cpu"
     batch.model_config = SimpleNamespace(is_encoder_decoder=False)
@@ -72,6 +74,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
+        request_retirer=release_only_retirer(
+            tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL)
+        ),
         req_to_token_pool=None,
         kv_weight_version_tracker=None,
         decode_offload_manager=None,

@@ -425,6 +425,8 @@ TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoo
       &smem);
 }
 
+// Packed DSA extend layout.
+
 /**
  * \brief Parameters of the packed (DSA extend) layout.
  *
