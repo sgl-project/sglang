@@ -145,22 +145,45 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
     def _aiter_gfx95_env(self):
         with (
             mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
-            mock.patch.object(
-                forward_mla_rocm.envs.SGLANG_ROCM_USE_MULTI_STREAM,
-                "get",
-                side_effect=AssertionError(
-                    "MLA projection fusion must not depend on MoE multi-stream mode"
-                ),
-            ),
             envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(True),
             get_parallel().override(dcp_enabled=False),
         ):
             yield
 
-    def _can_fuse(self, attn, forward_batch):
+    def _can_fuse(self, attn, forward_batch, is_capture_mode=True):
         return forward_mla_rocm._can_fuse_rocm_mla_projection_rope_cache(
-            attn, forward_batch=forward_batch, is_capture_mode=True
+            attn, forward_batch=forward_batch, is_capture_mode=is_capture_mode
         )
+
+    def test_each_term_alone_turns_it_off(self):
+        """Eager and prefill keep the split path, as do layouts the kernel lacks:
+        DSA caches, DCP's all-gathered q_nope_out, non-MXFP4 w_kc, NoPE layers."""
+        forward_batch = self._make_decode_batch()
+        with self._aiter_gfx95_env():
+            self.assertFalse(
+                self._can_fuse(self._make_attn(), forward_batch, is_capture_mode=False)
+            )
+            self.assertFalse(
+                self._can_fuse(
+                    self._make_attn(),
+                    SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+                )
+            )
+            for name, broken in (
+                ("use_dsa", True),
+                ("kv_b_proj", SimpleNamespace(set_lora=True)),
+                ("w_kc", torch.empty(1, dtype=torch.float8_e4m3fn)),
+                ("w_scale_k", None),
+                ("rotary_emb", None),
+            ):
+                with self.subTest(term=name):
+                    attn = self._make_attn()
+                    setattr(attn, name, broken)
+                    self.assertFalse(self._can_fuse(attn, forward_batch))
+            with get_parallel().override(dcp_enabled=True):
+                self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
+            with envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(False):
+                self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
 
     def test_projection_fusion_gate_targets_aiter_graph_decode(self):
         attn = self._make_attn()
@@ -193,6 +216,50 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
                     attn = self._make_attn()
                     setattr(attn, field, value)
                     self.assertFalse(self._can_fuse(attn, forward_batch))
+
+
+class TestMxfp4ProjectionQDtype(CustomTestCase):
+    """Gluon MLA decode (bh16bn128) reads bf16 Q at 12 local heads, so with an FP8
+    cache the MXFP4 fused kernel must emit bf16 Q there, as the split path does."""
+
+    def _q_out_dtype(self, num_heads, kv_cache_dtype):
+        attn = SimpleNamespace(
+            kv_cache_dtype=kv_cache_dtype,
+            current_attention_backend="aiter",
+            w_kc=torch.empty(num_heads, 4, 2, dtype=torch.uint8),
+            w_scale_k=torch.empty(num_heads, 4, 1, dtype=torch.uint8),
+            rotary_emb=SimpleNamespace(
+                cos_cache=None, sin_cache=None, is_neox_style=False
+            ),
+            attn_mqa=SimpleNamespace(layer_id=0, k_scale=None),
+        )
+        q_nope = torch.empty(3, num_heads, 4, dtype=torch.bfloat16)
+        kernel = mock.Mock()
+        layers = mock.Mock()
+        with (
+            mock.patch.object(
+                forward_mla_rocm,
+                "fused_fp4_bmm_rope_cat_and_cache_mla",
+                kernel,
+                create=True,
+            ),
+            mock.patch.object(forward_mla_rocm, "get_kv_layers", return_value=layers),
+        ):
+            forward_mla_rocm._fused_fp4_bmm_rope_cat_and_cache(
+                attn,
+                q_nope=q_nope,
+                q_pe=None,
+                k_nope=None,
+                k_pe=None,
+                positions=None,
+                out_cache_loc=torch.zeros(3, dtype=torch.int64),
+            )
+        return kernel.call_args.kwargs["q_out_dtype"]
+
+    def test_fp8_cache_with_12_heads_keeps_bf16_q(self):
+        self.assertEqual(self._q_out_dtype(12, "fp8_e4m3"), torch.bfloat16)
+        self.assertEqual(self._q_out_dtype(8, "fp8_e4m3"), forward_mla_rocm.fp8_dtype)
+        self.assertEqual(self._q_out_dtype(12, "auto"), torch.bfloat16)
 
 
 if __name__ == "__main__":
