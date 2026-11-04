@@ -915,19 +915,17 @@ def _static_state_entries(
             )
 
         # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
-        # than SWA pages.  Register it separately so P and D can independently
-        # map logical positions when their local ring sizes differ.
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        if is_npu_arch35():
-            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-            if c4_ptrs:
-                add(
-                    AscendStateType.DSV4_C4_STATE,
-                    c4_ptrs,
-                    c4_lens,
-                    c4_item_lens,
-                )
+        # than SWA pages. A3 (EXPLICIT cache_mode) follows SWA pages, but its
+        # ring sizes can also differ between P and D with decode-only MTP.
+        # Register it separately so each peer maps positions to its local rows.
+        c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+        if c4_ptrs:
+            add(
+                AscendStateType.DSV4_C4_STATE,
+                c4_ptrs,
+                c4_lens,
+                c4_item_lens,
+            )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

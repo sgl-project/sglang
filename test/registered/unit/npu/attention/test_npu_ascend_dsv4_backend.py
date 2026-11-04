@@ -71,9 +71,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-    dsv4_state_payloads,
-)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import dsv4_state_payloads
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenToKVPool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
@@ -366,6 +364,159 @@ class TestC4StateTransferLayout(unittest.TestCase):
             item_lens,
             [attn_state[0].nbytes, indexer_state[0].nbytes],
         )
+
+    @staticmethod
+    def _a3_req_pool(ring_size, swa_pages):
+        req_pool = DSV4ReqToTokenTablesMixin.__new__(DSV4ReqToTokenTablesMixin)
+        req_pool.c128_page_size = 1
+        req_pool.req_to_c128_sidecar = torch.zeros((4, 4), dtype=torch.int32)
+        req_pool.req_to_token = torch.zeros((4, 384), dtype=torch.int64)
+        # Full and SWA page numbers deliberately differ, as do P and D pages.
+        mapping = torch.zeros(24 * 128, dtype=torch.int64)
+        for logical_page, swa_page in enumerate(swa_pages):
+            full_page = 20 - 3 * logical_page
+            full_locs = full_page * 128 + torch.arange(128)
+            req_pool.req_to_token[2, logical_page * 128 : (logical_page + 1) * 128] = (
+                full_locs
+            )
+            mapping[full_locs] = swa_page * 128 + torch.arange(128)
+        kv_pool = SimpleNamespace(
+            swa_page_size=128,
+            get_ring_size=lambda _: ring_size,
+            translate_loc_from_full_to_swa=lambda locs: mapping[locs],
+        )
+        req_pool._dsv4_allocator = SimpleNamespace(get_kvcache=lambda: kv_pool)
+        return req_pool
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+        return_value=False,
+    )
+    def test_a3_payload_follows_swa_pages_at_ring_and_page_boundaries(self, _):
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+        for ring_size, pages in ((8, [7, 3, 9]), (16, [2, 8, 5])):
+            req_pool = self._a3_req_pool(ring_size, pages)
+            # Exhaust short histories, then cross SWA page boundaries.
+            seq_lens = list(range(18)) + [
+                127,
+                128,
+                129,
+                131,
+                132,
+                135,
+                136,
+                255,
+                256,
+                257,
+                263,
+            ]
+            for seq_len in seq_lens:
+                with self.subTest(ring_size=ring_size, seq_len=seq_len):
+                    payloads = dsv4_state_payloads(req_pool, 2, seq_len, page_size=128)
+                    rows = payloads[AscendStateType.DSV4_C4_STATE]().tolist()
+                    positions = range(max(0, seq_len - 8), seq_len)
+                    expected = [
+                        pages[pos // 128] * ring_size + pos % ring_size
+                        for pos in positions
+                    ]
+                    self.assertEqual(rows, expected)
+                    self.assertEqual(len(rows), len(set(rows)))
+
+    @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
+    def test_a3_transfer_rows_match_the_compressor_history(self, _):
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+            _build_explicit_state_block_table,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+
+        # Compare against the actual consumer, including partially filled
+        # histories and noncontiguous physical pages at a page boundary.
+        for ring_size in (8, 16):
+            req_pool = self._a3_req_pool(ring_size, [7, 3, 9])
+            state_pool = CompressStatePool.__new__(CompressStatePool)
+            state_pool.ring_size = ring_size
+            state_pool.swa_page_size = 128
+            state_pool.dummy_state_loc = 10 * ring_size
+            for seq_len in (0, 1, 4, 7, 8, 9, 13, 127, 128, 129, 255, 256, 257):
+                with self.subTest(ring_size=ring_size, seq_len=seq_len):
+                    rows = dsv4_state_payloads(req_pool, 2, seq_len, page_size=128)[
+                        AscendStateType.DSV4_C4_STATE
+                    ]()
+                    table = _build_explicit_state_block_table(
+                        compress_ratio=4,
+                        coff=2,
+                        state_pool=state_pool,
+                        token_to_kv_pool=req_pool._dsv4_allocator.get_kvcache(),
+                        req_to_token=req_pool.req_to_token,
+                        req_pool_indices=torch.tensor([2]),
+                        start_pos=torch.tensor([seq_len]),
+                        cu_seqlens=torch.tensor([0, 1]),
+                        seqused=torch.tensor([1]),
+                        max_input_capacity=1,
+                    )
+                    self.assertEqual(
+                        table[0, max(0, 8 - seq_len) : 8].tolist(), rows.tolist()
+                    )
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+        return_value=False,
+    )
+    def test_a3_swa_component_excludes_whole_c4_rings(self, _):
+        for ring_size in (8, 16):
+            pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+            swa = torch.empty((4, 128, 1, 8), dtype=torch.bfloat16)
+            pool.swa_kv_pool = SimpleNamespace(kv_buffer=[swa])
+            pool.compress_state_pools = [
+                SimpleNamespace(
+                    ratio=4,
+                    ring_size=ring_size,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=torch.empty(
+                            (10 * ring_size, 2048), dtype=torch.float32
+                        )
+                    ),
+                )
+            ]
+            pool.indexer_compress_state_pools = [
+                SimpleNamespace(
+                    ratio=4,
+                    ring_size=ring_size,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=torch.empty((10 * ring_size, 512), dtype=torch.float32)
+                    ),
+                )
+            ]
+            ptrs, lens, items = pool.get_state_buf_infos()
+            self.assertEqual(
+                (ptrs, lens, items), ([swa.data_ptr()], [swa.nbytes], [swa[0].nbytes])
+            )
+            self.assertEqual(pool.get_c4_state_buf_infos()[2], [8192, 2048])
+
+            # Exercise the registration gate as well as the buffer getter.
+            # Otherwise an A5-only gate would silently omit the A3 component.
+            from sglang.srt.mem_cache.static_kv_storage import _static_state_entries
+
+            pool.layer_router = SimpleNamespace(sub_pool=lambda _: None)
+            pool._unified_kv = False
+            pool.get_request_state_buf_infos = lambda: ([], [], [])
+            pool.get_c128_kv_buf_infos = lambda: ([], [], [])
+            with patch(
+                "sglang.srt.mem_cache.static_kv_storage.is_npu", return_value=True
+            ):
+                entries = _static_state_entries(
+                    pool,
+                    draft_token_to_kv_pool=None,
+                    total_kv_layers=1,
+                    state_pool=None,
+                )
+            self.assertEqual(
+                [entry.state_type.value for entry in entries.wire_entries],
+                ["swa", "dsv4_c4_state"],
+            )
+            self.assertEqual(entries.regions["state1"].item_lens, (8192, 2048))
 
 
 class TestC4IndexerInitialization(unittest.TestCase):
