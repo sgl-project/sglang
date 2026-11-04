@@ -626,6 +626,15 @@ def _fused_bmm_rope_cat_and_cache(
 
 
 class DeepseekMLARocmForwardMixin:
+    """ROCm absorbed MLA with separate arithmetic and kernel selection.
+
+    This path does not dispatch ``run_mla_indexer``, ``prepare_mla_qkv``, or
+    ``project_mla_values``, and does not consult ``needs_unfused_mla_qkv``.
+    Subclasses that customize those shared-path hooks must also customize this
+    mixin's forward methods to support MLA_ROCM. ROCm dense MHA preparation
+    does dispatch ``run_mla_indexer``.
+    """
+
     def init_mla_rocm_forward(self: DeepseekV2AttentionMLA):
         self.use_gluon_mla_decode_gfx950 = _gluon_mla_decode_gfx950_ok(
             kv_cache_dtype=self.kv_cache_dtype,

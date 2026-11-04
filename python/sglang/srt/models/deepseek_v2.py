@@ -267,6 +267,7 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+        init_modelslim_mla_kv,
     )
 else:
     pass
@@ -1057,10 +1058,10 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and self.shared_experts is not None
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
-            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
-            and not getattr(self, "is_hash", False)
+            and not self.is_hash
+            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not is_expert_remapping_enabled()
             and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
         )
@@ -1112,7 +1113,9 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        use_vision_topk = self.gate.e_score_correction_bias_vl is not None
+        use_vision_topk = (
+            self.gate.e_score_correction_bias_vl is not None and not self.is_hash
+        )
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
         if not self._enable_a2a_moe:
@@ -2287,6 +2290,8 @@ class DeepseekV2AttentionMLA(
             attn_type=attn_type,
             prefix=add_prefix("attn_mha", prefix),
         )
+        if _is_npu:
+            init_modelslim_mla_kv(self, prefix)
 
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None

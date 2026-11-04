@@ -32,6 +32,7 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
         model_runner = SimpleNamespace(
             device="cpu",
             model=SimpleNamespace(),
+            kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
             device_timer=None,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
