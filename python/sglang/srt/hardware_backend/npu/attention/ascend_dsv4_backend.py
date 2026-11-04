@@ -1058,13 +1058,10 @@ class DeepseekV4AscendAttnBackend(
         fm.ori_sparse_indices = ori_sparse_indices.unsqueeze(1).contiguous()
         fm.ori_topk_length = ori_topk_length.unsqueeze(1).contiguous()
         fm.ori_mask_mode = 0
-        if is_npu_arch35():
-            # Mask 0 forbids a window in the quantized reader.
-            fm.ori_win_left = -1
-            fm.ori_win_right = -1
-        else:
-            # The bf16 metadata check requires a non-negative window.
-            fm.ori_win_left = self._dsv4_sliding_window_size + block_size - 1
+        # Keep the logical window for the legacy DSpark ABI. The kernel
+        # adapter maps explicit A5 sparse attention to the released -1/-1 ABI.
+        fm.ori_win_left = self._dsv4_sliding_window_size + block_size - 1
+        fm.ori_win_right = 0
 
     def _build_dspark_sparse_metadata(
         self, *, seq_lens: torch.Tensor, block_size: int
@@ -1422,15 +1419,12 @@ class DeepseekV4AscendAttnBackend(
             metadata.ori_topk_length = self.graph_metadata["ori_topk_length"][:T]
             metadata.ori_topk_length.zero_()
             metadata.ori_mask_mode = 0
-            if is_npu_arch35():
-                # Mask 0 forbids a window in the quantized reader.
-                metadata.ori_win_left = -1
-                metadata.ori_win_right = -1
-            else:
-                # The bf16 metadata check requires a non-negative window.
-                metadata.ori_win_left = (
-                    self._dsv4_sliding_window_size + tokens_per_req - 1
-                )
+            # Match eager metadata: preserve the logical window until the
+            # kernel adapter selects the released or legacy operator ABI.
+            metadata.ori_win_left = (
+                self._dsv4_sliding_window_size + tokens_per_req - 1
+            )
+            metadata.ori_win_right = 0
 
         self.forward_metadata = metadata
 
