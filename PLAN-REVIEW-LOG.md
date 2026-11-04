@@ -4976,3 +4976,9 @@ parent 审阅完整差异并独立执行 transfers/service/cache/prefetch lifecy
 发现并修复持续恢复中的历史结果重放：Router ack 忘记本地 Job 后，新任务的相同目标会重建相同 Engine message ID；在 Engine 历史 COMPLETED 尚未过期且实际副本已驱逐时，只重放旧结果。现按 Router actor incarnation 与单调序号生成新 episode 的 wire ID，存活的逻辑 job 仍共享，单次提交丢响应仍重试同一 wire ID。
 
 parent 完整审阅 17 行 runtime 改动与回归，独立运行 HTTP orchestration 20 项通过，1.31s。测试保留旧 Engine COMPLETED、清除实际 residency，在任务切换和 Router 重启后核验三个独立 wire ID 与真实重新准备。日志：lifecycle-opt/o5-wire-parent-tests.log。
+
+### O5/O7 — 持续生命周期实验工具
+
+新增 additive lifecycle_bench/analyze_lifecycle 与文档/测试，复用原 HTTP/SSE、控制、配置对齐和统计工具，原 stress/router 入口保持原口径。按需、固定预取、生命周期策略复用同一固定任务计划；控制收尾有界异步，背压及期末 drain 计入，保留发送迟到、所有完成响应和无效路径。支持共享祖先/salt、预测误差、取消、路由归属和真实压力采样；模拟 rollout 与真实 trainer 指标分开。
+
+parent 审阅完整工具与测试，修正 tool_wait RPC 耗时未从 resume_expected 剩余时间扣除的问题，并增加确定性时钟测试。每组保存实际 capacity 成本快照，缺失明确 unknown；源首次生成及暖缓存参考都保留并计入源成本。独立复测新增 14 项通过，7.266s；旧 stress/analyze/router 41 项在首次组合复测通过。Ruff、格式及文档链接检查通过。日志：lifecycle-opt/o5-harness-parent-final-tests.log；正式 GPU 结果另行归档。
