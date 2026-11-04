@@ -9,10 +9,11 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .base_module import RotaryEmbeddingND, TransformerBlock, _scaled_residual_add
-from .vit_utils import _env_flag, create_token_ids, prepare_rotary_pos_emb
+from .vit_utils import create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
 
@@ -31,7 +32,7 @@ def _cuda_autocast_disabled(tensor: torch.Tensor):
 
 
 def _fused_blocks_available(blocks, hidden_states) -> bool:
-    if not _env_flag("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1"):
+    if not envs.MINIMAX_H3_VAE_DECODER_FUSED_NORM:
         return False
     # The fused Triton norms decode to all-NaN on ROCm (MI300), where
     # tensor.is_cuda is also true; keep ROCm on the unfused fp32-norm path.
