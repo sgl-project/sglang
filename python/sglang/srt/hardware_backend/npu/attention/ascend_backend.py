@@ -30,7 +30,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.memory_pool_npu import init_mxfp8_kv_scales
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -123,11 +122,13 @@ class ForwardMetadata:
     flash_mla_metadata: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
 
-    # Device query boundaries shared by flash attention implementations.
+    # Device cumulative Q lengths, including the leading zero.
     cu_seqlens_q: Optional[torch.Tensor] = None
+    # Per-request Q length for uniform batches; None for variable-length prefill.
     uniform_query_len: Optional[int] = None
-    # Flash attention scheduling plan and query-scale layout.
+    # Flash attention scheduling plan.
     fa_metadata: Optional[torch.Tensor] = None
+    # Q-scale layout shared by the scheduling plan and query quantization.
     fa_layout_q_descale: str = "TND"
 
     # DCP per-request lengths and decode inputs
@@ -349,14 +350,23 @@ class AscendAttnBackend(AttentionBackend):
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        cache_layout = model_runner.kv_cache_configurator.modelslim_cache_layout
-        self.use_quant_flash_attn = (
-            cache_layout is not None and cache_layout.layout == "gqa_mxfp8"
+        modelslim_cache_layout = (
+            model_runner.kv_cache_configurator.modelslim_cache_layout
         )
+        self.use_quant_flash_attn = (
+            modelslim_cache_layout is not None
+            and modelslim_cache_layout.layout == "gqa_mxfp8"
+        )
+        # Device metadata preparation replaces out-of-graph host updates.
+        self.use_in_graph_metadata = self.use_quant_flash_attn
         if self.use_quant_flash_attn:
             from sgl_kernel_npu.operators.attention import (
                 quant_flash_attn,
                 quant_flash_attn_metadata,
+            )
+
+            from sglang.srt.layers.quantization.modelslim.schemes.modelslim_qk_mxfp8_dynamic_v_mxfp8_per_channel import (
+                init_mxfp8_kv_scales,
             )
 
             self.needs_cpu_seq_lens = False
@@ -365,12 +375,14 @@ class AscendAttnBackend(AttentionBackend):
             envs.SGLANG_ENABLE_WAR_BARRIER.set(True)
             self.quant_flash_attn = quant_flash_attn
             self.quant_flash_attn_metadata = quant_flash_attn_metadata
-            self.modelslim_cache_layout = cache_layout
+            self.modelslim_cache_layout = modelslim_cache_layout
             self.fa_num_heads = model_runner.model_config.get_num_attention_heads(
                 get_parallel().attn_tp_size
             )
             init_mxfp8_kv_scales(
-                model_runner.model, model_runner.token_to_kv_pool, cache_layout
+                model_runner.model,
+                model_runner.token_to_kv_pool,
+                modelslim_cache_layout,
             )
         # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
         # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.
@@ -384,9 +396,6 @@ class AscendAttnBackend(AttentionBackend):
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
-            modelslim_cache_layout = (
-                model_runner.kv_cache_configurator.modelslim_cache_layout
-            )
             if (
                 modelslim_cache_layout is not None
                 and modelslim_cache_layout.layout == "mla_fp8"
@@ -612,7 +621,8 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-        if self.use_quant_flash_attn:
+        if self.use_in_graph_metadata:
+            # Select this graph bucket; its device metadata is refreshed in graph.
             self.forward_metadata = self.graph_metadata[bs]
             self.graph_mode = True
             return
@@ -655,7 +665,7 @@ class AscendAttnBackend(AttentionBackend):
                 query_len = int(forward_batch.spec_info.draft_token_num)
             else:
                 query_len = None
-            self._init_flash_attn(metadata, query_len)
+            self._init_flash_attn_metadata_buffers(metadata, query_len)
             self.graph_mode = False
             self.init_forward_metadata_in_graph(forward_batch)
             return
@@ -935,10 +945,14 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_mode = False
 
-    def _init_flash_attn(self, metadata, query_len):
-        """Allocate device lengths and initialize fixed-width query boundaries."""
+    def _init_flash_attn_metadata_buffers(self, metadata, query_len):
+        """Allocate buffers and fix layouts per eager batch or captured bucket."""
         bs = metadata.block_tables.shape[0]
         metadata.uniform_query_len = query_len
+        groups = self.fa_num_heads // self.modelslim_cache_layout.local_kv_heads
+        metadata.fa_layout_q_descale = (
+            "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
+        )
         if query_len is None:
             metadata.cu_seqlens_q = torch.zeros(
                 bs + 1, dtype=torch.int32, device=self.device
@@ -957,17 +971,13 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        if not self.use_quant_flash_attn:
+        """Refresh device metadata eagerly or as part of the captured graph."""
+        if not self.use_in_graph_metadata:
             return
         metadata = self.forward_metadata
         bs = metadata.block_tables.shape[0]
         if bs == 0:
             return
-        query_len = metadata.uniform_query_len
-        groups = self.fa_num_heads // self.modelslim_cache_layout.local_kv_heads
-        metadata.fa_layout_q_descale = (
-            "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
-        )
         seq_lens = forward_batch.seq_lens[:bs]
         offset = 0
         if forward_batch.forward_mode.is_target_verify():
@@ -1174,7 +1184,7 @@ class AscendAttnBackend(AttentionBackend):
                 query_len = self.speculative_num_draft_tokens
             else:
                 query_len = 1
-            self._init_flash_attn(metadata, query_len)
+            self._init_flash_attn_metadata_buffers(metadata, query_len)
             self.graph_metadata[bs] = metadata
             return metadata
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
@@ -4511,6 +4521,9 @@ class AscendAttnMultiStepDraftBackend:
                 AscendAttnBackend(model_runner, speculative_step_id=step_id)
             )
         self.needs_cpu_seq_lens = any(b.needs_cpu_seq_lens for b in self.attn_backends)
+        self.use_in_graph_metadata = all(
+            b.use_in_graph_metadata for b in self.attn_backends
+        )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None

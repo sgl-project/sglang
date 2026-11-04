@@ -13,6 +13,27 @@ from .modelslim_kv_cache import ModelSlimKVCacheLayout, ModelSlimKVCacheScheme
 logger = logging.getLogger(__name__)
 
 
+def init_mxfp8_kv_scales(model, pool, cache_layout):
+    """Populate static V scales after weight postprocessing and pool allocation."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    # Draft steps share the same pool; initialize its static scales only once.
+    full_pool = pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+    if full_pool._mxfp8_scales_initialized:
+        return
+    for module in model.modules():
+        scheme = getattr(module, "scheme", None)
+        if getattr(scheme, "cache_layout", None) == cache_layout:
+            # Keep the hybrid pool's global-to-local layer mapping.
+            _, v_scale = pool.get_kv_scale_buffer(module.layer_id)
+            v_scale.copy_(
+                scheme.v_scale_encoded.view(
+                    1, v_scale.shape[1], 1, v_scale.shape[-2], 1
+                )
+            )
+    full_pool._mxfp8_scales_initialized = True
+
+
 class _MXFP8KVCacheLayout(ModelSlimKVCacheLayout):
     group_size = 32
 
