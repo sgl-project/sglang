@@ -15,6 +15,8 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -148,7 +150,7 @@ def backend_extend(c, nocat):
     from types import SimpleNamespace
 
     import sglang.srt.layers.attention.aiter_backend as ab
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     be = object.__new__(ab.AiterAttnBackend)
     cache = c["cache"]
@@ -169,9 +171,15 @@ def backend_extend(c, nocat):
         kv_indices=c["kv_indices"],
         qo_indptr=c["qo_indptr"],
     )
-    be.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda i: cache, get_value_buffer=lambda i: cache[..., :L]
+    pool = SimpleNamespace(
+        get_key_buffer=lambda i: cache,
+        get_value_buffer=lambda i: cache[..., :L],
+        start_layer=0,
+        layer_num=1,
+        layer_transfer_counter=None,
     )
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    be.token_to_kv_pool = pool
     layer = SimpleNamespace(
         logit_cap=0.0,
         is_cross_attention=False,
