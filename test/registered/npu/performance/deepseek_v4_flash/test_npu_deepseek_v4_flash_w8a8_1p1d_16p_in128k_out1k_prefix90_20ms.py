@@ -243,6 +243,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     repeat_rate = 0.9
     request_rate = 3
     warmup_requests = 16
+    pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
     output_token_throughput = 964.864
     ttft = 7000
