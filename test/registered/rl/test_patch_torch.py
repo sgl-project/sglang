@@ -15,6 +15,12 @@ register_amd_ci(est_time=30, suite="stage-b-test-2-gpu-large-amd")
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
+        self._run_sender_receiver(patch_receiver=True)
+
+    def test_monkey_patch_torch_reductions_unpatched_receiver(self):
+        self._run_sender_receiver(patch_receiver=False)
+
+    def _run_sender_receiver(self, patch_receiver: bool):
         mp.set_start_method("spawn", force=True)
 
         cuda_visible_devices_list: List[int] = [
@@ -26,8 +32,10 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
         # Sender's cuda:1 and receiver's cuda:0 map to the same physical device.
         # With the patch, the IPC tensor must land on receiver's cuda:0.
-        sender_info = dict(visible_devices=[0, 1], tensor_device=1)
-        receiver_info = dict(visible_devices=[1, 0], tensor_device=0)
+        sender_info = dict(visible_devices=[0, 1], tensor_device=1, patch=True)
+        receiver_info = dict(
+            visible_devices=[1, 0], tensor_device=0, patch=patch_receiver
+        )
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
@@ -51,6 +59,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
                     ack_queue=ack_queue,
                     output_writer=output_writer,
                     tensor_device=info["tensor_device"],
+                    patch=info["patch"],
                 ),
             )
             p.start()
@@ -71,13 +80,15 @@ def _run_subprocess(
     ack_queue: mp.Queue,
     output_writer,
     tensor_device: int,
+    patch: bool,
 ):
     print(
         f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}',
         flush=True,
     )
 
-    monkey_patch_torch_reductions()
+    if patch:
+        monkey_patch_torch_reductions()
 
     try:
         if role == "sender":
