@@ -4716,3 +4716,7 @@ bounded retry targets the retained complete prefix after suffix reclamation.
 ### P3 independent review and proof
 
 Reviewed real cold preservation/source allocator reclamation, public-only blocker classification, shared-job key separation, partial backup and cancellation effects, and namespace field validation. Independent CPU7: 96 passed,81 subtests passed(22.05s); independent GPU host/file+live Mooncake writer reclamation/loadback:2 passed,2 subtests passed(18.48s). Logs p3-parent-cpu.log,p3-parent-gpu.log in /tmp/sglang-rfc-build. No new path support advertised beyond tested gpu->host/storage. P3 approved for commit.
+
+### P5 bounded session/branch state — independent review
+
+Integrated frozen branch/session/request targets, shared suffix material, explicit cleanup receipts and typed observation/query fences. Independent isolated-worktree and integrated-root crate proofs pass4 protocol+18 behavioral tests. Reviewed ownership/GC, version-domain separation, no pending-to-confirmed promotion, and session associations surviving physical removal. Existing provider remains authoritative; P6 host adapter still pending. Logs p5-parent-tests.log,p5-integrated-tests.log. Approved for commit.

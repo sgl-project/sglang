@@ -1,11 +1,55 @@
-# KV public protocol 1.0 (P1)
+# KV public protocol 1.0 and pure Router state (P1/P5)
 
 This crate contains pure schemas, validated action parsing, salt encoding and
-logical models. It imports no Router/indexer runtime and performs no I/O, PIN,
-routing, session mutation or protection aggregation. `protocol::parse_action`
+logical models, plus the P5 bounded association and evidence foundation. It imports
+no Router/indexer runtime and performs no I/O, PIN, routing or protection execution.
+`protocol::parse_action`
 validates the three new public actions. Other consumers' actions are returned
 unchanged; unsupported `sglang.*` names/versions return `Unsupported`. Existing
 Engine action parsers and semantics remain in Python.
+
+P5 is a pure API; Router runtime integration remains P6. `session_index` provides
+`SessionIndex`, explicit `SessionLimits`, canonical `ContentKey`, parent-linked
+`ContentRegistration`, immutable `BranchRevision`, request incarnation bindings
+and scoped cleanup receipts. Caller identity comes from trusted admission context.
+Only `start_session` creates a task; finish/cancel use `finish_task` (non-cascading)
+or explicit `finish_task_with_cascade`. The receipt lists exact task-owned claim
+and intent IDs to revoke. It does not call Engine's legacy recursive cleanup or
+remove physical KV. A retired task cannot be recreated, including by late events.
+
+Adapters register page-aligned content nodes with suffix-only token material;
+shared ancestors store tokens once. Digest/key construction, namespace/salt
+translation and physical layout validation stay in adapters. A token checksum
+survives material eviction to reject conflicting refills; it is not a storage key.
+`resolve(Selector)` binds session, branch/latest, request or registered explicit
+prefix to a `FrozenTarget`, with known/missing scopes, materialization gaps and
+the current session revision. Later branches cannot expand that target.
+`materialize` checks current material and constructs the P1 token prefix only at
+submission time. Intermediate ranges remain unsupported. Missing Stored events
+do not prevent rendered requests or confirmed cache hits from creating associations.
+
+All persistent collections and identifiers are bounded. `collect_garbage` drops
+unreferenced history/content; request bindings, current branches and externally
+held snapshots/content handles retain their dependencies. Hold `content()` handles
+when assembling several unassociated nodes. Reserve room for the incoming node
+before replacing an active branch. `evict_material` preserves associations.
+Capacity errors leave active state intact. Tombstones are never automatically
+evicted; exhausting their budget refuses further cleanup until the fenced owner
+domain is rotated. P6 must separately bound external operation/view handles.
+
+`observations` provides injected `LocationProvider` with separate `confirmed`,
+`expected` and `unknown` scopes. `ObservationFence` stores bounded owner/tier
+version fences only; existing indexer/local confirmed trees remain the residency
+source. Adapters bind epochs from trusted discovery, mark stream gaps, and obtain
+query tickets before actual scope queries. `confirm_query` checks the response
+epoch and unchanged ticket. Only a complete owner/tier snapshot repairs stream
+completeness; partial scope queries can confirm their actual ranges independently.
+Retained views must call `revalidate` before consumption. Every newer event
+invalidates retained observations conservatively. Owner epochs, instance domains
+and cache-event watermarks fence restarts and delayed responses. P1
+`PublicResult.state_version` is an **operation evidence sequence**, represented by
+`OperationEvidenceVersion`; it cannot be used as `CacheEventVersion` or establish
+current residency. P6 must query the authoritative provider after operation results.
 
 Envelope stays `0.1`; all three new actions use action version `1.0`.
 `fixtures/{prefetch,demote,pin,result,claim}.schema.json` are generated from Python
