@@ -1,8 +1,8 @@
 # CUDA 13.4 only args
-# Torch 2.15.0 RC1 from the PyTorch test channel; move to whl/cu134 once 2.15.0 is released.
+# Torch 2.15.0 stable from the PyTorch cu134 channel.
 # Torch wheels may differ from the CUDA 13.4 toolkit used for JIT (e.g. cu130 stable
 # wheels on Blackwell); override these four arguments to select other wheels.
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/test/cu134
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu134
 ARG TORCH_VERSION=2.15.0+cu134
 ARG TORCHVISION_VERSION=0.29.2+cu134
 ARG TORCHAUDIO_VERSION=2.11.1+cu134
