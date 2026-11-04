@@ -92,18 +92,20 @@ sgl-eval run mmmu_pro \\
   ],
 
   dockerImages: {
-    // NVIDIA: the versioned CUDA-13 release image (multi-arch amd64+arm64,
-    // covers Hopper + all Blackwell incl. sm_103 B300/GB300 and Grace). M3 is
-    // fully supported in tagged releases since v0.5.22, which also carries the
-    // page-128 trtllm_mha support the GB300 cell's decode split needs. Unlike
-    // the retired M3 dev images, the release image does NOT bundle MiniMax's
-    // MSA kernel — install it per the page's MSA section for the fast path;
-    // without it the same recipe serves on the built-in Triton sparse path.
-    b200: "lmsysorg/sglang:v0.5.22-cu130",
-    b300: "lmsysorg/sglang:v0.5.22-cu130",
-    gb200: "lmsysorg/sglang:v0.5.22-cu130",
-    gb300: "lmsysorg/sglang:v0.5.22-cu130",
-    h200: "lmsysorg/sglang:v0.5.22-cu130",
+    // NVIDIA: every cell stays on the image its verified rows were measured
+    // on. B200/B300/GB200/H200 keep the M3 dev images (bundle the MSA kernel;
+    // last 2026-06 builds — the dev lane is retired). GB300 moves to the
+    // versioned CUDA-13 release image: its recipe's decode split needs the
+    // page-128 trtllm_mha support that ships in tagged releases since
+    // v0.5.22, and its benchmark row was re-measured on that image. The
+    // release image does NOT bundle MiniMax's MSA kernel — on GB300 install
+    // it per the page's MSA section (required step for the measured fast
+    // path); without it the same recipe serves on the Triton sparse path.
+    b200: "lmsysorg/sglang:dev-minimax-m3",
+    b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    gb300: "lmsysorg/sglang:v0.5.23-cu130",
+    h200: "lmsysorg/sglang:dev-cu12-minimax-m3",
     // AMD ROCm images — published M3 builds, by arch (gfx942 -> mi30x, gfx950 -> mi35x).
     mi300x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
     mi325x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",

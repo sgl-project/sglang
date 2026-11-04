@@ -6,9 +6,11 @@
 // with piecewise CUDA graph default-on) and H200 (tp8, bf16, built-in Triton
 // sparse) are measured on PR #27944 — warm steady-state from a 3-run sweep (the
 // B200 3-run is identical; the H200 cold-start first run, ~2x slower, is
-// excluded). B300 / GB300
-// rows are the earlier 2026-06-11 tp4 MSA numbers (pre-piecewise),
-// pending a #27944 re-measure on their own boxes. GB200 is a bare-match
+// excluded). The B300
+// row is the earlier 2026-06-11 tp4 MSA numbers (pre-piecewise), pending a
+// #27944 re-measure on its own box. GB300 was re-measured 2026-11-03 on its
+// current recipe cell (v0.5.23-cu130 release image + MSA + the per-phase
+// decode split) — see the row comment. GB200 is a bare-match
 // stub (inferred-supported, not benchmarked). AMD: MI355X at 8-GPU tp8 (native
 // MXFP8) carries a bench_serving speed row; MI300X (MXFP8 -> block-fp8) was
 // accuracy-only. MI350X / MI325X inherit their same-arch sibling's recipe
@@ -67,15 +69,28 @@ export const benchmarks = [
   // GB200: inferred-supported, not directly benchmarked.
   { match: { hw: "gb200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" } },
   {
+    // GB300 re-measured 2026-11-03 on the recipe cell as shipped: image
+    // v0.5.23-cu130 + MSA installed per the page's MSA section + the
+    // per-phase decode split (--attention-backend fa4
+    // --decode-attention-backend trtllm_mha), tp4. bench_serving
+    // --flush-cache; warm steady-state of a 3-run sweep (cold run-1
+    // excluded); mean TTFT/TPOT reported (medians: 541/51.8 and 450/35.3).
+    // A same-image fa4-only control measured TPOT within ~1% at both points
+    // and GSM8K 88.6, so the deltas vs the retired 2026-06-11 dev-image row
+    // (TPOT 39.3/32.9, TTFT 4746/3324) are image-generational, not the
+    // decode split: TTFT improved ~4-5x, TPOT regressed ~30%/25% between the
+    // June dev build and v0.5.23 on this workload. The split's own e2e win
+    // shows up in interactivity-style serving replays (see the page's GB300
+    // note), not in steady-state TPOT at these points.
     match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "v0.5.23-cu130 (2026-11-03)",
     speed: [
-      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
-        ttft_ms: 4746, tpot_ms: 39.3, tokens_per_sec_per_gpu: 2493 },
-      { workload: { dataset: "random", isl: 8192, osl: 256, max_concurrency: 24 },
-        ttft_ms: 3324, tpot_ms: 32.9, tokens_per_sec_per_gpu: 4323 },
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
+        ttft_ms: 898, tpot_ms: 51.3, tokens_per_sec_per_gpu: 2416 },
+      { workload: { dataset: "random", isl: 8192, osl: 256, max_concurrency: 24, num_prompts: 48 },
+        ttft_ms: 1132, tpot_ms: 42.0, tokens_per_sec_per_gpu: 4596 },
     ],
-    accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on GB300 (legacy few_shot 200: 87.5)
+    accuracy: { gsm8k_pct: 89.6 }, // 2026-11-03, sgl-eval 0.1.3 (pin from python/pyproject test extra), full 1319, --thinking (template key verified; avg 253 thinking tokens), temp 1.0 / top_p 0.95, 0 truncated. Same-image fa4-only control: 88.6 (split-independent; the gap vs B200 tp8 96.5 predates this PR's change and tracks the image/platform, not the decode split).
   },
   // MI355X (gfx950): native MXFP8. Speed: bench_serving 1024/1024 @ conc 64, tp8
   // -> 1678 output tok/s (3355 total incl. input); 3355 / 8 = ~420 tokens/sec/GPU (total, in+out).
