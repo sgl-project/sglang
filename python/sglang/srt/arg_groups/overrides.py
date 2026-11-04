@@ -33,12 +33,7 @@ from sglang.srt.arg_groups.arg_utils import (
     resolvable_fields,
     with_fallback,
 )
-
-# Compatibility re-exports; model providers import model_override_base directly.
-from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
-    _MODEL_OVERRIDE_FNS,
-    _PREDICATE_OVERRIDE_FNS,
-    MODEL_OVERRIDES,
+from sglang.srt.arg_groups.model_override_base import (
     ResolvedView,
     ResolvingConfig,
     _declaration_overlay,
@@ -47,10 +42,8 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
-    mamba_extra_buffer_of,
     model_config_of,
     record_of,
-    register_model_override,
     register_model_override_predicate,
     resolved_view,
     resolving_view,
@@ -948,6 +941,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
@@ -979,7 +973,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
             and view.tp_size in SUPPORTED_TP_SIZES
             and view.attn_cp_size == 1
             and not view.encoder_only
-            and not view.enable_pdmux
         ):
             return {}
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
@@ -1100,19 +1093,50 @@ def _deterministic_rocm_rccl_check(view: Any) -> dict:
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
-    from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+    from sglang.srt.arg_groups.choices import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
-    # A per-phase backend takes priority over --attention-backend for its phase,
-    # so it has to be one of the deterministic backends too.
-    for field in ("prefill_attention_backend", "decode_attention_backend"):
-        backend = getattr(view, field, None)
+    # Views without the per-phase fields (e.g. partial views in tests) mean unset.
+    prefill_backend = getattr(view, "prefill_attention_backend", None)
+    decode_backend = getattr(view, "decode_attention_backend", None)
+
+    decode_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
+    decode_note = ""
+    if decode_backend == "aiter":
+        # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
+        # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch
+        # size, and speculative decoding would run AITER's unverified verify kernels.
         if (
-            backend is not None
-            and backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+            is_gfx95_supported()
+            and not use_mla_backend(view)
+            and view.speculative_algorithm is None
         ):
+            decode_choices.append("aiter")
+        else:
+            decode_note = (
+                " (aiter decode is accepted only on gfx950, for non-MLA models and "
+                "without speculative decoding)"
+            )
+
+    # A per-phase backend overrides --attention-backend for its phase. Unset (None)
+    # means the phase uses --attention-backend, which is checked below.
+    for flag, backend, choices, note in (
+        (
+            "--prefill-attention-backend",
+            prefill_backend,
+            DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
+            "",
+        ),
+        (
+            "--decode-attention-backend",
+            decode_backend,
+            decode_choices,
+            decode_note,
+        ),
+    ):
+        if backend is not None and backend not in choices:
             raise ValueError(
-                f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
-                f"but --{field.replace('_', '-')} is '{backend}'."
+                f"Currently only {choices} attention backends are supported for deterministic inference, "
+                f"but {flag} is '{backend}'{note}."
             )
 
     if view.attention_backend is None:
@@ -1536,7 +1560,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     # load with gate and up exchanged. Leave the backend at "auto" and let
     # create_moe_runner resolve it to ASCEND.
     if view.quantization == "mxfp8" and not get_platform().is_npu:
-        from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
+        from sglang.srt.arg_groups.choices import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
@@ -1713,7 +1737,7 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 @register_post_process
 def _gguf_quantization(view: Any) -> dict:
-    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+    from sglang.srt.utils.hf_transformers import check_gguf_file
 
     if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
         view.model_path
@@ -1958,7 +1982,7 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
     # model never loads an HF config) is honored as-is; otherwise the memo
     # is only kept once the record is resolved, because `page_size` below
     # is resolution-written.
-    from sglang.srt.arg_groups.overrides import model_config_of
+    from sglang.srt.arg_groups.model_override_base import model_config_of
 
     if not hasattr(server_args, "_mamba_cache_chunk_size"):
         try:

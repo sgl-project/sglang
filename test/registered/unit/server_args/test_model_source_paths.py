@@ -36,11 +36,11 @@ import unittest
 from unittest import mock
 
 import sglang.srt.connector as connector_module
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.model_path_hook import (
     handle_modelscope_paths,
     resolve_hf_gguf_model_path,
 )
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
@@ -93,7 +93,7 @@ class TestTheGgufArm(_ModelSourceCase):
             return resolved
 
         return mock.patch(
-            "sglang.srt.utils.hf_transformers_utils.resolve_hf_gguf_reference",
+            "sglang.srt.utils.hf_transformers.resolve_hf_gguf_reference",
             side_effect=_resolve,
         )
 

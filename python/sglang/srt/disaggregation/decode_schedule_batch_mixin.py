@@ -6,9 +6,10 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils.common import async_h2d
 
@@ -55,7 +56,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             out_cache_loc[offset : offset + req.extend_len] = chunk
             offset += req.extend_len
 
-            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+            seq_len = pre_alloc_fill_len(req)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
                 assert seq_len - pre_len == req.extend_len, (
@@ -126,7 +127,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     if req.grammar.current_token is None:
                         req.grammar.accept_token(req.output_ids[-1])
                 except ValueError as e:
-                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+                    from sglang.srt.managers.req_types import FINISH_ABORT
 
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
