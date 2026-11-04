@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import TopKConfig
 from sglang.srt.multimodal.dsv41 import vl_routing
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -35,11 +36,15 @@ def _moe(num_fused_shared, apply_scale_on_output):
         topk=SimpleNamespace(
             topk_config=TopKConfig(
                 top_k=TOP_K + num_fused_shared,
-                num_fused_shared_experts=num_fused_shared,
+                shared_experts=SharedExpertsConfig(
+                    num_fused_shared_experts=num_fused_shared
+                ),
                 renormalize=True,
                 routed_scaling_factor=1.5,
                 apply_routed_scaling_factor_on_output=apply_scale_on_output,
-            )
+            ),
+            # No EP dispatch and no bound token count outside a forward pass.
+            routing_inputs=lambda: (None, None),
         ),
         layer_id=0,
     )
@@ -54,7 +59,7 @@ def _dense(output, num_columns, num_valid):
 
 class TestDsv41VlRouter(CustomTestCase):
     def test_fused_router_matches_eager(self):
-        """Image rows use the VL bias and padded rows stay empty on both paths."""
+        """Image rows use the VL bias and padded rows carry no weight on both paths."""
         for num_tokens in (7, 1024):
             for num_fused_shared in (0, 1):
                 for apply_scale_on_output in (False, True):
@@ -90,8 +95,12 @@ class TestDsv41VlRouter(CustomTestCase):
             atol=1e-5,
             rtol=1e-5,
         )
+        # Padded rows carry no weight. Their ids are -1, except on ROCm, where
+        # _post_process_topk_ids refills them with 0 because the AITER MoE
+        # kernels cannot index with -1.
+        padded_id = 0 if torch.version.hip else -1
         for output in (fused, eager):
-            self.assertTrue((output.topk_ids[num_valid:] == -1).all())
+            self.assertTrue((output.topk_ids[num_valid:] == padded_id).all())
             self.assertTrue((output.topk_weights[num_valid:] == 0).all())
 
 
