@@ -75,7 +75,7 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
     model = "Qwen/Qwen3.5-0.8B"
     server_env = {
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK": "0",
-        "SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL": "0",
+        "SGLANG_TEST_MAMBA_LAZY_POOL_FULL": "0",
     }
     other_args = [
         "--skip-tokenizer-init",

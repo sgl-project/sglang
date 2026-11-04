@@ -292,10 +292,10 @@ def alloc_tracking_slots(
     A shortfall evicts cached states from the tree once; a candidate that still
     gets no slot is False, and its boundary writes no snapshot.
     """
-    if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-        return [False] * len(candidates)
-
-    shortfall = len(candidates) - state.slots.schedulable_available_size()
+    available = state.slots.schedulable_available_size()
+    if envs.SGLANG_TEST_MAMBA_LAZY_POOL_FULL.get():
+        available = 0
+    shortfall = len(candidates) - available
     if shortfall > 0 and tree_cache is not None and tree_cache.supports_mamba():
         tree_cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=shortfall))
     return [storage.take_tracking_slot(req, pos) for req, pos in candidates]
