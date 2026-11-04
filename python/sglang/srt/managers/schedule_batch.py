@@ -575,9 +575,9 @@ class Req(ReqDllmMixin):
         self.lora_id = lora_id
         self.routing_key = routing_key
 
-        # Lazy extra buffer + spec: skip the radix cache insert when the last
-        # verify may have scattered into the keep slot, so it no longer holds
-        # the state at mamba_last_track_seqlen.
+        # Lazy extra buffer + spec: False when the finishing verify wrote the
+        # keep slot or had no plan, so the keep slot may not hold the state at
+        # mamba_last_track_seqlen and the radix insert is skipped.
         self.mamba_lazy_checkpoint: bool = True
 
         # Check finish
@@ -1761,10 +1761,9 @@ def set_mamba_track_indices_from_reqs(
         mapping, batch.req_pool_indices, positions
     )
     if skipped_rows:
-        # Overlap can leave a request in TARGET_VERIFY after its Mamba state has
-        # been freed and reused by another request. The downstream scatter
-        # treats a negative destination as a no-op, while the old fallback to
-        # position 0 could overwrite the reused live slot.
+        # A row whose state was freed under overlap (and may already belong to
+        # another request) or that has no planned slot must scatter nothing;
+        # the scatter treats a negative destination as a no-op.
         batch.mamba_track_indices[skipped_rows] = -1
 
 
@@ -3070,17 +3069,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def mamba_lazy_prealloc_at_boundary(
         self, track_mask_cpu: torch.Tensor
     ) -> torch.Tensor:
-        """Allocate a temporary second ping-pong slot for reqs at a track boundary.
+        """Give each request at a track boundary a second ping-pong slot, so the
+        forward writes the new snapshot there and never into the keep slot;
+        mamba_lazy_post_decode_at_boundary frees the old one after the step.
 
-        In lazy mode each request normally holds only 1 ping-pong slot.
-        When seq_len hits a track interval boundary, we allocate the
-        second slot so the forward pass can write the new tracked state
-        there. The old slot is freed after the forward in
-        mamba_lazy_post_decode_at_boundary.
-
-        A req that still gets no slot after eviction has its bit cleared in the
-        returned track mask: no track state is written, and the keep slot keeps
-        the checkpoint at mamba_last_track_seqlen.
+        A request that gets no slot even after eviction has its bit cleared in
+        the returned track mask: nothing is written, and the keep slot keeps the
+        checkpoint at mamba_last_track_seqlen.
         """
         track_mask_cpu = track_mask_cpu.clone()
         rows = []
@@ -3116,15 +3111,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv.mamba_next_track_idx = 1 - next_idx
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
-        """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
+        """Spec counterpart of mamba_lazy_prealloc_at_boundary.
 
-        A crossing is only *possible* at prepare time (accept length is
-        unknown), so ensure the pending slot exists for reqs whose next
-        boundary is reachable, WITHOUT swapping mamba_next_track_idx; the
-        mask-gated commit writes it only on a real crossing, and
-        _mamba_lazy_spec_update promotes it afterwards. The per-req
-        scatter position is recorded on the batch and rides the result-queue
-        copy (forward isolation restores batch fields).
+        The accept length is unknown here, so a request whose next boundary is
+        reachable gets a pending slot without moving mamba_next_track_idx; the
+        verify writes it only on a real crossing, and _mamba_lazy_spec_update
+        promotes it. The per-request positions are stored on the batch, which
+        the result queue copies.
         """
         track_positions: List[int] = []
         rows = []
