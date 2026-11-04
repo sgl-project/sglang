@@ -92,6 +92,41 @@ class TestMuseGlimmerDetector(CustomTestCase):
         self.assertEqual(normal, "Need weather.")
         self.assert_streaming_matches(text)
 
+    def test_unframed_prose_before_tool_header_without_eom(self):
+        prose = "Let me check the weather."
+        for end in ("", "<|eot|>"):
+            text = (
+                f"{prose}<|start|>assistant to={DOUBLED}<|message|>"
+                f"{atem(DOUBLED, city='Paris')}{end}"
+            )
+            expected = (prose, [("get_weather", {"city": "Paris"})])
+            self.assertEqual(self.parse(text), expected)
+            chunks_to_check = ([text[:i], text[i:]] for i in range(len(text) + 1))
+            for chunks in (*chunks_to_check, list(text)):
+                with self.subTest(end=end, chunks=chunks):
+                    parser = FunctionCallParser(self.tools, "muse")
+                    normal, calls = [], []
+                    for chunk in chunks:
+                        content, new_calls = parser.parse_stream_chunk(chunk)
+                        normal.append(content)
+                        calls.extend(new_calls)
+                    content, new_calls = parser.parse_stream_end()
+                    normal.append(content)
+                    calls.extend(new_calls)
+                    self.assertEqual(
+                        (
+                            "".join(normal),
+                            [(c.name, json.loads(c.parameters)) for c in calls],
+                        ),
+                        expected,
+                    )
+
+    def test_channel_marker_inside_tool_argument_stays_literal(self):
+        value = "literal <|start|>assistant to=user<|message|> text"
+        text = f"<|start|>assistant to={DOUBLED}<|message|>{atem(DOUBLED, city=value)}"
+        self.assertEqual(self.parse(text), ("", [("get_weather", {"city": value})]))
+        self.assert_streaming_matches(text)
+
     def test_parallel_tool_calls(self):
         text = (
             f" to=self<|message|>Two cities.<|eom|>"
@@ -320,6 +355,29 @@ class TestMuseGlimmerDetector(CustomTestCase):
                 _, s_content, s_calls = self.pipeline_stream(raw, chunk_size)
                 self.assertEqual(s_calls, [])
                 self.assertIn("<atem:invoke", s_content)
+
+    def test_pipeline_unframed_preamble_without_eom(self):
+        raw = (
+            f"Let me check.<|start|>assistant to={DOUBLED}<|message|>"
+            f"{atem(DOUBLED, city='Paris')}<|eom|>"
+            "<|start|>assistant to=self<|message|>Found it.<|eom|>"
+            "<|start|>assistant to=user<|message|>It is sunny."
+        )
+        want_calls = [("get_weather", {"city": "Paris"})]
+        reasoning, normal = ReasoningParser(
+            "muse", tool_call_parser_active=True
+        ).parse_non_stream(raw)
+        content, calls = FunctionCallParser(self.tools, "muse").parse_non_stream(normal)
+        self.assertEqual(reasoning, "Found it.")
+        self.assertEqual(content, "Let me check.It is sunny.")
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in calls], want_calls
+        )
+        for size in (1, 2, 7, len(raw)):
+            self.assertEqual(
+                self.pipeline_stream(raw, size),
+                ("Found it.", "Let me check.It is sunny.", want_calls),
+            )
 
     def test_pipeline_preamble_before_tool_call_streams(self):
         """A real ``to=user`` message may precede the tool channel; its
