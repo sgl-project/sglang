@@ -16,12 +16,25 @@ _E8M0_ZERO = 2.0**-127
 
 
 @triton.jit
-def _row_values(row_addr, offs, mask, PACKED_FP4: tl.constexpr):
-    # fp32 values at columns `offs` of the rows starting at byte address `row_addr`.
-    # Packed rows hold two E2M1 values per byte, the even column in the low nibble.
-    if PACKED_FP4:
+def _dequant_rows(
+    w_base,
+    s_base,
+    row,
+    offs,
+    mask,
+    DIM: tl.constexpr,
+    BLK: tl.constexpr,
+    E8M0_ZERO: tl.constexpr,
+    MXFP4: tl.constexpr,
+):
+    # Dequantized fp32 values at columns `offs` of table rows `row`, whose payload
+    # and e8m0 scales start at byte addresses `w_base` and `s_base`. MXFP4 rows
+    # hold two E2M1 values per byte, the even column in the low nibble.
+    if MXFP4:
         byte = tl.load(
-            (row_addr + offs // 2).to(tl.pointer_type(tl.uint8)), mask=mask, other=0
+            (w_base + row * (DIM // 2) + offs // 2).to(tl.pointer_type(tl.uint8)),
+            mask=mask,
+            other=0,
         ).to(tl.int32)
         nib = tl.where(offs % 2 == 0, byte & 0xF, byte >> 4)
         # Magnitude code m: 0 -> 0.0, 1 -> 0.5 (fp32 bits 252 << 22), and for
@@ -32,9 +45,29 @@ def _row_values(row_addr, offs, mask, PACKED_FP4: tl.constexpr):
         vals = (bits | ((nib & 0x8) << 28)).to(tl.float32, bitcast=True)
     else:
         vals = tl.load(
-            (row_addr + offs).to(tl.pointer_type(tl.float8e4nv)), mask=mask, other=0.0
+            (w_base + row * DIM + offs).to(tl.pointer_type(tl.float8e4nv)),
+            mask=mask,
+            other=0.0,
         ).to(tl.float32)
-    return vals
+    exps = tl.load(
+        (s_base + row * (DIM // BLK) + offs // BLK).to(tl.pointer_type(tl.uint8)),
+        mask=mask,
+        other=0,
+    ).to(tl.int32)
+    # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
+    scale = (exps << 23).to(tl.float32, bitcast=True)
+    scale = tl.where(exps == 0, E8M0_ZERO, scale)
+    return vals * scale
+
+
+def unpack_mxfp4_rows(packed: torch.Tensor) -> torch.Tensor:
+    """[..., dim // 2] uint8 E2M1 pairs (even column in the low nibble) ->
+    [..., dim] e4m3, bit-exact: the torch twin of the MXFP4 decode above."""
+    nibble = torch.stack([packed & 0xF, packed >> 4], dim=-1).flatten(-2)
+    # E2M1 magnitudes 0, 0.5, 1, ..., 6 in e4m3: 0x00, 0x30, then 4 * m + 48.
+    magnitude = nibble & 0x7
+    bits = torch.where(magnitude >= 2, magnitude * 4 + 48, magnitude * 48)
+    return (bits | ((nibble & 0x8) << 4)).view(torch.float8_e4m3fn)
 
 
 @triton.jit
@@ -50,7 +83,7 @@ def _engram_gather_kernel(
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
     HAS_DST: tl.constexpr,
-    PACKED_FP4: tl.constexpr,
+    MXFP4: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -59,17 +92,19 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    row_bytes = DIM // 2 if PACKED_FP4 else DIM
-    s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = _row_values(w_ptr.to(tl.int64) + local * row_bytes, offs, owned, PACKED_FP4)
-    exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
-        tl.int32
+    vals = _dequant_rows(
+        w_ptr.to(tl.int64),
+        s_ptr.to(tl.int64),
+        local,
+        offs,
+        owned,
+        DIM,
+        BLK,
+        E8M0_ZERO,
+        MXFP4,
     )
-    # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
-    scale = (exps << 23).to(tl.float32, bitcast=True)
-    scale = tl.where(exps == 0, E8M0_ZERO, scale)
-    out = tl.where(owned, vals * scale, 0.0)
+    out = tl.where(owned, vals, 0.0)
     tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
 
 
@@ -83,11 +118,11 @@ def engram_gather(
     row_lo: int = 0,
     row_hi: int = 2**62,
     sort_ids: bool = False,
-    packed_fp4: bool = False,
+    mxfp4: bool = False,
 ) -> torch.Tensor:
     """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
 
-    ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes, or with ``packed_fp4``
+    ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes, or with ``mxfp4``
     [rows, dim // 2] bytes of E2M1 pairs (even column in the low nibble), and
     ``scale_ptr`` [rows, dim // block_size] e8m0 bytes for global rows
     [row_lo, row_hi); both may live in device or host memory. Ids outside the
@@ -121,7 +156,7 @@ def engram_gather(
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
             HAS_DST=dst is not None,
-            PACKED_FP4=packed_fp4,
+            MXFP4=mxfp4,
         )
     return out
 
@@ -140,7 +175,7 @@ def _engram_gather_peer_kernel(
     ROWS: tl.constexpr,
     LOG2_WORLD: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
-    PACKED_FP4: tl.constexpr,
+    MXFP4: tl.constexpr,
 ):
     tok = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -154,19 +189,21 @@ def _engram_gather_peer_kernel(
         start = tl.load(starts_ptr + probe)
         owner = tl.where(start <= idx, probe, owner)
     # Bases are pre-biased by each shard's first row, so a global id indexes them.
-    row_bytes = DIM // 2 if PACKED_FP4 else DIM
-    w_row = tl.load(w_bias_ptr + owner) + idx * row_bytes
-    s_row = tl.load(s_bias_ptr + owner) + idx * (DIM // BLK)
     offs = tl.arange(0, DIM)
-    s = (s_row[:, None] + (offs // BLK)[None, :]).to(tl.pointer_type(tl.uint8))
     mask = col_ok[:, None]
-    vals = _row_values(w_row[:, None], offs[None, :], mask, PACKED_FP4)
-    exps = tl.load(s, mask=mask, other=0).to(tl.int32)
-    scale = (exps << 23).to(tl.float32, bitcast=True)
-    scale = tl.where(exps == 0, E8M0_ZERO, scale)
+    out = _dequant_rows(
+        tl.load(w_bias_ptr + owner)[:, None],
+        tl.load(s_bias_ptr + owner)[:, None],
+        idx[:, None],
+        offs[None, :],
+        mask,
+        DIM,
+        BLK,
+        E8M0_ZERO,
+        MXFP4,
+    )
     # -0 becomes +0, as the zero-fill + sum of the sharded lookup leaves it, so the
     # two lookups agree bit for bit.
-    out = vals * scale
     out = tl.where(out == 0.0, 0.0, out)
     dst = out_ptr + (tok * n_cols + cols)[:, None].to(tl.int64) * DIM + offs[None, :]
     tl.store(dst, out.to(tl.bfloat16), mask=mask)
@@ -180,7 +217,7 @@ def engram_gather_peer(
     starts: torch.Tensor,
     dim: int,
     block_size: int,
-    packed_fp4: bool = False,
+    mxfp4: bool = False,
 ) -> torch.Tensor:
     """Gather ``ids`` ([T, C] int, unit column stride) into ``out`` ([T, C, dim]
     bf16, contiguous), reading each id from the shard that owns it.
@@ -189,7 +226,7 @@ def engram_gather_peer(
     padded with int64 max; ``w_bias`` / ``s_bias`` ([P] int64) are each shard's
     row / e8m0 scale base address minus its first row's offset, so any rank's
     shard (local or a peer mapping over NVLink) is addressed by the global id.
-    Rows are fp8 e4m3, or with ``packed_fp4`` E2M1 pairs as in ``engram_gather``.
+    Rows are fp8 e4m3, or with ``mxfp4`` E2M1 pairs as in ``engram_gather``.
     """
     assert ids.dim() == 2 and ids.stride(1) == 1, (ids.shape, ids.stride())
     assert ids.dtype in (torch.int32, torch.int64)
@@ -213,7 +250,7 @@ def engram_gather_peer(
             ROWS=rows,
             LOG2_WORLD=world.bit_length() - 1,
             E8M0_ZERO=_E8M0_ZERO,
-            PACKED_FP4=packed_fp4,
+            MXFP4=mxfp4,
             num_warps=4,
         )
     return out
