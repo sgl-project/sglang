@@ -11,7 +11,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn as causal_conv1d_fn_triton,
 )
-from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_update,
+)
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
