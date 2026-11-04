@@ -3503,14 +3503,6 @@
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 50
         },
-        "flux2_modelopt_fp8_t2i": {
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
-            "estimated_full_test_time_s": 498.1
-        },
         "wan22_modelopt_fp8_t2v": {
             "expected_load_ms": 63380.1,
             "stages_ms": {},

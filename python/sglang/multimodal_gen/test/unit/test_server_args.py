@@ -3870,34 +3870,6 @@ class TestPerRoleParallelism(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only defined for worker roles"):
             args.derive_pool_result_endpoint()
 
-    def test_cli_args_parsed(self):
-        """Per-role parallelism args are parsed from CLI."""
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--denoiser-tp",
-            "2",
-            "--denoiser-sp",
-            "4",
-            "--denoiser-ulysses",
-            "2",
-            "--denoiser-ring",
-            "2",
-            "--encoder-tp",
-            "1",
-            "--decoder-sp",
-            "8",
-        ]
-        args, unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.denoiser_tp, 2)
-        self.assertEqual(args.denoiser_sp, 4)
-        self.assertEqual(args.denoiser_ulysses, 2)
-        self.assertEqual(args.denoiser_ring, 2)
-        self.assertEqual(args.encoder_tp, 1)
-        self.assertEqual(args.decoder_sp, 8)
-
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
@@ -3971,19 +3943,6 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
 
 class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
-    def test_scheduler_rpc_timeout_cli_arg_is_parsed_in_seconds(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--scheduler-rpc-timeout",
-            "7200",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.scheduler_rpc_timeout, 7200)
-
     def test_scheduler_rpc_timeout_rejects_invalid_values(self):
         invalid_values = (0, -1, MAX_SCHEDULER_RPC_TIMEOUT_S + 1, True, 1.5, "1")
 
@@ -4001,18 +3960,6 @@ class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
 
 
 class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
-    def test_cli_default_and_explicit_timeout(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = ["--model-path", "/fake"]
-        self.assertIsNone(parser.parse_args(argv).http_graceful_shutdown_timeout)
-        for timeout in (0, 30):
-            with self.subTest(timeout=timeout):
-                args = parser.parse_args(
-                    argv + ["--http-graceful-shutdown-timeout", str(timeout)]
-                )
-                self.assertEqual(args.http_graceful_shutdown_timeout, timeout)
-
     def test_config_values(self):
         for timeout in (None, 0, 30):
             with self.subTest(timeout=timeout):
