@@ -50,11 +50,8 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
-    BatchVariant,
-    Layout,
     ReadoutFusion,
     SumGroup,
-    TokenAxis,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -69,11 +66,6 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
-)
-from sglang.srt.layers.layer_boundary.row_transport import (
-    ComputeTransport,
-    RowTransport,
-    TransportRows,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -308,29 +300,6 @@ def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
         get_parallel().enable_cp_tp_group_sharing
         and forward_batch.attn_cp_metadata is not None
         and is_cp_active(forward_batch)
-    )
-
-
-class _K3LatentMoETransport(ComputeTransport):
-    """The latent MoE moves its narrow expert operand and returns local rows."""
-
-    def __init__(self, hidden_states, batch, context, rows, overlapped_rows):
-        self.rows = rows
-        self.input = hidden_states
-
-    def release(self):
-        self.input = None
-
-
-def _latent_moe_transport():
-    full = Layout(frozenset())
-    shard = Layout(frozenset({TokenAxis.ATTN_CP}))
-    return RowTransport(
-        {
-            BatchVariant.ORDINARY: TransportRows(full, full, full),
-            BatchVariant.CONTEXT_PARALLEL: TransportRows(shard, shard, shard),
-        },
-        _K3LatentMoETransport,
     )
 
 
@@ -2619,6 +2588,14 @@ def _stage_facts(
         and is_moe
         and _uses_latent_moe(config)
     )
+    if latent_cp:
+        # K3 owns the latent MoE's expert gather and reduction. The boundary
+        # sees a complete local FFN; CP-TP sharing makes attention TP size one.
+        dense_tp_size = 1
+    elif is_moe:
+        dense_tp_size = None
+    else:
+        dense_tp_size = resolve_linear_parallel_group(_dense_mlp_parallel_group())[1]
     return (
         declare_attn(
             **attn_ops,
@@ -2632,18 +2609,12 @@ def _stage_facts(
         ),
         declare_ffn(
             **ffn_ops,
-            row_transport=_latent_moe_transport() if latent_cp else None,
-            sparse=is_moe,
+            sparse=is_moe and not latent_cp,
             next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
-            # The TP width the dense MLP is built with.
-            dense_tp_size=(
-                None
-                if is_moe
-                else resolve_linear_parallel_group(_dense_mlp_parallel_group())[1]
-            ),
+            dense_tp_size=dense_tp_size,
             # A latent MoE completes its output sum together with
             # the latent reduction its norm needs.
-            output_complete=is_moe and _uses_latent_moe(config) and not latent_cp,
+            output_complete=is_moe and _uses_latent_moe(config),
         ),
     )
 
@@ -2846,20 +2817,17 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        if self.ffn_boundary.declaration.row_transport is not None:
-            with self.ffn_boundary.exit(forward_batch) as output:
-                return output.finish(
-                    self.mlp(
-                        hidden_states,
-                        forward_batch=forward_batch,
-                        prefix_sum=(
-                            residual_batch.written_residual(forward_batch)
-                            if self._ffn_writes_stream
-                            else None
-                        ),
-                    )
-                )
-        if self._ffn_writes_stream:
+        if self._is_moe_layer and self.mlp.use_latent_moe:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch=forward_batch,
+                prefix_sum=(
+                    residual_batch.written_residual(forward_batch)
+                    if self._ffn_writes_stream
+                    else None
+                ),
+            )
+        elif self._ffn_writes_stream:
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=residual_batch.written_residual(forward_batch),

@@ -15,18 +15,21 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 
-_KIMI_K3_MODELS = {"KimiK3LinearForCausalLM", "KimiK3ForConditionalGeneration"}
-_COLLOCATED_MODELS = {"Qwen3NextForCausalLM", "KimiLinearForCausalLM"} | _KIMI_K3_MODELS
-
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
 # MoE and linear attention keep their TP partition (the linear attention
 # gathers the sequence where its recurrence needs it). Model ports register
 # here; every other model keeps the ordinary prefill CP path.
 _SUPPORTED_MODELS: set[str] = {
+    # GLM
     "Glm5NextForConditionalGeneration",
+    # Qwen
     "Qwen4ExpForConditionalGeneration",
-} | _COLLOCATED_MODELS
+    # Kimi
+    "KimiLinearForCausalLM",
+    "KimiK3LinearForCausalLM",
+    "KimiK3ForConditionalGeneration",
+}
 
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
@@ -40,6 +43,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 f"Linear-attention prefill CP is not integrated with {architecture}."
             )
         return
+    is_kimi = architecture.startswith("Kimi")
     # Attention DP or attention TP would leave the CP group narrower than TP.
     if view.attn_cp_size != cfg.tp_size:
         raise ValueError(
@@ -79,10 +83,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
         "attn-dp-size > 1": view.attn_dp_size > 1,
     }
-    if (
-        architecture == "Qwen4ExpForConditionalGeneration"
-        or architecture in _COLLOCATED_MODELS
-    ):
+    if architecture == "Qwen4ExpForConditionalGeneration" or is_kimi:
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.
@@ -93,7 +94,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
-        if architecture in _COLLOCATED_MODELS:
+        if is_kimi:
             unsupported["disaggregation-mode != null"] = (
                 cfg.disaggregation_mode != "null"
             )
@@ -121,7 +122,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         )
 
     linear_config = mambaish_config(model)
-    if architecture in _KIMI_K3_MODELS:
+    if architecture.startswith("KimiK3"):
         prefill_backend, _ = attention_backends_of(view)
         if prefill_backend not in ("fa3", "fa4"):
             raise ValueError(

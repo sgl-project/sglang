@@ -20,16 +20,10 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
-from sglang.srt.layers.cp.utils import (
-    cp_gather_after_forward,
-    cp_split_before_forward,
-    is_cp_active,
-)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
-    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -65,13 +59,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import (
-    get_parallel,
-    get_stream,
-    linear_attn_parallel_group,
-    linear_attn_tp_rank,
-    linear_attn_tp_size,
-)
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -140,11 +128,8 @@ class Qwen3GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # CP ranks own additional linear-attention head shards. Retain the
-        # same group in projections and loaders as in the boundary's sum.
-        parallel_group = linear_attn_parallel_group()
-        self.attn_tp_rank = linear_attn_tp_rank()
-        self.attn_tp_size = linear_attn_tp_size()
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -174,7 +159,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
-            parallel_group=parallel_group,
+            parallel_group="attn_tp",
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -186,7 +171,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
-            parallel_group=parallel_group,
+            parallel_group="attn_tp",
         )
 
         self.in_proj_ba = MergedColumnParallelLinear(
@@ -195,7 +180,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
-            parallel_group=parallel_group,
+            parallel_group="attn_tp",
         )
 
         # Override weight_loader for packed checkpoint format.
@@ -235,11 +220,11 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
         )
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
         )
         self.norm = (
             RMSNormGated(
@@ -274,7 +259,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             input_is_parallel=True,
             reduce_results=False,
-            parallel_group=parallel_group,
+            parallel_group="attn_tp",
             prefix=add_prefix("out_proj", prefix),
         )
 
@@ -584,17 +569,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(
-                    tp_group=(
-                        SumGroup.TP
-                        if linear_attn_parallel_group() == "tp"
-                        else SumGroup.ATTN_TP
-                    ),
-                    in_token_order=True,
-                ),
-                self.input_layernorm,
-            ),
+            (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
@@ -1002,13 +977,6 @@ class Qwen3NextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual_batch.start(forward_batch)
-        cp_active = get_parallel().enable_cp_tp_group_sharing and is_cp_active(
-            forward_batch
-        )
-        if cp_active:
-            hidden_states, positions = cp_split_before_forward(
-                hidden_states, positions, forward_batch
-            )
         aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -1028,12 +996,6 @@ class Qwen3NextModel(nn.Module):
             hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.norm
             )
-        if cp_active:
-            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
-            aux_hidden_states = [
-                cp_gather_after_forward(hidden, forward_batch)
-                for hidden in aux_hidden_states
-            ]
 
         if len(aux_hidden_states) == 0:
             return hidden_states

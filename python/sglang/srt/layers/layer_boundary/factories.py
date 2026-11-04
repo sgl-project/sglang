@@ -658,14 +658,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             rows.decode_group, SumGroup
         ):
             raise TypeError("operand transport requires a declared decode SumGroup")
-        # A token-order attention leaves full-row partials. The consumer's
-        # entry completes the sum onto the residual's CP rows before the read.
-        source_matches = rows.source == arrival.produced.layout or (
-            variant is BatchVariant.CONTEXT_PARALLEL
-            and arrival.produced.in_token_order
-            and rows.source == arrival.residual
-        )
-        if not source_matches or rows.returned != rows.source:
+        if rows.source != arrival.produced.layout or rows.returned != rows.source:
             raise NotImplementedError("compute transport must return its source rows")
         declaration = StageContract(
             InputContract(rows.source, read=stage.read),
