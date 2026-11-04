@@ -256,6 +256,7 @@ def _uses_flat_entry_layout(
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
+    supports_page_sharded_dcp = True
 
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
@@ -1592,6 +1593,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: Optional[int] = None,
         draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
+        src_page_positions: Optional[npt.NDArray[np.int64]] = None,
     ) -> int:
         """``dsa_index_k``: (source, destination buffers, page bytes) of a DSA
         index-K the decode shards by token like its KV (Kimi-K3.1); its rows
@@ -1633,6 +1635,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dcp_size=dst_dcp_size,
             dcp_rank=dst_dcp_rank,
             src_page_offset=src_page_offset,
+            src_page_positions=src_page_positions,
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
             draft_rows_collapsed=draft_rows_collapsed,
@@ -2214,6 +2217,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                if self.kv_shard_size > 1 and target_rank_registration_info is not None:
+                    # Every page owner sends KV/indexer state, but KDA heads
+                    # retain their TP placement. Only overlapping head ranges
+                    # may write this decode rank's request slot. This matters
+                    # even at equal TP sizes, where the ordinary path copied
+                    # whole slots assuming bootstrap had selected one sender.
+                    src_tp = self.state_tp_size
+                    dst_tp = target_rank_registration_info.dst_attn_tp_size
+                    src_rank = self.kv_args.engine_rank % src_tp
+                    dst_rank = target_rank_registration_info.dst_tp_rank % dst_tp
+                    if max(src_rank * dst_tp, dst_rank * src_tp) >= min(
+                        (src_rank + 1) * dst_tp, (dst_rank + 1) * src_tp
+                    ):
+                        continue
                 if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
                     src_item_lens
                 ) != list(dst_item_lens):
@@ -2901,7 +2918,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dcp_token_item_lens=dcp_token_item_lens,
                                 dst_dcp_size=target_rank_registration_info.dst_dcp_size,
                                 dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
-                                src_page_offset=kv_chunk.index_slice.start or 0,
+                                src_page_offset=(
+                                    kv_chunk.src_page_offset
+                                    if kv_chunk.src_page_offset is not None
+                                    else kv_chunk.index_slice.start or 0
+                                ),
+                                **(
+                                    {"src_page_positions": kv_chunk.index_slice}
+                                    if isinstance(kv_chunk.index_slice, np.ndarray)
+                                    else {}
+                                ),
                                 decode_prefix_len=req.decode_prefix_len or 0,
                                 num_kv_tokens=kv_chunk.num_kv_tokens,
                                 executor=executor,
@@ -3317,6 +3343,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         *,
+        src_page_offset: Optional[int] = None,
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
@@ -3358,6 +3385,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                src_page_offset=src_page_offset,
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,

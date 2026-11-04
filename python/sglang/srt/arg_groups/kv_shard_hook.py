@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
@@ -18,6 +19,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
     is_deepseek_dsa,
+    is_kimi_k31,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -27,9 +29,26 @@ from sglang.srt.utils.common import get_device_memory_capacity
 logger = logging.getLogger(__name__)
 
 
+def _is_kimi_cp(server_args, cfg) -> bool:
+    return getattr(cfg, "disaggregation_mode", None) in (
+        "null",
+        "prefill",
+    ) and is_kimi_k31(model_config_of(server_args).hf_config)
+
+
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    if _is_kimi_cp(server_args, cfg):
+        if prefill_backend != "dsa" or (
+            cfg.dsa_prefill_backend != "trtllm" or cfg.dsa_decode_backend != "trtllm"
+        ):
+            raise ValueError(
+                "Kimi KV sharding requires DSA with TRTLLM prefill and decode."
+            )
+        if cfg.kv_cache_dtype != "fp8_e4m3" or cfg.page_size != 64:
+            raise ValueError("Kimi KV sharding requires fp8_e4m3 KV and page size 64.")
+        return
     if prefill_backend == "dsa":
         hf_config = model_config_of(server_args).hf_config
         if (
@@ -90,19 +109,26 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
     if not cfg.enable_kv_cache_sharding:
         return
 
+    if not math.isfinite(cfg.kv_cache_sharding_scratch_size) or (
+        cfg.kv_cache_sharding_scratch_size <= 0
+    ):
+        raise ValueError("--kv-cache-sharding-scratch-size must be positive and finite")
+
     if gpu_mem is None:
         # `handle_gpu_memory_settings` resolves capacity internally now, so the
         # pipeline no longer threads it through. Only the chunk-size rounding
         # below reads it, and only when mem_fraction_static was left unset.
         gpu_mem = get_device_memory_capacity(cfg.device)
 
-    if cfg.disaggregation_mode != "prefill":
+    kimi_cp = _is_kimi_cp(server_args, cfg)
+    if cfg.disaggregation_mode != "prefill" and not kimi_cp:
         raise ValueError(
             "--enable-kv-cache-sharding is only supported on PD prefill "
-            "workers: a rank's pool holds only its stripe of every cached "
-            "page, which is incompatible with local decode."
+            "workers or standalone Kimi-K3.1 with interleave PCP and DSA."
         )
-    if cfg.speculative_algorithm is not None:
+    if cfg.speculative_algorithm is not None and not (
+        kimi_cp and cfg.speculative_algorithm == "DFLASH"
+    ):
         model_config = model_config_of(server_args)
         # PP1 is checked once by the DSA backend gate below.
         if (
@@ -232,6 +258,33 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "before the scratch translation."
         )
 
+    if kimi_cp:
+        if cfg.speculative_algorithm != "DFLASH":
+            raise ValueError("Kimi PCP KV sharding currently requires DFlash.")
+        if (
+            cfg.disaggregation_mode == "prefill"
+            and not envs.SGLANG_DFLASH_DRAFT_KV_RING.get()
+        ):
+            raise ValueError(
+                "Kimi PCP KV sharding on PD prefill requires the draft KV ring; "
+                "unsharded full draft KV cannot use the target's page-owner send indices."
+            )
+        if (
+            not cfg.enable_prefill_cp
+            or cfg.attn_cp_size != cfg.tp_size
+            or cfg.tp_size <= 1
+            or cfg.attn_dp_size != 1
+            or cfg.pp_size != 1
+            or cfg.cp_strategy != "interleave"
+        ):
+            raise ValueError(
+                "Kimi KV sharding requires interleave PCP across TP ranks, without DP/PP."
+            )
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError(
+                "Kimi KV sharding supports HiCache L2 only, without L3 storage."
+            )
+
     validate_kv_shard_attention_backend(server_args, cfg)
     if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
         raise ValueError(
@@ -325,14 +378,22 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     graph_config = cfg.cuda_graph_config
-    if graph_config.prefill.backend != Backend.DISABLED:
+    if kimi_cp:
+        graph_config = cfg.cuda_graph_config
+        for phase in (Phase.PREFILL, Phase.DECODE):
+            if getattr(graph_config, phase).backend != Backend.DISABLED:
+                graph_config = with_phase(
+                    graph_config, phase, backend=Backend.BREAKABLE
+                )
+        declarations["cuda_graph_config"] = graph_config
+    elif cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
         logger.warning(
             "Prefill CUDA graph (%s) is incompatible with "
             "--enable-kv-cache-sharding; disabling it.",
             cfg.cuda_graph_config.prefill.backend,
         )
         graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
-    if cfg.speculative_algorithm is not None:
+    if cfg.speculative_algorithm is not None and not kimi_cp:
         # P-side draft-extend uses the request's shard plan; ordinary speculative
         # graph capture has neither that plan nor logical-page allocations.
         graph_config = with_phase(graph_config, Phase.DECODE, backend=Backend.DISABLED)

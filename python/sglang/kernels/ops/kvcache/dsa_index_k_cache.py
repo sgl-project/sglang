@@ -267,8 +267,9 @@ def _set_k_and_s_triton_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, k)
-    tl.store(buf_fp32_ptr + out_s_offset, k_scale)
+    # Negative locations are masked writes (e.g. another page owner's rows).
+    tl.store(buf_fp8_ptr + out_k_offsets, k, mask=loc >= 0)
+    tl.store(buf_fp32_ptr + out_s_offset, k_scale, mask=loc >= 0)
 
 
 def _get_k_and_s_triton(

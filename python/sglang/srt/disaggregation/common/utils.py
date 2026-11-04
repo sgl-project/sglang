@@ -20,7 +20,7 @@ class TransferKVChunk:
 
     room: int
     prefill_kv_indices: npt.NDArray[np.int32]
-    index_slice: slice
+    index_slice: Union[slice, npt.NDArray[np.int64]]
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
@@ -35,6 +35,8 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # Logical chunk start before page-owner filtering; index_slice may be sparse.
+    src_page_offset: Optional[int] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
@@ -181,6 +183,7 @@ def build_dcp_token_transfer_plan(
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
     draft_rows_collapsed: bool = False,
+    src_page_positions: Optional[npt.NDArray[np.int64]] = None,
 ) -> DCPTokenTransferPlan:
     """Rows to copy for one decode DCP rank.
 
@@ -197,6 +200,39 @@ def build_dcp_token_transfer_plan(
             "PD DCP transfer requires decode_prefix_len to align to the virtual "
             f"DCP page size ({virtual_page_size}), got {decode_prefix_len}"
         )
+    if src_page_positions is not None:
+        # A page-sharded sender owns sparse sequence positions, stored at compact
+        # local page IDs. num_kv_tokens still bounds the ORIGINAL unfiltered chunk.
+        positions = np.asarray(src_page_positions, dtype=np.int64)
+        if positions.shape != src_pages.shape or positions.ndim != 1:
+            raise ValueError("DCP source page positions must match source page IDs")
+        if num_kv_tokens is None or num_kv_tokens < 0:
+            raise ValueError("Sharded DCP transfer requires a nonnegative token count")
+        relative = (positions - src_page_offset) * physical_page_size
+        if np.any(relative < 0) or np.any(relative >= num_kv_tokens):
+            raise ValueError("DCP source page position is outside the original chunk")
+        if np.any(np.diff(positions) <= 0):
+            raise ValueError("DCP source page positions must be strictly increasing")
+        offsets = np.arange(physical_page_size, dtype=np.int64)
+        valid = relative[:, None] + offsets < num_kv_tokens
+        logical = (positions[:, None] * physical_page_size + offsets)[valid]
+        source = (src_pages[:, None] * physical_page_size + offsets)[valid]
+        owned = (decode_prefix_len + logical) % dcp_size == dcp_rank
+        target_local = logical[owned] // dcp_size
+        target_src = source[owned]
+        target_dst = (
+            dst_pages[target_local // physical_page_size] * physical_page_size
+            + target_local % physical_page_size
+        )
+        if draft_rows_collapsed:
+            return DCPTokenTransferPlan(
+                target_src, target_dst, target_src.copy(), target_dst.copy()
+            )
+        draft_dst = (
+            dst_pages[logical // virtual_page_size] * virtual_page_size
+            + logical % virtual_page_size
+        )
+        return DCPTokenTransferPlan(target_src, target_dst, source, draft_dst)
     if num_kv_tokens is None:
         num_kv_tokens = src_pages.size * physical_page_size
     if num_kv_tokens == 0:

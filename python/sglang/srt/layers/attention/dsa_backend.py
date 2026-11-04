@@ -699,6 +699,8 @@ class DeepseekSparseAttnBackend(
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        if self._kv_shard_pool is not None:
+            self.needs_cpu_seq_lens = True
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -1336,6 +1338,11 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self._kv_shard_pool is not None:
+            if in_capture:
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
+            self.init_forward_metadata(forward_batch)
+            return
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1377,7 +1384,10 @@ class DeepseekSparseAttnBackend(
         ]
 
         kv_shard_extend = self._kv_shard_pool is not None and prepare_kv_shard_forward(
-            self._kv_shard_pool, self.req_to_token, forward_batch
+            self._kv_shard_pool,
+            self.req_to_token,
+            forward_batch,
+            draft_token_num=draft_token_num,
         )
         indexer_logical_page_table = None
 
@@ -1642,6 +1652,12 @@ class DeepseekSparseAttnBackend(
             # require SPLIT_KV = 256; this is independent of the cache page size.
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
+            )
+
+        if kv_shard_extend and indexer_logical_page_table is None:
+            indexer_logical_page_table = self._transform_table_1_to_real(page_table)
+            page_table = self._kv_shard_pool.translate_loc_to_scratch(page_table).to(
+                page_table.dtype
             )
 
         metadata = DSAMetadata(

@@ -804,6 +804,7 @@ class MoriKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         *,
+        src_page_offset: Optional[int] = None,
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx=None,
@@ -833,6 +834,7 @@ class MoriKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                src_page_offset=src_page_offset,
                 wait_event=wait_event,
             )
         )

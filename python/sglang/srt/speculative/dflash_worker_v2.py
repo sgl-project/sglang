@@ -3962,6 +3962,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
             kv_loc_plan=kv_loc_plan,
         )
 

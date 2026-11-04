@@ -204,6 +204,9 @@ def build_replay_fb_view(
         batch_size=bs,
         forward_mode=capture_forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
+        # Eager DSA graph breaks run the common KV-layout helper on this
+        # view. Decode/verify have no prefill context-parallel layout.
+        attn_cp_metadata=None,
         input_ids=buffers.input_ids[:num_tokens],
         positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
@@ -221,7 +224,14 @@ def build_replay_fb_view(
         max_seq_len_host=forward_batch.max_seq_len_host,
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
-        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        # Sharded DSA breaks execute eager cache stores for every captured row.
+        # Their locations must include the same padding as q/k, not the raw
+        # batch's shorter tensor. Draft scope disables KV sharding.
+        out_cache_loc=(
+            buffers.out_cache_loc[:num_tokens]
+            if get_parallel().enable_kv_cache_sharding
+            else getattr(forward_batch, "out_cache_loc", None)
+        ),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         kv_loc_plan=forward_batch.kv_loc_plan,
         kv_loc_cols=forward_batch.kv_loc_cols,

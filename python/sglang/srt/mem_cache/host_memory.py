@@ -75,7 +75,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         else:
             continue
         if ".." in relative.parts:
-            raise ValueError(f"Cannot resolve cgroup memory path: {membership}")
+            raise RuntimeError(f"Cannot resolve cgroup memory path: {membership}")
         directory = mount / relative
         if not directory.is_dir():
             continue

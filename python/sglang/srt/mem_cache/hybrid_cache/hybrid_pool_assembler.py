@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerHostPoolBuilder
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
@@ -252,6 +253,48 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _reserve_dsa_indexer_host_size(
+    kv_host_size: float, config: HostPoolGroupConfig
+) -> float:
+    """Keep declared DSA index buffers inside the explicit KV budget.
+
+    Host rows include packed drafts and only locally owned index layers.
+    Device allocation sizes are unsuitable here: KV sharding changes device
+    capacity without changing the host row format.
+    """
+    index_bytes = 0
+    for entry in config.pools[1:]:
+        decl = entry.decl
+        if not isinstance(decl.host_pool_builder, DSAIndexerHostPoolBuilder):
+            continue
+        pool = decl.device_pool
+        start, end = (
+            pool._owned_local_layer_range()
+            if pool.layer_shard_enabled
+            else (0, pool.layer_num)
+        )
+        layers = sum(
+            decl.owned_device_layers is None or layer in decl.owned_device_layers
+            for layer in range(start, end)
+        ) + len(entry.packed_draft_device_pools)
+        index_bytes += decl.storage_info.bytes_per_token_per_layer * layers
+    if not index_bytes:
+        return kv_host_size
+    root = config.pools[0]
+    pool = root.decl.device_pool
+    target_layers = (
+        (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+        if pool.layer_shard_enabled
+        else pool.layer_num
+    )
+    kv_bytes = (
+        pool.kv_cache_dim
+        * pool.store_dtype.itemsize
+        * (target_layers + len(root.packed_draft_device_pools))
+    )
+    return kv_host_size * kv_bytes / (kv_bytes + index_bytes)
 
 
 def build_pool_entry(
@@ -1320,6 +1363,8 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+        if use_mla:
+            kv_host_size = _reserve_dsa_indexer_host_size(kv_host_size, config)
     if qsa_pool is not None and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
         index_bytes = sum(

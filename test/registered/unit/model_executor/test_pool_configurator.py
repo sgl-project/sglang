@@ -103,6 +103,7 @@ def _make_model_runner(
     mr.end_layer = num_layers
     mr.dp_size = 1
     mr.page_size = page_size
+    mr.kv_shard_size = 1
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
     mr.sliding_window_size = sliding_window_size
@@ -261,7 +262,7 @@ class TestDefaultConfigurator(CustomTestCase):
         _, _, config = self._run(available, page_size=128)
         self.assertEqual(config.max_total_num_tokens % 128, 0)
 
-    def test_eight_context_scratch_is_reserved_before_kv_pool_sizing(self):
+    def test_byte_budget_scratch_is_reserved_before_kv_pool_sizing(self):
         page_size = 16
         mr = _make_model_runner(
             self,
@@ -282,15 +283,21 @@ class TestDefaultConfigurator(CustomTestCase):
                 prefill_max_requests=1,
                 chunked_prefill_size=1024,
                 max_running_requests=1,
+                kv_cache_sharding_scratch_size=0.0625,
             ),
         ):
             spec = make_page_shard_spec(mr)
-            # Each context rounds to 8256 tokens, a 64-token gather multiple,
-            # even with request limits of one. Only the prefix is multiplied.
-            self.assertEqual(spec.max_prefix_tokens, 8 * 8256)
-            self.assertEqual(spec.chunk_tokens, 1024)
             row_bytes = (512 + 64) * KV_SIZE
-            scratch_bytes = 2 * (8 * 8256 + 1024 + page_size) * row_bytes
+            # The fixed 64 MiB envelope is shared by two gather buffers;
+            # subtract the current chunk and trash page, then align prefix rows.
+            expected_prefix = (
+                (64 * 1024**2 // (2 * row_bytes) - 1024 - page_size) // 64
+            ) * 64
+            self.assertEqual(spec.max_prefix_tokens, expected_prefix)
+            self.assertEqual(spec.chunk_tokens, 1024)
+            scratch_bytes = 2 * (
+                ((expected_prefix + 1024 + page_size) * row_bytes + 4095) // 4096 * 4096
+            )
             self.assertEqual(compute_page_shard_scratch_bytes(mr), scratch_bytes)
 
             # Scratch has two one-layer slots; persistent KV spans all three

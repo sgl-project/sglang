@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 
 def get_kv_shard_pool(token_to_kv_pool) -> Optional[PageInterleaveKVPoolMixin]:
     """Return the page-interleaved pool, if logical-page sharding is active."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        token_to_kv_pool = token_to_kv_pool.full_kv_pool
     return (
         token_to_kv_pool
         if isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin)
@@ -44,15 +48,44 @@ def prepare_kv_shard_forward(
     pool: PageInterleaveKVPoolMixin,
     req_to_token: torch.Tensor,
     forward_batch: ForwardBatch,
+    *,
+    draft_token_num: int = 0,
 ) -> bool:
     """Update the pool's gather plan and report whether this is an extend."""
-    if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+    mode = forward_batch.forward_mode
+    pool.forward_batch = forward_batch
+    req_pool_indices = forward_batch.req_pool_indices
+    seq_lens = forward_batch.seq_lens_cpu
+    if (mode.is_target_verify() or mode.is_decode()) and seq_lens is None:
+        raise RuntimeError(
+            "KV-sharded attention requires request indices and CPU length metadata"
+        )
+    num_padding = getattr(forward_batch, "num_padding", 0)
+    if num_padding and (mode.is_target_verify() or mode.is_decode()):
+        # Captured dummy requests write to the trash row; they must not gather
+        # req_to_token[0] or consume a full prefix reservation.
+        req_pool_indices = req_pool_indices[:-num_padding]
+        seq_lens = seq_lens[:-num_padding]
+    if mode.is_target_verify():
+        if draft_token_num <= 0:
+            raise ValueError("KV-sharded target verify requires its draft block size")
+        # DFlash carries the committed mirror explicitly because its scheduler
+        # batch's CPU lengths are temporarily expanded by the verify block.
+        # Dummy/capture batches and other algorithms keep the ordinary prefix
+        # convention. Do not infer the convention from the algorithm alone.
+        live_prefix = getattr(
+            getattr(forward_batch, "spec_info", None), "live_seq_lens_cpu", None
+        )
+        prefix_lens = live_prefix if live_prefix is not None else seq_lens
+        seq_lens = [int(n) + draft_token_num for n in prefix_lens]
+    elif mode.is_decode():
+        prefix_lens = [max(0, int(n) - 1) for n in seq_lens]
+    elif mode.is_extend_or_draft_extend_or_mixed():
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+    else:
         pool.end_shard_extend()
         return False
 
-    req_pool_indices = forward_batch.req_pool_indices
-    prefix_lens = forward_batch.extend_prefix_lens_cpu
-    seq_lens = forward_batch.seq_lens_cpu
     if req_pool_indices is None or prefix_lens is None or seq_lens is None:
         raise RuntimeError(
             "KV-sharded attention requires request indices and CPU length metadata"

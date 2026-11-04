@@ -11,6 +11,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
     mamba_cache_chunk_size,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
@@ -78,6 +79,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -738,7 +740,10 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator.shard_spec if kv_shard_size > 1 else None
         )
         self.kv_shard_block_bound_pages = 0
-        self.kv_shard_chunk_pages = 0
+        self.kv_shard_chunk_pages = (
+            num_mixed_decode_tokens if self.kv_shard_scratch_spec is not None else 0
+        )
+        self.kv_shard_decode_prefix_tokens = 0
         # Reserve one extra page per shard class for allocation rounding.
         self.per_req_token_overhead = (
             kv_shard_size * self.kv_shard_granule
@@ -1074,8 +1079,35 @@ class PrefillAdder:
             return True
         ps = self.kv_shard_granule
         shard_size = self.kv_shard_size
-        block = self.kv_shard_block_bound_pages + -(-(prefix_len // ps) // shard_size)
+        block = self.kv_shard_block_bound_pages + -(-prefix_len // (ps * shard_size))
         chunk = self.kv_shard_chunk_pages + -(-extend_len // ps)
+        decode_prefix_tokens = self.kv_shard_decode_prefix_tokens
+        running = self.running_batch
+        # An empty running batch is created without spec_algorithm metadata.
+        algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+        if algorithm.is_dflash_family():
+            # After prefill these requests join the running decode batch. A
+            # prefill that fits by itself must not overflow that combined
+            # gather. Count only actual lengths plus overlap headroom.
+            allocator = self.token_to_kv_pool_allocator
+            candidate_prefix_tokens = allocator.decode_scratch_prefix_tokens(
+                [prefix_len + extend_len], algorithm
+            )
+            if candidate_prefix_tokens > self.kv_shard_scratch_spec.max_prefix_tokens:
+                raise RuntimeError(
+                    "request cannot fit the sharded decode scratch even in an "
+                    "empty batch; increase --kv-cache-sharding-scratch-size"
+                )
+            decode_prefix_tokens += candidate_prefix_tokens
+            running_prefix_tokens = allocator.decode_scratch_prefix_tokens(
+                (req.kv.kv_committed_len for req in running.reqs) if running else [],
+                algorithm,
+            )
+            if (
+                decode_prefix_tokens + running_prefix_tokens
+                > self.kv_shard_scratch_spec.max_prefix_tokens
+            ):
+                return False
         if (
             shard_size * block * ps > self.kv_shard_scratch_spec.max_prefix_tokens
             or chunk * ps > self.kv_shard_scratch_spec.chunk_tokens
@@ -1094,6 +1126,7 @@ class PrefillAdder:
             return False
         self.kv_shard_block_bound_pages = block
         self.kv_shard_chunk_pages = chunk
+        self.kv_shard_decode_prefix_tokens = decode_prefix_tokens
         return True
 
     def add_dllm_staging_req(self, req: Req):
@@ -1206,12 +1239,12 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
         ):
             return req
-        # The continuing chunk must fit. Keep reservation outside assert for -O.
+        # Active decode prefixes may leave no assembly room for this chunk.
         reserved = self._kv_shard_reserve_scratch(
             prefix_len=req.prefix_len, extend_len=new_len
         )
         if not reserved:
-            raise RuntimeError("chunked request exceeds the sharded assembly scratch")
+            return req
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1470,10 +1503,23 @@ class PrefillAdder:
                 scratch_mark = (
                     self.kv_shard_block_bound_pages,
                     self.kv_shard_chunk_pages,
+                    self.kv_shard_decode_prefix_tokens,
                 )
-                reserved_for = (admission.prefix_len, admission.extend_len)
+                prefix_bound = admission.prefix_len
+                if req.needs_host_load_back() and isinstance(
+                    self.tree_cache, UnifiedRadixCache
+                ):
+                    # Restoring aux state can expose FULL KV already resident
+                    # beyond the advertised host hit. Reserve that entire path
+                    # before queuing H2D, so its consumer cannot be deferred.
+                    (path,) = self.tree_cache.tree_core.collect_path_info(
+                        [req.best_match_node]
+                    )
+                    if path:
+                        prefix_bound = max(prefix_bound, path[-1].path_end)
+                reserved_for = (prefix_bound, admission.extend_len)
                 if not self._kv_shard_reserve_scratch(
-                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                    prefix_len=prefix_bound, extend_len=admission.extend_len
                 ):
                     return AddReqResult.OTHER
 
@@ -1584,11 +1630,13 @@ class PrefillAdder:
                 self.kv_shard_scratch_spec is not None
                 and (admission.prefix_len, admission.extend_len) != reserved_for
             ):
-                # No FULL was loaded (sharded trees have no aux components),
-                # so deferring here leaves no H2D without its consumer.
-                self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
-                    scratch_mark
-                )
+                # A successful load fits the reserved path bound. Only a
+                # failed load can expand the chunk and need to defer here.
+                (
+                    self.kv_shard_block_bound_pages,
+                    self.kv_shard_chunk_pages,
+                    self.kv_shard_decode_prefix_tokens,
+                ) = scratch_mark
                 if not self._kv_shard_reserve_scratch(
                     prefix_len=admission.prefix_len, extend_len=admission.extend_len
                 ):

@@ -32,6 +32,7 @@ therefore can be striped without extra compute-time communication:
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import msgspec
@@ -43,7 +44,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 )
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, get_cuda_graph_batch_size_alignment
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -51,11 +52,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 
 logger = logging.getLogger(__name__)
-
-# Keep enough assembled prefix KV for eight long-context requests. The
-# new-token compute budget is independent: eight 1K extensions can fill an
-# 8K prefill chunk even when each request has a nearly full-context prefix.
-_KV_SHARD_SCRATCH_PREFIX_CONTEXTS = 8
 
 
 class PageShardSpec(msgspec.Struct, frozen=True):
@@ -139,6 +135,10 @@ def get_shared_kv_shard_pool(
     """Find a draft's sharded target through their shared logical allocator."""
     if not kvc.is_draft_worker:
         return None
+    algorithm = getattr(kvc, "spec_algorithm", None)
+    if algorithm is not None and algorithm.is_dflash_family():
+        # DFlash owns ordinary attention over the target logical address space.
+        return None
 
     allocator = kvc.token_to_kv_pool_allocator
     if not isinstance(allocator, PageInterleavePoolAllocator):
@@ -176,51 +176,61 @@ def get_kv_shard_group_info(
     return group.rank_in_group, group.world_size
 
 
-def _page_shard_row_bytes(kvc: KVCacheConfigurator) -> int:
+def _page_shard_tensor_page_bytes(kvc: KVCacheConfigurator) -> Tuple[int, ...]:
+    """Byte widths of each separately aligned scratch tensor per physical page."""
     model_config = kvc.model_config
     kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
     if kvc.use_mla_backend:
         from sglang.srt.configs.model_config import (
             get_dsa_index_head_dim,
+            get_dsa_index_kpool,
             is_deepseek_dsa,
         )
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-        if is_deepseek_dsa(model_config.hf_config):
-            from sglang.srt.mem_cache.kv_cache_configurator import (
-                calculate_mla_kv_cache_dim,
-            )
-
-            kv_dim = calculate_mla_kv_cache_dim(
+        row_bytes = (
+            calculate_mla_kv_cache_dim(
                 model_config=model_config, kv_cache_dtype=kvc.kv_cache_dtype
             )
-            index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-            # FP8 index K plus one FP32 scale per 128 elements. The scratch
-            # indexer exists even when some persistent layers skip top-k.
-            return kv_dim * kv_size + index_head_dim + index_head_dim // 128 * 4
-        return (model_config.kv_lora_rank + model_config.qk_rope_head_dim) * kv_size
-    return (
-        model_config.get_num_kv_heads(get_parallel().attn_tp_size)
-        * (model_config.head_dim + model_config.v_head_dim)
+            * kv_size
+        )
+        tensor_page_bytes = (row_bytes * kvc.page_size,)
+        if is_deepseek_dsa(model_config.hf_config):
+            dim = get_dsa_index_head_dim(model_config.hf_config)
+            kpool = get_dsa_index_kpool(model_config.hf_config)
+            if kpool <= 0 or kvc.page_size % kpool:
+                raise ValueError("KV-shard page size must be divisible by index_kpool")
+            # Match IndexKeyCache._buffer_shape: scales are stored with each
+            # pooled key; rounding per token would overcharge pooled layouts.
+            index_bytes = dim + dim // DSATokenToKVPool.quant_block_size * 4
+            tensor_page_bytes += (kvc.page_size // kpool * index_bytes,)
+        return tensor_page_bytes
+    head_bytes = (
+        kvc.page_size
+        * model_config.get_num_kv_heads(get_parallel().attn_tp_size)
         * kv_size
+    )
+    return (head_bytes * model_config.head_dim, head_bytes * model_config.v_head_dim)
+
+
+def _page_shard_scratch_bytes(page_bytes: Tuple[int, ...], num_pages: int) -> int:
+    # Use the same per-tensor alignment as the symmetric scratch window, even
+    # when the pool falls back to ordinary torch allocations.
+    return page_interleave_pool._NUM_SCRATCH_SLOTS * sum(
+        ceil_align(num_pages * width, page_interleave_pool._SCRATCH_ALIGN_BYTES)
+        for width in page_bytes
     )
 
 
 def make_page_shard_spec(kvc: KVCacheConfigurator) -> Optional[PageShardSpec]:
-    """Provision eight full-context prefixes plus the batch's new-token budget.
+    """Fit both assembly slots in the per-GPU byte budget.
 
-    Prefix capacity must not shrink with the number of new tokens: eight
-    long cached prefixes can accompany just 1K new tokens each. Round each
-    context to a shard-group gather span before multiplying, so per-request
-    padding cannot overflow the region even for an unaligned context length.
-
-    This is a fixed eight-context prefix budget, independent of request limits
-    or chunk size. Both scratch slots are charged against HBM before sizing
-    persistent KV; large model contexts therefore reduce persistent capacity.
-    Admission still checks the actual batch's padded prefix and chunk spans.
-
-    MTP drafts inherit the target's exact bounds: both pools serve the same
-    scheduled batch and logical locations, even if their model configs differ
-    in context length.
+    Charge current-token, trash, and aligned tensor storage first; the
+    remainder determines a gather-granule-aligned prefix capacity. MTP drafts
+    inherit the target layout because they serve the same scheduled batch.
     """
     if kvc.is_draft_worker:
         pool = get_shared_kv_shard_pool(kvc)
@@ -229,16 +239,60 @@ def make_page_shard_spec(kvc: KVCacheConfigurator) -> Optional[PageShardSpec]:
     if shard_rank is None:
         return None
 
+    scratch_size = get_parallel().kv_cache_sharding_scratch_size
+    budget = scratch_size * 1024**3
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("--kv-cache-sharding-scratch-size must be positive and finite")
+    budget = int(budget)
+
     page_size = kvc.page_size
     granule = shard_size * page_size
+    chunk_tokens = ceil_align(get_schedule().chunked_prefill_size, page_size)
+    algorithm = getattr(kvc, "spec_algorithm", None)
+    minimum_prefix_tokens = kvc.model_config.context_len
+    if algorithm is not None and algorithm.is_dflash_family():
+        # Each verify request may start on a fresh page. The total token budget
+        # alone misses per-request page rounding, and graph buckets can include
+        # extra request slots. Charge this bound before sizing persistent KV.
+        requests = ceil_align(
+            get_schedule().max_running_requests, get_cuda_graph_batch_size_alignment()
+        )
+        verify_tokens = get_spec().speculative_num_draft_tokens
+        minimum_prefix_tokens += 2 * verify_tokens
+        chunk_tokens = max(
+            chunk_tokens, requests * ceil_align(verify_tokens, page_size)
+        )
+    page_bytes = _page_shard_tensor_page_bytes(kvc)
+    fixed_pages = chunk_tokens // page_size + 1
+    # The raw byte quotient is an upper bound; binary search accounts for the
+    # separate tensor/window alignments without rounding the budget upwards.
+    low, high = 0, budget // (2 * sum(page_bytes) * shard_size)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if (
+            _page_shard_scratch_bytes(page_bytes, fixed_pages + mid * shard_size)
+            <= budget
+        ):
+            low = mid
+        else:
+            high = mid - 1
+    max_prefix_tokens = low * granule
+    if max_prefix_tokens < ceil_align(minimum_prefix_tokens, granule):
+        required = _page_shard_scratch_bytes(
+            page_bytes,
+            fixed_pages + ceil_align(minimum_prefix_tokens, granule) // page_size,
+        )
+        raise ValueError(
+            "--kv-cache-sharding-scratch-size cannot fit one full context and decode headroom plus "
+            f"chunk/trash/alignment in both slots: need at least {required / 1024**3:.6f} GiB"
+        )
     return PageShardSpec(
         shard_rank=shard_rank,
         shard_size=shard_size,
         page_size=page_size,
-        max_prefix_tokens=_KV_SHARD_SCRATCH_PREFIX_CONTEXTS
-        * ceil_align(kvc.model_config.context_len, granule),
+        max_prefix_tokens=max_prefix_tokens,
         # chunked_prefill_size is the TOTAL new-token budget for the batch.
-        chunk_tokens=ceil_align(get_schedule().chunked_prefill_size, page_size),
+        chunk_tokens=chunk_tokens,
     )
 
 
@@ -257,7 +311,9 @@ def compute_page_shard_scratch_bytes(
     spec = make_page_shard_spec(kvc)
     if spec is None:
         return 0
-    scratch_bytes = 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)
+    scratch_bytes = _page_shard_scratch_bytes(
+        _page_shard_tensor_page_bytes(kvc), spec.scratch_rows // spec.page_size
+    )
     if include_mtp:
         if (
             kvc.is_draft_worker

@@ -120,7 +120,9 @@ def _unpack_latent(buf, locs, packed):
 
 
 class _IndexerCacheCheck:
-    def __init__(self, group, packed, *, raw_fp8=False, prefix_contexts=8):
+    def __init__(
+        self, group, packed, *, raw_fp8=False, prefix_contexts=8, kv_scale_pow2=False
+    ):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
         from sglang.srt.mem_cache.page_interleave import PageShardSpec
         from sglang.srt.mem_cache.page_interleave_pool import (
@@ -146,6 +148,7 @@ class _IndexerCacheCheck:
             start_layer=_INDEXER_START_LAYER,
             end_layer=_INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK) - 1,
             skip_topk_layers=_INDEXER_SKIP_TOPK,
+            kv_scale_pow2=kv_scale_pow2,
         )
         self.pool = PageInterleaveDSATokenToKVPool(
             _INDEXER_SIZE,
@@ -690,9 +693,14 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.dsa_index_topk = 2048
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
     backend.physical_page_size = 64
+    backend.real_page_span = 64
+    backend.kv_scale_pow2 = getattr(pool, "kv_scale_pow2", False)
     backend.use_mha = False
     backend.use_fused_topk = False
     backend.num_q_heads = 8
+    backend.attn_dcp_size = 1
+    backend.attn_dcp_rank = 0
+    backend.dsa_packed_extend_topk = backend.kv_scale_pow2
     backend.dcp_size = 1
     backend.num_dcp_q_heads = backend.num_q_heads
     backend.kv_lora_rank = 512
@@ -702,8 +710,11 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.kv_cache_dtype = pool.dtype
     backend.dsa_kv_cache_store_fp8 = pool.dsa_kv_cache_store_fp8
     backend.dsa_prefill_impl = prefill_impl
-    backend.dsa_decode_impl = "flashmla_kv"
+    backend.dsa_decode_impl = "trtllm" if prefill_impl == "trtllm" else "flashmla_kv"
+    backend.local_num_q_heads = backend.num_q_heads
     backend.flashmla_kv_num_q_heads = 64
+    backend.flashmla_kv_num_q_heads_prefill = 64
+    backend.flashmla_prefill_token_packing = False
     backend.flashmla_kv_format = "V32"
     backend.hisparse_coordinator = None
     backend.device_sm_major = (
@@ -713,6 +724,9 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     )
     backend._arange_buf = torch.arange(1024, dtype=torch.int32, device=device)
     if prefill_impl == "trtllm":
+        backend._trtllm_fused_q = True
+        backend._trtllm_q_bufs = {}
+        backend._trtllm_q_pad_graph = None
         from sglang.srt.layers.attention.trtllm_mla_backend import (
             make_persistent_multi_ctas_kv_counter_buffer,
         )
@@ -814,20 +828,50 @@ class TestShardedDSAMetadata(unittest.TestCase):
         self.assertEqual(pool.begin_args[2], [128, 64, 192])
 
 
+def _attention_indexer(sm_count):
+    from sglang.srt.layers.attention.dsa import dsa_indexer
+
+    # Use the real class so indexer methods call the production implementation.
+    # The test supplies projected Q/K/gates, so no projection weights are needed.
+    indexer = dsa_indexer.Indexer.__new__(dsa_indexer.Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.index_topk = 2048
+    indexer.num_init_tokens = indexer.num_local_tokens = 0
+    indexer.logits_with_pp_recv = False
+    indexer.sm_count = sm_count
+    indexer._mqa_logits_budget_bytes = {}
+    # PCP already partitions query rows; the independent attention-TP row
+    # splitting optimization is not part of this cache ownership comparison.
+    indexer.tp_split_min_rows = None
+    indexer.dsa_enable_prefill_cp = True
+    return indexer
+
+
+class TestShardedDSAIndexerFixture(unittest.TestCase):
+    def test_ragged_planning_uses_real_indexer_methods(self):
+        from sglang.srt.layers.attention.dsa import dsa_indexer
+
+        indexer = _attention_indexer(sm_count=1)
+        with patch.object(dsa_indexer, "_is_cuda", True):
+            self.assertIsNone(indexer._indexer_tp_split(None, q_offset=128))
+        with (
+            patch.object(dsa_indexer, "get_is_capture_mode", return_value=False),
+            patch.object(
+                dsa_indexer, "mqa_logits_budget_bytes", return_value=1048576
+            ) as budget,
+        ):
+            self.assertEqual(indexer._get_mqa_logits_budget_bytes(0), 1048576)
+            self.assertEqual(indexer._get_mqa_logits_budget_bytes(0), 1048576)
+        budget.assert_called_once_with(device_index=0, allow_sync=True)
+
+
 def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
     from sglang.srt.layers.attention.dsa import dsa_indexer
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 
-    indexer = SimpleNamespace(
-        index_topk=2048,
-        num_init_tokens=0,
-        num_local_tokens=0,
-        logits_with_pp_recv=False,
-        sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
-        _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
+    indexer = _attention_indexer(
+        torch.cuda.get_device_properties(check.device).multi_processor_count
     )
-    for name in ("_with_real_sm_count", "_mask_init_and_local_tokens"):
-        setattr(indexer, name, MethodType(getattr(dsa_indexer.Indexer, name), indexer))
 
     class RecordingMetadata:
         def __init__(self, metadata):
@@ -848,8 +892,8 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
             dsa_indexer, "get_token_to_kv_pool", return_value=backend.token_to_kv_pool
         ):
             results.append(
-                dsa_indexer.Indexer._get_topk_ragged(
-                    indexer, False, batch, layer_id, query, weights, metadata
+                indexer._get_topk_ragged(
+                    False, batch, layer_id, query, weights, metadata
                 )
             )
         starts, ends = metadata.get_indexer_kvcache_range()
@@ -1020,14 +1064,16 @@ def _check_attention_batch(check, requests, *, generation, prefill_impl, topk_ba
             *outputs,
             rtol=0,
             atol=0,
-            msg=f"{prefill_impl}: sharded output differs at layer {layer_id}",
+            msg=lambda detail, layer_id=layer_id: (
+                f"{prefill_impl}, layer {layer_id}: {detail}"
+            ),
         )
     check.pool.end_shard_extend()
     torch.cuda.synchronize()
     torch.distributed.barrier()
 
 
-def _run_attention(rank, world, init_method):
+def _run_attention(rank, world, init_method, trtllm_only=False):
     from sglang.kernels.ops.quantization.act_quant_triton import act_quant
     from sglang.srt.distributed.parallel_state import (
         destroy_distributed_environment,
@@ -1066,6 +1112,8 @@ def _run_attention(rank, world, init_method):
     ]
     if torch.cuda.get_device_capability()[0] == 10:
         cases.append(("trtllm", False))
+    if trtllm_only:
+        cases = [("trtllm", False)]
     # Consecutive shared layers exercise two-slot prefetch progression. Use
     # varied keys to avoid the byte fixture's tied scores at long contexts.
     with patch.dict(
@@ -1080,6 +1128,7 @@ def _run_attention(rank, world, init_method):
                     packed,
                     raw_fp8=prefill_impl == "trtllm",
                     prefix_contexts=16,
+                    kv_scale_pow2=False,
                 )
                 prefix = list(range(world, world + 32))
                 check.seed(prefix, generation=1)
@@ -1114,6 +1163,20 @@ def _run_attention(rank, world, init_method):
 
 
 class TestShardedDSAAttention(unittest.TestCase):
+    def test_four_gpu_trtllm_raw_fp8(self):
+        """Compare TRTLLM raw FP8 KV/query numerics against unsharded attention."""
+        if torch.cuda.device_count() < 4:
+            self.skipTest("requires four CUDA GPUs")
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("TRTLLM raw FP8 requires Blackwell")
+        with tempfile.TemporaryDirectory(prefix="sglang-kimi-shard-") as tmp:
+            mp.spawn(
+                _run_attention,
+                args=(4, f"file://{tmp}/init", True),
+                nprocs=4,
+                join=True,
+            )
+
     def test_four_gpu_matches_unsharded_full_and_shared_layers(self):
         if torch.cuda.device_count() < 4:
             self.skipTest("requires four CUDA GPUs")

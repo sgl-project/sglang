@@ -93,6 +93,9 @@ def _build_page_interleaved_dcp_plan(
 
 
 class AscendKVManager(MooncakeKVManager):
+    # Its DCP sender has not implemented compact page-owner inputs.
+    supports_page_sharded_dcp = False
+
     def __init__(
         self,
         args,

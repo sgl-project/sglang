@@ -30,6 +30,7 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     get_shm_exchange,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import (
+    PageInterleavePoolAllocator,
     page_interleave_shard_size,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -130,13 +131,13 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
-        BaseEvictionResult,
-    )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+        BaseEvictionResult,
+    )
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
@@ -2037,14 +2038,28 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        restored_indices = None
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, PageInterleavePoolAllocator):
+            spans = self.tree_core.load_back_shard_spans(
+                kv_xfer.nodes_to_load or (), allocator.page_size, allocator.shard_size
+            )
+            restored_indices = allocator.alloc_restore_spans(spans)
+            if restored_indices is None:
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+                return False
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=node_id,
             extra_pools=aux_xfers or None,
+            device_indices=restored_indices,
         )
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
+            if restored_indices is not None:
+                allocator.free(restored_indices)
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 

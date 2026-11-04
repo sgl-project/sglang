@@ -26,6 +26,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -128,7 +129,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         size = shape_key.size
-        if self._shared_output_buffer is None:
+        # Decode/verify returns structured logits, potentially with more token
+        # rows than the request-count key. Retain each graph's complete output,
+        # as FullCudaGraphBackend does, rather than slicing it as prefill hidden
+        # states. Strong references keep its captured tensor addresses alive.
+        retain_output = isinstance(warmup_out, LogitsProcessorOutput)
+        if not retain_output and self._shared_output_buffer is None:
             capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
                 warmup_out
             )
@@ -147,11 +153,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             ),
         ):
             self._precarve.mint()
-            if self._debug_eager:
-                # The whole forward runs as one eager break that writes the
-                # output buffer.
-                # The warmup ran the same forward, so its output gives the
-                # captured rows.
+            if self._debug_eager and not retain_output:
                 out_rows = self._output_rows(warmup_out, size)
 
                 @eager_on_graph
@@ -161,10 +163,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 forward_into_buffer(buffer)
             else:
                 out = forward_fn()
-                out_rows = self._output_rows(out, size)
-                self._copy_output_to_buffer(out, buffer, out_rows)
+                if not retain_output:
+                    out_rows = self._output_rows(out, size)
+                    self._copy_output_to_buffer(out, buffer, out_rows)
 
-        stored = self._slice_output(buffer, out_rows)
+        stored = out if retain_output else self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.

@@ -4501,8 +4501,21 @@ class HybridLinearKVPool(KVCache):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
         # The layer-wise wait logic is executed at the Hybrid LinearPool level;
-        # no additional wait is needed in the full_kv_pool
-        self.full_kv_pool.register_layer_transfer_counter(None)
+        # page-sharded gathers also run ahead of those getters on a side stream.
+        from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
+
+        shard = get_kv_shard_pool(self)
+        if shard is None:
+            self.full_kv_pool.register_layer_transfer_counter(None)
+        else:
+            ids = sorted(
+                self.full_attention_layer_id_mapping,
+                key=self.full_attention_layer_id_mapping.get,
+            )
+            shard.register_layer_transfer_counter(
+                layer_transfer_counter,
+                layer_ids=[layer - self.start_layer for layer in ids],
+            )
 
     def _wait_for_layer(self, layer_id: int):
         if self.layer_transfer_counter is not None:

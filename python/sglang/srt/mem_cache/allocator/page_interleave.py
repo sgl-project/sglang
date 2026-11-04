@@ -48,8 +48,13 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    get_alloc_reserve_per_decode,
+)
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -92,6 +97,11 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             kvcache=kvcache,
             need_sort=need_sort,
         )
+
+    @property
+    def draft_virtual_id_space(self) -> int:
+        """Ordinary draft size, including every owner's reserved padding page."""
+        return self.size + (self.shard_size - 1) * self.page_size
 
     def clear(self):
         # Logical pages l ∈ [0, shard_size) are reserved — physical page 0 of
@@ -138,6 +148,43 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         # be large while one class is fully protected by locked chains.
         return self.shard_size * self.page_size * min(self.class_free_page_counts())
 
+    def decode_scratch_prefix_tokens(self, prefix_lens, spec_algorithm) -> int:
+        """Gather bound including the in-flight step's possible prefix growth."""
+        reserve = (
+            get_alloc_reserve_per_decode()
+            if spec_algorithm is not None and not spec_algorithm.is_none()
+            else 2
+        )
+        granule = self.shard_size * self.page_size
+        return sum(ceil_align(length + reserve, granule) for length in prefix_lens)
+
+    def check_decode_capacity(
+        self, *, num_tokens, tree_cache, requests=None, spec_algorithm=None
+    ) -> bool:
+        if self.shard_spec is not None and requests is not None:
+            prefix_tokens = self.decode_scratch_prefix_tokens(
+                (req.kv.kv_committed_len for req in requests), spec_algorithm
+            )
+            new_tokens = (
+                get_alloc_len_per_decode()
+                if spec_algorithm is not None and not spec_algorithm.is_none()
+                else 1
+            )
+            # Each request may start at a physical-page boundary. Partially
+            # filled prefix pages reduce this demand, so this is a safe bound.
+            chunk_tokens = len(requests) * ceil_align(new_tokens, self.page_size)
+            if (
+                prefix_tokens > self.shard_spec.max_prefix_tokens
+                or chunk_tokens > self.shard_spec.chunk_tokens
+            ):
+                return False
+        return super().check_decode_capacity(
+            num_tokens=num_tokens,
+            tree_cache=tree_cache,
+            requests=requests,
+            spec_algorithm=spec_algorithm,
+        )
+
     def aggregate_free_size(self) -> int:
         """Total free logical slots across all classes — the accounting
         identity's `available` term (the invariant checker); NOT an admission
@@ -170,6 +217,24 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             "PageInterleavePoolAllocator allocates through alloc_extend only "
             "(class draws follow the chain's rotation; a bare alloc has no "
             "rotation base)"
+        )
+
+    def alloc_restore_spans(self, spans):
+        """Allocate page-aligned host fragments with their original first owner."""
+        if not spans:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        lengths, owners = zip(*spans)
+        assert all(length > 0 and length % self.page_size == 0 for length in lengths)
+        zeros = torch.zeros(len(spans), dtype=torch.int64)
+        lengths = torch.tensor(lengths, dtype=torch.int64)
+        return self.alloc_extend(
+            prefix_lens=zeros,
+            prefix_lens_cpu=zeros,
+            seq_lens=lengths,
+            seq_lens_cpu=lengths,
+            last_loc=zeros,
+            extend_num_tokens=int(lengths.sum()),
+            rotation_bases=list(owners),
         )
 
     @staticmethod
@@ -226,19 +291,17 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         for i in range(bs):
             prefix_len = int(prefix_lens_cpu[i])
             seq_len = int(seq_lens_cpu[i])
-            assert prefix_len % ps == 0, (
-                f"sharded extends start page-aligned (the radix-tree match "
-                f"quantum and the chunk flooring guarantee it), got "
-                f"prefix_len={prefix_len}, page_size={ps}"
-            )
-            new_pages = -(-seq_len // ps) - prefix_len // ps
-            assert new_pages > 0
+            assert 0 <= prefix_len <= seq_len
+            # Speculative decode can append inside an already allocated tail
+            # page. Only position-pages beyond that tail consume free pages.
+            prefix_pages = -(-prefix_len // ps)
+            new_pages = -(-seq_len // ps) - prefix_pages
             if rotation_bases[i] is None:
                 # New chain: least-full over the simulated fills (mirrored).
                 rotation_bases[i] = max(
                     range(shard_size), key=lambda r: (sim_counts[r], -r)
                 )
-            start_class = (rotation_bases[i] + prefix_len // ps) % shard_size
+            start_class = (rotation_bases[i] + prefix_pages) % shard_size
             start_classes.append(start_class)
             new_pages_list.append(new_pages)
             for c, need in enumerate(
@@ -297,8 +360,18 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
                     )
                 ] = self.class_free_pages[c][: counts[c]]
                 self.class_free_pages[c] = self.class_free_pages[c][counts[c] :]
-            extend_len = int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i])
-            offsets = torch.arange(extend_len, dtype=torch.int64, device=self.device)
+            prefix_len = int(prefix_lens_cpu[i])
+            extend_len = int(seq_lens_cpu[i]) - prefix_len
+            tail_tokens = min(extend_len, (-prefix_len) % ps)
+            if tail_tokens:
+                out_parts.append(
+                    last_loc[i]
+                    + 1
+                    + torch.arange(tail_tokens, dtype=torch.int64, device=self.device)
+                )
+            offsets = torch.arange(
+                extend_len - tail_tokens, dtype=torch.int64, device=self.device
+            )
             out_parts.append(pages[offsets // ps] * ps + offsets % ps)
         out_indices = torch.cat(out_parts) if len(out_parts) > 1 else out_parts[0]
 

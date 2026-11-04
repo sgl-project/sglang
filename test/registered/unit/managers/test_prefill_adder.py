@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
-from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
+from sglang.srt.mem_cache.page_interleave import PageShardSpec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
     SWAPrefillBudget,
@@ -971,25 +971,17 @@ class TestPrefillAdder(CustomTestCase):
         context_len = 16384
         extend_len = 1024
         prefix_len = context_len - extend_len
-        kvc = SimpleNamespace(
-            is_draft_worker=False,
-            page_size=4,
-            model_config=SimpleNamespace(context_len=context_len),
-        )
+        # This test isolates admission using a deliberately fixed envelope;
+        # byte-budget construction is covered by the pool configurator tests.
         for chunk_tokens in (8192, 16384):
             with self.subTest(chunk_tokens=chunk_tokens):
-                with (
-                    patch(
-                        "sglang.srt.mem_cache.page_interleave.get_kv_shard_group_info",
-                        return_value=(0, 2),
-                    ),
-                    patch(
-                        "sglang.srt.mem_cache.page_interleave.get_schedule",
-                        return_value=SimpleNamespace(chunked_prefill_size=chunk_tokens),
-                    ),
-                ):
-                    spec = make_page_shard_spec(kvc)
-                self.assertEqual(spec.max_prefix_tokens, 8 * context_len)
+                spec = PageShardSpec(
+                    shard_rank=0,
+                    shard_size=2,
+                    page_size=4,
+                    max_prefix_tokens=8 * context_len,
+                    chunk_tokens=chunk_tokens,
+                )
                 adder = self.create_sharded_adder(
                     shard_spec=spec,
                     allocator_size=8 * context_len,
@@ -1186,6 +1178,58 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.init_load_back.assert_not_called()
         self.assertEqual(adder.can_run_list, [first])
         self.assertEqual(adder.kv_shard_block_bound_pages, 2)
+
+    def test_sharded_scratch_reselection_rolls_back_decode_reservation(self):
+        adder = self.create_sharded_adder(max_prefix_tokens=64)
+        req = self.create_sharded_req("empty-host-hit", prefix_len=0, extend_len=16)
+        req.host_hit_length = 12
+        req.needs_host_load_back = MagicMock(return_value=True)
+        req.best_match_node = req.last_node
+        self.mock_tree_cache.init_load_back.return_value = (0, req.last_node)
+        seen = []
+
+        def reserve(**kwargs):
+            seen.append(adder.kv_shard_decode_prefix_tokens)
+            adder.kv_shard_decode_prefix_tokens += 20
+            return True
+
+        with patch.object(adder, "_kv_shard_reserve_scratch", side_effect=reserve):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(seen, [0, 0])
+        self.assertEqual(adder.kv_shard_decode_prefix_tokens, 20)
+        self.assertEqual(adder.can_run_list, [req])
+
+    def test_sharded_aux_restore_reserves_full_matched_path_before_h2d(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        adder = self.create_sharded_adder(max_prefix_tokens=64)
+        req = self.create_sharded_req("aux-hit", prefix_len=0, extend_len=16)
+        req.host_hit_length = 4
+        req.needs_host_load_back = MagicMock(return_value=True)
+        req.best_match_node = req.last_node
+        self.mock_tree_cache.__class__ = UnifiedRadixCache
+        self.mock_tree_cache.linker = None
+        self.mock_tree_cache.tree_core.collect_path_info.return_value = (
+            (SimpleNamespace(path_end=12),),
+        )
+        self.mock_tree_cache.tree_core.build_hicache_transfers.return_value = [
+            SimpleNamespace(host_indices=torch.arange(4))
+        ]
+        sequence = []
+
+        def reserve(**kwargs):
+            sequence.append(("reserve", kwargs["prefix_len"]))
+            return True
+
+        def load(params):
+            sequence.append(("load", None))
+            return 12, req.last_node
+
+        self.mock_tree_cache.init_load_back.side_effect = load
+        with patch.object(adder, "_kv_shard_reserve_scratch", side_effect=reserve):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(sequence[:2], [("reserve", 12), ("load", None)])
+        self.assertEqual(adder.can_run_list, [req])
 
     def _build_hybrid_swa_chunked_req(
         self,

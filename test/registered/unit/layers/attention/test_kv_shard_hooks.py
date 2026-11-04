@@ -57,9 +57,9 @@ def _batch(mode: ForwardMode):
         (ForwardMode.EXTEND, True),
         (ForwardMode.MIXED, True),
         (ForwardMode.SPLIT_PREFILL, True),
-        (ForwardMode.DECODE, False),
+        (ForwardMode.DECODE, True),
         (ForwardMode.IDLE, False),
-        (ForwardMode.TARGET_VERIFY, False),
+        (ForwardMode.TARGET_VERIFY, True),
         (ForwardMode.DRAFT_EXTEND_V2, False),
     ],
 )
@@ -68,10 +68,21 @@ def test_prepare_updates_the_pool_lifecycle(mode, active):
     req_to_token = torch.arange(8)
     batch = _batch(mode)
 
-    assert prepare_kv_shard_forward(pool, req_to_token, batch) is active
+    assert (
+        prepare_kv_shard_forward(pool, req_to_token, batch, draft_token_num=4) is active
+    )
     assert pool.begin_calls == int(active)
     assert pool.end_calls == int(not active)
     if active:
+        assert pool.forward_batch is batch
+        if mode == ForwardMode.DECODE:
+            assert pool.begin_args[2] == [127]
+            assert pool.begin_args[3] is batch.seq_lens_cpu
+            return
+        if mode == ForwardMode.TARGET_VERIFY:
+            assert pool.begin_args[2] is batch.seq_lens_cpu
+            assert pool.begin_args[3] == [132]
+            return
         assert all(
             actual is expected
             for actual, expected in zip(

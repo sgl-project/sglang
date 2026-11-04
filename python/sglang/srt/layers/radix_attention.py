@@ -32,6 +32,7 @@ from sglang.srt.layers.attention.graph_utils import (
 )
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -131,6 +132,26 @@ class RadixAttention(nn.Module):
             if "k_rope" not in kwargs:
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
         breakable_cg = is_in_breakable_cuda_graph()
+        if breakable_cg and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
+
+            pool = get_kv_shard_pool(get_token_to_kv_pool())
+            if pool is not None:
+                from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+                    bcg_kv_shard_attention,
+                )
+
+                output, _ = allocate_attention_outputs(self, q, v, None)
+                output = output.reshape(
+                    q.shape[0], self.tp_q_head_num * self.v_head_dim
+                )
+                bcg_kv_shard_attention(
+                    self, pool, q, k, v, save_kv_cache, output, **kwargs
+                )
+                return output
         full_cg = is_in_full_prefill_graph()
         use_eager_attention = (
             self.use_prefill_attention_wrapper

@@ -263,6 +263,8 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
     shard_pool = get_kv_shard_pool(pool)
     if shard_pool is None:
         return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc, None),)
+    if shard_pool is not pool:
+        layer_id = pool._transfer_full_attention_id(layer_id)
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
@@ -2227,6 +2229,57 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return_indices: bool = True,
         use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
+        if is_in_breakable_cuda_graph() and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            pool = get_kv_shard_pool(get_token_to_kv_pool())
+            if pool is not None:
+                from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+                    bcg_kv_shard_indexer,
+                )
+
+                rows = (x[0] if isinstance(x, tuple) else x).shape[0]
+                topk_result = (
+                    torch.empty(
+                        (rows, self.index_topk), dtype=torch.int32, device=q_lora.device
+                    )
+                    if return_indices
+                    else None
+                )
+                bcg_kv_shard_indexer(
+                    self,
+                    pool,
+                    x,
+                    q_lora,
+                    positions,
+                    layer_id,
+                    return_indices,
+                    topk_result,
+                )
+                return topk_result
+        return self._forward_cuda_impl(
+            x,
+            q_lora,
+            positions,
+            forward_batch,
+            layer_id,
+            return_indices,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    def _forward_cuda_impl(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+        *,
+        eager_graph_break: bool = False,
+        use_cuda_graph: bool = True,
+    ) -> Optional[torch.Tensor]:
         # A padded eager IDLE rank has no real requests and therefore no valid
         # DSA page-table rows to index. Return invalid rows with the physical DP
         # shape so later MLP/EP collectives still agree across ranks.
@@ -2251,7 +2304,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         in_piecewise_or_breakable_cuda_graph = (
-            use_cuda_graph and _is_in_piecewise_or_breakable_cuda_graph()
+            use_cuda_graph
+            and not eager_graph_break
+            and _is_in_piecewise_or_breakable_cuda_graph()
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside
