@@ -16,7 +16,30 @@ ROOT = Path(__file__).resolve().parents[4]
 
 class Buffer:
     def __init__(self, shape, dtype="bf16"):
-        self.shape, self.dtype = shape, dtype
+        self.shape, self.dtype = tuple(shape), dtype
+        self.ndim = len(self.shape)
+        self.selection = None
+
+    def narrow(self, axis, start, length):
+        if start < 0 or start + length > self.shape[axis]:
+            raise IndexError("invalid layer range")
+        shape = list(self.shape)
+        shape[axis] = length
+        view = Buffer(shape, self.dtype)
+        view.selection = (self, axis, start, length)
+        return view
+
+    def unsqueeze(self, axis):
+        shape = list(self.shape)
+        shape.insert(axis if axis >= 0 else axis + self.ndim + 1, 1)
+        view = Buffer(shape, self.dtype)
+        view.selection = self.selection
+        return view
+
+    def transpose(self, a, b):
+        shape = list(self.shape)
+        shape[a], shape[b] = shape[b], shape[a]
+        return Buffer(shape, self.dtype)
 
     def numel(self):
         result = 1
@@ -105,7 +128,18 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ("layer_first_kv_split", "transfer_kv_per_layer_kv_split"),
         ):
             with self.subTest(layout=layout):
+                if self.host.layout != layout:
+                    for attr in (
+                        "k_buffer",
+                        "v_buffer",
+                        "index_k_buffer",
+                        "index_k_scale_buffer",
+                    ):
+                        setattr(
+                            self.host, attr, getattr(self.host, attr).transpose(0, 1)
+                        )
                 self.host.layout = layout
+                self.host._init_npu_transfer_bindings()
                 op = self.ops[name]
                 for layer in range(3):
                     self.host.load_to_device_per_layer(
@@ -114,13 +148,49 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 self.assertEqual(op.call_count, 3)
                 for layer, call in enumerate(op.call_args_list):
                     kw = call.kwargs
-                    self.assertEqual(kw["device_layer_id"], layer)
-                    self.assertEqual(kw["host_layer_id"], layer)
                     self.assertEqual(
-                        kw["device_index_layer_id"], {0: 0, 2: 1}.get(layer)
+                        (kw["device_layer_id"], kw["host_layer_id"]), (0, 0)
                     )
-                    self.assertEqual(kw["host_index_layer_id"], {0: 0, 2: 1}.get(layer))
-                    self.assertIs(kw["host_k"], self.host.k_buffer)
+                    axis = 0 if layout == "layer_first_kv_split" else 1
+                    self.assertEqual(
+                        kw["device_k"].selection, (self.native.k, 0, layer, 1)
+                    )
+                    self.assertEqual(
+                        kw["host_k"].selection, (self.host.k_buffer, axis, layer, 1)
+                    )
+                    self.assertEqual(
+                        kw["device_v"].selection, (self.native.v, 0, layer, 1)
+                    )
+                    self.assertEqual(
+                        kw["host_v"].selection, (self.host.v_buffer, axis, layer, 1)
+                    )
+                    slot = {0: 0, 2: 1}.get(layer)
+                    selected_slot = 0 if slot is not None else None
+                    self.assertEqual(kw["device_index_layer_id"], selected_slot)
+                    self.assertEqual(kw["host_index_layer_id"], selected_slot)
+                    if slot is None:
+                        self.assertIsNone(kw["device_index_k"])
+                        self.assertIsNone(kw["host_index_k"])
+                        self.assertIsNone(kw["device_index_k_scale"])
+                        self.assertIsNone(kw["host_index_k_scale"])
+                    else:
+                        self.assertEqual(
+                            kw["device_index_k"].selection,
+                            (self.native.index_k, 0, slot, 1),
+                        )
+                        self.assertEqual(
+                            kw["host_index_k"].selection,
+                            (self.host.index_k_buffer, axis, slot, 1),
+                        )
+                        self.assertEqual(
+                            kw["device_index_k_scale"].selection,
+                            (self.native.index_scales, 0, slot, 1),
+                        )
+                        self.assertEqual(kw["device_index_k_scale"].ndim, 5)
+                        self.assertEqual(
+                            kw["host_index_k_scale"].selection,
+                            (self.host.index_k_scale_buffer, axis, slot, 1),
+                        )
                     self.assertEqual(kw["impl"], "auto")
 
     def add_draft(self, width=512):
@@ -134,6 +204,12 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.host._native_infos.append(SimpleNamespace(native_buffers=lambda: draft))
         layer_id = self.host._device_layer_num + len(self.host._native_infos) - 2
         self.host._host_layer_by_controller[layer_id] = layer_id
+        axis = 0 if self.host.layout == "layer_first_kv_split" else 1
+        for attr in ("k_buffer", "v_buffer"):
+            buffer = getattr(self.host, attr)
+            shape = list(buffer.shape)
+            shape[axis] = layer_id + 1
+            setattr(self.host, attr, Buffer(shape, buffer.dtype))
         self.host._init_npu_transfer_bindings()
         return draft
 
@@ -146,7 +222,8 @@ class TestNPUSparseDispatch(unittest.TestCase):
         op.assert_called_once()
         kw = op.call_args.kwargs
         self.assertIs(kw["device_k"], draft.k)
-        self.assertEqual((kw["device_layer_id"], kw["host_layer_id"]), (0, 3))
+        self.assertEqual((kw["device_layer_id"], kw["host_layer_id"]), (0, 0))
+        self.assertEqual(kw["host_k"].selection, (self.host.k_buffer, 1, 3, 1))
         self.assertIsNone(kw["host_index_k"])
         self.assertIsNone(kw["device_index_layer_id"])
 
@@ -187,7 +264,8 @@ class TestNPUSparseDispatch(unittest.TestCase):
         )
         kw = op.call_args.kwargs
         self.assertIs(kw["device_k"], draft.k)
-        self.assertEqual((kw["device_layer_id"], kw["host_layer_id"]), (0, 4))
+        self.assertEqual((kw["device_layer_id"], kw["host_layer_id"]), (0, 0))
+        self.assertEqual(kw["host_k"].selection, (self.host.k_buffer, 1, 4, 1))
         self.host.backup_from_device_all_layer(None, "host", "device", "kernel_ascend")
         calls = self.ops["transfer_kv_all_layer_kv_split_lf_pf"].call_args_list
         self.assertEqual([c.kwargs["host_layer_start"] for c in calls], [0, 4])
@@ -201,11 +279,25 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.host._npu_draft_pool_compatible = Mock(
             side_effect=AssertionError("checked at runtime")
         )
-        self.host.load_to_device_per_layer(None, "host", "device", 2, "kernel_ascend")
-        self.host.load_to_device_per_layer(
-            None, "host", "device", 3, "kernel_ascend", is_draft=True
-        )
-        self.host.backup_from_device_all_layer(None, "host", "device", "kernel_ascend")
+        with (
+            patch.object(
+                Buffer, "narrow", side_effect=AssertionError("view created at runtime")
+            ),
+            patch.object(
+                Buffer,
+                "unsqueeze",
+                side_effect=AssertionError("view created at runtime"),
+            ),
+        ):
+            self.host.load_to_device_per_layer(
+                None, "host", "device", 2, "kernel_ascend"
+            )
+            self.host.load_to_device_per_layer(
+                None, "host", "device", 3, "kernel_ascend", is_draft=True
+            )
+            self.host.backup_from_device_all_layer(
+                None, "host", "device", "kernel_ascend"
+            )
         self.assertEqual(self.ops["transfer_kv_per_layer_kv_split_pf_lf"].call_count, 2)
         self.assertEqual(self.ops["transfer_kv_all_layer_kv_split_lf_pf"].call_count, 2)
 
@@ -214,7 +306,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.host._init_npu_transfer_bindings()
         self.host.load_to_device_per_layer(None, "host", "device", 2, "kernel_ascend")
         kw = self.ops["transfer_kv_per_layer_kv_split_pf_lf"].call_args.kwargs
-        self.assertEqual((kw["device_layer_id"], kw["host_layer_id"]), (2, 1))
+        self.assertEqual((kw["device_layer_id"], kw["host_layer_id"]), (0, 0))
+        self.assertEqual(kw["device_k"].selection, (self.native.k, 0, 2, 1))
+        self.assertEqual(kw["host_k"].selection, (self.host.k_buffer, 1, 1, 1))
 
     def test_dcp_localization_is_preserved(self):
         self.host.dcp_size, self.host.dcp_rank = 2, 1
@@ -316,11 +410,20 @@ class TestNPUSparseDispatch(unittest.TestCase):
                         cfg=cfg,
                         args=cfg,
                         use_mla_backend=lambda _: mla,
+                        model_config_of=lambda _: SimpleNamespace(hf_config=None),
                         declare_resolution=lambda args, source, **kw: resolved.update(
                             kw
                         ),
                     )
-                    exec(code, namespace)
+                    with patch.dict(
+                        sys.modules,
+                        {
+                            "sglang.srt.configs.model_config": SimpleNamespace(
+                                is_deepseek_v4=lambda _: False
+                            )
+                        },
+                    ):
+                        exec(code, namespace)
                     expected = (
                         (
                             "layer_first_kv_split"

@@ -667,41 +667,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             binding = self._npu_layer_bindings[layer_id]
             if binding is None:
                 return
-            native, device_layer_id, host_layer_id, index_slot = binding
-            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-                print(
-                    f"[MF-AICPU H2D] per-layer begin: layout={self.layout} "
-                    f"layer_id={layer_id} device_layer_id={device_layer_id} "
-                    f"host_layer_id={host_layer_id} index_slot={index_slot} "
-                    f"is_draft={is_draft} page_size={self.page_size} "
-                    f"num_indices={device_indices.numel()}",
-                    flush=True,
-                )
             transfer(
                 device_indices=device_indices,
                 host_indices=host_indices,
-                device_k=native.k,
-                host_k=self.k_buffer,
-                device_v=native.v,
-                host_v=self.v_buffer,
-                device_index_k=native.index_k,
-                host_index_k=self.index_k_buffer if not is_draft else None,
-                device_index_k_scale=native.index_scales,
-                host_index_k_scale=self.index_k_scale_buffer if not is_draft else None,
-                page_size=self.page_size,
-                device_layer_id=device_layer_id,
-                host_layer_id=host_layer_id,
-                device_index_layer_id=index_slot,
-                host_index_layer_id=index_slot,
+                **binding,
                 impl="auto",
             )
-            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-                print(
-                    f"[MF-AICPU H2D] per-layer end: layer_id={layer_id} "
-                    f"device_layer_id={device_layer_id} "
-                    f"host_layer_id={host_layer_id}",
-                    flush=True,
-                )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -783,6 +754,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self._npu_layer_bindings = {}
         pools = []
         layer_start = 0
+        host_layer_axis = 0 if self.layout == "layer_first_kv_split" else 1
+
+        def layer_view(buffer, axis, layer):
+            if buffer is None or not buffer.numel():
+                return buffer
+            if layer == 0 and buffer.shape[axis] == 1:
+                return buffer
+            return buffer.narrow(axis, layer, 1)
+
         for i, info in enumerate(self._native_infos):
             native = info.native_buffers()
             layer_end = layer_start + native.k.shape[0]
@@ -806,11 +786,41 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 else (self._device_layer_num + i - 1,)
             )
             for layer_id in layers:
-                self._npu_layer_bindings[layer_id] = (
-                    native,
-                    layer_id if is_target else 0,
-                    self._host_layer_by_controller[layer_id],
-                    index_slots.get(layer_id),
+                device_layer = layer_id if is_target else 0
+                host_layer = self._host_layer_by_controller[layer_id]
+                slot = index_slots.get(layer_id)
+                index_k = (
+                    layer_view(native.index_k, 0, slot) if slot is not None else None
+                )
+                index_scale = (
+                    layer_view(native.index_scales, 0, slot)
+                    if slot is not None
+                    else None
+                )
+                if index_scale is not None and index_scale.ndim == 4:
+                    index_scale = index_scale.unsqueeze(-1)
+                self._npu_layer_bindings[layer_id] = dict(
+                    device_k=layer_view(native.k, 0, device_layer),
+                    host_k=layer_view(self.k_buffer, host_layer_axis, host_layer),
+                    device_v=layer_view(native.v, 0, device_layer),
+                    host_v=layer_view(self.v_buffer, host_layer_axis, host_layer),
+                    device_index_k=index_k,
+                    host_index_k=(
+                        layer_view(self.index_k_buffer, host_layer_axis, slot)
+                        if slot is not None
+                        else None
+                    ),
+                    device_index_k_scale=index_scale,
+                    host_index_k_scale=(
+                        layer_view(self.index_k_scale_buffer, host_layer_axis, slot)
+                        if slot is not None
+                        else None
+                    ),
+                    page_size=self.page_size,
+                    device_layer_id=0,
+                    host_layer_id=0,
+                    device_index_layer_id=0 if slot is not None else None,
+                    host_index_layer_id=0 if slot is not None else None,
                 )
             layer_start = layer_end
         self._npu_pool_bindings = tuple(pools)
@@ -983,17 +993,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
             for native, host_layer_start, is_target in self._npu_pool_bindings:
-                if (
-                    torch.distributed.is_initialized()
-                    and torch.distributed.get_rank() == 0
-                ):
-                    print(
-                        f"[MF-AIV D2H] all-layer begin: layout={self.layout} "
-                        f"host_layer_start={host_layer_start} is_target={is_target} "
-                        f"page_size={self.page_size} "
-                        f"num_indices={device_indices.numel()}",
-                        flush=True,
-                    )
                 transfer(
                     device_indices=device_indices,
                     host_indices=host_indices,
@@ -1009,16 +1008,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     host_layer_start=host_layer_start,
                     impl="auto",
                 )
-                if (
-                    torch.distributed.is_initialized()
-                    and torch.distributed.get_rank() == 0
-                ):
-                    print(
-                        f"[MF-AIV D2H] all-layer end: "
-                        f"host_layer_start={host_layer_start} "
-                        f"is_target={is_target}",
-                        flush=True,
-                    )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
