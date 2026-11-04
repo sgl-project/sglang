@@ -183,17 +183,20 @@ class HTTP:
                               client_cpu_ms=(time.thread_time()-cpu)*1000,
                               started_monotonic=started_monotonic)
 
-    def generate(self, tokens, salt, count, *, trial, seed, origin="resume"):
+    def generate(self, tokens, salt, count, *, trial, seed, origin="resume", kv_context=None):
         body = {"input_ids": tokens, "cache_salt": salt, "stream": True,
                 "sampling_params": {"temperature": 0, "max_new_tokens": count,
                                     "ignore_eos": True, "sampling_seed": seed}}
+        if kv_context is not None:
+            body["kv_context"] = kv_context
         start, cpu = time.perf_counter(), time.thread_time()
         started_monotonic = time.monotonic()
         first = None
-        events, last = [], None
+        events, last, response_headers = [], None, {}
         try:
             req = urllib.request.Request(self.url + "/generate", data=json.dumps(body).encode(), headers=self.headers)
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                response_headers = {"x-sgl-worker-url": response.headers.get("x-sgl-worker-url")}
                 # HTTPResponse iteration uses readline(): yield at an SSE line
                 # boundary without requests.iter_lines' 512-byte chunk gate.
                 for event in sse_objects(response):
@@ -223,10 +226,12 @@ class HTTP:
                    "client_cpu_ms": (time.thread_time()-cpu)*1000, "output_ids": last.get("output_ids"),
                    "text": last.get("text"), "meta_info": last.get("meta_info", {}), "url": self.url,
                    "started_monotonic": started_monotonic, "completed_monotonic": time.monotonic()}
+            out["response_headers"] = response_headers
             return out
         finally:
             self.journal.emit("generate", trial=trial, origin=origin, url=self.url,
                               request=body, events=events, started_monotonic=started_monotonic,
+                              response_headers=response_headers,
                               elapsed_ms=(time.perf_counter()-start)*1000)
 
 

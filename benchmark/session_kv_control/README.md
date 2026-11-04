@@ -100,6 +100,8 @@ cd "$BENCH_DIR"
 
 `--router URL` 只读取 Router capabilities 并保存。当前 harness 固定恢复节点 B，尚未实现 B3 的 Router 就绪感知选路；缺少经核验的 worker attribution 与 Router session event 协议时，不将 HTTP 成功解释为完成 B3。静态参考服务也只采集配置。默认负载为每轮一个源请求和一个恢复请求；可选背景流量与 host 压力见下文。共享前缀比例尚未单独扫描。实验期间应避免未记录的其他流量占用 A/B。
 
+真实 B3 选路使用独立入口 `router_bench.py --router-mode b2-b3`，协议和用法见 [Router 实验说明](ROUTER_BENCH.md)。原入口的 `--router` 仍保留能力采集用途。
+
 ## 本地轨迹输入
 
 `--trace-jsonl FILE` 使用本地记录，替代合成长度矩阵。每行须有唯一 `id`、`token_prefix`（完整 u32 token 数组）或 `prefix_text` 二选一、`tool_suffix`（非空 token 数组或文本）、`tool_wait_s`。token 前缀必须符合实际 page 对齐；文本按本地 tokenizer 编码后同样检查，不自动截断原轨迹。可选 `lead_s` 覆盖命令行 lead，`model`/`tokenizer` 路径作为身份断言，必须与 `--model` 一致。

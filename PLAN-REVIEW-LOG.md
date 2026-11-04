@@ -4836,3 +4836,9 @@ Parent independent isolated tests145passed90subtests; integrated with native/dem
 Registered publisher source epochs, compare-and-swap lifecycle authority, bounded retired epochs/chunk fingerprints, atomic placement+query evidence, native cache generation/version, session label preservation, bridge split-batch coordinates and Indexer restart UUID fences are integrated. Legacy sources remain advisory/unknown; trusted empty-cut reconciliation and external invalidation are explicit, no durable replay/HA advertised.
 
 Parent reviewed source gate/reconcile/clear paths, placement lock atomicity, split bridge shape, client confirmation filters and protobuf reserved fields. Independent indexer156passed; combined main indexer156+orchestrator44passed with1optional liveignored. P6/P7a retained. Evidence: /tmp/sglang-rfc-build/p7b-report.md, p7b-parent-tests.log, p7b-integrated-tests.log.
+
+## P8 Router benchmark harness acceptance — 2026-11-04
+
+Explicit router_bench.py B2/B3 pair uses the same Router lifecycle preparation targeting B, fixed tool deadlines, both workers cold after verified shared publication, actual x-sgl-worker-url attribution, tier/output consistency and stable task cancellation/drain/ack. Direct B2 and freely routed B3 are distinguished; route-change negatives remain in raw. Auth values are absent from raw.
+
+Parent independent integrated16unittests passed(11.953s), reviewed source setup, timer/observer separation, worker/epoch checks, cleanup and accounting. P6 real-model experiment running separately; no GPU benefit inferred from HTTP fixtures. Evidence /tmp/sglang-rfc-build/p8-router-harness-report.md and p8-router-integrated-tests.log.
