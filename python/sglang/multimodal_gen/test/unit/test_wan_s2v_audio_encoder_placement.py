@@ -6,7 +6,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from transformers import BatchEncoding
 
+from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_S2V_14B_Config
 from sglang.multimodal_gen.runtime.loader.component_loaders import (
     audio_encoder_loader as audio_loader_module,
@@ -215,3 +217,39 @@ def test_retry_after_failed_download_gets_the_whole_file(tmp_path):
     with open(path, "rb") as f:
         assert f.read() == b"RIFF-complete"
 
+
+class _T5Stub(torch.nn.Module):
+    """Returns a fixed last_hidden_state for the real Wan postprocess to pad and mask."""
+
+    def __init__(self, hidden):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.hidden = hidden
+
+    def forward(self, input_ids, attention_mask, output_hidden_states):
+        return BaseEncoderOutput(
+            last_hidden_state=self.hidden, attention_mask=attention_mask
+        )
+
+
+def test_text_prompt_encodes_through_the_pipelines_postprocess():
+    """The stage runs the pipeline's own text postprocess, which may return a
+    TextConditioningOutput; it must still hand out the valid-token embeddings."""
+    valid, max_len, dim = 5, 512, 8
+    hidden = torch.randn(1, max_len, dim)
+    mask = torch.zeros(1, max_len, dtype=torch.long)
+    mask[:, :valid] = 1
+    stage = _stage()
+    stage.text_encoder = _T5Stub(hidden)
+    stage.tokenizer = lambda prompt, **kwargs: BatchEncoding(
+        {
+            "input_ids": torch.ones(1, max_len, dtype=torch.long),
+            "attention_mask": mask,
+        }
+    )
+    server_args = SimpleNamespace(pipeline_config=Wan2_2_S2V_14B_Config())
+    with patch.object(
+        stage_module, "get_local_torch_device", return_value=torch.device("cpu")
+    ):
+        embeds = stage._encode_text_prompt("a cat", server_args=server_args)
+    assert torch.equal(embeds, hidden[:, :valid])

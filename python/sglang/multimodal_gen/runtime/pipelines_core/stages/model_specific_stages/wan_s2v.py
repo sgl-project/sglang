@@ -17,6 +17,7 @@ try:
 except ImportError:  # pragma: no cover
     sf = None
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -167,6 +168,8 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             output_hidden_states=True,
         )
         prompt_embeds = postprocess_func(outputs, text_inputs)
+        if isinstance(prompt_embeds, TextConditioningOutput):
+            prompt_embeds = prompt_embeds.prompt_embeds
         attention_mask = text_inputs.get("attention_mask")
         if (
             attention_mask is not None
