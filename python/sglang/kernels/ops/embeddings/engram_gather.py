@@ -32,7 +32,7 @@ def _dequant_rows(
     # hold two E2M1 values per byte, the even column in the low nibble.
     if MXFP4:
         byte = tl.load(
-            (w_base + row * (DIM // 2) + offs // 2).to(tl.pointer_type(tl.uint8)),
+            w_base.to(tl.pointer_type(tl.uint8)) + row * (DIM // 2) + offs // 2,
             mask=mask,
             other=0,
         ).to(tl.int32)
@@ -45,12 +45,12 @@ def _dequant_rows(
         vals = (bits | ((nib & 0x8) << 28)).to(tl.float32, bitcast=True)
     else:
         vals = tl.load(
-            (w_base + row * DIM + offs).to(tl.pointer_type(tl.float8e4nv)),
+            w_base.to(tl.pointer_type(tl.float8e4nv)) + row * DIM + offs,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
     exps = tl.load(
-        (s_base + row * (DIM // BLK) + offs // BLK).to(tl.pointer_type(tl.uint8)),
+        s_base.to(tl.pointer_type(tl.uint8)) + row * (DIM // BLK) + offs // BLK,
         mask=mask,
         other=0,
     ).to(tl.int32)

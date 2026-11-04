@@ -47,6 +47,7 @@ from sglang.srt.arg_groups.engram_config import (
     EngramReplication,
     cols_per_rank,
 )
+from sglang.srt.configs.model_config import _quant_config_to_dict
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
@@ -82,7 +83,6 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_serving,
-    process_model_config,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
@@ -1058,10 +1058,11 @@ def _table_views(
     return weight, scale
 
 
-def _engram_table_is_mxfp4() -> bool:
+def _engram_table_is_mxfp4(config) -> bool:
     """Whether the checkpoint stores the Engram tables as packed MXFP4, declared by
     quantization_config.engram_embed_quant; absent means the fp8 table."""
-    quant = process_model_config().hf_quant_config.get("engram_embed_quant", "fp8")
+    quant_config = _quant_config_to_dict(getattr(config, "quantization_config", None))
+    quant = (quant_config or {}).get("engram_embed_quant", "fp8")
     if quant not in ("fp8", "mxfp4"):
         raise ValueError(
             f"unsupported engram_embed_quant {quant!r}; expected 'fp8' or 'mxfp4'"
@@ -1517,7 +1518,7 @@ class Engram(nn.Module):
             layout.head_dim,
             layer_id,
             column_bounds=layout.column_bounds(self.layer_hash_index),
-            mxfp4=_engram_table_is_mxfp4(),
+            mxfp4=_engram_table_is_mxfp4(config),
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
