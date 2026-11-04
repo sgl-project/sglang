@@ -7,11 +7,13 @@
 import collections
 import concurrent.futures
 import fnmatch
+import functools
 import glob
 import hashlib
 import itertools
 import json
 import logging
+import mmap
 import os
 import re
 import struct
@@ -1143,6 +1145,33 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+@functools.lru_cache(maxsize=1)
+def _integrated_gpu() -> bool:
+    """True when the current CUDA device shares host memory (DGX Spark, N1X, Thor)."""
+    try:
+        return torch.cuda.is_available() and bool(
+            torch.cuda.get_device_properties(torch.cuda.current_device()).is_integrated
+        )
+    except Exception:
+        return False
+
+
+def _fault_in_mmap_view(t: torch.Tensor) -> torch.Tensor:
+    """Fault the file-backed pages of a safetensors mmap view in on the CPU.
+
+    On an integrated GPU, a host-to-device copy taken straight from an unmapped
+    mmap view pays its page faults inside the driver copy, which is two orders
+    of magnitude slower than faulting the pages here first (DGX Spark: 33 s vs
+    0.9 s for a 5.6 GiB checkpoint; N1X: 1 882 s). The pages stay file-backed and
+    reclaimable, so this costs no extra host memory. No-op on discrete GPUs.
+    """
+    if _integrated_gpu() and t.device.type == "cpu" and t.is_contiguous() and t.numel():
+        flat = t.reshape(-1).view(torch.uint8)
+        flat[:: mmap.PAGESIZE].sum()
+        flat[-1:].sum()
+    return t
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -1176,7 +1205,7 @@ def safetensors_weights_iterator(
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
+                    yield name, _fault_in_mmap_view(f.get_tensor(name))
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
@@ -1352,7 +1381,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {k: _fault_in_mmap_view(f.get_tensor(k)) for k in f.keys()}
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.
