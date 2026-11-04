@@ -47,18 +47,18 @@ def _require_ops(*, device: torch.device) -> _Ops:
 
 def pack(*, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Preshuffled MXFP4 weight and E8M0 scales for a BF16 [out, in] weight."""
-    # The (16, 16) shuffle needs 16 output rows and 32 packed input bytes.
+    # gemm_a4w4 and the preshuffled scales read whole 256x256 tiles.
     if (
         weight.dtype != torch.bfloat16
         or weight.ndim != 2
         or weight.shape[0] == 0
-        or weight.shape[0] % 16 != 0
+        or weight.shape[0] % 256 != 0
         or weight.shape[1] == 0
-        or weight.shape[1] % 64 != 0
+        or weight.shape[1] % 256 != 0
     ):
         raise ValueError(
             "MXFP4 needs a nonempty 2D BF16 weight with output/input dimensions "
-            "aligned to 16/64, got "
+            "aligned to 256, got "
             f"{weight.dtype} {tuple(weight.shape)}"
         )
     quant, shuffle, _, fp4x2 = _require_ops(device=weight.device)
@@ -80,9 +80,10 @@ def run(*, x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.
         or not scale.is_contiguous()
     ):
         raise ValueError("latent MXFP4 weight and scales must match the activations")
-    quant, _, gemm, fp4x2 = _require_ops(device=x.device)
-    if weight.dtype != fp4x2:
+    # pack() already checked the device, so skip the per-call device query.
+    ops = _ops()
+    if ops is None or weight.dtype != ops[3]:
         raise ValueError("latent MXFP4 GEMM needs packed FP4 weights from pack()")
-    rows = x.shape[0]
+    quant, _, gemm, fp4x2 = ops
     xq, x_scale = quant(x.contiguous(), quant_dtype=fp4x2, shuffle=True)
-    return gemm(xq, weight, x_scale, scale, dtype=x.dtype, bpreshuffle=True)[:rows]
+    return gemm(xq, weight, x_scale, scale, dtype=x.dtype, bpreshuffle=True)

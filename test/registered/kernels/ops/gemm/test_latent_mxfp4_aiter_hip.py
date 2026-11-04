@@ -81,10 +81,11 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
                 self._assert_matches_bf16(actual=out, x=x, weight=weight)
 
     def test_rejects_invalid_weight_layout(self):
-        for shape in ((7168,), (17, 64), (16, 32), (16, 0)):
+        # gemm_a4w4 and the preshuffled scales read whole 256x256 tiles.
+        for shape in ((7168,), (16, 64), (3600, 7168), (3584, 7200), (256, 0)):
             with self.subTest(shape=shape):
                 weight = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
-                with self.assertRaisesRegex(ValueError, "aligned to 16/64"):
+                with self.assertRaisesRegex(ValueError, "aligned to 256"):
                     latent_mxfp4_aiter_hip.pack(weight=weight)
 
     def test_rejects_incompatible_activations(self):

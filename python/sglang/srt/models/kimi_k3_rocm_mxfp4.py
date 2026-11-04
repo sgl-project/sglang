@@ -1,13 +1,29 @@
 """Optional MXFP4 copies of Kimi-K3's replicated latent MoE projections."""
 
 import logging
+from typing import Optional
 
 import torch
 from torch import nn
 
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
+
+
+def build_latent_mxfp4_projections() -> Optional["LatentMXFP4Projections"]:
+    """Per-layer holder when the device can run the MXFP4 GEMMs, else None."""
+    if not (envs.SGLANG_USE_AITER.get() and latent_mxfp4_aiter_hip.supported()):
+        print_warning_once(
+            "SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4 needs SGLANG_USE_AITER=1 and AITER "
+            "on gfx950; keeping the BF16 latent projections."
+        )
+        return None
+    return LatentMXFP4Projections(
+        min_tokens=envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4_MIN_TOKENS.get()
+    )
 
 
 class LatentMXFP4Projections(nn.Module):
@@ -30,7 +46,6 @@ class LatentMXFP4Projections(nn.Module):
         self.register_buffer("up_scale", None, persistent=False)
 
     def prepare(self, *, down_weight: torch.Tensor, up_weight: torch.Tensor) -> None:
-        self.down_weight = self.down_scale = self.up_weight = self.up_scale = None
         if (
             down_weight.shape != (3584, 7168)
             or up_weight.shape != (7168, 3584)
@@ -39,6 +54,7 @@ class LatentMXFP4Projections(nn.Module):
             or down_weight.device != up_weight.device
             or not latent_mxfp4_aiter_hip.supported(device=down_weight.device)
         ):
+            self.down_weight = self.down_scale = self.up_weight = self.up_scale = None
             logger.warning(
                 "Kimi-K3 latent MXFP4 is unavailable for these weights/device; "
                 "keeping the original latent projections"
@@ -46,8 +62,19 @@ class LatentMXFP4Projections(nn.Module):
             return
         down, down_scale = latent_mxfp4_aiter_hip.pack(weight=down_weight)
         up, up_scale = latent_mxfp4_aiter_hip.pack(weight=up_weight)
-        self.down_weight, self.down_scale = down, down_scale
-        self.up_weight, self.up_scale = up, up_scale
+        if self.down_weight is None:
+            self.down_weight, self.down_scale = down, down_scale
+            self.up_weight, self.up_scale = up, up_scale
+            return
+        # A reload (e.g. a weight update) refills the copies in place: captured
+        # CUDA graphs hold their addresses.
+        for dst, src in (
+            (self.down_weight, down),
+            (self.down_scale, down_scale),
+            (self.up_weight, up),
+            (self.up_scale, up_scale),
+        ):
+            dst.copy_(src)
 
     def can_run(self, *, num_tokens: int) -> bool:
         return self.down_weight is not None and num_tokens >= self.min_tokens

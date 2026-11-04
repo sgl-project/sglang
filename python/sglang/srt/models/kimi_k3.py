@@ -483,17 +483,6 @@ class KimiK3MoE(nn.Module):
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
         self._latent_mxfp4 = None
-        if (
-            _is_hip
-            and self.use_latent_moe
-            and get_moe_a2a_backend().is_none()
-            and envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4.get()
-        ):
-            from sglang.srt.models.kimi_k3_rocm_mxfp4 import LatentMXFP4Projections
-
-            self._latent_mxfp4 = LatentMXFP4Projections(
-                min_tokens=envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4_MIN_TOKENS.get()
-            )
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -698,6 +687,18 @@ class KimiK3MoE(nn.Module):
                 quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
+            # MXFP4 copies are made from the BF16 latent weights only.
+            if (
+                _is_hip
+                and latent_quant_config is None
+                and get_moe_a2a_backend().is_none()
+                and envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4.get()
+            ):
+                from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
+                    build_latent_mxfp4_projections,
+                )
+
+                self._latent_mxfp4 = build_latent_mxfp4_projections()
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -1239,7 +1240,9 @@ class KimiK3MoE(nn.Module):
         # Both front helpers include the BF16 down-projection, bypassing MXFP4.
         # Leave routed_input unset for separate routing and MXFP4 compression below.
         routed_input = None
-        if not self._use_latent_mxfp4(num_tokens=hidden_states.shape[0]):
+        # One decision per forward keeps the down and up projections paired.
+        use_mxfp4 = self._use_latent_mxfp4(num_tokens=hidden_states.shape[0])
+        if not use_mxfp4:
             routed_input = self._ep_front(hidden_states)
             if routed_input is None and not fine_grained_overlap:
                 routed_input = self._ep_front_overlap(hidden_states)
@@ -1277,7 +1280,7 @@ class KimiK3MoE(nn.Module):
                 # materialize its shape-only result without launching GEMM.
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
-                if self._use_latent_mxfp4(num_tokens=hidden_states.shape[0]):
+                if use_mxfp4:
                     routed_input = self._latent_mxfp4.down(x=hidden_states)
                 else:
                     routed_input, _ = self.routed_expert_down_proj(hidden_states)
@@ -1290,7 +1293,7 @@ class KimiK3MoE(nn.Module):
         else:
             latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
-            if self._use_latent_mxfp4(num_tokens=latent.shape[0]):
+            if use_mxfp4:
                 out = self._latent_mxfp4.up(x=latent)
             else:
                 out, _ = self.routed_expert_up_proj(latent)
@@ -1429,7 +1432,8 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        if self._use_latent_mxfp4(num_tokens=num_tokens):
+        use_mxfp4 = self._use_latent_mxfp4(num_tokens=num_tokens)
+        if use_mxfp4:
             head_sizes = self._front_sizes[:-1]
             head = _k3_bf16_gemm(hidden_states, self._front_w[: sum(head_sizes)])
             gate_up, router_logits = torch.split(head, head_sizes, dim=-1)
@@ -1542,7 +1546,7 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         if not fused_norm:
             latent = self._latent_norm(latent)
-        if self._use_latent_mxfp4(num_tokens=num_tokens):
+        if use_mxfp4:
             out = self._latent_mxfp4.up(x=latent)
         else:
             out, _ = self.routed_expert_up_proj(latent)

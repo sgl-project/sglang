@@ -9,8 +9,12 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
+from sglang.srt.environ import envs
 from sglang.srt.models import kimi_k3
-from sglang.srt.models.kimi_k3_rocm_mxfp4 import LatentMXFP4Projections
+from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
+    LatentMXFP4Projections,
+    build_latent_mxfp4_projections,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -140,10 +144,19 @@ class TestLatentMXFP4Runtime(CustomTestCase):
                 side_effect=[
                     (torch.ones(1), torch.ones(1)),
                     (torch.ones(1), torch.ones(1)),
+                    (torch.full((1,), 2.0), torch.ones(1)),
+                    (torch.full((1,), 3.0), torch.ones(1)),
                 ],
             ),
         ):
             projections.prepare(down_weight=down, up_weight=up)
+            # A reload refills the copies captured CUDA graphs already point at.
+            buffers = (projections.down_weight, projections.up_weight)
+            projections.prepare(down_weight=down, up_weight=up)
+        self.assertIs(projections.down_weight, buffers[0])
+        self.assertIs(projections.up_weight, buffers[1])
+        self.assertEqual(projections.down_weight.item(), 2.0)
+        self.assertEqual(projections.up_weight.item(), 3.0)
         self.assertFalse(projections.can_run(num_tokens=2047))
         self.assertTrue(projections.can_run(num_tokens=2048))
         self.assertTrue(projections.can_run(num_tokens=2049))
@@ -154,6 +167,15 @@ class TestLatentMXFP4Runtime(CustomTestCase):
         self.assertIsNone(projections.up_weight)
         with self.assertRaisesRegex(RuntimeError, "has not been prepared"):
             projections.up(x=torch.ones(1, 3584))
+
+    def test_builder_honors_the_aiter_opt_out(self):
+        """SGLANG_USE_AITER=0 must keep the BF16 latent projections even though
+        AITER is importable on the device."""
+        with mock.patch.object(latent_mxfp4_aiter_hip, "supported", return_value=True):
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertIsNone(build_latent_mxfp4_projections())
+            with envs.SGLANG_USE_AITER.override(True):
+                self.assertIsNotNone(build_latent_mxfp4_projections())
 
     def test_rejects_nonpositive_token_floor(self):
         for min_tokens in (0, -1):
