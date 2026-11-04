@@ -279,7 +279,7 @@ export const config = {
 `# Low Latency speed rows whose notes mention SGLANG_SIMULATE_ACC_LEN=3 were served
 # with it to pin the accept length; that number is throughput evidence only. Never
 # run accuracy against it.
-python3 -m sglang.bench_serving \\
+python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
