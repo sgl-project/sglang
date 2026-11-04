@@ -424,6 +424,33 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     return True
 
 
+def get_numa_node_available_bytes(node: int) -> int:
+    """
+    Estimate the available memory on a NUMA node in bytes.
+
+    Node meminfo has no MemAvailable field, so this adds MemFree, file-backed
+    page cache and reclaimable slab. The result can be slightly optimistic,
+    as not all of that cache can always be reclaimed.
+    """
+    with open(f"/sys/devices/system/node/node{node}/meminfo") as f:
+        fields = {p[2].rstrip(":"): int(p[3]) for p in map(str.split, f) if len(p) >= 4}
+    return (
+        fields["MemFree"]
+        + fields["Active(file)"]
+        + fields["Inactive(file)"]
+        + fields["SReclaimable"]
+    ) * 1024
+
+
+def parse_node_list(spec: str) -> list[int]:
+    """Parse a node list such as "2", "2,3" or "0-1". Returns the list of nodes as integers."""
+    nodes = []
+    for part in spec.split(","):
+        start, _, end = part.strip().partition("-")
+        nodes.extend(range(int(start), int(end or start) + 1))
+    return nodes
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -489,9 +516,24 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = get_free_cpu_memory()
-        n_numa_node: int = len(get_cpu_ids_by_node())
-        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
+        mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
+        # This file contain numa nodes with compute cores
+        has_cpu_path = "/sys/devices/system/node/has_cpu"
+        if mem_bind_env:
+            nodes = parse_node_list(mem_bind_env)
+        elif os.path.exists(has_cpu_path):
+            with open(has_cpu_path) as f:
+                nodes = parse_node_list(f.read())
+        else:
+            nodes = None
+
+        if nodes:
+            free_gpu_memory = min(get_numa_node_available_bytes(n) for n in nodes)
+        else:
+            # No NUMA information, e.g. on non-Linux systems
+            total_free_memory = get_free_cpu_memory()
+            n_numa_node: int = len(get_cpu_ids_by_node())
+            free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
