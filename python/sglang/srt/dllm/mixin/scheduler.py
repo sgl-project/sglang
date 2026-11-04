@@ -39,7 +39,7 @@ class SchedulerDllmMixin:
         )
 
     def _release_aborted_dllm_req(self: Scheduler, req: Req) -> None:
-        self.request_retirer.retire_aborted_dllm_waiting(req)
+        self.request_retirer.retire_queued_abort(req)
         logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
     def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:

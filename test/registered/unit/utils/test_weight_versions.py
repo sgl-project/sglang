@@ -17,7 +17,7 @@ from sglang.srt.utils.weight_versions import (
     weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists, make_request_retirer
+from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -414,16 +414,18 @@ class TestSpanlessAbortPaths(CustomTestCase):
         req.time_stats = SimpleNamespace(
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
+        req.finished_reason = None
+        req.finish_outside_step = lambda reason: None
+        req.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         sent = []
-        retirer = make_request_retirer(
-            send_abort_output=lambda obj, req_arg: sent.append(obj)
-        )
-        retirer.release_aborted_request = MagicMock()
-        scheduler = SimpleNamespace(
-            enable_priority_scheduling=False,
-            abort_on_priority_when_disabled=True,
-            request_retirer=retirer,
-        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_priority_scheduling = False
+        scheduler.abort_on_priority_when_disabled = True
+        scheduler.send_abort_output = lambda obj, req_arg: sent.append(obj)
+        scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
+        scheduler.hisparse_coordinator = None
+        scheduler.init_request_retirer()
+        scheduler.request_retirer.release_aborted_request = MagicMock()
 
         with patch(
             "sglang.srt.managers.utils.get_serving",

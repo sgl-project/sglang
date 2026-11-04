@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import make_request_retirer
 from sglang.test.separate_buffer_allocator_double import (
     separate_buffer_allocator_double,
 )
@@ -116,12 +115,10 @@ def _make_prealloc_queue(
 
     model_runner = SimpleNamespace(max_token_pool_size=max_token_pool_size)
     tp_worker = SimpleNamespace(model_runner=model_runner)
-    output_streamer = MagicMock()
     queue.scheduler = SimpleNamespace(
         enable_hisparse=enable_hisparse,
         tp_worker=tp_worker,
-        output_streamer=output_streamer,
-        request_retirer=make_request_retirer(output_streamer=output_streamer),
+        output_streamer=MagicMock(),
     )
     return queue
 

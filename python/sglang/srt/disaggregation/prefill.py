@@ -466,7 +466,7 @@ class PrefillBootstrapQueue:
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted_request(req)
+            self.scheduler.retire_unadmitted_request(req)
             return
         if not self.create_sender(req, num_kv_heads):
             return
@@ -480,7 +480,7 @@ class PrefillBootstrapQueue:
         for req in self.queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.scheduler.request_retirer.abort_queued_attempt(req)
+                self.scheduler.release_aborted_request(req)
 
                 if hasattr(req.disagg_kv_sender, "abort"):
                     req.disagg_kv_sender.abort()
@@ -492,9 +492,8 @@ class PrefillBootstrapQueue:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
-            self.scheduler.request_retirer.reject_request(
-                req, message, status_code=HTTPStatus.BAD_REQUEST
-            )
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
 
@@ -1453,13 +1452,15 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        self.request_retirer.retire_bootstrap_failure(
-            req,
-            error_message,
-            metadata_buffer_allocator=self.req_to_metadata_buffer_idx_allocator,
-        )
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""

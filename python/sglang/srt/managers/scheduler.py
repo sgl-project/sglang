@@ -2605,9 +2605,7 @@ class Scheduler(
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
-            reject_request=lambda *a, **kw: self.request_retirer.reject_request(
-                *a, **kw
-            ),
+            stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
@@ -2824,9 +2822,7 @@ class Scheduler(
             beam_coordinator=self.beam_coordinator,
             hisparse_coordinator=self.hisparse_coordinator,
             uocr_runtime=self.uocr_runtime,
-            output_streamer=self.output_streamer,
             send_abort_output=self.send_abort_output,
-            send_to_tokenizer=self.ipc_channels.send_to_tokenizer,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -3224,9 +3220,8 @@ class Scheduler(
                 error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
                 if error_msg:
                     logger.error(error_msg)
-                    self.request_retirer.reject_request(
-                        req, error_msg, status_code=HTTPStatus.BAD_REQUEST
-                    )
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.output_streamer.stream_output([req], req.return_logprob)
                     return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -3244,9 +3239,8 @@ class Scheduler(
                         recv_req.time_stats.trace_ctx.abort(
                             abort_info={"reason": error_msg}
                         )
-                    self.request_retirer.reject_request(
-                        req, error_msg, status_code=HTTPStatus.BAD_REQUEST
-                    )
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.output_streamer.stream_output([req], req.return_logprob)
                     return
 
         elif (
@@ -3314,15 +3308,16 @@ class Scheduler(
             return
 
         if error_msg := self.validate_dllm_request(req):
-            self.request_retirer.reject_unqueued_request(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.BAD_REQUEST,
                     "message": error_msg,
                 },
-                release_aborted=False,
             )
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self.send_abort_output(abort_req, req)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -3651,6 +3646,31 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
+    def retire_unadmitted_request(self, req: Req) -> None:
+        """Finish a request the disaggregation queues rejected at their door."""
+        # `create_req` marks a streaming session in-flight, and the pre-abort
+        # detach lives in `StreamingSession.find_active_slot`, which only runs
+        # while scheduling; a session left in-flight rejects every later request.
+        if req.session is not None and req.session.streaming:
+            req.release_mm_inputs_on_abort()
+            req.session.abort_req()
+            req.session = None
+        # `beam_coordinator.validate_and_init` counts the group in ahead of the
+        # checks that reject; no-op when the request has no group.
+        self.beam_coordinator.retire_group(req)
+        # PREFILL runs `_prefetch_kvcache` before its door, so even the
+        # one-token stub is registered with the cache by now:
+        # `prefetch_from_storage` arms the paced-retry set for this attempt's
+        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
+        # that, and a retired request reaches neither.
+        self.release_aborted_request(req)
+        # `update_finish_state` returns early once `finished()`, so an already
+        # set `finished_reason` is what the client receives; report the same.
+        reason = req.finished_reason or req.to_finish
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.update_finish_state()
+        self.output_streamer.stream_output([req], req.return_logprob)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
@@ -3691,9 +3711,8 @@ class Scheduler(
         """Return a sampling-mask validation error without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        self.request_retirer.reject_request(
-            req, error_msg, status_code=HTTPStatus.BAD_REQUEST
-        )
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3707,14 +3726,9 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            self.request_retirer.reject_unqueued_request(
+            self._retire_unavailable(
                 req,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
-                },
-                release_aborted=True,
+                message="Using priority is disabled for this server. Please send a new request without a priority.",
             )
             return False
         return True
@@ -3722,6 +3736,18 @@ class Scheduler(
     def release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         self.request_retirer.release_aborted_request(req)
+
+    def _retire_unavailable(self, req: Req, *, message: str) -> None:
+        self.request_retirer.retire_queued_abort(
+            req,
+            reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
+        )
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
 
     def _abort_uocr_doc_windows(
         self,
@@ -3731,7 +3757,7 @@ class Scheduler(
     ) -> None:
         """Abort document windows held off the waiting queue."""
         for req in reqs:
-            self.request_retirer.retire_aborted_doc_window(
+            self.request_retirer.retire_queued_abort(
                 req, finished_reason=finished_reason
             )
 
@@ -3759,17 +3785,16 @@ class Scheduler(
             )
             if abort_existing_req:
                 self.waiting_queue.leave([candidate_req])
-                self.request_retirer.retire_evicted_waiting(
+                self._retire_unavailable(
                     candidate_req,
                     message="The request is aborted by a higher priority request.",
-                    incoming=recv_req,
                 )
-                return candidate_req.rid == recv_req.rid
+                # An evicted request sharing the incoming rid refuses it too.
+                if candidate_req.rid != recv_req.rid:
+                    return False
 
         # Reject the incoming request by default.
-        self.request_retirer.reject_queue_full(
-            recv_req, message="The request queue is full."
-        )
+        self._retire_unavailable(recv_req, message="The request queue is full.")
         return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
@@ -6003,13 +6028,25 @@ class Scheduler(
         return inflight_batches
 
     def _abort_waiting(self, recv_req: AbortReq) -> None:
+        is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
+        is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        # With host receive on, a PD decode request may hold its KV as a host backup.
+        host_backup = (
+            is_decode and get_disagg().disaggregation_decode_host_receive_threshold < 1
+        )
         for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
-            self.request_retirer.retire_aborted_waiting(
+            # Without the initiator's reason the tokenizer falls back to a
+            # generic abort message.
+            self.request_retirer.retire_queued_abort(
                 req,
                 finished_reason=recv_req.finished_reason,
-                disaggregation_mode=self.disaggregation_mode,
+                backup_backend="host_pool" if host_backup else None,
+                checkpoint=is_decode,
+                # A PD prefill request may hold KV its sender still reads; the
+                # prefill tail aborts the sender before it frees that KV.
+                release_memory=not is_prefill,
             )
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if is_prefill:
                 self.release_aborted_prefill_waiting_req(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 

@@ -17,6 +17,7 @@ import torch
 import zmq
 from torch.distributed import ReduceOp, all_reduce, barrier
 
+from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -69,7 +70,7 @@ class SchedulerRequestReceiver:
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
-    reject_request: Callable[..., None]
+    stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     # SGLANG_RUST_SERVER: requests are drained from the embedded Rust
     # listener's ring rather than received over zmq.
@@ -264,7 +265,8 @@ class SchedulerRequestReceiver:
                     status_code = error_code
                 else:
                     status_code = HTTPStatus(int(error_code))
-                self.reject_request(req, error_msg, status_code=status_code)
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:

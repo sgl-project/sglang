@@ -919,7 +919,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted_request(req)
+            self.scheduler.retire_unadmitted_request(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             req.time_stats.set_retract_time()
@@ -1062,9 +1062,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
         if message is not None:
             logger.error(message)
-            self.scheduler.request_retirer.reject_request(
-                req, message, status_code=HTTPStatus.BAD_REQUEST
-            )
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
 
@@ -1079,14 +1078,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
-            self.scheduler.request_retirer.retire_aborted_retracted(req)
+            self.scheduler.request_retirer.retire_queued_abort(
+                req,
+                backup_backend=get_disagg().disaggregation_decode_retraction_backup,
+            )
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
             lambda req: recv_req.matches(req.rid)
         ):
-            self.scheduler.request_retirer.retire_aborted_held(
+            self.scheduler.request_retirer.retire_queued_abort(
                 req, finished_reason=recv_req.finished_reason
             )
 
@@ -1693,10 +1695,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.unlock(decode_req.req.lock)
                         decode_req.req.lock = None
                     logger.error(reclaim_error)
-                    self.scheduler.request_retirer.reject_request(
+                    prepare_abort(
                         decode_req.req,
                         reclaim_error,
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
                     )
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None

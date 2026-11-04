@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.test.scheduler_test_utils import empty_request_lists, make_request_retirer
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -58,6 +58,7 @@ class _FakeReq:
         self.output_ids = []
         self.weight_version_events = []
         self.prefill_weight_versions = None
+        self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -91,14 +92,10 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.rust_server = None
     s.output_streamer = MagicMock()
     s.beam_coordinator = MagicMock()
+    s.hisparse_coordinator = None
+    s.tree_cache = MagicMock()
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
-    s.request_retirer = make_request_retirer(
-        beam_coordinator=s.beam_coordinator,
-        output_streamer=s.output_streamer,
-        send_abort_output=s.send_abort_output,
-        send_to_tokenizer=s.ipc_channels.send_to_tokenizer,
-    )
     return s
 
 
@@ -122,14 +119,54 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
         s.enable_hierarchical_cache = True
-        s.request_retirer.tree_cache = MagicMock(spec=["finish"])
+        s.tree_cache = MagicMock(spec=["finish"])
+        s.init_request_retirer()
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
 
-        s.request_retirer.tree_cache.finish.assert_called_once_with(
+        s.tree_cache.finish.assert_called_once_with(
             candidate.cache_request_handle, CacheRequestOutcome.ABORT
         )
         self.assertEqual(list(s.waiting_queue), [])
+
+    def test_evicted_request_releases_the_memory_it_holds(self):
+        """An evicted waiting request gives back its mamba slot, as every other
+        queued abort does; otherwise the slot leaks."""
+        candidate = _req("candidate", wait_entry=1.0)
+        candidate.priority = 0
+        candidate.kv.holds_mamba = True
+        incoming = _req("incoming", wait_entry=2.0)
+        incoming.priority = 1
+        s = _scheduler([candidate])
+        s.max_queued_requests = 1
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.init_request_retirer()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
+            self.assertFalse(s._abort_on_queued_limit(incoming))
+
+        release.assert_called_once_with(candidate, s.tree_cache, checkpoint=False)
+
+    def test_evicting_the_incoming_rid_also_answers_the_incoming_request(self):
+        """An evicted request sharing the incoming rid refuses the incoming one,
+        which is retired like any refusal, with its own abort."""
+        candidate = _req("same", wait_entry=1.0)
+        candidate.priority = 0
+        incoming = _req("same", wait_entry=2.0)
+        incoming.priority = 1
+        s = _scheduler([candidate])
+        s.max_queued_requests = 1
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.init_request_retirer()
+
+        self.assertTrue(s._abort_on_queued_limit(incoming))
+
+        self.assertTrue(candidate.finished() and incoming.finished())
+        self.assertEqual(s.ipc_channels.send_to_tokenizer.send_output.call_count, 2)
 
 
 class TestWaitingTimeout(CustomTestCase):
@@ -171,7 +208,6 @@ class TestQueuedAbort(CustomTestCase):
 
     def test_popped_request_is_finished_and_a_later_abort_skips_it(self):
         req = _req("queued")
-        req.kv = SimpleNamespace(holds_mamba=False)
         # Still listed in the last batch, as a requeued or dLLM request is.
         s = _scheduler([req], last_batch_reqs=[req])
         s.disaggregation_mode = DisaggregationMode.NULL
@@ -179,6 +215,7 @@ class TestQueuedAbort(CustomTestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
+        s.init_request_retirer()
         s.request_retirer.release_aborted_request = MagicMock()
 
         s.abort_request(AbortReq(rid="queued"))
