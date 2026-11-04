@@ -14,7 +14,10 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
@@ -187,13 +190,13 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
                 ),
             ),
             enable_hisparse=False,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
         )
         forwarded = SchedulerPPMixin.process_decode_transfer_queue(
             scheduler, {"s": False, "f": True, "h": False}
         )
         self.assertEqual(forwarded, {"s": False, "f": True})
-        self.assertEqual(scheduler.waiting_queue, [admitted])
+        self.assertEqual(list(scheduler.waiting_queue), [admitted])
 
     def test_no_consensus_means_nothing_to_forward(self):
         scheduler = SimpleNamespace(

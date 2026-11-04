@@ -48,9 +48,9 @@ from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_ds
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -678,7 +678,7 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        self.ack_staging_queue = _RequestList(
+        self.ack_staging_queue = IndexedReqList(
             ListKind.HISPARSE_STAGING, req_of=lambda x: x.req
         )
         self.decode_producer_stream = None
@@ -1072,7 +1072,7 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
-    def request_lists(self) -> Dict[ListKind, RequestList]:
+    def request_lists(self) -> Dict[ListKind, ReqList]:
         return {ListKind.HISPARSE_STAGING: self.ack_staging_queue}
 
     def collect_ready_reqs(self) -> List[Req]:
