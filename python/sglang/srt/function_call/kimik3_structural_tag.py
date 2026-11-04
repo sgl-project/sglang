@@ -209,6 +209,68 @@ def _with_root_definitions(
     return result
 
 
+def _is_root_structure_ref(ref: Any) -> bool:
+    # Refs into the definition pools resolve in every argument schema, which
+    # carries the root's pools; any other local ref points into the root's own
+    # structure, which an argument schema no longer has.
+    return (
+        isinstance(ref, str)
+        and (ref == "#" or ref.startswith("#/"))
+        and not ref.startswith(("#/$defs/", "#/definitions/"))
+    )
+
+
+def _localize_root_refs(
+    schema: Union[bool, Dict[str, Any]], root_schema: Dict[str, Any]
+) -> Union[bool, Dict[str, Any]]:
+    """Make the root-structure refs of an argument schema resolvable inside it.
+
+    Each argument value compiles as its own JSON schema, so a ref such as
+    ``#/properties/value/properties/a`` would be looked up in the argument
+    schema and fail. Every such target (and, transitively, the root-structure
+    refs inside it) is copied under ``$defs`` and the ref is rewritten to it.
+    Unresolvable refs are left for the compiler to report.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    pools = [schema.get(key) for key in ("$defs", "definitions")]
+    taken = {name for pool in pools if isinstance(pool, dict) for name in pool}
+    names: Dict[str, str] = {}
+    pending: List[str] = []
+
+    def rewrite(node: Any) -> Any:
+        if isinstance(node, list):
+            return [rewrite(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        result = {key: rewrite(value) for key, value in node.items()}
+        ref = node.get("$ref")
+        if _is_root_structure_ref(ref) and (
+            ref == "#" or _resolve_local_ref(ref, root_schema) is not None
+        ):
+            if ref not in names:
+                index = len(names)
+                while f"root_ref_{index}" in taken:
+                    index += 1
+                names[ref] = f"root_ref_{index}"
+                taken.add(names[ref])
+                pending.append(ref)
+            result["$ref"] = f"#/$defs/{names[ref]}"
+        return result
+
+    result = rewrite(schema)
+    if not pending:
+        return schema
+    hoisted: Dict[str, Any] = {}
+    while pending:
+        ref = pending.pop()
+        target = root_schema if ref == "#" else _resolve_local_ref(ref, root_schema)
+        hoisted[names[ref]] = rewrite(target)
+    defs = result.get("$defs")
+    result["$defs"] = {**(defs if isinstance(defs, dict) else {}), **hoisted}
+    return result
+
+
 def _restrict_schema_type(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
@@ -315,7 +377,11 @@ def _argument_value_variants(
     return [
         (
             json_type,
-            _value_format(restricted, json_type, loose_string=loose_strings),
+            _value_format(
+                _localize_root_refs(restricted, root_schema),
+                json_type,
+                loose_string=loose_strings,
+            ),
         )
         for json_type in _schema_types(schema, root_schema)
         if (restricted := _restrict_schema_type(schema, json_type, root_schema))
