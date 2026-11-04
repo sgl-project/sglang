@@ -274,8 +274,8 @@ _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
-    """The forced acceptance lengths' generator (SGLANG_SIMULATE_ACC_LEN), seeded
-    alike on every rank from the server seed."""
+    """The generator of the SGLANG_SIMULATE_ACC_LEN draws (forced lengths, and
+    DSpark's bonus seed), seeded alike on every rank from the server seed."""
     return torch.Generator().manual_seed(
         (int(seed) ^ _SIM_ACC_LEN_DOMAIN) & 0x7FFFFFFFFFFFFFFF
     )
