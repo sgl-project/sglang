@@ -137,9 +137,8 @@ class SRTPlatform(DeviceMixin):
         selected runners exactly as /update_weights_from_distributed does. A handler that
         writes parameters itself (through ``context.runners``) returns ``[]``, so
         end_weight_update runs post_load_weights, as after peer (p2p) writes. An exception
-        on any rank fails the request on all ranks, after the ranks that succeeded have
-        loaded their share, so the caller redoes the bucket or retires the engine; the
-        transport owns its timeouts.
+        on any rank fails the request on all ranks before any of them loads, so the
+        caller redoes the bucket or retires the engine; the transport owns its timeouts.
         """
         return {}
 

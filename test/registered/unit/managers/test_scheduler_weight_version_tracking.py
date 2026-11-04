@@ -632,20 +632,47 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         target.weight_updater.load_weights_from_distributed.assert_not_called()
         self.assertEqual((self.flushes, self.recorded), ([], []))
 
-    def test_rank_0_reports_another_ranks_failure_from_the_gather(self):
-        """Only rank 0 replies: a failure gathered from rank 1 fails the request after rank 0 loaded."""
-        gathered = [(1, None), (0, "TP rank 1: no receive buffers")]
+    def _gathering(self, *rounds):
+        """all_gather_object returns each round's TP-wide (count, error) list in turn."""
+        rounds = iter(rounds)
+        return patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda outputs, obj, group: outputs.__setitem__(
+                slice(None), next(rounds)
+            ),
+        )
+
+    def test_a_receive_failure_on_another_rank_stops_this_rank_from_loading(self):
+        """The ranks agree on the receive first: load_weights may run collectives every rank must reach."""
         target = _runner()
         manager = self._manager_serving(
             {"ici": lambda *, context, payload: [("w", object())]}, target=target
         )
 
         with (
-            patch(
-                "torch.distributed.all_gather_object",
-                side_effect=lambda outputs, obj, group: outputs.__setitem__(
-                    slice(None), gathered
-                ),
+            self._gathering([(1, None), (0, "TP rank 1: no receive buffers")]),
+            get_parallel().override(tp_rank=0, tp_size=2),
+        ):
+            output = manager.plugin_weight_update(
+                PluginWeightUpdateReqInput(handler="ici", weight_version="3")
+            )
+
+        self.assertFalse(output.success)
+        self.assertIn("TP rank 1", output.message)
+        self.assertEqual(output.received_tensor_counts, [])
+        target.weight_updater.load_weights_from_distributed.assert_not_called()
+        self.assertEqual((self.flushes, self.recorded), ([], []))
+
+    def test_rank_0_reports_another_ranks_load_failure_from_the_gather(self):
+        """Only rank 0 replies: a load failure gathered from rank 1 fails the request after rank 0 loaded."""
+        target = _runner()
+        manager = self._manager_serving(
+            {"ici": lambda *, context, payload: [("w", object())]}, target=target
+        )
+
+        with (
+            self._gathering(
+                [(1, None), (1, None)], [(1, None), (1, "TP rank 1: load failed")]
             ),
             get_parallel().override(tp_rank=0, tp_size=2),
         ):
@@ -659,6 +686,55 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertEqual(output.received_tensor_counts, [])
         target.weight_updater.load_weights_from_distributed.assert_called_once()
         self.assertEqual((self.flushes, self.recorded), ([], []))
+
+    def test_a_direct_write_rank_keeps_post_load_when_another_rank_received(self):
+        """Whether end runs post_load_weights is this rank's own load, not the TP-wide counts."""
+        target = _runner()
+        manager = self._manager_serving(
+            {"ici": lambda *, context, payload: []}, target=target
+        )
+
+        with (
+            self._gathering([(0, None), (3, None)], [(0, None), (3, None)]),
+            get_parallel().override(tp_rank=0, tp_size=2),
+        ):
+            output = manager.plugin_weight_update(
+                PluginWeightUpdateReqInput(handler="ici")
+            )
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertEqual(output.received_tensor_counts, [0, 3])
+        target.weight_updater.end_weight_update.assert_called_once_with(
+            run_post_load=True
+        )
+
+    def test_a_handler_may_return_a_generator_or_nothing(self):
+        """A generator loads the same tensors into every runner; None counts as a direct write."""
+        received = [("w", object()), ("b", object())]
+        target, draft = _runner(), _runner()
+        manager = self._manager_serving(
+            {
+                "gen": lambda *, context, payload: iter(received),
+                "none": lambda *, context, payload: None,
+            },
+            target=target,
+            draft=draft,
+        )
+
+        from_generator = manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="gen")
+        )
+        from_none = manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="none")
+        )
+
+        self.assertEqual(from_generator.received_tensor_counts, [2])
+        for runner in (target, draft):
+            runner.weight_updater.load_weights_from_distributed.assert_called_once_with(
+                received
+            )
+        self.assertTrue(from_none.success)
+        self.assertEqual(from_none.received_tensor_counts, [0])
 
     def test_a_runner_that_rejects_loads_fails_the_request_before_the_transport_runs(
         self,
