@@ -116,6 +116,7 @@ class TestMixedSWAKVBlockScales(CustomTestCase):
                     )
                     pool.get_contiguous_buf_infos = Mock(return_value=swa_infos)
                     pool.kv_cache_layout = "nhd"
+                    pool.head_num, pool.head_dim, pool.v_head_dim = 8, 64, 64
                     if quantized:
                         pool.get_kv_scale_buf_infos = Mock(return_value=scale_infos)
                     setattr(target, name, pool)
