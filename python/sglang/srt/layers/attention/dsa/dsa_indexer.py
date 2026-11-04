@@ -374,7 +374,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.n_heads,
                 bias=False,
-                params_dtype=torch.bfloat16,
+                params_dtype=(
+                    torch.float32
+                    if _is_npu
+                    and config is not None
+                    and config.architectures[0]
+                    in ("LongcatFlashForCausalLM", "LongcatFlashForCausalLMNextN")
+                    else torch.bfloat16
+                ),
                 prefix=add_prefix("weights_proj", prefix),
             )
         if index_k_uses_rmsnorm:
