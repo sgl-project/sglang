@@ -17,17 +17,19 @@
 and runs its own BF16 GEMM when there is none or the batch is outside the window.
 """
 
+import functools
 from typing import Callable, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import unquant
 from sglang.srt.utils.common import print_warning_once
 
 # Merged MoE front [shared gate-up | router | latent down] at TP8; other TPs differ.
-# Only this shape has tuned bf16 rows (ROCm/aiter#6411, gfx950 only).
+# Only this shape has tuned bf16 rows (ROCm/aiter#6411, gfx950 with 256 CUs only).
 _TUNED_FRONT_SHAPE = (6016, 7168)
-_TUNED_FRONT_ARCH = "gfx950"
+_TUNED_FRONT_TARGET = ("gfx950", 256)
 
 
 class TunedFrontGemm:
@@ -45,50 +47,72 @@ class TunedFrontGemm:
         return self._mm(inp=x, weights=weight, otype=x.dtype)
 
 
+@functools.cache
+def _first_untuned_tokens(*, n: int, k: int, min_tokens: int, max_tokens: int):
+    """First batch size in the window with no tuned bf16 row, or None."""
+    from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config
+
+    for m in range(min_tokens, max_tokens + 1):
+        config = get_GEMM_A16W16_tuned_config(
+            M=m,
+            N=n,
+            K=k,
+            bias=False,
+            dtype=str(torch.bfloat16),
+            otype=str(torch.bfloat16),
+        )
+        if config is None:
+            return m
+    return None
+
+
 def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
     if not (
         envs.SGLANG_USE_AITER.get() and envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.get()
     ):
         return None
     try:
-        from aiter.jit.utils.chip_info import get_gfx
-        from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config, tgemm
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+        from aiter.tuned_gemm import tgemm
     except ImportError as e:
         raise ImportError(
             "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT=1 needs aiter.tuned_gemm.tgemm and "
             "get_GEMM_A16W16_tuned_config, which this AITER build lacks."
         ) from e
 
-    shape, gfx = tuple(weight.shape), get_gfx()
+    if unquant._skip_aiter_unquant:
+        print_warning_once(
+            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT is ignored with deterministic "
+            "inference: AITER picks the kernel and split-K by batch size."
+        )
+        return None
+    shape, target = tuple(weight.shape), (get_gfx(), get_cu_num())
     if (
         weight.dtype != torch.bfloat16
         or shape != _TUNED_FRONT_SHAPE
-        or gfx != _TUNED_FRONT_ARCH
+        or target != _TUNED_FRONT_TARGET
     ):
         print_warning_once(
             "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT is set but only covers a bf16 "
-            f"{_TUNED_FRONT_SHAPE} front (TP8) on {_TUNED_FRONT_ARCH}; got "
-            f"{weight.dtype} {shape} on {gfx}, keeping the default GEMM."
+            f"{_TUNED_FRONT_SHAPE} front (TP8) on {_TUNED_FRONT_TARGET}; got "
+            f"{weight.dtype} {shape} on {target}, keeping the default GEMM."
         )
         return None
-    # Without its tuned rows tgemm silently falls back to a default kernel.
-    if (
-        get_GEMM_A16W16_tuned_config(
-            M=1,
-            N=shape[0],
-            K=shape[1],
-            bias=False,
-            dtype=str(torch.bfloat16),
-            otype=str(torch.bfloat16),
+    min_tokens = envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.get()
+    max_tokens = envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.get()
+    if not 1 <= min_tokens <= max_tokens:
+        raise ValueError(
+            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_{MIN,MAX}_TOKENS must satisfy "
+            f"1 <= MIN <= MAX; got {min_tokens}, {max_tokens}."
         )
-        is None
-    ):
+    # Without its tuned rows tgemm silently falls back to a default kernel.
+    untuned = _first_untuned_tokens(
+        n=shape[0], k=shape[1], min_tokens=min_tokens, max_tokens=max_tokens
+    )
+    if untuned is not None:
         raise RuntimeError(
             "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT=1 but this AITER has no tuned bf16 GEMM "
-            f"row for N={shape[0]}, K={shape[1]} on {gfx}; it needs ROCm/aiter#6411."
+            f"row for M={untuned}, N={shape[0]}, K={shape[1]} on {target}; it needs "
+            "ROCm/aiter#6411, whose rows cover 1-192 tokens."
         )
-    return TunedFrontGemm(
-        mm=tgemm.mm,
-        min_tokens=envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.get(),
-        max_tokens=envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.get(),
-    )
+    return TunedFrontGemm(mm=tgemm.mm, min_tokens=min_tokens, max_tokens=max_tokens)

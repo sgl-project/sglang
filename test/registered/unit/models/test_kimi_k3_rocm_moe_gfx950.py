@@ -4,14 +4,19 @@ The CPU tests in ``test_kimi_k3_rocm_quant.py`` fake ``tgemm.mm``;
 only this file checks the keywords ``TunedFrontGemm`` passes to AITER and its output.
 """
 
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
-from sglang.srt.models.kimi_k3_rocm_moe import build_tuned_front_gemm
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.models.kimi_k3_rocm_moe import (
+    _first_untuned_tokens,
+    build_tuned_front_gemm,
+)
+from sglang.srt.utils.common import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,12 +32,14 @@ _LAST_TUNED_M = 192
 _MAX_REL_ERR = 2e-2
 
 
-@unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "AITER's tuned front rows are gfx950 only"
-)
+@unittest.skipUnless(is_hip(), "AITER's tuned front rows are gfx950 only")
 class TestTunedFrontGemmGfx950(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if get_gfx() != "gfx950":
+            raise unittest.SkipTest("AITER's tuned front rows are gfx950 only")
         gen = torch.Generator(device="cuda").manual_seed(0)
         cls.weight = (
             torch.randn(_FRONT_N, _FRONT_K, device="cuda", generator=gen) * 0.02
@@ -40,10 +47,14 @@ class TestTunedFrontGemmGfx950(CustomTestCase):
         cls.x = torch.randn(_IN_WINDOW_M, _FRONT_K, device="cuda", generator=gen).to(
             torch.bfloat16
         )
+        # Default window; the build probes AITER's row for every batch size in it.
         with (
+            patch.dict(os.environ),
             envs.SGLANG_USE_AITER.override(True),
             envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.override(True),
         ):
+            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.clear()
+            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.clear()
             cls.tuned = build_tuned_front_gemm(weight=cls.weight)
 
     def test_matches_the_default_bf16_gemm_inside_the_window(self):
@@ -58,11 +69,16 @@ class TestTunedFrontGemmGfx950(CustomTestCase):
         rel_err = (out.float() - ref.float()).abs().max() / ref.float().abs().max()
         self.assertLess(rel_err.item(), _MAX_REL_ERR)
 
-    def test_default_window_stops_at_the_last_tuned_row(self):
-        """AITER's last tuned bf16 row for this shape is M=192;
-        tgemm silently runs an untuned kernel past it, so the window must stop there."""
+    def test_default_window_is_tuned_up_to_its_last_batch(self):
+        """tgemm silently runs an untuned kernel for a batch without a row; the
+        default window must end at AITER's last tuned front row (M=192)."""
         self.assertTrue(self.tuned.covers(_LAST_TUNED_M))
         self.assertFalse(self.tuned.covers(_LAST_TUNED_M + 1))
+        self.assertIsNone(
+            _first_untuned_tokens(
+                n=_FRONT_N, k=_FRONT_K, min_tokens=1, max_tokens=_LAST_TUNED_M
+            )
+        )
 
 
 if __name__ == "__main__":

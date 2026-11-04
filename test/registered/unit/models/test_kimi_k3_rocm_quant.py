@@ -13,8 +13,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import unquant
 from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
-from sglang.srt.models.kimi_k3_rocm_moe import build_tuned_front_gemm
+from sglang.srt.models.kimi_k3_rocm_moe import (
+    _first_untuned_tokens,
+    build_tuned_front_gemm,
+)
 from sglang.srt.models.kimi_k3_rocm_quant import _k3_channel_fp8_to_bf16
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,14 +108,15 @@ def _shaped(rows: int, cols: int, dtype=torch.bfloat16) -> torch.Tensor:
     return torch.zeros(1, dtype=dtype).expand(rows, cols)
 
 
-def _fake_aiter(*, gfx: str = "gfx950", has_rows: bool = True) -> dict:
+def _fake_aiter(*, gfx: str = "gfx950", cu_num: int = 256, rows_up_to=192) -> dict:
     tuned_gemm = types.ModuleType("aiter.tuned_gemm")
     tuned_gemm.tgemm = SimpleNamespace(mm=lambda **kwargs: None)
-    tuned_gemm.get_GEMM_A16W16_tuned_config = lambda **kwargs: (
-        {"libtype": "flydsl"} if has_rows else None
+    tuned_gemm.get_GEMM_A16W16_tuned_config = lambda *, M, **kwargs: (
+        {"libtype": "flydsl"} if M <= rows_up_to else None
     )
     chip_info = types.ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = lambda: gfx
+    chip_info.get_cu_num = lambda: cu_num
     return {
         "aiter": types.ModuleType("aiter"),
         "aiter.tuned_gemm": tuned_gemm,
@@ -125,13 +130,24 @@ class TestTunedFrontGemm(CustomTestCase):
     """AITER has tuned rows for one bf16 front shape (TP8) on gfx950 only;
     the builder declines every other target, and a broken AITER fails the load."""
 
-    def _build(self, *, use_aiter=True, enabled=True, weight=None, aiter=None):
+    def _build(
+        self,
+        *,
+        use_aiter=True,
+        enabled=True,
+        weight=None,
+        aiter=None,
+        window=(48, 192),
+        deterministic=False,
+    ):
+        _first_untuned_tokens.cache_clear()
         with (
             patch.dict(sys.modules, _fake_aiter() if aiter is None else aiter),
+            patch.object(unquant, "_skip_aiter_unquant", deterministic),
             envs.SGLANG_USE_AITER.override(use_aiter),
             envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.override(enabled),
-            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.override(48),
-            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.override(192),
+            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.override(window[0]),
+            envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.override(window[1]),
         ):
             return build_tuned_front_gemm(
                 weight=_shaped(6016, 7168) if weight is None else weight
@@ -151,6 +167,10 @@ class TestTunedFrontGemm(CustomTestCase):
             ("TP4 front shape", dict(weight=_shaped(7552, 7168))),
             ("fp16 front", dict(weight=_shaped(6016, 7168, torch.float16))),
             ("gfx942", dict(aiter=_fake_aiter(gfx="gfx942"))),
+            # A partitioned gfx950 has fewer CUs, and AITER keys rows on the CU count.
+            ("gfx950 with 32 CUs", dict(aiter=_fake_aiter(cu_num=32))),
+            # AITER picks the kernel and split-K by batch size.
+            ("deterministic inference", dict(deterministic=True)),
         ):
             with self.subTest(name):
                 self.assertIsNone(self._build(**kwargs))
@@ -160,7 +180,19 @@ class TestTunedFrontGemm(CustomTestCase):
         with self.assertRaises(ImportError):
             self._build(aiter=without_tgemm)
         with self.assertRaises(RuntimeError):
-            self._build(aiter=_fake_aiter(has_rows=False))
+            self._build(aiter=_fake_aiter(rows_up_to=0))
+
+    def test_fails_at_load_when_the_window_runs_past_the_tuned_rows(self):
+        """tgemm runs an untuned default kernel for a batch without a row, so a
+        window that only its smallest batch probes would pass a partial AITER."""
+        with self.assertRaisesRegex(RuntimeError, "M=193"):
+            self._build(window=(1, 256))
+        with self.assertRaisesRegex(RuntimeError, "M=65"):
+            self._build(aiter=_fake_aiter(rows_up_to=64), window=(1, 192))
+
+    def test_rejects_an_empty_window(self):
+        with self.assertRaises(ValueError):
+            self._build(window=(64, 32))
 
 
 if __name__ == "__main__":
