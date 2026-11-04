@@ -99,17 +99,17 @@ def rpd_to_chrome_trace(
 
         rangeStringApi = (
             rangeStringApi + " and rocpd_api.start/1000 <= %s" % (end_time)
-            if start != None
+            if start is not None
             else "where rocpd_api.start/1000 <= %s" % (end_time)
         )
         rangeStringOp = (
             rangeStringOp + " and rocpd_op.start/1000 <= %s" % (end_time)
-            if start != None
+            if start is not None
             else "where rocpd_op.start/1000 <= %s" % (end_time)
         )
         rangeStringMonitor = (
             rangeStringMonitor + " and start/1000 <= %s" % (end_time)
-            if start != None
+            if start is not None
             else "where start/1000 <= %s" % (end_time)
         )
 
