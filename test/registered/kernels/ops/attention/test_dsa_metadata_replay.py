@@ -18,6 +18,7 @@ from sglang.test.kits.dsa_metadata_kit import (
     addresses,
     apply_metadata,
     assert_metadata_equal,
+    assert_no_token_level_schedule,
     inputs,
     make_backend,
 )
@@ -54,6 +55,8 @@ class TestDSAMetadataReplay(CustomTestCase):
                         self, fused.forward_metadata, ordinary.forward_metadata
                     )
                     self.assertEqual(pointers, addresses(fused.forward_metadata))
+                    assert_no_token_level_schedule(self, fused.forward_metadata)
+                    assert_no_token_level_schedule(self, ordinary.forward_metadata)
                     if mode.is_target_verify():
                         metadata = fused.forward_metadata
                         _, _, table, _, _ = IndexerKPool._get_kpool_decode_metadata(
@@ -92,6 +95,7 @@ class TestDSAMetadataReplay(CustomTestCase):
                 self, fused.forward_metadata, ordinary.forward_metadata
             )
             self.assertEqual(pointers, addresses(fused.forward_metadata))
+            assert_no_token_level_schedule(self, fused.forward_metadata)
 
     def test_precomputed_and_sibling_copy_refresh_derived_metadata(self):
         mode = ForwardMode.DECODE
@@ -127,6 +131,7 @@ class TestDSAMetadataReplay(CustomTestCase):
                 self, sibling.forward_metadata, ordinary.forward_metadata
             )
             self.assertEqual(pointers, addresses(sibling.forward_metadata))
+            assert_no_token_level_schedule(self, sibling.forward_metadata)
             self.assertIsNot(
                 sibling.forward_metadata.kpool_write_plan,
                 source.forward_metadata.kpool_write_plan,
