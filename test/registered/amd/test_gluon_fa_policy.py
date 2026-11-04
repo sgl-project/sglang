@@ -1,6 +1,7 @@
 """Host policy and diffusion adapter checks for existing upstream AMD runners."""
 
 import sys
+import unittest
 from pathlib import Path
 
 import pytest
@@ -203,6 +204,51 @@ def test_resolver_uses_metadata_without_device_queries(monkeypatch):
     monkeypatch.setattr(gfx1250_policy, "get_num_cus", unexpected_device_query)
     policy = resolve_execution_policy(*_meta_inputs(), num_cus=256)
     assert policy.numerical_mode == NumericalMode.GUARDED
+
+
+class TestDpxExecutionPolicy(unittest.TestCase):
+    def test_local_guards_require_long_bf16_self_attention_and_96_cus(self):
+        for num_cus in (95, 96, 97, 192, 256):
+            for seqlen in (65_535, 65_536, 65_537, 90_000, 176_400):
+                with self.subTest(num_cus=num_cus, seqlen=seqlen):
+                    policy = resolve_execution_policy(
+                        *_meta_inputs(sq=seqlen, sk=seqlen), num_cus=num_cus
+                    )
+                    expected = NumericalMode.ONLINE
+                    if seqlen >= 65_536:
+                        expected = (
+                            NumericalMode.LOCAL_GUARDED
+                            if num_cus == 96
+                            else NumericalMode.GUARDED
+                        )
+                    self.assertEqual(policy.numerical_mode, expected)
+                    self.assertEqual(policy.launch_config.schedule, "pingpong")
+
+    def test_rectangular_bf16_keeps_existing_policy(self):
+        for sq, sk, expected in (
+            (65_536, 65_537, NumericalMode.GUARDED),
+            (176_400, 512, NumericalMode.PERSISTENT),
+        ):
+            with self.subTest(sq=sq, sk=sk):
+                policy = resolve_execution_policy(
+                    *_meta_inputs(sq=sq, sk=sk), num_cus=96
+                )
+                self.assertEqual(policy.numerical_mode, expected)
+
+    def test_custom_scale_keeps_online_policy(self):
+        for head_size in (64, 128, 256):
+            with self.subTest(head_size=head_size):
+                policy = resolve_execution_policy(
+                    *_meta_inputs(head_size=head_size), softmax_scale=0.25, num_cus=96
+                )
+                self.assertEqual(policy.numerical_mode, NumericalMode.ONLINE)
+
+    def test_explicit_launch_keeps_online_policy(self):
+        explicit = LaunchConfig("pingpong", 256, 64, 8, True, "")
+        policy = resolve_execution_policy(
+            *_meta_inputs(), launch_config=explicit, num_cus=96
+        )
+        self.assertEqual(policy.numerical_mode, NumericalMode.ONLINE)
 
 
 @pytest.mark.parametrize("scale", [0.0, -1.0, float("inf"), float("nan")])

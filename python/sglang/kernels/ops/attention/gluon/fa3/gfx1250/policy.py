@@ -216,13 +216,15 @@ def resolve_execution_policy(
         raise ValueError("softmax_scale must be finite and positive")
 
     config = launch_config
+    selected_num_cus = num_cus
     if config is None:
+        selected_num_cus = get_num_cus(query.device) if num_cus is None else num_cus
         config = select_launch_config(
             batch,
             num_heads,
             seqlen_q,
             seqlen_k=seqlen_k,
-            num_cus=get_num_cus(query.device) if num_cus is None else num_cus,
+            num_cus=selected_num_cus,
             head_size=head_size,
             dtype=query.dtype,
         )
@@ -299,9 +301,11 @@ def resolve_execution_policy(
         and seqlen_k < 2**31
         and scale == head_size**-0.5
     ):
-        mode = (
-            NumericalMode.GUARDED
-            if query.dtype == torch.bfloat16
-            else NumericalMode.LOCAL_GUARDED
+        # On 96-CU partitions, per-workgroup guards avoid global scans and
+        # repeated online maximum updates/rescaling for long self-attention.
+        # Keep the global BF16 guards for other resource/shape regimes.
+        local_shift = query.dtype == torch.float16 or (
+            selected_num_cus == 96 and seqlen_q == seqlen_k
         )
+        mode = NumericalMode.LOCAL_GUARDED if local_shift else NumericalMode.GUARDED
     return ExecutionPolicy(config, mode, scale)
