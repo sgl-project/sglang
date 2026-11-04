@@ -1,8 +1,8 @@
-# KV public protocol 1.0 and pure Router state (P1/P5)
+# KV public protocol, session state, and cache protection
 
 This crate contains pure schemas, validated action parsing, salt encoding and
 logical models, plus the P5 bounded association and evidence foundation. It imports
-no Router/indexer runtime and performs no I/O, PIN, routing or protection execution.
+no Router/indexer runtime. Its backend protection module performs bounded asynchronous Mooncake I/O; Engine L2 PIN execution remains in Python.
 `protocol::parse_action`
 validates the three new public actions. Other consumers' actions are returned
 unchanged; unsupported `sglang.*` names/versions return `Unsupported`. Existing
@@ -151,11 +151,96 @@ P1 creates no Router state or runtime configuration defaults.
 PIN payload: `mode` acquire/renew/release, `target`, `location`, `claim_id`,
 `revision` (0–2^53−1), `ttl_seconds` (finite positive, at most 31,536,000, required
 for acquire/renew and absent/null for release), `required_protection`
-(eviction_exclusion by default, or backend_soft_pin). Valid PIN always returns
-unsupported; it never creates a claim or changes priority. `ClaimState` is a
-separate schema with caller_id, task_incarnation, claim_id, revision, state,
-owner_epoch, protection_version=1.0, tombstone, effective_protection and
-remaining_ttl. These are P4 hooks, with no lifecycle executor.
+(eviction_exclusion by default, or backend_soft_pin), and optional `owner_task`.
+The native FULL-only persistent host cache executes local host
+`eviction_exclusion`. GPU PIN, L3 PIN and `backend_soft_pin` are unsupported.
+Discovery advertises only live executable protection under `pin_protections`.
+PIN supports independent submissions and attached hints. Attached explicit
+prefixes validate and activate existing host content at dispatch, using the same
+executor as independent PIN. An accepted explicit claim survives the inference
+request's later completion/abort until release, TTL or invalidation.
+
+Attached `request_cached` acquire is queued without claiming readiness. It binds
+only to the owner's committed token prefix after a successful request checkpoint,
+before request correctness references are released. Abort, failed checkpoint or
+missing committed material cannot activate it. The host replica must already be
+complete and published at activation; PIN does not silently copy GPU data or wait
+for a pending host backup. The finite TTL starts at successful activation. A
+nonterminal checkpoint does not execute the queued action. Independent
+`request_cached` acquire is invalid because it has no request binding.
+
+Each attached claim uses a deterministic effective ID derived from the caller,
+unique request binding and original payload claim_id. This isolates sampling
+branches and reused request IDs. ClaimState.caller_id retains the original caller
+(`request` for hints) and ClaimState.claim_id returns the effective ID. Attached
+renew/release with the same bound context and original claim_id address that
+same claim. They do not resolve target bytes/session history. Independent
+follow-ups/query use the returned effective claim_id with the same caller's
+unbound context; a new sampling binding cannot release another branch by reusing
+the original payload. No additional protocol field is required. Acquire and
+renew message replay preserve their historical receipt and never extend TTL.
+Operation `lookup` with the unbound `request` caller and message_id discovers all
+sampling bindings and their effective claim IDs. Queued/failed operations have
+no active claim receipt. Bound contexts remain forbidden for independent submit;
+use an unbound context and the effective ID for external follow-ups.
+
+Discovery sets `pin_submission=["independent","attached"]`,
+`pin_request_cached="successful_checkpoint_existing_host_prefix"` and
+`pin_attached_claim_id="returned_effective_claim_id_per_binding"`.
+
+`owner_task` is an explicit local logical-index identity
+`{"session_id":"task","incarnation":7}`. Acquire/renew validate it against
+this Engine's live index; it is not a global Router incarnation. Selecting a
+session/content prefix never establishes demand ownership. Omitting owner_task
+creates a caller-owned claim keyed by caller_id + claim_id, so an explicit
+prefix works on a worker with no local session/index association. The Router
+must release these caller-owned claims when its demand ends. Legacy finish_task
+retains its recursive index behavior, and releases only the finishing caller's
+claims explicitly owned by the removed local task identities. Other callers'
+claims and unowned claims remain protected.
+
+Acquire validates the entire existing page-aligned FULL host prefix at existing
+radix boundaries, including ancestor dependencies and the D2H publication fence.
+It creates no missing cache content and performs no split. Admission checks
+claim/record/token/scope/result budgets before installing native host locks.
+Overlapping physical host slots are charged once. Split-aware receipts preserve
+protection across later radix splits. TTL starts after installing those locks.
+Ordinary hits, completed operations and repeated messages do not renew claims.
+Same revision + same request is idempotent; conflicting or older revisions fail.
+Release creates a tombstone even when acquire was not observed. Renew/release
+address the claim key without resolving target bytes or a removed session.
+Released/expired keys require a new claim ID. Terminal records are never silently
+evicted: `protection_limits.max_records` exhaustion rejects new keys until an
+explicit owner epoch rotation. Other protection_limits bound active claims,
+physical tokens, scope tokens/prefixes, TTL and retained feedback events.
+
+Independent query through POST `/v1/kv/control`:
+
+```json
+{"kind":"claim","context":{"engine_id":"worker-b","engine_epoch":"epoch-from-capabilities","namespace":"weights-v1","caller_id":"router-owner"},"claim_id":"keep-prefix","owner_task":null}
+```
+
+It returns ClaimState with caller_id, task_incarnation, claim_id, revision, state,
+owner_epoch, protection_version=1.0, tombstone, effective_protection, remaining_ttl,
+owner_task, actual_scope and location. The compatibility field task_incarnation
+is the decimal local incarnation when owner_task is present, otherwise `"caller"`.
+Only active claims report positive remaining_ttl and eviction_exclusion.
+actual_scope records the accepted coverage; terminal scope is historical and
+does not assert current residency. Operation public_result.claim is the receipt
+at operation completion. Use the independent query for current state.
+
+`{"kind":"claim_events","context":...,"after_sequence":0,"limit":256}`
+returns owner_epoch, gap, items (`sequence`, `claim`), and next_sequence. The
+bounded per-epoch journal contains only this caller's changes, including expiry
+with no inference traffic. A gap requires querying the caller's known claim keys.
+This is polling feedback, without a durable journal or push subscription. Cache
+reset/flush, host-resource teardown and weight namespace changes invalidate
+claims and release references before destroying their cache ownership. Epoch
+rotation rejects old contexts; the journal is not retained across that rotation.
+Storage-only detach preserves independent L2 claims. Accepted claims are never
+revoked due to ordinary admission pressure. Valid TTLs schedule owner ticks,
+remain separate from in-flight operations, and bound idle sleeping; normal
+decode steps avoid scanning protection records before the nearest deadline.
 
 New action results retain `ref`, `sequence`, `update.status`, `update.quiescent`,
 `completed_steps` and target outcomes, and add `public_result`:
@@ -164,7 +249,7 @@ New action results retain `ref`, `sequence`, `update.status`, `update.quiescent`
   ready_location, preserved_scope, reclaimed_scope, missing_scope, blocked_scope;
 - owner_epoch, state_version and outcome_sequence (owner registry sequence),
   cache_generation when known, source_observed_at (null until an observation
-  source supplies it), and claim (null in P1).
+  source supplies it), and the historical claim receipt for PIN.
 
 Scope entries use the existing TargetOutcome shape: coverage, branch_index,
 component/content identity, status, actual location, completed_steps, code/reason.
@@ -307,3 +392,20 @@ public DEMOTE starts, allowing distinct blockers after concurrent radix splits.
 Legacy primitive locations now reject a non-null `backend_namespace` on GPU/host
 with `invalid_payload`; absent/null values and storage namespaces retain the P2
 contract. No new public schema field or action version was introduced in P3.
+
+Regenerate the shared schemas and default-expanded claim vectors from the root:
+
+```sh
+PYTHONPATH=python .venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+import msgspec
+from sglang.srt.managers.kv_control.contracts import Prefetch, Demote, Pin, ClaimState, PublicResult, validated
+root = Path("sgl-router/sgl-kv-orchestrator/fixtures")
+for name, schema in {"prefetch": Prefetch, "demote": Demote, "pin": Pin, "claim": ClaimState, "result": PublicResult}.items():
+    (root / f"{name}.schema.json").write_text(json.dumps(msgspec.json.schema(schema), ensure_ascii=False, indent=2) + "\n")
+values = json.loads((root / "results.json").read_text())
+values["claims"] = [msgspec.to_builtins(validated(v, ClaimState)) for v in values["claims"]]
+(root / "results.json").write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n")
+PY
+```

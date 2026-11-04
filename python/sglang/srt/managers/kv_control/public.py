@@ -41,12 +41,25 @@ def public_capabilities(caps):
             else ()
         )
         paths[name] = tuple(p for p in permitted if p in available)
+    pins = caps.get("pin_protections", ()) if caps.get("available", True) else ()
+    actions = {name: (ACTION_VERSION,) for name, values in paths.items() if values}
+    if pins:
+        actions["sglang.pin"] = (ACTION_VERSION,)
     return dict(
         protocol_version=PROTOCOL_VERSION,
         schema_versions={name: (ACTION_VERSION,) for name in PUBLIC_ACTIONS},
-        actions={name: (ACTION_VERSION,) for name, values in paths.items() if values},
+        actions=actions,
         paths=paths,
-        pin_protections=(),
+        pin_protections=pins,
+        pin_query="claim" if pins else None,
+        pin_submission=("independent", "attached") if pins else (),
+        pin_request_cached="successful_checkpoint_existing_host_prefix"
+        if pins
+        else None,
+        pin_attached_claim_id="returned_effective_claim_id_per_binding"
+        if pins
+        else None,
+        pin_owner_task="optional_local_index_identity" if pins else None,
         hash_only_execution=False,
         prefix=dict(
             namespace=caps.get("namespace"),
@@ -67,14 +80,28 @@ def public_capabilities(caps):
 
 
 def normalize_public(payload, caps):
-    if isinstance(payload, Pin):
-        raise ControlError("unsupported", "PIN has a schema but no protection executor")
-    name = "sglang.demote" if isinstance(payload, Demote) else "sglang.prefetch"
     capability = public_capabilities(caps)
-    path = payload.source.tier, payload.destination.tier
-    if path not in capability["paths"][name]:
-        raise ControlError("unsupported", "Public transfer path is not executable")
-    for location in (payload.source, payload.destination):
+    if isinstance(payload, Pin):
+        if (
+            not (
+                capability["pin_protections"]
+                if payload.mode == "acquire"
+                else caps.get("pin_protections", ())
+            )
+            or payload.location.tier != "host"
+            or payload.required_protection != "eviction_exclusion"
+        ):
+            raise ControlError(
+                "unsupported", "Only local host eviction exclusion is executable"
+            )
+        locations = (payload.location,)
+    else:
+        name = "sglang.demote" if isinstance(payload, Demote) else "sglang.prefetch"
+        path = payload.source.tier, payload.destination.tier
+        if path not in capability["paths"][name]:
+            raise ControlError("unsupported", "Public transfer path is not executable")
+        locations = (payload.source, payload.destination)
+    for location in locations:
         if (
             location.backend_namespace is not None
             and location.backend_namespace != capability["backend_namespace"]
@@ -88,11 +115,14 @@ def normalize_public(payload, caps):
         ):
             raise ControlError("unsupported", "Storage backend is not executable")
     target = payload.target
+    if isinstance(payload, Pin) and payload.mode != "acquire":
+        # Claim identity suffices even after its content/session was removed.
+        return payload
     if (
         target != "request_cached"
         and not isinstance(target, PrefixTarget)
         and target.allow_clip
-        and not payload.allow_partial
+        and (isinstance(payload, Pin) or not payload.allow_partial)
     ):
         raise ControlError("invalid_payload", "Clipping requires allow_partial")
     if isinstance(target, PrefixTarget):
@@ -121,6 +151,8 @@ def normalize_public(payload, caps):
             cache_salt=c.cache_salt or None,
             layout_id=c.layout_id,
         )
+    if isinstance(payload, Pin):
+        return msgspec.structs.replace(payload, target=target)
     primitive = MoveTo if isinstance(payload, Demote) else CopyTo
     return primitive(
         target=target,
@@ -159,6 +191,7 @@ def project_result(current, update, sequence):
             for o in update.target_outcomes
             if o.status in (Status.ACCEPTED, Status.RUNNING)
             or "destination_ready" in o.completed_steps
+            or "protection_active" in o.completed_steps
         )
         or public.accepted_scope
     )

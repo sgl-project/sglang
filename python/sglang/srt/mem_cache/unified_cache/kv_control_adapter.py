@@ -9,7 +9,6 @@ from array import array
 from dataclasses import dataclass, replace
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     ContentSpan,
     ControlError,
@@ -106,6 +105,7 @@ class UnifiedCacheExecutor:
         self.storage_adapter = None
         self.storage_reason = "Storage is not attached"
         self.storage_reads = None
+        self.protection = None
         self.preparations = {}
         if self.core.enable_hicache and not self._transfer_unsupported_reason():
             from sglang.srt.mem_cache.unified_cache.control_transfers import (
@@ -277,6 +277,16 @@ class UnifiedCacheExecutor:
         return {
             "namespace": self.config.namespace,
             "available": self.cache_available is None or self.cache_available(),
+            "pin_protections": (
+                {
+                    "tier": "host",
+                    "condition": "eviction_exclusion",
+                    "owner": "engine",
+                    "scope": "complete_full_prefix_at_existing_boundary",
+                },
+            )
+            if supported and self.protection is not None
+            else (),
             "engine_epoch": self.engine_epoch,
             "cache_generation": self.generation,
             "tree_core": "python",
@@ -830,6 +840,23 @@ class UnifiedCacheExecutor:
             coverage_kind=row.kind,
             window_size=row.window,
         )
+
+    def pin(self, *, ref, payload, scope):
+        if threading.get_ident() != self._thread:
+            raise ControlError("wrong_owner", "PIN must run on its cache owner")
+        if (
+            ref.context.engine_id != self.engine_id
+            or ref.context.engine_epoch != self.engine_epoch
+        ):
+            raise ControlError("stale_epoch", "PIN owner identity differs")
+        if self.protection is None:
+            raise ControlError("unsupported", "L2 protection is not installed")
+        return self.protection.start(ref=ref, payload=payload, scope=scope)
+
+    def release_task_protections(self, *, caller_id, tasks):
+        if self.protection is not None:
+            return self.protection.cleanup(caller_id=caller_id, tasks=tasks)
+        return ()
 
     def start(self, work: ExecutionRequest) -> ExecutionUpdate:
         try:

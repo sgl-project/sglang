@@ -1984,5 +1984,162 @@
       }
     },
     "valid": false
+  },
+  {
+    "name": "pin_explicit_local_owner",
+    "action": {
+      "action_id": "a",
+      "action_type": "sglang.pin",
+      "action_version": "1.0",
+      "payload": {
+        "mode": "acquire",
+        "target": {
+          "kind": "prefix",
+          "compatibility": {
+            "namespace": "ns",
+            "cache_salt": null,
+            "layout_id": "python:full:p4:w0",
+            "page_size": 4,
+            "components": [
+              "full"
+            ],
+            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+          },
+          "start_token": 0,
+          "end_token": 4,
+          "token_ids": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "blocks": [
+            {
+              "block_hash": "-9223372036854775808",
+              "component": "full",
+              "start_token": 0,
+              "end_token": 4
+            }
+          ]
+        },
+        "location": {
+          "tier": "host"
+        },
+        "claim_id": "c",
+        "revision": 3,
+        "required_protection": "eviction_exclusion",
+        "ttl_seconds": 60,
+        "owner_task": {
+          "session_id": "task",
+          "incarnation": 7
+        }
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "pin_owner_incarnation_overflow",
+    "action": {
+      "action_id": "a",
+      "action_type": "sglang.pin",
+      "action_version": "1.0",
+      "payload": {
+        "mode": "acquire",
+        "target": {
+          "kind": "prefix",
+          "compatibility": {
+            "namespace": "ns",
+            "cache_salt": null,
+            "layout_id": "python:full:p4:w0",
+            "page_size": 4,
+            "components": [
+              "full"
+            ],
+            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+          },
+          "start_token": 0,
+          "end_token": 4,
+          "token_ids": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "blocks": [
+            {
+              "block_hash": "-9223372036854775808",
+              "component": "full",
+              "start_token": 0,
+              "end_token": 4
+            }
+          ]
+        },
+        "location": {
+          "tier": "host"
+        },
+        "claim_id": "c",
+        "revision": 3,
+        "required_protection": "eviction_exclusion",
+        "ttl_seconds": 60,
+        "owner_task": {
+          "session_id": "task",
+          "incarnation": 9007199254740992
+        }
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "pin_owner_rejects_unknown_fields",
+    "action": {
+      "action_id": "a",
+      "action_type": "sglang.pin",
+      "action_version": "1.0",
+      "payload": {
+        "mode": "acquire",
+        "target": {
+          "kind": "prefix",
+          "compatibility": {
+            "namespace": "ns",
+            "cache_salt": null,
+            "layout_id": "python:full:p4:w0",
+            "page_size": 4,
+            "components": [
+              "full"
+            ],
+            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+          },
+          "start_token": 0,
+          "end_token": 4,
+          "token_ids": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "blocks": [
+            {
+              "block_hash": "-9223372036854775808",
+              "component": "full",
+              "start_token": 0,
+              "end_token": 4
+            }
+          ]
+        },
+        "location": {
+          "tier": "host"
+        },
+        "claim_id": "c",
+        "revision": 3,
+        "required_protection": "eviction_exclusion",
+        "ttl_seconds": 60,
+        "owner_task": {
+          "session_id": "task",
+          "incarnation": 7,
+          "caller_id": "other"
+        }
+      }
+    },
+    "valid": false
   }
 ]

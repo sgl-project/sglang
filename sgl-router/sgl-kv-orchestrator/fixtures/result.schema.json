@@ -382,7 +382,7 @@
     },
     "ClaimState": {
       "title": "ClaimState",
-      "description": "P4 transport hook, separate from operation completion; no claim executor.",
+      "description": "Current owner-confirmed protection, independent of operation completion.",
       "type": "object",
       "properties": {
         "caller_id": {
@@ -455,6 +455,35 @@
             }
           ],
           "default": null
+        },
+        "owner_task": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "actual_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicLocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -464,6 +493,27 @@
         "revision",
         "state",
         "owner_epoch"
+      ],
+      "additionalProperties": false
+    },
+    "TaskIdentity": {
+      "title": "TaskIdentity",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "incarnation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "session_id",
+        "incarnation"
       ],
       "additionalProperties": false
     }

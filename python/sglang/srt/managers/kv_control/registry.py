@@ -214,6 +214,20 @@ class OperationRegistry:
         validated(message_id, Identifier)
         return context.caller_id, context.binding_id, message_id
 
+    def set_public_claim(self, ref, claim):
+        """Attach the synchronous PIN receipt at the operation's current version."""
+        current = self.get(ref)
+        if current.public_result is None:
+            raise ControlError(
+                "invalid_completion", "Claim receipt requires a public action"
+            )
+        self._messages[self._key(ref.context, ref.message_id)].results[
+            ref.action_id
+        ] = msgspec.structs.replace(
+            current,
+            public_result=msgspec.structs.replace(current.public_result, claim=claim),
+        )
+
     def reserve(self, batch: NativeBatch, context: ControlContext) -> Submission:
         key = self._key(context, batch.message_id)
         self.prune()

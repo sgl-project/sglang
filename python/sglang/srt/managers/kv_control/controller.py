@@ -85,7 +85,7 @@ class Executor(Protocol):
 @dataclass
 class _Pending:
     ref: OperationRef
-    payload: Primitive
+    payload: Primitive | Pin
     target: ResolvedTarget | None
     started: bool = False
     cancel_sent: bool = False
@@ -299,7 +299,7 @@ class KVControl:
                             "incompatible_namespace", "Target namespace differs"
                         )
                 if not execute_primitives and (
-                    isinstance(payload, (SetPriority, CopyTo, MoveTo))
+                    isinstance(payload, (SetPriority, CopyTo, MoveTo, Pin))
                     or isinstance(payload, Signal)
                     and self.policy_runtime is not None
                     and self.policy_runtime.consumes(payload)
@@ -314,6 +314,20 @@ class KVControl:
                     and self.policy_runtime.consumes(payload)
                 ):
                     scope = self.index.resolve(payload.target)
+                if isinstance(payload, Pin):
+                    if payload.location.engine_id not in (None, context.engine_id):
+                        raise ControlError(
+                            "unsupported", "Remote engines approve their own protection"
+                        )
+                    if payload.mode == "acquire":
+                        if payload.target == "request_cached":
+                            if context.binding_id is None:
+                                raise ControlError(
+                                    "invalid_payload",
+                                    "request_cached requires a request incarnation",
+                                )
+                        else:
+                            scope = self.index.resolve(payload.target)
                 if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
                     locations = (
                         (payload.location,)
@@ -355,14 +369,19 @@ class KVControl:
         for result, item in zip(submission.results, prepared):
             if not isinstance(item, ControlError):
                 payload, scope = item
-                if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
+                if isinstance(payload, (SetPriority, CopyTo, MoveTo)) or (
+                    isinstance(payload, Pin)
+                    and payload.mode == "acquire"
+                    and payload.target == "request_cached"
+                ):
                     public = public_payloads.get(result.ref.action_id)
                     self._pending[result.ref.operation_id] = _Pending(
                         result.ref,
                         payload,
                         scope,
                         deadline=self._clock() + public.timeout_ms / 1000
-                        if public is not None and public.timeout_ms is not None
+                        if isinstance(public, Prefetch)
+                        and public.timeout_ms is not None
                         else None,
                     )
                     if public is not None:
@@ -386,7 +405,19 @@ class KVControl:
         )
 
     def _dispatch(self, ref, payload, scope):
-        if isinstance(payload, Signal):
+        if isinstance(payload, Pin):
+            if payload.mode == "acquire" and payload.target == "request_cached":
+                key = ref.context.caller_id, ref.context.binding_id
+                self._requests.setdefault(key, set()).add(ref.operation_id)
+                self.registry.update(
+                    ref,
+                    ExecutionUpdate(
+                        status=Status.QUEUED, quiescent=True, code="request_completion"
+                    ),
+                )
+            else:
+                self._execute_pin(ref, payload, scope)
+        elif isinstance(payload, Signal):
             if self.policy_runtime is not None and self.policy_runtime.consumes(
                 payload
             ):
@@ -437,6 +468,9 @@ class KVControl:
                 payload.session_id, expected_revision=payload.expected_revision
             )
             self._cancel_task_interests(change.removed_tasks)
+            cleanup = getattr(self.executor, "release_task_protections", None)
+            if cleanup is not None:
+                cleanup(caller_id=ref.context.caller_id, tasks=change.removed_tasks)
             if self.policy_runtime is not None:
                 self.policy_runtime.cleanup(change.removed_tasks)
             self.registry.update(
@@ -463,6 +497,27 @@ class KVControl:
                 )
             else:
                 self._start(pending)
+
+    def _execute_pin(self, ref, payload, scope):
+        if (
+            payload.owner_task is not None
+            and payload.mode != "release"
+            and self.index.task_identity(payload.owner_task.session_id)
+            != payload.owner_task
+        ):
+            raise ControlError(
+                "stale_revision", "PIN demand owner task is no longer live"
+            )
+        if scope is not None:
+            self.registry.set_public_scope(
+                ref,
+                requested_outcomes(scope),
+                self.executor.capabilities().get("cache_generation"),
+            )
+        update, claim = self.executor.pin(ref=ref, payload=payload, scope=scope)
+        self._finish(ref, update)
+        if claim is not None:
+            self.registry.set_public_claim(ref, claim)
 
     def _cancel_task_interests(self, removed_tasks: tuple[TaskIdentity, ...]) -> None:
         removed = frozenset(removed_tasks)
@@ -536,6 +591,9 @@ class KVControl:
 
     def _start(self, pending):
         assert self.executor is not None and pending.target is not None
+        if isinstance(pending.payload, Pin):
+            self._execute_pin(pending.ref, pending.payload, pending.target)
+            return
         if pending.deadline is not None and self._clock() >= pending.deadline:
             self.cancel(pending.ref)
             return

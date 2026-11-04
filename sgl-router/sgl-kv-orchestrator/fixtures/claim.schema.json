@@ -3,7 +3,7 @@
   "$defs": {
     "ClaimState": {
       "title": "ClaimState",
-      "description": "P4 transport hook, separate from operation completion; no claim executor.",
+      "description": "Current owner-confirmed protection, independent of operation completion.",
       "type": "object",
       "properties": {
         "caller_id": {
@@ -76,6 +76,35 @@
             }
           ],
           "default": null
+        },
+        "owner_task": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "actual_scope": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TargetOutcome"
+          },
+          "default": []
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicLocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -85,6 +114,277 @@
         "revision",
         "state",
         "owner_epoch"
+      ],
+      "additionalProperties": false
+    },
+    "TaskIdentity": {
+      "title": "TaskIdentity",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "incarnation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "session_id",
+        "incarnation"
+      ],
+      "additionalProperties": false
+    },
+    "TargetOutcome": {
+      "title": "TargetOutcome",
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/TokenRange"
+        },
+        "status": {
+          "$ref": "#/$defs/Status"
+        },
+        "branch_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
+        },
+        "content_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Location"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "completed_steps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "default": []
+        },
+        "code": {
+          "type": "string",
+          "default": ""
+        },
+        "reason": {
+          "type": "string",
+          "default": ""
+        },
+        "coverage_kind": {
+          "enum": [
+            "checkpoint",
+            "tokens",
+            "window"
+          ],
+          "default": "tokens"
+        },
+        "window_size": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "coverage",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "TokenRange": {
+      "title": "TokenRange",
+      "type": "object",
+      "properties": {
+        "start_token": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "end_token": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "component": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "start_token",
+        "end_token"
+      ],
+      "additionalProperties": false
+    },
+    "Status": {
+      "title": "Status",
+      "enum": [
+        "accepted",
+        "cancelled",
+        "cancelling",
+        "completed",
+        "deferred",
+        "failed",
+        "missing",
+        "partial",
+        "queued",
+        "received",
+        "rejected",
+        "running",
+        "unconsumed",
+        "unsupported"
+      ]
+    },
+    "Location": {
+      "title": "Location",
+      "type": "object",
+      "properties": {
+        "tier": {
+          "enum": [
+            "gpu",
+            "host",
+            "storage"
+          ]
+        },
+        "engine_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backend_namespace": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "tier"
+      ],
+      "additionalProperties": false
+    },
+    "PublicLocation": {
+      "title": "PublicLocation",
+      "type": "object",
+      "properties": {
+        "tier": {
+          "enum": [
+            "gpu",
+            "host",
+            "storage"
+          ]
+        },
+        "engine_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backend_namespace": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "tier"
       ],
       "additionalProperties": false
     }

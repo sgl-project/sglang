@@ -64,6 +64,13 @@ pub enum ClaimStatus {
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIdentity {
+    pub session_id: String,
+    pub incarnation: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimState {
@@ -79,6 +86,10 @@ pub struct ClaimState {
     pub protection_version: String,
     pub effective_protection: Option<String>,
     pub remaining_ttl: Option<f64>,
+    pub owner_task: Option<TaskIdentity>,
+    #[serde(default)]
+    pub actual_scope: Vec<Value>,
+    pub location: Option<crate::protocol::Location>,
 }
 
 /// Carries observations, never creates claims or confirms queued placement.

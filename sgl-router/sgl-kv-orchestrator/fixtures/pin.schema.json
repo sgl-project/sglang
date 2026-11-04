@@ -78,6 +78,17 @@
             "eviction_exclusion"
           ],
           "default": "eviction_exclusion"
+        },
+        "owner_task": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -641,6 +652,27 @@
       },
       "required": [
         "tier"
+      ],
+      "additionalProperties": false
+    },
+    "TaskIdentity": {
+      "title": "TaskIdentity",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "incarnation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "session_id",
+        "incarnation"
       ],
       "additionalProperties": false
     }

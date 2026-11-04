@@ -19,9 +19,11 @@ from sglang.srt.managers.kv_control.contracts import (
     Location,
     LogicalTarget,
     OperationRef,
+    Position,
     PublicLocation,
     PublicTarget,
     Seconds,
+    TaskIdentity,
     TokensTarget,
     Value,
     validated,
@@ -33,6 +35,10 @@ from sglang.srt.managers.kv_control.policy_runtime import (
     validate_definitions,
 )
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
+from sglang.srt.mem_cache.unified_cache.control_protection import (
+    HostCacheProtection,
+    ProtectionLimits,
+)
 from sglang.srt.mem_cache.unified_cache.priority_claims import CacheControlConfig
 
 
@@ -50,6 +56,7 @@ class ServiceConfig(Value):
     engine_id: Identifier | None = None
     limits: Limits = Limits()
     cache_limits: CacheLimits = CacheLimits()
+    protection_limits: ProtectionLimits = ProtectionLimits()
     policies: tuple[PolicyConfig, ...] = ()
     policy_max_wait_seconds: Seconds = 1.0
     max_policy_requests: Annotated[int, msgspec.Meta(ge=1, le=4096)] = 128
@@ -201,6 +208,18 @@ class Capacity(Value, tag="capacity", tag_field="kind"):
     context: ControlContext
 
 
+class Claim(Value, tag="claim", tag_field="kind"):
+    context: ControlContext
+    claim_id: Identifier
+    owner_task: TaskIdentity | None = None
+
+
+class ClaimEvents(Value, tag="claim_events", tag_field="kind"):
+    context: ControlContext
+    after_sequence: Position = 0
+    limit: PageSize = 256
+
+
 Command = (
     Capabilities
     | Submit
@@ -212,6 +231,8 @@ Command = (
     | StorageTargets
     | Associations
     | Capacity
+    | Claim
+    | ClaimEvents
 )
 
 
@@ -273,6 +294,13 @@ class KVControlService:
         executor.cache_available = self.cache_is_available
         if self.namespace_keys:
             executor.cache_salt_transform = self.cache_salt
+        if executor.transfers is not None:
+            executor.protection = HostCacheProtection(
+                executor,
+                limits=self.config.protection_limits,
+                clock=self.control._clock,
+                max_result_targets=self.config.limits.max_scope_spans,
+            )
         return executor
 
     def cache_is_available(self):
@@ -365,11 +393,20 @@ class KVControlService:
             raise ControlError("busy", "Cache controller still owns transfer buffers")
         for node in self.cache.tree_core._node_arena.values():
             if node is not self.cache.tree_core.root_node and any(
-                cd.lock_ref or cd.host_lock_ref for cd in node.component_data
+                cd.lock_ref
+                or (
+                    cd.host_lock_ref
+                    and not (
+                        self.control.executor.protection is not None
+                        and self.control.executor.protection.owns_host_refs(node)
+                    )
+                )
+                for cd in node.component_data
             ):
                 raise ControlError(
                     "busy", "Cache content still has active correctness references"
                 )
+        self.invalidate_protection(reason="namespace_changed")
 
     def capabilities(self):
         from sglang.srt.managers.kv_control.key_namespace import SALT_ENCODING
@@ -406,6 +443,22 @@ class KVControlService:
         )
 
     @property
+    def has_background_work(self):
+        protection = self.control.executor.protection
+        return self.has_pending or (
+            protection is not None and protection.has_background_work
+        )
+
+    @property
+    def next_deadline(self):
+        protection = self.control.executor.protection
+        return protection.next_deadline if protection is not None else None
+
+    def invalidate_protection(self, *, reason):
+        protection = self.control.executor.protection
+        return protection.invalidate(reason=reason) if protection is not None else ()
+
+    @property
     def blocks_prefill(self):
         transfers = self.control.executor.transfers
         return transfers is not None and transfers.blocks_prefill
@@ -420,6 +473,8 @@ class KVControlService:
             self.policy_runtime.progress()
         if self.has_pending:
             self.control.progress()
+        if executor.protection is not None:
+            executor.protection.progress()
         if self.policy_runtime is not None:
             self.policy_runtime.progress()
 
@@ -550,6 +605,26 @@ class KVControlService:
             if self.policy_runtime is not None:
                 self.policy_runtime.execution.before_cancel(command.ref)
             return control.cancel(command.ref)
+        if isinstance(command, (Claim, ClaimEvents)):
+            protection = control.executor.protection
+            if protection is None:
+                raise ControlError("unsupported", "L2 protection is unavailable")
+            if context.binding_id is not None:
+                raise ControlError(
+                    "invalid_payload",
+                    "Claim queries require an independent caller context",
+                )
+            if isinstance(command, Claim):
+                return protection.get(
+                    caller_id=context.caller_id,
+                    claim_id=command.claim_id,
+                    owner_task=command.owner_task,
+                )
+            return protection.changes(
+                caller_id=context.caller_id,
+                after_sequence=command.after_sequence,
+                limit=command.limit,
+            )
         if isinstance(command, Residency):
             return control.executor.residency(
                 control.index.resolve(command.target),
@@ -566,6 +641,12 @@ class KVControlService:
             operations=registry.capacity(),
             associations=control.index.capacity(),
             copies=control.executor.claims.capacity(),
+            protection=dict(
+                active_claims=control.executor.protection.registry.active_claims,
+                protected_tokens=control.executor.protection.registry.protected_tokens,
+            )
+            if control.executor.protection is not None
+            else None,
             policies=dict(self.policy_runtime.execution.stats)
             if self.policy_runtime is not None
             else {},

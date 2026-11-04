@@ -62,6 +62,7 @@ pub struct Pin {
     pub ttl_seconds: Option<f64>,
     #[serde(default = "protection")]
     pub required_protection: String,
+    pub owner_task: Option<crate::models::TaskIdentity>,
 }
 fn protection() -> String {
     "eviction_exclusion".into()

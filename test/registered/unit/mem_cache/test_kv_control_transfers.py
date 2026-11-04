@@ -1221,7 +1221,8 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             cache, service, dma = cold_prefix(owner)
             caps = service.capabilities()["public_protocol"]
             assert caps["storage_backend"] == "file"
-            assert "sglang.pin" not in caps["actions"]
+            assert "sglang.pin" in caps["actions"]
+            assert {p["tier"] for p in caps["pin_protections"]} == {"host"}
             result = public_transfer(
                 service, "prefetch", "storage", "host", "public-restore"
             )

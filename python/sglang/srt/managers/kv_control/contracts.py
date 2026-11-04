@@ -225,10 +225,12 @@ class Pin(Value):
     required_protection: Literal["eviction_exclusion", "backend_soft_pin"] = (
         "eviction_exclusion"
     )
+    # Explicit demand ownership, independent of the selected content/session.
+    owner_task: TaskIdentity | None = None
 
 
 class ClaimState(Value):
-    """P4 transport hook, separate from operation completion; no claim executor."""
+    """Current owner-confirmed protection, independent of operation completion."""
 
     caller_id: Identifier
     task_incarnation: Identifier
@@ -243,6 +245,9 @@ class ClaimState(Value):
         None
     )
     remaining_ttl: Seconds | None = None
+    owner_task: TaskIdentity | None = None
+    actual_scope: tuple[TargetOutcome, ...] = ()
+    location: PublicLocation | None = None
 
 
 class SetPriority(Value):

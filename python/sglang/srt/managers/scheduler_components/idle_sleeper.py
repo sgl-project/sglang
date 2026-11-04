@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import zmq
-
 from sglang.srt.environ import envs
 from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
@@ -33,8 +32,8 @@ class IdleSleeper:
 
         self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
 
-    def maybe_sleep(self):
-        self.poller.poll(1000)
+    def maybe_sleep(self, *, timeout_ms: int = 1000):
+        self.poller.poll(timeout_ms)
         if (
             self.empty_cache_interval > 0
             and real_time() - self.last_empty_time > self.empty_cache_interval
@@ -63,8 +62,10 @@ class RustServerIdleSleeper:
         self.can_empty_cache = can_empty_cache
         self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
 
-    def maybe_sleep(self):
-        self.rust_server.wait_request(self.timeout_ms)
+    def maybe_sleep(self, *, timeout_ms: int | None = None):
+        self.rust_server.wait_request(
+            self.timeout_ms if timeout_ms is None else min(self.timeout_ms, timeout_ms)
+        )
         if (
             self.empty_cache_interval > 0
             and real_time() - self.last_empty_time > self.empty_cache_interval

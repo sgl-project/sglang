@@ -114,7 +114,10 @@
       "protection_version": "1.0",
       "tombstone": true,
       "effective_protection": null,
-      "remaining_ttl": null
+      "remaining_ttl": null,
+      "owner_task": null,
+      "actual_scope": [],
+      "location": null
     }
   ]
 }

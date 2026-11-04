@@ -481,6 +481,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        service = getattr(self, "kv_control_service", None)
+        if service is not None:
+            service.invalidate_protection(reason="cache_reset")
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
         self.tree_core.reset()
@@ -666,6 +669,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        service = getattr(self, "kv_control_service", None)
+        if service is not None:
+            service.invalidate_protection(reason="host_cache_detached")
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
