@@ -294,7 +294,7 @@ struct TopKConfig {
       const auto tie_1 = lane_id_1 < num_ties ? tie_buffer[lane_id_1] : invalid;
       const auto target_0 = tie_buffer[warp_id_0];
       const auto target_1 = tie_buffer[warp_id_1];
-      if (true) {  // NOTE: warp_id_0 <= kNumWarps < num_ties
+      {  // warp_id_0 < kNumWarps < num_ties: always a valid target
         const auto rank_0 = warp_sum_bool(is_greater(tie_0, target_0));
         const auto rank_1 = warp_sum_bool(is_greater(tie_1, target_0));
         const auto rank = rank_0 + rank_1;
@@ -525,7 +525,6 @@ struct TopKConfig {
         const auto inter = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
         const auto prefix = inter + warp_inc;      // inclusive prefix through this bin
         const auto above = total_active - prefix;  // elements in bins ABOVE this one
-        // 3. Find threshold bin
         if (above < topk_remain && above + hist_val >= topk_remain) {
           smem->match = {tx, above, hist_val};
         }
@@ -537,7 +536,6 @@ struct TopKConfig {
       topk_remain -= above_count;
       if (round == 3 && kDeterministic) straddle = equal_count > topk_remain;
 
-      // 4. Scatter
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
         if (!active[i]) continue;
@@ -555,7 +553,7 @@ struct TopKConfig {
             write_pos[i] = topk - topk_remain + slot;
           }
         }
-        // my_bin == thr && round < 3: stay active for next round
+        // bin == threshold_bin before the last round: stays active
       }
 
       if (round == 3 || topk_remain == 0) break;
@@ -593,7 +591,6 @@ struct TopKConfig {
 
 template <uint32_t kHistBits_>
 struct TopKRadixBase : TopKConfig {
- public:
   static constexpr uint32_t kVecSize = 4;
   static constexpr uint32_t kHistBits = kHistBits_;
   static constexpr uint32_t kHistSize = 1 << kHistBits;
@@ -685,8 +682,18 @@ struct TopKRadixBase : TopKConfig {
     vec.store(histogram, tx);
   }
 
-  /// Same, but scanning a histogram that need not be `smem`'s own -- the cluster
-  /// path merges into one rank's copy and scans it there.
+  /// Fills the slots after the count_gt "above" ones from the staged ties.
+  template <typename Smem>
+  SGL_DEVICE static void handle_staged_ties(const TopKProblem& problem, Smem* smem) {
+    const auto topk = problem.topk;
+    const auto count_gt = smem->count_gt;
+    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    const auto tie_count = min(smem->count_eq, kMaxNumTie);
+    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+  }
+
+  /// Finds the coarse bin holding the topk-th largest of `seq_len` scores in
+  /// smem->histogram and calls fn(bin) on the one thread that owns it. Block-wide.
   template <typename Smem, typename Fn>
   SGL_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem, Fn fn) {
     const auto tx = threadIdx.x;
@@ -729,10 +736,6 @@ struct TopKRadixBase : TopKConfig {
     __syncthreads();
   }
 
-  /// Re-stages the tie buffer exactly when the threshold bin overflows it: radix
-  /// rounds narrow the bin to one bucket, then a final scan emits what lies above
-  /// it and stages the bucket for the caller's handle_tie. In the deterministic mode,
-  /// an exact-equal group that still overflows is narrowed by index, smallest first.
   /// Digits of refine_ties are taken from the key relative to the bin's lower edge:
   /// members of one coarse bin share their top key bits, so absolute digits would
   /// waste a round on them. A +0 edge also admits -0, whose key sits just below
@@ -748,6 +751,10 @@ struct TopKRadixBase : TopKConfig {
     return key_bits > kRefineBits ? key_bits - kRefineBits : 0u;
   }
 
+  /// Re-stages the tie buffer exactly when the threshold bin overflows it: radix
+  /// rounds narrow the bin to one bucket, then a final scan emits what lies above
+  /// it and stages the bucket for the caller's handle_tie. In the deterministic mode,
+  /// an exact-equal group that still overflows is narrowed by index, smallest first.
   /// `first_round_done`: the caller has already built the first round's histogram
   /// (digit refine_first_shift of the relative tie key) in refine_hist.
   SGL_DEVICE static void refine_ties(  //
@@ -949,7 +956,6 @@ template <uint32_t kLocalVecs_>
 struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kLocalVecs = kLocalVecs_;
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
-  using Smem = typename TopKRadixBase<12>::Smem;
 
   template <bool kUsePDL>
   SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
@@ -1049,22 +1055,16 @@ struct TopKRegister : TopKRadixBase<12> {
         refine_ties_cold(problem, smem, v_lo, v_hi, smem->count_eq);
       }
     }
-    const auto count_gt = smem->count_gt;
-    const auto count_eq = smem->count_eq;
-    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
-    const auto tie_count = min(count_eq, kMaxNumTie);
-    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+    handle_staged_ties(problem, smem);
   }
 };
 
 // ---------------------------------------------------------------------------
-// Streaming path: seq_len > 8192 -- two vectorized passes over global memory
+// Streaming path: rows too long for the register path -- two vectorized passes
+// over global memory
 // ---------------------------------------------------------------------------
 
 struct TopKStreaming : TopKRadixBase<12> {
- public:
-  static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
-
   /// Collect pass of a row whose threshold bin overflows: emits what lies above the
   /// bin and histograms the bin's members by refine_ties' first digit, then lets
   /// refine_ties finish from its second round. Out of line, so the normal row's
@@ -1094,10 +1094,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     });
     __syncthreads();
     refine_ties(problem, smem, v_lo, v_hi, smem->count_eq, /*first_round_done=*/true);
-    const auto count_gt = smem->count_gt;
-    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
-    const auto tie_count = min(smem->count_eq, kMaxNumTie);
-    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+    handle_staged_ties(problem, smem);
   }
 
   template <bool kUsePDL>
@@ -1133,11 +1130,8 @@ struct TopKStreaming : TopKRadixBase<12> {
       if constexpr (kExact) smem->thr_count = smem->histogram[threshold_bin];
     });
 
-    // Phase 3: Collect candidates and sort. Classify by two fp32 boundaries derived
-    // from the threshold bin instead of recomputing the fp16 bin per element: an
-    // element is "above" iff val >= v_hi (bin > threshold) and a "tie" iff
-    // v_lo <= val < v_hi (bin == threshold). This drops the F2F + bit-twiddle from
-    // the second full pass over the input.
+    // Phase 3: collect by the bin's two fp32 edges (coarse_bin_bounds), which avoids
+    // recomputing the fp16 bin of every score.
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
     const auto topk = problem.topk;
@@ -1166,11 +1160,8 @@ struct TopKStreaming : TopKRadixBase<12> {
       }
     });
 
-    // Phase 4: Handle ties. Drive the output layout from the *collect* counts so it
-    // is self-consistent with the fp32 classification above (rather than the fp16
-    // histogram counts), even if rounding moves a boundary element between the
-    // "above" and "tie" sets. above_count is < topk by the threshold-bin invariant,
-    // so the count_gt guard above effectively never triggers.
+    // Phase 4: handle ties. The output layout follows the collect counts, not the
+    // histogram's, so it stays consistent with the fp32 classification above.
     __syncthreads();
     if constexpr (kExact) {
       if (smem->count_eq > kMaxNumTie && (!zero_bin || smem->tie_nonzero != 0)) [[unlikely]] {
@@ -1178,11 +1169,7 @@ struct TopKStreaming : TopKRadixBase<12> {
         refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
       }
     }
-    const auto count_gt = smem->count_gt;
-    const auto count_eq = smem->count_eq;
-    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
-    const auto tie_count = min(count_eq, kMaxNumTie);
-    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+    handle_staged_ties(problem, smem);
   }
 };
 
@@ -1296,29 +1283,65 @@ SGL_DEVICE void cluster_sync() {
 /// tie buffer through st.async); rank 0 waits for exactly the tie bytes and
 /// resolves them. An overflowing threshold bin (more than kMaxNumTie members)
 /// is known cluster-wide before the collect pass and takes a cold refine path.
-///
-/// The scan bins two scores per instruction and the collect skips vectors below the
-/// bin; one warp finds the threshold bin and this rank's bases and publishes them; rank 0
-/// resolves the ties on only the warps it needs (tie_select_digits); the fine path stages
-/// each rank's bin members so that its second pass does not rescan the row.
-template <uint32_t N>
+template <uint32_t kClusterSize>
 struct TopKCluster : TopKRadixBase<11> {
- public:
   // C8 (two CTAs per SM) keeps L1 across the scan and the collect pass: bar-0 is awaited
-  // before the scan and the st.async mbarriers are awaited with a shared::cluster-only
-  // acquire. C16 measured 0.07-0.13 us slower with it, so it keeps the cluster-scope waits.
-  static constexpr bool kKeepL1 = N == 8;
-  static constexpr uint32_t kClusterSize = N;
-  static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
+  // before the scan and the st.async mbarriers with a shared::cluster-only acquire.
+  // C16 keeps the cluster-scope waits, measured faster there.
+  static constexpr bool kKeepL1 = kClusterSize == 8;
   static constexpr uint32_t kHistItems = kHistSize / kBlockSize;  // bins per thread
   static constexpr uint32_t kGroupBins = 32;
   static constexpr uint32_t kGroups = kHistSize / kGroupBins;
   static constexpr uint32_t kGroupChunks = kGroups / 4;  // 16-byte chunks of one rank's group sums
   static constexpr uint32_t kBinRow = kGroupBins + 4;    // + this rank's count above the group, padded
   static constexpr uint32_t kBinChunks = kBinRow / 4;
-  static_assert(N < kNumWarps, "phase 2d uses warps 0..N");
+  static_assert(kClusterSize < kNumWarps, "phase 2d uses warps 0..kClusterSize");
   static_assert(kGroups == 32 || kGroups == 64, "the group search maps 1 or 2 groups to a lane");
   static constexpr uint32_t kNegZeroBin = 0x7FFFu >> (16 - kHistBits);  // negatives that round to fp16 -0
+  using MatchBin = TieHandleSmem::MatchBin;
+  // Transaction mbarriers: the group and bin all-gathers, rank 0's tie arrivals,
+  // and the fine path's group and bin all-gathers.
+  enum : uint32_t { kMbarGroup, kMbarBin, kMbarTies, kMbarFineGroup, kMbarFineBin, kNumMbars };
+  struct Smem {
+    uint64_t mbar[kNumMbars];
+    uint32_t fine_uses;  // phases completed by the two fine-path mbarriers
+    uint32_t cold_parity;
+    uint32_t count_eq;
+    uint32_t count_gt;
+    uint32_t local_start_eq;  // refine_cluster: this rank's base in rank 0's tie buffer
+    union {
+      uint32_t local_start_gt;  // refine_cluster: this rank's base in the output
+      uint32_t fine_count_gt;   // fine_path: above-digit members emitted by pass 2
+    };
+    uint32_t refine_gt;
+    uint32_t refine_remain;
+    MatchBin refine_match;
+    uint32_t warp_sum[kNumWarps];
+    alignas(16) uint32_t group_local[kGroups];
+    alignas(16) uint32_t recv_group[kClusterSize][kGroups];
+    alignas(16) uint32_t recv_bin[kClusterSize][kBinRow];  // group's bins + count above the group
+    uint32_t rank_suffix[kClusterSize][2];                 // fine path, per rank: members above / at the digit
+    uint32_t sel_group, above_group, own_above_group, sel_bin, above_total, eq_total;
+    uint32_t tie_ctr_gt, tie_ctr_eq;  // rank 0's tie select
+    MatchBin tie_digit;
+    TieValue tie_stage[kWarpSize];
+    union {
+      alignas(16) uint32_t histogram[kHistSize];
+      TieHandleSmem tie_handle;
+      int32_t stage_out_idxs[kMaxTopK];  // refine_cluster, ranks > 0: above indices until the base is known
+    };
+    union {
+      TieValue tie_values[kMaxNumTie];
+      alignas(16) uint32_t refine_hist[kRefineSize];  // cold paths: digits of the exact key - key_low(v_lo)
+    };
+    // Phase 2d's results for this rank: bases of its above and tie slots, bin edges.
+    uint32_t base_gt, base_eq, my_gt, my_eq;
+    float v_lo, v_hi;
+    // Fine path: this rank's threshold-bin members, staged by pass 1 for pass 2.
+    uint32_t member_count;
+    TieValue members[kMaxNumTie];
+  };
+
   /// fp32 edges {lo, hi} of the threshold bin under this path's binning, which keys
   /// -0.0 as +0.0: "above" iff val >= hi, "tie" iff val >= lo and not above, so the
   /// collected counts equal the histogram's on every non-NaN score.
@@ -1337,48 +1360,15 @@ struct TopKCluster : TopKRadixBase<11> {
   SGL_DEVICE static uint32_t key_bits(float v_lo, float v_hi) {
     return 32 - __clz(extract_exact_bin(v_hi) - key_low(v_lo) - 1);
   }
-  // Cold paths: 12-bit digits of the exact key relative to key(v_lo).
-  static constexpr uint32_t kOvfBits = 12;
-  static constexpr uint32_t kOvfSize = 1u << kOvfBits;
-  static constexpr uint32_t kOvfItems = kOvfSize / kBlockSize;
-  using MatchBin = TieHandleSmem::MatchBin;
-  struct Smem {
-    uint64_t mbar[5];    // group all-gather, bin all-gather, rank 0 tie arrivals, fine-path group / bin all-gathers
-    uint32_t fine_uses;  // phases completed by mbar[3] / mbar[4] (fine path only)
-    uint32_t cold_parity;
-    uint32_t count_eq;
-    uint32_t count_gt;
-    uint32_t local_start_eq;
-    uint32_t local_start_gt;
-    uint32_t ovf_gt;
-    uint32_t ovf_remain;
-    MatchBin ovf_match;
-    uint32_t warp_sum[kNumWarps];
-    alignas(16) uint32_t group_local[kGroups];
-    alignas(16) uint32_t recv_group[N][kGroups];
-    alignas(16) uint32_t recv_bin[N][kBinRow];  // group's bins + count above the group
-    uint32_t rank_suffix[N][2];                 // fine path, per rank: members above / at the digit
-    uint32_t sel_group, above_group, own_above_group, sel_bin, above_total, eq_total;
-    uint32_t tie_ctr_gt, tie_ctr_eq;  // rank 0's tie select
-    MatchBin tie_digit;
-    TieValue tie_stage[kWarpSize];
-    union {
-      alignas(16) uint32_t histogram[kHistSize];
-      TieHandleSmem tie_handle;
-      int32_t stage_out_idxs[kMaxTopK];
-    };
-    union {
-      TieValue tie_values[kMaxNumTie];
-      alignas(16) uint32_t ovf_hist[kOvfSize];  // overflow path only
-    };
-    // Phase 2d's results for this rank: bases of its above and tie slots, bin edges.
-    uint32_t base_gt, base_eq, my_gt, my_eq;
-    float v_lo, v_hi;
-    // Fine path: this rank's threshold-bin members, staged by pass 1 for pass 2.
-    uint32_t member_count;
-    TieValue members[kMaxNumTie];
-  };
-  static_assert(sizeof(TieValue) * kMaxNumTie >= sizeof(uint32_t) * kOvfSize);
+
+  /// .shared address of this CTA's mbarrier `id`.
+  SGL_DEVICE static uint32_t mbar_addr(Smem* smem, uint32_t id) {
+    return ptx::to_shared(&smem->mbar[id]);
+  }
+  /// st.async of `v` to `ptr`'s counterpart in rank `dst_rank`, completing on that rank's mbarrier `id`.
+  SGL_DEVICE static void push_v4(Smem* smem, const uint32_t* ptr, uint4 v, uint32_t dst_rank, uint32_t id) {
+    ptx::st_async_v4(ptx::map_rank(ptx::to_shared(ptr), dst_rank), v, ptx::map_rank(mbar_addr(smem, id), dst_rank));
+  }
 
   /// extract_coarse_bin<kHistBits>(x + 0) of two scores, x in the low half of the result:
   /// one packed add and one packed fp16 conversion for both, and a byte permute that
@@ -1397,15 +1387,15 @@ struct TopKCluster : TopKRadixBase<11> {
     return {(key >> (16 - kHistBits)) & (kHistSize - 1), key >> (32 - kHistBits)};
   }
 
-  /// for_each_input<N> by whole vectors: fn_vec(vec, idx of vec[0]) per full vector,
+  /// for_each_input<kClusterSize> by whole vectors: fn_vec(vec, idx of vec[0]) per full vector,
   /// fn_one(val, idx) per score of the partial last vector, with the same loads in the same order.
   template <typename FV, typename F1>
   SGL_DEVICE static void for_each_vec(const float* __restrict__ in, uint32_t seq_len, FV&& fn_vec, F1&& fn_one) {
-    constexpr auto kStride = N * kBlockSize;
+    constexpr auto kStride = kClusterSize * kBlockSize;
     constexpr uint32_t kChunk = 128;
     const auto tx = threadIdx.x;
     const auto num_full = seq_len / kVecSize;
-    auto vi = (tx % kChunk) + blockIdx.y * kChunk + (tx / kChunk) * (N * kChunk);
+    auto vi = (tx % kChunk) + blockIdx.y * kChunk + (tx / kChunk) * (kClusterSize * kChunk);
     if (vi < num_full) {
       vec_t next_vec;
       next_vec.load(in, vi);
@@ -1429,8 +1419,8 @@ struct TopKCluster : TopKRadixBase<11> {
     }
   }
 
-  /// The collect pass: fn(val, idx) on every score that may be at or above v_lo. C8 tests
-  /// a whole vector first (its max below v_lo: none is), which most vectors are.
+  /// The collect pass: fn(val, idx) on every score that may be at or above v_lo. A whole
+  /// vector is tested first (its max below v_lo: none is), which most vectors are.
   template <typename F>
   SGL_DEVICE static void collect_scan(const TopKProblem& problem, float v_lo, F&& fn) {
     for_each_vec(
@@ -1446,543 +1436,306 @@ struct TopKCluster : TopKRadixBase<11> {
         fn);
   }
 
-  SGL_DEVICE static void zero_ovf_hist(Smem* smem) {
-    AlignedVector<uint32_t, kOvfItems> zero;
-    zero.fill(0);
-    zero.store(smem->ovf_hist, threadIdx.x);
-  }
-
-  /// Rank 0: digit search over the merged kOvfSize-bin histogram (zeroed after reading).
-  SGL_DEVICE static void ovf_find_digit(Smem* smem, const uint32_t remain) {
+  /// Selects the top-k of `problem` across the cluster, cold rows included.
+  /// `item`: 0 for the first problem this CTA runs (initializes the mbarriers), +1 per later one.
+  /// kInlineCold: inline the cold path instead of calling it. A call makes ptxas keep per-item
+  /// state on the stack in a 32-register kernel (the persistent pool); inlining it makes the
+  /// small-batch kernel, which also holds the one-block paths, spill to shared memory.
+  template <bool kUsePDL, bool kInlineCold = false>
+  SGL_DEVICE static void forward(TopKProblem problem, void* _smem, const uint32_t item = 0) {
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
-    const auto warp_id = broadcast(tx / kWarpSize);
-    AlignedVector<uint32_t, kOvfItems> counts;
-    counts.load(smem->ovf_hist, tx);
-    zero_ovf_hist(smem);
-    if (tx == 0) smem->ovf_match = {0, 0, 0};  // stays if nothing matches (NaN-polluted counts)
-    uint32_t local_sum = 0;
-#pragma unroll
-    for (uint32_t i = 0; i < kOvfItems; ++i) {
-      local_sum += counts[i];
-    }
-    const auto warp_inc = warp::inclusive_sum(local_sum, lane_id);
-    if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
-    __syncthreads();
-    const auto ws = smem->warp_sum[lane_id];
-    const auto total = warp::reduce_sum(ws);
-    uint32_t prefix = warp::reduce_sum(lane_id < warp_id ? ws : 0) + warp_inc - local_sum;
-#pragma unroll
-    for (uint32_t i = 0; i < kOvfItems; ++i) {
-      prefix += counts[i];
-      const auto above = total - prefix;
-      if (above < remain && above + counts[i] >= remain) {
-        smem->ovf_match = {tx * kOvfItems + i, above, counts[i]};
-      }
-    }
-  }
-
-  /// Refine from scratch, for an edge bin or a fine-path digit that still holds more
-  /// than kMaxNumTie members: cluster-wide radix rounds over the exact key (12-bit
-  /// digits relative to key(v_lo), round 0 fused with the collect pass, merged into
-  /// rank 0 with remote atomics), then the final bucket is staged and resolved by
-  /// rank 0's handle_tie. Self-contained: counts from the scans, rank bases from
-  /// atomics on rank 0, its own cluster barriers. kIsRank0 stays a template
-  /// parameter: as a runtime flag it changes the generated code.
-  template <bool kIsRank0>
-  SGL_DEVICE static void overflow_path(const TopKProblem& problem, Smem* smem, Smem* smem_0, float v_lo, float v_hi) {
-    const auto tx = threadIdx.x;
+    const auto smem = static_cast<Smem*>(_smem);
+    const uint32_t this_rank = blockIdx.y;
+    const uint32_t parity = item & 1;
     const auto topk = problem.topk;
-    zero_ovf_hist(smem);
+
+    init_histogram(smem->histogram, tx);
     if (tx == 0) {
-      smem->count_gt = 0;
       smem->count_eq = 0;
-      smem->ovf_gt = 0;
-    }
-    __syncthreads();
-    ptx::cluster_sync();  // every rank's counters and histogram are zero before any remote update
-
-    // NaN-safe: a NaN upper edge (inf bin) puts nothing above and +inf in the bin.
-    const auto is_above = [=](float val) { return val >= v_hi; };
-    const auto in_bin = [=](float val) { return val >= v_lo && !(val >= v_hi); };
-    const uint32_t key_lo = key_low(v_lo);
-    const uint32_t span = extract_exact_bin(v_hi) - key_lo;  // in-bin keys are < key_lo + span
-    const uint32_t num_bits = 32 - __clz(span - 1);
-    // Mode 2 radixes (key, smallest index first) so the final bucket is one element
-    // and the selected set is deterministic (idx < 2^20: scores are at most 1M long).
-    using Key = std::conditional_t<kDeterministic, uint64_t, uint32_t>;
-    constexpr uint32_t kIdxBits = kDeterministic ? 20 : 0;
-    const auto comp = [=](float val, uint32_t idx) -> Key {
-      const Key rel = extract_tie_key(val) - key_lo;
-      if constexpr (kDeterministic) {
-        return (rel << kIdxBits) | ((1u << kIdxBits) - 1 - idx);
-      } else {
-        return rel;
-      }
-    };
-    const uint32_t total_bits = num_bits + kIdxBits;
-    uint32_t shift = total_bits > kOvfBits ? total_bits - kOvfBits : 0;
-    const auto emit_above = [&](uint32_t idx) {
-      const auto pos = atomicAdd(&smem->count_gt, 1);
-      if constexpr (kIsRank0) {
-        if (pos < topk) [[likely]] {
-          problem.emit(pos, idx);
-        }
-      } else {
-        if (pos < topk) [[likely]] {
-          smem->stage_out_idxs[pos] = idx;
-        }
-      }
-    };
-
-    for_each_input<N>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-      if (is_above(val)) {
-        emit_above(idx);
-      } else if (in_bin(val)) {
-        atomicAdd(&smem->ovf_hist[static_cast<uint32_t>(comp(val, idx) >> shift)], 1);
-      }
-    });
-    Key bucket_lo = 0;
-    Key bucket_mask = (static_cast<Key>(span - 1) << kIdxBits) | ((Key(1) << kIdxBits) - 1);
-    uint32_t remain = 0;
-#pragma unroll 1
-    for (uint32_t round = 0;; ++round) {
-      __syncthreads();
-      if constexpr (!kIsRank0) {
-        AlignedVector<uint32_t, kOvfItems> counts;
-        counts.load(smem->ovf_hist, tx);
-        zero_ovf_hist(smem);
+      smem->count_gt = 0;
+      smem->tie_ctr_gt = 0;
+      smem->tie_ctr_eq = 0;
+      if (item == 0) {
 #pragma unroll
-        for (uint32_t i = 0; i < kOvfItems; ++i) {
-          if (counts[i] != 0) atomicAdd(&smem_0->ovf_hist[tx * kOvfItems + i], counts[i]);
+        for (uint32_t i = 0; i < kNumMbars; ++i) {
+          ptx::mbar_init(&smem->mbar[i], 1);
         }
-        if (round == 0 && tx == 0) atomicAdd(&smem_0->ovf_gt, smem->count_gt);
-        ptx::barrier_cluster_arrive_release();  // A: histograms merged
-        ptx::barrier_cluster_wait();
-        ptx::barrier_cluster_arrive_relaxed();  // B: digit published
-        ptx::barrier_cluster_wait();
-      } else {
-        if (round == 0 && tx == 0) atomicAdd(&smem->ovf_gt, smem->count_gt);
-        ptx::barrier_cluster_arrive_relaxed();  // A
-        ptx::barrier_cluster_wait();
-        __syncthreads();
-        if (round == 0) {
-          const auto gt = smem->ovf_gt;
-          remain = gt < topk ? topk - gt : 0;
-          if (tx == 0) smem->ovf_remain = remain;
-        }
-        if (remain != 0) ovf_find_digit(smem, remain);
-        __syncthreads();
-        ptx::barrier_cluster_arrive_release();  // B: publishes ovf_match / ovf_remain
-        ptx::barrier_cluster_wait();
+        ptx::fence_mbar_init();
+        smem->fine_uses = 0;
       }
-      if (round == 0) {
-        remain = smem_0->ovf_remain;
-        if (remain == 0) break;  // above elements fill every slot
-      }
-      const MatchBin match = smem_0->ovf_match;
-      bucket_lo += static_cast<Key>(match.bin) << shift;
-      bucket_mask = (Key(1) << shift) - 1;
-      remain -= match.above_count;
-      if (shift == 0 || match.equal_count <= kMaxNumTie) break;
-      if constexpr (kIsRank0) __syncthreads();  // all have read ovf_match before the next find rewrites it
-      shift = shift > kOvfBits ? shift - kOvfBits : 0;
-      for_each_input<N>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-        if (!in_bin(val)) return;
-        const Key d = comp(val, idx) - bucket_lo;
-        if (d <= bucket_mask) atomicAdd(&smem->ovf_hist[static_cast<uint32_t>(d >> shift)], 1);
-      });
-    }
-
-    __syncthreads();  // everyone has read the histogram before tie_values overwrite it
-    if (remain != 0) {
-      for_each_input<N>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-        if (!in_bin(val)) return;
-        const Key rel = comp(val, idx);
-        if (rel < bucket_lo) return;
-        if (rel - bucket_lo > bucket_mask) {
-          emit_above(idx);
-        } else {
-          const auto pos = atomicAdd(&smem->count_eq, 1);
-          if (pos < kMaxNumTie) [[likely]] {
-            smem->tie_values[pos] = {val, idx};
-          }
-        }
-      });
     }
     __syncthreads();
-    if constexpr (!kIsRank0) {
-      const auto local_count_gt = smem->count_gt;
-      const auto local_count_eq = min(smem->count_eq, kMaxNumTie);
-      if (tx == 0) {
-        smem->local_start_gt = atomicAdd(&smem_0->count_gt, local_count_gt);
-        smem->local_start_eq = atomicAdd(&smem_0->count_eq, local_count_eq);
-      }
-      __syncthreads();
-      const auto local_start_gt = smem->local_start_gt;
-      const auto local_start_eq = smem->local_start_eq;
-#pragma unroll
-      for (uint32_t i = 0; i < kTieItems; ++i) {
-        const auto t = tx + i * kBlockSize;
-        if (t < local_count_eq && local_start_eq + t < kMaxNumTie) {
-          smem_0->tie_values[local_start_eq + t] = smem->tie_values[t];
-        }
-      }
-      ptx::cluster_sync();
-#pragma unroll
-      for (uint32_t i = 0; i < kTopKItems; ++i) {
-        if (const auto t = tx + i * kBlockSize; t < local_count_gt && local_start_gt + t < topk) {
-          problem.emit(local_start_gt + t, smem->stage_out_idxs[t]);
-        }
-      }
-    } else {
-      ptx::cluster_sync();
-      const auto count_gt = smem->count_gt;
-      const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
-      const auto tie_count = min(smem->count_eq, kMaxNumTie);
-      handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
-    }
-  }
+    // bar-0: every rank's mbarriers are initialized (and the previous item's
+    // receive buffers consumed) before any rank pushes into them.
+    ptx::barrier_cluster_arrive_release();
+    PDLWaitPrimary<kUsePDL>();
+    // C8 waits for bar-0 before the scan: its acquire invalidates L1, and after the scan it
+    // would drop the score lines the collect pass re-reads.
+    if constexpr (kKeepL1) ptx::barrier_cluster_wait();
 
-  /// Cold path for a threshold bin with more than kMaxNumTie members (not an edge
-  /// bin). The above elements are exact and emitted as on the normal path;
-  /// the same pass builds a 4096-bin histogram of the bin's members over 12-bit
-  /// digits of key - key(v_lo), which is all-gathered like the coarse one (64 group
-  /// sums, then the selected group's 64 bins), so every rank finds the k-th digit
-  /// and its bases itself. A second pass emits the members above that digit and
-  /// st.asyncs the digit's members to rank 0, which resolves them. If the digit
-  /// still holds more than kMaxNumTie members (runs of near-equal keys), the
-  /// barrier-based refine (overflow_path) takes over.
-  SGL_DEVICE static void fine_path(
-      const TopKProblem& problem,
-      Smem* smem,
-      const uint32_t this_rank,
-      const float v_lo,
-      const float v_hi,
-      const uint32_t above_total,
-      const uint32_t base_gt,
-      const uint32_t my_gt,
-      const uint32_t item_parity) {
-    constexpr uint32_t kFineGroups = 64;
-    constexpr uint32_t kFineGroupBins = kOvfSize / kFineGroups;  // 64
-    constexpr uint32_t kFineRow = kFineGroupBins + 4;
-    constexpr uint32_t kLanesPerFineGroup = kFineGroupBins / kOvfItems;
-    static_assert(kFineGroups <= kGroups && sizeof(uint32_t) * N * kFineRow <= sizeof(uint32_t) * kHistSize);
-    const auto tx = threadIdx.x;
-    const auto lane_id = tx % kWarpSize;
-    const auto warp_id = broadcast(tx / kWarpSize);
-    const auto topk = problem.topk;
-    const uint32_t key_lo = key_low(v_lo);
-    const uint32_t num_bits = key_bits(v_lo, v_hi);
-    const uint32_t shift = num_bits > kOvfBits ? num_bits - kOvfBits : 0;
-    const uint32_t remain = topk - above_total;  // 0 < remain < members of the bin
-    const uint32_t parity = smem->fine_uses & 1;
-    const auto recv2 = reinterpret_cast<uint32_t (*)[kFineRow]>(smem->histogram);
+    // Phase 1: histogram over this rank's interleaved chunks.
+    // Bin -0.0 as +0.0 (x + 0 under round-to-nearest), as fp32 compares see it.
+    const auto count_bin = [&](uint32_t bin) { atomicAdd(&smem->histogram[bin], 1); };
+    for_each_vec(
+        problem.in,
+        problem.seq_len,
+        [&](const vec_t& v, uint32_t) {
+          const auto [b0, b1] = coarse_bins2(v[0], v[1]);
+          const auto [b2, b3] = coarse_bins2(v[2], v[3]);
+          count_bin(b0);
+          count_bin(b1);
+          count_bin(b2);
+          count_bin(b3);
+        },
+        [&](float val, uint32_t) { count_bin(extract_coarse_bin<kHistBits>(__fadd_rn(val, 0.0f))); });
+    __syncthreads();
 
-    zero_ovf_hist(smem);
-    if (tx == 0) {
-      smem->local_start_gt = 0;                        // counter of the second pass
-      smem->member_count = 0;                         // members staged by the first pass
-    }
-    __syncthreads();
-    // Pass 1: above as on the normal path; members into the fine histogram.
-    for_each_input<N>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-      if (val >= v_hi) {
-        const auto pos = atomicAdd(&smem->count_gt, 1);
-        if (pos < my_gt) [[likely]] {
-          problem.emit(base_gt + pos, idx);
-        }
-      } else if (val >= v_lo) {
-        atomicAdd(&smem->ovf_hist[(extract_tie_key(val) - key_lo) >> shift], 1);
-        if (const auto pos = atomicAdd(&smem->member_count, 1); pos < kMaxNumTie) smem->members[pos] = {val, idx};
-      }
-    });
-    __syncthreads();
-    if (const auto got_gt = smem->count_gt; got_gt < my_gt) {
-      for (uint32_t t = got_gt + tx; t < my_gt; t += kBlockSize) {
-        problem.emit(base_gt + t, base_gt + t);
-      }
-    }
-    // F1: group sums, all-gathered.
+    // Phase 2a: group sums (32 bins per group), all-gathered.
+    AlignedVector<uint32_t, kHistItems> my_bins;
+    my_bins.load(smem->histogram, tx);
     {
-      AlignedVector<uint32_t, kOvfItems> v;
-      v.load(smem->ovf_hist, tx);
+      constexpr uint32_t kLanesPerGroup = kGroupBins / kHistItems;
       uint32_t sum = 0;
 #pragma unroll
-      for (uint32_t i = 0; i < kOvfItems; ++i) {
-        sum += v[i];
+      for (uint32_t i = 0; i < kHistItems; ++i) {
+        sum += my_bins[i];
       }
-      sum = warp::reduce_sum<kLanesPerFineGroup>(sum);
-      if (tx % kLanesPerFineGroup == 0) smem->group_local[tx / kLanesPerFineGroup] = sum;
+      sum = warp::reduce_sum<kLanesPerGroup>(sum);
+      if (tx % kLanesPerGroup == 0) smem->group_local[tx / kLanesPerGroup] = sum;
     }
-    if (tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar[3]), N * kFineGroups * sizeof(uint32_t));
+    if (tx == 0) ptx::mbar_arrive_expect_tx(mbar_addr(smem, kMbarGroup), kClusterSize * kGroups * sizeof(uint32_t));
     __syncthreads();
-    if (tx < N * (kFineGroups / 4)) {
-      const uint32_t c = tx % (kFineGroups / 4), dst = tx / (kFineGroups / 4);
+    if constexpr (!kKeepL1) ptx::barrier_cluster_wait();  // bar-0 wait
+    if (tx < kClusterSize * kGroupChunks) {
+      const uint32_t chunk = tx % kGroupChunks, dst_rank = tx / kGroupChunks;
       // Raw uint4 / uint2 views of the DSMEM rows: AlignedVector adds instructions here.
-      const auto v = reinterpret_cast<const uint4*>(smem->group_local)[c];
-      ptx::st_async_v4(
-          ptx::map_rank(ptx::to_shared(&smem->recv_group[this_rank][c * 4]), dst),
-          v,
-          ptx::map_rank(ptx::to_shared(&smem->mbar[3]), dst));
+      const auto v = reinterpret_cast<const uint4*>(smem->group_local)[chunk];
+      push_v4(smem, &smem->recv_group[this_rank][chunk * 4], v, dst_rank, kMbarGroup);
     }
+
+    // Phase 2b: warp 0 finds the group holding the topk-th score. Only the warps that read
+    // a received buffer poll its mbarrier (no spinning next to a co-resident CTA).
+    const auto warp_id = broadcast(tx / kWarpSize);
     if (warp_id == 0) {
-      ptx::mbar_wait(ptx::to_shared(&smem->mbar[3]), parity);
-      uint32_t t0 = 0, t1 = 0;
-#pragma unroll
-      for (uint32_t r = 0; r < N; ++r) {
-        const auto v = reinterpret_cast<const uint2*>(smem->recv_group[r])[lane_id];
-        t0 += v.x;
-        t1 += v.y;
+      if constexpr (kKeepL1) {
+        ptx::mbar_wait_shared(mbar_addr(smem, kMbarGroup), parity);
+      } else {
+        ptx::mbar_wait(mbar_addr(smem, kMbarGroup), parity);
       }
-      const auto incl = warp::inclusive_sum(t0 + t1, lane_id);
+      uint32_t group_sum[kGroups / 32];
+#pragma unroll
+      for (uint32_t i = 0; i < kGroups / 32; ++i) {
+        group_sum[i] = 0;
+      }
+#pragma unroll
+      for (uint32_t r = 0; r < kClusterSize; ++r) {
+        if constexpr (kGroups == 32) {
+          group_sum[0] += smem->recv_group[r][lane_id];
+        } else {
+          const auto v = reinterpret_cast<const uint2*>(smem->recv_group[r])[lane_id];
+          group_sum[0] += v.x;
+          group_sum[1] += v.y;
+        }
+      }
+      uint32_t lane_sum = 0;
+#pragma unroll
+      for (uint32_t i = 0; i < kGroups / 32; ++i) {
+        lane_sum += group_sum[i];
+      }
+      const auto incl = warp::inclusive_sum(lane_sum, lane_id);
       const auto total = __shfl_sync(0xFFFFFFFF, incl, kWarpSize - 1);
-      const uint32_t above1 = total - incl, above0 = above1 + t1;
-      const bool hit1 = above1 < remain && above1 + t1 >= remain;
-      const bool hit0 = above0 < remain && above0 + t0 >= remain;
-      const auto mask = __ballot_sync(0xFFFFFFFF, hit0 || hit1);
+      uint32_t above = total - incl;  // groups of higher lanes
+      uint32_t hit = 0, hit_above = 0;
+#pragma unroll
+      for (int i = kGroups / 32 - 1; i >= 0; --i) {
+        if (above < topk && above + group_sum[i] >= topk) {
+          hit = i + 1;
+          hit_above = above;
+        }
+        above += group_sum[i];
+      }
+      const auto mask = __ballot_sync(0xFFFFFFFF, hit != 0);
       const auto src = mask ? __ffs(mask) - 1 : 0;
-      const auto g = __shfl_sync(0xFFFFFFFF, 2 * lane_id + (hit1 ? 1 : 0), src);
-      const auto g_above = __shfl_sync(0xFFFFFFFF, hit1 ? above1 : above0, src);
-      uint32_t own = (2 * lane_id > g ? smem->group_local[2 * lane_id] : 0) +
-                     (2 * lane_id + 1 > g ? smem->group_local[2 * lane_id + 1] : 0);
+      auto group = __shfl_sync(0xFFFFFFFF, lane_id * (kGroups / 32) + hit - 1, src);
+      auto group_above = __shfl_sync(0xFFFFFFFF, hit_above, src);
+      if (mask == 0) {  // only with NaN-polluted counts
+        group = 0;
+        group_above = 0;
+      }
+      // This rank's elements in groups above group.
+      uint32_t own = 0;
+#pragma unroll
+      for (uint32_t i = 0; i < kGroups / 32; ++i) {
+        const auto grp = lane_id * (kGroups / 32) + i;
+        own += grp > group ? smem->group_local[grp] : 0;
+      }
       own = warp::reduce_sum(own);
       if (lane_id == 0) {
-        smem->sel_group = g;
-        smem->above_group = g_above;
+        smem->sel_group = group;
+        smem->above_group = group_above;
         smem->own_above_group = own;
       }
     }
-    if (tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar[4]), N * kFineRow * sizeof(uint32_t));
+    if (tx == 0) ptx::mbar_arrive_expect_tx(mbar_addr(smem, kMbarBin), kClusterSize * kBinRow * sizeof(uint32_t));
     __syncthreads();
-    // F2: the selected group's 64 bins plus the count above the group.
-    if (tx < N * (kFineRow / 4)) {
-      const uint32_t c = tx % (kFineRow / 4), dst = tx / (kFineRow / 4);
-      const auto g = smem->sel_group;
-      const auto v = c < kFineGroupBins / 4 ? reinterpret_cast<const uint4*>(smem->ovf_hist + g * kFineGroupBins)[c]
-                                            : uint4{smem->own_above_group, 0, 0, 0};
-      ptx::st_async_v4(
-          ptx::map_rank(ptx::to_shared(&recv2[this_rank][c * 4]), dst),
-          v,
-          ptx::map_rank(ptx::to_shared(&smem->mbar[4]), dst));
-    }
-    if (warp_id == 0) {
-      ptx::mbar_wait(ptx::to_shared(&smem->mbar[4]), parity);
-      uint32_t t0 = 0, t1 = 0;
-#pragma unroll
-      for (uint32_t r = 0; r < N; ++r) {
-        const auto v = reinterpret_cast<const uint2*>(recv2[r])[lane_id];
-        t0 += v.x;
-        t1 += v.y;
-      }
-      const auto incl = warp::inclusive_sum(t0 + t1, lane_id);
-      const auto total = __shfl_sync(0xFFFFFFFF, incl, kWarpSize - 1);
-      const uint32_t above1 = smem->above_group + total - incl, above0 = above1 + t1;
-      const bool hit1 = above1 < remain && above1 + t1 >= remain;
-      const bool hit0 = above0 < remain && above0 + t0 >= remain;
-      const auto mask = __ballot_sync(0xFFFFFFFF, hit0 || hit1);
-      const auto src = mask ? __ffs(mask) - 1 : 0;
-      const auto b = __shfl_sync(0xFFFFFFFF, 2 * lane_id + (hit1 ? 1 : 0), src);
-      const auto b_above = __shfl_sync(0xFFFFFFFF, hit1 ? above1 : above0, src);
-      const auto b_count = __shfl_sync(0xFFFFFFFF, hit1 ? t1 : t0, src);
-      if (lane_id == 0) {
-        smem->sel_bin = b;
-        smem->above_total = b_above;
-        smem->eq_total = b_count;
-      }
-    } else if (warp_id <= N) {
-      ptx::mbar_wait(ptx::to_shared(&smem->mbar[4]), parity);
-    }
-    __syncthreads();
-    const uint32_t b = smem->sel_bin;
-    const uint32_t digit = smem->sel_group * kFineGroupBins + b;
-    const uint32_t above_digit = smem->above_total;  // bin members above the digit, cluster-wide
-    const uint32_t eq_digit = smem->eq_total;
-    if (warp_id < N) {
-      const auto row = recv2[warp_id];
-      const auto v = reinterpret_cast<const uint2*>(row)[lane_id];
-      uint32_t gt = (2 * lane_id > b ? v.x : 0) + (2 * lane_id + 1 > b ? v.y : 0);
-      gt = warp::reduce_sum(gt) + row[kFineGroupBins];
-      if (lane_id == 0) {
-        smem->rank_suffix[warp_id][0] = gt;
-        smem->rank_suffix[warp_id][1] = row[b];
-      }
-    }
-    __syncthreads();
-    uint32_t base_gt2, base_eq2, my_gt2, my_eq2;
-    {
-      const bool mine = lane_id < N;
-      const auto gt = mine ? smem->rank_suffix[lane_id][0] : 0u;
-      const auto eq = mine ? smem->rank_suffix[lane_id][1] : 0u;
-      const bool before = lane_id < this_rank;
-      base_gt2 = warp::reduce_sum(before ? gt : 0u);
-      base_eq2 = warp::reduce_sum(before ? eq : 0u);
-      my_gt2 = __shfl_sync(0xFFFFFFFF, gt, this_rank);
-      my_eq2 = __shfl_sync(0xFFFFFFFF, eq, this_rank);
-    }
-    if (tx == 0) smem->fine_uses += 1;  // read again only by the next item, after its first barrier
 
-    if (eq_digit > kMaxNumTie) [[unlikely]] {
-      if (this_rank == 0 && tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar[2]), 0);
-      const auto smem_0 = ptx::map_rank(smem, 0);
-      if (this_rank == 0) {
-        overflow_path<true>(problem, smem, smem, v_lo, v_hi);
-        ptx::mbar_wait(ptx::to_shared(&smem->mbar[2]), item_parity);
+    // Phase 2c: all-gather this rank's bins of the selected group, plus its count above the group.
+    if (tx < kClusterSize * kBinChunks) {
+      const uint32_t chunk = tx % kBinChunks, dst_rank = tx / kBinChunks;
+      const auto sel_group = smem->sel_group;
+      const auto v = chunk < kGroupBins / 4
+                         ? reinterpret_cast<const uint4*>(smem->histogram + sel_group * kGroupBins)[chunk]
+                         : uint4{smem->own_above_group, 0, 0, 0};
+      push_v4(smem, &smem->recv_bin[this_rank][chunk * 4], v, dst_rank, kMbarBin);
+    }
+    // Phase 2d: warp kClusterSize alone finds the threshold bin, this rank's bases and the bin
+    // edges; the other warps read them back after the barrier.
+    if (warp_id == kClusterSize) {
+      ptx::mbar_wait_shared(mbar_addr(smem, kMbarBin), parity);
+      uint32_t bin_count = 0, before = 0, mine = 0;  // bin lane_id: all ranks, ranks before this one, this rank
+#pragma unroll
+      for (uint32_t r = 0; r < kClusterSize; ++r) {
+        const auto v = smem->recv_bin[r][lane_id];
+        bin_count += v;
+        before += r < this_rank ? v : 0u;
+        mine = r == this_rank ? v : mine;
+      }
+      const auto row_above =
+          lane_id < kClusterSize ? smem->recv_bin[lane_id][kGroupBins] : 0u;  // rank lane_id, above the group
+      const auto incl = warp::inclusive_sum(bin_count, lane_id);
+      const auto total = __shfl_sync(0xFFFFFFFF, incl, kWarpSize - 1);
+      const auto above = smem->above_group + total - incl;
+      const bool hit = above < topk && above + bin_count >= topk;
+      const auto mask = __ballot_sync(0xFFFFFFFF, hit);
+      const auto bin = mask ? __ffs(mask) - 1 : 0;
+      const auto bin_above = __shfl_sync(0xFFFFFFFF, above, bin);
+      const auto bin_eq = __shfl_sync(0xFFFFFFFF, bin_count, bin);
+      const auto base_gt = warp::reduce_sum((lane_id < this_rank ? row_above : 0u) + (lane_id > bin ? before : 0u));
+      const auto my_gt = warp::reduce_sum((lane_id == this_rank ? row_above : 0u) + (lane_id > bin ? mine : 0u));
+      const auto base_eq = __shfl_sync(0xFFFFFFFF, before, bin);
+      const auto my_eq = __shfl_sync(0xFFFFFFFF, mine, bin);
+      if (lane_id == 0) {
+        const auto [v_lo, v_hi] = bin_bounds(smem->sel_group * kGroupBins + bin);
+        smem->sel_bin = bin;
+        smem->above_total = bin_above;
+        smem->eq_total = bin_eq;
+        smem->base_gt = base_gt;
+        smem->base_eq = base_eq;
+        smem->my_gt = my_gt;
+        smem->my_eq = my_eq;
+        smem->v_lo = v_lo;
+        smem->v_hi = v_hi;
+      }
+    }
+    __syncthreads();
+    const uint32_t above_total = smem->above_total;
+    const uint32_t eq_total = smem->eq_total;
+    // Rank 0's coarse histogram is dead (pushed, consumed): it becomes the tie select's digit histogram.
+    if (this_rank == 0) init_histogram(smem->histogram, tx);
+    // CTA-uniform: let them live in uniform registers through the collect loop.
+    const uint32_t base_gt = broadcast(smem->base_gt);
+    const uint32_t base_eq = broadcast(smem->base_eq);
+    const uint32_t my_gt = broadcast(smem->my_gt);
+    const uint32_t my_eq = broadcast(smem->my_eq);
+    const float v_lo = smem->v_lo, v_hi = smem->v_hi;
+
+    // Cold path (exact modes): the bin overflows the tie buffer.
+    if (kExact && eq_total > kMaxNumTie) [[unlikely]] {
+      // The cold path re-derives everything else from shared memory.
+      if (tx == 0) smem->cold_parity = parity;
+      __syncthreads();
+      if constexpr (kInlineCold) {
+        cold_path(problem, smem);
       } else {
-        overflow_path<false>(problem, smem, smem_0, v_lo, v_hi);
+        cold_path_noinline(problem, smem);
       }
       return;
     }
 
-    // Pass 2: members above the digit -> output; the digit's members -> rank 0.
+    // Phase 3: collect. Above -> output at base_gt; ties -> rank 0's tie buffer at base_eq.
+    // The collected counts equal the histogram's (bin_bounds), except that a NaN
+    // score is counted but never collected, so no store needs a bound; mode 0 only
+    // truncates the tie buffer at kMaxNumTie (in rank order). NaN holes are filled below.
+    const auto v_hi_u = broadcast(v_hi), v_lo_u = broadcast(v_lo);
+    const uint32_t tie_cap = broadcast(min(my_eq, base_eq < kMaxNumTie ? kMaxNumTie - base_eq : 0u));
+    const uint32_t tie_total = min(eq_total, kMaxNumTie);
     if (this_rank == 0) {
-      init_histogram(smem->histogram, tx);  // recv2 consumed; tie_select's digit histogram
-      if (tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar[2]), (eq_digit - my_eq2) * sizeof(TieValue));
-    }
-    const uint32_t out_base = above_total + base_gt2;
-    const uint32_t tie_dst = ptx::map_rank(ptx::to_shared(&smem->tie_values[base_eq2]), 0);
-    const uint32_t tie_bar = ptx::map_rank(ptx::to_shared(&smem->mbar[2]), 0);
-    const auto pass2 = [&](float val, uint32_t idx) {
-      if (!(val >= v_lo && !(val >= v_hi))) return;
-      const auto d = (extract_tie_key(val) - key_lo) >> shift;
-      if (d > digit) {
-        const auto pos = atomicAdd(&smem->local_start_gt, 1);
-        if (pos < my_gt2) problem.emit(out_base + pos, idx);
-      } else if (d == digit) {
-        const auto pos = atomicAdd(&smem->count_eq, 1);
-        if (pos < my_eq2) {
-          if (this_rank == 0) {
+      if (tx == 0) ptx::mbar_arrive_expect_tx(mbar_addr(smem, kMbarTies), (tie_total - tie_cap) * sizeof(TieValue));
+      collect_scan(problem, v_lo_u, [&](float val, uint32_t idx) {
+        if (val >= v_hi_u) {
+          const auto pos = atomicAdd(&smem->count_gt, 1);
+          problem.emit(pos, idx);
+        } else if (val >= v_lo_u) {
+          const auto pos = atomicAdd(&smem->count_eq, 1);
+          if (kExact || pos < tie_cap) [[likely]] {
             smem->tie_values[pos] = {val, idx};
-          } else {
+          }
+        }
+      });
+    } else {
+      const uint32_t tie_dst = broadcast(ptx::map_rank(ptx::to_shared(&smem->tie_values[base_eq]), 0));
+      const uint32_t tie_bar = broadcast(ptx::map_rank(mbar_addr(smem, kMbarTies), 0));
+      auto out = problem;
+      out.out += base_gt;
+      collect_scan(problem, v_lo_u, [&](float val, uint32_t idx) {
+        if (val >= v_hi_u) {
+          const auto pos = atomicAdd(&smem->count_gt, 1);
+          out.emit(pos, idx);
+        } else if (val >= v_lo_u) {
+          const auto pos = atomicAdd(&smem->count_eq, 1);
+          if (kExact || pos < tie_cap) [[likely]] {
             ptx::st_async_v2(tie_dst + pos * sizeof(TieValue), __float_as_uint(val), idx, tie_bar);
           }
         }
-      }
-    };
-    // C8: rescan only the members pass 1 staged, unless they overflowed the stage.
-    if (const auto members = smem->member_count; members <= kMaxNumTie) {
-      for (uint32_t t = tx; t < members; t += kBlockSize) {
-        const auto m = smem->members[t];
-        pass2(m.value, m.idx);
-      }
-    } else {
-      for_each_input<N>(problem.in, problem.seq_len, pass2);
+      });
     }
     __syncthreads();
-    if (this_rank == 0) {
-      if (tx < kWarpSize) ptx::mbar_wait(ptx::to_shared(&smem->mbar[2]), item_parity);
-      __syncthreads();
-      const auto base = above_total + above_digit;
-      const auto need = remain - above_digit;
-      if (eq_digit <= kWarpSize * 4 || eq_digit <= need) {
-        handle_tie(smem->tie_values, problem, base, eq_digit, need, &smem->tie_handle);
-      } else {
-        tie_select(problem, smem, base, eq_digit, need, key_lo + (digit << shift), shift);
-      }
-    }
-  }
-
-  /// Every cold case (the threshold bin holds more than kMaxNumTie members). Takes
-  /// only the problem: the state is re-read from shared memory, so a call to it
-  /// (cold_path_noinline) keeps few registers live across the hot path.
-  SGL_DEVICE static void cold_path(const TopKProblem problem, Smem* smem) {
-    const uint32_t parity = smem->cold_parity;
-    const uint32_t this_rank = blockIdx.y;
-    const float v_lo = smem->v_lo, v_hi = smem->v_hi;
-    const uint32_t base_gt = smem->base_gt, my_gt = smem->my_gt;
-    const auto above_total = smem->above_total;
-    __syncthreads();  // everyone has read the 2d results before the fine path reuses them
-    fine_path(problem, smem, this_rank, v_lo, v_hi, above_total, base_gt, my_gt, parity);
-  }
-  __device__ __noinline__ static void cold_path_noinline(const TopKProblem problem, Smem* smem) {
-    cold_path(problem, smem);
-  }
-
-  /// Rank 0: exact select of `remain` of the `n` staged ties (n > remain, n <= kMaxNumTie).
-  /// One 11-bit digit of the key relative to key(v_lo) over the zeroed histogram;
-  /// elements above the k-th digit are emitted, the k-th digit's members are ranked
-  /// by (value desc, idx asc) in one warp when they are at most 32, else
-  /// compacted and handed to the generic handle_tie.
-  SGL_DEVICE static void tie_select(
-      const TopKProblem& problem,
-      Smem* smem,
-      uint32_t base,
-      uint32_t n,
-      uint32_t remain,
-      uint32_t key_lo,
-      uint32_t num_bits) {
-    const auto tx = threadIdx.x;
-    const auto lane_id = tx % kWarpSize;
-    const auto warp_id = broadcast(tx / kWarpSize);
-    const uint32_t shift = num_bits > kHistBits ? num_bits - kHistBits : 0;
-    TieValue tie[kTieItems];
-    uint32_t digit[kTieItems];
-#pragma unroll
-    for (uint32_t i = 0; i < kTieItems; ++i) {
-      const auto t = tx + i * kBlockSize;
-      tie[i] = t < n ? smem->tie_values[t] : TieValue::invalid();
-      const auto key = extract_tie_key(tie[i].value);
-      // Filler ties (NaN rows) sit below key_lo: put them in digit 0.
-      digit[i] = min((key >= key_lo ? key - key_lo : 0u) >> shift, kHistSize - 1);
-      if (t < n) atomicAdd(&smem->histogram[digit[i]], 1);
-    }
-    __syncthreads();
-    // The digit holding the remain-th largest tie (same scan as find_threshold, from the top).
     {
-      AlignedVector<uint32_t, kHistItems> h;
-      h.load(smem->histogram, tx);
-      uint32_t local = 0;
-#pragma unroll
-      for (uint32_t i = 0; i < kHistItems; ++i) {
-        local += h[i];
-      }
-      const auto warp_inc = warp::inclusive_sum(local, lane_id);
-      if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
-      __syncthreads();
-      const auto ws = smem->warp_sum[lane_id];
-      uint32_t prefix = warp::reduce_sum(lane_id < warp_id ? ws : 0) + warp_inc - local;  // ties in lower digits
-#pragma unroll
-      for (uint32_t i = 0; i < kHistItems; ++i) {
-        prefix += h[i];
-        const auto above = n - prefix;
-        if (above < remain && above + h[i] >= remain) smem->tie_digit = {tx * kHistItems + i, above, h[i]};
-      }
-      __syncthreads();
-    }
-    const auto [sel, above, count] = smem->tie_digit;
-    const auto need = remain - above;
-#pragma unroll
-    for (uint32_t i = 0; i < kTieItems; ++i) {
-      if (tx + i * kBlockSize >= n) continue;
-      if (digit[i] > sel) {
-        problem.emit(base + atomicAdd(&smem->tie_ctr_gt, 1), tie[i].idx);
-      } else if (digit[i] == sel) {
-        const auto pos = atomicAdd(&smem->tie_ctr_eq, 1);
-        if (need == count) {
-          problem.emit(base + above + pos, tie[i].idx);
-        } else if (count <= kWarpSize) {
-          smem->tie_stage[pos] = tie[i];
-        } else {
-          smem->tie_values[pos] = tie[i];  // compacted in place: every tie was read before the scan
+      // The counts promise holes only for NaN scores; fill them with legal entries.
+      const auto got_gt = smem->count_gt, got_eq = smem->count_eq;
+      if (got_gt < my_gt) [[unlikely]] {
+        for (uint32_t t = got_gt + tx; t < my_gt; t += kBlockSize) {
+          problem.emit(base_gt + t, base_gt + t);  // a slot index is < topk < seq_len
         }
       }
-    }
-    if (need == count) return;
-    __syncthreads();
-    if (count > kWarpSize) [[unlikely]] {
-      return handle_tie(smem->tie_values, problem, base + above, count, need, &smem->tie_handle);
-    }
-    if (warp_id == 0) {
-      const auto mine = lane_id < count ? smem->tie_stage[lane_id] : TieValue::invalid();
-      uint32_t rank = 0;
-      for (uint32_t j = 0; j < count; ++j) {
-        const auto other = smem->tie_stage[j];
-        rank += (other.value > mine.value) || (other.value == mine.value && other.idx < mine.idx);
+      if (got_eq < tie_cap) [[unlikely]] {
+        for (uint32_t t = got_eq + tx; t < tie_cap; t += kBlockSize) {
+          const auto v = TieValue{-infinity_value(), base_eq + t};
+          if (this_rank == 0) {
+            smem->tie_values[t] = v;
+          } else {
+            ptx::st_async_v2(
+                ptx::map_rank(ptx::to_shared(&smem->tie_values[base_eq + t]), 0),
+                __float_as_uint(v.value),
+                v.idx,
+                ptx::map_rank(mbar_addr(smem, kMbarTies), 0));
+          }
+        }
+        __syncthreads();
       }
-      if (lane_id < count && rank < need) problem.emit(base + above + rank, mine.idx);
+    }
+    {
+      if (this_rank != 0) return;
+      // Rank 0's tie stage runs on the warps it uses (one per tie, or one per target for at
+      // most a warp of ties); the rest leave now.
+      const auto remain_topk = above_total < topk ? topk - above_total : 0;
+      // Slots to fill: every tie, or every remaining slot when the ties fit (holes only with NaN).
+      const auto tie_slots = tie_total <= remain_topk ? remain_topk : tie_total;
+      const bool by_target = tie_total <= kWarpSize && tie_total > remain_topk;
+      const uint32_t tie_warps = max(by_target ? tie_total : (tie_slots + kWarpSize - 1) / kWarpSize, 1u);
+      if (tx >= min(tie_warps, kNumWarps) * kWarpSize) return;
+      if (tx < kWarpSize) ptx::mbar_wait_shared(mbar_addr(smem, kMbarTies), parity);
+      ptx::bar_sync<1>(min(tie_warps, kNumWarps) * kWarpSize);
+      if (tie_total <= kWarpSize || tie_total <= remain_topk) {
+        handle_tie(smem->tie_values, problem, above_total, tie_total, remain_topk, &smem->tie_handle);
+      } else {
+        tie_select_digits(problem, smem, above_total, tie_total, remain_topk, key_low(v_lo), key_bits(v_lo, v_hi));
+      }
     }
   }
 
+  static constexpr uint32_t kTieDigitBits = 6;
   /// Rank 0: exact select of `remain` of the `n` staged ties (remain < n <= kMaxNumTie),
   /// on the warps holding a tie. Rounds of kTieDigitBits-bit digits of the key relative to key(v_lo) (mode 2:
   /// followed by the inverted index, so equal values are cut at the smallest indices) narrow
@@ -1990,7 +1743,6 @@ struct TopKCluster : TopKRadixBase<11> {
   /// over the zeroed histogram, warp 0 finds the digit, and the members above it are emitted.
   /// The final digit's members are emitted whole, cut (an all-equal digit, mode 1), or ranked
   /// all-pairs by warp 0 when at most a warp of them is left.
-  static constexpr uint32_t kTieDigitBits = 6;
   SGL_DEVICE static void tie_select_digits(
       const TopKProblem& problem,
       Smem* smem,
@@ -2097,307 +1849,534 @@ struct TopKCluster : TopKRadixBase<11> {
     if (lane_id < count && rank < need) problem.emit(base + done + rank, mine.idx);
   }
 
-  /// Selects the top-k of `problem` across the cluster, cold rows included.
-  /// `item`: 0 for the first problem this CTA runs (initializes the mbarriers), +1 per later one.
-  /// kInlineCold: inline the cold path instead of calling it. A call makes ptxas keep per-item
-  /// state on the stack in a 32-register kernel (the persistent pool); inlining it makes the
-  /// small-batch kernel, which also holds the one-block paths, spill to shared memory.
-  template <bool kUsePDL, bool kInlineCold = false>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem, const uint32_t item = 0) {
+  // Cold paths (exact modes): the threshold bin holds more than kMaxNumTie members.
+
+  /// Every cold case (the threshold bin holds more than kMaxNumTie members). Takes
+  /// only the problem: the state is re-read from shared memory, so a call to it
+  /// (cold_path_noinline) keeps few registers live across the hot path.
+  SGL_DEVICE static void cold_path(const TopKProblem problem, Smem* smem) {
+    const uint32_t parity = smem->cold_parity;
+    const uint32_t this_rank = blockIdx.y;
+    const float v_lo = smem->v_lo, v_hi = smem->v_hi;
+    const uint32_t base_gt = smem->base_gt, my_gt = smem->my_gt;
+    const auto above_total = smem->above_total;
+    __syncthreads();  // everyone has read the 2d results before the fine path reuses them
+    fine_path(problem, smem, this_rank, v_lo, v_hi, above_total, base_gt, my_gt, parity);
+  }
+  __device__ __noinline__ static void cold_path_noinline(const TopKProblem problem, Smem* smem) {
+    cold_path(problem, smem);
+  }
+
+  /// Cold path for a threshold bin with more than kMaxNumTie members (not an edge
+  /// bin). The above elements are exact and emitted as on the normal path;
+  /// the same pass builds a 4096-bin histogram of the bin's members over 12-bit
+  /// digits of key - key(v_lo), which is all-gathered like the coarse one (64 group
+  /// sums, then the selected group's 64 bins), so every rank finds the k-th digit
+  /// and its bases itself. A second pass emits the members above that digit and
+  /// st.asyncs the digit's members to rank 0, which resolves them. If the digit
+  /// still holds more than kMaxNumTie members (runs of near-equal keys), the
+  /// barrier-based refine (refine_cluster) takes over.
+  SGL_DEVICE static void fine_path(
+      const TopKProblem& problem,
+      Smem* smem,
+      const uint32_t this_rank,
+      const float v_lo,
+      const float v_hi,
+      const uint32_t above_total,
+      const uint32_t base_gt,
+      const uint32_t my_gt,
+      const uint32_t item_parity) {
+    constexpr uint32_t kFineGroups = 64;
+    constexpr uint32_t kFineGroupBins = kRefineSize / kFineGroups;  // 64
+    constexpr uint32_t kFineRow = kFineGroupBins + 4;
+    constexpr uint32_t kLanesPerFineGroup = kFineGroupBins / kRefineItems;
+    static_assert(kFineGroups <= kGroups && sizeof(uint32_t) * kClusterSize * kFineRow <= sizeof(uint32_t) * kHistSize);
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
-    const auto smem = static_cast<Smem*>(_smem);
-    const uint32_t this_rank = blockIdx.y;
-    const uint32_t parity = item & 1;
+    const auto warp_id = broadcast(tx / kWarpSize);
     const auto topk = problem.topk;
+    const uint32_t key_lo = key_low(v_lo);
+    const uint32_t num_bits = key_bits(v_lo, v_hi);
+    const uint32_t shift = num_bits > kRefineBits ? num_bits - kRefineBits : 0;
+    const uint32_t remain = topk - above_total;  // 0 < remain < members of the bin
+    const uint32_t parity = smem->fine_uses & 1;
+    const auto recv_fine_bin = reinterpret_cast<uint32_t (*)[kFineRow]>(smem->histogram);
 
-    init_histogram(smem->histogram, tx);
+    zero_refine_hist(smem);
     if (tx == 0) {
-      smem->count_eq = 0;
-      smem->count_gt = 0;
-      smem->tie_ctr_gt = 0;
-      smem->tie_ctr_eq = 0;
-      if (item == 0) {
-#pragma unroll
-        for (uint32_t i = 0; i < 5; ++i) {
-          ptx::mbar_init(&smem->mbar[i], 1);
-        }
-        ptx::fence_mbar_init();
-        smem->fine_uses = 0;
-      }
+      smem->fine_count_gt = 0;
+      smem->member_count = 0;
     }
     __syncthreads();
-    // bar-0: every rank's mbarriers are initialized (and the previous item's
-    // receive buffers consumed) before any rank pushes into them.
-    ptx::barrier_cluster_arrive_release();
-    PDLWaitPrimary<kUsePDL>();
-    // C8 waits for bar-0 before the scan: its acquire invalidates L1, and after the scan it
-    // would drop the score lines the collect pass re-reads.
-    if constexpr (kKeepL1) ptx::barrier_cluster_wait();
-
-    // Phase 1: histogram over this rank's interleaved chunks.
-    // Bin -0.0 as +0.0 (x + 0 under round-to-nearest), as fp32 compares see it.
-    const auto count = [&](uint32_t bin) { atomicAdd(&smem->histogram[bin], 1); };
-    for_each_vec(
-        problem.in,
-        problem.seq_len,
-        [&](const vec_t& v, uint32_t) {
-          const auto [b0, b1] = coarse_bins2(v[0], v[1]);
-          const auto [b2, b3] = coarse_bins2(v[2], v[3]);
-          count(b0);
-          count(b1);
-          count(b2);
-          count(b3);
-        },
-        [&](float val, uint32_t) { count(extract_coarse_bin<kHistBits>(__fadd_rn(val, 0.0f))); });
+    // Pass 1: above as on the normal path; members into the fine histogram.
+    for_each_input<kClusterSize>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if (val >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < my_gt) [[likely]] {
+          problem.emit(base_gt + pos, idx);
+        }
+      } else if (val >= v_lo) {
+        atomicAdd(&smem->refine_hist[(extract_tie_key(val) - key_lo) >> shift], 1);
+        if (const auto pos = atomicAdd(&smem->member_count, 1); pos < kMaxNumTie) smem->members[pos] = {val, idx};
+      }
+    });
     __syncthreads();
-
-    // Phase 2a: group sums (32 bins per group), all-gathered.
-    AlignedVector<uint32_t, kHistItems> my_bins;
-    my_bins.load(smem->histogram, tx);
+    if (const auto got_gt = smem->count_gt; got_gt < my_gt) {
+      for (uint32_t t = got_gt + tx; t < my_gt; t += kBlockSize) {
+        problem.emit(base_gt + t, base_gt + t);
+      }
+    }
+    // F1: group sums, all-gathered.
     {
-      constexpr uint32_t kLanesPerGroup = kGroupBins / kHistItems;
+      AlignedVector<uint32_t, kRefineItems> v;
+      v.load(smem->refine_hist, tx);
       uint32_t sum = 0;
 #pragma unroll
-      for (uint32_t i = 0; i < kHistItems; ++i) {
-        sum += my_bins[i];
+      for (uint32_t i = 0; i < kRefineItems; ++i) {
+        sum += v[i];
       }
-      sum = warp::reduce_sum<kLanesPerGroup>(sum);
-      if (tx % kLanesPerGroup == 0) smem->group_local[tx / kLanesPerGroup] = sum;
+      sum = warp::reduce_sum<kLanesPerFineGroup>(sum);
+      if (tx % kLanesPerFineGroup == 0) smem->group_local[tx / kLanesPerFineGroup] = sum;
     }
-    if (tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar[0]), N * kGroups * sizeof(uint32_t));
+    if (tx == 0)
+      ptx::mbar_arrive_expect_tx(mbar_addr(smem, kMbarFineGroup), kClusterSize * kFineGroups * sizeof(uint32_t));
     __syncthreads();
-    if constexpr (!kKeepL1) ptx::barrier_cluster_wait();  // bar-0 wait
-    if (tx < N * kGroupChunks) {
-      const uint32_t c = tx % kGroupChunks, dst = tx / kGroupChunks;
+    if (tx < kClusterSize * (kFineGroups / 4)) {
+      const uint32_t chunk = tx % (kFineGroups / 4), dst_rank = tx / (kFineGroups / 4);
       // Raw uint4 / uint2 views of the DSMEM rows: AlignedVector adds instructions here.
-      const auto v = reinterpret_cast<const uint4*>(smem->group_local)[c];
-      ptx::st_async_v4(
-          ptx::map_rank(ptx::to_shared(&smem->recv_group[this_rank][c * 4]), dst),
-          v,
-          ptx::map_rank(ptx::to_shared(&smem->mbar[0]), dst));
+      const auto v = reinterpret_cast<const uint4*>(smem->group_local)[chunk];
+      push_v4(smem, &smem->recv_group[this_rank][chunk * 4], v, dst_rank, kMbarFineGroup);
     }
-    // Only the warps that read a received buffer poll its mbarrier; the rest go
-    // on to the next CTA barrier (no spinning next to a co-resident CTA).
-
-    // Phase 2b: warp 0 finds the group holding the k-th element and this rank's
-    // count above that group.
-    const auto warp_id = broadcast(tx / kWarpSize);
     if (warp_id == 0) {
-      if constexpr (kKeepL1) {
-        ptx::mbar_wait_shared(ptx::to_shared(&smem->mbar[0]), parity);
-      } else {
-        ptx::mbar_wait(ptx::to_shared(&smem->mbar[0]), parity);
-      }
-      uint32_t t[kGroups / 32];
+      ptx::mbar_wait(mbar_addr(smem, kMbarFineGroup), parity);
+      uint32_t sum_even = 0, sum_odd = 0;
 #pragma unroll
-      for (uint32_t i = 0; i < kGroups / 32; ++i) {
-        t[i] = 0;
+      for (uint32_t r = 0; r < kClusterSize; ++r) {
+        const auto v = reinterpret_cast<const uint2*>(smem->recv_group[r])[lane_id];
+        sum_even += v.x;
+        sum_odd += v.y;
       }
-#pragma unroll
-      for (uint32_t r = 0; r < N; ++r) {
-        if constexpr (kGroups == 32) {
-          t[0] += smem->recv_group[r][lane_id];
-        } else {
-          const auto v = reinterpret_cast<const uint2*>(smem->recv_group[r])[lane_id];
-          t[0] += v.x;
-          t[1] += v.y;
-        }
-      }
-      uint32_t lane_sum = 0;
-#pragma unroll
-      for (uint32_t i = 0; i < kGroups / 32; ++i) {
-        lane_sum += t[i];
-      }
-      const auto incl = warp::inclusive_sum(lane_sum, lane_id);
+      const auto incl = warp::inclusive_sum(sum_even + sum_odd, lane_id);
       const auto total = __shfl_sync(0xFFFFFFFF, incl, kWarpSize - 1);
-      uint32_t above = total - incl;  // groups of higher lanes
-      uint32_t hit = 0, hit_above = 0;
-#pragma unroll
-      for (int i = kGroups / 32 - 1; i >= 0; --i) {
-        if (above < topk && above + t[i] >= topk) {
-          hit = i + 1;
-          hit_above = above;
-        }
-        above += t[i];
-      }
-      const auto mask = __ballot_sync(0xFFFFFFFF, hit != 0);
+      const uint32_t above_odd = total - incl, above_even = above_odd + sum_odd;
+      const bool hit_odd = above_odd < remain && above_odd + sum_odd >= remain;
+      const bool hit_even = above_even < remain && above_even + sum_even >= remain;
+      const auto mask = __ballot_sync(0xFFFFFFFF, hit_even || hit_odd);
       const auto src = mask ? __ffs(mask) - 1 : 0;
-      auto g = __shfl_sync(0xFFFFFFFF, lane_id * (kGroups / 32) + hit - 1, src);
-      auto g_above = __shfl_sync(0xFFFFFFFF, hit_above, src);
-      if (mask == 0) {  // only with NaN-polluted counts
-        g = 0;
-        g_above = 0;
-      }
-      // This rank's elements in groups above g.
-      uint32_t own = 0;
-#pragma unroll
-      for (uint32_t i = 0; i < kGroups / 32; ++i) {
-        const auto grp = lane_id * (kGroups / 32) + i;
-        own += grp > g ? smem->group_local[grp] : 0;
-      }
+      const auto group = __shfl_sync(0xFFFFFFFF, 2 * lane_id + (hit_odd ? 1 : 0), src);
+      const auto group_above = __shfl_sync(0xFFFFFFFF, hit_odd ? above_odd : above_even, src);
+      uint32_t own = (2 * lane_id > group ? smem->group_local[2 * lane_id] : 0) +
+                     (2 * lane_id + 1 > group ? smem->group_local[2 * lane_id + 1] : 0);
       own = warp::reduce_sum(own);
       if (lane_id == 0) {
-        smem->sel_group = g;
-        smem->above_group = g_above;
+        smem->sel_group = group;
+        smem->above_group = group_above;
         smem->own_above_group = own;
       }
     }
-    if (tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar[1]), N * kBinRow * sizeof(uint32_t));
+    if (tx == 0) ptx::mbar_arrive_expect_tx(mbar_addr(smem, kMbarFineBin), kClusterSize * kFineRow * sizeof(uint32_t));
     __syncthreads();
-
-    // Phase 2c: all-gather this rank's bins of the selected group, plus its count above the group.
-    if (tx < N * kBinChunks) {
-      const uint32_t c = tx % kBinChunks, dst = tx / kBinChunks;
-      const auto sel_group = smem->sel_group;
-      const auto v = c < kGroupBins / 4 ? reinterpret_cast<const uint4*>(smem->histogram + sel_group * kGroupBins)[c]
-                                        : uint4{smem->own_above_group, 0, 0, 0};
-      ptx::st_async_v4(
-          ptx::map_rank(ptx::to_shared(&smem->recv_bin[this_rank][c * 4]), dst),
-          v,
-          ptx::map_rank(ptx::to_shared(&smem->mbar[1]), dst));
+    // F2: the selected group's 64 bins plus the count above the group.
+    if (tx < kClusterSize * (kFineRow / 4)) {
+      const uint32_t chunk = tx % (kFineRow / 4), dst_rank = tx / (kFineRow / 4);
+      const auto group = smem->sel_group;
+      const auto v = chunk < kFineGroupBins / 4
+                         ? reinterpret_cast<const uint4*>(smem->refine_hist + group * kFineGroupBins)[chunk]
+                         : uint4{smem->own_above_group, 0, 0, 0};
+      push_v4(smem, &recv_fine_bin[this_rank][chunk * 4], v, dst_rank, kMbarFineBin);
     }
-    // Phase 2d: warp N alone finds the threshold bin, this rank's bases and the bin edges;
-    // the other warps read them back after the barrier.
-    if (warp_id == N) {
-      ptx::mbar_wait_shared(ptx::to_shared(&smem->mbar[1]), parity);
-      uint32_t tb = 0, before = 0, mine = 0;  // bin lane_id: all ranks, ranks before this one, this rank
+    if (warp_id == 0) {
+      ptx::mbar_wait(mbar_addr(smem, kMbarFineBin), parity);
+      uint32_t sum_even = 0, sum_odd = 0;
 #pragma unroll
-      for (uint32_t r = 0; r < N; ++r) {
-        const auto v = smem->recv_bin[r][lane_id];
-        tb += v;
-        before += r < this_rank ? v : 0u;
-        mine = r == this_rank ? v : mine;
+      for (uint32_t r = 0; r < kClusterSize; ++r) {
+        const auto v = reinterpret_cast<const uint2*>(recv_fine_bin[r])[lane_id];
+        sum_even += v.x;
+        sum_odd += v.y;
       }
-      const auto row_above = lane_id < N ? smem->recv_bin[lane_id][kGroupBins] : 0u;  // rank lane_id, above the group
-      const auto incl = warp::inclusive_sum(tb, lane_id);
+      const auto incl = warp::inclusive_sum(sum_even + sum_odd, lane_id);
       const auto total = __shfl_sync(0xFFFFFFFF, incl, kWarpSize - 1);
-      const auto above = smem->above_group + total - incl;
-      const bool hit = above < topk && above + tb >= topk;
-      const auto mask = __ballot_sync(0xFFFFFFFF, hit);
-      const auto b = mask ? __ffs(mask) - 1 : 0;
-      const auto above_b = __shfl_sync(0xFFFFFFFF, above, b);
-      const auto eq_b = __shfl_sync(0xFFFFFFFF, tb, b);
-      const auto base_gt = warp::reduce_sum((lane_id < this_rank ? row_above : 0u) + (lane_id > b ? before : 0u));
-      const auto my_gt = warp::reduce_sum((lane_id == this_rank ? row_above : 0u) + (lane_id > b ? mine : 0u));
-      const auto base_eq = __shfl_sync(0xFFFFFFFF, before, b);
-      const auto my_eq = __shfl_sync(0xFFFFFFFF, mine, b);
+      const uint32_t above_odd = smem->above_group + total - incl, above_even = above_odd + sum_odd;
+      const bool hit_odd = above_odd < remain && above_odd + sum_odd >= remain;
+      const bool hit_even = above_even < remain && above_even + sum_even >= remain;
+      const auto mask = __ballot_sync(0xFFFFFFFF, hit_even || hit_odd);
+      const auto src = mask ? __ffs(mask) - 1 : 0;
+      const auto bin = __shfl_sync(0xFFFFFFFF, 2 * lane_id + (hit_odd ? 1 : 0), src);
+      const auto bin_above = __shfl_sync(0xFFFFFFFF, hit_odd ? above_odd : above_even, src);
+      const auto bin_count = __shfl_sync(0xFFFFFFFF, hit_odd ? sum_odd : sum_even, src);
       if (lane_id == 0) {
-        const auto [v_lo, v_hi] = bin_bounds(smem->sel_group * kGroupBins + b);
-        smem->sel_bin = b;
-        smem->above_total = above_b;
-        smem->eq_total = eq_b;
-        smem->base_gt = base_gt;
-        smem->base_eq = base_eq;
-        smem->my_gt = my_gt;
-        smem->my_eq = my_eq;
-        smem->v_lo = v_lo;
-        smem->v_hi = v_hi;
+        smem->sel_bin = bin;
+        smem->above_total = bin_above;
+        smem->eq_total = bin_count;
+      }
+    } else if (warp_id <= kClusterSize) {
+      ptx::mbar_wait(mbar_addr(smem, kMbarFineBin), parity);
+    }
+    __syncthreads();
+    const uint32_t bin = smem->sel_bin;
+    const uint32_t digit = smem->sel_group * kFineGroupBins + bin;
+    const uint32_t above_digit = smem->above_total;  // bin members above the digit, cluster-wide
+    const uint32_t eq_digit = smem->eq_total;
+    if (warp_id < kClusterSize) {
+      const auto row = recv_fine_bin[warp_id];
+      const auto v = reinterpret_cast<const uint2*>(row)[lane_id];
+      uint32_t gt = (2 * lane_id > bin ? v.x : 0) + (2 * lane_id + 1 > bin ? v.y : 0);
+      gt = warp::reduce_sum(gt) + row[kFineGroupBins];
+      if (lane_id == 0) {
+        smem->rank_suffix[warp_id][0] = gt;
+        smem->rank_suffix[warp_id][1] = row[bin];
       }
     }
     __syncthreads();
-    const uint32_t above_total = smem->above_total;
-    const uint32_t eq_total = smem->eq_total;
-    // Rank 0's coarse histogram is dead (pushed, consumed): it becomes the tie select's digit histogram.
-    if (this_rank == 0) init_histogram(smem->histogram, tx);
-    // CTA-uniform: let them live in uniform registers through the collect loop.
-    const uint32_t base_gt = broadcast(smem->base_gt);
-    const uint32_t base_eq = broadcast(smem->base_eq);
-    const uint32_t my_gt = broadcast(smem->my_gt);
-    const uint32_t my_eq = broadcast(smem->my_eq);
-    const float v_lo = smem->v_lo, v_hi = smem->v_hi;
+    uint32_t digit_base_gt, digit_base_eq, digit_my_gt, digit_my_eq;
+    {
+      const bool mine = lane_id < kClusterSize;
+      const auto gt = mine ? smem->rank_suffix[lane_id][0] : 0u;
+      const auto eq = mine ? smem->rank_suffix[lane_id][1] : 0u;
+      const bool before = lane_id < this_rank;
+      digit_base_gt = warp::reduce_sum(before ? gt : 0u);
+      digit_base_eq = warp::reduce_sum(before ? eq : 0u);
+      digit_my_gt = __shfl_sync(0xFFFFFFFF, gt, this_rank);
+      digit_my_eq = __shfl_sync(0xFFFFFFFF, eq, this_rank);
+    }
+    if (tx == 0) smem->fine_uses += 1;  // read again only by the next item, after its first barrier
 
-    // Cold path (exact modes): the bin overflows the tie buffer.
-    if (kExact && eq_total > kMaxNumTie) [[unlikely]] {
-      // The cold path re-derives everything else from shared memory.
-      if (tx == 0) smem->cold_parity = parity;
-      __syncthreads();
-      if constexpr (kInlineCold) {
-        cold_path(problem, smem);
+    if (eq_digit > kMaxNumTie) [[unlikely]] {
+      if (this_rank == 0 && tx == 0) ptx::mbar_arrive_expect_tx(mbar_addr(smem, kMbarTies), 0);
+      const auto smem_0 = ptx::map_rank(smem, 0);
+      if (this_rank == 0) {
+        refine_cluster<true>(problem, smem, smem, v_lo, v_hi);
+        ptx::mbar_wait(mbar_addr(smem, kMbarTies), item_parity);
       } else {
-        cold_path_noinline(problem, smem);
+        refine_cluster<false>(problem, smem, smem_0, v_lo, v_hi);
       }
       return;
     }
 
-    // Phase 3: collect. Above -> output at base_gt; ties -> rank 0's tie buffer at base_eq.
-    // The collected counts equal the histogram's (bin_bounds), except that a NaN
-    // score is counted but never collected, so no store needs a bound; mode 0 only
-    // truncates the tie buffer at kMaxNumTie (in rank order). NaN holes are filled below.
-    const auto v_hi_u = broadcast(v_hi), v_lo_u = broadcast(v_lo);
-    const uint32_t tie_cap = broadcast(min(my_eq, base_eq < kMaxNumTie ? kMaxNumTie - base_eq : 0u));
-    const uint32_t tie_total = min(eq_total, kMaxNumTie);
+    // Pass 2: members above the digit -> output; the digit's members -> rank 0.
     if (this_rank == 0) {
-      if (tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar[2]), (tie_total - tie_cap) * sizeof(TieValue));
-      collect_scan(problem, v_lo_u, [&](float val, uint32_t idx) {
-        if (val >= v_hi_u) {
-          const auto pos = atomicAdd(&smem->count_gt, 1);
-          problem.emit(pos, idx);
-        } else if (val >= v_lo_u) {
-          const auto pos = atomicAdd(&smem->count_eq, 1);
-          if (kExact || pos < tie_cap) [[likely]] {
+      init_histogram(smem->histogram, tx);  // recv_fine_bin consumed; tie_select_single_digit's digit histogram
+      if (tx == 0) ptx::mbar_arrive_expect_tx(mbar_addr(smem, kMbarTies), (eq_digit - digit_my_eq) * sizeof(TieValue));
+    }
+    const uint32_t out_base = above_total + digit_base_gt;
+    const uint32_t tie_dst = ptx::map_rank(ptx::to_shared(&smem->tie_values[digit_base_eq]), 0);
+    const uint32_t tie_bar = ptx::map_rank(mbar_addr(smem, kMbarTies), 0);
+    const auto pass2 = [&](float val, uint32_t idx) {
+      if (!(val >= v_lo && !(val >= v_hi))) return;
+      const auto member_digit = (extract_tie_key(val) - key_lo) >> shift;
+      if (member_digit > digit) {
+        const auto pos = atomicAdd(&smem->fine_count_gt, 1);
+        if (pos < digit_my_gt) problem.emit(out_base + pos, idx);
+      } else if (member_digit == digit) {
+        const auto pos = atomicAdd(&smem->count_eq, 1);
+        if (pos < digit_my_eq) {
+          if (this_rank == 0) {
             smem->tie_values[pos] = {val, idx};
+          } else {
+            ptx::st_async_v2(tie_dst + pos * sizeof(TieValue), __float_as_uint(val), idx, tie_bar);
           }
         }
-      });
+      }
+    };
+    // Rescan only the members pass 1 staged, unless they overflowed the stage.
+    if (const auto members = smem->member_count; members <= kMaxNumTie) {
+      for (uint32_t t = tx; t < members; t += kBlockSize) {
+        const auto m = smem->members[t];
+        pass2(m.value, m.idx);
+      }
     } else {
-      const uint32_t tie_dst = broadcast(ptx::map_rank(ptx::to_shared(&smem->tie_values[base_eq]), 0));
-      const uint32_t tie_bar = broadcast(ptx::map_rank(ptx::to_shared(&smem->mbar[2]), 0));
-      auto out = problem;
-      out.out += base_gt;
-      collect_scan(problem, v_lo_u, [&](float val, uint32_t idx) {
-        if (val >= v_hi_u) {
-          const auto pos = atomicAdd(&smem->count_gt, 1);
-          out.emit(pos, idx);
-        } else if (val >= v_lo_u) {
+      for_each_input<kClusterSize>(problem.in, problem.seq_len, pass2);
+    }
+    __syncthreads();
+    if (this_rank == 0) {
+      if (tx < kWarpSize) ptx::mbar_wait(mbar_addr(smem, kMbarTies), item_parity);
+      __syncthreads();
+      const auto base = above_total + above_digit;
+      const auto need = remain - above_digit;
+      if (eq_digit <= kWarpSize * 4 || eq_digit <= need) {
+        handle_tie(smem->tie_values, problem, base, eq_digit, need, &smem->tie_handle);
+      } else {
+        tie_select_single_digit(problem, smem, base, eq_digit, need, key_lo + (digit << shift), shift);
+      }
+    }
+  }
+
+  /// Rank 0: exact select of `remain` of the `n` staged ties (n > remain, n <= kMaxNumTie).
+  /// One 11-bit digit of the key relative to key(v_lo) over the zeroed histogram;
+  /// elements above the k-th digit are emitted, the k-th digit's members are ranked
+  /// by (value desc, idx asc) in one warp when they are at most 32, else
+  /// compacted and handed to the generic handle_tie.
+  SGL_DEVICE static void tie_select_single_digit(
+      const TopKProblem& problem,
+      Smem* smem,
+      uint32_t base,
+      uint32_t n,
+      uint32_t remain,
+      uint32_t key_lo,
+      uint32_t num_bits) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    const uint32_t shift = num_bits > kHistBits ? num_bits - kHistBits : 0;
+    TieValue tie[kTieItems];
+    uint32_t digit[kTieItems];
+#pragma unroll
+    for (uint32_t i = 0; i < kTieItems; ++i) {
+      const auto t = tx + i * kBlockSize;
+      tie[i] = t < n ? smem->tie_values[t] : TieValue::invalid();
+      const auto key = extract_tie_key(tie[i].value);
+      // Filler ties (NaN rows) sit below key_lo: put them in digit 0.
+      digit[i] = min((key >= key_lo ? key - key_lo : 0u) >> shift, kHistSize - 1);
+      if (t < n) atomicAdd(&smem->histogram[digit[i]], 1);
+    }
+    __syncthreads();
+    // The digit holding the remain-th largest tie (same scan as find_threshold, from the top).
+    {
+      AlignedVector<uint32_t, kHistItems> h;
+      h.load(smem->histogram, tx);
+      uint32_t local = 0;
+#pragma unroll
+      for (uint32_t i = 0; i < kHistItems; ++i) {
+        local += h[i];
+      }
+      const auto warp_inc = warp::inclusive_sum(local, lane_id);
+      if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+      __syncthreads();
+      const auto ws = smem->warp_sum[lane_id];
+      uint32_t prefix = warp::reduce_sum(lane_id < warp_id ? ws : 0) + warp_inc - local;  // ties in lower digits
+#pragma unroll
+      for (uint32_t i = 0; i < kHistItems; ++i) {
+        prefix += h[i];
+        const auto above = n - prefix;
+        if (above < remain && above + h[i] >= remain) smem->tie_digit = {tx * kHistItems + i, above, h[i]};
+      }
+      __syncthreads();
+    }
+    const auto [sel, above, count] = smem->tie_digit;
+    const auto need = remain - above;
+#pragma unroll
+    for (uint32_t i = 0; i < kTieItems; ++i) {
+      if (tx + i * kBlockSize >= n) continue;
+      if (digit[i] > sel) {
+        problem.emit(base + atomicAdd(&smem->tie_ctr_gt, 1), tie[i].idx);
+      } else if (digit[i] == sel) {
+        const auto pos = atomicAdd(&smem->tie_ctr_eq, 1);
+        if (need == count) {
+          problem.emit(base + above + pos, tie[i].idx);
+        } else if (count <= kWarpSize) {
+          smem->tie_stage[pos] = tie[i];
+        } else {
+          smem->tie_values[pos] = tie[i];  // compacted in place: every tie was read before the scan
+        }
+      }
+    }
+    if (need == count) return;
+    __syncthreads();
+    if (count > kWarpSize) [[unlikely]] {
+      return handle_tie(smem->tie_values, problem, base + above, count, need, &smem->tie_handle);
+    }
+    if (warp_id == 0) {
+      const auto mine = lane_id < count ? smem->tie_stage[lane_id] : TieValue::invalid();
+      uint32_t rank = 0;
+      for (uint32_t j = 0; j < count; ++j) {
+        const auto other = smem->tie_stage[j];
+        rank += (other.value > mine.value) || (other.value == mine.value && other.idx < mine.idx);
+      }
+      if (lane_id < count && rank < need) problem.emit(base + above + rank, mine.idx);
+    }
+  }
+
+  /// Refine from scratch, for an edge bin or a fine-path digit that still holds more
+  /// than kMaxNumTie members: cluster-wide radix rounds over the exact key (12-bit
+  /// digits relative to key(v_lo), round 0 fused with the collect pass, merged into
+  /// rank 0 with remote atomics), then the final bucket is staged and resolved by
+  /// rank 0's handle_tie. Self-contained: counts from the scans, rank bases from
+  /// atomics on rank 0, its own cluster barriers. kIsRank0 stays a template
+  /// parameter: as a runtime flag it changes the generated code.
+  template <bool kIsRank0>
+  SGL_DEVICE static void refine_cluster(const TopKProblem& problem, Smem* smem, Smem* smem_0, float v_lo, float v_hi) {
+    const auto tx = threadIdx.x;
+    const auto topk = problem.topk;
+    zero_refine_hist(smem);
+    if (tx == 0) {
+      smem->count_gt = 0;
+      smem->count_eq = 0;
+      smem->refine_gt = 0;
+    }
+    __syncthreads();
+    ptx::cluster_sync();  // every rank's counters and histogram are zero before any remote update
+
+    // NaN-safe: a NaN upper edge (inf bin) puts nothing above and +inf in the bin.
+    const auto is_above = [=](float val) { return val >= v_hi; };
+    const auto in_bin = [=](float val) { return val >= v_lo && !(val >= v_hi); };
+    const uint32_t key_lo = key_low(v_lo);
+    const uint32_t span = extract_exact_bin(v_hi) - key_lo;  // in-bin keys are < key_lo + span
+    const uint32_t num_bits = 32 - __clz(span - 1);
+    // Mode 2 radixes (key, smallest index first) so the final bucket is one element
+    // and the selected set is deterministic (idx < 2^20: scores are at most 1M long).
+    using Key = std::conditional_t<kDeterministic, uint64_t, uint32_t>;
+    constexpr uint32_t kIdxBits = kDeterministic ? 20 : 0;
+    const auto comp = [=](float val, uint32_t idx) -> Key {
+      const Key rel = extract_tie_key(val) - key_lo;
+      if constexpr (kDeterministic) {
+        return (rel << kIdxBits) | ((1u << kIdxBits) - 1 - idx);
+      } else {
+        return rel;
+      }
+    };
+    const uint32_t total_bits = num_bits + kIdxBits;
+    uint32_t shift = total_bits > kRefineBits ? total_bits - kRefineBits : 0;
+    const auto emit_above = [&](uint32_t idx) {
+      const auto pos = atomicAdd(&smem->count_gt, 1);
+      if constexpr (kIsRank0) {
+        if (pos < topk) [[likely]] {
+          problem.emit(pos, idx);
+        }
+      } else {
+        if (pos < topk) [[likely]] {
+          smem->stage_out_idxs[pos] = idx;
+        }
+      }
+    };
+
+    for_each_input<kClusterSize>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if (is_above(val)) {
+        emit_above(idx);
+      } else if (in_bin(val)) {
+        atomicAdd(&smem->refine_hist[static_cast<uint32_t>(comp(val, idx) >> shift)], 1);
+      }
+    });
+    Key bucket_lo = 0;
+    Key bucket_mask = (static_cast<Key>(span - 1) << kIdxBits) | ((Key(1) << kIdxBits) - 1);
+    uint32_t remain = 0;
+#pragma unroll 1
+    for (uint32_t round = 0;; ++round) {
+      __syncthreads();
+      if constexpr (!kIsRank0) {
+        AlignedVector<uint32_t, kRefineItems> counts;
+        counts.load(smem->refine_hist, tx);
+        zero_refine_hist(smem);
+#pragma unroll
+        for (uint32_t i = 0; i < kRefineItems; ++i) {
+          if (counts[i] != 0) atomicAdd(&smem_0->refine_hist[tx * kRefineItems + i], counts[i]);
+        }
+        if (round == 0 && tx == 0) atomicAdd(&smem_0->refine_gt, smem->count_gt);
+        ptx::barrier_cluster_arrive_release();  // A: histograms merged
+        ptx::barrier_cluster_wait();
+        ptx::barrier_cluster_arrive_relaxed();  // B: digit published
+        ptx::barrier_cluster_wait();
+      } else {
+        if (round == 0 && tx == 0) atomicAdd(&smem->refine_gt, smem->count_gt);
+        ptx::barrier_cluster_arrive_relaxed();  // A
+        ptx::barrier_cluster_wait();
+        __syncthreads();
+        if (round == 0) {
+          const auto gt = smem->refine_gt;
+          remain = gt < topk ? topk - gt : 0;
+          if (tx == 0) smem->refine_remain = remain;
+        }
+        if (remain != 0) refine_find_digit(smem, remain);
+        __syncthreads();
+        ptx::barrier_cluster_arrive_release();  // B: publishes refine_match / refine_remain
+        ptx::barrier_cluster_wait();
+      }
+      if (round == 0) {
+        remain = smem_0->refine_remain;
+        if (remain == 0) break;  // above elements fill every slot
+      }
+      const MatchBin match = smem_0->refine_match;
+      bucket_lo += static_cast<Key>(match.bin) << shift;
+      bucket_mask = (Key(1) << shift) - 1;
+      remain -= match.above_count;
+      if (shift == 0 || match.equal_count <= kMaxNumTie) break;
+      if constexpr (kIsRank0) __syncthreads();  // all have read refine_match before the next find rewrites it
+      shift = shift > kRefineBits ? shift - kRefineBits : 0;
+      for_each_input<kClusterSize>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        if (!in_bin(val)) return;
+        const Key d = comp(val, idx) - bucket_lo;
+        if (d <= bucket_mask) atomicAdd(&smem->refine_hist[static_cast<uint32_t>(d >> shift)], 1);
+      });
+    }
+
+    __syncthreads();  // everyone has read the histogram before tie_values overwrite it
+    if (remain != 0) {
+      for_each_input<kClusterSize>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        if (!in_bin(val)) return;
+        const Key rel = comp(val, idx);
+        if (rel < bucket_lo) return;
+        if (rel - bucket_lo > bucket_mask) {
+          emit_above(idx);
+        } else {
           const auto pos = atomicAdd(&smem->count_eq, 1);
-          if (kExact || pos < tie_cap) [[likely]] {
-            ptx::st_async_v2(tie_dst + pos * sizeof(TieValue), __float_as_uint(val), idx, tie_bar);
+          if (pos < kMaxNumTie) [[likely]] {
+            smem->tie_values[pos] = {val, idx};
           }
         }
       });
     }
     __syncthreads();
-    {
-      // The counts promise holes only for NaN scores; fill them with legal entries.
-      const auto got_gt = smem->count_gt, got_eq = smem->count_eq;
-      if (got_gt < my_gt) [[unlikely]] {
-        for (uint32_t t = got_gt + tx; t < my_gt; t += kBlockSize) {
-          problem.emit(base_gt + t, base_gt + t);  // a slot index is < topk < seq_len
+    if constexpr (!kIsRank0) {
+      const auto local_count_gt = smem->count_gt;
+      const auto local_count_eq = min(smem->count_eq, kMaxNumTie);
+      if (tx == 0) {
+        smem->local_start_gt = atomicAdd(&smem_0->count_gt, local_count_gt);
+        smem->local_start_eq = atomicAdd(&smem_0->count_eq, local_count_eq);
+      }
+      __syncthreads();
+      const auto local_start_gt = smem->local_start_gt;
+      const auto local_start_eq = smem->local_start_eq;
+#pragma unroll
+      for (uint32_t i = 0; i < kTieItems; ++i) {
+        const auto t = tx + i * kBlockSize;
+        if (t < local_count_eq && local_start_eq + t < kMaxNumTie) {
+          smem_0->tie_values[local_start_eq + t] = smem->tie_values[t];
         }
       }
-      if (got_eq < tie_cap) [[unlikely]] {
-        for (uint32_t t = got_eq + tx; t < tie_cap; t += kBlockSize) {
-          const auto v = TieValue{-infinity_value(), base_eq + t};
-          if (this_rank == 0) {
-            smem->tie_values[t] = v;
-          } else {
-            ptx::st_async_v2(
-                ptx::map_rank(ptx::to_shared(&smem->tie_values[base_eq + t]), 0),
-                __float_as_uint(v.value),
-                v.idx,
-                ptx::map_rank(ptx::to_shared(&smem->mbar[2]), 0));
-          }
+      ptx::cluster_sync();
+#pragma unroll
+      for (uint32_t i = 0; i < kTopKItems; ++i) {
+        if (const auto t = tx + i * kBlockSize; t < local_count_gt && local_start_gt + t < topk) {
+          problem.emit(local_start_gt + t, smem->stage_out_idxs[t]);
         }
-        __syncthreads();
       }
+    } else {
+      ptx::cluster_sync();
+      handle_staged_ties(problem, smem);
     }
-    {
-      if (this_rank != 0) return;
-      // Rank 0's tie stage runs on the warps it uses (one per tie, or one per target for at
-      // most a warp of ties); the rest leave now.
-      const auto remain_topk = above_total < topk ? topk - above_total : 0;
-      // Slots to fill: every tie, or every remaining slot when the ties fit (holes only with NaN).
-      const auto tie_slots = tie_total <= remain_topk ? remain_topk : tie_total;
-      const bool by_target = tie_total <= kWarpSize && tie_total > remain_topk;
-      const uint32_t tie_warps = max(by_target ? tie_total : (tie_slots + kWarpSize - 1) / kWarpSize, 1u);
-      if (tx >= min(tie_warps, kNumWarps) * kWarpSize) return;
-      if (tx < kWarpSize) ptx::mbar_wait_shared(ptx::to_shared(&smem->mbar[2]), parity);
-      ptx::bar_sync<1>(min(tie_warps, kNumWarps) * kWarpSize);
-      if (tie_total <= kWarpSize || tie_total <= remain_topk) {
-        handle_tie(smem->tie_values, problem, above_total, tie_total, remain_topk, &smem->tie_handle);
-      } else {
-        tie_select_digits(problem, smem, above_total, tie_total, remain_topk, key_low(v_lo), key_bits(v_lo, v_hi));
+  }
+
+  SGL_DEVICE static void zero_refine_hist(Smem* smem) {
+    AlignedVector<uint32_t, kRefineItems> zero;
+    zero.fill(0);
+    zero.store(smem->refine_hist, threadIdx.x);
+  }
+
+  /// Rank 0: digit search over the merged kRefineSize-bin histogram (zeroed after reading).
+  SGL_DEVICE static void refine_find_digit(Smem* smem, const uint32_t remain) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    AlignedVector<uint32_t, kRefineItems> counts;
+    counts.load(smem->refine_hist, tx);
+    zero_refine_hist(smem);
+    if (tx == 0) smem->refine_match = {0, 0, 0};  // stays if nothing matches (NaN-polluted counts)
+    uint32_t local_sum = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kRefineItems; ++i) {
+      local_sum += counts[i];
+    }
+    const auto warp_inc = warp::inclusive_sum(local_sum, lane_id);
+    if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+    __syncthreads();
+    const auto ws = smem->warp_sum[lane_id];
+    const auto total = warp::reduce_sum(ws);
+    uint32_t prefix = warp::reduce_sum(lane_id < warp_id ? ws : 0) + warp_inc - local_sum;
+#pragma unroll
+    for (uint32_t i = 0; i < kRefineItems; ++i) {
+      prefix += counts[i];
+      const auto above = total - prefix;
+      if (above < remain && above + counts[i] >= remain) {
+        smem->refine_match = {tx * kRefineItems + i, above, counts[i]};
       }
     }
   }
