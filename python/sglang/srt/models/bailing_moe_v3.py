@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.router_gate_matvec import (
     ROUTER_GATE_MATVEC_MAX_M,
     router_gate_matvec,
@@ -1625,7 +1626,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and current_arch().is_sm(9)
                             and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale
