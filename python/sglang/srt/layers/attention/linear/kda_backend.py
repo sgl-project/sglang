@@ -1102,7 +1102,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.query_start_loc.shape[0] - 1
                 ) * forward_batch.spec_info.draft_token_num
                 mixed_qkv = mixed_qkv[:logical_num_tokens]
-                a = a[:, :logical_num_tokens]
+                # A deferred f_b leaves f_a as [tokens, K], not [1, tokens, H, K].
+                if layer._k3_deferred_f_b:
+                    a = a[:logical_num_tokens]
+                else:
+                    a = a[:, :logical_num_tokens]
                 b = b[:, :logical_num_tokens]
             core_attn_out = self._forward_target_verify(
                 layer, forward_batch, mixed_qkv, a, b
@@ -1600,7 +1604,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return None
         f_b_weight, norm_weight, norm_eps, a_log = layer._k3_hip_fused_verify_args
         batch_size = mixed_qkv.shape[0] // draft_token_num
-        output_gate = layer._k3_onorm_gate.view(
+        output_gate = layer._k3_onorm_gate[: mixed_qkv.shape[0]].view(
             -1, layer.num_v_heads, layer.head_v_dim
         )
         replay_ring = (

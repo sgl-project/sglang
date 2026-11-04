@@ -836,8 +836,9 @@ def _verify_backend(state, slots: torch.Tensor, steps: int):
 def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     """The fused verify must reproduce the backend's unfused chain plus o_norm.
 
-    Covers the handoff the kernel depends on: the deferred f_a, the o_norm gate,
-    the slot/scratch index slices and the transposed conv-cache views.
+    Goes through forward_extend with MoE token padding past the verify rows, so
+    it covers the padding trim of the deferred f_a [tokens, K] and the o_norm
+    gate, the slot/scratch index slices and the transposed conv-cache views.
     """
     from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
     from sglang.srt.layers.attention.linear.kda_backend import _materialize_k3_f_b
@@ -848,6 +849,7 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     torch.manual_seed(20261104)
     batch, steps, num_slots, ring_len = 3, 5, 7, 8
     tokens = batch * steps
+    padded_tokens = tokens + 2
 
     def randn(*shape, dtype=torch.bfloat16, scale=1.0):
         return (scale * torch.randn(*shape, device=_DEVICE)).to(dtype)
@@ -873,7 +875,7 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
         layer.A_log,
     )
     # The model slices these out of one in-projection: [q,k,v,g | f_a | b | pad].
-    wide = randn(tokens, _CHANNELS + _HEADS * _DIM + _DIM + _HEADS + 4)
+    wide = randn(padded_tokens, _CHANNELS + _HEADS * _DIM + _DIM + _HEADS + 4)
     mixed_qkv, gate, f_a, beta, _ = wide.split(
         [_CHANNELS, _HEADS * _DIM, _DIM, _HEADS, 4], dim=-1
     )
@@ -922,20 +924,23 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     layer._k3_deferred_f_b = True
     layer._k3_onorm_gate = gate
     layer._k3_onorm_consumed = False
-    fused = _verify_backend(fused_state, slots, steps)._forward_target_verify(
+    fused = _verify_backend(fused_state, slots, steps).forward_extend(
         layer, forward_batch, mixed_qkv, f_a, beta
     )
     assert layer._k3_onorm_consumed
+    assert fused.shape[1] == padded_tokens
+    assert torch.count_nonzero(fused[:, tokens:]) == 0
+    fused = fused[:, :tokens]
 
     ref_state = clone_state()
     layer._k3_deferred_f_b = False
     layer._k3_onorm_gate = None
-    unfused = _verify_backend(ref_state, slots, steps)._forward_target_verify(
+    unfused = _verify_backend(ref_state, slots, steps).forward_extend(
         layer, forward_batch, mixed_qkv, _materialize_k3_f_b(layer, f_a), beta
-    )
+    )[:, :tokens]
     unfused = rms_norm_gated(
         unfused,
-        gate.view(1, tokens, _HEADS, _DIM),
+        gate[:tokens].reshape(1, tokens, _HEADS, _DIM),
         norm_weight,
         None,
         "sigmoid",
