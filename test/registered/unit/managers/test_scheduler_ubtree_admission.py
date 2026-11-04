@@ -50,6 +50,7 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
         scheduler.dllm_config = None
         scheduler.spec_algorithm = SpeculativeAlgorithm.from_string("UBTREE")
         scheduler._maybe_namespace_elastic_radix_cache = lambda req: None
+        scheduler._record_kv_event_lora_name = lambda req, lora_name: None
         scheduler.init_req_max_new_tokens = lambda req: None
         scheduler.max_req_input_len = 128
         scheduler.tree_cache = SimpleNamespace(
@@ -59,10 +60,12 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
             process_req_with_grammar=Mock(return_value=False)
         )
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
+        scheduler.rust_server = None
+        scheduler.output_streamer = Mock()
         scheduler._add_request_to_queue = Mock()
 
         with (
-            get_context().override_server_args(),
+            get_context().override_server_args(sampling_backend="flashinfer"),
             get_parallel().override(tp_rank=0, pp_rank=0),
         ):
             for fields in (
@@ -91,6 +94,19 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
                     self.assertEqual(
                         scheduler._add_request_to_queue.call_args.args[0].rid, "valid"
                     )
+
+            # UBTree's target sampler supports min_p even though the upstream
+            # generic speculative path rejects it.
+            scheduler._add_request_to_queue.reset_mock()
+            scheduler.ipc_channels.send_to_tokenizer.reset_mock()
+            scheduler.handle_generate_request(
+                _request("valid-min-p", params={"temperature": 0.8, "min_p": 0.1})
+            )
+            scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+            scheduler._add_request_to_queue.assert_called_once()
+            self.assertEqual(
+                scheduler._add_request_to_queue.call_args.args[0].rid, "valid-min-p"
+            )
 
 
 if __name__ == "__main__":
