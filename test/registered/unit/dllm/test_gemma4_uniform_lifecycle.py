@@ -11,12 +11,12 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -99,13 +99,7 @@ class _Scheduler(SchedulerDllmMixin):
             free_group_end=Mock(),
         )
         self.tree_cache = object()
-        self.request_retirer = RequestRetirer(
-            tree_cache=self.tree_cache,
-            beam_coordinator=None,
-            hisparse_coordinator=None,
-            uocr_runtime=None,
-            send_abort_output=None,
-        )
+        self.request_retirer = release_only_retirer(tree_cache=self.tree_cache)
         self.output_streamer = SimpleNamespace(stream_output=Mock())
         self.model_config = SimpleNamespace(context_len=context_len)
 

@@ -16,7 +16,6 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
@@ -26,6 +25,7 @@ from sglang.srt.sampling.sampling_params import (
     SamplingParams,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -94,13 +94,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
-        request_retirer=RequestRetirer(
-            tree_cache=None,
-            beam_coordinator=None,
-            hisparse_coordinator=None,
-            uocr_runtime=None,
-            send_abort_output=None,
-        ),
+        request_retirer=release_only_retirer(),
         abort_request=lambda *a, **k: None,
     )
 

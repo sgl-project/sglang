@@ -56,13 +56,11 @@ if _HAS_MLX:
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
     )
-    from sglang.srt.managers.scheduler_components.request_retirer import (
-        RequestRetirer,
-    )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from sglang.test.scheduler_test_utils import release_only_retirer
     from sglang.test.tree_slots import tree_slots_of
 
 
@@ -1225,12 +1223,9 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             logprob_result_processor=None,
             output_streamer=None,
             beam_coordinator=None,
-            request_retirer=RequestRetirer(
+            request_retirer=release_only_retirer(
                 tree_cache=tree_cache,
-                beam_coordinator=None,
                 hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
-                uocr_runtime=None,
-                send_abort_output=None,
             ),
             abort_request=lambda req: None,
         )
@@ -1250,6 +1245,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             setattr(SchedulerBatchResultProcessor, name, value)
         req = SimpleNamespace(
             rid="r0",
+            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
             finished=lambda: True,
             multimodal_inputs=None,
             session=None,

@@ -19,9 +19,11 @@ if TYPE_CHECKING:
 
 
 class RequestRetirer:
-    """Ends requests: those the scheduler drops outside a step are finished,
-    released, and told to the tokenizer once; those finished in a step are
-    released, and their output goes out with the step's."""
+    """Ends requests and releases what they hold.
+
+    abort_queued ends a request no launched step carries and tells the
+    tokenizer once; release_finished releases one a step already finished,
+    whose output goes out with the step."""
 
     def __init__(
         self,
@@ -61,18 +63,16 @@ class RequestRetirer:
         if not release_memory:
             return
         discard_kv_cache_backup(req, self.tree_cache)
+        self.release_finished(req, checkpoint=checkpoint)
+
+    def release_finished(self, req: Req, *, checkpoint: bool) -> None:
+        """Release the memory a finished request holds: HiSparse rows, KV and
+        mamba state."""
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.request_finished(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
-
-    def release_finished(self, req: Req, *, checkpoint: bool) -> None:
-        """Release what a request that finished in a step holds."""
-        # HiSparse clears its mapping of the row before the row is freed.
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.request_finished(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     # Public while `Scheduler.release_aborted_request` still delegates here.
     def release_aborted_request(self, req: Req) -> None:
