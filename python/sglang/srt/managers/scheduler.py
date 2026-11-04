@@ -181,6 +181,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseUocrDocReqInput,
@@ -1939,6 +1940,10 @@ class Scheduler(
                 (
                     EndWeightUpdateReqInput,
                     self.weight_updater.end_weight_update,
+                ),
+                (
+                    PluginWeightUpdateReqInput,
+                    self.weight_updater.plugin_weight_update,
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
