@@ -48,6 +48,9 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Keep tags and history so setuptools-scm can resolve the image version.
+          fetch-depth: 0
 
       - name: Compute image metadata
         id: meta

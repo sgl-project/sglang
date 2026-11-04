@@ -62,6 +62,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+          # Keep tags and history so setuptools-scm can resolve the image version.
+          fetch-depth: 0
 
       - name: Compute Docker build metadata args
         run: |
@@ -152,6 +154,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+          # Keep tags and history so setuptools-scm can resolve the image version.
+          fetch-depth: 0
 
       - name: Compute Docker build metadata args
         run: |
