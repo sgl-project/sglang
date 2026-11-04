@@ -276,7 +276,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             self.get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        if self.use_fia:
+        if self.use_fia and not self.is_modelslim_mxfp8:
             kv_item_lens = [
                 self.get_key_buffer(i)[0].nbytes * self.page_size
                 for i in range(self.start_layer, self.start_layer + self.layer_num)
@@ -293,6 +293,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 for i in range(self.start_layer, self.start_layer + self.layer_num)
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_kv_scale_buf_infos(self):
+        """Expose dynamic K scales for PD; V scales are initialized from weights."""
+        buffers = self.k_scale_buffer
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes for buffer in buffers],
+        )
 
     def set_kv_buffer(
         self,
