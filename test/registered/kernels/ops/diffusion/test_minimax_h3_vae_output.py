@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_minimax_h3_vae_denorm_clamp,
@@ -21,7 +22,6 @@ from sglang.kernels.ops.diffusion import (
     minimax_h3_vae_denorm_clamp,
     minimax_h3_vae_temporal_blend_write,
 )
-from sglang.kernels.arch import current_arch
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     attention as h3_attention,
