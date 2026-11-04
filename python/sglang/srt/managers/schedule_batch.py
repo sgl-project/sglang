@@ -719,6 +719,8 @@ class Req(ReqDllmMixin):
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        # Proposal distribution saved while a PD MTP request is retracted.
+        self.retraction_draft_probs = None
         self.output_dsa_topk_indices = None
 
         # capture routed experts
@@ -2881,7 +2883,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
-    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
+    def retract_decode(self, before_retract=None) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
@@ -2920,6 +2922,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
+            # Snapshot the per-request speculative relay before its row is freed.
+            if before_retract is not None:
+                before_retract(req, idx)
             # release memory and don't insert into the tree because we need the space instantly
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)

@@ -4815,6 +4815,28 @@ class Scheduler(
         if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            qwen_eagle_pd = (
+                get_disagg().disaggregation_mode == "decode"
+                and batch.spec_algorithm.is_eagle()
+                and not batch.spec_algorithm.is_frozen_kv_mtp()
+                and self.model_config.hf_config.architectures
+                in (
+                    ["Qwen3_5ForConditionalGeneration"],
+                    ["Qwen3_5MoeForConditionalGeneration"],
+                    ["Qwen4ExpForConditionalGeneration"],
+                )
+            )
+            if qwen_eagle_pd and self.enable_overlap and self.result_queue:
+                active_reqs = set(batch.reqs)
+                if any(
+                    req in active_reqs
+                    for previous_batch, _ in self.result_queue
+                    for req in previous_batch.reqs
+                ):
+                    # Commit the in-flight result before snapshotting state.
+                    return None
+            if qwen_eagle_pd and self.enable_overlap:
+                self.schedule_stream.wait_stream(self.forward_stream)
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
                 self.decode_offload_manager.drain_before_retraction()
@@ -4826,7 +4848,18 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            if qwen_eagle_pd:
+                from sglang.srt.speculative.eagle_disaggregation import (
+                    snapshot_retracted_eagle_input,
+                )
+
+                retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                    before_retract=lambda req, idx: snapshot_retracted_eagle_input(
+                        req, idx, batch, self.future_map
+                    )
+                )
+            else:
+                retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
             self.running_reqs.leave([*retracted_reqs, *reqs_to_abort])
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
