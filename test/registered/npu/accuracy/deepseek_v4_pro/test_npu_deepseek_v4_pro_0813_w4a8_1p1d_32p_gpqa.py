@@ -208,7 +208,7 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
         """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
         self.run_accuracy()
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
+    def test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_l2_host_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
         # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
         # plus a 3200-token question, which exceeds L1 so evictions land in L2.
