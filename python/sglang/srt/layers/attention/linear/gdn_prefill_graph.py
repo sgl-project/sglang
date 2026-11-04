@@ -78,6 +78,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
     conv_block_table: torch.Tensor  # [max_conv_blocks, 2] (seq, block)
     track_mode: torch.Tensor  # [max_seqs]
     track_h_row: torch.Tensor  # [max_seqs] row of the per-chunk states h
+    track_chunk_idx: torch.Tensor  # [max_seqs] selected local chunk, or -1
     track_conv_start: torch.Tensor  # [max_seqs]
     num_logical_tokens: torch.Tensor  # [1]
     host: np.ndarray  # int32 staging for `packed`
@@ -107,6 +108,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             2 * max_conv_blocks,  # conv_block_table
             max_seqs,  # track_mode
             max_seqs,  # track_h_row
+            max_seqs,  # track_chunk_idx
             max_seqs,  # track_conv_start
             1,  # num_logical_tokens
         ]
@@ -125,8 +127,9 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             conv_block_table=views[3].view(max_conv_blocks, 2),
             track_mode=views[4],
             track_h_row=views[5],
-            track_conv_start=views[6],
-            num_logical_tokens=views[7],
+            track_chunk_idx=views[6],
+            track_conv_start=views[7],
+            num_logical_tokens=views[8],
             host=np.zeros(sum(sizes), dtype=np.int32),
             cache_indices=torch.full(
                 (max_seqs,), PAD_SLOT_ID, dtype=cache_index_dtype, device=device
@@ -204,11 +207,13 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
 
         track_mode = np.zeros(self.max_seqs, dtype=np.int64)
         track_h_row = np.zeros(self.max_seqs, dtype=np.int64)
+        track_chunk_idx = np.full(self.max_seqs, -1, dtype=np.int64)
         track_conv_start = np.zeros(self.max_seqs, dtype=np.int64)
         if track_rows is not None:
             # Same source rows as the eager plan: h_offsets[row] + chunk.
             for row, chunk in track_rows.chunk_rows:
                 track_h_row[row] = offsets[row] + chunk
+                track_chunk_idx[row] = chunk
                 track_mode[row] = TRACK_CHUNK_STATE
             for row in track_rows.final_rows:
                 track_mode[row] = TRACK_FINAL_STATE
@@ -216,6 +221,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
                 track_conv_start[row] = cu[row] + aligned_len - track_rows.conv_len
         o = self._write(o=o, values=track_mode)
         o = self._write(o=o, values=track_h_row)
+        o = self._write(o=o, values=track_chunk_idx)
         o = self._write(o=o, values=track_conv_start)
         o = self._write(o=o, values=np.array([total]))
         assert o == self.host.shape[0]
