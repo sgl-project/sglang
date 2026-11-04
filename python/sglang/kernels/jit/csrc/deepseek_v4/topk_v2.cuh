@@ -253,6 +253,21 @@ SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const 
   });
 }
 
+/// paged_transform of the slots this CTA staged (index >= 0); the slots still -1 belong
+/// to another rank of the cluster, which writes them itself.
+template <TopKMode kMode>
+SGL_DEVICE void paged_transform_owned(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
+  static_assert(kMode == TopKMode::PAGE_TABLE || kMode == TopKMode::DUAL_OUTPUT);
+  constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
+  int32_t indices[kNumElems];
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { indices[i] = problem.out[tx]; });
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
+    if (indices[i] < 0) return;
+    out[tx] = transform.page_to_indices(indices[i]);
+    if constexpr (kMode == TopKMode::DUAL_OUTPUT) transform.raw_out[tx] = indices[i];
+  });
+}
+
 /**
  * \brief Ragged (prefill) top-k: select inside a per-row window, emit indices
  * rebased onto the flattened KV.
@@ -640,6 +655,15 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
   } else if (problem.seq_len <= params.static_cluster_floor) {
     if (by != worker_rank) return;
     Streaming::forward<kPDL>(problem, &smem);
+  } else if constexpr (kMode == TopKMode::PAGE_TABLE || kMode == TopKMode::DUAL_OUTPUT) {
+    // Every rank stages the slots it selects in its own buffer and transforms them
+    // itself, so the row ends without a cluster barrier (every DSMEM write a rank
+    // receives is awaited by that rank's own mbarriers).
+    for_each_item(problem.topk, [&](uint32_t tx, uint32_t) { s_topk_indices[tx] = -1; });
+    ClusterN::forward<kPDL>(problem, &smem);
+    device::PDLTriggerSecondary<kPDL>();
+    __syncthreads();
+    return paged_transform_owned<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
   } else {
     auto cluster = cooperative_groups::this_cluster();
     if constexpr (kNeedStaging) {
