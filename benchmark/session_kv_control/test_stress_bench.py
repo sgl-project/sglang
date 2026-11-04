@@ -47,12 +47,14 @@ class FakeControl:
         self.claims = {}
         self.delay = 0
         self.fail_pressure = False
+        self.transfers = []
 
     def target(self, tokens, salt):
         return {"token_ids": tokens, "cache_salt": salt}
 
     def transfer(self, what, target, src, dst, trial, observe=None):
         start = time.monotonic()
+        self.transfers.append((what, src, dst, trial))
         if self.fail_pressure and "pressure" in trial:
             raise bench.BenchError("pressure control failed")
         if what == "prefetch":
@@ -84,7 +86,7 @@ class FakeControl:
 def arguments(**extra):
     values = dict(length=64, concurrency=2, seed=11, run_id="unit", timeout_s=1,
                   pressure_prefixes=3, output_tokens=2, pin_ttl_s=90,
-                  tool_wait_s=.02, lead_s=.01, passes=2)
+                  tool_wait_s=.02, lead_s=.01, passes=2, retention_mode="demote")
     return argparse.Namespace(**{**values, **extra})
 
 
@@ -212,6 +214,38 @@ class StressChecks(unittest.TestCase):
         self.assertEqual(flush.call_count, 1)
         self.assertEqual([(r["passage"], r["case"]) for r in arm["rows"] if r["client"] == 0], [(0, 3), (0, 2), (1, 3), (1, 2)])
         self.assertTrue(all("demote" in r for r in arm["rows"]))
+
+    def test_natural_l3_preserves_gpu_cache_without_demote(self):
+        args, control = arguments(tool_wait_s=0, lead_s=0, retention_mode="natural"), FakeControl()
+        spec = {"block": 0, "arm": "prefetch", "id": "natural", "dataset_order": [0, 1]}
+        with patch.object(bench, "flush"):
+            arm = bench.l3_arm(args, control, [case(0), case(1)], spec, QuietJournal())
+        self.assertTrue(arm["valid"], arm)
+        self.assertEqual(len(control.transfers), 4)
+        self.assertTrue(all(what == "prefetch" for what, _, _, _ in control.transfers))
+        self.assertTrue(all("demote" not in row for row in arm["rows"]))
+
+    def test_natural_l2_pressure_copies_host_without_explicit_reclamation(self):
+        args, control = arguments(retention_mode="natural"), FakeControl()
+        with patch.object(bench, "flush"):
+            arm = bench.l2_arm(args, control, [case()], (case()["prefix"], [5]),
+                               {"block": 0, "arm": "pin", "id": "natural-pin"}, QuietJournal())
+        self.assertTrue(arm["valid"], arm)
+        pressure = [x for x in control.transfers if "pressure" in x[3]]
+        self.assertEqual(len(pressure), args.pressure_prefixes)
+        self.assertTrue(all(what == "publish" and src == {"tier": "gpu"} and dst == {"tier": "host"}
+                            for what, src, dst, _ in pressure))
+        self.assertTrue(all("host_copy" in row and "demote" not in row
+                            for row in arm["rows"] if row["phase"] == "pressure"))
+        self.assertTrue(any(what == "demote" and "prime" in trial for what, _, _, trial in control.transfers))
+        self.assertTrue(all(receipt["valid"] for receipt in arm["cleanup"]))
+
+    def test_retention_mode_cli_default_and_natural_option(self):
+        common = ["--engine-a", "a", "--engine-b", "b", "--model", "m", "--output", "o",
+                  "--host-capacity-tokens", "100"]
+        for mode in ("l2", "l3"):
+            self.assertEqual(bench.parser().parse_args([mode]+common).retention_mode, "demote")
+            self.assertEqual(bench.parser().parse_args([mode]+common+["--retention-mode", "natural"]).retention_mode, "natural")
 
     def test_summary_denominator_tier_counts_and_throughput(self):
         control = FakeControl()

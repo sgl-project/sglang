@@ -4880,3 +4880,7 @@ Docs PLAN.md, Router runbook and final report now describe completed P0–P8 fir
 真实 Mooncake 双 Engine 冒烟：L3 两组共 4 条恢复请求、L2 两组共 14 条生成请求全部有效，PIN release/query 无清理失败。初次无效 source smoke 和原 calibration 的自动容量预检拒绝保留为启动观察，不混入正式性能结果。资源采样器已实际读取双 Engine metrics/loads、Master metrics 和 GPU0/1 显存/利用率。
 
 正式矩阵采用 64×16K 会话、两次遍历、3 轮配对，扫描 8/16 并发；L2 使用 4×16K 热点和 53×16K 冷数据冲刷、3 轮配对。无每请求 cache flush；L3 两组均在请求完成后 DEMOTE，显式测量 host/storage 行为。收益尚待正式数据判定。按用户已有授权提交工具，不推送。
+
+### 0.8 压力口径补充：自然 GPU 驱逐
+
+显式 DEMOTE 会释放 GPU 前缀，无法单独证明大 L1 KV 池受到容量压力，因此补充 `--retention-mode natural`。L2 热点仍按工具等待语义 DEMOTE/PIN，冷压力仅 COPY 到 host、保留 GPU KV；L3 正式请求后不主动回收 GPU，让原生 LRU 与 write_through 工作。默认 demote 保留已有口径，manifest/arm/summary 明确标记模式。root 审阅全部变更并独立测试：23 项通过（日志 harness-natural-tests-root.log）。运行中的 L2 demote 对照继续使用已加载的 08be8787e6 工具，不改动其解释器或 Engine。后续主矩阵使用 natural，按实际 GPU/host 使用量证明压力。

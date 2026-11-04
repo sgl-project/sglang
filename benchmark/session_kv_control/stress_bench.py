@@ -163,12 +163,16 @@ def generation_row(control, tokens, salt, count, seed, trial, phase):
     return row
 
 
-def materialize(row, control, target, length, trial, storage=False):
+def materialize(row, control, target, length, trial, storage=False, retain_gpu=False):
     if row["valid"]:
         try:
             if storage:
                 row["publication"] = publish(control, target, length, trial)
-            row["demote"] = demote(control, target, length, trial)
+            if retain_gpu:
+                row["host_copy"] = control.transfer("publish", target, {"tier": "gpu"}, {"tier": "host"}, trial)
+                require_completed(row["host_copy"], length, "GPU to host COPY without explicit reclamation")
+            else:
+                row["demote"] = demote(control, target, length, trial)
         except Exception as exc:
             row["valid"] = False
             row["errors"].append(str(exc))
@@ -229,7 +233,7 @@ def prefetch_resume(args, b, case, trial, candidate, controls):
                 require_completed(row["prefetch"], len(case["prefix"]), "prefetch")
             except Exception as exc:
                 row["errors"].append("prefetch: "+str(exc))
-        if row.get("generation"):
+        if row.get("generation") and args.retention_mode == "demote":
             try:
                 row["demote"] = demote(b, target, len(case["prefix"]), trial)
             except Exception as exc:
@@ -241,7 +245,7 @@ def prefetch_resume(args, b, case, trial, candidate, controls):
 
 def l2_arm(args, b, cases, material, spec, journal):
     start, claims = time.monotonic(), []
-    arm = {**spec, "rows": [], "errors": [], "cleanup": [], "valid": False,
+    arm = {**spec, "retention_mode": args.retention_mode, "rows": [], "errors": [], "cleanup": [], "valid": False,
            "hot_salts": [c["salt"] for c in cases]}
     candidate = spec["arm"] == "pin"
     try:
@@ -268,7 +272,8 @@ def l2_arm(args, b, cases, material, spec, journal):
             salt = l2_salt(args, spec, "pressure", index)
             trial = f"{spec['id']}-pressure-{index}"
             row = generation_row(b, material[0], salt, 1, args.seed, trial, "pressure")
-            return materialize(row, b, b.target(material[0], salt), args.length, trial)
+            return materialize(row, b, b.target(material[0], salt), args.length, trial,
+                               retain_gpu=args.retention_mode == "natural")
         arm["rows"] += bounded_jobs(list(range(args.pressure_prefixes)), args.concurrency, pressure)
         arm["pressure_wall_ms"] = (time.monotonic()-pressure_start)*1000
         arm["hot_residency_before_resume"] = [host_tokens(b, b.target(c["prefix"], c["salt"]), spec["id"]) for c in cases]
@@ -311,7 +316,7 @@ def l2_arm(args, b, cases, material, spec, journal):
 
 def l3_arm(args, b, cases, spec, journal):
     start = time.monotonic()
-    arm = {**spec, "rows": [], "errors": [], "planned_requests": len(cases)*args.passes, "valid": False}
+    arm = {**spec, "retention_mode": args.retention_mode, "rows": [], "errors": [], "planned_requests": len(cases)*args.passes, "valid": False}
     try:
         flush(b, args.timeout_s, spec["id"])
         jobs = [(p, index) for p in range(args.passes) for index in spec["dataset_order"]]
@@ -347,6 +352,7 @@ def summarize(arms):
         resumes = [r for r in completed if r.get("phase") == "resume"]
         wall = arm["wall_ms"]/1000
         counts = {"block": arm["block"], "arm": arm["arm"], "valid": arm["valid"],
+                  "retention_mode": arm.get("retention_mode", "demote"),
                   "planned_requests": arm["planned_requests"], "recorded_requests": len(rows),
                   "completed_requests": len(completed),
                   "failed_requests": arm["planned_requests"]-len(completed),
@@ -385,8 +391,8 @@ def summarize(arms):
                                   "completed_requests_per_s_delta": delta("achieved_completed_requests_per_s")})
     summary["notes"] = ["All completed requests contribute; failed and unattempted jobs remain in denominators.",
         "Paired blocks, rather than correlated requests, are the experimental units; no confidence claim from three blocks.",
-        "Wall throughput includes flush, tool waits, control drain, DEMOTE and cleanup; L2 additionally includes priming and pressure.",
-        "L3 source publication is reported separately. Per-request DEMOTE applies to both arms. No per-request flush.",
+        "Wall throughput includes flush, tool waits, control drain, configured retention work and cleanup; L2 additionally includes priming and pressure.",
+        "L3 source publication is reported separately. Retention mode applies identically to both arms; natural mode has no per-request explicit GPU reclamation. No per-request flush.",
         "Tier tokens are logical cache attribution, not physical I/O or peak memory. Late storage reuse may share reads."]
     return summary
 
@@ -537,6 +543,8 @@ def parser():
         sub.add_argument("--seed", type=int, default=1729)
         sub.add_argument("--length", type=int, default=16384)
         sub.add_argument("--concurrency", type=int, default=8)
+        sub.add_argument("--retention-mode", choices=["demote", "natural"], default="demote",
+                         help="natural preserves ordinary GPU cache residency; demote isolates host/storage paths")
         sub.add_argument("--output-tokens", type=int, default=32)
         sub.add_argument("--timeout-s", type=float, default=120)
         sub.add_argument("--poll-ms", type=float, default=50)
