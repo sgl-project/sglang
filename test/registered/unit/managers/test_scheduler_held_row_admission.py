@@ -30,6 +30,7 @@ class _Req:
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
+        self.input_embeds = None
 
     def init_next_round_input(self, tree_cache=None):
         pass
@@ -134,6 +135,42 @@ class TestHeldRowAdmission(CustomTestCase):
             final_chunk,
             waiting,
         )
+
+    def test_input_forms_stay_queued_before_preemption(self):
+        for first_embeds in (False, True):
+            for preemption in (False, True):
+                with self.subTest(first_embeds=first_embeds, preemption=preemption):
+                    waiting = [
+                        _Req(holds_row=False) for _ in range(2 if preemption else 3)
+                    ]
+                    for i, req in enumerate(waiting):
+                        req.input_embeds = (
+                            [[1.0]] if (i % 2 == 0) == first_embeds else None
+                        )
+                    running_batch = ScheduleBatch(reqs=[])
+                    s = self._scheduler(DisaggregationMode.NULL, [], None, waiting)
+                    s.enable_priority_preemption = preemption
+                    if preemption:
+                        s.get_num_allocatable_reqs = lambda *args, **kwargs: 1
+
+                    def capture(can_run_list, *args, **kwargs):
+                        raise _BatchBuilt(list(can_run_list))
+
+                    with (
+                        get_context().override_server_args(
+                            pp_max_micro_batch_size=NUM_ROWS
+                        ),
+                        patch.object(ScheduleBatch, "init_new", side_effect=capture),
+                        patch("sglang.srt.managers.scheduler.set_time_batch"),
+                        patch.object(
+                            _Adder, "preempt_to_schedule", return_value=False
+                        ) as preempt,
+                    ):
+                        with self.assertRaises(_BatchBuilt) as built:
+                            s._get_new_batch_prefill_raw(None, running_batch)
+                    self.assertEqual(built.exception.args[0], waiting[::2])
+                    self.assertEqual(list(s.waiting_queue), [waiting[1]])
+                    preempt.assert_not_called()
 
     def test_final_chunk_leaves_the_free_row_to_a_waiting_request(self):
         for mode in (DisaggregationMode.NULL, DisaggregationMode.PREFILL):
