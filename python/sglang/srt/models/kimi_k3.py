@@ -75,7 +75,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe import aiter_presort, route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -1347,6 +1347,7 @@ class KimiK3MoE(nn.Module):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
+            aiter_presort.clear_registration()
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 

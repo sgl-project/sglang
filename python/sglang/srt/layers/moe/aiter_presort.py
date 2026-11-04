@@ -31,6 +31,13 @@ def _registrar() -> Optional[Callable[[Optional[dict]], None]]:
     return register_presorted_moe
 
 
+def clear_registration() -> None:
+    """Drop a registration that no fused_moe consumed, as AITER's caller contract requires."""
+    registrar = _registrar()
+    if registrar is not None:
+        registrar(None)
+
+
 def enabled(scores: torch.Tensor) -> bool:
     return (
         envs.SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT.get()
