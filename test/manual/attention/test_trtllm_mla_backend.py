@@ -19,11 +19,12 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     set_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
@@ -1041,8 +1042,9 @@ class TestTRTLLMMLA(CustomTestCase):
         backend.init_forward_metadata_out_graph(capture_fb, in_capture=True)
 
         # Verify capture metadata
-        self.assertIn(batch_size, backend.decode_cuda_graph_metadata)
-        capture_metadata = backend.decode_cuda_graph_metadata[batch_size]
+        key = (batch_size, ForwardMode.DECODE)
+        self.assertIn(key, backend.decode_cuda_graph_metadata)
+        capture_metadata = backend.decode_cuda_graph_metadata[key]
 
         self.assertIsNotNone(capture_metadata.block_kv_indices)
 

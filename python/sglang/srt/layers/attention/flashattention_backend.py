@@ -46,7 +46,8 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
@@ -60,8 +61,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
 
@@ -233,14 +233,8 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            # Static verify width; NOTE: overwrites the config-named attr in place.
-            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
-                phase="target_verify",
-                spec_algorithm=SpeculativeAlgorithm.from_string(
-                    get_spec().speculative_algorithm
-                ),
-                is_draft_worker=True,
-                num_draft_tokens=int(self.speculative_num_draft_tokens),
+            self.speculative_num_draft_tokens = model_runner.decode_num_tokens_per_req(
+                num_draft_tokens=int(self.speculative_num_draft_tokens)
             )
         self.speculative_step_id = speculative_step_id
 
@@ -322,16 +316,17 @@ class FlashAttentionBackend(AttentionBackend):
         # block-schedule cache (see forward_extend rel_bias handling).
         self.full_cg_prefill_metadata = None
 
-        # In embedding mode with no chunked prefill and radix cache disabled,
-        # skip KV cache write and use flash_attn_varlen_func with raw K/V
-        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        # Keep raw-K/V prefill opt-in aligned with the flag that installs the
+        # no-op KV pool. Without it, embedding requests use paged attention.
+        # Internal auto-enables (e.g. EmbeddingGemma) also set this flag.
         # Restricted to non-MLA backends: the read-skip elif lives inside the
         # `if not self.use_mla:` branch in forward_extend, while the write-skip
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
         self.fa_skip_kv_cache = (
-            get_model().is_embedding
+            get_schedule().prefill_only_disable_kv_cache
+            and get_model().is_embedding
             and get_schedule().chunked_prefill_size == -1
             and get_memory().disable_radix_cache
             and not self.use_mla

@@ -524,7 +524,7 @@ python -m sglang.launch_server \
 - Test Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --num-prompt 100 \
   --max-concurrency 1
@@ -584,7 +584,7 @@ python -m sglang.launch_server \
 - Test Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --num-prompt 1000 \
   --max-concurrency 100
