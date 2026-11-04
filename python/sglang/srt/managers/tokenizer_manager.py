@@ -43,6 +43,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    Type,
     Union,
 )
 
@@ -62,7 +63,7 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -100,6 +101,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
+    PauseContinueBroadcastReq,
     PauseGenerationReqInput,
     RequestOutputStats,
     ScaleElasticEPReqInput,
@@ -108,6 +110,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizerWorkerRegistrationReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
@@ -122,7 +125,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
 )
@@ -206,7 +209,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
@@ -561,8 +564,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        *,
-        start_pd_bootstrap_service: bool = True,
     ):
         # Parse args
         self.server_args = server_args
@@ -606,7 +607,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_lora()
 
         # Init PD disaggregation and encoder disaggregation
-        self.init_disaggregation(start_pd_bootstrap_service=start_pd_bootstrap_service)
+        # Behind MultiTokenizerRouter, the router runs the PD bootstrap service.
+        self.init_disaggregation(
+            start_pd_bootstrap_service=self.tokenizer_ipc_name is None
+        )
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
@@ -623,6 +627,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
         )
+
+        self.maybe_init_router_registration()
 
     def init_model_config(self):
         server_args = self.server_args
@@ -812,6 +818,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        # Future for awaiting pause/continue broadcast confirmation
+        self._pause_continue_future: Optional[asyncio.Future] = None
 
     def init_lora(self):
         # LoRA
@@ -908,6 +916,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.server_args.base_gpu_id, self.mm_processor
         )
 
+    def maybe_init_router_registration(self):
+        if self.tokenizer_ipc_name is None:
+            return
+        # Register this worker with the router for pause/continue broadcasting
+        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
+        self._dispatch_to_scheduler(reg)
+
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -924,6 +939,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+                (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
             ]
         )
         self.init_communicators()
@@ -2420,25 +2436,68 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        if self.tokenizer_ipc_name is not None:
+            # Send to router which will broadcast to all workers
+            # (router also handles forwarding to scheduler for non-abort modes)
+            await self._pause_continue_through_router(obj)
+            if obj.mode == "abort":
+                # Abort polling: only the originator checks its own lock state
+                await self._abort_all_until_unlocked()
+            return
+
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
                 await self._async_dispatch_to_scheduler(obj)
             else:
-                # we are using the model_update_lock to check if there is still on-going requests.
-                while True:
-                    # TODO: maybe make it async instead of fire-and-forget
-                    self.abort_request(abort_all=True)
-                    is_locked = await self.model_update_lock.is_locked()
-                    if not is_locked:
-                        break
-                    await asyncio.sleep(1.0)
+                await self._abort_all_until_unlocked()
+
+    async def _abort_all_until_unlocked(self):
+        # we are using the model_update_lock to check if there is still on-going requests.
+        while True:
+            # TODO: maybe make it async instead of fire-and-forget
+            self.abort_request(abort_all=True)
+            is_locked = await self.model_update_lock.is_locked()
+            if not is_locked:
+                break
+            await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        if self.tokenizer_ipc_name is not None:
+            await self._pause_continue_through_router(obj)
+            return
+
         async with self.is_pause_cond:
             self.is_pause = False
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
+
+    async def _pause_continue_through_router(
+        self, obj: Union[PauseGenerationReqInput, ContinueGenerationReqInput]
+    ):
+        loop = asyncio.get_event_loop()
+        self._pause_continue_future = loop.create_future()
+        self._dispatch_to_scheduler(obj)
+        await self._pause_continue_future
+
+    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
+        """Called from handle_loop when a broadcast arrives from the router."""
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._apply_pause_continue_broadcast(obj))
+
+    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
+        """Apply pause/continue state under the condition lock."""
+        async with self.is_pause_cond:
+            if obj.is_pause:
+                self.is_pause = True
+            else:
+                self.is_pause = False
+                self.is_pause_cond.notify_all()
+
+        # Resolve the pending future if this worker initiated the pause/continue
+        if self._pause_continue_future and not self._pause_continue_future.done():
+            self._pause_continue_future.set_result(True)
+            self._pause_continue_future = None
 
     async def update_weights_from_disk(
         self,
@@ -4203,6 +4262,19 @@ class SignalHandler:
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #
+
+
+def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerManager]:
+    worker_class = server_args.get_tokenizer_worker_class()
+    if not isinstance(worker_class, type) or not issubclass(
+        worker_class, TokenizerManager
+    ):
+        raise TypeError(
+            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerManager "
+            f"subclass, got {worker_class!r}"
+        )
+
+    return worker_class
 
 
 def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:

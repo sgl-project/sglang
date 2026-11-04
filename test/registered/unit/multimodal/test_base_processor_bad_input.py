@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import requests
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,

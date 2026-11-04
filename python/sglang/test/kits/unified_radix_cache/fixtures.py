@@ -26,10 +26,8 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    TreeComponent,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
     resolve_tree_core_backend,

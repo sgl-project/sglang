@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     resolve_window_id_space,
@@ -35,14 +36,14 @@ from sglang.srt.layers.attention.graph_variants import SeqLenBucketGraphVariants
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
-    generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import is_gfx95_supported
 
@@ -575,6 +576,16 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
+        # Deterministic mode allows aiter decode only for the paged_attention_ragged
+        # path; the unified-attention and 5D-pool kernels are not verified batch-invariant.
+        if get_exec().deterministic.enable_deterministic_inference and (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter decode attention only with the "
+                "default paged KV cache: not with sliding-window models, "
+                "SGLANG_USE_AITER_UNIFIED_ATTN or a vectorized 5D KV cache layout."
             )
 
         # Decode metadata format. unified_attention and pa_decode_gluon (the

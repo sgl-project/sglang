@@ -12,10 +12,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.lora.moe.activation import ActivationFn
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
-from sglang.srt.lora.moe.plan import ActivationFn, SelectedPlan, resolve_plans
+from sglang.srt.lora.moe.plan import SelectedPlan, resolve_plans
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.moe.runner import MoeLoraBatch, MoeLoraRunner
 from sglang.srt.lora.utils import Phase, architecture_for_capability
