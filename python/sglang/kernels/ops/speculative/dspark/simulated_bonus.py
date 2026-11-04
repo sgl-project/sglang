@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import random
-
 import torch
 import triton
 import triton.language as tl
@@ -142,17 +140,15 @@ def simulated_bonus_sample(
     temperatures: torch.Tensor,
     bs: int,
     rows_per_request: int,
+    seed: int,
 ) -> torch.Tensor:
     """Gumbel-max temperature sample of each request's row at ``correct_len``.
     [bs] int64."""
-    seed = torch.full(
-        (1,), random.getrandbits(31), dtype=torch.int32, device=target_logits.device
-    )
     return simulated_bonus_sample_graph(
         target_logits=target_logits,
         correct_len=correct_len.contiguous(),
         temperatures=temperatures.reshape(-1).contiguous(),
-        seed=seed,
+        seed=torch.full((1,), seed, dtype=torch.int32, device=target_logits.device),
         bs=bs,
         rows_per_request=rows_per_request,
     )
