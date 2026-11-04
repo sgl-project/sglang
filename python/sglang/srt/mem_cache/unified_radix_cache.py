@@ -3082,10 +3082,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
         stats = self._prefetch_outcome_stats.copy()
+        if self.cache_controller is not None:
+            stats.update(self.cache_controller.storage_read_stats_snapshot())
         reads = self._native_storage_reads()
         if reads is not None:
-            stats.update({"native_" + key: value for key, value in reads.stats.items()})
-            stats["native_demand_waiters"] = len(reads.demands)
+            stats.update(
+                {"native_" + key: value for key, value in reads.snapshot().items()}
+            )
         return stats
 
     def _prefetch_occupied_span(

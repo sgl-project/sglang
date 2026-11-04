@@ -817,6 +817,9 @@ class KVControlService:
             "operations": registry.capacity(),
             "associations": control.index.capacity(),
             "copies": control.executor.claims.capacity(),
+            "storage_reads": self.cache.prefetch_outcome_stats_snapshot()
+            if control.executor.storage_reads is not None
+            else None,
             "protection": {
                 "active_claims": control.executor.protection.registry.active_claims,
                 "protected_tokens": control.executor.protection.registry.protected_tokens,

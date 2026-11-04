@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from array import array
 from dataclasses import dataclass, field
@@ -49,6 +50,8 @@ class _Read:
     loaded_span: tuple[int, int | None] = (0, None)
     reserved_host_tokens: int = 0
     admission_order: int = 0
+    created_at: float = field(default_factory=time.monotonic)
+    started_at: float | None = None
 
 
 @dataclass
@@ -56,6 +59,7 @@ class _Demand:
     job: _Read
     # Already resident at join time is L2, not this request's storage hit.
     storage_start: int
+    joined_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -88,7 +92,43 @@ class StorageCacheReads:
             demand_consumed=0,
             demand_aborted=0,
             demand_limit_declined=0,
+            jobs_created=0,
+            interests_coalesced=0,
+            jobs_started=0,
+            jobs_completed=0,
+            jobs_failed=0,
+            jobs_deferred=0,
+            jobs_cancelled=0,
+            requested_tokens=0,
+            loaded_tokens=0,
+            queue_seconds=0.0,
+            restore_seconds=0.0,
+            demand_wait_seconds=0.0,
         )
+
+    def snapshot(self):
+        """Owner-local counters and gauges; jobs, not logical interests, cost I/O."""
+        stats = dict(self.stats)
+        active = [job for job in self.jobs.values() if job.operation is not None]
+        stats.update(
+            active_jobs=len(active),
+            queued_jobs=sum(
+                job.operation is None and not job.loading for job in self.jobs.values()
+            ),
+            demand_waiters=len(self.demands),
+            reserved_host_tokens=self._unallocated_reservations(None),
+            inflight_tokens=sum(job.reserved_host_tokens for job in active),
+            speculative_inflight_tokens=sum(
+                job.reserved_host_tokens for job in active if not job.demands
+            ),
+        )
+        pool = self.cache.cache_controller.mem_pool_host
+        stats.update(
+            host_capacity_tokens=pool.size,
+            host_available_tokens=pool.available_size(),
+            host_bytes_per_token=pool.size_per_token,
+        )
+        return stats
 
     @staticmethod
     def _demand_key(tokens, extra_key, cache_salt):
@@ -136,6 +176,7 @@ class StorageCacheReads:
             return None
         job = demand.job
         job.demands.remove(request)
+        self.stats["demand_wait_seconds"] += time.monotonic() - demand.joined_at
         self.stats["demand_aborted" if aborted else "demand_consumed"] += 1
         count, start = job.loaded_span
         left = max(start or 0, demand.storage_start)
@@ -239,6 +280,9 @@ class StorageCacheReads:
             self._next_admission_order += 1
             self._rows(job)
             self.jobs[key] = job
+            self.stats["jobs_created"] += 1
+        else:
+            self.stats["interests_coalesced"] += 1
         interest = _Interest(work, job)
         self.interests[work.ref.operation_id] = interest
         job.interests.add(work.ref.operation_id)
@@ -345,6 +389,10 @@ class StorageCacheReads:
                 self._release(job)
                 return
             job.operation = info.operation
+            job.started_at = time.monotonic()
+            self.stats["jobs_started"] += 1
+            self.stats["queue_seconds"] += job.started_at - job.created_at
+            self.stats["requested_tokens"] += job.reserved_host_tokens
             job.operation.native_quiescent = False
             job.operation.native_on_publish = lambda: self._published(job)
         except Exception as error:
@@ -521,6 +569,7 @@ class StorageCacheReads:
                     self._retire(job)
 
     def _retire(self, job, *, status=None, code=""):
+        length = 0
         try:
             if job.operation is not None and getattr(
                 job.operation, "native_quiescent", False
@@ -592,6 +641,22 @@ class StorageCacheReads:
         finally:
             job.reserved_host_tokens = 0
             job.loaded_span = self.cache.pop_prefetch_loaded_span(job.handle)
+            self.stats["loaded_tokens"] += job.loaded_span[0]
+            if job.started_at is not None:
+                self.stats["restore_seconds"] += time.monotonic() - job.started_at
+            outcome = (
+                "failed"
+                if job.failure
+                else "deferred"
+                if status == Status.DEFERRED
+                else "cancelled"
+                if job.cancel_requested
+                or all(self.interests[i].cancelled for i in job.interests)
+                else "completed"
+                if length == len(job.tokens)
+                else "failed"
+            )
+            self.stats["jobs_" + outcome] += 1
             job.retired = True
             key = self._demand_key(
                 job.tokens, job.compatibility.extra_key, job.compatibility.cache_salt

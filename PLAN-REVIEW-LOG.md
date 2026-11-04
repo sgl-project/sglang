@@ -4938,3 +4938,11 @@ CPU123测试/96子测试、工具41测试、真实GPU/file/Mooncake2测试/2子�
 ### 生成归档格式核查
 
 CSV 标准 CRLF、matplotlib SVG path 换行及一份原始测试输出含生成器/捕获空白。通过结果目录局部 .gitattributes 标明 CSV 的 cr-at-eol，保留生成 SVG 和原始 .log 字节，未放宽源码或测试检查。补充物理 SHA 后，归档 diff whitespace 检查与 SHA256SUMS 通过；性能数据未改写。
+
+## Act 3 — Build：生命周期优化 O0（2026-11-04）
+
+实现依据为 SESSION_KV_OPTIMIZATION_PLAN.zh-CN.md，基线 f9943a83fa。用户授权按功能测试后提交，并要求控制改动范围与维护成本。沿用 codex-build 的实现、完整差异审阅、parent 独立复测流程，使用隔离 worktree，提交由 parent 执行。
+
+O0 增加普通恢复与 native 读取的查询/GET 累积调用、时间及 anchor KV payload tokens/bytes；wire bytes 保持 unknown。native 观测按物理 job 计数，逻辑兴趣与真实 demand 分开；容量与预留 gauge 经已有 loads/capacity 查询返回，不修改公共三动作 schema。
+
+parent 已阅读完整五文件差异并独立运行 transfers/cache/feedback/service：76 passed、39 subtests，22.22s。仓库要求的 ruff F401/F821/F823/UP037 检查通过。日志为 /tmp/sglang-rfc-build/lifecycle-opt/o0-parent-tests.log。本提交不宣称性能改善；后续同二进制配对将验证观测成本与策略收益。

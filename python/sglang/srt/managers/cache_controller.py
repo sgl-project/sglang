@@ -341,6 +341,16 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Query and GET each have a single writer thread and separate keys.
+        # Samples are cumulative local observations, not a TP-reduced snapshot.
+        self.storage_read_stats = dict(
+            query_jobs=0,
+            query_seconds=0.0,
+            get_batches=0,
+            get_requested_tokens=0,
+            get_completed_tokens=0,
+            get_seconds=0.0,
+        )
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -1206,6 +1216,21 @@ class HiCacheController:
         for page in pages:
             self.host_mem_release_queue.put(page)
 
+    def storage_read_stats_snapshot(self):
+        """All ordinary/native reads; bytes describe anchor KV API payload only.
+
+        Sidecar traffic and backend retries are not observed here. In particular,
+        these counters do not measure physical network traffic or wire bytes.
+        """
+        stats = self.storage_read_stats.copy()
+        for kind in ("requested", "completed"):
+            stats[f"get_{kind}_bytes"] = (
+                stats[f"get_{kind}_tokens"] * self.storage_host_pool.size_per_token
+            )
+        return {"storage_read_" + key: value for key, value in stats.items()} | {
+            "storage_read_wire_bytes": None,
+        }
+
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
@@ -1317,9 +1342,17 @@ class HiCacheController:
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
         # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
-        )
+        stats = self.storage_read_stats
+        stats["get_batches"] += 1
+        stats["get_requested_tokens"] += len(batch_hashes) * self.page_size
+        started = time.monotonic()
+        try:
+            kv_hits = self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
+            stats["get_completed_tokens"] += kv_hits * self.page_size
+        finally:
+            stats["get_seconds"] += time.monotonic() - started
 
         # Read from KV-derived sidecar pools, if any.
         sidecar_hits: dict[str, int] = {}
@@ -1439,9 +1472,16 @@ class HiCacheController:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0
                     else:
-                        hash_value, storage_hit_count = self._storage_hit_query(
-                            operation
-                        )
+                        started = time.monotonic()
+                        self.storage_read_stats["query_jobs"] += 1
+                        try:
+                            hash_value, storage_hit_count = self._storage_hit_query(
+                                operation
+                            )
+                        finally:
+                            self.storage_read_stats["query_seconds"] += (
+                                time.monotonic() - started
+                            )
                 except Exception:
                     logger.exception(
                         "HiCache storage query failed for request %s",

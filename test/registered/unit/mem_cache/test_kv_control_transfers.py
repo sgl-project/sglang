@@ -1236,7 +1236,6 @@ def assert_retired(cache, service):
 
 
 class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
-
     def _cold_scopes(self, owner, scopes):
         _, cache, service, dma = owner
         for index, target in enumerate(scopes):
@@ -1282,6 +1281,89 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         cache.discard_storage_prefetch_accounting(request)
         service.progress()
         return span
+
+    def test_read_observations_count_physical_jobs_and_include_ordinary_reads(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [
+                cache_fixtures.target(cache_salt=f"observed-{i}") for i in range(2)
+            ]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            get = cc.page_get_func
+            entered, release = threading.Event(), threading.Event()
+            demand = CacheRequestHandle("observed-demand", 0)
+            ordinary = CacheRequestHandle("observed-ordinary", 0)
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    first = self._restore(service, scopes[0], "observed-first")
+                    wait_for(service, entered.is_set)
+                    shared = self._restore(service, scopes[0], "observed-shared")
+                    self._ordinary_prefetch(cache, service, scopes[0], demand)
+                    during = cache.prefetch_outcome_stats_snapshot()
+                    self.assertEqual(during["native_jobs_created"], 1)
+                    self.assertEqual(during["native_jobs_started"], 1)
+                    self.assertEqual(during["native_interests_coalesced"], 1)
+                    self.assertEqual(during["native_demand_waiters"], 1)
+                    self.assertEqual(during["native_inflight_tokens"], 4)
+                    self.assertEqual(during["native_speculative_inflight_tokens"], 0)
+                    self.assertEqual(during["native_reserved_host_tokens"], 0)
+                    release.set()
+                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                    self.assertEqual(wait(service, shared).status, Status.COMPLETED)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand), (4, 0)
+                    )
+                    self._ordinary_prefetch(cache, service, scopes[1], ordinary)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, ordinary),
+                        (4, 0),
+                    )
+                stats = cache.prefetch_outcome_stats_snapshot()
+                self.assertEqual(stats["storage_read_query_jobs"], 2)
+                self.assertEqual(stats["storage_read_get_batches"], 2)
+                self.assertEqual(stats["storage_read_get_requested_tokens"], 8)
+                self.assertEqual(stats["storage_read_get_completed_tokens"], 8)
+                self.assertEqual(
+                    stats["storage_read_get_requested_bytes"],
+                    8 * cc.storage_host_pool.size_per_token,
+                )
+                self.assertEqual(
+                    stats["storage_read_get_completed_bytes"],
+                    stats["storage_read_get_requested_bytes"],
+                )
+                self.assertIsNone(stats["storage_read_wire_bytes"])
+                self.assertEqual(stats["native_jobs_completed"], 1)
+                self.assertEqual(stats["native_loaded_tokens"], 4)
+                self.assertEqual(stats["native_requested_tokens"], 4)
+                self.assertEqual(stats["native_active_jobs"], 0)
+                self.assertEqual(stats["native_demand_waiters"], 0)
+                for key in (
+                    "native_queue_seconds",
+                    "native_restore_seconds",
+                    "native_demand_wait_seconds",
+                    "storage_read_query_seconds",
+                    "storage_read_get_seconds",
+                ):
+                    self.assertGreaterEqual(stats[key], 0)
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+                cache.release_aborted_request(ordinary)
+            assert_retired(cache, service)
+            cache.sanity_check()
 
     def test_queued_native_host_job_coalesces_demand_before_any_io(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
