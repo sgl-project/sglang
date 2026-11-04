@@ -17,12 +17,9 @@ import msgspec
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.memory.allocator import alloc_decode_kernel, alloc_extend_kernel
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import (
-    alloc_decode_kernel,
-    alloc_extend_kernel,
-)
 from sglang.srt.mem_cache.allocator.swa import (
     UNIFIED_SWA_SEGMENT_BOUND,
     UNIFIED_SWA_SEGMENT_RELEASED,
