@@ -925,10 +925,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.v_buffer[layer_id - self.start_layer]
 
     def get_index_k_buffer(self, layer_id: int):
-        if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
-            raise RuntimeError(
-                "Packed NPU DSA uses get_index_k_with_scale_buffer, not a separate K view"
-            )
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         if getattr(self, "index_k_buffer", None) is None:
@@ -949,8 +945,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
     def get_index_k_with_scale_buffer(self, layer_id: int):
-        if not (self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0):
-            raise RuntimeError("Packed index cache requires an FP8 DSA indexer layer")
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
@@ -960,8 +954,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             set_index_k_scale_buffer_npu,
         )
 
-        if not (self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0):
-            raise RuntimeError("Packed index cache requires an FP8 DSA indexer layer")
         set_index_k_scale_buffer_npu(
             self.index_k_buffer[self._get_indexer_slot(layer_id)],
             loc.reshape(-1).contiguous(),
