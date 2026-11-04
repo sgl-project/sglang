@@ -38,6 +38,7 @@
 #endif
 
 #if SUPPORT_CLUSTER
+#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/mbarrier.cuh>
 #endif
 
@@ -1375,7 +1376,7 @@ struct TopKCluster : TopKRadixBase<11> {
   /// replicates each half's sign over it (the ordered fp16 key is ~h for negatives, h | 0x8000 otherwise).
   SGL_DEVICE static uint2 coarse_bins2(float x, float y) {
 #if SGL_CUDA_ARCH >= 1000
-    const auto v = __fadd2_rn(fp32x2_t{x, y}, fp32x2_t{0.0f, 0.0f});
+    const auto v = math::add_f32x2(fp32x2_t{x, y}, fp32x2_t{0.0f, 0.0f});
 #else
     const auto v = fp32x2_t{__fadd_rn(x, 0.0f), __fadd_rn(y, 0.0f)};
 #endif
