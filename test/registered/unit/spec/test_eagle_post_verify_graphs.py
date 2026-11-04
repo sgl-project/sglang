@@ -539,6 +539,61 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertEqual(int(staged["sim_accept_len"]), 3)
 
 
+class TestCheckpointHookGraphWiring(CustomTestCase):
+    def test_worker_binds_before_graph_setup_and_passes_the_same_hooks_to_eager(self):
+        hooks = SimpleNamespace(checkpoint_commit=lambda view: True)
+        with patch.object(
+            eagle_worker_v2, "bind_eagle_runtime_hooks", return_value=hooks
+        ) as bind:
+            worker = _worker(switch=True)
+        bind.assert_called_once_with(worker.target_worker, supports_sharded_verify=True)
+        self.assertIs(worker._post_verify_graphs._speculative_runtime_hooks, hooks)
+        self.assertIs(_verify_kwargs(worker)["speculative_runtime_hooks"], hooks)
+
+    def test_half_constructed_workers_and_graphs_keep_the_stock_checkpoint(self):
+        from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+        for cls in (eagle_worker_v2.EAGLEWorkerV2, NGRAMWorker, EaglePostVerifyGraphs):
+            with self.subTest(cls=cls.__name__):
+                obj = cls.__new__(cls)
+                self.assertNotIn("_speculative_runtime_hooks", obj.__dict__)
+                self.assertIs(
+                    obj._speculative_runtime_hooks,
+                    eagle_worker_v2.STOCK_SPECULATIVE_RUNTIME_HOOKS,
+                )
+                self.assertIsNone(
+                    getattr(obj._speculative_runtime_hooks, "checkpoint_commit", None)
+                )
+
+    def test_graph_commit_forwards_the_bound_callback(self):
+        callback = lambda view: True
+        graphs = EaglePostVerifyGraphs.__new__(EaglePostVerifyGraphs)
+        graphs._target_worker = object()
+        graphs._speculative_runtime_hooks = SimpleNamespace(checkpoint_commit=callback)
+        slot = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            staged={
+                "seq_lens": torch.tensor([5]),
+                "req_pool_indices": torch.tensor([0]),
+            },
+            tree_cache=None,
+            tokens_per_request=7,
+        )
+        outputs = (
+            None,
+            torch.tensor([2]),
+            torch.tensor([[0, 1]]),
+            None,
+            None,
+            None,
+            (None, None),
+        )
+        with patch.object(spec_utils, "commit_mamba_states_after_verify") as commit:
+            graphs._commit(slot, outputs)
+        self.assertIs(commit.call_args.kwargs["checkpoint_commit"], callback)
+        self.assertIs(commit.call_args.kwargs["prepared_step_indices"], outputs[6])
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPostVerifyGraphsMatchEager(CustomTestCase):
     def setUp(self):

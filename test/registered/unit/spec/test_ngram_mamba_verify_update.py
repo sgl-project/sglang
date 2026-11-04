@@ -368,5 +368,86 @@ class TestMtpVerifyHookSignature(CustomTestCase):
             )
 
 
+class TestCheckpointCommitDispatch(CustomTestCase):
+    def test_commit_decline_takeover_and_failure_preserve_launch_order(self):
+        from sglang.kernels.ops.attention.linear import gdn_replayssm_spec_decode as op
+
+        kwargs = dict(
+            checkpoint_state=torch.zeros((1, 2, 1, 128, 128), dtype=torch.bfloat16),
+            d_cache=torch.zeros((1, 2, 1, 16, 128), dtype=torch.bfloat16),
+            k_cache=torch.zeros((1, 2, 1, 16, 128), dtype=torch.bfloat16),
+            g_cache=torch.zeros((1, 2, 1, 16)),
+            d_residual_cache=None,
+            k_residual_cache=None,
+            state_batch_indices=torch.tensor([0], dtype=torch.int32),
+            replay_indices=torch.tensor([1], dtype=torch.int64),
+            write_pos=torch.tensor([0, 3], dtype=torch.int32),
+            cache_base=torch.tensor([0, 0], dtype=torch.int32),
+            is_flush=torch.tensor([0, 1], dtype=torch.int8),
+            accept_lens=torch.tensor([3], dtype=torch.int32),
+        )
+
+        class Launch:
+            def __init__(self, name, calls):
+                self.name, self.calls = name, calls
+
+            def __getitem__(self, grid):
+                def launch(*args, **kw):
+                    self.calls.append(self.name)
+                    if self.name == "stock":
+                        args[0].add_(1)
+                    else:
+                        args[0].zero_()
+
+                return launch
+
+        for mode, expected in (
+            ("absent", ["stock", "finish"]),
+            ("decline", ["hook", "stock", "finish"]),
+            ("takeover", ["hook", "finish"]),
+            ("failure", ["hook"]),
+        ):
+            calls = []
+            kwargs["checkpoint_state"].zero_()
+            kwargs["write_pos"].copy_(torch.tensor([0, 3], dtype=torch.int32))
+
+            def hook():
+                calls.append("hook")
+                self.assertEqual(kwargs["checkpoint_state"].count_nonzero(), 0)
+                self.assertEqual(kwargs["write_pos"][1], 3)
+                if mode in ("takeover", "failure"):
+                    kwargs["checkpoint_state"].fill_(7)
+                if mode == "failure":
+                    raise RuntimeError("owned launch failed")
+                return mode == "takeover"
+
+            with (
+                self.subTest(mode=mode),
+                patch.object(
+                    op, "gdn_replayssm_compact_commit_kernel", Launch("stock", calls)
+                ),
+                patch.object(
+                    op,
+                    "_finish_gdn_replayssm_circular_fold_kernel",
+                    Launch("finish", calls),
+                ),
+            ):
+                if mode == "failure":
+                    with self.assertRaisesRegex(RuntimeError, "owned launch failed"):
+                        op.commit_gdn_replayssm_circular(**kwargs, compact_commit=hook)
+                else:
+                    op.commit_gdn_replayssm_circular(
+                        **kwargs, compact_commit=None if mode == "absent" else hook
+                    )
+                self.assertEqual(calls, expected)
+                self.assertTrue(
+                    torch.all(
+                        kwargs["checkpoint_state"]
+                        == (7 if mode in ("takeover", "failure") else 1)
+                    )
+                )
+                self.assertEqual(kwargs["write_pos"][1], 3 if mode == "failure" else 0)
+
+
 if __name__ == "__main__":
     unittest.main()
