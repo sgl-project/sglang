@@ -9,7 +9,7 @@ Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
 operator namespace, logical grouping, lazy registry metadata, and test placement.
 The implementation tutorial below does not replace that API contract.
 
-For performance work beyond the mechanics, read the guide for your platform: [performance-cuda.md](performance-cuda.md) (cost model, SASS checks, SM100 notes, fair comparisons).
+For performance work beyond the mechanics, read the guide for your platform: [performance-cuda.md](performance-cuda.md) (estimating before implementing, SASS checks, SM100 notes, fair comparisons).
 
 ## When to use JIT vs AOT (`sgl-kernel`)
 

@@ -2,7 +2,7 @@
 
 `SKILL.md` covers the mechanics of adding a kernel. This file is the short version of what matters once it has to be fast. Unless marked otherwise, observations are from nvcc / ptxas 13.4 on `sm_100a` (B200).
 
-**Measurement decides.** The model and rules below are a starting point. Accept or reject every optimization by measured time, read together with the SASS and Nsight Compute counters. A claim like "faster" or "no gain" in a PR needs a measurement behind it.
+**Measurement decides.** The estimates and rules below are a starting point. Accept or reject every optimization by measured time, read together with the SASS and Nsight Compute counters. A claim like "faster" or "no gain" in a PR needs a measurement behind it.
 
 ## Estimate before implementing
 
@@ -16,6 +16,8 @@ Classify each shape bucket the kernel serves, including padded sizes (CUDA-graph
 - Stores leave an SM at about 32 B/cycle. A large output written by a few SMs adds a drain time after the last store.
 
 **High throughput** (several waves, or a persistent kernel). Divide the work of each resource (HBM / L2 bytes, shared-memory bytes, tensor-core time, issue slots, per-pipe cycles, store rate) by its rate; the largest term is the bound. Each producer-consumer pipeline also needs enough data in flight: with S stages of B bytes and fetch latency L, the rate is at most S · B / L. Compute residency with the occupancy API (`runtime::get_blocks_per_sm`), not by dividing totals.
+
+**Use the estimate to steer the work.** A kernel takes at least the larger of two terms: its critical path (dependent memory round trips, dependent compute, synchronization hops, launch and prologue) and its most loaded resource (work divided by rate, per GPU and per SM). The larger term says what to optimize: shorten the chain, or cut or spread the work on the bound resource. Drop a design whose bound is already worse than the baseline before writing it. Compare each measurement with the bound: a large gap means the kernel does not do what the design says, or the estimate misses an effect, and either is the next thing to look at; a small gap means little is left to gain on this design.
 
 **Cross-CTA reduction**, from lowest to highest latency: a cluster with DSMEM (size capped, must fit in one GPC); global atomics (last-arriving CTA reduces; floating-point atomics are nondeterministic); a separate kernel.
 
@@ -44,6 +46,15 @@ Log registers, spills and stack frame with `SGLANG_JIT_LOG_RESOURCE_USAGE=1 SGLA
 - loads issued ahead of their use. The compiler does not hoist a load above a dynamic branch (it might fault), so prefetch manually across data-dependent loops;
 - no `BSSY` / `BRA` around short per-element conditionals. Select the operand, not the result: `f(c ? a : b)` stays branch-free, `c ? f(a) : b` branches once `f` is longer than a few instructions;
 - no lane loop (`ELECT` / `BRA.U.ANY`) around single-thread ops (TMA, `tcgen05.mma`, `tcgen05.commit`). Guard them with `warp::elect_one_lane()`, not `threadIdx.x == 0`.
+
+For a stall, separate waiting from contention by the Nsight Compute stall reason; more concurrency hides the first and worsens the second:
+
+| stall reason | cause |
+|---|---|
+| `long_scoreboard` | waiting on global memory (a dependent chain) |
+| `short_scoreboard` | waiting on shared memory or MUFU |
+| `lg_throttle` / `mio_throttle` | full LSU / MIO queues (too many narrow memory instructions) |
+| `wait` | fixed instruction latency |
 
 Fix in this order, and stop at the first that works: restructure the source (compile-time constants, `__restrict__`, integer types, a manual hoist); then a header-library helper or intrinsic; then single-instruction inline PTX, after checking the PTX ISA. Never rely on undefined behaviour.
 
