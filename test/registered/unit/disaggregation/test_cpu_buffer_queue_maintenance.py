@@ -36,6 +36,7 @@ class TestQueueMaintenance(CustomTestCase):
                         scheduler = SimpleNamespace(
                             scheduler_stage_metrics=None,
                             enable_decode_hicache=False,
+                            tree_cache=SimpleNamespace(linker=None),
                             enable_hisparse=False,
                             waiting_queue=IndexedReqList(ListKind.WAITING),
                             polling_count=count,

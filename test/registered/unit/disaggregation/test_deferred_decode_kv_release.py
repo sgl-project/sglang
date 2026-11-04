@@ -943,10 +943,10 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         receiver = FakeKVReceiver(mgr, "unused", 7)
         receiver.abort()
         entry.kv_receiver = receiver
-        q.queue = [entry]
+        q.queue.join([entry])
         self.assertEqual(self._pop(q), [entry])
-        self.assertEqual(q.queue, [])
-        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(list(q.queue.items()), [])
+        self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3])
         self.assertEqual(q.metadata_buffers.bootstrap_room[3], 0)
         self.assertFalse(receiver.abort_notified)

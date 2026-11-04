@@ -177,6 +177,8 @@ class TestKvChecksumComputer(unittest.TestCase):
         from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
         pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+        pool.full_kv_pool = SimpleNamespace()
+        pool.full_attention_layer_id_mapping = {0: 0}
         pool.get_state_buf_infos = lambda: ([1, 2], [], [])
         pool.get_qsa_pending_state_buf_infos = lambda: ([3, 4], [], [])
         pool.get_qsa_compressed_state_buf_infos = lambda: ([5], [], [])
