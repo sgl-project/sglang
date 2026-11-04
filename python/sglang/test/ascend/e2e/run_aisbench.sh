@@ -163,6 +163,14 @@ install_aisbench() {
     echo "===== Install aisbench in virtual env - Begin ====="
     PYTHON_ENV_FOR_AISBENCH=test_env_aisbench
     PIP_FOR_AISBENCH=${PYTHON_ENV_FOR_AISBENCH}/bin/pip
+    # Reuse the venv when it already imports cleanly; this keeps benchmark
+    # retry attempts fast and surfaces broken installs immediately.
+    if [ -x "${PYTHON_ENV_FOR_AISBENCH}/bin/python" ] && \
+       "${PYTHON_ENV_FOR_AISBENCH}/bin/python" -c "import ais_bench, datasets, pyarrow" >/dev/null 2>&1; then
+        echo "aisbench venv already usable, skip installation."
+        echo "===== Install aisbench in virtual env - End ====="
+        return
+    fi
     python -m venv ${PYTHON_ENV_FOR_AISBENCH}
     AISBENCH_SOURCE_PATH=/root/.cache/.cache/benchmark
     AISBENCH_PKG_PATH=/root/.cache/.cache/aisbench-packages
@@ -185,14 +193,27 @@ install_aisbench() {
         fi
     else
         echo "Install aisbench locally."
-        ${PIP_FOR_AISBENCH} install -U pip --no-index --find-links=${AISBENCH_PKG_PATH}
-        ${PIP_FOR_AISBENCH} install -e ${AISBENCH_SOURCE_PATH} --use-pep517 --no-index --find-links=${AISBENCH_PKG_PATH}
-        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/api.txt --no-index --find-links=${AISBENCH_PKG_PATH}
-        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/extra.txt --no-index --find-links=${AISBENCH_PKG_PATH}
+        # Offline-first with an online fallback: the PVC package cache may
+        # lag behind the benchmark repo requirements (observed: nltk needs
+        # regex>=2021.8.3 which is not in aisbench-packages), so retry each
+        # step against the Tsinghua mirror to fill the gaps.
+        ${PIP_FOR_AISBENCH} install -U pip --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -U pip -i ${pip_mirror_source}
+        ${PIP_FOR_AISBENCH} install -e ${AISBENCH_SOURCE_PATH} --use-pep517 --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -e ${AISBENCH_SOURCE_PATH} --use-pep517 --find-links=${AISBENCH_PKG_PATH} -i ${pip_mirror_source}
+        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/api.txt --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/api.txt --find-links=${AISBENCH_PKG_PATH} -i ${pip_mirror_source}
+        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/extra.txt --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/extra.txt --find-links=${AISBENCH_PKG_PATH} -i ${pip_mirror_source}
         if [ "${DATASET_TYPE}" == "bfcl" ];then
             ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/datasets/bfcl_dependencies.txt --no-index --find-links=${AISBENCH_PKG_PATH}
         fi
     fi
+    # The requirements pull numpy<2 (torch-npu ecosystem) but leave pyarrow
+    # unpinned, and the latest pyarrow imports only with numpy>=2:
+    # "ImportError: pyarrow requires NumPy 2.0 or newer, found 1.26.4".
+    # Cap pyarrow to a numpy-1.x-compatible release.
+    ${PIP_FOR_AISBENCH} install "pyarrow<16" -i ${pip_mirror_source}
     echo "===== Install aisbench in virtual env - End ====="
 }
 
