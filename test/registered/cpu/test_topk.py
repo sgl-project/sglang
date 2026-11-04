@@ -294,6 +294,40 @@ class TestTopK(CustomTestCase):
 
 
 class TestCustomTopK(CustomTestCase):
+    def test_biased_sigmoid_small_expert_counts(self):
+        """Biased sigmoid routing supports expert counts below one SIMD vector."""
+        for dtype, num_experts, num_tokens, renormalize in itertools.product(
+            [torch.float32, torch.bfloat16, torch.float16],
+            [1, 2, 4, 8, 16, 32],
+            [1, 3],
+            [False, True],
+        ):
+            with self.subTest(
+                dtype=dtype,
+                experts=num_experts,
+                tokens=num_tokens,
+                renormalize=renormalize,
+            ):
+                gates = torch.linspace(-2, 2, num_experts, dtype=dtype).repeat(
+                    num_tokens, 1
+                )
+                bias = torch.linspace(2, 0, num_experts)
+                topk = min(2, num_experts)
+                weights, ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
+                    torch.zeros(num_tokens, 1, dtype=dtype),
+                    gates,
+                    topk,
+                    renormalize,
+                    bias,
+                )
+                scores = gates.float().sigmoid()
+                expected_ids = (scores + bias).topk(topk, dim=-1).indices
+                expected_weights = scores.gather(1, expected_ids)
+                if renormalize:
+                    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+                torch.testing.assert_close(ids.long(), expected_ids)
+                torch.testing.assert_close(weights, expected_weights)
+
     def _run_single_test(
         self, M, E, topk, renormalize, dtype, native_custom_f, fused_custom_f
     ):
