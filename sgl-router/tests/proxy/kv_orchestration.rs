@@ -1198,7 +1198,7 @@ async fn lifecycle_host_source_is_opt_in_and_disabled_ready_pin_remains_absent()
         let router = router_with(&[&engine], false, Some(cfg)).await;
         start(&router, "task").await;
         api(&router,json!({"kind":"session_event","task":task("task"),"event":"tool_wait","event_id":"cold","revision":1,
-            "target":prefix(vec![1,2,3,4]),"worker_url":engine.url,"pressure":true,"expected_wait_ms":100,"source":{"tier":"host"}})).await;
+            "target":prefix(vec![1,2,3,4]),"worker_url":engine.url,"pressure":true,"expected_wait_ms":10000,"source":{"tier":"host"}})).await;
         query(&router, "task", "cold").await;
         lifecycle_prepare(&router, &engine, "task", vec![5, 6, 7, 8]).await;
         let view = ready(&router, "task", "prepare").await;
@@ -1681,4 +1681,35 @@ async fn new_lifecycle_and_actor_episodes_use_fresh_wire_ids_after_cached_comple
     }
     assert_eq!(wire_ids.len(), 3);
     assert_eq!(engine.state.lock().unwrap().operations.len(), 3);
+}
+
+#[tokio::test]
+async fn measured_lifecycle_keeps_host_copy_when_resumption_is_close() {
+    let engine = Engine::start().await;
+    let mut cfg = orchestration();
+    cfg.preparation_policy = Some(Default::default());
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "near").await;
+    let near = api(&router,json!({"kind":"session_event","task":task("near"),"event":"tool_wait","event_id":"near","revision":1,
+        "target":prefix(vec![1,2,3,4]),"worker_url":engine.url,"pressure":true,"expected_wait_ms":100,"source":{"tier":"host"}})).await;
+    assert_eq!(near["state"], "skipped");
+    assert_eq!(near["reason"], "insufficient expected cold residency");
+    assert!(engine
+        .state
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .all(|command| { command["envelope"]["actions"][0]["action_type"] != "sglang.demote" }));
+    let distant = api(&router,json!({"kind":"session_event","task":task("near"),"event":"tool_wait","event_id":"distant","revision":2,
+        "target":prefix(vec![1,2,3,4]),"worker_url":engine.url,"pressure":true,"expected_wait_ms":10000,"source":{"tier":"host"}})).await;
+    assert_eq!(distant["operations"].as_array().unwrap().len(), 1);
+    query(&router, "near", "distant").await;
+    assert!(engine
+        .state
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .any(|command| { command["envelope"]["actions"][0]["action_type"] == "sglang.demote" }));
 }

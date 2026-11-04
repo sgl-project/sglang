@@ -33,6 +33,10 @@ only its own claim when no shared interests remain; unknown child outcomes block
 acknowledgement. The query exposes `auto_pin` independently from `ready_scope`.
 With this policy configured, `tool_wait` can explicitly select a host source for
 L2-to-L3 DEMOTE; the default source remains GPU.
+The policy keeps host content when the expected wait minus its preparation lead
+is at most `min_cold_residency_ms` (default 3,000ms). This avoids demotion and
+immediate read-back during a short tool wait; explicit `submit` commands retain
+their requested behavior.
 
 P5 is a pure API; Router runtime integration remains P6. `session_index` provides
 `SessionIndex`, explicit `SessionLimits`, canonical `ContentKey`, parent-linked

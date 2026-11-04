@@ -16,6 +16,8 @@ pub struct PreparationConfig {
     pub ready_pin_ttl_ms: u64,
     /// Conservative token reservation; overlapping jobs may be charged twice.
     pub auto_pin_max_tokens: u64,
+    /// Avoid a host demotion immediately followed by its preparation.
+    pub min_cold_residency_ms: u64,
 }
 
 impl Default for PreparationConfig {
@@ -28,6 +30,7 @@ impl Default for PreparationConfig {
             max_lead_ms: 10_000,
             ready_pin_ttl_ms: 0,
             auto_pin_max_tokens: 65_536,
+            min_cold_residency_ms: 3_000,
         }
     }
 }
@@ -44,6 +47,7 @@ impl PreparationConfig {
             || self.ready_pin_ttl_ms > 60_000
             || self.auto_pin_max_tokens > 1 << 24
             || (self.ready_pin_ttl_ms > 0 && self.auto_pin_max_tokens == 0)
+            || self.min_cold_residency_ms > 86_400_000
         {
             return Err("invalid preparation sample or lead budget");
         }

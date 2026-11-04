@@ -1127,6 +1127,24 @@ impl Actor {
                             }
                         }
                         if event == "tool_wait"
+                            && value["source"]["tier"] == "host"
+                            && self
+                                .config
+                                .preparation_policy
+                                .as_ref()
+                                .is_some_and(|policy| {
+                                    value["expected_wait_ms"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                        .saturating_sub(lead)
+                                        <= policy.min_cold_residency_ms
+                                })
+                        {
+                            return Ok(
+                                json!({"state":"skipped","reason":"insufficient expected cold residency","estimated_preparation_ms":cost}),
+                            );
+                        }
+                        if event == "tool_wait"
                             && (!value["pressure"].as_bool().unwrap_or(false)
                                 || value["expected_wait_ms"].as_u64().unwrap_or(0)
                                     < self.config.poll_ms)

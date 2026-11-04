@@ -4988,3 +4988,9 @@ parent 审阅完整工具与测试，修正 tool_wait RPC 耗时未从 resume_ex
 在原准备 Job 内挂载一次有限 L2 PIN 子操作，默认 TTL=0 关闭；已有兴趣共享决定清理，失效不自动重获。保守 token 预算、操作/claim 计数和父子 prefix/payload material 均受限；未知申请或释放保留预算并阻止 ack。内部子 claim 身份绑定 wire episode；公开准备观察与 auto_pin 结果分开。host 来源的生命周期 DEMOTE 仅在新策略配置后开放。
 
 parent 阅读完整差异与测试，要求将无 claim 查询的拒绝快捷路径限制为内部新 claim，防止显式失败续期掩盖旧有效 claim。修正后 parent 独立复测 HTTP orchestration 27 项通过，3.14s；core 49 项通过，另 1 项 live 测试按原配置忽略。真实请求发送不会释放保护；共享清理、丢响应、未知释放、TTL、缺失窗口及 material 拒绝均覆盖。Rustfmt 1.92.0 通过；Clippy 无新增诊断，原 backend_protection/observations/protocol 的七项诊断独立记录。日志：lifecycle-opt/o4-parent-http-tests.log、o4-parent-core-tests.log。
+
+### O5 — 避免短工具等待中的升降往返
+
+新增最小预期冷层驻留窗口 min_cold_residency_ms，默认 3000ms。新策略仅在 host 来源的生命周期 tool_wait 中，比较剩余等待减准备提前量；窗口不足则保留 host 副本。显式 submit 指令及旧策略保持原行为。该门槛避免仅因压力就 DEMOTE 随即 PREFETCH 同一短期上下文。
+
+parent 独立 HTTP 回归 28 项通过；新增测试同时验证近恢复跳过、较长等待提交实际 DEMOTE，包含保护及旧行为回归。日志：lifecycle-opt/o5-cold-window-parent-tests.log。
