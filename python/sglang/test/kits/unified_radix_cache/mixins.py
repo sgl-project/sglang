@@ -17,10 +17,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    EvictLayer,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     ServerArgs,
@@ -322,9 +320,13 @@ class UnifiedRadixCacheFixtures:
         return chain
 
     def _release_ongoing_load_back_locks(self, cache):
-        for node, lock_params, host_lock_params in list(
-            cache.ongoing_load_back.values()
-        ):
+        receipts = []
+        for entry in cache.ongoing_load_back.values():
+            if isinstance(entry, list):
+                receipts.extend(entry)
+            else:
+                receipts.append(entry)
+        for node, lock_params, host_lock_params in receipts:
             cache.dec_lock_ref(node, lock_params)
             cache.dec_host_lock_ref(node, host_lock_params)
         cache.ongoing_load_back.clear()

@@ -23,6 +23,7 @@ import tempfile
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import (
     HipKernel,
     check_hip,
@@ -97,9 +98,8 @@ def smallm_moe_enabled() -> bool:
     if not envs.SGLANG_ROCM_SMALLM_MOE.get():
         return False
     if _available is None:
-        arch = ""
-        if torch.version.hip and torch.cuda.is_available():
-            arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        hip = current_arch().hip
+        arch = hip.gcn_arch if hip is not None else ""
         _available = (
             arch == "gfx950"
             and hip_version() >= (7, 2, 0)
