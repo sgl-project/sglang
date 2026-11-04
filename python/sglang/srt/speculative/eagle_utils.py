@@ -136,8 +136,8 @@ def _eagle_prefill_tail_tokens(
     return tail_tokens
 
 
-# Measured on H200 with GLM-5.3-Flash: the KV-only pass adds a fixed CPU cost (one more
-# eager draft forward) that batches of at most this many KV-only tokens did not win back.
+# Measured on H200 with GLM-5.3-Flash: the KV-only pass is one more eager draft forward,
+# a fixed CPU cost that batches of at most this many KV-only tokens did not win back.
 _MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS = 4096
 
 

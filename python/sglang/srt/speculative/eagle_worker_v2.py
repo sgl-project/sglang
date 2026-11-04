@@ -1053,8 +1053,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return (
             isinstance(model, DeepseekV3ForCausalLMNextN)
             and model.supports_forward_kv_only(kv_cache_dtype=kv_cache_dtype)
-            # With an FP8 cache, these DSA prefills (flashmla_auto may pick one) read
-            # fresh KV when no request has a prefix; the last-token pass reads the cache.
+            # With an FP8 cache and no prefix, these DSA prefills read fresh KV,
+            # while the last-token pass reads the cache; flashmla_auto may pick one.
             and not (
                 kv_cache_dtype == torch.float8_e4m3fn
                 and get_exec().kernel.dsa_prefill_backend
