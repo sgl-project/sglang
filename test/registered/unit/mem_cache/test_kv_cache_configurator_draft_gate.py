@@ -66,6 +66,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 from sglang.test.unified_allocator_fixtures import (
+    FakeUnifiedSWAKVPool,
     arena_of,
     plan_stand_in,
     stand_in_views,
@@ -79,37 +80,6 @@ from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
     MultiLayerEagleWorkerV2,
 )
 from sglang.test.tree_slots import tree_slots_of
-
-
-class _FakeKVCache:
-    def __init__(self, source, name=None):
-        # A bare size for a private pool; else the band of ``source`` (a test
-        # arena) whose unit moves this buffer follows.
-        size = source if name is None else source.num_entries(name)
-        if name is not None:
-            source.follow(name, self)
-        self.buf = torch.full((size,), -1, dtype=torch.int64)
-        self.allocator = None
-
-    def move_units(self, dst_pages, src_pages, page_size):
-        slots = torch.arange(page_size, device=dst_pages.device)
-        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
-        src_loc = (src_pages[:, None] * page_size + slots).flatten()
-        self.buf[dst_loc] = self.buf[src_loc].clone()
-
-    def attach_allocator(self, allocator):
-        self.allocator = allocator
-
-
-class _FakeUnifiedSWAKVPool:
-    def __init__(self, shared_pool):
-        self.full_kv_pool = _FakeKVCache(shared_pool, "full")
-        self.swa_kv_pool = _FakeKVCache(shared_pool, "swa")
-        self.full_to_swa_index_mapping = None
-
-    def attach_allocators(self, *, full_allocator, swa_allocator):
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
 
 
 class _CapturedSizes(Exception):
@@ -228,9 +198,9 @@ class TestDraftBindingDispatch(CustomTestCase):
         alloc = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
             arena=pool,
-            kvcache=_FakeUnifiedSWAKVPool(pool),
+            kvcache=FakeUnifiedSWAKVPool(pool),
             views=stand_in_views(
-                ChainRoles(owner="full", window="swa"), _FakeUnifiedSWAKVPool(pool)
+                ChainRoles(owner="full", window="swa"), FakeUnifiedSWAKVPool(pool)
             ),
             device="cpu",
             full_max_total_num_tokens=n_full,

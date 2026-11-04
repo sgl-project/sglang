@@ -1,8 +1,6 @@
-import importlib.util
 import queue
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
 import numpy as np
@@ -14,6 +12,7 @@ from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeK
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mori_stub import mori_stub
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -54,29 +53,8 @@ class TestCommonSenderLifecycle(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # These tests exercise Mori's Python queue adapter, not its RDMA engine.
-        if "mori" not in sys.modules and importlib.util.find_spec("mori") is None:
-            package, cpp, io = (
-                ModuleType("mori"),
-                ModuleType("mori.cpp"),
-                ModuleType("mori.io"),
-            )
-            cpp.TransferStatus = type("TransferStatus", (), {})
-            for name in (
-                "BackendType",
-                "EngineDesc",
-                "IOEngine",
-                "IOEngineConfig",
-                "MemoryDesc",
-                "MemoryLocationType",
-                "PollCqMode",
-                "RdmaBackendConfig",
-            ):
-                setattr(io, name, type(name, (), {}))
-            io.StatusCode = SimpleNamespace(SUCCESS=0, IN_PROGRESS=1)
-            package.cpp, package.io = cpp, io
-            stub = patch.dict(
-                sys.modules, {"mori": package, "mori.cpp": cpp, "mori.io": io}
-            )
+        stub = mori_stub()
+        if stub is not None:
             stub.start()
             cls.addClassCleanup(stub.stop)
         from sglang.srt.disaggregation.mori.conn import MoriKVManager

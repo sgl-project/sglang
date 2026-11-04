@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.kv.plan import (
     WireEntry,
 )
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
-from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -127,20 +126,9 @@ class KVStorage:
         a state slot (a radix hit) keeps that. If the slots run out after the
         rows were bound, the rows and slots this call took go back before
         `StateSlotsExhausted` surfaces."""
-        table = self.requests
-        state = self._allocator.state
-        fresh_rows = [req.kv.req_pool_idx is None for req in reqs]
-        rows = table.alloc(reqs)
-        if rows is None or state is None:
-            return rows
-        try:
-            state.acquire(table, reqs, rows, fresh_rows)
-        except StateSlotsExhausted:
-            for req, fresh in zip(reqs, fresh_rows):
-                if fresh:
-                    table.free(req)
-            raise
-        return rows
+        from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+
+        return acquire_rows(self.requests, self._allocator.state, reqs)
 
     def take_tokens(
         self, num_tokens: int, *, make_room: Callable[[int], Any]

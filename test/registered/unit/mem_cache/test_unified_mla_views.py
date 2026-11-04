@@ -22,7 +22,7 @@ GPU parity of the read/write kernels (set_mla_kv_buffer TMA path etc.) lives in
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import arena_of
+from sglang.test.unified_allocator_fixtures import FakeKVCache, arena_of
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -257,27 +257,6 @@ class TestMLAView(unittest.TestCase):
                         )
 
 
-class _FakeKVCache:
-    def __init__(self, source, name=None):
-        # A bare size for a pool no arena moves; else the band of ``source``
-        # (a test arena) whose unit moves this buffer follows.
-        if name is None:
-            size = source
-        else:
-            size = source.num_entries(name)
-            source.follow(name, self)
-        # buf[p] == virtual id currently stored at physical slot p (-1 if free).
-        self.buf = torch.full((size,), -1, dtype=torch.int64)
-
-    def move_units(
-        self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
-    ):
-        slots = torch.arange(page_size, device=dst_pages.device)
-        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
-        src_loc = (src_pages[:, None] * page_size + slots).flatten()
-        self.buf[dst_loc] = self.buf[src_loc].clone()
-
-
 class TestTranslateKvLoc(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
@@ -375,7 +354,7 @@ class TestTranslateKvLoc(unittest.TestCase):
             self.assertTrue(torch.equal(got.reshape(-1), want))
 
 
-class _RecordingView(_FakeKVCache):
+class _RecordingView(FakeKVCache):
     """Stands in for the owner sub-pool's view, recording the ids it is handed."""
 
     seen = None
@@ -403,7 +382,7 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
                 roles=ChainRoles(owner="full", state="mamba"),
                 arena=pool,
                 kvcache=owner,
-                views={"full": owner, "mamba": _FakeKVCache(pool, "mamba")},
+                views={"full": owner, "mamba": FakeKVCache(pool, "mamba")},
                 device=_DEV,
                 page_size=ps,
             )
