@@ -127,10 +127,8 @@ ZE_AFFINITY_MASK=0,1 sglang serve \
 
 Tensor parallelism all-reduces every decoder layer, so both cards need full
 PCIe Gen5 links (check `current_link_speed` of the card's upstream port in
-sysfs); on a Gen2 link one 32 MB all-reduce takes 13 ms instead of 1.9 ms. On
-such hosts, drop `--num-gpus 2 --tp-size 2`: the loader then splits the decoder
-layers over the visible cards, which sends one hidden state between them per
-forward and is insensitive to link speed.
+sysfs); on a Gen2 link one 32 MB all-reduce takes 13 ms instead of 1.9 ms, so
+pick two cards whose links train at Gen5.
 
 ## 6. Benchmark
 
