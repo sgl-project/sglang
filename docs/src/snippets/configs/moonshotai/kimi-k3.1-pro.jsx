@@ -207,7 +207,8 @@ export const config = {
             "--hicache-write-policy write_back",
             "--hicache-ratio 2.5",
           ],
-          env: (s) => [`SGLANG_HICACHE_MAMBA_HOST_RATIO=${s.pdMode === "prefill" ? 8 : 12}`],
+          // Keeps every rank on the Rust TreeCore; write-back asserts on a mix with the Python one.
+          env: (s) => [`SGLANG_HICACHE_MAMBA_HOST_RATIO=${s.pdMode === "prefill" ? 8 : 12}`, "RUSTUP_TOOLCHAIN=stable"],
           hints: ["The host pools pin about 190 GB of host memory per GPU; check the node's GTT limit before raising either ratio."],
         },
         { id: "amd-off", label: "Off", showWhen: (s) => config.isAmd(s) },
@@ -277,6 +278,8 @@ export const config = {
     mi350x: "lmsysorg/sglang:dev-kimi-k31-pro-mi35x",
     mi355x: "lmsysorg/sglang:dev-kimi-k31-pro-mi35x",
   },
+  // MI35x PD roles take the host network and RDMA flags for the bootstrap ports and Mooncake.
+  dockerHostNetworkWhen: (s) => config.isAmd(s) && ["prefill", "decode"].includes(s.pdMode),
   github: {
     cookbookModel: "moonshotai/kimi-k3.1-pro",
   },
