@@ -10,6 +10,7 @@ from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,6 +31,16 @@ def _pack_topk_oracle(topk_ids, topk_weights):
         topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     )
     return (topk_ids.to(torch.int32) << 16) | weight_bits
+
+
+def _rank_local_oracle(packed, offset, count):
+    """Rank-local packed ids: experts [offset, offset + count) become 0..count-1,
+    any other expert in top-k slot k becomes count + k; weight bits unchanged."""
+    ids = packed >> 16
+    slot = torch.arange(packed.shape[1], device=packed.device, dtype=torch.int32)
+    is_local = (ids >= offset) & (ids < offset + count)
+    local_ids = torch.where(is_local, ids - offset, count + slot)
+    return (local_ids << 16) | (packed & 0xFFFF)
 
 
 def _route_oracle(
@@ -118,6 +129,110 @@ class TestRouteQuant(CustomTestCase):
             torch.equal(quantized.view(torch.uint8), ref_q.view(torch.uint8))
         )
         torch.testing.assert_close(scale, ref_scale, rtol=0, atol=0)
+
+    def test_rank_local_packed_ids(self):
+        """Under EP the fused launch can write rank-local packed ids so FlashInfer
+        routes count + top_k experts instead of 896; only the packed ids change,
+        and they must stay unique per row and below count + top_k."""
+        if not moe_route_quant_fused.available():
+            self.skipTest("fused route+quant kernel unavailable")
+        for ep_size in (2, 8, 16):
+            count = NUM_EXPERTS // ep_size
+            for rank in sorted({0, ep_size // 2, ep_size - 1}):
+                # 64 is the fused launch's token cap
+                for num_tokens in (1, 5, 17, 64):
+                    torch.manual_seed(num_tokens + rank)
+                    scores = torch.randn(
+                        num_tokens, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16
+                    )
+                    bias = torch.randn(NUM_EXPERTS, device="cuda")
+                    hidden = torch.randn(
+                        num_tokens, 3584, device="cuda", dtype=torch.bfloat16
+                    )
+                    args = (scores, bias, hidden, TOPK)
+                    kwargs = dict(
+                        renormalize=True, routed_scaling_factor=2.5, apply_scale=True
+                    )
+                    ref = moe_route_quant_fused.route_quant_fused(*args, **kwargs)
+                    out = moe_route_quant_fused.route_quant_fused(
+                        *args,
+                        **kwargs,
+                        local_expert_offset=rank * count,
+                        num_local_experts=count,
+                    )
+                    tag = f"ep={ep_size} rank={rank} m={num_tokens}"
+                    for i in (0, 1, 3, 4):
+                        self.assertTrue(
+                            torch.equal(
+                                out[i].view(torch.uint8), ref[i].view(torch.uint8)
+                            ),
+                            msg=tag,
+                        )
+                    self.assertTrue(
+                        torch.equal(
+                            out[2], _rank_local_oracle(ref[2], rank * count, count)
+                        ),
+                        msg=tag,
+                    )
+                    local_ids = (out[2] >> 16).sort(dim=-1).values
+                    self.assertTrue(bool((local_ids[:, 1:] != local_ids[:, :-1]).all()))
+                    self.assertLess(int(local_ids.max()), count + TOPK, msg=tag)
+
+    def test_handoff_rank_local_layout(self):
+        """The runner must learn which range the packed ids it took were made
+        rank-local for (it changes num_experts and the offset), exactly once and
+        only for that tensor; a range that cannot shrink routing keeps global ids."""
+        if not moe_route_quant_fused.available():
+            self.skipTest("fused route+quant kernel unavailable")
+        torch.manual_seed(2)
+        scores = torch.randn(8, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(NUM_EXPERTS, device="cuda")
+        hidden = torch.randn(8, 3584, device="cuda", dtype=torch.bfloat16)
+
+        def route_and_take(local_experts):
+            route_quant_handoff.stage(hidden, local_experts=local_experts)
+            hit = route_quant_handoff.try_route_quant_fused(
+                scores,
+                bias,
+                TOPK,
+                num_fused_shared_experts=0,
+                renormalize=True,
+                routed_scaling_factor=2.5,
+                apply_routed_scaling_factor_on_output=False,
+            )
+            self.assertIsNotNone(hit)
+            return route_quant_handoff.take(hidden)[0]
+
+        try:
+            ref_packed = route_and_take(None)
+            self.assertIsNone(route_quant_handoff.take_local_experts(ref_packed))
+            for staged, expected in (
+                ((336, 112), (336, 112)),
+                ((0, NUM_EXPERTS), None),  # every expert local: nothing to shrink
+                ((840, 112), None),  # past the routed experts
+            ):
+                packed = route_and_take(staged)
+                self.assertIsNone(
+                    route_quant_handoff.take_local_experts(packed.clone())
+                )
+                packed = route_and_take(staged)
+                self.assertEqual(
+                    route_quant_handoff.take_local_experts(packed), expected
+                )
+                self.assertIsNone(route_quant_handoff.take_local_experts(packed))
+                want = (
+                    ref_packed
+                    if expected is None
+                    else (_rank_local_oracle(ref_packed, *expected))
+                )
+                self.assertTrue(torch.equal(packed, want), msg=str(staged))
+        finally:
+            route_quant_handoff.clear()
+        # FlashInfer's routing requires num_experts % 4 == 0
+        rank_local = route_quant_handoff.rank_local_num_experts
+        self.assertEqual(rank_local(336, 112, NUM_EXPERTS, TOPK), 128)
+        self.assertEqual(rank_local(0, 7, 64, 6), 16)
+        self.assertIsNone(rank_local(0, 56, 72, 16))  # 72 does not shrink
 
     def test_route_radix_ties_and_nan(self):
         """The cases the self-comparison could not see.
