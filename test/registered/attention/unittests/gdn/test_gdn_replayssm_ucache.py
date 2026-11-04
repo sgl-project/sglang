@@ -105,10 +105,24 @@ class TestGdnReplaySsmUcache(CustomTestCase):
         for step in range(NUM_STEPS):
             if step == DT_BIAS_UPDATE_STEP:
                 dt_bias.copy_(randn(HV, scale=0.5))
-            q, k = randn(batch * T, H, K), randn(batch * T, H, K)
-            v = randn(batch * T, HV, V, scale=0.5)
+            # q/k/v are views into one packed [q | k | v] row per token, as in
+            # serving: the verifier copies them out with a single split launch.
+            qkv = torch.cat(
+                (
+                    randn(batch * T, H * K),
+                    randn(batch * T, H * K),
+                    randn(batch * T, HV * V, scale=0.5),
+                ),
+                dim=1,
+            ).to(torch.bfloat16)
+            q, k, v = torch.split(qkv, [H * K, H * K, HV * V], dim=1)
+            q, k, v = (
+                q.view(batch * T, H, K),
+                k.view(batch * T, H, K),
+                v.view(batch * T, HV, V),
+            )
             a, b = randn(batch * T, HV, scale=0.5), randn(batch * T, HV)
-            q, k, v, a, b = (x.to(torch.bfloat16) for x in (q, k, v, a, b))
+            a, b = a.to(torch.bfloat16), b.to(torch.bfloat16)
             hist_before = buffers.hist_len.clone()
             output = verifier.target_verify(
                 layer_id=0,

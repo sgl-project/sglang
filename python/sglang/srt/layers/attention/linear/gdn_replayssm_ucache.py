@@ -154,6 +154,65 @@ def _commit_cursors_kernel(
     tl.store(hist_pool_ptr + slot, new_hist, live)
 
 
+@triton.jit
+def _zero_padded_rows_kernel(
+    slots_ptr,
+    out_ptr,
+    row_numel,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if tl.load(slots_ptr + row) < 0:
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(
+            out_ptr + row.to(tl.int64) * row_numel + offs,
+            tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
+            offs < row_numel,
+        )
+
+
+# Copies the packed [q | k | v] token rows of one strided view into three
+# contiguous buffers in a single launch (the FlashInfer verify reads contiguous q/k/v).
+@triton.jit
+def _split_qkv_kernel(
+    src_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    src_row_stride,
+    Q_COLS: tl.constexpr,
+    K_COLS: tl.constexpr,
+    V_COLS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    total = Q_COLS + K_COLS + V_COLS
+    x = tl.load(src_ptr + token * src_row_stride + cols, mask=cols < total)
+    tl.store(q_ptr + token * Q_COLS + cols, x, mask=cols < Q_COLS)
+    k_cols = cols - Q_COLS
+    tl.store(k_ptr + token * K_COLS + k_cols, x, mask=(k_cols >= 0) & (k_cols < K_COLS))
+    v_cols = cols - Q_COLS - K_COLS
+    tl.store(v_ptr + token * V_COLS + v_cols, x, mask=(v_cols >= 0) & (v_cols < V_COLS))
+
+
+# Refreshes every layer's fp32 gate-parameter copy from its bf16 source in one
+# launch; the int64 tables hold the source and destination addresses.
+@triton.jit
+def _refresh_gate_params_kernel(
+    src_ptrs,
+    dst_ptrs,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    entry = tl.program_id(0)
+    src = tl.load(src_ptrs + entry).to(tl.pointer_type(tl.bfloat16))
+    dst = tl.load(dst_ptrs + entry).to(tl.pointer_type(tl.float32))
+    offs = tl.arange(0, BLOCK)
+    mask = offs < numel
+    tl.store(dst + offs, tl.load(src + offs, mask=mask).to(tl.float32), mask=mask)
+
+
 def gather_gdn_ucache_rows(
     *, slots: torch.Tensor, buffers: GdnUcacheBuffers
 ) -> GdnUcacheRows:
@@ -220,14 +279,26 @@ def _load_flush_kernel(device: torch.device) -> Callable:
 
 
 class GdnUcacheVerifier:
-    """Runs the per-layer verify launches of one target model."""
+    """Runs the per-layer verify launches of one target model.
+
+    Per forward, the first GDN layer gathers the cursors, zeroes the padded rows of
+    the shared output buffer and refreshes every layer's fp32 gate parameters; each
+    layer then costs one q/k/v split plus the FlashInfer launch."""
 
     def __init__(self, *, device: torch.device, first_layer_id: int):
         self._flush_kernel = _load_flush_kernel(device)
+        self._device = device
         self._first_layer_id = first_layer_id
-        # layer_id -> fp32 (A_log, dt_bias) buffers, allocated before any capture.
+        # layer_id -> fp32 (A_log, dt_bias) passed to FlashInfer, allocated eagerly.
         self._gate_params: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # (bf16 source, fp32 destination) pairs refreshed by one launch per forward.
+        self._gate_refresh: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._gate_refresh_tables: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         self._rows: Optional[GdnUcacheRows] = None
+        # Shared by all layers: a layer's output is consumed (gated norm and
+        # out_proj) before the next GDN layer's verify overwrites it.
+        self._output: Optional[torch.Tensor] = None
+        self._qkv: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
     def target_verify(
         self,
@@ -252,24 +323,27 @@ class GdnUcacheVerifier:
         num_v_heads, head_v_dim = value.shape[-2], value.shape[-1]
         num_k_heads, head_k_dim = key.shape[-2], key.shape[-1]
         batch = value.numel() // (num_draft_tokens * num_v_heads * head_v_dim)
-        # The first GDN layer of each forward gathers the cursors for all layers;
-        # inside a captured graph this gather is replayed before that layer.
+        token_shape = (batch, num_draft_tokens)
+        output = self._output_buffer(
+            batch=batch, row_shape=(num_draft_tokens, num_v_heads, head_v_dim)
+        )
         if layer_id == self._first_layer_id:
             self._rows = gather_gdn_ucache_rows(
                 slots=cache_indices[:batch], buffers=buffers
             )
+            self._zero_padded_rows(output)
+            self._refresh_gate_params()
         rows = self._rows
         assert rows is not None and rows.slots.shape[0] == batch
         A_log_fp32, dt_bias_fp32 = self._fp32_gate_params(layer_id, A_log, dt_bias)
-        output = value.new_zeros(batch, num_draft_tokens, num_v_heads, head_v_dim)
-        token_shape = (batch, num_draft_tokens)
+        q, k, v = self._contiguous_qkv(query, key, value)
         self._flush_kernel(
             A_log=A_log_fp32,
             a=a.reshape(*token_shape, num_v_heads),
             dt_bias=dt_bias_fp32,
-            q=query.reshape(*token_shape, num_k_heads, head_k_dim),
-            k=key.reshape(*token_shape, num_k_heads, head_k_dim),
-            v=value.reshape(*token_shape, num_v_heads, head_v_dim),
+            q=q.view(*token_shape, num_k_heads, head_k_dim),
+            k=k.view(*token_shape, num_k_heads, head_k_dim),
+            v=v.view(*token_shape, num_v_heads, head_v_dim),
             b=b.reshape(*token_shape, num_v_heads),
             initial_state_source=state,
             initial_state_indices=rows.slots,
@@ -296,12 +370,24 @@ class GdnUcacheVerifier:
         g_ring: torch.Tensor,
         flush_min: int,
     ) -> None:
-        """Compiles the kernels and builds FlashInfer's per-batch-size helper
-        tensors eagerly, so CUDA graph capture creates none of them."""
+        """Compiles the kernels, allocates the shared buffers and builds
+        FlashInfer's per-batch-size helper tensors eagerly, so CUDA graph capture
+        creates none of them."""
         num_k_heads, head_k_dim = k_ring.shape[1], k_ring.shape[3]
         num_v_heads, head_v_dim = u_ring.shape[1], u_ring.shape[3]
         device = state.device
         tokens = (max_batch_size, num_draft_tokens)
+        self._output_buffer(
+            batch=max_batch_size, row_shape=(num_draft_tokens, num_v_heads, head_v_dim)
+        )
+        self._qkv_buffers(
+            num_tokens=max_batch_size * num_draft_tokens,
+            cols=(
+                num_k_heads * head_k_dim,
+                num_k_heads * head_k_dim,
+                num_v_heads * head_v_dim,
+            ),
+        )
 
         def zeros(*shape, dtype=torch.bfloat16):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -332,24 +418,136 @@ class GdnUcacheVerifier:
                 restart_hist_on_flush=False,
             )
 
+    def _output_buffer(self, *, batch: int, row_shape: tuple) -> torch.Tensor:
+        out = self._output
+        if out is None or out.shape[0] < batch or tuple(out.shape[1:]) != row_shape:
+            _assert_not_capturing("the verify output buffer")
+            out = torch.zeros(
+                (batch, *row_shape), dtype=torch.bfloat16, device=self._device
+            )
+            self._output = out
+        return out[:batch]
+
+    def _zero_padded_rows(self, output: torch.Tensor) -> None:
+        # Valid rows are fully written by every layer; padded rows are skipped by
+        # the kernel and must read as zero.
+        rows = self._rows
+        batch = output.shape[0]
+        if batch == 0:
+            return
+        row_numel = output[0].numel()
+        block = 4096
+        _zero_padded_rows_kernel[(batch, triton.cdiv(row_numel, block))](
+            rows.slots, output, row_numel, BLOCK=block
+        )
+
+    def _qkv_buffers(
+        self, *, num_tokens: int, cols: tuple[int, int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bufs = self._qkv
+        if (
+            bufs is None
+            or bufs[0].shape[0] < num_tokens
+            or tuple(buf.shape[1] for buf in bufs) != cols
+        ):
+            _assert_not_capturing("the q/k/v split buffers")
+            bufs = tuple(
+                torch.empty((num_tokens, c), dtype=torch.bfloat16, device=self._device)
+                for c in cols
+            )
+            self._qkv = bufs
+        return tuple(buf[:num_tokens] for buf in bufs)
+
+    def _contiguous_qkv(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if query.is_contiguous() and key.is_contiguous() and value.is_contiguous():
+            return query, key, value
+        q_cols, k_cols, v_cols = (
+            x.shape[-2] * x.shape[-1] for x in (query, key, value)
+        )
+        num_tokens = query.numel() // q_cols
+        row_stride = query.stride(-3)
+        elem = query.element_size()
+        packed = (
+            key.data_ptr() == query.data_ptr() + q_cols * elem
+            and value.data_ptr() == key.data_ptr() + k_cols * elem
+            and key.stride(-3) == row_stride
+            and value.stride(-3) == row_stride
+            and all(
+                x.stride(-1) == 1 and x.stride(-2) == x.shape[-1]
+                for x in (query, key, value)
+            )
+        )
+        if not packed:
+            return query.contiguous(), key.contiguous(), value.contiguous()
+        q, k, v = self._qkv_buffers(
+            num_tokens=num_tokens, cols=(q_cols, k_cols, v_cols)
+        )
+        block = 1024
+        _split_qkv_kernel[(num_tokens, triton.cdiv(q_cols + k_cols + v_cols, block))](
+            query,
+            q,
+            k,
+            v,
+            row_stride,
+            Q_COLS=q_cols,
+            K_COLS=k_cols,
+            V_COLS=v_cols,
+            BLOCK=block,
+        )
+        return q, k, v
+
     def _fp32_gate_params(
         self, layer_id: int, A_log: torch.Tensor, dt_bias: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         params = self._gate_params.get(layer_id)
         if params is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "GDN u-cache verify: layer gate parameters must be prepared by "
-                    "an eager forward before CUDA graph capture."
-                )
+            _assert_not_capturing("layer gate parameters (run an eager forward first)")
             params = (_fp32_view_or_buffer(A_log), _fp32_view_or_buffer(dt_bias))
             self._gate_params[layer_id] = params
-        # Refreshed on device every call (and captured), so in-place weight
-        # updates reach graph replays; an fp32 contiguous parameter is aliased.
+            for buf, src in zip(params, (A_log, dt_bias)):
+                if buf.data_ptr() == src.data_ptr():
+                    continue
+                buf.copy_(src)
+                if src.dtype == torch.bfloat16 and src.is_contiguous():
+                    self._gate_refresh.append((src, buf))
+                    self._gate_refresh_tables = None
+        # Other non-aliased sources (not bf16 contiguous) are refreshed per call.
         for buf, src in zip(params, (A_log, dt_bias)):
-            if buf.data_ptr() != src.data_ptr():
+            if buf.data_ptr() != src.data_ptr() and not (
+                src.dtype == torch.bfloat16 and src.is_contiguous()
+            ):
                 buf.copy_(src)
         return params
+
+    def _refresh_gate_params(self) -> None:
+        # In-place weight updates reach graph replays: the refresh is captured.
+        if not self._gate_refresh:
+            return
+        if self._gate_refresh_tables is None:
+            _assert_not_capturing("the gate refresh tables")
+            self._gate_refresh_tables = tuple(
+                torch.tensor(
+                    [t.data_ptr() for t in group],
+                    dtype=torch.int64,
+                    device=self._device,
+                )
+                for group in zip(*self._gate_refresh)
+            )
+        numel = self._gate_refresh[0][0].numel()
+        assert all(src.numel() == numel for src, _ in self._gate_refresh)
+        src_ptrs, dst_ptrs = self._gate_refresh_tables
+        _refresh_gate_params_kernel[(len(self._gate_refresh),)](
+            src_ptrs, dst_ptrs, numel, BLOCK=triton.next_power_of_2(numel)
+        )
+
+
+def _assert_not_capturing(what: str) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"GDN u-cache verify: {what} must be prepared before CUDA graph capture."
+        )
 
 
 def _fp32_view_or_buffer(param: torch.Tensor) -> torch.Tensor:

@@ -809,26 +809,6 @@ def scatter_mamba_states_after_mtp_verify(
                 src_indices_raw,
             )
 
-    scatter_conv_windows_after_mtp_verify(
-        mamba_caches,
-        state_indices_tensor,
-        last_correct_step_indices,
-        mamba_track_indices,
-        mamba_steps_to_track,
-        src_indices_raw=src_indices_raw,
-    )
-
-
-def scatter_conv_windows_after_mtp_verify(
-    mamba_caches,
-    state_indices_tensor: torch.Tensor,
-    last_correct_step_indices: torch.Tensor,
-    mamba_track_indices: torch.Tensor | None,
-    mamba_steps_to_track: torch.Tensor | None,
-    src_indices_raw: torch.Tensor | None = None,
-) -> None:
-    """Scatter the accepted per-step conv windows (all conv types) into the
-    persistent conv caches, plus the interval-crossing track slots."""
     pairs = [
         (conv, window)
         for conv, window in zip(

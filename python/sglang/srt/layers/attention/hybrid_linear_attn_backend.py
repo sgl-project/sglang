@@ -12,7 +12,6 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
-    scatter_conv_windows_after_mtp_verify,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -1630,14 +1629,19 @@ class HybridLinearAttnBackend(AttentionBackend):
                 # Linear chain only, so the last accepted step + 1 counts the bonus.
                 num_accept_tokens=last_correct_step_indices + 1,
             )
-            scatter_conv_windows_after_mtp_verify(
-                mamba_caches,
-                state_indices_tensor,
-                last_correct_step_indices,
-                mamba_track_indices=None,
-                mamba_steps_to_track=None,
-                src_indices_raw=src_indices_raw,
-            )
+            # Per-conv-type scatter (as the ReplaySSM spec commit does): with no
+            # track rows it is cheaper than the single-launch multi-pair kernel.
+            for conv_states, intermediate_conv_window in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                if conv_states.numel() > 0:
+                    fused_conv_window_scatter_with_mask(
+                        conv_states,
+                        intermediate_conv_window,
+                        state_indices_tensor,
+                        last_correct_step_indices,
+                        src_indices_raw,
+                    )
         else:
             scatter_mamba_states_after_mtp_verify(
                 mamba_caches,
