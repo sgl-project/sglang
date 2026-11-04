@@ -1,6 +1,6 @@
 # SGLang Session-Aware KV Cache Orchestrator 实现方案与实施计划
 
-日期：2026-11-04。状态：P0–P2 已提交，P2 基线为 `69de4c3e82`；P4a L2 registry 基础已提交为 `b3bccb5015`。P3 DEMOTE 结果/回收语义已实现，CPU 和 Rust 验证通过，工作树未提交，待 parent 审查；新增 GPU 回收断言待测试窗口复验。D1–D7 已采用。P4 执行接入和 P5–P8 待实施，P9 为后续扩展。
+日期：2026-11-04。状态：当前基线 `f6ec094123` 已整合 P0–P3、P4a/P4b/P4c 和 P5；P4 的 Router/L3 owner 接入仍由 P6 完成。当前修改为 P8 实测问题驱动的 native/demand PREFETCH 合并优化，CPU、GPU/file/Mooncake 正确性及 Rust 验证通过，未提交。模型级 TTFT before/after 由 parent 审查后重启快照测量；P6/P7 和完整 P8 验收未完成，P9 为后续扩展。
 
 目标是在保留 `rfc-kvc` 引擎控制实现的基础上，接入 Router 侧的 session 编排，完成 `PREFETCH`、`DEMOTE`、`PIN`、Mooncake 执行适配及结果反馈。主要验证场景是：应用等待工具期间，将已存在于 Mooncake 的上下文准备到另一个 Engine 的 L2，并在恢复推理时实际复用。
 
@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | C1 | 在现有 `rfc-kvc` 基础上修改，保留提交历史并合入上游基线 | 采用 merge 整合；本计划不要求重写已有提交 |
 | C2 | Mooncake 为主要存储后端，file 用于测试 | 真实功能验收必须覆盖 Mooncake；file 和 mock 用于可控测试 |
-| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 当前任务执行 P3 DEMOTE 结果与回收语义；按本任务明确限制保持未提交、不推送，由 parent 审查和提交；未授权部署 |
+| C3 | 用户已授权实现及测试后提交，取代文档阶段限制 | 当前任务执行晚到请求与 native PREFETCH 的重复 I/O 优化；按本任务明确限制保持未提交、不推送，由 parent 审查和提交；未授权部署 |
 
 ### 已采用的实施默认值 D1–D7
 
@@ -448,16 +448,16 @@ Router wire 与外部 bridge 当前忽略 session 信息，需要分别接入。
 
 ## 11. 实施阶段与依赖
 
-本任务实施 P3。公开 DEMOTE 复用 P2 后端与搬运执行，补齐阻塞原因、取消时的实际副作用和按真实 allocator 释放报告回收的规则。CPU 96 tests + 81 subtests 和 Rust fixtures 通过，GPU 复验等待 parent 测试窗口。P4 PIN 执行与 P5–P8 Router/恢复/联合验收保持独立阶段；P4a registry 未改动，L1 PIN 和 host→storage DEMOTE 仍不支持。P9 为后续扩展。
+本任务针对 P2 模型矩阵发现的晚到 PREFETCH 回归，合并匹配的普通请求与正在执行的 native L3→L2 读取。首轮仅支持相同完整 page-aligned token scope、兼容 salt/extra-key、wait_complete；预算受既有 max_prepared_prefixes 和 max_scope_tokens 约束。受控实际存储调用从两次 query/GET 降到一次，CPU 与 live GPU/Mooncake 正确性已验证。原矩阵和 ready-window 结果保持不变；本次没有模型级性能收益结论，parent 将运行一致负载的 before/after。
 
 | 阶段 | 主要产物 | 依赖 | 退出条件 |
 | --- | --- | --- | --- |
 | P0 基线整合 | 固定 merge 基线、冲突记录、D1–D7 决策记录 | C1/C2 | 原有控制/搬运回归通过，Router/indexer 可构建 |
 | P1 协议与模型（已提交） | 三动作 schema、PrefixTarget、capabilities、结果、跨语言 fixtures、Rust 纯模型 | P0 | Python 72 tests + 66 subtests；Rust 4 tests；locked Router/indexer check 通过 |
 | P2 后端与 PREFETCH（已提交） | 注册 file/Mooncake adapters、独立 L3→L2、完成结果、物理 key 描述 | P1 | CPU 74 tests + 66 subtests；GPU/file 通过；真实 Mooncake 跨 owner 无本地前缀恢复及 GPU load-back 通过 |
-| P3 DEMOTE（已实现，未提交） | native 回收、保存/回收结果、证据化阻塞原因、取消副作用 | P2 | CPU 96 tests + 81 subtests；Rust 4 tests；GPU 新增断言待测试窗口 |
-| P4 PIN | L2 registry、L3 protection owner、对象聚合、TTL/renew/release | P1/P2 | 共享保护、未知结果与过期处理通过专项测试 |
-| P5 Router 关联与观察 | session/branch index、confirmed-only 接口、关联输入、位置查询 adapter | P1 | 多分支和纯命中能正确建关联，位置失效不删除关联 |
+| P3 DEMOTE（已提交） | native 回收、保存/回收结果、证据化阻塞原因、取消副作用 | P2 | parent CPU/GPU/Mooncake 验证通过，证据见 review log |
+| P4 PIN（L2 runtime/L3 owner 已实现，Router 接入待 P6） | L2 registry、L3 protection owner、对象聚合、TTL/renew/release | P1/P2 | 共享保护、未知结果与过期处理通过专项测试 |
+| P5 Router 关联与观察（纯模型已提交） | session/branch index、confirmed-only 接口、关联输入、位置查询 adapter | P1 | 多分支和纯命中能正确建关联，位置失效不删除关联 |
 | P6 编排与路由 | intent/job 管理、Engine client、独立信号、参考策略、两套路由接入 | P2/P3/P4/P5 | 完成跨 Engine 准备并保留最终路由决策权 |
 | P7 反馈与恢复 | 完整事件、query 对账、epoch/gap、bridge 分片顺序、保护恢复 | P2/P4/P5/P6 | 故障注入后无错误 ready、无共享误释放 |
 | P8 联合验收与评测 | 两 Engine Mooncake 场景、功能矩阵、对照实验、运行说明 | P3/P4/P6/P7 | 三动作及主场景均有可重复证据 |
@@ -622,4 +622,4 @@ request metadata 的变更还涉及 [io_struct.py](/home/youwei/bzh/project/Toke
 | 能力限制 | 仍返回 unsupported 的路径、unknown 恢复边界 |
 | 后续依赖 | 未完成前不能宣布支持的能力 |
 
-当前进度：P0–P2 和 P4a registry 基础已提交。P3 未提交，CPU/Rust 验证证据见 `PLAN-REVIEW-LOG.md`；GPU 2/3 有外部任务，等待 parent 安排 GPU 2 正确性测试窗口，本次没有运行 GPU 测试或干预现有进程。P2 的历史 GPU/file/Mooncake 证明保留，不能替代 P3 新增断言的复验。P4 执行与 P5–P8 待实施，P9 为后续扩展。外部计划源文件保持不变。
+当前进度：`f6ec094123` 基线保持 P1–P5 能力与约束。本次合并 native/demand PREFETCH 的修改未提交，证据见 `PLAN-REVIEW-LOG.md` 和 `/tmp/sglang-rfc-build/prefetch-report.txt`。两台 Qwen 服务仍使用不可变 P2 快照；没有重启、配置修改或源码快照改写。GPU 1 小型正确性测试在查询确认两台服务 running/waiting queues 均为零后执行。P6/P7、模型级 before/after 及完整 P8 验收仍待后续工作。

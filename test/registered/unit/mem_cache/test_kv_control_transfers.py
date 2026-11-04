@@ -1207,6 +1207,7 @@ def prefix_path(cache, service):
 def assert_retired(cache, service):
     assert not service.control.executor.storage_reads.jobs
     assert not service.control.executor.storage_reads.interests
+    assert not service.control.executor.storage_reads.demands
     assert not cache.ongoing_prefetch
     assert not cache.prefetch_loaded_tokens_by_reqid
     assert not cache.prefetch_loaded_storage_start_by_reqid
@@ -1216,6 +1217,285 @@ def assert_retired(cache, service):
 
 
 class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
+    def test_native_demand_coalesces_backend_io(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, dma = cold_prefix(owner)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            counts = {"query": 0, "get": 0}
+            query, get = cc._storage_hit_query, cc.page_get_func
+
+            def counted_query(*args, **kwargs):
+                counts["query"] += 1
+                return query(*args, **kwargs)
+
+            def counted_get(*args, **kwargs):
+                counts["get"] += 1
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            demand = CacheRequestHandle("ordinary-demand", 0)
+            try:
+                with (
+                    patch.object(cc, "_storage_hit_query", counted_query),
+                    patch.object(cc, "page_get_func", counted_get),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    native = transfer(
+                        service, src="storage", dst="host", message="native"
+                    )
+                    wait_for(service, entered.is_set)
+                    cache.prefetch_from_storage(
+                        demand,
+                        cache.tree_core.root_node.id,
+                        cache_fixtures.array("q", [1, 2, 3, 4]),
+                        matched_prefix_tokens=[],
+                        cache_salt=service.cache_salt(None),
+                    )
+                    release.set()
+                    wait(service, native)
+
+                    def demand_ready():
+                        cache.drain_storage_control_queues()
+                        return cache.check_prefetch_progress(demand)
+
+                    wait_for(service, demand_ready)
+                    span = cache.pop_prefetch_loaded_span(demand)
+                    cache.discard_storage_prefetch_accounting(demand)
+                    service.progress()
+                    print(
+                        "native/demand physical operations", counts, "demand span", span
+                    )
+                    self.assertEqual(counts, {"query": 1, "get": 1})
+                    self.assertEqual(span, (4, 0))
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+            assert_retired(cache, service)
+
+    def test_native_demand_cancel_lifetimes_and_mismatches(self):
+        from dataclasses import replace
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+
+        for abort_demand in (False, True):
+            with (
+                self.subTest(abort_demand=abort_demand),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                cache, service, dma = cold_prefix(owner)
+                cc = cache.cache_controller
+                reads = service.control.executor.storage_reads
+                entered, release = threading.Event(), threading.Event()
+                original = cc.page_get_func
+                calls = []
+
+                def blocked(*args, **kwargs):
+                    calls.append(1)
+                    entered.set()
+                    assert release.wait(5)
+                    return original(*args, **kwargs)
+
+                demand = CacheRequestHandle("demand", 3)
+                try:
+                    with (
+                        patch.object(cc, "page_get_func", blocked),
+                        patch.object(cache, "prefetch_threshold", 1),
+                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    ):
+                        native = transfer(
+                            service, src="storage", dst="host", message="native"
+                        )
+                        wait_for(service, entered.is_set)
+                        key = lambda values: RadixKey(cache_fixtures.array("q", values))
+                        for values, salt in (
+                            ([1, 2, 3], service.cache_salt(None)),
+                            ([1, 2, 3, 5], service.cache_salt(None)),
+                            ([1, 2, 3, 4], service.cache_salt("other")),
+                            ([1, 2, 3, 4], "foreign-weight-namespace"),
+                        ):
+                            self.assertFalse(
+                                reads.join_demand(demand, [], key(values), None, salt)
+                            )
+                        cache.prefetch_from_storage(
+                            demand,
+                            cache.tree_core.root_node.id,
+                            cache_fixtures.array("q", [1, 2, 3, 4]),
+                            matched_prefix_tokens=[],
+                            cache_salt=service.cache_salt(None),
+                        )
+                        self.assertTrue(cache.has_ongoing_prefetch(demand))
+                        self.assertFalse(cache.check_prefetch_progress(demand))
+                        self.assertTrue(
+                            cache.check_prefetch_progress(
+                                CacheRequestHandle("unrelated", 0)
+                            )
+                        )
+                        # Same request re-entry cannot add a duplicate interest.
+                        cache.prefetch_from_storage(
+                            demand,
+                            cache.tree_core.root_node.id,
+                            cache_fixtures.array("q", [1, 2, 3, 4]),
+                            matched_prefix_tokens=[],
+                            cache_salt=service.cache_salt(None),
+                        )
+                        self.assertEqual(len(reads.demands), 1)
+                        sibling = CacheRequestHandle("aborted-sibling", 0)
+                        with patch.object(
+                            service.control.executor,
+                            "config",
+                            replace(
+                                service.control.executor.config, max_prepared_prefixes=1
+                            ),
+                        ):
+                            self.assertFalse(
+                                reads.join_demand(
+                                    sibling,
+                                    [],
+                                    key([1, 2, 3, 4]),
+                                    None,
+                                    service.cache_salt(None),
+                                )
+                            )
+                            self.assertEqual(reads.stats["demand_limit_declined"], 1)
+                        self.assertTrue(
+                            reads.join_demand(
+                                sibling,
+                                [],
+                                key([1, 2, 3, 4]),
+                                None,
+                                service.cache_salt(None),
+                            )
+                        )
+                        cache.release_aborted_request(sibling)
+                        self.assertEqual(len(reads.demands), 1)
+                        self.assertFalse(
+                            next(iter(reads.jobs.values())).operation.is_terminated()
+                        )
+                        cancelled = service.control.cancel(native.ref)
+                        self.assertEqual(cancelled.status, Status.CANCELLING)
+                        job = next(iter(reads.jobs.values()))
+                        self.assertFalse(job.operation.is_terminated())
+                        if abort_demand:
+                            cache.release_aborted_request(demand)
+                            service.progress()
+                            self.assertTrue(job.operation.is_terminated())
+                        release.set()
+                        done = wait(service, native)
+                        self.assertEqual(done.status, Status.CANCELLED)
+                        self.assertEqual(len(calls), 1)
+                        if not abort_demand:
+                            self.assertTrue(cache.check_prefetch_progress(demand))
+                            self.assertTrue(service.has_pending)
+                            self.assertFalse(cache._storage_attachment.detach()[0])
+                            self.assertEqual(cache.evict_host(4), 0)
+                            span = cache.pop_prefetch_loaded_span(demand)
+                            self.assertEqual(span, (4, 0))
+                            self.assertEqual(
+                                split_cached_prefix_by_tier(4, 4, *span), (0, 0, 4)
+                            )
+                            self.assertEqual(cache.evict_host(4), 4)
+                        self.assertFalse(service.has_pending)
+                finally:
+                    release.set()
+                    cache.release_aborted_request(demand)
+                assert_retired(cache, service)
+
+    def test_native_demand_partial_failure_and_abort_leave_no_holds(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+        from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, dma = cold_prefix(owner)
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            original = cc.page_get_func
+            calls = []
+
+            def partial(operation, hashes, indices, extra_info=None):
+                calls.append(1)
+                entered.set()
+                assert release.wait(5)
+                # A real complete leading page, followed by a failed page read.
+                return original(operation, hashes[:2], indices[:2], extra_info)
+
+            demand = CacheRequestHandle("partial", 0)
+            try:
+                with (
+                    patch.object(cc, "page_get_func", partial),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    native = transfer(
+                        service, src="storage", dst="host", message="partial"
+                    )
+                    wait_for(service, entered.is_set)
+                    cache.prefetch_from_storage(
+                        demand,
+                        cache.tree_core.root_node.id,
+                        cache_fixtures.array("q", [1, 2, 3, 4]),
+                        matched_prefix_tokens=[],
+                        cache_salt=service.cache_salt(None),
+                    )
+                    release.set()
+                    done = wait(service, native)
+                    self.assertEqual(done.status, Status.FAILED)
+                    self.assertTrue(cache.check_prefetch_progress(demand))
+                    span = cache.pop_prefetch_loaded_span(demand)
+                    self.assertEqual(span, (2, 0))
+                    self.assertEqual(
+                        split_cached_prefix_by_tier(2, 2, *span), (0, 0, 2)
+                    )
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(cache.evict_host(4), 2)
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+            assert_retired(cache, service)
+
+    def test_native_demand_published_prefix_and_disabled_control(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+        from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, dma = cold_prefix(owner)
+            native = transfer(service, src="storage", dst="host", message="ready")
+            self.assertEqual(wait(service, native).status, Status.COMPLETED)
+            node = prefix_path(cache, service)[-1][0]
+            demand = CacheRequestHandle("arrives-after-publication", 0)
+            with patch.object(
+                cache.cache_controller,
+                "submit_prefetch",
+                side_effect=AssertionError(
+                    "published host prefix needs no storage I/O"
+                ),
+            ):
+                # Ordinary match found the complete host prefix, so only the
+                # empty suffix reaches the prefetch entrypoint.
+                cache.prefetch_from_storage(
+                    demand,
+                    node.id,
+                    cache_fixtures.array("q", []),
+                    matched_prefix_tokens=[1, 2, 3, 4],
+                    cache_salt=service.cache_salt(None),
+                )
+            self.assertTrue(cache.check_prefetch_progress(demand))
+            span = cache.pop_prefetch_loaded_span(demand)
+            self.assertEqual(span, (0, None))
+            self.assertEqual(split_cached_prefix_by_tier(4, 4, *span), (0, 4, 0))
+            self.assertEqual(
+                service.control.executor.storage_reads.stats["demand_coalesced"], 0
+            )
+            with patch.object(cache, "kv_control_service", None):
+                self.assertIsNone(cache._native_storage_reads())
+                self.assertTrue(cache.check_prefetch_progress(demand))
+            assert_retired(cache, service)
+
     def test_public_file_prefetch_registers_host_without_local_prefix(self):
         with hicache(self, namespace_keys=True) as owner:
             cache, service, dma = cold_prefix(owner)

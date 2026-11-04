@@ -409,3 +409,41 @@ values["claims"] = [msgspec.to_builtins(validated(v, ClaimState)) for v in value
 (root / "results.json").write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n")
 PY
 ```
+
+
+## Native PREFETCH and arriving demand
+
+With KV control enabled, an ordinary `wait_complete` request can join an active
+native storage→host restore when the complete page-aligned token scope and
+already-encoded salt/extra-key match exactly. Matching is indexed by immutable
+prefix identity; each readiness poll is a handle lookup. Unequal scopes,
+best_effort/timeout, buffer-only/bigram and disabled-control paths retain their
+existing behavior. No global prefill barrier is added for these host restores.
+
+Demand interests are bounded by `max_prepared_prefixes`, with scope material
+bounded by `max_scope_tokens`. A join allocates no additional storage bounce or
+GPU memory. Existing native approvals, host/GPU correctness references, backend
+workers and owner-thread publication remain authoritative. Router cancellation
+cannot terminate a read still needed by ordinary demand; its receipt drains while
+the request waits. Request abort drops only its demand. Once all interests are
+cancelled, normal terminate/drain applies.
+
+After publication/drain, the request resumes through the existing
+`check_prefetch_progress` / `pop_prefetch_loaded_span` interface. The pop releases
+the temporary shared holds into the normal synchronous match/load-back admission
+path; ordinary eviction semantics then apply. Reset/detach cannot discard live
+demand holds. This adds no PIN or retention claim. Partial/missing reads unblock
+admission to use the real published prefix and compute the remainder.
+
+The loaded span is clipped against data already resident when the request joined.
+Joined reads attribute newly published data to storage; requests arriving after
+host publication keep normal host attribution. Existing cached-token tier splitting
+and clipping are reused. Shared reads do not fabricate an extra physical lookup.
+
+`prefetch_outcome_stats_snapshot()` adds fixed counters `native_demand_coalesced`,
+`native_demand_consumed`, `native_demand_aborted`, `native_demand_limit_declined`,
+and gauge `native_demand_waiters`. Consumed means the admission span was taken,
+not proof of eventual inference use. Existing `issued` counts actual controller
+submissions. No latency/byte EMA or unused-work estimate is invented. Model-level
+benefit must be measured after restarting the benchmark snapshot; correctness
+proof and fewer backend calls alone do not establish a TTFT improvement.

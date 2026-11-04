@@ -44,6 +44,16 @@ class _Read:
     failure_status: Status = Status.FAILED
     cancel_requested: bool = False
     waiting: str = "whole_scope_capacity"
+    demands: set[CacheRequestHandle] = field(default_factory=set)
+    retired: bool = False
+    loaded_span: tuple[int, int | None] = (0, None)
+
+
+@dataclass
+class _Demand:
+    job: _Read
+    # Already resident at join time is L2, not this request's storage hit.
+    storage_start: int
 
 
 @dataclass
@@ -67,6 +77,63 @@ class StorageCacheReads:
         self.host = executor.transfers
         self.jobs: dict[bytes, _Read] = {}
         self.interests: dict[str, _Interest] = {}
+        self.demands: dict[CacheRequestHandle, _Demand] = {}
+        self._joinable: dict[tuple, _Read] = {}
+        self.stats = dict(
+            demand_coalesced=0,
+            demand_consumed=0,
+            demand_aborted=0,
+            demand_limit_declined=0,
+        )
+
+    @staticmethod
+    def _demand_key(tokens, extra_key, cache_salt):
+        return tokens, extra_key, cache_salt
+
+    def join_demand(self, request, prefix, suffix, extra_key, cache_salt):
+        if request in self.demands:
+            return True
+        # Other stop policies retain their existing deadline/early-compute behavior.
+        if self.cache.prefetch_stop_policy != "wait_complete":
+            return False
+        if len(self.demands) >= self.executor.config.max_prepared_prefixes:
+            self.stats["demand_limit_declined"] += 1
+            return False
+        if (
+            len(prefix or ()) + len(suffix)
+            > self.cache.kv_control_service.config.limits.max_scope_tokens
+        ):
+            return False
+        tokens = tuple(prefix or ()) + tuple(suffix.token_ids)
+        job = self._joinable.get(self._demand_key(tokens, extra_key, cache_salt))
+        if job is None or job.cancel_requested or job.failure or job.retired:
+            return False
+        self.demands[request] = _Demand(
+            job, max(len(prefix or ()), self._length(job, "host"))
+        )
+        job.demands.add(request)
+        self.stats["demand_coalesced"] += 1
+        return True
+
+    def demand_ready(self, request):
+        """Admission may proceed after drain, including partial/missing results."""
+        demand = self.demands.get(request)
+        return None if demand is None else demand.job.retired
+
+    def release_demand(self, request, *, aborted=False):
+        demand = self.demands.pop(request, None)
+        if demand is None:
+            return None
+        job = demand.job
+        job.demands.remove(request)
+        self.stats["demand_aborted" if aborted else "demand_consumed"] += 1
+        count, start = job.loaded_span
+        left = max(start or 0, demand.storage_start)
+        right = (start or 0) + count
+        span = (right - left, left) if right > left else (0, None)
+        if job.retired and not job.demands:
+            self._release(job)
+        return span
 
     def _scope(self, work):
         payload = work.payload
@@ -232,6 +299,14 @@ class StorageCacheReads:
             job.operation = info.operation
             job.operation.native_quiescent = False
             job.operation.native_on_publish = lambda: self._published(job)
+            if job.work.payload.dst.tier == "host":
+                self._joinable[
+                    self._demand_key(
+                        job.tokens,
+                        job.compatibility.extra_key,
+                        job.compatibility.cache_salt,
+                    )
+                ] = job
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
             if job.operation is None and not job.loading:
@@ -276,7 +351,12 @@ class StorageCacheReads:
         for job in tuple(self.jobs.values())[:limit]:
             self.jobs.pop(job.key)
             self.jobs[job.key] = job
-            cancelled = all(self.interests[i].cancelled for i in job.interests)
+            cancelled = not job.demands and all(
+                self.interests[i].cancelled for i in job.interests
+            )
+            if cancelled and job.operation is not None and not job.cancel_requested:
+                job.cancel_requested = True
+                self.cache.cache_controller.terminate_prefetch(job.operation)
             if job.loading:
                 result = (
                     self.host.cancel(job.work.ref)
@@ -372,8 +452,18 @@ class StorageCacheReads:
                     target_outcomes=tuple(outcomes),
                 )
         finally:
-            self._release(job)
-            self.cache.pop_prefetch_loaded_span(job.handle)
+            job.loaded_span = self.cache.pop_prefetch_loaded_span(job.handle)
+            job.retired = True
+            key = self._demand_key(
+                job.tokens, job.compatibility.extra_key, job.compatibility.cache_salt
+            )
+            if self._joinable.get(key) is job:
+                self._joinable.pop(key)
+            # Demand consumers hold the published prefix until their next
+            # admission pass (or abort). pop_prefetch_loaded_span hands off to
+            # ordinary match/load-back, just like a completed ordinary restore.
+            if not job.demands:
+                self._release(job)
             self.cache.discard_storage_prefetch_accounting(job.handle)
             self.cache.storage_prefetch_retries.cancel(job.handle.rid)
             self.cache._storage_prefetch_wait.pop(job.handle, None)
@@ -413,6 +503,10 @@ class StorageCacheReads:
             return self._take(interest)
         interest.cancelled = True
         job = interest.job
+        if job.demands:
+            # The ordinary request now owns demand for this physical operation.
+            # Keep the cancelled native receipt draining; never terminate its I/O.
+            return self._take(interest)
         if job.failure is None and any(
             not self.interests[i].cancelled for i in job.interests
         ):

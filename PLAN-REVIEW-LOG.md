@@ -4728,3 +4728,89 @@ Reviewed async single-writer actor, shared object aggregation, explicit backend_
 ### P4b L2 PIN runtime — independent review and integration
 
 Reviewed native registry dispatch, independent claim/query/expiry lifetime, attached request binding/fanout, successful checkpoint activation, abort handling, caller cleanup, pre-reset invalidation and deadline-aware idle sleep. Independent isolated final7suite97passed80subtests. Integrated with P2/P3/P5/P4c:109passed84subtests(28.43s), Rust4protocol+20backend+18state passed(optional live backend test excluded here; independently tested in P4c). Regenerated merged shared schemas after drift test caught P2 backend_namespace missing from P4b claim schema. Evidence p4b-parent-final-tests.log,p4b-integrated-tests.log,p4b-integrated-rust.log. GPU correctness already verified via p4b-gpu-pin.py. Approved for commit.
+
+## Late native PREFETCH / ordinary demand coalescing — 2026-11-04
+
+Base `f6ec0941235f9711735bbc5c93082449fc368c73`, clean at entry. No commits/pushes,
+subdelegation, global config or P7 event-publication changes. P1–P5 behavior and
+first-profile physical limits are retained. This is a targeted P8 optimization;
+model-level performance acceptance remains pending parent review/restart/replay.
+
+Evidence read before production edits: `perf-optimization-notes.txt`,
+`perf-findings-p2.json`, `bench-p2-matrix-v1/{manifest,summary}.json`, ready-window
+summary, and `engine-b.log` in `/tmp/sglang-rfc-build`. Original benchmark artifacts
+were read only. Both results remain evidence:
+- P2 matrix: 36/36 valid; 1s wait / 0.5s lead. Mean TTFT 2K 336→138ms,
+  8K 804→755ms, 16K 1469→2503ms, with 16K ready-before 0/6.
+- Ready-window: 16/16 valid; 3s wait / 2.5s lead. Mean TTFT 8K 630→96ms,
+  16K 996→161ms, all prefetch cases ready before resume.
+No failed/slow model samples were removed or reclassified.
+
+Mechanism: logs show native loaded=16384 followed by ordinary matched=16384,
+loaded=0. Source inspection found separate per-handle storage submissions without
+native/demand matching. A pre-edit deterministic real-file/pool test counted TWO
+storage hit queries and TWO backend page GET calls; the second request reported
+(0,None) loaded span. The same interleaving after the change counts ONE query/GET
+and reports (4,0). Logs: `prefetch-before-mechanism.log` and
+`prefetch-after-mechanism.log`. Event gates control correctness interleavings,
+not elapsed-time performance; no artificial delay was used for a performance claim.
+The original model run has no packet-level GET trace, so its log alone is not
+claimed as proof that every additional millisecond was duplicate network I/O.
+
+Implementation: `StorageCacheReads` indexes only active native storage→host jobs
+by exact complete tokens + actual encoded salt/extra-key. Normal persistent-host,
+non-bigram `wait_complete` requests join through the existing cache prefetch entry.
+Each request has an incarnation-keyed bounded demand interest. Router cancel keeps
+I/O alive while demand exists; request abort removes only that request. Publication
+and native drain remain prerequisites for admission progress. Shared holds survive
+native-result retirement until each request takes its loaded span or aborts, then
+normal match/load-back/request locking takes over. Partial/failing reads unblock
+with their actual prefix, without marking an unfilled tail ready. Published-before-
+arrival data stays host-attributed; joined newly loaded data is storage-attributed.
+No new PIN, bypassed capacity check, GPU reservation or global inference barrier.
+
+Bounds use existing max_prepared_prefixes for demand handles and max_scope_tokens
+for material. Overflow falls back to the ordinary path. Key lookup is indexed;
+readiness polls are O(1) and do not walk/hash the prefix. Source inspection showed
+active native I/O polls already check quiescence rather than repeatedly traversing
+16K tokens; no unproven quadratic-polling refactor was added. Fixed counters and a
+waiter gauge are exposed through existing prefetch stats; no invented timing/bytes
+or success/unused estimates. `native_demand_consumed` means admission pop, not an
+inference-hit guarantee. Disabled control and nonmatching scopes/policies retain
+the existing path. Reset/storage detach cannot discard retained demand receipts.
+
+Verification:
+- Seven control suites: 113 passed, 86 subtests; final log `prefetch-cpu-tests.log`.
+- Storage lifecycle + scheduler HiCache events/held-row admission/chunked gate/
+  runtime attach: 24 passed, 17 subtests (`prefetch-admission-tests.log`).
+- GPU1 real host/file + Mooncake coalesced demand: 2 passed, 2 subtests
+  (`prefetch-gpu-tests.log`), SDK0.3.14, supplied TCP master, private test namespace,
+  64MiB segment. `prefetch-gpu-idle-check.json` records both model servers with
+  zero running/waiting/queued requests immediately before the tiny test. Existing
+  servers/source snapshots were not changed; GPUs2/3 processes were untouched.
+- Rust locked tests with CARGO_BUILD_JOBS=8: 4 protocol + 20 backend + 18 state
+  passed; optional live admin soft-pin test ignored (`prefetch-rust-tests.log`).
+  Live storage data I/O was separately exercised by the GPU test.
+- Changed Python `ruff --select F` and `git diff --check` passed.
+Dependency deprecation warnings remain. A test-fixture-only rerun initially used
+msgspec.replace on a dataclass config; corrected to dataclasses.replace and rerun.
+The failed log is retained as `prefetch-cpu-budget-fixture-failure.log`.
+
+New deterministic cases cover active GET joins, duplicate submissions, independent
+abort, Router cancel while demand waits, both consumers cancelled/drain, token/
+length/salt/encoded-namespace mismatches, per-cache budget exhaustion, partial read,
+post-publication host attribution, disabled-control fallback and no leaked holds.
+Existing idle native completion, allocator/headroom and PIN lifetime suites pass.
+The live test joins an actual request handle before owner publication, verifies its
+storage span and confirms host and GPU K/V bytes through the unchanged load-back.
+
+Limitations: exact page-aligned scope only, wait_complete only; no superset-prefix
+matching or latency policy/EMA. Native cancellation can remain draining until the
+shared demand read finishes. Normal admission/eviction rules apply after span pop.
+No new Qwen TTFT result is claimed. Parent must restart the working snapshot and
+repeat the immutable 0.5s and 2.5s lead matrices, keeping every failed/slow sample,
+before deciding whether this fixes the observed model-level regression.
+
+### P8 native/demand coalescing — independent review
+
+Reviewed indexed exact-prefix demand joins, owner publication/quiescence, cancellation/drain, request abort, loaded-span attribution and teardown guards. Independent final CPU proof113passed86subtests(21.46s); independent GPU host/file/live Mooncake join2passed2subtests(18.92s). Prior parent run encountered newly edited fixture using msgspec.replace on dataclass Limits; final corrected fixture proof is recorded, no failed production result hidden. Deterministic before/after I/O count2queries+2GETs ->1query+1GET; model TTFT benefit still awaits snapshot restart. Other scopes/stop policies retain ordinary path. Approved for commit.

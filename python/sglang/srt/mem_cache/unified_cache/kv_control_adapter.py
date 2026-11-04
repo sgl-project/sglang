@@ -134,6 +134,7 @@ class UnifiedCacheExecutor:
                 or self.storage.interests
                 or self.storage_reads.jobs
                 or self.storage_reads.interests
+                or self.storage_reads.demands
             ):
                 raise ControlError(
                     "busy", "Storage control must drain before replacing its adapter"
@@ -157,6 +158,7 @@ class UnifiedCacheExecutor:
                 or self.storage.interests
                 or self.storage_reads.jobs
                 or self.storage_reads.interests
+                or self.storage_reads.demands
             ):
                 raise ControlError(
                     "busy", "Storage control must drain before detaching"

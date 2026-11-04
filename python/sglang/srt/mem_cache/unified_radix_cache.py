@@ -482,6 +482,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         service = getattr(self, "kv_control_service", None)
+        reads = self._native_storage_reads()
+        if reads is not None and reads.demands:
+            raise RuntimeError("Release native prefetch demand before cache reset")
         if service is not None:
             service.invalidate_protection(reason="cache_reset")
         # In-flight restores still read their host slots; finish them first.
@@ -669,6 +672,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        reads = self._native_storage_reads()
+        if reads is not None and reads.demands:
+            raise RuntimeError("Release native prefetch demand before host teardown")
         service = getattr(self, "kv_control_service", None)
         if service is not None:
             service.invalidate_protection(reason="host_cache_detached")
@@ -2219,6 +2225,10 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    def _native_storage_reads(self):
+        service = getattr(self, "kv_control_service", None)
+        return service.control.executor.storage_reads if service is not None else None
+
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
@@ -2302,6 +2312,17 @@ class UnifiedRadixCache(BasePrefixCache):
             # No lookup was issued, so no retry is armed: polling here would
             # spend the re-issue budget the admission-time device-hit-loss
             # re-query needs once the device match evicts while queued.
+            return
+        native_reads = self._native_storage_reads()
+        if (
+            minimum_prefetch_tokens is None
+            and native_reads is not None
+            and not buffer_mode
+            and not self.tree_core.is_eagle
+            and native_reads.join_demand(
+                request, matched_prefix_tokens, prefetch_key, extra_key, cache_salt
+            )
+        ):
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
@@ -2464,7 +2485,10 @@ class UnifiedRadixCache(BasePrefixCache):
         return True
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
-        return handle in self.ongoing_prefetch
+        reads = self._native_storage_reads()
+        return handle in self.ongoing_prefetch or (
+            reads is not None and handle in reads.demands
+        )
 
     def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
         # PP0 also records misses/skips; only hits travel with the request relay.
@@ -2540,6 +2564,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        reads = self._native_storage_reads()
+        if reads is not None and (ready := reads.demand_ready(request)) is not None:
+            return ready
         if (
             self.cache_controller is not None
             and self.cache_controller.pp_prefetch_decisions.get(request.rid)
@@ -2908,13 +2935,15 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     def pop_prefetch_loaded_tokens(self, request: CacheRequestHandle) -> int:
-        self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
-        return self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
+        return self.pop_prefetch_loaded_span(request)[0]
 
     def pop_prefetch_loaded_span(
         self, request: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:
         """Pop the loaded L3 token count and its absolute prefix start."""
+        reads = self._native_storage_reads()
+        if reads is not None and reads.demand_ready(request):
+            return reads.release_demand(request)
         return (
             self.prefetch_loaded_tokens_by_reqid.pop(request, 0),
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
@@ -2922,6 +2951,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
+        reads = self._native_storage_reads()
+        if reads is not None:
+            reads.release_demand(request, aborted=True)
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
@@ -3049,7 +3081,12 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l3_miss_tokens"] += miss
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
-        return self._prefetch_outcome_stats.copy()
+        stats = self._prefetch_outcome_stats.copy()
+        reads = self._native_storage_reads()
+        if reads is not None:
+            stats.update({"native_" + key: value for key, value in reads.stats.items()})
+            stats["native_demand_waiters"] = len(reads.demands)
+        return stats
 
     def _prefetch_occupied_span(
         self, prefetch_key, host_indices, *, operation=None

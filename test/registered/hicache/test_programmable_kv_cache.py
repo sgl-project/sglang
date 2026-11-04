@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from array import array
+from unittest.mock import patch
 
 import torch
 
@@ -412,6 +413,25 @@ class TestProgrammableKVCache(CustomTestCase):
                 "restore",
             )
             self.assertFalse(restored.public_result.ready_scope)
+            from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+            demand = CacheRequestHandle("live-coalesced-demand", 0)
+            stack.callback(b.release_aborted_request, demand)
+            with (
+                patch.object(b, "prefetch_threshold", 1),
+                patch.object(b, "prefetch_stop_policy", "wait_complete"),
+            ):
+                b.prefetch_from_storage(
+                    demand,
+                    b.tree_core.root_node.id,
+                    array("q", ordinary.token_ids),
+                    matched_prefix_tokens=[],
+                    cache_salt=sb.cache_salt("tenant-租户"),
+                )
+            self.assertFalse(b.check_prefetch_progress(demand))
+            self.assertEqual(
+                sb.control.executor.storage_reads.stats["demand_coalesced"], 1
+            )
             # Joining an exact-prefix operation shares I/O; cancellation drains
             # only that interest while the other still owns the physical job.
             other = public_action(
@@ -421,6 +441,8 @@ class TestProgrammableKVCache(CustomTestCase):
             sb.control.cancel(other.ref)
             done = self._wait(sb, restored.ref)
             self.assertTrue(done.public_result.ready_scope)
+            self.assertTrue(b.check_prefetch_progress(demand))
+            self.assertEqual(b.pop_prefetch_loaded_span(demand), (4, 0))
             self.assertEqual(done.public_result.ready_location.tier, "host")
             self.assertEqual(
                 sb.control.registry.get(other.ref).status, Status.CANCELLED

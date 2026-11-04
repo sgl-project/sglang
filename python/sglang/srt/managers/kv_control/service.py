@@ -438,8 +438,11 @@ class KVControlService:
 
     @property
     def has_pending(self):
-        return self.control.registry.capacity()["active"] != 0 or bool(
-            getattr(self.control.executor, "preparations", ())
+        reads = self.control.executor.storage_reads
+        return (
+            self.control.registry.capacity()["active"] != 0
+            or bool(getattr(self.control.executor, "preparations", ()))
+            or (reads is not None and bool(reads.demands))
         )
 
     @property
