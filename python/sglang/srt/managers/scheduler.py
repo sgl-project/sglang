@@ -3726,7 +3726,7 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            self._retire_unavailable(
+            self._abort_unavailable(
                 req,
                 message="Using priority is disabled for this server. Please send a new request without a priority.",
             )
@@ -3737,7 +3737,7 @@ class Scheduler(
         """Drop the cache-side state an aborted request left behind."""
         self.request_retirer.release_aborted_request(req)
 
-    def _retire_unavailable(self, req: Req, *, message: str) -> None:
+    def _abort_unavailable(self, req: Req, *, message: str) -> None:
         self.request_retirer.abort_queued(
             req,
             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
@@ -3783,7 +3783,7 @@ class Scheduler(
             )
             if abort_existing_req:
                 self.waiting_queue.leave([candidate_req])
-                self._retire_unavailable(
+                self._abort_unavailable(
                     candidate_req,
                     message="The request is aborted by a higher priority request.",
                 )
@@ -3792,7 +3792,7 @@ class Scheduler(
                     return False
 
         # Reject the incoming request by default.
-        self._retire_unavailable(recv_req, message="The request queue is full.")
+        self._abort_unavailable(recv_req, message="The request queue is full.")
         return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
