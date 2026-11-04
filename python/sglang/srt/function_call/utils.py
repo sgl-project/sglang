@@ -1,9 +1,11 @@
 import ast
 import threading
 import warnings
+from copy import deepcopy
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
+from urllib.parse import unquote
 
 import orjson
 import partial_json_parser
@@ -174,6 +176,126 @@ def normalize_json_schema_types(schema: Any) -> None:
             normalize_json_schema_types(schema[key])
 
 
+# Only schema-bearing keywords hold subschemas; instance data such as
+# ``default`` or ``examples`` must never be read as definitions.
+_SUBSCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "dependentSchemas")
+_SUBSCHEMA_KEYWORDS = (
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "prefixItems",
+    "items",
+    "additionalProperties",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+)
+
+
+def _iter_subschemas(node: dict, *, with_definitions: bool) -> Iterable[Any]:
+    map_keywords = _SUBSCHEMA_MAP_KEYWORDS
+    if with_definitions:
+        map_keywords += ("$defs", "definitions")
+    for key in map_keywords:
+        nested = node.get(key)
+        if isinstance(nested, dict):
+            yield from nested.values()
+    for key in _SUBSCHEMA_KEYWORDS:
+        value = node.get(key)
+        if isinstance(value, list):
+            yield from value
+        elif value is not None:
+            yield value
+
+
+def _resolve_json_pointer(node: Any, parts: List[str]) -> Any:
+    for part in parts:
+        if isinstance(node, dict):
+            node = node.get(part)
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+
+def _reachable_definitions(
+    schema: dict, collected: Dict[str, Dict[str, Any]]
+) -> Dict[str, set]:
+    reached: Dict[str, set] = {key: set() for key in collected}
+    visited = set()
+    pending = [schema]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, list):
+            pending.extend(node)
+            continue
+        if not isinstance(node, dict) or id(node) in visited:
+            continue
+        visited.add(id(node))
+        pending.extend(_iter_subschemas(node, with_definitions=False))
+        ref = node.get("$ref")
+        if not (isinstance(ref, str) and ref.startswith("#/")):
+            continue
+        parts = [
+            part.replace("~1", "/").replace("~0", "~")
+            for part in unquote(ref[2:]).split("/")
+        ]
+        definitions = collected.get(parts[0], {})
+        if len(parts) > 1 and parts[1] in definitions:
+            reached[parts[0]].add(parts[1])
+            pending.append(_resolve_json_pointer(definitions[parts[1]], parts[2:]))
+        else:
+            pending.append(_resolve_json_pointer(schema, parts))
+    return reached
+
+
+def hoist_json_schema_defs(schema: Any) -> None:
+    """Give root-relative ``$ref`` targets a root to resolve against when an
+    embedded sub-schema (e.g. Pydantic ``model_json_schema()``) buried them."""
+    if not isinstance(schema, dict):
+        return
+    keys = [key for key in ("$defs", "definitions") if key not in schema]
+    if not keys:
+        return
+    collected: Dict[str, Dict[str, Any]] = {key: {} for key in keys}
+
+    def collect(node: Any) -> bool:
+        if not isinstance(node, dict):
+            return True
+        if node is not schema and ("$id" in node or "id" in node):
+            return False
+        for key in keys:
+            nested = node.get(key)
+            if isinstance(nested, dict):
+                for name, definition in nested.items():
+                    if name in collected[key] and collected[key][name] != definition:
+                        return False
+                    collected[key][name] = definition
+        return all(
+            collect(child) for child in _iter_subschemas(node, with_definitions=True)
+        )
+
+    if not collect(schema):
+        return
+    # Unreached definitions stay nested: promoted, they would collide with other
+    # tools' same-named definitions in the required-choice merge.
+    reached = _reachable_definitions(schema, collected)
+    for key in keys:
+        needed = {
+            name: definition
+            for name, definition in collected[key].items()
+            if name in reached[key]
+        }
+        if needed:
+            schema[key] = deepcopy(needed)
+
+
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
     min_length = min(len(s1), len(s2))
@@ -260,24 +382,25 @@ def safe_ast_parse(source: str) -> ast.Module:
     return _run_ast_quiet(ast.parse, source)
 
 
-def _get_tool_schema_defs(tools: List[Tool]) -> dict:
+def _get_tool_schema_defs(tools: List[Tool], key: str = "$defs") -> dict:
     """
-    Get consolidated $defs from all tools, validating for conflicts.
+    Get consolidated definitions under ``key`` from all tools, validating for conflicts.
 
     Args:
         tools: List of tools to process
+        key: Definitions keyword, ``$defs`` or legacy ``definitions``
 
     Returns:
-        Dictionary of consolidated $defs from all tools
+        Dictionary of consolidated definitions from all tools
 
     Raises:
-        ValueError: If conflicting $defs are found
+        ValueError: If conflicting definitions are found
     """
     all_defs = {}
     for tool in tools:
-        if tool.function.parameters is None:
+        if not isinstance(tool.function.parameters, dict):
             continue
-        defs = tool.function.parameters.get("$defs", {})
+        defs = tool.function.parameters.get(key, {})
         for def_name, def_schema in defs.items():
             if def_name in all_defs and all_defs[def_name] != def_schema:
                 raise ValueError(
@@ -457,6 +580,10 @@ def get_json_schema_constraint(
                 }
                 if not parallel_tool_calls:
                     schema["maxItems"] = 1
+                for key in ("$defs", "definitions"):
+                    tool_defs = _get_tool_schema_defs([tool], key=key)
+                    if tool_defs:
+                        schema[key] = tool_defs
                 return schema
         return None
     elif tool_choice == "required":

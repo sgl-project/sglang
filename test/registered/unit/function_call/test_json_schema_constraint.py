@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
+    hoist_json_schema_defs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -109,6 +110,101 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         item_schema = schema["items"]
         self.assertEqual(item_schema["properties"]["name"]["enum"], ["get_weather"])
         self.assertIn("parameters", item_schema["properties"])
+
+    def test_specific_tool_choice_resolves_defs(self):
+        for key in ("$defs", "definitions"):
+            with self.subTest(key=key):
+                self.tools[0].function.parameters = {
+                    "type": "object",
+                    "properties": {"wait": {"$ref": f"#/{key}/WaitFor"}},
+                    "required": ["wait"],
+                    key: {
+                        "WaitFor": {
+                            "type": "object",
+                            "properties": {"delay": {"$ref": f"#/{key}/Delay"}},
+                            "required": ["delay"],
+                        },
+                        "Delay": {"type": "integer", "minimum": 0},
+                    },
+                }
+                # A conflicting definition in an unselected tool must not leak in.
+                self.tools[1].function.parameters[key] = {"Delay": {"type": "string"}}
+                schema = get_json_schema_constraint(
+                    self.tools, ToolChoice(function={"name": "get_weather"})
+                )
+                validator = jsonschema.Draft202012Validator(schema)
+                validator.validate(
+                    [{"name": "get_weather", "parameters": {"wait": {"delay": 1}}}]
+                )
+                with self.assertRaises(jsonschema.ValidationError):
+                    validator.validate(
+                        [{"name": "get_weather", "parameters": {"wait": {"delay": -1}}}]
+                    )
+
+    def test_boolean_parameters_schema(self):
+        """A boolean ``parameters`` schema must yield a constraint, not raise."""
+        tools = [Tool(type="function", function=Function(name="noop", parameters=True))]
+        for tool_choice in (ToolChoice(function={"name": "noop"}), "required"):
+            with self.subTest(tool_choice=tool_choice):
+                schema = get_json_schema_constraint(tools, tool_choice)
+                jsonschema.Draft202012Validator(schema).validate(
+                    [{"name": "noop", "parameters": {"any": 1}}]
+                )
+
+    def test_required_tool_choice_after_hoisting_nested_defs(self):
+        """Nested definitions no live schema reaches (unused, or referenced only by
+        unused ones) must not conflict across tools once hoisted; reached ones resolve."""
+
+        def unreached_defs(leaf_type):
+            return {
+                "Unused": {"type": leaf_type},
+                "Dormant": {"$ref": "#/$defs/Leaf"},
+                "Leaf": {"type": leaf_type},
+            }
+
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="f",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "x": {
+                                "$ref": "#/$defs/Used",
+                                "$defs": {
+                                    "Used": {"type": "integer"},
+                                    **unreached_defs("string"),
+                                },
+                            }
+                        },
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="other",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "y": {
+                                "type": "integer",
+                                "$defs": unreached_defs("integer"),
+                            }
+                        },
+                    },
+                ),
+            ),
+        ]
+        for tool in tools:
+            hoist_json_schema_defs(tool.function.parameters)
+        validator = jsonschema.Draft202012Validator(
+            get_json_schema_constraint(tools, "required")
+        )
+        validator.validate([{"name": "f", "parameters": {"x": 1}}])
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate([{"name": "f", "parameters": {"x": "1"}}])
 
     def test_specific_tool_choice_dict_schema(self):
         """Test schema generation for specific tool choice as ToolChoice object"""
