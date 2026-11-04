@@ -1726,11 +1726,17 @@ class TestMambaHostShare(CustomTestCase):
             device="cpu",
         )
 
-        self.assertEqual(
-            pool.host_capacity_bytes,
-            pool.mamba_cache.conv[0].nbytes + pool.mamba_cache.temporal.nbytes,
+        checkpoint_bytes = (
+            pool.mamba_cache.conv[0].nbytes + pool.mamba_cache.temporal.nbytes
         )
-        self.assertLess(pool.host_capacity_bytes, pool.get_kv_size_bytes())
+        self.assertLess(checkpoint_bytes, pool.get_kv_size_bytes())
+        kv_pool = SimpleNamespace(
+            host_capacity_bytes=None, get_kv_size_bytes=lambda: checkpoint_bytes
+        )
+        self.assertEqual(
+            hybrid_pool_assembler._split_hicache_size(10, (kv_pool, pool)),
+            (5.0, 5.0),
+        )
 
 
 if __name__ == "__main__":
