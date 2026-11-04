@@ -77,11 +77,12 @@ from sglang.srt.runtime_context import get_context, get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
 register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-b200")
+register_amd_ci(est_time=129, stage="stage-b", runner_config="2-gpu-large-amd")
 
 _GATHER_WORLD = 2
 _GATHER_LAYER_NUM = 4

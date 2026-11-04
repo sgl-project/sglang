@@ -11,7 +11,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -28,6 +28,12 @@ except ImportError:
     _HAS_GRANIAN = False
 
 register_cuda_ci(est_time=111, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(
+    est_time=180,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 @unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")

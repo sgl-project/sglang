@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 if torch.version.cuda is not None:
     from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
@@ -28,6 +28,12 @@ else:
     )
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=23,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AttributeError: '_OpNamespace' 'sgl_kernel' object has no attribute 'tree_speculative_sampling_target_only'",
+)
 
 test_cases = [
     (

@@ -7,10 +7,11 @@ import torch
 
 import sglang.multimodal_gen.runtime.models.dits.sana_wm_components as wm
 from sglang.kernels.ops.diffusion import BitExactFusionGate
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=33, stage="jit-kernel-unit", runner_config="amd")
 
 
 class TestSanaWMReverseScan(CustomTestCase):

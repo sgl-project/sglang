@@ -6,10 +6,16 @@ from sglang.kernels.ops.diffusion import (
     fused_layernorm_modulate_raw,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(
+    est_time=12,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: LayerNorm modulation expects contiguous BF16 CUDA [B, S, D], D divisible by 4 and <= 8192",
 )
 
 DEVICE = "cuda"

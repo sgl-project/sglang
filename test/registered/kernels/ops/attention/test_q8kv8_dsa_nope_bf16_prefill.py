@@ -18,9 +18,10 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_q_fp8_pad
 from sglang.srt.utils import is_sm90_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")
 
 FP8 = torch.float8_e4m3fn
 NOPE = 512

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=449, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(est_time=1123, stage="extra-b", runner_config="4-gpu-amd")
 
 # topk=1 chains and a topk=2 tree: the relayed topology is constant for the
 # former and data-dependent for the latter, so both shapes are covered.

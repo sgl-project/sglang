@@ -1,6 +1,10 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
@@ -8,6 +12,12 @@ MODEL = "openai/gpt-oss-20b"
 
 register_cuda_ci(est_time=135, stage="extra-a", runner_config="1-gpu-large")
 register_cpu_ci(est_time=1602, suite="extra-test-cpu-intel")
+register_amd_ci(
+    est_time=200,
+    stage="extra-a",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):

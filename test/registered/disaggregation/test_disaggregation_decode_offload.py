@@ -3,7 +3,7 @@ import shutil
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -21,6 +21,7 @@ register_cuda_ci(
     stage="extra-a",
     runner_config="2-gpu-large",
 )
+register_amd_ci(est_time=1213, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):

@@ -47,9 +47,15 @@ from sglang.kernels.ops.diffusion import (
     triton_group_norm_silu,
     wan_rmsnorm_silu,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=135,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ValueError: RMSNorm requires contiguous CUDA BF16 inputs and weight, with eps=1e-6 or eps=1e-5.",
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

@@ -9,10 +9,11 @@ import test_unified_radix_cache_kv_events
 import test_unified_radix_cache_load_back
 import test_unified_radix_cache_storage
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures
 
 register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=140, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _SHARED_SUITES = (
     test_unified_radix_cache_core,

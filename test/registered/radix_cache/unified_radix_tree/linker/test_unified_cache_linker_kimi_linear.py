@@ -3,7 +3,7 @@ bit-for-bit like a device hit."""
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import _random_suffixes
 from sglang.test.kl_test_utils import (
     _extract_output_logprobs,
@@ -26,6 +26,12 @@ register_cuda_ci(
     stage="extra-b",
     # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
     runner_config="4-gpu-h100",
+)
+register_amd_ci(
+    est_time=99,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Mooncake store service exited with code -6",
 )
 
 _MODEL_PATH = "yujiepan/kimi-linear-tiny-random"

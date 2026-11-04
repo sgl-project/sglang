@@ -17,11 +17,17 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.layer_ut_utils import assert_output_close, init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(
+    est_time=20,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: <class 'sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe",
+)
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
 GROUP_SIZE, PACK_FACTOR = 128, 8

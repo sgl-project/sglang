@@ -20,7 +20,7 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 if not hasattr(_hf_activations, "PytorchGELUTanh"):
 
@@ -42,6 +42,12 @@ from sglang.srt.utils.hf_transformers import _fix_added_tokens_encoding
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_cuda_ci(est_time=213, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=335,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: start (0) + length (4320) exceeds dimension size (4304).",
+)
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"

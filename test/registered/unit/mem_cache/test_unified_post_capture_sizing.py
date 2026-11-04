@@ -29,10 +29,16 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(
+    est_time=21,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ImportError: cuda.bindings.driver is required for CUDA VMM operations",
+)
 
 _RESERVED_BYTES = 64 << 20
 _FINAL_BYTES = 16 << 20

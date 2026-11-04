@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.test_utils import (
@@ -12,6 +12,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=263, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(
+    est_time=387,
+    stage="extra-a",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 SWA_MODEL = "openai/gpt-oss-20b"
 

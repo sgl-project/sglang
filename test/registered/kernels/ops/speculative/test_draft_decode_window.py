@@ -55,9 +55,10 @@ from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_i
 from sglang.srt.speculative import spec_utils
 from sglang.srt.speculative.spec_utils import resolve_draft_decode_window
 from sglang.srt.utils import next_power_of_2
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 _HAS_CUDA = torch.cuda.is_available()
 

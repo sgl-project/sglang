@@ -37,10 +37,11 @@ from sglang.srt.layers.attention.flashattention_backend import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=17, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _DEV = "cuda"
 _NUM_DRAFT = 4

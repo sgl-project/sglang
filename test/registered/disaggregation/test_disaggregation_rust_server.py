@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -28,6 +28,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, is_rust_server_built
 
 register_cuda_ci(est_time=70, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(
+    est_time=120,
+    stage="stage-b",
+    runner_config="2-gpu-large-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 @unittest.skipUnless(

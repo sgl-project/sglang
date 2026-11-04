@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
 from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
     fused_recurrent_linear_replayssm_decode,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
     import helion  # noqa: F401
@@ -38,6 +38,12 @@ else:
     )
 
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=270,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 pytestmark = pytest.mark.skipif(
     not HELION_AVAILABLE,

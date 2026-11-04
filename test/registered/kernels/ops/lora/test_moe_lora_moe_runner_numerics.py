@@ -26,13 +26,19 @@ from sglang.srt.lora.moe.runner import (
     MoeLoraRunner,
 )
 from sglang.srt.lora.utils import Phase, architecture_for_capability
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # SM100 runs its own plan rows (per-row B and split-K in decode) and base GEMMs.
 # The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
 # its four GPUs are allocation granularity, not multi-GPU coverage.
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(
+    est_time=120,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 def _bind_test_menu(runner, plan, launch_config):

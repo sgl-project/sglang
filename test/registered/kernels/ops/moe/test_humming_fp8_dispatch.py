@@ -11,10 +11,16 @@ from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 from sglang.srt.layers.moe.moe_runner import humming as humming_runner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.utils import get_device_sm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=135,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_moe_permute_prepare",
+)
 
 
 def _silu_reference(gate_up: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:

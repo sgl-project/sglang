@@ -6,12 +6,18 @@ import torch
 
 from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
 from sglang.srt.utils import is_sm120_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=30,
     stage="base-b",
     runner_config="1-gpu-small",
+)
+register_amd_ci(
+    est_time=14,
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
 )
 
 

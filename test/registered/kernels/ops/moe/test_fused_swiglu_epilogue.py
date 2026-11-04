@@ -18,10 +18,16 @@ import sys
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=18,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: 512/512 elements differ from silu_and_mul",
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

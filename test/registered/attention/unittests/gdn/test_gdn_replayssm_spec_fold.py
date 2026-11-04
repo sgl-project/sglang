@@ -17,10 +17,16 @@ from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=20,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: dtype=torch.bfloat16 slot=7 accept_len=4",
+)
 
 B, T = 3, 4
 H, HV = 4, 8

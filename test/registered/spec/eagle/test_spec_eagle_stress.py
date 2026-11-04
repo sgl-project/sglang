@@ -9,7 +9,7 @@ scheduler/test_scheduler_control.py.
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecFeatureKit,
@@ -18,6 +18,12 @@ from sglang.test.kits.spec_server_kits import (
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
 register_cuda_ci(est_time=718, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=1010,
+    stage="extra-a",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestEagle3Perf(Eagle3Base, SpecPerfKit):

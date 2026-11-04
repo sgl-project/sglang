@@ -10,7 +10,7 @@ import pybase64
 import requests
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -20,6 +20,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=199, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(
+    est_time=191,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 _MODEL = os.environ.get("SGLANG_ROUTED_EXPERTS_TEST_MODEL", "deepseek-ai/DeepSeek-V3")
 _NUM_EXPERTS = 24

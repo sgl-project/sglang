@@ -13,10 +13,16 @@ from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
 )
 from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=30,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 NOPE_DIM = 512

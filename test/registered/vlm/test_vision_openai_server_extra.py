@@ -3,10 +3,11 @@ budget; the per-commit set lives in test_vision_openai_server_a.py."""
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.vlm_utils import OmniOpenAITestMixin, TestOpenAIMLLMServerBase
 
 register_cuda_ci(est_time=239, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=984, stage="extra-a", runner_config="1-gpu-large-amd")
 
 
 class TestQwen3OmniServer(OmniOpenAITestMixin):

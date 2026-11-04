@@ -6,7 +6,7 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import (
     AccuracyTwoPassMixin,
     UnifiedRadixTreeTestMixin,
@@ -26,6 +26,7 @@ DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
 register_cuda_ci(est_time=1844, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(est_time=3600, stage="extra-b", runner_config="4-gpu-amd")
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):

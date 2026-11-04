@@ -15,7 +15,7 @@ from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -25,6 +25,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=396, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(
+    est_time=581,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 # FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
 # ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,

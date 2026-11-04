@@ -7,7 +7,7 @@ import unittest
 import requests
 from transformers import AutoTokenizer
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=72, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=222, stage="stage-b", runner_config="1-gpu-large-amd")
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 # Default --mamba-track-interval: the grid on which decode checkpoints the

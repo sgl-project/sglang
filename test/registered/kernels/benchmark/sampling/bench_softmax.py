@@ -6,10 +6,16 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.jit.utils import is_hip_runtime
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(
+    est_time=23,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
 )
 
 

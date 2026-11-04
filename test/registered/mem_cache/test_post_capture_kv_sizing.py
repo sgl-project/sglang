@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -29,6 +29,12 @@ from sglang.test.test_utils import (
 
 # CI Registration
 register_cuda_ci(est_time=78, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=110,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError: unexpectedly None : Post-capture KV sizing log line not found; the feature was gated off or th",
+)
 
 STDOUT_FILENAME = "post_capture_kv_sizing_stdout.log"
 STDERR_FILENAME = "post_capture_kv_sizing_stderr.log"

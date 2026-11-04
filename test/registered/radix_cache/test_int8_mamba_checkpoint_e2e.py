@@ -25,7 +25,7 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import (
     DefaultServerBase,
@@ -35,6 +35,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=167, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(est_time=487, stage="extra-b", runner_config="4-gpu-amd")
 
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):

@@ -29,11 +29,21 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-b200")
+register_amd_ci(
+    est_time=180,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError",
+)
 
 
 # =============================================================================

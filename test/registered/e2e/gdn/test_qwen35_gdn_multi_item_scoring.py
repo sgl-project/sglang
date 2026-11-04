@@ -8,13 +8,19 @@ import torch
 from transformers import AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
 )
 
 register_cuda_ci(est_time=32, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=47,
+    stage="extra-a",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): Exception: flashinfer_python with minimum required version 0.7.2 is not installed.",
+)
 
 
 class TestQwen35GDNMultiItemScoring(CustomTestCase):

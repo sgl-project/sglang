@@ -18,9 +18,10 @@ from sglang.srt.lora.dense.runner import DenseLoraRunner  # noqa: E402
 from sglang.srt.lora.utils import LoRABatchInfo  # noqa: E402
 from sglang.srt.lora.utils import Phase  # noqa: E402
 from sglang.srt.lora.workspace import LoraWorkspace  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=37, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="dense LoRA kernels need CUDA"

@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.srt.utils import is_sm100_supported, is_xpu, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
@@ -21,6 +21,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=93, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=186,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"

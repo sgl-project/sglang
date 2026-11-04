@@ -13,7 +13,7 @@ import torch
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.utils import get_device_sm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.layer_ut_utils import (
     assert_output_close,
     init_single_process_dist,
@@ -23,6 +23,12 @@ from sglang.test.layer_ut_utils import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=24,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): NameError: name 'int8_scaled_mm' is not defined",
+)
 
 INT8_MAX = 127.0
 

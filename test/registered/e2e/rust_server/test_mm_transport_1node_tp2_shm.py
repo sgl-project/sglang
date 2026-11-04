@@ -9,12 +9,18 @@ building the stub reads nothing.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.rust_mm_transport_fixture import (
     RustMmTransportServerBase,
 )
 
 register_cuda_ci(est_time=53, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(
+    est_time=84,
+    stage="stage-b",
+    runner_config="2-gpu-large-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 class TestRustMmTransport1NodeTp2Shm(RustMmTransportServerBase):

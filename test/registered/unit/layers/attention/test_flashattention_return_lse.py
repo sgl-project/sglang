@@ -12,10 +12,16 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.iquest_q1 import _apply_learned_sink
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=18,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ImportError: Can not import FA3 in sgl_kernel. Please check your installation.",
+)
 
 
 class TestFlashAttentionReturnLse(CustomTestCase):

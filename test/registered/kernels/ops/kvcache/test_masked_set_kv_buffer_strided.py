@@ -24,9 +24,10 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import masked_set_kv_buffer_kernel
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=13, stage="jit-kernel-unit", runner_config="amd")
 
 
 class TestMaskedSetKvBufferStrided(unittest.TestCase):

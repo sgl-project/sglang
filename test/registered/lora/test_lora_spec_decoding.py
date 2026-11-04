@@ -15,7 +15,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -26,6 +26,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=95, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=167, stage="stage-b", runner_config="1-gpu-large-amd")
 
 PROMPTS = [
     "What is the capital of France? Answer in one sentence.",

@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.customized_info_sampler import (
     CUSTOMIZED_INFO_ARRAY_FIELD,
     CUSTOMIZED_INFO_FIELD,
@@ -12,6 +12,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 
 register_cuda_ci(est_time=315, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(
+    est_time=473,
+    stage="extra-a",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
 # Smallest in-tree GDN hybrid: MHA full attention + gated-delta-net linear

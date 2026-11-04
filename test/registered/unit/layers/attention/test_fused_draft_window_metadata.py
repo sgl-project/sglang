@@ -35,11 +35,12 @@ from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of, plan_stand_in
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=23, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class TestFusedDraftWindowMetadata(CustomTestCase):

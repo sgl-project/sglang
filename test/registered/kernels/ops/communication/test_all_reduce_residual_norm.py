@@ -22,10 +22,16 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+register_amd_ci(
+    est_time=101,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_communicator",
+)
 
 H = 6144
 TOP_K = 8

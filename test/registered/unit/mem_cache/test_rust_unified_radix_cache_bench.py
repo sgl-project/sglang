@@ -4,9 +4,10 @@ import unittest
 
 import test_unified_radix_cache_bench as shared_suite
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=39, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class RustBackendSuite(unittest.TestSuite):

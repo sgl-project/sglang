@@ -17,7 +17,7 @@ import requests
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -29,6 +29,12 @@ register_cuda_ci(
     est_time=480,
     stage="base-b",
     runner_config="1-gpu-large",
+)
+register_amd_ci(
+    est_time=275,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
 )
 
 MODEL = "Qwen/Qwen3-8B"

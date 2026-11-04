@@ -4,10 +4,16 @@ from sgl_kernel import sgl_per_token_quant_fp8 as aot_per_token_quant_fp8
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.ops.quantization.per_token_quant_fp8 import per_token_quant_fp8
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(
+    est_time=18,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Tensor match failed for Tensor<39, 1536>[strides=<1536, 1>, dtype=float8_e4m3fn, device=rocm:0]",
 )
 
 

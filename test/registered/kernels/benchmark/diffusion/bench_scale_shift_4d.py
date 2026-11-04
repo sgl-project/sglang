@@ -6,13 +6,14 @@ from dataclasses import dataclass
 import torch
 
 from sglang.kernels.ops.diffusion import fuse_scale_shift_kernel
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.utils import cuda_event_us
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=5, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 @dataclass(frozen=True)

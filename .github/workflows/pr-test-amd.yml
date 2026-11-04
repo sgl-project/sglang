@@ -440,12 +440,16 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+  # With continue_on_error every shard runs past failed and hung files, and each
+  # hang costs a full --timeout-per-file. The jit-kernel and stage-b steps then
+  # get 180 min so a few hangs don't kill the step and drop the files not yet run.
   jit-kernel-unit-test-amd:
-    name: ${{ format('jit-kernel-unit-test-amd ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+    name: ${{ format('jit-kernel-unit-test-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
+        part: [0, 1, 2]
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -477,16 +481,17 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run JIT kernel unit tests
-        timeout-minutes: 30
+        timeout-minutes: ${{ needs.check-changes.outputs.continue_on_error == 'true' && 180 || 60 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-benchmark-test-amd:
-    name: ${{ format('jit-kernel-benchmark-test-amd ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+    name: ${{ format('jit-kernel-benchmark-test-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
+        part: [0]
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -518,9 +523,9 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run JIT kernel benchmarks
-        timeout-minutes: 30
+        timeout-minutes: ${{ needs.check-changes.outputs.continue_on_error == 'true' && 180 || 60 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-benchmark-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-benchmark-test-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
   # These jobs poll GitHub API to wait for previous stages to complete.
@@ -587,7 +592,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 90 || 75 }}
+        timeout-minutes: ${{ needs.check-changes.outputs.continue_on_error == 'true' && 180 || ((inputs.runner_arch || 'mi300') == 'mi300' && 90 || 75) }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -714,7 +719,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 60 || 45 }}
+        timeout-minutes: ${{ needs.check-changes.outputs.continue_on_error == 'true' && 180 || ((inputs.runner_arch || 'mi300') == 'mi300' && 60 || 45) }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -733,10 +738,10 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-        part: [0]
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -756,9 +761,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 120 || 45 }}
+        timeout-minutes: ${{ needs.check-changes.outputs.continue_on_error == 'true' && 180 || ((inputs.runner_arch || 'mi300') == 'mi300' && 120 || 45) }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 5400 || 2700 }} ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 5400 || 2700 }} ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd:
     name: ${{ format('multimodal-gen-test-1-gpu-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
@@ -1081,7 +1086,7 @@ jobs:
             [
               {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 8},
               {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 2},
-              {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 1}
+              {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 2}
             ]
           max-wait-minutes: '480'
 

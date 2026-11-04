@@ -1,7 +1,7 @@
 import unittest
 from urllib.parse import urlparse
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_deterministic import (
     BenchArgs,
@@ -10,6 +10,7 @@ from sglang.test.test_deterministic import test_deterministic as run_determinist
 from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
 register_cuda_ci(est_time=480, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(est_time=2700, stage="extra-b", runner_config="large-8-gpu-amd")
 
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 

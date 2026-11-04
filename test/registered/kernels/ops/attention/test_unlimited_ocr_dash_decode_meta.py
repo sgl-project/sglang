@@ -32,7 +32,7 @@ from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
 from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
     UnlimitedOCRV2AttnBackend,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.unlimited_ocr_dash import (
     cos_sin_2d_reference,
     local_union_reference,
@@ -41,6 +41,7 @@ from sglang.test.kernels.unlimited_ocr_dash import (
 )
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 BS, IMG, PAGE, MM_PAD = 128, 99, 7, 1_000_000
 NUM_BLOCKS, WIDTH = 64, 12

@@ -24,9 +24,15 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=90,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or is_hip(),

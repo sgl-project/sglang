@@ -9,12 +9,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
 register_cuda_ci(est_time=168, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(
+    est_time=254,
+    stage="extra-a",
+    runner_config="2-gpu-large-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class _PrefillCompleteServer(PDDisaggregationServerBase):

@@ -2,11 +2,17 @@ import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.elementwise.sam_rel_pos_bias import sam_rel_pos_bias
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.sam import sam_rel_pos_bias_reference
 
 register_cuda_ci(
     est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(
+    est_time=12,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Tensor match failed for Tensor<1, 12, 1600, 40, 1>[strides=<768000, 64000, 40, 1, 1>, dtype=bflo",
 )
 
 # SAM ViT-B global attention: 12 heads.

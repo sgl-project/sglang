@@ -27,11 +27,12 @@ from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
     c2_decode_norm_rope_store,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_amd_ci(est_time=34, stage="jit-kernel-benchmark", runner_config="amd")
 
 HEAD_DIM = 512
 ROPE_DIM = 64

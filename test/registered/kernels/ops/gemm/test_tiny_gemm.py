@@ -8,10 +8,16 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=300, stage="nightly", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=90,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 # One kernel is built per m in [1, MAX_M], so hold max_m fixed across the sweep:
 # every num_tokens of a shape then shares one JIT module.

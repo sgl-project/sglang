@@ -19,7 +19,7 @@ from sglang.kernels.ops.attention.unlimited_ocr_dash.route import (
     route_prefill_triton,
     win_bounds_decode,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.unlimited_ocr_dash import (
     block_scores_reference,
     entmax_route_reference,
@@ -28,6 +28,7 @@ from sglang.test.kernels.unlimited_ocr_dash import (
 )
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
 
 BS, D, NUM_PAGES = 128, 128, 8192
 ROUTER = dict(idx_scale=0.37, prior_floor=1e-2, sigma=1.3)

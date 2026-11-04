@@ -6,10 +6,16 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.model_executor.runner_backend import cuda_graph_dedup_mixin as dedup
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=15,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): AssertionError",
+)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

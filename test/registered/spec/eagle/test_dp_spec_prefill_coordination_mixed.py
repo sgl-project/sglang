@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
@@ -21,6 +21,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=114, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(
+    est_time=171,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 
 class TestDPSpecPrefillCoordinationMixed(CustomTestCase):

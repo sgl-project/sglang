@@ -2,7 +2,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=276, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(est_time=449, stage="extra-b", runner_config="large-8-gpu-amd")
 
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 

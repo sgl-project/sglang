@@ -21,11 +21,17 @@ from sglang.srt.layers.moe.moe_runner.hpc_ops import (
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=15,
+    stage="stage-b",
+    runner_config="1-gpu-large-amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 # Qwen3-30B-A3B-FP8 MoE shapes.
 E, TOPK, H, I = 128, 8, 2048, 768

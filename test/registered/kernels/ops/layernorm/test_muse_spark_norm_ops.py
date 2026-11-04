@@ -13,9 +13,15 @@ from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xRMSNorm,
     MuseSpark1xRMSNormWithInputScale,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=45,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_muse_spark_norm_residual_4096_512_false_false_1 in /ro",
+)
 
 _BACKENDS = [KernelBackend.TRITON, KernelBackend.JIT]
 

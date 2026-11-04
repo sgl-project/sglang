@@ -8,10 +8,11 @@ from sglang.kernels.ops.mm.process.image import (
     _normalize_and_patchify_torch,
     normalize_and_patchify,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=17, stage="jit-kernel-unit", runner_config="amd")
 
 
 class TestImagePatchify(CustomTestCase):

@@ -15,10 +15,16 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
     CausalLingBotWorldTransformerBlock,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=53,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="all cases skip on ROCm in AMD parity run #48317 (MI300, rocm10)",
+)
 
 
 def make_sites(channels):

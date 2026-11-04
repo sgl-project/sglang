@@ -6,13 +6,19 @@ python3 -m unittest test_qwen35_deterministic.TestQwen35Fa3Deterministic
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
 
 register_cuda_ci(est_time=121, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(
+    est_time=188,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 QWEN35 = "Qwen/Qwen3.5-35B-A3B"
 

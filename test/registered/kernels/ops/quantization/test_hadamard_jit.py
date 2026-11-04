@@ -16,10 +16,16 @@ from sglang.kernels.ops.quantization.hadamard import (
     hadamard_transform_28n,
     hadamard_transform_40n,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=32, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=128, stage="nightly", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=48,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_hadamard_bf16_t",
+)
 
 # Exact M×N Hadamard matrices (±1 entries) copied from
 # python/sglang/kernels/jit/csrc/fast-hadamard-transform/code_gen.py.

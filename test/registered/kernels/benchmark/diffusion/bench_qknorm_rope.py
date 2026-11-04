@@ -11,10 +11,16 @@ from sglang.kernels.jit.benchmark.utils import (
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(
+    est_time=23,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): ModuleNotFoundError: No module named 'flashinfer'",
 )
 
 MAX_SEQ_LEN = 131072

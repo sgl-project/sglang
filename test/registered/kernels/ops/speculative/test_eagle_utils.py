@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CUDA and ROCm both build this kernel through the JIT launcher; MUSA still
 # gets it from the AOT extension.
@@ -13,6 +13,7 @@ else:
     from sgl_kernel import verify_tree_greedy
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 
 def test_verify_tree_greedy():

@@ -2,7 +2,7 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -16,6 +16,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=500, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(
+    est_time=678,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): server exits during launch",
+)
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 

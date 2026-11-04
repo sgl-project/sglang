@@ -20,13 +20,14 @@ from sglang.srt.lora.moe.plan import SelectedPlan, _build_plan, _load_plans, _ti
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.utils import Phase
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Also exercise the Blackwell implementation in per-PR CI.
 # The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
 # its four GPUs are allocation granularity, not multi-GPU coverage.
 register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=13, stage="jit-kernel-unit", runner_config="amd")
 
 _GB300 = "sm100"
 _H200 = "sm90"

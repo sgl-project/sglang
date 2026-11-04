@@ -23,13 +23,19 @@ from sglang.kernels.ops.attention.dsv4.rope import (
 )
 from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_cache
 from sglang.srt.utils import get_device, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (
     quantize_fp4_indexer_ref,
     store_fp4_index_cache_ref,
 )
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(
+    est_time=75,
+    stage="jit-kernel-unit",
+    runner_config="amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): RuntimeError: Failed to build JIT module sgl_kernel_jit_dpsk_v4_block_amax_false_fp32_t_fp32_t",
+)
 
 _is_xpu = is_xpu()
 if _is_xpu:

@@ -14,10 +14,11 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.runtime_context import get_context, get_model, get_parallel
 from sglang.srt.utils import get_device, is_cuda
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 @unittest.skipUnless(is_cuda(), "covers the CUDA routers")
