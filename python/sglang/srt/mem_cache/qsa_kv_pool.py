@@ -15,6 +15,12 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.device_pool_info import (
+    DevicePoolInfo,
+    IndexKeyBufferInfo,
+    IndexKeyLayout,
+)
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 
@@ -48,6 +54,22 @@ def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
 
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        # Full KV is supplied by full_kv_pool; pending request rings stay resident.
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                layer_ids=tuple(self.full_attention_layer_id_mapping),
+                buffer_info=IndexKeyBufferInfo(
+                    page_size=self.page_size,
+                    compress_ratio=self.qsa_compress_ratio,
+                    key_layout=IndexKeyLayout.KEY_ROWS,
+                    buffers=tuple(self.qsa_compressed_k_buffer_pool),
+                ),
+            ),
+        )
 
     # Full-KV pages are a multiple of the compress ratio, so no group straddles pages;
     # ``compressed_slot = full_slot // ratio`` needs no ownership bookkeeping;
