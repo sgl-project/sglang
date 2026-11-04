@@ -118,7 +118,7 @@ may be either a normal style adapter or a timestep-distilled Turbo adapter.
 | DiT | ConvRot INT8, W4A8, W4A4, or mixed W4A4+INT8 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected. INT8 layers run on SGLang's JIT-compiled ConvRot ops on CC 9.0, 10.0, 12.0 and 12.1 and on `comfy-kitchen` elsewhere; W4A8 and W4A4 layers require `comfy-kitchen`. TP must preserve each file's ConvRot group boundaries. |
 | DiT | [NVFP4, optionally mixed with INT8 or FP8](https://huggingface.co/Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; NVFP4 execution requires NVIDIA compute capability 10.0+. |
 | DiT | [AutoRound W4A16 component](https://huggingface.co/Ar4ikov/MiniMax-H3-transformer-W4A16-RTN) | `--component-paths.transformer Ar4ikov/MiniMax-H3-transformer-W4A16-RTN` | Self-describing Diffusers component; SGLang reuses the SRT GPTQ/Marlin backend. The linked export is FL2VA. |
-| DiT | GGUF, full or AdaLN-pruned ([full](https://huggingface.co/leejet/MiniMax-H3-GGUF), [pruned](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | `--component-weights-paths.transformer OWNER/REPO/FILE.gguf` | CUDA capacity path; aligned TP and layerwise offload are supported, FSDP and LoRA are not. |
+| DiT | GGUF, full or AdaLN-pruned ([full](https://huggingface.co/leejet/MiniMax-H3-GGUF), [pruned](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | `--component-weights-paths.transformer OWNER/REPO/FILE.gguf` | CUDA capacity path; aligned TP and layerwise offload are supported. A single dynamic LoRA requires TP=1; FSDP and merging LoRA into packed weights are unsupported. |
 | Text encoder | Architecture-compatible Qwen3-VL BF16 finetune ([Heretic example](https://huggingface.co/llmfan46/Qwen3-VL-32B-Instruct-ultra-uncensored-heretic)) | `--component-paths.text_encoder OWNER/REPO` | Reuses the native H3 extractor, including its vision tower and layer-50 hidden-state selection. Finetuning changes conditioning, not the sampling schedule. |
 | Text encoder | [Serialized FP8 component](https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct-FP8) | `--component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8` | Only eligible language-model linears use FP8; embeddings, norms, and the vision tower keep their declared precision. |
 | Text encoder | ConvRot INT8, W4A8, or W4A4 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders), [Heretic INT8](https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Auto-detected. INT8 layers run on SGLang's JIT-compiled ConvRot ops on CC 9.0, 10.0, 12.0 and 12.1 and on `comfy-kitchen` elsewhere; W4A8 and W4A4 layers require `comfy-kitchen`. INT8/W4A8 files may include a scalar-scale INT8 embedding, which requires `comfy-kitchen`. Unmarked tensors retain their declared precision. |
@@ -805,8 +805,22 @@ quality-validated.
 AdaLN-pruned Diffusers components that publish `adaln_basis` and `adaln_mean`
 can also consume a LoRA trained against the released full-width AdaLN modules:
 SGLang projects those adapter factors onto the pruned coordinates at load time.
-A structurally modified checkpoint without that metadata still fails closed,
-and packed GGUF weights remain incompatible with LoRA.
+A structurally modified checkpoint without that metadata still fails closed.
+
+With a GGUF transformer, use `--tp-size 1` and `--lora-merge-mode dynamic`
+(or `auto`, which selects dynamic mode for packed weights). One adapter per
+transformer is supported, including with layerwise offload. The adapter adds
+its output delta alongside the quantized base; it does not merge into GGML
+blocks or create an unquantized copy of the whole transformer. You still pay
+for the adapter weights and its per-step projections. Keep the adapter's
+sampling schedule and trigger phrase from the table above; GGUF does not
+change those requirements. FSDP, TP greater than one with LoRA, and explicit
+`merge` mode remain unsupported.
+
+For an AdaLN-pruned GGUF without `adaln_basis` and `adaln_mean`, a LoRA
+trained against full-width AdaLN modules is rejected. Use an adapter targeting
+unchanged layers, such as an attention-only adapter, or use a full-width GGUF.
+Dynamic LoRA does not restore the projection metadata removed by pruning.
 
 ### Pika H3 Flex: six-step adapters
 

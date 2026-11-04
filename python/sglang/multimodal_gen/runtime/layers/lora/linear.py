@@ -142,6 +142,15 @@ def _add_lora_delta_in_gemm(
     return out
 
 
+def is_gguf_linear(layer: nn.Module) -> bool:
+    if not isinstance(layer, LinearBase) or not hasattr(layer, "qweight"):
+        return False
+    # Keep the SRT GGUF backend out of ordinary LoRA imports (including MPS).
+    from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFLinearMethod
+
+    return isinstance(layer.quant_method, GGUFLinearMethod)
+
+
 class BaseLayerWithLoRA(nn.Module):
     def __init__(
         self,
@@ -160,7 +169,12 @@ class BaseLayerWithLoRA(nn.Module):
         # valid only while every merge on this layer is a copy-merge (the
         # merged-store path), which never writes the base storage. H3's DiT
         # backup alone is 38 GB of anonymous memory under clone().
-        if snapshot_base:
+        if is_gguf_linear(base_layer):
+            # Dynamic LoRA never writes packed weights. No dense base or restore
+            # snapshot is needed, including while qweight is an offload placeholder.
+            self.cpu_weight = None
+            self._base_is_view = False
+        elif snapshot_base:
             self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
             self._base_is_view = False
         else:
@@ -217,6 +231,8 @@ class BaseLayerWithLoRA(nn.Module):
     @property
     def can_merge_base_weight(self) -> bool:
         """Whether a LoRA delta may safely replace the stored base weight."""
+        if is_gguf_linear(self.base_layer):
+            return False
         weight = self.weight
         if not (weight.dtype.is_floating_point or weight.dtype.is_complex):
             return False
@@ -427,6 +443,10 @@ class BaseLayerWithLoRA(nn.Module):
                           If False, append to existing list (for multi-LoRA support).
             output_offset: Optional constant output term paired with this adapter
         """
+        if merge_weights and is_gguf_linear(self.base_layer):
+            raise ValueError(
+                "GGUF LoRA requires dynamic mode; packed weights cannot be merged."
+            )
         lora_A_param = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
@@ -627,7 +647,7 @@ class BaseLayerWithLoRA(nn.Module):
         over an even sample of rows. Nothing is written; None when there is
         nothing to round or the adapter has no plain 2-D form here."""
         lora_list = self._active_lora_list()
-        if self.disable_lora or not lora_list:
+        if self.disable_lora or not lora_list or not self.can_merge_base_weight:
             return None
         src, _ = self._materialized_weight_src()
         if not src.is_floating_point() or src.dtype == torch.float32:
@@ -668,6 +688,10 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
+        if is_gguf_linear(self.base_layer):
+            raise ValueError(
+                "GGUF LoRA requires dynamic mode; packed weights cannot be merged."
+            )
         if strength is not None:
             self.strength = strength
             if self.lora_weights_list:
@@ -1083,9 +1107,14 @@ def wrap_with_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # type: ignore[arg-type]
-            effective_snapshot_base = _use_owned_base_snapshot(
-                snapshot_base, layer.weight.device.type, layer.weight.numel()
-            )
+            if is_gguf_linear(layer):
+                if getattr(layer, "tp_size", 1) != 1:
+                    raise ValueError("GGUF LoRA currently requires TP=1.")
+                effective_snapshot_base = False
+            else:
+                effective_snapshot_base = _use_owned_base_snapshot(
+                    snapshot_base, layer.weight.device.type, layer.weight.numel()
+                )
             ret = lora_layer_type(
                 layer,
                 lora_rank=lora_rank,
