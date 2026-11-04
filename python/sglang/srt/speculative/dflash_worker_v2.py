@@ -107,6 +107,7 @@ from sglang.srt.speculative.spec_utils import (
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
+    simulated_acc_len_generator,
 )
 from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
 
@@ -415,6 +416,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         check_simulate_acc_token_mode()
+        # The forced lengths overwrite accept_len after its broadcast, so every rank
+        # draws them from the same server-seeded stream.
+        self._simulated_acc_len_rng = (
+            simulated_acc_len_generator(target_worker.random_seed)
+            if SIMULATE_ACC_LEN > 0
+            else None
+        )
 
         # DP drafts use per-DP attention TP, independent of idle peers. CP
         # drafts use full TP without CP, including their backend and KV pool.
@@ -2297,6 +2305,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
                 next_token_logits=next_token_logits,
+                generator=self._simulated_acc_len_rng,
             )
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.

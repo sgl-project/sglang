@@ -43,10 +43,21 @@ jobs:
               tests/e2e/sglang/test_session_server_multi_role/test_qwen38small.py
               tests/e2e/megatron/model_scripts/test_glm5_2_744b_a40b_5layer_ci.py
           # The 4- and 8-GPU suites run past 180 min on MI300X; the 4-GPU suite takes ~155 min on MI355X.
+          # As one job, the 4-GPU suite loses its runner every night after 13-16 tests; split it in two.
           - suite: nightly-stage-c-4-gpu-mi350
             runner: linux-mi300-4gpu-sglang
             timeout: 300
             skip_tests: ""
+            partition_id: 0
+            partition_size: 2
+            part: 1/2
+          - suite: nightly-stage-c-4-gpu-mi350
+            runner: linux-mi300-4gpu-sglang
+            timeout: 300
+            skip_tests: ""
+            partition_id: 1
+            partition_size: 2
+            part: 2/2
           # The 8-GPU suite no longer finishes in 300 min on MI300X; split it in two.
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi300-8gpu-sglang

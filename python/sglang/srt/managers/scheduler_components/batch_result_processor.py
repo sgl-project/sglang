@@ -25,9 +25,8 @@ from sglang.srt.layers.logits_processor import (
     TokenCustomizedInfo,
 )
 from sglang.srt.managers.auxiliary_output import CommittedTokens
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
     mamba_lazy_spec_in_window,
@@ -193,7 +192,8 @@ class SchedulerBatchResultProcessor:
         if not req.return_routed_experts:
             return
         capturer = get_global_experts_capturer()
-        if capturer is None:
+        # Only the rank that sends outputs keeps routed experts on the host.
+        if capturer is None or not capturer.has_host_cache:
             return
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
