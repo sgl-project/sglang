@@ -60,7 +60,11 @@ def _mega_moe_mma_type(experts) -> str:
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
     # Per layer: a draft may differ from the target (draft_model_build_scope).
-    return "mxf4xmxf4" if experts._mega_moe_w4a4 else "fp8xfp4"
+    if experts._mega_moe_w4a4:
+        return "mxf4xmxf4"
+    # The kernel dispatches on the weight dtype: E4M3 weights are the W8A8
+    # (fp8xfp8) kind, packed E2M1 weights (int8/uint8) are W4A8.
+    return "fp8xfp8" if experts.w13_weight.dtype == torch.float8_e4m3fn else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
@@ -107,7 +111,7 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     # Flash's 2304-wide intermediate dimension.
     # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
+    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
     hidden_align = 16 * scale_group
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
@@ -518,7 +522,9 @@ def run_mega_routed_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
-    jit_pre_dispatch = mma_type == "fp8xfp4"
+    # Both FP8 types go through the JIT pre-dispatch below, which folds the scale
+    # in-kernel; scaling here as well would apply it twice.
+    jit_pre_dispatch = mma_type in ("fp8xfp4", "fp8xfp8")
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
         if not jit_pre_dispatch:
@@ -665,6 +671,18 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(sf).copy_(result)
 
 
+def _mega_moe_sf_as_fp32(sf: torch.Tensor) -> torch.Tensor:
+    """Scale factor as fp32 multipliers, whatever form the quantizer left it in.
+
+    MXFP4 experts carry fp32 per-32 scales; MXFP8 experts carry UE8M0 exponent
+    bytes (``format_ue8m0``), which `transform_sf_into_required_layout` takes as
+    fp32 powers of two.
+    """
+    if sf.dtype == torch.uint8:
+        return (sf.to(torch.int32) << 23).view(torch.float32)
+    return sf
+
+
 def build_mega_moe_experts_weights(experts) -> None:
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (
@@ -683,15 +701,16 @@ def build_mega_moe_experts_weights(experts) -> None:
 
     mma_type = _mega_moe_mma_type(experts)
     w13 = experts.w13_weight.data
-    w13_sf_fp32 = experts.w13_weight_scale_inv.data
+    w13_sf_fp32 = _mega_moe_sf_as_fp32(experts.w13_weight_scale_inv.data)
     w2 = experts.w2_weight.data
-    w2_sf_fp32 = experts.w2_weight_scale_inv.data
+    w2_sf_fp32 = _mega_moe_sf_as_fp32(experts.w2_weight_scale_inv.data)
 
-    num_groups, n1, half_k1 = w13.shape
-    k1 = half_k1 * 2
+    num_groups, n1, packed_k1 = w13.shape
+    # Packed E2M1 weights hold two K elements per byte; E4M3 holds one.
+    k1 = packed_k1 * (1 if mma_type == "fp8xfp8" else 2)
     check_mega_moe_shapes(hidden=k1, intermediate=n1 // 2, mma_type=mma_type)
-    _, n2, half_k2 = w2.shape
-    k2 = half_k2 * 2
+    _, n2, packed_k2 = w2.shape
+    k2 = packed_k2 * (1 if mma_type == "fp8xfp8" else 2)
 
     w13_sf = transform_sf_into_required_layout(
         w13_sf_fp32,
