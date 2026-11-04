@@ -21,11 +21,12 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
@@ -380,6 +381,19 @@ class HostKVCache(abc.ABC):
     def device_row_stride_bytes(self) -> int:
         """Bytes between consecutive device KV rows."""
         return self._strided_device_row_bytes or self.token_stride_size
+
+    def _device_row_stride_kwargs(self, kernel: str, *, device_is_src: bool) -> dict:
+        """Row-stride kwargs for an AOT KV transfer kernel over strided device rows.
+
+        The XPU kernels step device rows by an explicit stride; the CUDA/ROCm AOT
+        kernels need packed rows.
+        """
+        if self.device_rows_packed:
+            return {}
+        if not _is_xpu:
+            self._require_packed_device_rows(kernel)
+        key = "src_row_stride" if device_is_src else "dst_row_stride"
+        return {key: self.device_row_stride_bytes}
 
     def _require_packed_device_rows(self, kernel: str) -> None:
         if not self.device_rows_packed:
