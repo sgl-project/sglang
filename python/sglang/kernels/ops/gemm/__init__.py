@@ -591,6 +591,30 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.hopper_fp8_block_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_fp8_block_gemv:hopper_fp8_block_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_bf16_tiny_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv:hopper_bf16_tiny_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gate_matvec_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.router_gate_matvec_cuda:router_gate_matvec_cuda",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.batched_gemm_a16wfp4_flatten_mxfp4_quant",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip:batched_gemm_a16wfp4_flatten_mxfp4_quant",
