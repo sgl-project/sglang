@@ -496,6 +496,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             # Out of the box the indexer runs the TileLang kernel (works on
             # stock DeepGEMM); both knobs stay env-overridable so a DeepGEMM
             # build with SM120 attention support can opt into

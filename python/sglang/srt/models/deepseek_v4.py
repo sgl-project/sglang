@@ -3489,7 +3489,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # dispatch cost dominates at small M (decode): dispatch by token count.
         if (
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-            and (get_platform().is_sm100 or get_platform().is_sm90)
+            and not _is_hip
             and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
         ):
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
