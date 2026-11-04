@@ -14,8 +14,8 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
