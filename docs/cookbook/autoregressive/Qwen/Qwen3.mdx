@@ -42,6 +42,7 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 ### 3.2 Configuration Tips
 
+- **Qwen3-8B on B300 (BF16, TP1):** SGLang selects `trtllm_mha` by default when speculative decoding is disabled. If your launch command sets `--attention-backend flashinfer`, remove it or replace it with `--attention-backend trtllm_mha`.
 - **Memory Management:** Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
 - **Expert Parallelism:** SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
 - **Kernel Tuning:** For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
@@ -354,7 +355,7 @@ python -m sglang.launch_server \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -410,7 +411,7 @@ Max ITL (ms):                            13.45
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -466,7 +467,7 @@ Max ITL (ms):                            457.52
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -532,7 +533,7 @@ python -m sglang.launch_server \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -588,7 +589,7 @@ Max ITL (ms):                            15.79
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -644,7 +645,7 @@ Max ITL (ms):                            104.94
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -702,7 +703,7 @@ Max ITL (ms):                            408.30
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -758,7 +759,7 @@ Max ITL (ms):                            14.48
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -814,7 +815,7 @@ Max ITL (ms):                            574.64
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
