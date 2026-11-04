@@ -127,6 +127,9 @@ jobs:
               # stage reads this.
               - "docs/docs/advanced_features/server_arguments.mdx"
               - "docs/docs/advanced_features/server_arguments_undocumented.txt"
+              # test_tool_parser_docs_coverage.py diffs this doc against the
+              # registered --tool-call-parser names.
+              - "docs/docs/advanced_features/tool_parser.mdx"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"
