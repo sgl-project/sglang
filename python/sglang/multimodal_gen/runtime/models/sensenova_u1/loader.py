@@ -8,7 +8,14 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 from transformers.cache_utils import Cache
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_rank,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from sglang.multimodal_gen.runtime.models import (  # noqa: F401
     sensenova_u1 as _sensenova_u1,
 )
@@ -17,6 +24,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
     move_to_device,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+    Qwen3MLP,
     Qwen3Model,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -56,6 +64,12 @@ def load_model_and_tokenizer(
     model = AutoModel.from_pretrained(model_path, **model_kwargs).eval()
     device = get_local_torch_device()
     current_platform.set_device(device)
+    if get_tp_world_size() > 1:
+        shard_decoder_for_tensor_parallel(
+            model=model, rank=get_tp_rank(), world_size=get_tp_world_size()
+        )
+    else:
+        pass
     model = place_model(model=model, device=device)
     return {"model": model, "tokenizer": tokenizer}
 
@@ -201,3 +215,64 @@ def _install_device_hooks(
         layer.register_forward_pre_hook(move_layer_inputs, with_kwargs=True)
     for module in input_moving_modules:
         module.register_forward_pre_hook(move_inputs_to_module_device)
+
+
+def shard_decoder_for_tensor_parallel(
+    model: NEOChatModel, rank: int, world_size: int
+) -> None:
+    # Megatron layout: q/k/v and gate/up split by output, o/down by input and summed.
+    config = model.language_model.config
+    if (
+        config.num_attention_heads % world_size
+        or config.num_key_value_heads % world_size
+        or config.intermediate_size % world_size
+    ):
+        raise ValueError(
+            f"SenseNova-U1 heads ({config.num_attention_heads} query, "
+            f"{config.num_key_value_heads} key/value) and intermediate size "
+            f"({config.intermediate_size}) must divide by --tp-size {world_size}."
+        )
+    else:
+        pass
+    for layer in model.language_model.model.layers:
+        for suffix in ("", "_mot_gen"):
+            attention, mlp = layer.self_attn, getattr(layer, "mlp" + suffix)
+            if not isinstance(mlp, Qwen3MLP):
+                raise ValueError("SenseNova-U1 tensor parallelism needs dense MLPs.")
+            else:
+                pass
+            column_parallel = [
+                *(
+                    getattr(attention, name + suffix)
+                    for name in ("q_proj", "k_proj", "v_proj")
+                ),
+                mlp.gate_proj,
+                mlp.up_proj,
+            ]
+            row_parallel = [getattr(attention, "o_proj" + suffix), mlp.down_proj]
+            for linear in column_parallel:
+                _keep_shard(linear=linear, rank=rank, world_size=world_size, dim=0)
+            for linear in row_parallel:
+                _keep_shard(linear=linear, rank=rank, world_size=world_size, dim=1)
+                linear.register_forward_hook(_all_reduce_output)
+    logger.info(
+        f"SenseNova-U1 decoder sharded for tensor parallelism: rank {rank} of {world_size}"
+    )
+
+
+def _keep_shard(linear: torch.nn.Linear, rank: int, world_size: int, dim: int) -> None:
+    if linear.bias is not None:
+        raise ValueError(
+            "SenseNova-U1 tensor parallelism expects bias-free projections."
+        )
+    else:
+        pass
+    shard = linear.weight.data.chunk(world_size, dim=dim)[rank].clone()
+    linear.weight = torch.nn.Parameter(shard, requires_grad=False)
+    linear.out_features, linear.in_features = shard.shape
+
+
+def _all_reduce_output(
+    module: torch.nn.Linear, inputs: tuple[torch.Tensor, ...], output: torch.Tensor
+) -> torch.Tensor:
+    return tensor_model_parallel_all_reduce(output)

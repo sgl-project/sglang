@@ -6,12 +6,14 @@ export const config = (() => {
   const plan = (s) => {
     const flags = ["--model-path " + modelOf(s), ...["--port {{PORT}}"]];
     let gpus = s.hw === "arc_b" ? 2 : 1;
-    let t = { tp_size: 1, ulysses_degree: 1, ring_degree: 1 };
+    let t = { tp_size: gpus, ulysses_degree: 1, ring_degree: 1 };
     const env = [];
     const warnings = [];
     const errors = [];
-    if (s.hw === "arc_b")
-      warnings.push("BF16 weights (32.7 GiB) exceed one 24 GB card; decoder layers are split over two visible XPUs.");
+    if (s.hw === "arc_b") {
+      flags.push("--num-gpus 2", "--tp-size 2");
+      warnings.push("BF16 weights (32.7 GiB) exceed one 24 GB card; the decoder runs tensor parallel over two XPUs. Pick two cards whose PCIe links train at Gen5.");
+    }
     if (s.batching === "on") flags.push("--batching-max-size 2", "--batching-delay-ms 100");
     return { flags, gpus, topology: t, env, warnings, errors };
   };

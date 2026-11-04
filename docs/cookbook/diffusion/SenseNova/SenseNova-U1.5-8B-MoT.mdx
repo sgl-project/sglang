@@ -115,14 +115,22 @@ first use.
 
 ### 5.3 Intel Arc Pro B60 (BMG)
 
-The BF16 weights (32.7 GiB) do not fit one 24 GB card, so expose two cards; the
-loader splits the decoder layers between them automatically:
+The BF16 weights (32.7 GiB) do not fit one 24 GB card, so run the decoder
+tensor parallel over two cards:
 
 ```bash Command
 ZE_AFFINITY_MASK=0,1 sglang serve \
   --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 2 --tp-size 2 \
   --port 30000
 ```
+
+Tensor parallelism all-reduces every decoder layer, so both cards need full
+PCIe Gen5 links (check `current_link_speed` of the card's upstream port in
+sysfs); on a Gen2 link one 32 MB all-reduce takes 13 ms instead of 1.9 ms. On
+such hosts, drop `--num-gpus 2 --tp-size 2`: the loader then splits the decoder
+layers over the visible cards, which sends one hidden state between them per
+forward and is insensitive to link speed.
 
 ## 6. Benchmark
 

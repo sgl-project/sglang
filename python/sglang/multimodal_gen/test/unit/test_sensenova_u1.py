@@ -3,6 +3,7 @@ import asyncio
 import copy
 import json
 import math
+import threading
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
     assign_layer_devices,
     module_weight_bytes,
     place_model,
+    shard_decoder_for_tensor_parallel,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
     modeling_fm_modules,
@@ -782,13 +784,14 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     assert scheduler._try_merge_generation_reqs(requests) is None
 
 
-def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
+def test_sensenova_u1_rejects_multi_gpu_without_tensor_parallelism():
     config = SenseNovaU1PipelineConfig()
 
-    with pytest.raises(ValueError, match="num_gpus=1"):
+    with pytest.raises(ValueError, match="tensor parallelism only"):
         config.validate_server_args(
             SimpleNamespace(
                 num_gpus=2,
+                tp_size=None,
                 enable_torch_compile=False,
                 lora_path=None,
                 attention_backend=None,
@@ -801,6 +804,7 @@ def test_sensenova_u1_clears_auto_tuned_runtime_defaults():
     config = SenseNovaU1PipelineConfig()
     args = SimpleNamespace(
         num_gpus=1,
+        tp_size=None,
         enable_torch_compile=False,
         lora_path=None,
         component_residency={"transformer": "layerwise-offload"},
@@ -846,6 +850,7 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
     config = SenseNovaU1PipelineConfig()
     args = SimpleNamespace(
         num_gpus=1,
+        tp_size=None,
         enable_torch_compile=False,
         lora_path=None,
         component_residency={"transformer": "resident"},
@@ -920,6 +925,7 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
     config = SenseNovaU1PipelineConfig()
     args = {
         "num_gpus": 1,
+        "tp_size": None,
         "enable_torch_compile": False,
         "lora_path": None,
         "component_residency": None,
@@ -1395,21 +1401,17 @@ def test_sensenova_u1_layer_split_balances_bytes_with_primary_weights():
     assert assignment == [devices[0]] * 19 + [devices[1]] * 23
 
 
-@pytest.mark.skipif(
-    not torch.accelerator.is_available() or torch.accelerator.device_count() < 2,
-    reason="needs two accelerator devices",
-)
-@torch.inference_mode()
-def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
-    """A decoder split over two devices must give the single-device outputs and KV cache."""
+def _tiny_neo_chat_model(
+    intermediate_size: int, num_key_value_heads: int, dtype: torch.dtype
+) -> NEOChatModel:
     llm_config = dict(
         architectures=["Qwen3ForCausalLM"],
         vocab_size=64,
         hidden_size=32,
-        intermediate_size=2048,
+        intermediate_size=intermediate_size,
         num_hidden_layers=6,
         num_attention_heads=2,
-        num_key_value_heads=1,
+        num_key_value_heads=num_key_value_heads,
         head_dim=16,
         max_position_embeddings=64,
         max_position_embeddings_hw=64,
@@ -1437,7 +1439,19 @@ def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
         noise_scale_max_value=16.0,
     )
     config.llm_config._attn_implementation = "eager"
-    model = NEOChatModel(config).to(torch.bfloat16).eval()
+    return NEOChatModel(config).to(dtype).eval()
+
+
+@pytest.mark.skipif(
+    not torch.accelerator.is_available() or torch.accelerator.device_count() < 2,
+    reason="needs two accelerator devices",
+)
+@torch.inference_mode()
+def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
+    """A decoder split over two devices must give the single-device outputs and KV cache."""
+    model = _tiny_neo_chat_model(
+        intermediate_size=2048, num_key_value_heads=1, dtype=torch.bfloat16
+    )
     device = torch.device(torch.accelerator.current_accelerator().type, 0)
     reference = copy.deepcopy(model).to(device)
     monkeypatch.setattr(
@@ -1472,6 +1486,72 @@ def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
     assert outputs[1][1].device == layer_devices[-1]
     outputs[1] = (outputs[1][0], outputs[1][1].to(device), outputs[1][2])
     torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_sensenova_u1_tensor_parallel_decoder_matches_unsharded(monkeypatch):
+    """Two decoder shards summing their row-parallel outputs must reproduce the full decoder."""
+    world_size = 2
+    model = _tiny_neo_chat_model(
+        intermediate_size=64, num_key_value_heads=2, dtype=torch.float32
+    )
+    shards = [copy.deepcopy(model) for _ in range(world_size)]
+    barrier = threading.Barrier(world_size)
+    partials: dict[int, torch.Tensor] = {}
+
+    def all_reduce_across_threads(tensor: torch.Tensor) -> torch.Tensor:
+        rank = threading.current_thread().rank
+        partials[rank] = tensor
+        barrier.wait()
+        total = sum(partials[r] for r in range(world_size))
+        barrier.wait()
+        return total
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.loader."
+        "tensor_model_parallel_all_reduce",
+        all_reduce_across_threads,
+    )
+    for rank, shard in enumerate(shards):
+        shard_decoder_for_tensor_parallel(model=shard, rank=rank, world_size=world_size)
+    attention = shards[0].language_model.model.layers[0].self_attn
+    assert attention.q_proj_mot_gen.weight.shape == (16, 32)
+    assert attention.o_proj_mot_gen.weight.shape == (32, 16)
+
+    tokens = torch.tensor([[1, 2, 3]])
+    image = torch.randn(1, 4, 32)
+    indexes = torch.tensor([[[3, 3, 3, 3], [0, 0, 1, 1], [0, 1, 0, 1]]])
+
+    def run(candidate: NEOChatModel) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix = candidate.language_model(input_ids=tokens, use_cache=True)
+        denoise = candidate.language_model.model(
+            inputs_embeds=image,
+            indexes=indexes,
+            past_key_values=prefix.past_key_values,
+            attention_mask={"full_attention": None},
+            use_cache=True,
+            update_cache=False,
+            image_gen_indicators=torch.ones(1, 4, dtype=torch.bool),
+        )
+        return prefix.logits, denoise.last_hidden_state
+
+    outputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def run_rank(rank: int) -> None:
+        threading.current_thread().rank = rank
+        with torch.inference_mode():
+            outputs[rank] = run(shards[rank])
+
+    threads = [
+        threading.Thread(target=run_rank, args=(rank,)) for rank in range(world_size)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    expected = run(model)
+    for rank in range(world_size):
+        torch.testing.assert_close(outputs[rank], expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="needs an accelerator")
