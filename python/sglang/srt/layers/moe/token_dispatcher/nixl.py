@@ -279,11 +279,7 @@ class NixlEPBuffer:
 
     @classmethod
     def prepare_local_capture(cls, target: int, local_rank: int) -> None:
-        """Isolate a staged joiner without changing its capacity-wide layout.
-
-        Do not restore these masks on exit: unmasking belongs to on_scale,
-        after every joiner has finished capture and Mooncake admission starts.
-        """
+        """Isolate joiner capture; on_scale unmasks peers after cohort admission."""
         state = cls._state()
         if not get_exec().moe.is_ep_scale_joiner or not state.reuse_graphs:
             raise RuntimeError("Local capture is only valid for graph-reuse joiners")
@@ -293,8 +289,7 @@ class NixlEPBuffer:
         cls._mask_unwired(state, peers, strict=True)
         state.buffer.update_mask_buffer(local_rank, False)
         torch.cuda.synchronize()
-        # Connections physically exist, but only self is active. Avoid the lazy
-        # connection path activating remote ranks during a dummy forward.
+        # Prevent lazy connections from activating peers during capture.
         state.connected_ep_size = target
         state.scale_to = target
 
@@ -316,12 +311,7 @@ class NixlEPBuffer:
 
     @classmethod
     def _mask_unwired(cls, state, ranks: list, *, strict: bool = False) -> None:
-        """Have the transport skip slots the capacity-wide dispatch cannot reach.
-
-        Under --elastic-ep-reuse-cuda-graph every rank dispatches at the buffer
-        capacity, so a kept decode graph and a joiner agree on one layout. Slots
-        with no live peer must then be masked, or the dispatch waits on them.
-        """
+        """Mask peerless slots so a capacity-wide dispatch does not wait on them."""
         if not ranks:
             return
         for rank in ranks:
