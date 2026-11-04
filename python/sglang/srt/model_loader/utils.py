@@ -244,6 +244,21 @@ def supports_cuda_vmm_feature_transport(model_config: ModelConfig) -> bool:
     return bool(getattr(model_cls, "supports_cuda_vmm_feature_transport", False))
 
 
+def supports_quantized_moe_partial_block_shards(model_config: ModelConfig) -> bool:
+    """Whether the model class handles MoE shards that split quantization blocks.
+
+    Block-quantized MoE checkpoints normally require each rank's expert
+    intermediate shard to be a multiple of the weight block size. A model
+    class can set ``supports_quantized_moe_partial_block_shards = True`` when
+    its weight loading does not depend on those block boundaries (for example
+    it dequantizes with each shard's offsets and requantizes the experts).
+    """
+    model_cls, _ = get_model_architecture(model_config)
+    return bool(
+        getattr(model_cls, "supports_quantized_moe_partial_block_shards", False)
+    )
+
+
 def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:
     resolved_model_impl = getattr(model_config, "_resolved_model_impl", None)
     if resolved_model_impl is not None:
