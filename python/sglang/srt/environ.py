@@ -1010,6 +1010,9 @@ class Envs:
     # is a diagnostic switch, not a supported off-ramp -- to actually stop
     # serving FP8, drop --quantization fp8.
     SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
+    # Kill-switch for the gfx115x row-stride pad on unquantized linear and lm_head
+    # weights (see maybe_pad_weight_for_gfx115). Speed only; outputs do not depend on it.
+    SGLANG_DISABLE_GFX115_WEIGHT_PADDING = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -1342,6 +1345,13 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # Split the KV of each (request, KV head) of a full-attention layer across at
+    # least this many CTAs in TRTLLM-GEN fixed-q-len decode/verify (not ragged
+    # verify), at batch sizes >= MIN_BS. FlashInfer stops splitting once
+    # batch * kv_heads exceeds half the SMs. 0 keeps FlashInfer's choice.
+    SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS = EnvInt(0)
+    # Measured with 4 KV heads per rank on one GPU type; re-tune elsewhere.
+    SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS_MIN_BS = EnvInt(12)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
@@ -1548,6 +1558,7 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1710,11 +1721,12 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
-    # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
-    # it under live traffic isolates where ranks actually diverge. Comma
+    # Which speculative decisions rank 0 broadcasts to its TP group. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
     # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
-    SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    # The default syncs only the startup memory probes: ranks compute every per-step
+    # decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
+    SGLANG_SPEC_TP_SYNC = EnvStr("init")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
@@ -1986,6 +1998,12 @@ class Envs:
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # Shard the ratio-1/2 index sources' dense prefill scores across the
+    # attention-TP group and all-gather the selections, instead of every rank
+    # scoring every row. Identical to the replicated path under fp32 logits;
+    # bf16 logits vary with the tile's row count, so picks near the selection
+    # floor can differ there.
+    SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
