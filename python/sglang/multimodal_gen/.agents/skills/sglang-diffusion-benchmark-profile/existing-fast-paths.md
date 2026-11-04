@@ -384,6 +384,8 @@ framework-specific optimization workflow.
   good on a mismatch. The denorm kernel runs in place when the decode stage
   owns the frames.
 - Under `quality=lossless` / `high` (`VaeFastPathGate`, decode scoped): the
+  ViT decoder blocks fuse each scaled residual add into the next RMSNorm
+  (`vae_vit.py`, CUDA only, rounding-level differences), and the
   tiled decode runs up to `vae_config.decoder_tile_batch` (64) spatial tiles
   and `vae_config.window_batch` (1) temporal windows per decoder forward, in
   the original order. Batching changes cuBLAS/cuDNN algorithm selection, so it
