@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -12,6 +13,9 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.flash_attention import (
+    flash_attn_varlen_func as _lingbot_fa_varlen,
+)
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_modulate_scale_shift_cuda,
@@ -49,6 +53,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -140,6 +145,32 @@ def _sequence_splits_are_uniform(seq_splits: list[int]) -> bool:
     )
 
 
+def _check_sequence_split_strategy(strategy: str, seq_splits: list[int]) -> None:
+    # These gather or P2P-rotate equal-sized per-rank chunks (current_start // ws,
+    # plain all-gathers), so uneven splits would hang or corrupt the cache.
+    if strategy in (
+        "kvgather_replicated",
+        "kvgather_sharded",
+        "ring",
+    ) and not _sequence_splits_are_uniform(seq_splits):
+        raise NotImplementedError(
+            f"LingBot sequence strategy {strategy!r} requires uniform sequence splits, got {seq_splits}."
+        )
+
+
+def _share_rows_into_packed(layers, name: str) -> torch.Tensor:
+    # Pack the layers' `name` tensors along dim 0 and re-point each layer at its
+    # row slice of the packed buffer, so the copy is freed and updates alias it.
+    params = [getattr(layer, name) for layer in layers]
+    packed = torch.cat([param.data for param in params], dim=0)
+    offset = 0
+    for param in params:
+        rows = param.shape[0]
+        param.data = packed[offset : offset + rows]
+        offset += rows
+    return packed
+
+
 def _sequence_shard_tensor(
     x: torch.Tensor, seq_splits: list[int], rank: int
 ) -> torch.Tensor:
@@ -224,6 +255,38 @@ class LingBotWorldCamConditioner(nn.Module):
         return (1.0 + cam_scale) * hidden_states + cam_shift
 
 
+_LINGBOT_SP_STRATEGIES = (
+    "ulysses",
+    "kvgather_replicated",
+    "kvgather_sharded",
+    "ring",
+)
+
+
+def lingbot_sp_strategy() -> str:
+    """Which sequence-parallel exchange the causal attention uses.
+
+    `ulysses` splits the cache by head, so history never crosses ranks. The
+    other three split by token or not at all, and each pays for that
+    differently -- see the docstrings on the branches in `forward`.
+    """
+    value = os.environ.get("SGLANG_LINGBOT_SP_STRATEGY", "ulysses").strip().lower()
+    if value not in _LINGBOT_SP_STRATEGIES:
+        raise ValueError(
+            f"SGLANG_LINGBOT_SP_STRATEGY must be one of {_LINGBOT_SP_STRATEGIES}, got {value!r}"
+        )
+    return value
+
+
+def _lingbot_merge_lse(o1, l1, o2, l2):
+    """Online-softmax merge of two partial attention results."""
+    merged = torch.logaddexp(l1, l2)
+    out = o1 * (l1 - merged).exp().unsqueeze(-1) + o2 * (l2 - merged).exp().unsqueeze(
+        -1
+    )
+    return out, merged
+
+
 class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -233,6 +296,20 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 f"num_heads ({self.num_heads}) must be divisible by ulysses_degree ({ulysses_world_size})."
             )
         self.ulysses_num_heads = self.num_heads // ulysses_world_size
+        # kv-gather and ring keep every head on every rank and shard the
+        # queries instead, so they need a full-width attention impl.
+        self.full_head_attn = LocalAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends=(
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
+                AttentionBackendEnum.TORCH_SDPA,
+            ),
+        )
         self.ulysses_attn = LocalAttention(
             num_heads=self.ulysses_num_heads,
             head_size=self.head_dim,
@@ -260,6 +337,19 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
     ):
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
+        if kv_cache is None:
+            # Pass un-rotated q/k: the base attention applies RoPE itself, and the
+            # in-place flashinfer RoPE below would otherwise rotate them twice.
+            return super().forward(
+                q,
+                k,
+                v,
+                (cos, sin),
+                block_mask,
+                kv_cache,
+                current_start,
+                cache_start,
+            )
         if _is_cuda and q.dim() == 4 and q.shape == k.shape:
             if cos_sin_cache is None:
                 cos_sin_cache = torch.cat(
@@ -287,21 +377,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             and get_ulysses_parallel_world_size() > 1
         )
 
-        if kv_cache is None:
-            if sequence_shard_enabled:
-                raise NotImplementedError(
-                    "LingBot causal sequence sharding currently requires kv_cache-backed inference."
-                )
-            return super().forward(
-                q,
-                k,
-                v,
-                (cos, sin),
-                block_mask,
-                kv_cache,
-                current_start,
-                cache_start,
-            )
+        strategy = lingbot_sp_strategy() if sequence_shard_enabled else "ulysses"
 
         if sequence_shard_enabled:
             seq_splits = getattr(forward_batch, "sequence_shard_splits", None)
@@ -311,7 +387,10 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
-            # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
+            _check_sequence_split_strategy(strategy, seq_splits)
+
+        if sequence_shard_enabled and strategy == "ulysses":
+            # Trade sequence for heads. Packed so this is one collective, not three.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
             qkv = (
                 _usp_input_all_to_all(qkv, head_dim=2)
@@ -319,6 +398,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
+        elif sequence_shard_enabled and strategy == "kvgather_replicated":
+            # Queries stay sharded with every head; only the NEW chunk's K/V is
+            # gathered. History is already identical on every rank because each
+            # step appended the same gathered chunk, so it is never re-synced.
+            kv = torch.cat([roped_key, v], dim=-1)
+            kv = sequence_model_parallel_all_gather(kv, dim=1)
+            roped_key, v = kv.chunk(2, dim=-1)
 
         if (
             not sequence_shard_enabled
@@ -327,15 +413,23 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         ):
             return self.attn(roped_query, roped_key, v)
 
-        cache_head_start = (
-            get_tp_rank() * roped_key.shape[2]
-            if sequence_shard_enabled
-            else self.head_start
-        )
+        if sequence_shard_enabled and strategy == "ulysses":
+            cache_head_start = get_tp_rank() * roped_key.shape[2]
+        elif sequence_shard_enabled:
+            # every non-ulysses strategy keeps all heads resident
+            cache_head_start = 0
+        else:
+            cache_head_start = self.head_start
+        # A token-sharded window stores this rank's slice only, so the chunk
+        # start must be counted in local rows, not global ones.
+        cache_chunk_start = current_start
+        if sequence_shard_enabled and strategy in ("kvgather_sharded", "ring"):
+            cache_chunk_start = current_start // get_sp_world_size()
+
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
-            current_chunk_start=current_start,
+            current_chunk_start=cache_chunk_start,
             cache_head_start=cache_head_start,
             recent_window_tokens=(
                 None
@@ -346,20 +440,89 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         if update_cache_only:
             return v
-        attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
-        x = attn_impl(
-            roped_query,
-            cache_view.k,
-            cache_view.v,
-        )
-        if sequence_shard_enabled:
+        if not sequence_shard_enabled:
+            x = self.attn(roped_query, cache_view.k, cache_view.v)
+        elif strategy == "ulysses":
+            x = self.ulysses_attn(roped_query, cache_view.k, cache_view.v)
             assert seq_splits is not None
             x = (
                 _usp_output_all_to_all(x, head_dim=2)
                 if uniform_seq_splits
                 else _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
             )
+        elif strategy == "kvgather_replicated":
+            # Output is already this rank's row shard; no second collective.
+            x = self.full_head_attn(roped_query, cache_view.k, cache_view.v)
+        elif strategy == "kvgather_sharded":
+            # The window itself is split by token, so it must be reassembled
+            # every step -- O(window) instead of O(chunk).
+            full_k = sequence_model_parallel_all_gather(cache_view.k, dim=1)
+            full_v = sequence_model_parallel_all_gather(cache_view.v, dim=1)
+            x = self.full_head_attn(roped_query, full_k, full_v)
+        elif strategy == "ring":
+            x = self._ring_attend(roped_query, cache_view.k, cache_view.v)
+        else:
+            raise ValueError(f"unhandled LingBot SP strategy: {strategy}")
         return x
+
+    def _ring_attend(self, q, k, v):
+        """P2P-rotate a token-sharded window, merging each hop's partial result.
+
+        The transfer for the next hop is issued before this hop's attention so
+        the two overlap; unlike a blocking all-gather, no step waits on the
+        whole window before it can start computing.
+        """
+        sp_group = get_sp_group()
+        pg = sp_group.device_group
+        ws = get_sp_world_size()
+        rank = get_sp_parallel_rank()
+        nxt = torch.distributed.get_global_rank(pg, (rank + 1) % ws)
+        prv = torch.distributed.get_global_rank(pg, (rank - 1) % ws)
+
+        bufs = [torch.stack((k, v)), None]
+        bufs[1] = torch.empty_like(bufs[0])
+        cur = 0
+        out_acc = lse_acc = None
+        for step in range(ws):
+            nxt_buf = 1 - cur
+            pending = None
+            if step < ws - 1:
+                pending = torch.distributed.batch_isend_irecv(
+                    [
+                        torch.distributed.P2POp(
+                            torch.distributed.isend, bufs[cur], nxt, group=pg
+                        ),
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, bufs[nxt_buf], prv, group=pg
+                        ),
+                    ]
+                )
+            result = _lingbot_fa_varlen(
+                q=q,
+                k=bufs[cur][0],
+                v=bufs[cur][1],
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=bufs[cur][0].shape[1],
+                softmax_scale=self.head_dim**-0.5,
+                causal=False,
+                return_softmax_lse=True,
+                ver=3,
+            )
+            out, lse = result[0], result[1]
+            if lse.shape[-1] == q.shape[1]:
+                lse = lse.transpose(1, 2)
+            out_acc, lse_acc = (
+                (out, lse)
+                if out_acc is None
+                else _lingbot_merge_lse(out_acc, lse_acc, out, lse)
+            )
+            if pending is not None:
+                for op in pending:
+                    op.wait()
+            cur = nxt_buf
+        return out_acc.to(q.dtype)
 
 
 class LingBotWorldTransformerBlock(nn.Module):
@@ -704,16 +867,9 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         width_local: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        token_start = rank * local_len
-        token_indices = torch.arange(
-            token_start, token_start + local_len, device=device, dtype=torch.long
+        return self.rotary_emb.forward_3d_sequence_shard(
+            local_len, rank, frame_stride_local, width_local, device
         )
-        t_idx = token_indices // frame_stride_local
-        rem = token_indices % frame_stride_local
-        h_idx = rem // width_local
-        w_idx = rem % width_local
-        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
-        return self.rotary_emb.forward_uncached(positions)
 
     def forward(
         self,
@@ -813,13 +969,16 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         else:
             ts_seq_len = None
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep,
-                encoder_hidden_states,
-                encoder_hidden_states_image,
-                timestep_seq_len=ts_seq_len,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+            timestep_seq_len=ts_seq_len,
         )
         timestep_proj = (
             timestep_proj.unflatten(2, (6, -1))
@@ -932,8 +1091,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             head_start=head_start,
         )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
-        self._fused_qkv_weight = None
-        self._fused_qkv_bias = None
+        self._qkv_fused = False
         self._norm1_modulation_gate = BitExactFusionGate(
             "LingBot norm1 modulation", per_signature=True
         )
@@ -1095,7 +1253,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         return reference()
 
     def _can_fuse_qkv_projection(self) -> bool:
-        if self._fused_qkv_weight is not None:
+        if self._qkv_fused:
             return True
 
         layers = (self.to_q, self.to_k, self.to_v)
@@ -1113,74 +1271,81 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
     def fuse_qkv_projection(self) -> bool:
         if not self._can_fuse_qkv_projection():
             return False
-        if self._fused_qkv_weight is not None:
+        if self._qkv_fused:
             return True
 
+        self.repack_qkv_projection()
+        return True
+
+    def repack_qkv_projection(self) -> None:
+        # Share one packed buffer between to_q/to_k/to_v instead of keeping a
+        # second copy: each layer's weight/bias becomes a view into it, so
+        # in-place LoRA merges and weight copies still reach the fused GEMM.
+        # No reference to the packed tensor is kept; the layer views own its
+        # storage, so layerwise offload's release_layer() frees it.
         layers = (self.to_q, self.to_k, self.to_v)
         with torch.no_grad():
-            self._fused_qkv_weight = nn.Parameter(
-                torch.cat([layer.weight.detach() for layer in layers], dim=0)
-                .contiguous()
-                .to(self.to_q.weight.device),
-                requires_grad=False,
-            )
+            _share_rows_into_packed(layers, "weight")
             if all(layer.bias is not None for layer in layers):
-                self._fused_qkv_bias = nn.Parameter(
-                    torch.cat([layer.bias.detach() for layer in layers], dim=0)
-                    .contiguous()
-                    .to(self.to_q.weight.device),
-                    requires_grad=False,
-                )
+                _share_rows_into_packed(layers, "bias")
+        self._qkv_fused = True
 
-        return True
+    def _packed_qkv(self, name: str) -> torch.Tensor | None:
+        # Rebuild the packed view from the layers when they are still adjacent
+        # rows of one buffer. .to(dtype/device), loaders and offload prefetch
+        # give each layer a new tensor, which breaks adjacency.
+        params = [
+            getattr(layer, name).data for layer in (self.to_q, self.to_k, self.to_v)
+        ]
+        first = params[0]
+        offset = first.storage_offset()
+        storage = first.untyped_storage().data_ptr()
+        for param in params:
+            if (
+                not param.is_contiguous()
+                or param.untyped_storage().data_ptr() != storage
+                or param.storage_offset() != offset
+                or param.dtype != first.dtype
+                or param.shape[1:] != first.shape[1:]
+            ):
+                return None
+            offset += param.numel()
+        rows = sum(param.shape[0] for param in params)
+        return first.as_strided(
+            (rows, *first.shape[1:]), first.stride(), first.storage_offset()
+        )
+
+    def _packed_qkv_params(self) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        weight = self._packed_qkv("weight")
+        if weight is None:
+            return None
+        if self.to_q.bias is None:
+            return weight, None
+        bias = self._packed_qkv("bias")
+        return None if bias is None else (weight, bias)
 
     def _project_qkv(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.fuse_qkv_projection():
-            qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
+        layers = (self.to_q, self.to_k, self.to_v)
+        # A dynamically applied LoRA adds its delta inside each layer's forward,
+        # which the fused GEMM would skip.
+        lora_active = any(
+            isinstance(layer, BaseLayerWithLoRA) and layer.lora_active
+            for layer in layers
+        )
+        if not lora_active and self.fuse_qkv_projection():
+            packed = self._packed_qkv_params()
+            if packed is None:
+                self.repack_qkv_projection()
+                packed = self._packed_qkv_params()
+            qkv = F.linear(hidden_states, *packed)
             return qkv.chunk(3, dim=-1)
 
         query, _ = self.to_q(hidden_states)
         key, _ = self.to_k(hidden_states)
         value, _ = self.to_v(hidden_states)
         return query, key, value
-
-    def _cross_attn_with_cache(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        crossattn_cache: CrossAttentionKVCache | None,
-    ) -> torch.Tensor:
-        attn2 = self.attn2
-        q, _ = attn2.to_q(hidden_states)
-        if attn2.tp_rmsnorm:
-            q = tensor_parallel_rms_norm(q, attn2.norm_q)
-        else:
-            q = attn2.norm_q(q)
-        q = q.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-        if crossattn_cache is not None and crossattn_cache.is_init:
-            k = crossattn_cache.k
-            v = crossattn_cache.v
-        else:
-            k, _ = attn2.to_k(encoder_hidden_states)
-            if attn2.tp_rmsnorm:
-                k = tensor_parallel_rms_norm(k, attn2.norm_k)
-            else:
-                k = attn2.norm_k(k)
-            k = k.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            v, _ = attn2.to_v(encoder_hidden_states)
-            v = v.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            if crossattn_cache is not None:
-                crossattn_cache.store(k, v)
-
-        hidden_states = attn2.attn(q, k, v)
-        hidden_states = hidden_states.flatten(2)
-        hidden_states, _ = attn2.to_out(hidden_states)
-        return hidden_states
 
     def _cam_conditioner_scale_shift(
         self,
@@ -1359,6 +1524,12 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         super().post_load_weights()
         for block in self.blocks:
             block.fuse_qkv_projection()
+
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        super().refresh_weight_derived_caches(weights_path=weights_path)
+        for block in self.blocks:
+            if block._qkv_fused:
+                block.repack_qkv_projection()
 
     @lru_cache(maxsize=8)
     def _compute_rope_for_sequence_shard_with_offset(
@@ -1725,13 +1896,16 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 device=hidden_states.device,
             )
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self._prepare_condition_embeddings(
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_image=encoder_hidden_states_image,
-                crossattn_cache=crossattn_cache,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self._prepare_condition_embeddings(
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+            crossattn_cache=crossattn_cache,
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape

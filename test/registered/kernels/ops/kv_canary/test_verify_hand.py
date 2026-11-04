@@ -1132,6 +1132,47 @@ class TestRealKvSource:
 
         assert _n_violations(cuda_log) == 0
 
+    def test_real_kv_source_strided_rows(self) -> None:
+        """A strided source (``stride(0) > shape[1]``) is folded row by ``stride(0)``.
+
+        The gap after each row is filled with bytes the view does not own; stepping rows by
+        ``shape[1]`` would fold them into the hash and break the clean chain.
+        """
+        buf_pair = _buf_pair()
+        sources = make_real_kv_sources(
+            count=1,
+            num_slots=16,
+            row_gap=32,
+            device=_DEVICE,
+            fill_strategy="random_bytes",
+        )
+        assert sources[0].tensor.stride(0) > sources[0].tensor.shape[1]
+        sources_ref = clone_real_kv_sources(sources)
+
+        _stamp_clean_kv_chain(
+            buf_pair=buf_pair,
+            sources_cuda=sources,
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64, device=_DEVICE),
+            positions=torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE),
+            out_cache_loc=torch.tensor([1, 2, 5], dtype=torch.int64, device=_DEVICE),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[1, 2, 5],
+            positions=[0, 1, 2],
+            prev_slot_indices=[-1, 1, 2],
+            device=_DEVICE,
+        )
+        cuda_log, _ = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+            real_kv_sources_pair=(sources, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
+        assert _n_violations(cuda_log) == 0
+
 
 class TestLayoutAndScheduling:
     def test_page_size_gt_1_access_pattern(self) -> None:

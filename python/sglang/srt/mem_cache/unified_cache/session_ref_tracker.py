@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import NodeId
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -55,7 +55,7 @@ class UnifiedSessionRefTracker:
 
     def register_session_ref(self, req: Req, leaf: NodeId) -> None:
         """Register the leaf a finished request's insert ended on with each
-        component; the lock anchor ``req.last_node`` is a different node."""
+        component; the request's lock sits on a different node."""
         if not self.enable_session_radix_cache:
             return
 

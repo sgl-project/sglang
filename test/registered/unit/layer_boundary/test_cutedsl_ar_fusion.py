@@ -15,13 +15,14 @@ from sglang.srt.layers.layer_boundary import (
     NORM_QUANT_READOUT,
     PLAIN_ADD,
     Layout,
+    OutputContract,
     StageKind,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
     complete_owed,
 )
-from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attn_input_fusions,
     ffn_input_fusions,
@@ -30,22 +31,22 @@ from sglang.srt.layers.layer_boundary.fusions.allreduce import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
-from sglang.srt.layers.layer_boundary.residual.access import export_output
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_forward, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _MODULE = "sglang.srt.layers.layer_boundary.fusions.cutedsl"
 _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8))
@@ -179,7 +180,12 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
     ):
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
-                incoming=SimpleNamespace(residual=Layout(frozenset()))
+                incoming=SimpleNamespace(
+                    residual=Layout(frozenset()),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
+                )
             )
         }
         fusions = ffn_input_fusions(comm)
@@ -192,7 +198,10 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
                 incoming=SimpleNamespace(
-                    residual=Layout(frozenset({TokenAxis.ATTN_TP}))
+                    residual=Layout(frozenset({TokenAxis.ATTN_TP})),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
                 )
             )
         }
@@ -415,7 +424,7 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
     finish = MagicMock(return_value=torch.ones(2, 8))
     with (
         # A norm the kernel could fold in, on a batch it does not take.
-        patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
+        patch(f"{_MODULE}.fused_norm_gamma", return_value=torch.ones(8)),
         patch.object(CuteDSLFusion, "_finalize_eligible", return_value=False),
         patch.object(CuteDSLFusion, "_eligible", return_value=False),
     ):
@@ -434,9 +443,9 @@ def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
     for takes, completed in ((True, 0), (False, 1)):
         finish = MagicMock(return_value=torch.ones(2, 8))
         handoff = _handoff(finish)
-        hidden, _ = export_output(
-            handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
-        )
+        stream = ResidualStream(torch.zeros(2, 8))
+        owed = stream.record(handoff, PLAIN_ADD)
+        hidden, _ = stream.export(owed, takes_handoff=takes)
         assert finish.call_count == completed
         assert (hidden is handoff) == takes
 
@@ -481,7 +490,7 @@ def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
             return_value=SimpleNamespace(moe_fusions={0: fusion}),
         ),
     ):
-        out = op.redispatch(cuda_key, torch.zeros(4, 8), 0, True, False)
+        out = op.redispatch(cuda_key, torch.zeros(4, 8), 0, False)
         assert get_forward().defer_moe_finalize is True
 
     assert fusion.seen_defer is False
@@ -575,9 +584,6 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
             with (
                 patch.object(exits, "_ffn_has_tokens", return_value=True),
                 patch.object(
-                    exits, "post_experts_sum_is_one_all_reduce", return_value=False
-                ),
-                patch.object(
                     exits, "get_lora", return_value=SimpleNamespace(enable_lora=True)
                 ),
                 patch.object(
@@ -602,8 +608,11 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
                 ) as gate,
             ):
                 # Avoid platform-specific Aiter details: no residual cannot fuse.
+                facts = exits.ExitFacts(
+                    single_sum=False, fused_consumer_sum=exits._fused_consumer_sum()
+                )
                 with patch.object(exits, "_use_aiter", False, create=True):
-                    result = exits._batch_allows_deferred_sum(fb, boundary)
+                    result = exits._batch_allows_deferred_sum(fb, facts, boundary)
                 self.assertEqual(result, eligible and not a2a)
                 if a2a:
                     gate.assert_not_called()

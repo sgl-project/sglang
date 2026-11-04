@@ -3,6 +3,7 @@ import os
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -517,6 +518,65 @@ def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
     transformer.disable_offload()
     layerwise.release_host_stores()
     assert budget.committed_bytes == 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("explicit", [None, "canonical", "legacy"])
+@pytest.mark.parametrize("keep_after_warmup", [False, True])
+def test_explicit_layerwise_offload_disables_request_end_preload(
+    monkeypatch, explicit, keep_after_warmup
+):
+    args = _server_args(
+        component_residency=(
+            {"text_encoder": "layerwise-offload"} if explicit == "canonical" else None
+        ),
+        layerwise_offload_components=["text_encoder"],
+        _explicit_arg_names=(
+            {"layerwise_offload_components"} if explicit == "legacy" else set()
+        ),
+        enable_layerwise_nvtx_marker=False,
+        pipeline_config=SimpleNamespace(supports_auto_residency=False),
+    )
+    module = _NestedDummyModel()
+    use = ComponentUse(
+        "encode",
+        "text_encoder",
+        preferred_ready_after_request=True,
+        keep_ready_after_warmup=keep_after_warmup,
+    )
+    stage = SimpleNamespace(component_uses=lambda *_: [use])
+    pipeline = SimpleNamespace(
+        modules={"text_encoder": module},
+        _stage_name_mapping={"encode": stage},
+        component_residency_strategies={},
+    )
+    configure_layerwise_offload_modules(pipeline.modules, args)
+    manager = ComponentResidencyManager(pipeline, args)
+    manager.refresh_pipeline(pipeline)
+    strategy = manager.strategy_for("text_encoder", module)
+    assert isinstance(strategy, LayerwiseOffloadStrategy)
+    prepare = Mock(wraps=strategy.prepare_for_use)
+    monkeypatch.setattr(strategy, "prepare_for_use", prepare)
+    release = Mock(wraps=module.layerwise_offload_managers[0].release_after_use)
+    monkeypatch.setattr(
+        module.layerwise_offload_managers[0], "release_after_use", release
+    )
+
+    for is_warmup in (True, False, False):
+        batch = SimpleNamespace(is_warmup=is_warmup)
+        manager.begin_request([stage], batch, args)
+        manager.before_stage(stage, 0, batch, args)
+        manager.begin_stage()
+        prepare.reset_mock()
+        release.reset_mock()
+        manager.end_stage()
+        manager.finish_request()
+        if explicit is not None:
+            prepare.assert_not_called()
+            release.assert_called()
+        elif not (is_warmup and keep_after_warmup):
+            prepare.assert_called_once()
+    module.disable_offload()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1504,6 +1564,21 @@ def _configure_mixin_model(monkeypatch) -> _MixinModel:
     model.configure_layerwise_offload(_server_args())
     assert is_layerwise_offloaded_module(model)
     return model
+
+
+def test_streamed_parameters_opt_out_of_prepared_kernel_caches(monkeypatch):
+    model = _configure_mixin_model(monkeypatch)
+    manager = model.layerwise_offload_managers[0]
+    parameters = dict(model.named_parameters())
+
+    managed = {
+        name for metadata in manager._weight_metadata.values() for name in metadata
+    }
+    assert managed
+    assert all(
+        getattr(parameters[name], "_sglang_layerwise_offloaded", False)
+        for name in managed
+    )
 
 
 def test_disable_offload_short_circuits_residency_release(monkeypatch):

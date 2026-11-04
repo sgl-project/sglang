@@ -22,21 +22,27 @@ them by then -- so it gates on its own `is_retracted` / `is_rebootstrap` flags.
 import unittest
 from array import array
 from http import HTTPStatus
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode, is_unadmitted_reject
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.disaggregation.utils import is_unadmitted_reject
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ERROR_MSG = (
     "Input length (1500 tokens) exceeds the maximum allowed length (1018 tokens)."
@@ -66,7 +72,7 @@ def _make_scheduler():
     sched = SimpleNamespace(
         output_streamer=MagicMock(),
         beam_coordinator=MagicMock(),
-        _release_aborted_request=MagicMock(),
+        release_aborted_request=MagicMock(),
     )
     sched.retire_unadmitted_request = MagicMock(
         side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
@@ -77,7 +83,7 @@ def _make_scheduler():
 def _prefill_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
-        queue=[],
+        queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(return_value=True),
     )
     return q
@@ -87,7 +93,7 @@ def _decode_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
         token_to_kv_pool_allocator=MagicMock(),
-        retracted_queue=[],
+        retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
         pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
         _create_receiver_and_enqueue=MagicMock(
@@ -95,6 +101,8 @@ def _decode_queue(sched):
         ),
         _resolve_prefill_dp_rank=MagicMock(return_value=0),
     )
+    # Exercise the production initializer reached by the cache-hit fast path.
+    q._init_receiver = MethodType(DecodePreallocQueue._init_receiver, q)
     return q
 
 
@@ -139,7 +147,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q = _prefill_queue(sched)
                     _admit_prefill(q, req)
                     q.create_sender.assert_not_called()
-                    self.assertEqual(q.queue, [])
+                    self.assertEqual(list(q.queue), [])
                 else:
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
@@ -171,7 +179,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 sched = _make_scheduler()
                 q = _prefill_queue(sched)
                 _admit_prefill(q, req)
-                self.assertEqual(q.queue, [req])
+                self.assertEqual(list(q.queue), [req])
                 sched.retire_unadmitted_request.assert_not_called()
                 self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
@@ -209,9 +217,13 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     sched.retire_unadmitted_request.assert_not_called()
                     self.assertIsInstance(req.to_finish, FINISH_ABORT)
                     if flag == "is_retracted":
-                        self.assertEqual(q.retracted_queue, [req])
+                        self.assertEqual(list(q.retracted_queue), [req])
                     else:
                         q._create_receiver_and_enqueue.assert_called_once()
+                        receiver = (
+                            q._create_receiver_and_enqueue.return_value.kv_receiver
+                        )
+                        receiver.init.assert_called_once_with(0)
 
     def test_preempted_reentry_is_not_retired(self):
         """Preemption requeues through a bare `_add_request_to_queue`.
@@ -238,11 +250,13 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 if door == "prefill":
                     q = _prefill_queue(sched)
                     _admit_prefill(q, req)
-                    self.assertEqual(q.queue, [req])
+                    self.assertEqual(list(q.queue), [req])
                 else:
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
                     q._create_receiver_and_enqueue.assert_called_once()
+                    receiver = q._create_receiver_and_enqueue.return_value.kv_receiver
+                    receiver.init.assert_called_once_with(0)
                 sched.retire_unadmitted_request.assert_not_called()
 
     def test_valid_request_still_admitted(self):
@@ -253,11 +267,13 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 if door == "prefill":
                     q = _prefill_queue(sched)
                     _admit_prefill(q, req)
-                    self.assertEqual(q.queue, [req])
+                    self.assertEqual(list(q.queue), [req])
                 else:
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
                     q._create_receiver_and_enqueue.assert_called_once()
+                    receiver = q._create_receiver_and_enqueue.return_value.kv_receiver
+                    receiver.init.assert_called_once_with(0)
                 sched.retire_unadmitted_request.assert_not_called()
 
     def test_null_mode_is_deliberately_untouched(self):
@@ -271,15 +287,16 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req = _make_req()
         req.set_finish_with_abort(ERROR_MSG)
         sched = SimpleNamespace(
+            uocr_runtime=None,
             disaggregation_mode=DisaggregationMode.NULL,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),
         )
         Scheduler._add_request_to_queue(sched, req)
-        self.assertEqual(sched.waiting_queue, [req])
+        self.assertEqual(list(sched.waiting_queue), [req])
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
     def test_retire_detaches_a_streaming_session(self):
@@ -299,7 +316,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
 
         # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
         # before the door, and only this call clears it again.
-        sched._release_aborted_request.assert_called_once_with(req)
+        sched.release_aborted_request.assert_called_once_with(req)
         session.abort_req.assert_called_once()
         self.assertIsNone(req.session)
         sched.beam_coordinator.retire_group.assert_called_once_with(req)

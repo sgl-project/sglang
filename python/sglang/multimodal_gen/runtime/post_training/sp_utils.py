@@ -11,7 +11,6 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
-    sequence_model_parallel_all_reduce,
 )
 
 
@@ -34,14 +33,6 @@ def gather_stacked_latents_for_sp(
         flat_inputs, batch=batch
     )
     return gathered_flat_inputs.unflatten(0, (bsz, t_steps))
-
-
-def all_reduce_if_sp_sharded(batch, tensor: torch.Tensor) -> torch.Tensor:
-    if not should_do_sp_collective(batch):
-        return tensor
-    tensor = tensor.to(get_local_torch_device())
-    sequence_model_parallel_all_reduce(tensor)
-    return tensor
 
 
 def all_gather_if_sp_sharded(batch, x: torch.Tensor, dim: int = 0) -> torch.Tensor:

@@ -175,8 +175,8 @@ def build_tensorcast_session_options(
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
-        world_rank = parallel.world_rank
-        world_size = parallel.world_size
+        world_rank = parallel.launch_world_rank
+        world_size = parallel.launch_world_size
 
     rank_label = format_tensorcast_rank_label(world_rank, cast(int, world_size))
     if config.transfer_mode == TensorcastTransferMode.ALLOCATOR:
