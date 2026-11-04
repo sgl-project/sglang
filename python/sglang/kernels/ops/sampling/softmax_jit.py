@@ -266,7 +266,6 @@ def softmax(
     *,
     rows_per_request: int = 1,
     out: Optional[torch.Tensor] = None,
-    config: Optional[tuple[int, int, int]] = None,
 ) -> torch.Tensor:
     """``softmax(logits / T)`` over ``[rows, vocab]`` fp32 / bf16 / fp16 logits, into fp32
     probabilities; in place when ``out is logits`` (fp32 logits only).
@@ -274,20 +273,12 @@ def softmax(
     Rows must be whole aligned vectors (``vocab`` and the row stride multiples of 8 fp32 on
     Blackwell, 4 on Hopper; a 32 / 16 B aligned base), as every mainstream vocabulary is;
     anything else raises. ``temperatures`` holds one positive value per request (``rows //
-    rows_per_request`` of them, any shape that flattens to that). ``config`` overrides the
-    ``(cluster_size, vecs_per_thread, threads)`` choice, for benchmarking.
+    rows_per_request`` of them, any shape that flattens to that).
     """
     if out is None:
         out = torch.empty_like(logits, dtype=torch.float32)
     num_rows, vocab_size = logits.shape
-    if config is None:
-        cluster_size, module = _precompile(logits.dtype, vocab_size)(num_rows)
-    else:
-        config = _Config(*config)
-        cluster_size = config.cluster_size
-        module = _jit_softmax_module(
-            config.threads, config.vecs_per_thread, config.max_cluster, logits.dtype
-        )
+    cluster_size, module = _precompile(logits.dtype, vocab_size)(num_rows)
     if temperatures is not None:
         temperatures = temperatures.view(-1)
     module.softmax(logits, out, temperatures, rows_per_request, cluster_size)

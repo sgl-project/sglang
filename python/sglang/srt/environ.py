@@ -1108,6 +1108,7 @@ class Envs:
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
+    SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -1514,6 +1515,8 @@ class Envs:
     SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
     # Per-file overrides for dense LoRA plan tables.
     SGLANG_LORA_DENSE_CONFIG_DIR = EnvStr(None)
+    # Root of the csgmv_configs tuning tables; defaults to the packaged directory.
+    SGLANG_LORA_CONFIG_DIR = EnvStr(None)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1795,6 +1798,8 @@ class Envs:
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    # Kill-switch for the gate-fused LFM2 short convolution.
+    SGLANG_DISABLE_LFM_FUSED_CONV = EnvBool(False)
     # Opt-in: on the unified radix tree, leave the matched-prefix mamba evictable
     # during decode (it is already COW'd to the request's own slot) and shrink the
     # mamba pool ratio accordingly. Frees one resident slot per running request,
@@ -2050,8 +2055,6 @@ class Envs:
     # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
     # 64-slot page), so a candidate consumer layer scores only its published blocks.
     SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
-    # DeepSeek-V4.1 mHC boundary (HIP): the 32-row Triton tile from _HC_BOUNDARY_WIDE_MIN_M rows (bitwise the same).
-    SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

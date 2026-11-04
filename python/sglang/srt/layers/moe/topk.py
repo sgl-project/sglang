@@ -271,11 +271,7 @@ if _is_cuda or _is_hip or _is_xpu:
         from sgl_kernel import topk_sigmoid, topk_softmax
     else:
         from sglang.kernels.ops.moe import topk_softmax
-
-        try:
-            from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
-        except ImportError:
-            pass
+        from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk

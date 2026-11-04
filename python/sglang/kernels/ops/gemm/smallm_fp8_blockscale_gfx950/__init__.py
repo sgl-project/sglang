@@ -1,6 +1,7 @@
 """gfx950 small-M FP8 block-scale GEMM with fused activation quant."""
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -8,6 +9,7 @@ import tempfile
 import torch
 
 from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
+from sglang.srt.environ import envs
 
 _SRC = os.path.join(os.path.dirname(__file__), "smallm_fp8_blockscale_gemm.hip")
 # (N, K) -> (max M, N tiles/block, K steps/wave, waves), first match wins.
@@ -20,6 +22,7 @@ SHAPES = {
 }
 _mod = None
 _fns = {}
+logger = logging.getLogger(__name__)
 
 
 class Args(ctypes.Structure):
@@ -35,7 +38,7 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
     cfg = next((cfg for max_m, *cfg in SHAPES.get((N, K), ()) if M <= max_m), None)
     if not (
         _mod is not False
-        and os.environ.get("SGLANG_ROCM_SMALLM_FP8_BS", "1") != "0"
+        and envs.SGLANG_ROCM_SMALLM_FP8_BS.get()
         and x.dtype == torch.bfloat16
         and x.stride(1) == 1
         and x.stride(0) % 8 == 0
@@ -56,7 +59,7 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
             check_hip(hip_lib().hipModuleLoad(ctypes.byref(_mod), co.encode()), "load")
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
             _mod = False
-            print(f"[smallm_fp8_bs] disabled: {e}", flush=True)
+            logger.warning("smallm_fp8_bs disabled: %s", e)
             return None
     key = ((M + 15) // 16, *cfg)
     hip, fn = hip_lib(), _fns.get(key)
