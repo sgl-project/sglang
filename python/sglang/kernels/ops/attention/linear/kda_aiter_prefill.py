@@ -66,6 +66,7 @@ def _covered(
     beta: torch.Tensor,
     *,
     ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     A_log: torch.Tensor | None,
     dt_bias: torch.Tensor | None,
@@ -76,8 +77,10 @@ def _covered(
 ) -> bool:
     num_heads = q.shape[2] if q.ndim == 4 else 0
     return (
+        # spec-decode extends stay on the reference path, as in kda_gfx950_prefill
+        not kwargs.get("is_spec_decode", False)
         # the kernel writes only the final state per sequence
-        not return_intermediate_states
+        and not return_intermediate_states
         and kwargs.get("track_state") is None
         # breakable prefill CUDA graphs pass padded chunk tables; the walk syncs
         and kwargs.get("chunk_indices") is None
@@ -89,6 +92,8 @@ def _covered(
         # the prepare's 2^-G stays finite only down to -5.5
         and -5.5 <= lower_bound < 0
         and query_start_loc.dtype in (torch.int32, torch.int64)
+        # the kernel takes one state row per sequence
+        and cache_indices.shape == (query_start_loc.numel() - 1,)
         and q.shape == k.shape == v.shape == g.shape
         and all(_dense_heads(x) for x in (q, k, v, g))
         and beta.shape == (1, q.shape[1], num_heads)
@@ -130,6 +135,7 @@ def extend(
         g,
         beta,
         ssm_states=ssm_states,
+        cache_indices=cache_indices,
         query_start_loc=query_start_loc,
         A_log=A_log,
         dt_bias=dt_bias,

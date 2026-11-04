@@ -143,6 +143,27 @@ class TestAiterKDAPrefill(CustomTestCase):
                 )
 
     @torch.inference_mode()
+    def test_padded_slot_starts_from_zeros_and_keeps_pool(self):
+        """A negative cache index must start from a zero state and write no pool row."""
+        inputs = _inputs((64, 96), torch.bfloat16)
+        inputs["cache_indices"][1] = -1
+        actual_inputs, expected_inputs = _clone(inputs), _clone(inputs)
+        expected = _reference(expected_inputs)
+        actual = kda_aiter_prefill.extend(
+            *_args(actual_inputs), **_kwargs(actual_inputs)
+        )
+        self.assertLess(_rms_ratio(actual, expected), 1e-2)
+        live_row = inputs["cache_indices"][0].item()
+        untouched = torch.ones(SLOTS, dtype=torch.bool, device="cuda")
+        untouched[live_row] = False
+        self.assertTrue(
+            torch.equal(
+                actual_inputs["ssm_states"][untouched],
+                inputs["ssm_states"][untouched],
+            )
+        )
+
+    @torch.inference_mode()
     def test_uncovered_inputs_fall_back(self):
         inputs = _inputs((193, 137), torch.bfloat16)
         args = _args(inputs)
@@ -153,6 +174,8 @@ class TestAiterKDAPrefill(CustomTestCase):
             {"lower_bound": None},
             {"lower_bound": -6.0},
             {"beta_is_raw": False},
+            {"is_spec_decode": True},
+            {"cache_indices": inputs["cache_indices"][:1]},
         ):
             with self.subTest(overrides=list(overrides)):
                 self.assertIsNone(

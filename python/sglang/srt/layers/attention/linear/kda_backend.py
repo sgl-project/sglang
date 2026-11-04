@@ -1139,13 +1139,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
         track_chunk_idx = self.forward_metadata.track_chunk_idx
+        # Aligned-only tracking copies the final pool state;
+        # only an interior boundary needs per-chunk h, so final-state kernels can run.
+        track_h_src = self.forward_metadata.track_ssm_h_src if track_ssm else None
+        # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
+        needs_h = track_h_src is not None and track_h_src.numel() > 0
         h_track_buf = None
-        if (
-            track_ssm
-            and track_chunk_idx is not None
-            # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
-            and self.forward_metadata.track_ssm_h_src.numel() > 0
-        ):
+        if needs_h and track_chunk_idx is not None:
             # fp32 scratch the kernel snapshots the tracked chunk-boundary
             # states into (rows follow the batch; untracked rows stay unread).
             # A kernel that does not declare support would leave the buffer
@@ -1166,10 +1166,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        # Aligned-only tracking copies the final pool state;
-        # only an interior boundary needs per-chunk h, so final-state kernels can run.
-        track_h_src = self.forward_metadata.track_ssm_h_src if track_ssm else None
-        needs_h = track_h_src is not None and track_h_src.numel() > 0
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
