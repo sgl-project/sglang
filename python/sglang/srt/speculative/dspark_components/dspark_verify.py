@@ -1196,8 +1196,7 @@ def sample_simulated_bonus(
     seed: int,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
-    distribution the sampling accept uses: temperature, then top-k / top-p. Both
-    branches are Gumbel-max draws on ``seed``."""
+    distribution the sampling accept uses: temperature, then top-k / top-p."""
     if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
@@ -1207,15 +1206,7 @@ def sample_simulated_bonus(
             draft_token_num=1,
             bs=bs,
         ).view(bs, -1)
-        # Unit temperature on log-probs samples probs; filtered tokens stay at -inf.
-        bonus = simulated_bonus_sample(
-            target_logits=probs.log(),
-            correct_len=torch.zeros(bs, dtype=torch.int64, device=probs.device),
-            temperatures=torch.ones(bs, dtype=torch.float32, device=probs.device),
-            bs=bs,
-            rows_per_request=1,
-            seed=seed,
-        )
+        bonus = torch.multinomial(probs, num_samples=1)
     else:
         bonus = simulated_bonus_sample(
             target_logits=target_logits,

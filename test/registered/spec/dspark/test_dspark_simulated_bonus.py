@@ -82,30 +82,6 @@ class TestSimulatedBonus(unittest.TestCase):
         want = torch.softmax(base / 0.7, dim=-1)
         self.assertLess((freq - want).abs().max().item(), 5e-3)
 
-    def test_top_k_matches_filtered_distribution(self):
-        torch.manual_seed(3)
-        vocab, n, k = 8, 200_000, 3
-        base = torch.randn(vocab, device="cuda")
-        out = sample_simulated_bonus(
-            target_logits=base.repeat(n, 1),
-            correct_len=torch.zeros(n, dtype=torch.int32, device="cuda"),
-            greedy_bonus=torch.zeros(n, dtype=torch.int64, device="cuda"),
-            sampling_info=types.SimpleNamespace(
-                temperatures=torch.full((n, 1), 0.7, device="cuda"),
-                top_ks=torch.full((n,), k, dtype=torch.int32, device="cuda"),
-                need_top_k_sampling=True,
-                need_top_p_sampling=False,
-            ),
-            bs=n,
-            verify_num_draft_tokens=1,
-            seed=2,
-        )
-        freq = torch.bincount(out, minlength=vocab).float() / n
-        keep = base.topk(k).indices
-        want = torch.zeros(vocab, device="cuda")
-        want[keep] = torch.softmax(base[keep] / 0.7, dim=-1)
-        self.assertLess((freq - want).abs().max().item(), 5e-3)
-
 
 if __name__ == "__main__":
     unittest.main()

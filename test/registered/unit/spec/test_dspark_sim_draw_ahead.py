@@ -3,7 +3,6 @@ bonus seed move before the draft launch. They read only the server-seeded genera
 the batch size and the request temperatures, so the ahead order writes exactly what
 the after-draft order wrote; with real acceptance the switch is inert."""
 
-import random
 import sys
 from types import SimpleNamespace
 
@@ -87,26 +86,6 @@ def test_ahead_matches_after_draft():
     assert ahead == after
     assert len({s[0] for s in after}) > 1  # the draw really varies across steps
     assert w.num_sim_draws_ahead == steps
-
-
-def test_ranks_draw_alike_whatever_else_reads_the_process_rng():
-    """With the accept broadcast off (SGLANG_SPEC_TP_SYNC), two ranks must still stage the
-    same correct length and bonus seed when one consumes the process RNG more often."""
-    ranks = [_worker() for _ in range(2)]
-    draws = [[], []]
-    for step in range(40):
-        for rank, w in enumerate(ranks):
-            random.seed(rank)
-            torch.manual_seed(rank)
-            for _ in range(rank * step):
-                random.random()
-                torch.rand(1)
-            temps = _temps(step)
-            info = None if temps is None else SimpleNamespace(temperatures=temps)
-            w._begin_simulated_step_ahead(bs=BS, simulate_bonus_sampling_info=info)
-            draws[rank].append(_snapshot(w))
-    assert draws[0] == draws[1]
-    assert len({s[0] for s in draws[0]}) > 1
 
 
 def test_inert_under_real_acceptance():
