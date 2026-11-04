@@ -127,6 +127,8 @@ class SchedulerBoundary(CustomTestCase):
             "get_schedule": lambda: NS(chunked_prefill_size=16384),
             "staging_grid_tokens": lambda c, p: c,
             "logger": NS(debug=lambda *a: None),
+            "np": np,
+            "torch": NS(Tensor=object),
         }
         exec(
             compile(
@@ -206,6 +208,9 @@ class TestSchedulerSendRange(CustomTestCase):
             ),
             logger=NS(debug=lambda *args: None),
             envs=NS(SGLANG_DISAGG_STAGING_MIN_GROUPS=NS(get=lambda: 4)),
+            np=np,
+            torch=NS(Tensor=object),
+            is_cp_sharded_padded=lambda: False,
         )
         exec(
             compile(
@@ -309,6 +314,9 @@ class TestSchedulerSendRange(CustomTestCase):
             ),
             logger=NS(debug=lambda *args: None),
             envs=NS(SGLANG_DISAGG_STAGING_MIN_GROUPS=NS(get=lambda: 4)),
+            np=np,
+            torch=NS(Tensor=object),
+            is_cp_sharded_padded=lambda: False,
         )
         exec(
             compile(

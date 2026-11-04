@@ -68,6 +68,8 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged_dsa,
 )
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
+from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
@@ -78,17 +80,15 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
-    GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    RadixAttention,
     unwrap_write_loc,
 )
-from sglang.srt.mem_cache.utils import get_mla_kv_buffer_triton
 from sglang.srt.utils import ceil_div, get_bool_env_var, is_cuda
 from sglang.srt.utils.common import ceil_align
 
@@ -219,6 +219,10 @@ class PageInterleaveKVPoolMixin:
             device=shard_group.device,
             cta_policy=NCCL_CTA_POLICY_ZERO if self._use_symmetric_scratch else None,
         )
+        if not self.kv_gather_comm.available:
+            raise RuntimeError(
+                "Page-interleave KV cache requires an available PyNccl communicator."
+            )
         self.kv_gather_stream = self.device_module.Stream()
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
@@ -820,8 +824,11 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
-        slot = self._acquire_slot_for_read(layer.layer_id)
+        slot = self._acquire_slot_for_read(
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         rows = self._translate_loc_cached(loc)
         kv_buffer = slot.tensors["kv"]
         if self.store_dtype != self.dtype:
@@ -1031,6 +1038,7 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         """Read logical rows as separate NoPE and RoPE tensors.
 
@@ -1040,9 +1048,13 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         converts those decoded values to the requested type.
         """
         if not self.dsa_kv_cache_store_fp8:
-            return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+            return super().get_mla_kv_buffer(
+                layer, loc, dst_dtype, layer_id_override=layer_id_override
+            )
 
-        slot = self._acquire_slot_for_read(layer.layer_id)
+        slot = self._acquire_slot_for_read(
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         rows = self.translate_loc_to_scratch(loc)
         kv = dequantize_k_cache_paged_dsa(self._scratch_kv(slot), rows)
         if dst_dtype is not None:

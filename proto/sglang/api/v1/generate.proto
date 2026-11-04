@@ -209,12 +209,26 @@ message GenerateMetaInfo {
   optional uint32 image_tokens = 18;
   optional uint32 audio_tokens = 19;
   optional uint32 video_tokens = 20;
+  // `cached_tokens` by cache tier, on every frame; null without cached
+  // tokens.
+  CachedTokensDetails cached_tokens_details = 21 [(sglang.json.v1.field_json).emit_null_when_absent = true];
 }
 
 message WeightVersionSpan {
   string version = 1;
   int64 start = 2;
   int64 end = 3;
+}
+
+// A request's cached prompt tokens by the cache tier that served them.
+message CachedTokensDetails {
+  // GPU memory, and a hierarchical cache's host-memory tier.
+  uint32 device = 1;
+  uint32 host = 2;
+  // A storage tier: present when nonzero or while one is attached.
+  optional uint32 storage = 3;
+  // The attached storage tier's backend.
+  optional string storage_backend = 4;
 }
 
 message GenerateResponse {

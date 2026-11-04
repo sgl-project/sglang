@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.kda_input_pack import contiguous_kda_inputs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -118,12 +119,15 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             if needs_checkpoint
             else None
         )
+        q, k, v, g, beta = contiguous_kda_inputs(
+            q, k, v, g[:, : q.shape[1]], beta[:, : q.shape[1]]
+        )
         result = self._recurrent_kda(
-            q=q.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
-            g=g[:, : q.shape[1]].contiguous(),
-            beta=beta[:, : q.shape[1]].contiguous(),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
             A_log=A_log.reshape(-1).float().contiguous(),
             # FlashInfer's grouped-CTA recurrent kernel (extends with a cached prefix)
             # indexes dt_bias as a flat [H*K] tensor and asserts a unit leading stride.

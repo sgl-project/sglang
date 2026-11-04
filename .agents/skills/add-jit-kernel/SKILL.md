@@ -96,11 +96,11 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
 
 - **`host::SymbolicSize{"name"}`** — A named symbolic dimension. Call `.set_value(n)` to pin it, `.unwrap()` to extract after verification.
 - **`host::SymbolicDType`** — Symbolic dtype. Use `.set_options<Ts...>()` to restrict allowed types.
-- **`host::SymbolicDevice`** — Symbolic device. Use `.set_options<kDLCUDA>()` to restrict to CUDA.
+- **`host::SymbolicDevice`** — Symbolic device. Use `.set_options<kDLGPU>()` to restrict to the GPU (`kDLGPU` / `kDLGPUHost` from `sgl_kernel/utils.cuh` resolve to the CUDA or ROCm device type). Options set on the symbol stay in force when it is later passed to `.with_device(device_sym)` without a type list. Keep `kDLCUDA` only in kernels that cannot build on ROCm (inline PTX, cute/cutlass, flashinfer).
 - **`host::TensorMatcher({dims...})`** — Fluent builder for tensor validation:
   - `.with_dtype<T>()` — require a specific C++ type (e.g. `fp16_t`)
   - `.with_dtype<T1, T2, ...>()` — allow a set of types
-  - `.with_device<kDLCUDA>(device_sym)` — require CUDA and bind the checked device to a `SymbolicDevice`
+  - `.with_device<kDLGPU>(device_sym)` — require the GPU and bind the checked device to a `SymbolicDevice`
   - `.with_strides({strides...})` — validate strides (omit to require contiguous)
   - `.ensure_alignment(bytes)` — require the data pointer **and every stride except the innermost** to be a multiple of `bytes` (a power of two). Size-1 dimensions are skipped, since their strides are arbitrary. This is how a vectorized kernel states its precondition; see the alignment convention above.
   - `.verify(tensor_view)` — execute the check; throws `PanicError` with full context on failure; **chainable** (`verify(a).verify(b)` to check multiple tensors with the same shape)
@@ -110,10 +110,10 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
 ```cpp
 auto N = SymbolicSize{"num_elements"};
 auto device = SymbolicDevice{};
-device.set_options<kDLCUDA>();
+device.set_options<kDLGPU>();
 TensorMatcher({N})  //
     .with_dtype<fp16_t>()
-    .with_device<kDLCUDA>(device)
+    .with_device<kDLGPU>(device)
     .ensure_alignment(16)  // e.g. for 128-bit vectorized load/store
     .verify(dst)
     .verify(src);  // same shape, dtype, device as dst
@@ -122,7 +122,7 @@ const DLDevice dev = device.unwrap();
 const int64_t last_dim = 128;
 TensorMatcher({N, last_dim})  // a fixed dimension can be a plain integer
     .with_dtype<fp16_t>()
-    .with_device<kDLCUDA>(device)
+    .with_device<kDLGPU>(device)
     .verify(tensor_2d);
 ```
 
@@ -361,11 +361,11 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   // 1. Validate input tensors with TensorMatcher
   SymbolicSize N = {"num_elements"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({N})  //
       .with_dtype<T>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(dst)
       .verify(src);  // same shape / dtype / device as dst
 
