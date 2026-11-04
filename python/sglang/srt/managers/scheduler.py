@@ -6028,17 +6028,12 @@ class Scheduler(
     def _abort_waiting(self, recv_req: AbortReq) -> None:
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
-        # With host receive on, a PD decode request may hold its KV as a host backup.
-        host_backup = (
-            is_decode and get_disagg().disaggregation_decode_host_receive_threshold < 1
-        )
         for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.request_retirer.abort_queued(
                 req,
                 finished_reason=recv_req.finished_reason,
-                backup_backend="host_pool" if host_backup else None,
                 checkpoint=is_decode,
                 # A PD prefill request may hold KV its sender still reads; the
                 # prefill tail aborts the sender before it frees that KV.

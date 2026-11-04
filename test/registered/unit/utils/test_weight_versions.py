@@ -416,7 +416,9 @@ class TestSpanlessAbortPaths(CustomTestCase):
         )
         req.finished_reason = None
         req.finish_outside_step = lambda reason: None
-        req.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+        req.kv = SimpleNamespace(
+            holds_kv=False, holds_mamba=False, retraction_backup=None
+        )
         sent = []
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_priority_scheduling = False

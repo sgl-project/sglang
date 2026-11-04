@@ -43,14 +43,12 @@ class RequestRetirer:
         *,
         reason: Optional[FINISH_ABORT] = None,
         finished_reason: Optional[FinishReasonDict] = None,
-        backup_backend: Optional[str] = None,
         checkpoint: bool = False,
         release_memory: bool = True,
     ) -> None:
         """Abort a request no launched step carries: one aborted in a queue, or
         refused at the waiting-queue door. ``reason`` is the request's own finish
-        reason, ``finished_reason`` what the tokenizer receives, and
-        ``backup_backend`` where its KV backup lives."""
+        reason and ``finished_reason`` what the tokenizer receives."""
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
@@ -61,8 +59,7 @@ class RequestRetirer:
         )
         if not release_memory:
             return
-        if backup_backend is not None:
-            discard_kv_cache_backup(req, self.tree_cache, backup_backend)
+        discard_kv_cache_backup(req, self.tree_cache)
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.request_finished(req)

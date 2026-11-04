@@ -84,6 +84,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
     def _new_req(self, priority=None):
         req = MagicMock()
         req.kv.holds_kv = req.kv.holds_mamba = False
+        req.kv.retraction_backup = None
         req.priority = priority
         req.rid = "req"
         req.output_ids = []
@@ -450,7 +451,9 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req = SimpleNamespace(
             disagg_kv_sender=sender,
             metadata_buffer_index=3,
-            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+            kv=SimpleNamespace(
+                holds_kv=True, holds_mamba=False, retraction_backup=None
+            ),
             pending_bootstrap=True,
         )
 

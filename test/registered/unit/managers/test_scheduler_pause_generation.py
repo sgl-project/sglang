@@ -957,13 +957,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         req.kv.retraction_backup = RetractionBackup(cpu_tensors=object())
         prealloc_queue.retracted_queue.join([req])
 
-        with patch(
-            "sglang.srt.disaggregation.decode.get_disagg",
-            return_value=SimpleNamespace(
-                disaggregation_decode_retraction_backup="cpu_tensor"
-            ),
-        ):
-            prealloc_queue.retracted_queue.abort(AbortReq(rid="aborted"))
+        prealloc_queue.retracted_queue.abort(AbortReq(rid="aborted"))
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         scheduler.tree_cache.finish.assert_called_once_with(

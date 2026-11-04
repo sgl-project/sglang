@@ -58,7 +58,9 @@ class _FakeReq:
         self.output_ids = []
         self.weight_version_events = []
         self.prefill_weight_versions = None
-        self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+        self.kv = SimpleNamespace(
+            holds_kv=False, holds_mamba=False, retraction_backup=None
+        )
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
