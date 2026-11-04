@@ -248,10 +248,12 @@ sgl_per_tensor_quant_fp8_cpu(const at::Tensor& input, const std::optional<at::Te
   at::Tensor scale;
   float static_scale = 0.0f;
   if (is_static) {
-    scale = scale_opt.value();
-    TORCH_CHECK(scale.device().is_cpu(), "sgl_per_tensor_quant_fp8_cpu: scale must be a CPU tensor");
-    TORCH_CHECK(scale.numel() == 1, "sgl_per_tensor_quant_fp8_cpu: static scale must be scalar");
-    static_scale = scale.item<float>();
+    const auto& static_scale_tensor = scale_opt.value();
+    TORCH_CHECK(static_scale_tensor.device().is_cpu(), "sgl_per_tensor_quant_fp8_cpu: scale must be a CPU tensor");
+    TORCH_CHECK(static_scale_tensor.numel() == 1, "sgl_per_tensor_quant_fp8_cpu: static scale must be scalar");
+    static_scale = static_scale_tensor.item<float>();
+    // Outputs must not alias inputs: the schema declares no alias annotation.
+    scale = at::full({1}, static_scale, input.options().dtype(at::kFloat));
   } else {
     scale = at::empty({1}, input.options().dtype(at::kFloat));
   }
