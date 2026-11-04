@@ -2,6 +2,7 @@
 int32 all-reduce lookup, TP ranks emulated in one process on one GPU: bitwise equal."""
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -38,6 +39,13 @@ def _ids(bounds, tokens, seed):
     lo = torch.tensor(bounds[:-1])
     size = torch.tensor(bounds[1:]) - lo
     return lo + (torch.rand(tokens, len(lo), generator=g) * size).long()
+
+
+def _edge_ids(bounds, tokens):
+    """Each column's first and last rows in turn, so every id repeats."""
+    first = torch.tensor(bounds[:-1])
+    last = torch.tensor(bounds[1:]) - 1
+    return torch.where(torch.arange(tokens).view(-1, 1) % 2 == 0, first, last)
 
 
 def _shard(weight, scale, bounds, rank, world):
@@ -92,12 +100,13 @@ def _layout(rank, group):
     "the Triton engram gather (CUDA or gfx950)",
 )
 class TestEngramAllGatherLookup(CustomTestCase):
-    def _check(self, world, tokens, seed):
+    def _check(self, world, tokens, seed, edges=False):
         g = torch.Generator().manual_seed(seed)
         sizes = torch.randint(50, 400, (COLUMNS,), generator=g).tolist()
         bounds = tuple(torch.tensor([0, *sizes]).cumsum(0).tolist())
         weight, scale = _table(sizes, seed)
-        ids = _ids(bounds, tokens, seed).cuda()
+        ids = _edge_ids(bounds, tokens) if edges else _ids(bounds, tokens, seed)
+        ids = ids.cuda()
         shards = [_shard(weight, scale, bounds, r, world) for r in range(world)]
         # today's lookup: zero-filled owned rows, summed as int32
         reference = sum(s._owned_rows(ids).view(torch.int32) for s in shards)
@@ -117,10 +126,11 @@ class TestEngramAllGatherLookup(CustomTestCase):
                 torch.equal(out.view(torch.int32), reference),
                 f"rank {r} of {world}, {tokens} tokens",
             )
-        # every rank sent the same number of rows: no padding, no size exchange
-        self.assertEqual(
-            {t.shape for t in group.sent[0]}, {(tokens * COLUMNS // world, DIM)}
-        )
+        # one collective, the same payload size on every rank: no size exchange
+        n = tokens * COLUMNS // world
+        span = n + (n * (DIM // 32) + DIM - 1) // DIM
+        self.assertEqual(len(group.sent), 1)
+        self.assertEqual({t.shape for t in group.sent[0]}, {(span, DIM)})
 
     def test_matches_all_reduce(self):
         for world in (2, 3, 4, 8):
@@ -128,11 +138,32 @@ class TestEngramAllGatherLookup(CustomTestCase):
                 with self.subTest(world=world, tokens=tokens):
                     self._check(world, tokens, seed=world * 1000 + tokens)
 
-    def test_only_eager_prefill_takes_the_all_gather(self):
+    def test_first_and_last_rows_repeated(self):
+        for world in (2, 3, 4, 8):
+            with self.subTest(world=world):
+                self._check(world, 9, seed=world, edges=True)
+
+    def _takes_all_gather(self, mode, *guards):
         weight, scale = _table([60] * COLUMNS, 1)
         bounds = tuple(range(0, 60 * COLUMNS + 1, 60))
         shard = _shard(weight, scale, bounds, 0, 4)
         ids = _ids(bounds, 3, 1).cuda()
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "sglang.srt.layers.engram.get_parallel",
+                    return_value=_layout(0, None),
+                )
+            )
+            for guard in guards:
+                stack.enter_context(patch(guard, return_value=True))
+            gathered = stack.enter_context(patch.object(shard, "_all_gather_lookup"))
+            reduced = stack.enter_context(patch.object(shard, "_lookup"))
+            shard(ids, SimpleNamespace(forward_mode=mode))
+        self.assertNotEqual(gathered.called, reduced.called)
+        return gathered.called
+
+    def test_only_eager_prefill_takes_the_all_gather(self):
         modes = (
             ForwardMode.EXTEND,
             ForwardMode.MIXED,
@@ -140,19 +171,20 @@ class TestEngramAllGatherLookup(CustomTestCase):
             ForwardMode.TARGET_VERIFY,
         )
         for mode in modes:
-            with (
-                self.subTest(mode=mode),
-                patch(
-                    "sglang.srt.layers.engram.get_parallel",
-                    return_value=_layout(0, None),
-                ),
-                patch.object(shard, "_all_gather_lookup") as gathered,
-                patch.object(shard, "_lookup") as reduced,
-            ):
-                shard(ids, SimpleNamespace(forward_mode=mode))
-                took_gather = mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-                self.assertEqual(gathered.called, took_gather)
-                self.assertEqual(reduced.called, not took_gather)
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    self._takes_all_gather(mode),
+                    mode in (ForwardMode.EXTEND, ForwardMode.MIXED),
+                )
+
+    def test_graph_capture_keeps_the_all_reduce(self):
+        guards = (
+            "torch.cuda.is_current_stream_capturing",
+            "sglang.srt.layers.engram.is_in_breakable_cuda_graph",
+        )
+        for guard in guards:
+            with self.subTest(guard=guard):
+                self.assertFalse(self._takes_all_gather(ForwardMode.EXTEND, guard))
 
 
 if __name__ == "__main__":

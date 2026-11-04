@@ -1268,34 +1268,50 @@ class EngramEmbedding(nn.Module):
 
     def _all_gather_lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices and owns whole hash
-        columns: each rank all-gathers its columns' rows as stored (fp8 rows, e8m0
-        scales), and every rank dequantizes all of them with the kernel of the
-        zero-fill + all-reduce lookup, so the rows are bitwise the same."""
+        columns: each rank all-gathers its columns' rows as stored (fp8 rows, then
+        their e8m0 scales, in one payload), and every rank dequantizes all of them
+        with the kernel of the zero-fill + all-reduce lookup, so the rows are
+        bitwise the same."""
         if indices.shape[0] == 0:
             return self.new_rows(indices)
         parallel = get_parallel()
         k, world, num_tokens = self._cols_per_rank, self.tp_size, indices.shape[0]
+        n, scale_dim = num_tokens * k, self.dim // FP8_BLOCK_SIZE
+        # A rank's payload: its n fp8 rows, then their scales padded to whole rows.
+        span = n + (n * scale_dim + self.dim - 1) // self.dim
         start = parallel.tp_rank * k
         local = indices.flatten(1)[:, start : start + k].reshape(-1) - self.row_start
-        rows = self.weight.view(torch.uint8).index_select(0, local)
-        scales = self.scale.view(torch.uint8).index_select(0, local)
-        all_rows = rows.new_empty((world * rows.shape[0], rows.shape[1]))
-        all_scales = scales.new_empty((world * scales.shape[0], scales.shape[1]))
-        parallel.tp_group.all_gather_into_tensor(all_rows, rows)
-        parallel.tp_group.all_gather_into_tensor(all_scales, scales)
+        payload = torch.empty(
+            (span, self.dim), dtype=torch.uint8, device=indices.device
+        )
+        torch.index_select(self.weight.view(torch.uint8), 0, local, out=payload[:n])
+        torch.index_select(
+            self.scale.view(torch.uint8),
+            0,
+            local,
+            out=payload[n:].view(-1)[: n * scale_dim].view(n, scale_dim),
+        )
+        gathered = payload.new_empty((world * span, self.dim))
+        parallel.tp_group.all_gather_into_tensor(gathered, payload)
+        # The kernel reads a row's scales at the row's own index: lay the ranks'
+        # scales out like their rows.
+        scales = payload.new_empty((world, span, scale_dim))
+        scales[:, :n] = gathered.view(world, -1)[
+            :, n * self.dim : n * (self.dim + scale_dim)
+        ].view(world, n, scale_dim)
         # [source rank, token, its columns] -> [token, columns in rank order]
         arange = functools.partial(
             torch.arange, dtype=torch.int32, device=indices.device
         )
         ids = (
-            arange(world).view(1, -1, 1) * (num_tokens * k)
+            arange(world).view(1, -1, 1) * span
             + arange(num_tokens).view(-1, 1, 1) * k
             + arange(k)
         ).flatten()
         out = self.new_rows(indices)
         engram_gather(
-            all_rows.data_ptr(),
-            all_scales.data_ptr(),
+            gathered.data_ptr(),
+            scales.data_ptr(),
             ids,
             out.view(-1, self.dim),
             self.dim,
