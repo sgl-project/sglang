@@ -203,7 +203,9 @@ def resolve_rocm_fp4_gemm_backend(
         else:
             _warn_legacy_aiter_fp4_asm_gemm_env(message)
             # The env var was a silent no-op without native MXFP4; keep it that way.
-            return "aiter" if legacy_use_aiter_asm and mxfp4_gemm_supported else "triton"
+            return (
+                "aiter" if legacy_use_aiter_asm and mxfp4_gemm_supported else "triton"
+            )
 
     if backend == "auto":
         # With native MXFP4, auto stays unresolved: each Quark MXFP4 layer then
