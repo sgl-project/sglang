@@ -207,9 +207,7 @@ export const config = {
             "--hicache-write-policy write_back",
             "--hicache-ratio 2.5",
           ],
-          // Write-back needs every rank on the same TreeCore. The day-0 image bundles none, so each rank
-          // fetches the pinned Rust toolchain at startup and some fall back to Python unless one installed
-          // toolchain is named; a mixed set asserts once the host pool fills.
+          // Keeps every rank on the Rust TreeCore; write-back asserts on a mix with the Python one.
           env: (s) => [`SGLANG_HICACHE_MAMBA_HOST_RATIO=${s.pdMode === "prefill" ? 8 : 12}`, "RUSTUP_TOOLCHAIN=stable"],
           hints: ["The host pools pin about 190 GB of host memory per GPU; check the node's GTT limit before raising either ratio."],
         },
@@ -280,9 +278,7 @@ export const config = {
     mi350x: "lmsysorg/sglang:dev-kimi-k31-pro-mi35x",
     mi355x: "lmsysorg/sglang:dev-kimi-k31-pro-mi35x",
   },
-  // A MI35x PD role is reached on its bootstrap and ZMQ ports from the other node and moves KV over
-  // the RDMA NICs, so its container needs the host network and the RDMA flags (without the device,
-  // Mooncake falls back to TCP; without IPC_LOCK / memlock, RDMA setup fails at startup).
+  // MI35x PD roles take the host network and RDMA flags for the bootstrap ports and Mooncake.
   dockerHostNetworkWhen: (s) => config.isAmd(s) && ["prefill", "decode"].includes(s.pdMode),
   github: {
     cookbookModel: "moonshotai/kimi-k3.1-pro",
