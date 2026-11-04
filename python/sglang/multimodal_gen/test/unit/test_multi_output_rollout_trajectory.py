@@ -97,6 +97,42 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
                 tuple(entry.dit_trajectory.latents.shape), (1, _STEPS + 1, 2)
             )
 
+    def test_merge_and_select_preserve_per_output_denoising_environment(self):
+        merged = concat_rollout_trajectory_data(
+            [_per_output_trajectory(i, with_env=True) for i in range(3)]
+        )
+
+        self.assertEqual(
+            merged.denoising_env.pos_cond_kwargs["encoder_hidden_states"]
+            .flatten()
+            .tolist(),
+            [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0],
+        )
+        selected = [
+            select_output_rollout_trajectory(merged, index).denoising_env
+            for index in range(3)
+        ]
+        self.assertEqual(
+            [
+                env.pos_cond_kwargs["encoder_hidden_states"][0, 0].item()
+                for env in selected
+            ],
+            [1.0, 2.0, 3.0],
+        )
+
+    def test_sequence_rope_caches_are_not_merged_or_sliced(self):
+        merged = concat_rollout_trajectory_data(
+            [_per_output_trajectory(i, with_env=True) for i in range(3)]
+        )
+        cos, sin = merged.denoising_env.pos_cond_kwargs["freqs_cis"]
+        self.assertEqual(tuple(cos.shape), (5, 4))
+        self.assertEqual(tuple(sin.shape), (6, 4))
+        for index in range(3):
+            env = select_output_rollout_trajectory(merged, index).denoising_env
+            cos, sin = env.pos_cond_kwargs["freqs_cis"]
+            self.assertEqual(tuple(cos.shape), (5, 4))
+            self.assertEqual(tuple(sin.shape), (6, 4))
+
     def test_select_without_output_index_returns_group_trajectory(self):
         merged = concat_rollout_trajectory_data(
             [_per_output_trajectory(i) for i in range(3)]
