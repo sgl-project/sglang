@@ -130,6 +130,17 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
     )
 
 
+def _validate_gluon_quant_method(layer, quant_method) -> None:
+    if not get_moe_runner_backend().is_gluon():
+        return
+
+    from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+        validate_gluon_quant_method,
+    )
+
+    validate_gluon_quant_method(layer, quant_method)
+
+
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     """Copy a CPU tensor view into independent contiguous storage."""
     if loaded_weight.device.type != "cpu":
@@ -609,6 +620,7 @@ class FusedMoE(torch.nn.Module):
             moe_intermediate_size=intermediate_size,
         )
 
+        _validate_gluon_quant_method(self, self.quant_method)
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.runner_backend = self.quant_method.get_moe_runner_backend(self)
         self.moe_runner_config.runner_backend = self.runner_backend
@@ -618,12 +630,28 @@ class FusedMoE(torch.nn.Module):
             and self.runner_backend.is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         ) or packed_nvfp4_routed_deferred
+        # The routed kernel defers the same way; the standard dispatcher passes
+        # the deferred triple through, an A2A combine cannot.
+        self.supports_routed_deferred_finalize = (
+            self.runner_backend is not None
+            and self.runner_backend.is_flashinfer_trtllm_routed()
+            and nvfp4_deferred
+            and get_moe_a2a_backend().is_none()
+            # No deferred consumer rescales, so the top-k weights must carry it.
+            and _fuses_routed_scaling_factor_in_topk(
+                self.quant_method, self.runner_backend
+            )
+        )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
+            deferred_finalize_supported = (
+                self.supports_deferred_finalize
+                or self.supports_routed_deferred_finalize
+            )
             logging.getLogger(__name__).debug(
                 "FlashInfer TRTLLM MoE deferred finalize is "
-                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"{'enabled' if deferred_finalize_supported else 'disabled'} "
                 f"(moe_runner_backend={self.runner_backend}, "
                 f"quant_method={type(self.quant_method).__name__})."
             )

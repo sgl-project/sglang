@@ -34,7 +34,12 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
-from sglang.srt.rust_server.config import _build_server_args, _partition_cores
+from sglang.srt.rust_server.config import (
+    _build_server_args,
+    _frontend_cpu_key,
+    _frontend_cpu_share,
+    _partition_cores,
+)
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
@@ -54,7 +59,8 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput, Req
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
@@ -208,12 +214,29 @@ class RustServer:
 
     @classmethod
     def _partition_cores(
-        cls, mm_workers: int = 0
+        cls, mm_workers: int = 0, cpu_share: Tuple[int, int] = (0, 1)
     ) -> tuple[Optional[List[int]], Optional[List[int]]]:
         return _partition_cores(
             mm_workers=mm_workers,
             server_core_budget=cls._server_core_budget,
+            cpu_share=cpu_share,
         )
+
+    @classmethod
+    def gather_frontend_cpu_share(cls, hosts_listener: bool) -> Tuple[int, int]:
+        """Collective: every rank calls once; returns this listener's
+        ``(index, count)`` among the listeners on its node with the same CPU
+        affinity mask, for ``_partition_cores``."""
+        if get_exec().moe.is_ep_joiner:
+            # Stays out for the reason `gather_server_endpoints` does: the
+            # serving ranks never enter this collective again. The joiner's
+            # listener partitions its whole mask, as before this split.
+            return 0, 1
+        world_group = get_parallel().world_group
+        cpu_keys = world_group.all_gather_object(
+            _frontend_cpu_key() if hosts_listener else None
+        )
+        return _frontend_cpu_share(cpu_keys, rank=world_group.rank_in_group)
 
     @classmethod
     def _port_offset(cls) -> int:
@@ -231,6 +254,17 @@ class RustServer:
         return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
 
     @classmethod
+    def _advertised_host(cls) -> str:
+        """The host this rank's listener is published at: the bound host, else
+        the address the interfaces answer on. A deployment whose service
+        discovery publishes another of the node's addresses overrides this."""
+        host = get_serving().host
+        if host in ("", "0.0.0.0", "::"):
+            # An unspecified bind address is not reachable from another node.
+            host = get_local_ip_auto(fallback="127.0.0.1")
+        return host
+
+    @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
         if get_exec().moe.is_ep_joiner:
@@ -242,11 +276,7 @@ class RustServer:
             # out, and the serving ranks' table is untouched.
             return []
         bind_host = get_serving().host
-        host = bind_host
-        if host in ("", "0.0.0.0", "::"):
-            # An unspecified bind address is not reachable from another
-            # node; advertise the address the interfaces answer on.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+        host = cls._advertised_host()
         # Nodes that rendezvous on loopback share this machine, so a loopback
         # listener reaches them; otherwise it is a likely misconfiguration.
         if get_parallel().nnodes > 1 and _is_loopback(host):
@@ -299,7 +329,9 @@ class RustServer:
         return table
 
     @classmethod
-    def launch(cls, scheduler: Scheduler) -> RustServer:
+    def launch(
+        cls, scheduler: Scheduler, frontend_cpu_share: Tuple[int, int] = (0, 1)
+    ) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
@@ -322,7 +354,8 @@ class RustServer:
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
                 else 0
-            )
+            ),
+            cpu_share=frontend_cpu_share,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
