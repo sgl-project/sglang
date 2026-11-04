@@ -25,9 +25,11 @@ from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
-# most (token, expert) pairs for which the patched sort quantizes the stage-1 input;
-# aiter quantizes larger batches itself
-_EMIT_MAX_PAIRS = 256
+# most (token, expert) pairs for which the patched sort (+ stage-1 quant) runs; aiter sorts
+# and quantizes larger batches itself. At E=896 / top-16 / block_m 32 on MI355X the sorted
+# variant beats aiter's opus sort + quant by 31-46% up to 960 pairs and ties from 1152
+# (its bitonic width doubles past 1024).
+_SMALL_SORT_MAX_PAIRS = 1024
 
 
 # P <= 64: one sort CTA does the whole P x P rank compare
@@ -483,7 +485,7 @@ def _small_sort_supported(
     return (
         expert_mask is None
         and num_local_tokens is None
-        and p <= 256
+        and p <= _SMALL_SORT_MAX_PAIRS
         # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
         # aiter at E=129 but loses at E=513; cutoff untuned in between. The no-quant
         # path past 32 pairs takes the histogram + bitonic sort kernel instead, which
@@ -689,7 +691,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and hidden_states.dim() == 2
             and hidden_states.stride(-1) == 1
             and hidden_states.shape[-1] % 512 == 0
-            and topk_ids.numel() <= _EMIT_MAX_PAIRS
+            and topk_ids.numel() <= _SMALL_SORT_MAX_PAIRS
         )
         input_token = _pending_quant_input.set(hidden_states if emit else None)
         emitted_token = _emitted_quant.set(None)
