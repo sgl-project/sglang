@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
     CompressedTensorsW8A16Fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+from sglang.srt.model_executor.cpu_graph_runner import register_fake_ops
 from sglang.srt.utils import cpu_has_amx_support
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,6 +35,10 @@ def _dequant_fp8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def _ue8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
     return (scale.to(torch.int32) << 23).view(torch.float32)
+
+
+def _ref_quant_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return torch.clamp(x.float() / scale, -448.0, 448.0).to(torch.float8_e4m3fn)
 
 
 def _reference_w8a8_int8_linear(
@@ -189,6 +194,72 @@ class TestCPUFp8QuantOps(CustomTestCase):
 
         with self.assertRaisesRegex(NotImplementedError, "W8A8 FP8 linear"):
             scheme.apply_weights(layer, x, None)
+
+    def test_fp8_quant_ops_match_reference(self):
+        """Covers every dtype plus K not divisible by the 16-wide vector loop."""
+        ops = torch.ops.sgl_kernel
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            for m, k in ((1, 7), (5, 129), (33, 4096)):
+                with self.subTest(dtype=dtype, m=m, k=k):
+                    x = torch.randn(m, k, dtype=dtype)
+
+                    q, scale = ops.sgl_per_token_quant_fp8_cpu(x)
+                    ref_scale = x.float().abs().amax(-1, keepdim=True).clamp(min=1e-12)
+                    torch.testing.assert_close(scale, ref_scale / 448.0)
+                    self.assertTrue(
+                        torch.equal(q.float(), _ref_quant_fp8(x, scale).float())
+                    )
+
+                    q, scale = ops.sgl_per_tensor_quant_fp8_cpu(x, None)
+                    torch.testing.assert_close(
+                        scale, x.float().abs().max().clamp(min=1e-12).view(1) / 448.0
+                    )
+                    self.assertTrue(
+                        torch.equal(q.float(), _ref_quant_fp8(x, scale).float())
+                    )
+
+                    static_scale = torch.tensor([0.01])
+                    q, _ = ops.sgl_per_tensor_quant_fp8_cpu(x, static_scale)
+                    self.assertTrue(
+                        torch.equal(q.float(), _ref_quant_fp8(x, static_scale).float())
+                    )
+
+            with self.subTest(dtype=dtype, op="mxfp8"):
+                x = torch.randn(3, 96, dtype=dtype)
+                q, scale_u8 = ops.mxfp8_group_quantize_cpu(x)
+                ref = _ref_quant_fp8(
+                    x, _ue8m0_to_float(scale_u8).repeat_interleave(32, -1)
+                )
+                self.assertTrue(torch.equal(q.float(), ref.float()))
+
+        x = torch.randn(4, 80, dtype=torch.bfloat16)
+        q, scale = ops.sgl_per_token_group_quant_8bit_cpu(x, 40, 1e-10)
+        ref_scale = x.float().view(4, 2, 40).abs().amax(-1).clamp(min=1e-10) / 448.0
+        torch.testing.assert_close(scale, ref_scale)
+        self.assertTrue(
+            torch.equal(
+                q.float(),
+                _ref_quant_fp8(x, scale.repeat_interleave(40, -1)).float(),
+            )
+        )
+
+    def test_fp8_quant_ops_opcheck(self):
+        """Schema (no output/input aliasing) and fake impls used by the CPU graph runner."""
+        register_fake_ops(tp_size=1)
+        ops = torch.ops.sgl_kernel
+        x = torch.randn(4, 64, dtype=torch.bfloat16)
+        cases = [
+            (ops.sgl_per_token_group_quant_8bit_cpu, (x, 32, 1e-10)),
+            (ops.sgl_per_token_quant_fp8_cpu, (x,)),
+            (ops.sgl_per_tensor_quant_fp8_cpu, (x, None)),
+            (ops.sgl_per_tensor_quant_fp8_cpu, (x, torch.tensor([0.01]))),
+            (ops.mxfp8_group_quantize_cpu, (x,)),
+        ]
+        for op, args in cases:
+            with self.subTest(op=str(op)):
+                torch.library.opcheck(
+                    op, args, test_utils=("test_schema", "test_faketensor")
+                )
 
 
 class TestCPUInt8QuantOps(CustomTestCase):
