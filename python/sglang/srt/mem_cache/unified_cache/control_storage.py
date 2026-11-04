@@ -115,7 +115,12 @@ class StorageCacheTransfers:
         prefixes = self.host._prefixes(staging)
         key = hashlib.sha256(
             msgspec.json.encode(
-                (work.payload.src.tier, isinstance(work.payload, MoveTo), prefixes)
+                (
+                    work.payload.src.tier,
+                    isinstance(work.payload, MoveTo),
+                    work.public_demote,
+                    prefixes,
+                )
             )
         ).digest()
         job = self.jobs.get(key)
@@ -264,6 +269,21 @@ class StorageCacheTransfers:
                 complete &= reclaimed
                 if reclaimed:
                     steps += ("source_reclaimed",)
+            code = "" if complete else "source_busy" if ready else "missing_copy"
+            if ready and not complete and work.public_demote:
+                if job.failure:
+                    code = job.failure[0]
+                elif interest.cancelled:
+                    code = "cancelled"
+                else:
+                    code = next(
+                        (
+                            self.host._reclamation_reason(n)
+                            for n, a, b in rows
+                            if a < end and b > start and n.id not in job.reclaimed
+                        ),
+                        "not_reclaimable",
+                    )
             outcome = TargetOutcome(
                 coverage=TokenRange(component="full", start_token=start, end_token=end),
                 status=Status.COMPLETED
@@ -273,7 +293,7 @@ class StorageCacheTransfers:
                 else Status.MISSING,
                 location=self.executor.storage_adapter.location(),
                 completed_steps=steps,
-                code="" if complete else "source_busy" if ready else "missing_copy",
+                code=code,
             )
             if output and (
                 output[-1].status,
@@ -307,15 +327,7 @@ class StorageCacheTransfers:
             and active
             and isinstance(job.work.payload, MoveTo)
         ):
-            rows = self.host._paths(job.staging, source=False)[0][2]
-            for node, _, _ in reversed(rows):
-                if (
-                    node.component_data[FULL].value is not None
-                    and node in self.cache.tree_core.evictable_device_leaves
-                ):
-                    result = self.cache.tree_core.demote(node.id)
-                    self.cache._free_values(result.device_frees, result.host_frees)
-                    job.reclaimed.add(node.id)
+            self.host._reclaim(job, self.host._paths(job.staging, source=False))
         try:
             for identity in job.interests:
                 interest = self.interests[identity]

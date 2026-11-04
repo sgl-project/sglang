@@ -4638,3 +4638,81 @@ ranks (P9), expanded DEMOTE (P3), PIN (P4), Router/recovery (P5–P7).
 ### P2 independent review and proof
 
 Reviewed registered adapters, namespace/key descriptions, native read/write completion and short-read checks. Independent seven-file CPU regression (including protection foundation): 86 passed, 77 subtests passed (15.19 s). Independent real GPU host/file and live Mooncake tests on GPU1: 2 passed, 2 subtests passed (13.78 s). Both restored K/V bytes and post-publication GPU load-back verified. Shared exact-scope cancellation preserves the other interest. Locked Rust protocol fixtures passed. Logs: /tmp/sglang-rfc-build/p2-parent-{cpu,gpu,rust}.log. Initial supported Mooncake path is TP1 FULL MHA page_first_direct; other physical layouts are not advertised. P2 approved for commit; model-level two-worker acceptance remains P8.
+
+## P3 DEMOTE outcome/reclamation evidence — 2026-11-04
+
+Base: clean `69de4c3e82` (P2). No commits, pushes or delegation. P4 registry/runtime
+and Router/L3 owner wiring are untouched. Source changes are contracts/controller,
+`control_transfers.py` and `control_storage.py`; regressions extend the existing
+registered manager/transfer suites and the existing opt-in live GPU test.
+
+Public DEMOTE carries an internal owner-selected flag after normalization to
+MoveTo; no public field/version changes. This separates its bounded source-load
+handling and reason codes from legacy copy/move jobs. It reserves per-page outcome
+capacity before starting so concurrent splits and distinct blocker reasons cannot
+exceed the result budget. Both cold paths retain native completion, shared exact
+scope jobs, capacity checks and reference drain. Host readiness is fence/publish
+based; storage uses the existing verified contiguous backup ACK. Existing host
+copies and native file/Mooncake skip-write paths avoid redundant data writes.
+
+Reclamation is shared by host/storage paths: release only this job's GPU holds,
+check actual pending transfers, remaining references and device children, call
+native tree demote, capture the real returned free-token count, and drain frees
+through the cache allocator before recording source_reclaimed. Generic
+`source_busy` remains on legacy results; public blocked scope uses active_reference,
+inflight_backup, inflight_load, structural_dependency, or conservative
+not_reclaimable. Failure/cancellation keeps the actual failure/cancel code on
+preserved-but-unreclaimed ranges. There is no L1 PIN or inferred pin_conflict.
+Incomplete host/storage backup keeps all source data. A completed cold backup can
+reclaim an eligible suffix while retaining an ancestor. Active references terminate
+as partial without waiting for request completion; owned I/O still requires drain.
+
+Cancellation of one shared host DEMOTE caller now snapshots already-published
+cold coverage before dropping its interest, leaving the other caller's physical
+job intact. Last-caller host/storage cancellation drains and reports destination
+publication without initiating reclamation. New tests assert allocator capacity,
+source/host contents, per-range public projection, released references, immutable
+historical results, and retries on retained prefixes. Partial storage ACKs and host
+submission failures preserve the ready prefix and all GPU source. Concurrent load
+and storage backup tests verify bounded rejection/partial results without cancelling
+the foreign demand. File reuse rejects any redundant os.replace; Mooncake reuse
+rejects any redundant SDK put when physical keys already exist.
+
+Legacy SetPriority/CopyTo/MoveTo parsing now rejects non-null backend_namespace on
+GPU/host with invalid_payload, before dispatch. Old payloads remain accepted.
+Host→storage public DEMOTE remains unsupported and is explicitly regression-tested.
+
+Proof (PYTHONPATH=/home/youwei/.cache/sglang-rfc-tools/mooncake:python):
+
+```text
+Seven CPU suites: 96 passed, 17 warnings, 81 subtests passed in 29.60s
+cargo test --locked --manifest-path sgl-router/Cargo.toml -p sgl-kv-orchestrator:
+  4 passed; 0 failed; doc tests 0 passed; 0 failed
+ruff check --select F on changed Python files: All checks passed!
+git diff --check: clean
+```
+
+CPU command is the P2 six-file pytest plus
+`test/registered/unit/mem_cache/test_kv_control_protection.py` with `-q --tb=short`.
+Logs: `/tmp/sglang-rfc-build/p3-cpu-tests.log`, `p3-rust-fixtures.log`.
+Dependency deprecation warnings are unchanged.
+
+Fresh real GPU/file/Mooncake proof is **pending a parent-approved GPU 2 window**.
+An async request was made; no window was confirmed during this implementation.
+No GPU test, model server, benchmark or process termination was run. The existing
+live test now additionally checks the writer's reclaimed scope, removed GPU values
+and four returned allocator slots alongside real physical-key existence and K/V
+bytes. These added GPU assertions were syntax/lint checked, not executed here.
+P2's prior parent proof (2 GPU tests + 2 subtests, SDK 0.3.14) remains historical
+baseline evidence, not a fresh P3 result. Reproduction command with 64 MiB segment
+is saved in `/tmp/sglang-rfc-build/p3-report.txt` for the scheduled window.
+
+Remaining: P4 execution wiring, Router/L3 ownership and P5–P8 integration; P9 expanded
+profiles. No host-source reclamation or L1 PIN was added. Storage confirmation is
+point-in-time evidence with retained host data during reclamation, not a persistent
+backend lease. Full-scope retries must respect current source residency; the tested
+bounded retry targets the retained complete prefix after suffix reclamation.
+
+### P3 independent review and proof
+
+Reviewed real cold preservation/source allocator reclamation, public-only blocker classification, shared-job key separation, partial backup and cancellation effects, and namespace field validation. Independent CPU7: 96 passed,81 subtests passed(22.05s); independent GPU host/file+live Mooncake writer reclamation/loadback:2 passed,2 subtests passed(18.48s). Logs p3-parent-cpu.log,p3-parent-gpu.log in /tmp/sglang-rfc-build. No new path support advertised beyond tested gpu->host/storage. P3 approved for commit.

@@ -379,11 +379,22 @@ class TestProgrammableKVCache(CustomTestCase):
                 [h for node, *_ in path for h in a.tree_core.get_hash_values(node.id)],
                 [p["storage_digest"] for p in desc_a["pages"]],
             )
+            writer_available = a.token_to_kv_pool_allocator.available_size()
             saved = public_action(
                 sa, "demote", target, {"tier": "gpu"}, location, "save"
             )
             saved = self._wait(sa, saved.ref)
             self.assertTrue(saved.public_result.preserved_scope)
+            self.assertTrue(saved.public_result.reclaimed_scope)
+            self.assertEqual(
+                a.token_to_kv_pool_allocator.available_size(), writer_available + 4
+            )
+            self.assertTrue(
+                all(
+                    node.component_data[ComponentType.FULL].value is None
+                    for node, *_ in path
+                )
+            )
             self.assertEqual(
                 saved.public_result.ready_location.backend_namespace,
                 location["backend_namespace"],

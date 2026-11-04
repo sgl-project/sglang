@@ -35,6 +35,7 @@ class _Job:
     failure: tuple[str, str] | None = None
     reclaimed: set[int] = field(default_factory=set)
     waiting: str = "resource_approval"
+    blocked: str = ""
 
 
 @dataclass
@@ -162,9 +163,13 @@ class HostCacheTransfers:
             # Existing destination runs cannot disappear under our holds.
             # A failed top-down submission can add one published prefix;
             # FULL MOVE leaves a retained prefix and a reclaimed suffix.
-            result_budget += max(
-                2 if isinstance(work.payload, MoveTo) else 1,
-                runs + (not all(destination)),
+            result_budget += (
+                len(tokens) // self.core.page_size
+                if work.public_demote
+                else max(
+                    2 if isinstance(work.payload, MoveTo) else 1,
+                    runs + (not all(destination)),
+                )
             )
             paths.append((tokens, compatibility, rows))
         if source and result_budget > min(
@@ -197,6 +202,7 @@ class HostCacheTransfers:
                     work.payload.src.tier,
                     work.payload.dst.tier,
                     isinstance(work.payload, MoveTo),
+                    work.public_demote,
                     sorted(set(prefixes), key=msgspec.json.encode),
                 )
             )
@@ -268,7 +274,11 @@ class HostCacheTransfers:
                 )
                 for n in nodes.values()
             ):
-                job.waiting = "source_pending"
+                if job.work.public_demote:
+                    job.blocked = "inflight_load" if src == "gpu" else "inflight_backup"
+                    self._retire(job)
+                else:
+                    job.waiting = "source_pending"
                 return
             anchors = {rows[-1][0].id: rows[-1][0] for _, _, rows in paths}
             job.gpu_locks = [self.cache.lock(n.id) for n in anchors.values()]
@@ -381,7 +391,56 @@ class HostCacheTransfers:
                 if job.failure is None:
                     job.failure = ("transfer_error", str(error)[:512])
 
-    def _outcomes(self, work, reclaimed):
+    def _reclamation_reason(self, node):
+        """Read actual owner state after dropping this job's temporary holds."""
+        if node.write_through_pending_id is not None:
+            return "inflight_backup"
+        if self._load_pending(node):
+            return "inflight_load"
+        storage = self.executor.storage
+        if storage is not None:
+            for other in storage.jobs.values():
+                if (
+                    other.operation_id is not None
+                    and other.gpu_locks
+                    and any(
+                        n is node
+                        for _, _, rows in self._paths(other.staging, source=False)
+                        for n, _, _ in rows
+                    )
+                ):
+                    return "inflight_backup"
+        if node.component_data[FULL].lock_ref:
+            return "active_reference"
+        if any(
+            child.component_data[FULL].value is not None
+            for child in node.children.values()
+        ):
+            return "structural_dependency"
+        if node not in self.core.evictable_device_leaves:
+            return "not_reclaimable"
+        return ""
+
+    def _reclaim(self, job, paths):
+        # Native demote updates the tree; the cache then returns its actual
+        # device frees to the allocator. No result is inferred from an event.
+        nodes = {n.id: (n, end) for _, _, rows in paths for n, _, end in rows}
+        for node, _ in sorted(nodes.values(), key=lambda item: item[1], reverse=True):
+            cd = node.component_data[FULL]
+            if (
+                cd.value is not None
+                and cd.host_value is not None
+                and not self._reclamation_reason(node)
+            ):
+                result = self.core.demote(node.id)
+                freed = sum(
+                    value.numel() for value in result.device_frees.get(FULL, ())
+                )
+                self.cache._free_values(result.device_frees, result.host_frees)
+                if cd.value is None and freed:
+                    job.reclaimed.add(node.id)
+
+    def _outcomes(self, work, reclaimed, *, retained_code="", blocked=False):
         outcomes = []
         paths = self._paths(work, source=False)
         for branch, (_, _, rows) in enumerate(paths):
@@ -412,13 +471,17 @@ class HostCacheTransfers:
                         if complete
                         else Status.PARTIAL
                         if ready
+                        else Status.DEFERRED
+                        if blocked
                         else Status.MISSING,
                         location=Location(
                             tier=work.payload.dst.tier,
                             engine_id=self.executor.engine_id,
                         ),
                         completed_steps=steps,
-                        code="source_busy"
+                        code=(retained_code or self._reclamation_reason(node))
+                        if work.public_demote and not complete and (ready or blocked)
+                        else "source_busy"
                         if ready and not complete
                         else ""
                         if complete
@@ -484,30 +547,40 @@ class HostCacheTransfers:
             and isinstance(job.work.payload, MoveTo)
         ):
             paths = self._paths(job.work, source=False)
-            nodes = {n.id: (n, end) for _, _, rows in paths for n, _, end in rows}
-            for node, _ in sorted(
-                nodes.values(), key=lambda item: item[1], reverse=True
-            ):
-                cd = node.component_data[FULL]
-                if (
-                    cd.value is not None
-                    and cd.host_value is not None
-                    and node in self.core.evictable_device_leaves
-                ):
-                    result = self.core.demote(node.id)
-                    self.cache._free_values(result.device_frees, result.host_frees)
-                    job.reclaimed.add(node.id)
+            self._reclaim(job, paths)
         try:
             for identity in job.interests:
                 interest = self.interests[identity]
                 outcomes = (
-                    self._outcomes(interest.work, job.reclaimed) if job.started else ()
+                    self._outcomes(
+                        interest.work,
+                        job.reclaimed,
+                        retained_code=job.failure[0]
+                        if job.failure
+                        else "cancelled"
+                        if interest.cancelled
+                        else job.blocked,
+                        blocked=bool(job.blocked),
+                    )
+                    if job.started or job.blocked
+                    else ()
                 )
                 if job.failure:
                     code, reason = job.failure
                     status = Status.MISSING if code == "missing" else Status.FAILED
                 elif interest.cancelled:
                     status, code, reason = Status.CANCELLED, "cancelled", ""
+                elif job.blocked:
+                    status = (
+                        Status.PARTIAL
+                        if isinstance(job.work.payload, MoveTo)
+                        and any(o.completed_steps for o in outcomes)
+                        else Status.DEFERRED
+                    )
+                    code, reason = (
+                        job.blocked,
+                        "Retry after the existing transfer completes",
+                    )
                 else:
                     status = (
                         Status.COMPLETED
@@ -576,9 +649,28 @@ class HostCacheTransfers:
         if job.failure is None and any(
             not self.interests[i].cancelled for i in job.interests
         ):
+            outcomes = (
+                self._outcomes(
+                    interest.work,
+                    job.reclaimed,
+                    retained_code="cancelled",
+                    blocked=True,
+                )
+                if job.started and interest.work.public_demote
+                else ()
+            )
             job.interests.remove(ref.operation_id)
             self.interests.pop(ref.operation_id)
-            return ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
+            return ExecutionUpdate(
+                status=Status.CANCELLED,
+                quiescent=True,
+                target_outcomes=outcomes,
+                completed_steps=tuple(
+                    step
+                    for step in ("destination_ready", "source_reclaimed")
+                    if outcomes and all(step in o.completed_steps for o in outcomes)
+                ),
+            )
         if not job.started:
             self._retire(job)
         return self.poll(ref)

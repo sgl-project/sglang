@@ -51,6 +51,8 @@ class ExecutionRequest(Value):
     # Internal provenance, supplied by the owner. Public envelopes/contexts
     # cannot choose policy authority by naming a caller or adding payload keys.
     origin: Literal["explicit", "policy"] = "explicit"
+    # Owner-selected semantics, never a caller-controlled primitive field.
+    public_demote: bool = False
 
 
 class Executor(Protocol):
@@ -565,6 +567,7 @@ class KVControl:
                     target=pending.target,
                     max_result_targets=self.limits.max_scope_spans,
                     origin=pending.origin,
+                    public_demote=current.action_type == "sglang.demote",
                 )
             )
             self._execution_update(pending, update)

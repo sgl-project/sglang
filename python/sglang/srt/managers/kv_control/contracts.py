@@ -589,6 +589,19 @@ def parse_action(action: KvHintAction) -> Payload:
         validate_target(payload.target)
     if isinstance(payload, (Prefetch, Pin)):
         validate_public(payload)
+    if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
+        locations = (
+            (payload.location,)
+            if isinstance(payload, SetPriority)
+            else (payload.src, payload.dst)
+        )
+        if any(
+            location.tier != "storage" and location.backend_namespace is not None
+            for location in locations
+        ):
+            raise ControlError(
+                "invalid_payload", "Only storage locations may name a backend namespace"
+            )
     if isinstance(payload, SetPriority):
         if payload.value is None:
             if payload.ttl_seconds is not None:

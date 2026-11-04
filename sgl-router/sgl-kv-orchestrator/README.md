@@ -220,3 +220,46 @@ roundtrip still runs. Each live run uses a unique weight namespace. The test che
 write→resolved-key existence, cross-worker key equality, host registration, shared
 interest cancellation and GPU load-back bytes. Model generation, TP>1, MLA,
 other Mooncake host layouts and Router-driven recovery remain separate validation.
+
+
+## P3 DEMOTE observations
+
+The action/envelope versions and payload fields are unchanged. Public DEMOTE
+remains GPU→host/storage; host→storage DEMOTE and L1 PIN are unsupported.
+Legacy copy/move behavior and soft priority retain their existing meaning.
+
+A DEMOTE confirms the cold copy before reclaiming any source. Host completion
+requires publication after the DMA fence; storage requires the native writer's
+verified contiguous prefix receipt. Existing host backups and file/Mooncake
+objects use native skip-write paths. An incomplete backup preserves all GPU source
+ranges and reports confirmed cold ranges separately from missing ranges.
+
+Reclamation runs through tree-core demote and allocator frees, deepest eligible
+nodes first. Public target outcomes use these blocked reason codes:
+
+- `active_reference`: the GPU component still has a correctness reference after
+  this job releases its own temporary hold.
+- `inflight_backup` / `inflight_load`: a matching pending transfer or storage job
+  still holds the affected source.
+- `structural_dependency`: a child still has GPU KV, preventing ancestor removal.
+- `not_reclaimable`: conservative fallback for another non-evictable state.
+- `cancelled` or the actual backup failure code when that operation deliberately
+  retains the source after publication.
+
+No code infers `pin_conflict` from ordinary references or soft priority. Request
+references do not cause an indefinite retry loop: the result is partial with the
+preserved/reclaimed/blocked scopes. A foreign source load returns partial when
+cold data is already ready, otherwise deferred. Owned I/O still drains before
+quiescence. A new bounded attempt may target the retained complete prefix; already
+reclaimed suffixes do not become sources again.
+
+Cancelled shared callers retain publication evidence already observed at their
+cancellation boundary; the other caller keeps its own interest/holds. Last-caller
+cancellation waits for its I/O drain and reports resulting cold data without
+initiating source reclamation. Outcome records are historical evidence and do not
+promise continuing storage residency. Per-page result capacity is approved before
+public DEMOTE starts, allowing distinct blockers after concurrent radix splits.
+
+Legacy primitive locations now reject a non-null `backend_namespace` on GPU/host
+with `invalid_payload`; absent/null values and storage namespaces retain the P2
+contract. No new public schema field or action version was introduced in P3.

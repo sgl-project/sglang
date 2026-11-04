@@ -199,6 +199,20 @@ class TestKVControl(CustomTestCase):
         assert core.index.get("s", "c") == record
         assert core.index.capacity()["continuations"] == 1
 
+    def test_legacy_nonstorage_backend_namespace_is_rejected_before_execution(self):
+        boundary = CompletionBoundary()
+        core = KVControl("engine", "ns", enabled=True, executor=boundary)
+        for kind, payload, location in (
+            ("copy_to", movement(src="gpu", dst="host"), "dst"),
+            ("move_to", movement(src="gpu", dst="host"), "src"),
+            ("set_priority", priority(), "location"),
+        ):
+            payload[location]["backend_namespace"] = "storage-domain"
+            result = submit(core, action(kind, payload), message_id=kind).results[0]
+            self.assertEqual(result.status, Status.REJECTED)
+            self.assertEqual(result.update.code, "invalid_payload")
+        self.assertEqual(boundary.starts, 0)
+
     def test_disabled_default_and_absent_executor_are_honest(self):
         disabled = KVControl("engine", "ns")
         assert (
@@ -770,6 +784,18 @@ class TestPublicKVProtocol(CustomTestCase):
             done.public_result.state_version, cancelling.public_result.state_version
         )
         self.assertEqual(done.public_result.outcome_sequence, done.sequence)
+
+    def test_host_to_storage_demote_remains_unsupported(self):
+        control, executor, _ = self.owner()
+        a = self.public_action()
+        a = action(
+            "demote",
+            dict(a.payload, source={"tier": "host"}, destination={"tier": "storage"}),
+        )
+        result = control.submit(envelope(a), control.context("A")).results[0]
+        self.assertEqual(result.status, Status.UNSUPPORTED)
+        self.assertFalse(result.public_result.reclaimed_scope)
+        self.assertEqual(executor.starts, 0)
 
     def test_attached_timeout_and_old_result_wire_contract(self):
         control, executor, clock = self.owner()
