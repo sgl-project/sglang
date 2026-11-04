@@ -18,6 +18,53 @@ from sglang.srt.utils import (
 )
 
 
+def load_image_item(
+    data,
+    *,
+    gpu_image_decode: bool,
+    discard_alpha_channel: bool,
+    smart_rgb_conversion: bool,
+):
+    """Decode one image source to a PIL image, or a GPU tensor when nvJPEG decoded it."""
+    img, _ = load_image(data, gpu_image_decode)
+    if isinstance(img, torch.Tensor):
+        return img  # JPEG already decoded on GPU by nvJPEG
+    # PIL decodes lazily; do it here in the io worker so the decode
+    # doesn't run later on the event-loop thread.
+    if discard_alpha_channel:
+        if smart_rgb_conversion:
+            return smart_to_rgb(img)
+        if img.mode != "RGB":
+            return img.convert("RGB")
+    img.load()
+    return img
+
+
+def load_video_item(data, *, video_decode_device: Optional[str]):
+    return load_video(data, use_gpu=video_decode_device != "cpu")
+
+
+def load_audio_item(data, *, audio_sample_rate: Optional[int]):
+    return load_audio(data, audio_sample_rate)
+
+
+@contextmanager
+def media_load_errors(data):
+    """Report a loader failure on `data` as ValueError for client media errors, RuntimeError otherwise."""
+    try:
+        yield
+    except CLIENT_MEDIA_EXCEPTIONS as e:
+        data_str = str(data)
+        if len(data_str) > 100:
+            data_str = data_str[:100] + "..."
+        raise ValueError(f"Error while loading data {data_str}: {e}") from e
+    except Exception as e:
+        data_str = str(data)
+        if len(data_str) > 100:
+            data_str = data_str[:100] + "..."
+        raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+
+
 def _tokenizer_of(processor):
     """The tokenizer reached from an HF processor.
 
@@ -212,37 +259,20 @@ class MultimodalProcessorMixin:
         """
         if cls._is_preprocessed_input(data):
             return data
-        try:
+        with media_load_errors(data):
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
-                if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
-                # PIL decodes lazily; do it here in the io worker so the decode
-                # doesn't run later on the event-loop thread.
-                if discard_alpha_channel:
-                    if cls.smart_rgb_conversion:
-                        return smart_to_rgb(img)
-                    if img.mode != "RGB":
-                        return img.convert("RGB")
-                img.load()
-                return img
+                return load_image_item(
+                    data,
+                    gpu_image_decode=cls.gpu_image_decode,
+                    discard_alpha_channel=discard_alpha_channel,
+                    smart_rgb_conversion=cls.smart_rgb_conversion,
+                )
             elif modality == Modality.VIDEO:
                 if video_decode_device is None:
                     video_decode_device = cls.video_preprocessing_device
-                return load_video(data, use_gpu=video_decode_device != "cpu")
+                return load_video_item(data, video_decode_device=video_decode_device)
             elif modality == Modality.AUDIO:
-                return load_audio(data, audio_sample_rate)
-
-        except CLIENT_MEDIA_EXCEPTIONS as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
-        except Exception as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+                return load_audio_item(data, audio_sample_rate=audio_sample_rate)
 
     @staticmethod
     def _get_preprocessed_input_format(data):
