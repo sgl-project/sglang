@@ -18,9 +18,15 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import DocPrefetch
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -34,21 +40,17 @@ _OWNERS = (
     DllmManager,
     HiSparseCoordinator,
     UocrSchedulerRuntime,
+    DocPrefetch,
     DeferredResponses,
 )
 
-# Fields annotated as holding requests that are not a `RequestList`. Only
-# shrinks: a list that migrates leaves it.
-_NOT_YET_LISTS = {
-    "Scheduler.waiting_queue",
-    "DecodePreallocQueue.queue",
+# Fields annotated as holding requests that are not a `ReqList`: each holds
+# requests a list already holds.
+_NOT_LISTS = {
     # Shares its entries with `queue`.
     "DecodePreallocQueue.pending_reqs",
-    "DecodeTransferQueue.queue",
-    "DecodeTransferQueue._deferred_releases",
     # A subset of `waiting_queue`.
     "DllmManager.staging_queue",
-    "DeferredResponses.held",
 }
 
 _HOLDS_REQUESTS = re.compile(r"\b(Req|DecodeRequest)\b")
@@ -75,7 +77,23 @@ def _fields_holding_requests(owner) -> set:
 class TestRequestHoldersAreLists(CustomTestCase):
     def test_every_field_holding_requests_is_a_request_list(self):
         fields = set().union(*map(_fields_holding_requests, _OWNERS))
-        self.assertEqual(fields, _NOT_YET_LISTS)
+        self.assertEqual(fields, _NOT_LISTS)
+
+
+class TestKeyedReqList(CustomTestCase):
+    def test_join_keeps_order_and_leave_ignores_outsiders(self):
+        a, b, c, outsider = (FakeReq(rid=rid, finished=lambda: False) for rid in "abcx")
+        running = KeyedReqList(ListKind.DECODING)
+        running.join([a, b])
+        running.join([c, b])
+        self.assertEqual(list(running), [a, b, c])
+
+        b.finished = lambda: True
+        running.leave_finished()
+        running.leave([a, outsider])
+
+        self.assertEqual(list(running), [c])
+        self.assertNotIn(a, running)
 
 
 if __name__ == "__main__":
