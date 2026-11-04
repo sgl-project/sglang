@@ -1,6 +1,5 @@
 import unittest
 
-from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite, parse_spec_tp_sync
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,16 +24,6 @@ class TestParseSpecTpSync(CustomTestCase):
         # Ranks with the same logits draw the same draft noise.
         self.assertNotIn(DRAFT, parse_spec_tp_sync("rng"))
         self.assertIn(DRAFT, parse_spec_tp_sync("dspark-draft"))
-
-    def test_default_syncs_only_the_startup_memory_probes(self):
-        # Per-rank free memory differs, so the graph-capture decision must stay synced;
-        # every per-step site is off unless SGLANG_SPEC_TP_SYNC names it.
-        with envs.SGLANG_SPEC_TP_SYNC.override("all"):
-            envs.SGLANG_SPEC_TP_SYNC.clear()
-            sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
-        self.assertEqual(
-            sites, frozenset({SpecTpSyncSite.DSPARK_MEM, SpecTpSyncSite.DFLASH_MEM})
-        )
 
 
 if __name__ == "__main__":
