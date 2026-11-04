@@ -1277,6 +1277,9 @@ class Envs:
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
+    # Force FlashInfer decode on (1) or off (0) tensor cores; unset picks from
+    # the KV cache dtype and the GQA group size.
+    SGLANG_FLASHINFER_USE_TENSOR_CORE = EnvBool(None)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
