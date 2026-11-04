@@ -35,6 +35,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
     MessageProcessingResult,
+    StreamOptions,
     Tool,
     ToolChoice,
     ToolChoiceFuncName,
@@ -1326,9 +1327,9 @@ class ServingChatTestCase(CustomTestCase):
                     }
                 yield {
                     **output,
-                    "text": output["text"][len(text) :]
-                    if incremental
-                    else output["text"],
+                    "text": (
+                        output["text"][len(text) :] if incremental else output["text"]
+                    ),
                 }
 
             self.tm.generate_request = Mock(return_value=generate())
@@ -2936,6 +2937,79 @@ class ServingChatTestCase(CustomTestCase):
             "not-json <| kimi_image_placeholder |>",
         )
         self.assertNotIn("image_prompts", kwargs)
+
+    def test_kimi_k3_keeps_tool_call_arguments_bytes(self):
+        """The K3 encoder keeps a nested argument value's original JSON text;
+        parsing the arguments to a dict first would re-serialize it."""
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        arguments = '{"options": { "unit" : "c" , "days" : 3 }}'
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "Sunny"},
+            ],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            messages[1]["tool_calls"][0]["function"]["arguments"], arguments
+        )
+
+    def test_kimi_k3_explicit_tool_choice_none_reaches_encoder_without_tools(self):
+        """An explicit tool_choice=none is rendered even without tools; the
+        default "none" of a request without tools is not."""
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        messages = [{"role": "user", "content": "Hi"}]
+        for kwargs, expected in (({"tool_choice": "none"}, "none"), ({}, None)):
+            with self.subTest(kwargs=kwargs):
+                request = ChatCompletionRequest(model="x", messages=messages, **kwargs)
+                self.assertEqual(request.tool_choice, "none")
+
+                self.chat._process_messages(request, is_multimodal=False)
+
+                call_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(call_kwargs.get("tool_choice"), expected)
+
+    def test_validate_request_accepts_draft07_schema_identifiers(self):
+        """A plain-name ``$id`` fragment is valid draft-07 but fails the 2020-12
+        metaschema; it constrains nothing, so the tool is accepted."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "$id": "#lookup",
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+
+        self.assertIsNone(self.chat._validate_request(request))
 
     def test_message_tools_participate_in_validation_across_encodings(self):
         tool = {
@@ -6167,6 +6241,25 @@ class TestUsageReasoningTokens(CustomTestCase):
             prompt_tokens=5, completion_tokens=7
         )
         self.assertIsNone(no_reasoning.completion_tokens_details)
+
+
+class TestShouldIncludeUsage(CustomTestCase):
+    def test_explicit_include_usage_overrides_server_default(self):
+        from sglang.srt.entrypoints.openai.utils import should_include_usage
+
+        for include_usage, server_default, expected in (
+            (False, True, False),
+            (True, False, True),
+            (None, True, True),
+            (None, False, False),
+        ):
+            with self.subTest(
+                include_usage=include_usage, server_default=server_default
+            ):
+                stream_options = StreamOptions(include_usage=include_usage)
+                self.assertEqual(
+                    should_include_usage(stream_options, server_default)[0], expected
+                )
 
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):
