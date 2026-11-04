@@ -49,6 +49,21 @@ class TestBlockVerificationArgs(unittest.TestCase):
                         args.speculative_use_rejection_sampling, use_rejection_sampling
                     )
 
+    def test_supported_on_npu(self):
+        """sgl_kernel_npu implements block verification for the chain-mode
+        EAGLE/EAGLE3/NEXTN rejection-sampling kernel."""
+        for algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
+            with self.subTest(algorithm=algorithm):
+                args = self._args(
+                    device="npu",
+                    speculative_algorithm=algorithm,
+                    speculative_use_rejection_sampling=True,
+                )
+                handle_speculative_decoding(args)
+                self.assertTrue(
+                    resolution_result(args, "speculative_use_block_verification")
+                )
+
     def test_dflash_family(self):
         """DFLASH/DSPARK sampled drafts publish their own proposal distribution,
         so block verification must not switch on EAGLE's rejection sampling."""
@@ -90,16 +105,17 @@ class TestBlockVerificationArgs(unittest.TestCase):
             ({"speculative_algorithm": None}, "only supports EAGLE"),
             ({"speculative_algorithm": "STANDALONE"}, "only supports EAGLE"),
             ({"speculative_algorithm": "NGRAM"}, "only supports EAGLE"),
-            ({"device": "cpu"}, "only supports CUDA or ROCm"),
-            ({"device": "npu"}, "only supports CUDA or ROCm"),
-            # DFLASH/DSPARK serve on NPU, whose chain sampler has no block mode.
+            ({"device": "cpu"}, "only supports CUDA, ROCm, or NPU"),
+            ({"device": "xpu"}, "only supports CUDA, ROCm, or NPU"),
+            # Block verification is unverified for DFLASH/DSPARK on NPU; only
+            # the chain-mode EAGLE/EAGLE3/NEXTN sampler supports block mode there.
             (
                 {"speculative_algorithm": "DFLASH", "device": "npu"},
-                "only supports CUDA or ROCm",
+                "on NPU only supports EAGLE / EAGLE3 / NEXTN",
             ),
             (
                 {"speculative_algorithm": "DSPARK", "device": "npu"},
-                "only supports CUDA or ROCm",
+                "on NPU only supports EAGLE / EAGLE3 / NEXTN",
             ),
             ({"speculative_eagle_topk": 2}, "requires --speculative-eagle-topk=1"),
             ({"speculative_accept_threshold_single": 0.5}, "incompatible"),

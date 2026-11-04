@@ -120,7 +120,8 @@ class Spec(msgspec.Struct):
     speculative_use_block_verification: A[
         bool,
         "Use block verification for EAGLE/EAGLE3/NEXTN (requires topk=1) or for "
-        "sampled DFLASH/DSPARK drafts, on CUDA or ROCm.",
+        "sampled DFLASH/DSPARK drafts, on CUDA or ROCm; on NPU only "
+        "EAGLE/EAGLE3/NEXTN is supported.",
     ] = False
     speculative_token_map: A[
         Optional[str],
