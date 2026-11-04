@@ -79,7 +79,6 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    make_sim_draw_generator,
     target_model_type,
     verify_logits_adjustments_are_noop,
 )
@@ -93,6 +92,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
     prepare_mamba_track_for_verify,
+    simulated_acc_len_generator,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -359,7 +359,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             else None
         )
         self._sim_generator = (
-            make_sim_draw_generator(target_worker.random_seed)
+            simulated_acc_len_generator(target_worker.random_seed)
             if self._simulated_correct_len is not None
             else None
         )

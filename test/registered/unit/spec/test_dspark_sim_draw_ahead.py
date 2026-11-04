@@ -15,8 +15,8 @@ from sglang.srt.speculative.dspark_components import dspark_worker_v2 as worker_
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    make_sim_draw_generator,
 )
+from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -94,10 +94,10 @@ def test_ahead_matches_after_draft_on_fixed_seeds():
 
 
 def test_ranks_draw_alike_whatever_else_reads_the_process_rng():
-    """The accept-sample broadcast is skipped on simulated steps, so two ranks must stage
-    the same correct length and bonus seed even when other code on one rank consumes
-    the process's random / torch generators a different number of times."""
-    ranks = [_worker(make_sim_draw_generator(721047113)) for _ in range(2)]
+    """The accept-sample site is off by default, so two ranks must stage the same
+    correct length and bonus seed even when other code on one rank consumes the
+    process's random / torch generators a different number of times."""
+    ranks = [_worker(simulated_acc_len_generator(721047113)) for _ in range(2)]
     draws = [[], []]
     for step in range(40):
         for rank, w in enumerate(ranks):
@@ -112,7 +112,6 @@ def test_ranks_draw_alike_whatever_else_reads_the_process_rng():
             draws[rank].append(_snapshot(w))
     assert draws[0] == draws[1]
     assert len({s[0] for s in draws[0]}) > 1
-    assert ranks[0]._verify_executor.verify_epilogue.sim_draws_rank_identical
 
 
 def test_inert_under_real_acceptance():

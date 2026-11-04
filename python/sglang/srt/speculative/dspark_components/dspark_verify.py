@@ -133,18 +133,6 @@ def candidate_request_length_bound(
     return longest + pending_verify_tokens
 
 
-# XORed into the server seed so the simulated draws differ from other samplers'.
-_SIM_DRAW_DOMAIN = 0x51A7_D2A3
-
-
-def make_sim_draw_generator(random_seed: int) -> torch.Generator:
-    """The CPU generator of the SGLANG_SIMULATE_ACC_LEN draws (correct length, bonus
-    seed). Every TP rank seeds it alike and draws in the same order, so ranks agree."""
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed((int(random_seed) ^ _SIM_DRAW_DOMAIN) & 0x7FFFFFFFFFFFFFFF)
-    return generator
-
-
 def draw_sim_seed(generator: Optional[torch.Generator]) -> int:
     if generator is None:
         return random.getrandbits(31)
@@ -235,14 +223,6 @@ class TargetVerifyExecutor:
             if greedy_bonus
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
-        rank_identical = self._sim_draws_rank_identical(
-            simulate_bonus_sampling_info
-        ) and accept_draws_rank_identical(
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            block_verification=self._block_verification,
-            rejection_noise=self._rejection_noise,
-        )
         return build_accept_outs(
             correct_len=correct_len,
             bonus=bonus,
@@ -253,22 +233,10 @@ class TargetVerifyExecutor:
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
             sync_site=sync_site,
-            rank_identical=rank_identical,
             simulated_correct_len=self._simulated_correct_len,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             sim_generator=self._sim_generator,
-        )
-
-    def _sim_draws_rank_identical(self, simulate_bonus_sampling_info) -> bool:
-        if self._simulated_correct_len is None:
-            return True
-        if self._sim_generator is None:
-            return False
-        # A top-k / top-p simulated bonus is a torch.multinomial on the rank's generator.
-        return simulate_bonus_sampling_info is None or not (
-            simulate_bonus_sampling_info.need_top_k_sampling
-            or simulate_bonus_sampling_info.need_top_p_sampling
         )
 
     def begin_simulated_step(self) -> None:
@@ -916,11 +884,6 @@ class DsparkVerifyEpilogue:
             rows_per_request=self.stride,
         )
 
-    @property
-    def sim_draws_rank_identical(self) -> bool:
-        """Whether every rank stages the same simulated correct length and bonus seed."""
-        return self.simulated_correct_len is None or self._sim_generator is not None
-
     def sim_bonus(self, logits, bs: int) -> torch.Tensor:
         """The simulated row's bonus from the buffers begin_sim_bonus staged; graph-safe."""
         return simulated_bonus_sample_graph(**self._sim_bonus_args(logits, bs))
@@ -1154,7 +1117,6 @@ def build_accept_outs(
     verify_num_draft_tokens: int,
     tp_sync: SpecTpSync,
     sync_site: SpecTpSyncSite,
-    rank_identical: bool = False,
     simulated_correct_len: Optional[torch.Tensor] = None,
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
@@ -1163,9 +1125,7 @@ def build_accept_outs(
     block_accept_lens_out: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
-    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
-    ``rank_identical``: every rank drew this accept alike (accept_draws_rank_identical
-    and lockstep simulated draws), so ``tp_sync`` may skip its broadcast."""
+    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens."""
     bs = correct_len.shape[0]
     if simulated_correct_len is not None:
         # The accept runs as served; only its length is replaced.
@@ -1191,10 +1151,9 @@ def build_accept_outs(
                 .to(bonus.dtype)
                 .view_as(bonus)
             )
-    if not rank_identical or tp_sync.syncs_rank_identical(sync_site):
-        tp_sync.sync(sync_site, correct_len)
-        tp_sync.sync(sync_site, bonus)
-        tp_sync.sync(sync_site, cap_trim_lens)
+    tp_sync.sync(sync_site, correct_len)
+    tp_sync.sync(sync_site, bonus)
+    tp_sync.sync(sync_site, cap_trim_lens)
 
     finalized = FinalizeAcceptLens.execute(
         correct_len=correct_len,
@@ -1321,27 +1280,6 @@ def _blockwise_rejection_applies(
         and not block_verification
         and not sampling_info.need_top_k_sampling
         and not sampling_info.need_top_p_sampling
-    )
-
-
-def accept_draws_rank_identical(
-    *,
-    draft_block: DraftBlockResult,
-    sampling_info,
-    block_verification: bool,
-    rejection_noise: Optional[RejectionNoise],
-) -> bool:
-    """Whether accept_draft_tokens takes a path every TP rank computes alike from the
-    same logits: greedy, or a sampled accept on counter-based noise keyed by the
-    server seed. AcceptSampling draws from each rank's own torch generator."""
-    if sampling_info is None or sampling_info.is_all_greedy:
-        return True
-    return _accepts_on_shards(
-        draft_block, sampling_info, block_verification
-    ) or _blockwise_rejection_applies(
-        sampling_info=sampling_info,
-        rejection_noise=rejection_noise,
-        block_verification=block_verification,
     )
 
 

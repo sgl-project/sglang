@@ -382,6 +382,53 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 
 
+def test_simulated_acceptance_draws_alike_across_ranks(monkeypatch):
+    """The forced length replaces accept_len after its broadcast, so two ranks must
+    draw it alike even when one consumes the process RNG more often."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+    from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
+
+    monkeypatch.setattr(worker_mod, "SIMULATE_ACC_LEN", 2.5)
+    monkeypatch.setattr(worker_mod, "SIMULATE_ACC_METHOD", "match-expected")
+    monkeypatch.setattr(worker_mod, "SIMULATE_ACC_TOKEN_MODE", "fixed")
+    monkeypatch.setattr(
+        worker_mod, "is_dflash_sampling_verify_available", lambda: False
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "compute_dflash_correct_drafts_and_bonus",
+        lambda **kwargs: (torch.tensor([0]), torch.tensor([7])),
+    )
+    ranks = [
+        SimpleNamespace(
+            _selector_sample=None,
+            _tp_sync=SimpleNamespace(sync=lambda site, tensor: None),
+            _use_triton_accept_bonus=False,
+            _simulated_acc_len_rng=simulated_acc_len_generator(17),
+            block_size=4,
+        )
+        for _ in range(2)
+    ]
+    lens = [[], []]
+    for step in range(40):
+        for rank, worker in enumerate(ranks):
+            torch.manual_seed(rank)
+            for _ in range(rank * step):
+                torch.rand(1)
+            _, commit_lens, _, _, _ = worker_mod.DFlashWorkerV2._accept_block(
+                worker,
+                candidates=torch.tensor([[9, 1, 2, 3]]),
+                next_token_logits=torch.zeros(1, 4, 8),
+                sampling_info=SimpleNamespace(is_all_greedy=True),
+                draft_input=object(),
+                prefix_lens=torch.tensor([3]),
+                bs=1,
+            )
+            lens[rank].append(commit_lens.item())
+    assert lens[0] == lens[1]
+    assert set(lens[0]) == {2, 3}
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""
