@@ -467,7 +467,7 @@ class TestFp8QAsmSelection(CustomTestCase):
         return _fp8_q_asm_mla_selected(**kwargs)
 
     def test_off_by_default(self):
-        self.assertFalse(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.get())
+        self.assertFalse(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.default)
         self.assertFalse(self._selected(enabled=False))
 
     def test_verify_window_bound(self):
@@ -485,7 +485,7 @@ class TestFp8QAsmSelection(CustomTestCase):
                     )
 
     def test_folded_window_is_opt_in(self):
-        self.assertEqual(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(), 4)
+        self.assertEqual(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.default, 4)
         for qlen in (5, 8):
             with self.subTest(qlen=qlen):
                 self.assertTrue(self._selected(verify_qlen=qlen, max_verify_qlen=8))
@@ -607,9 +607,34 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             self.assertFalse(other._use_mla_decode_persist_metadata())
             self.assertIsNone(other.max_split_per_batch)
 
+    def test_persist_auto_splits_still_set_the_module_modes(self):
+        """Under PERSIST=1 with auto KV splits, draft extend reads the module modes with a
+        split cap of -1, so the opt-in must not keep them on the non-auto schedule."""
+        from sglang.srt.layers.attention import aiter_backend
+
+        with (
+            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.override(True),
+            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.override(8),
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(True),
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", True),
+            mock.patch.object(aiter_backend, "fast_mode", False),
+            mock.patch.object(aiter_backend, "intra_batch_mode", True),
+        ):
+            eligible = self._build(num_draft_tokens=8)
+
+            self.assertTrue(eligible.use_mla_fp8_q_asm)
+            self.assertEqual(eligible.max_split_per_batch, -1)
+            self.assertTrue(aiter_backend.fast_mode)
+            self.assertFalse(aiter_backend.intra_batch_mode)
+            self.assertEqual(eligible._mla_decode_metadata_modes(), (True, False))
+
 
 class TestFp8QAsmQueryCast(CustomTestCase):
-    def _run_decode(self, *, enabled, qlen, query_dtype=torch.bfloat16):
+    def _run_decode(
+        self, *, enabled, qlen, query_dtype=torch.bfloat16, persistent=True, q_max=1.0
+    ):
         from sglang.srt.layers.attention import aiter_backend
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
@@ -622,17 +647,27 @@ class TestFp8QAsmQueryCast(CustomTestCase):
         be.dcp_world_size = 1
         be.input_dtype = torch.bfloat16
         be.use_mla_fp8_q_asm = enabled
+        be.q_scale = torch.tensor([1.0])
         layer = mock.Mock(tp_q_head_num=12, v_head_dim=512)
-        q = torch.linspace(-1, 1, steps=2 * 12 * 576).view(2, 12, 576).to(query_dtype)
+        q = torch.linspace(-q_max, q_max, steps=2 * 12 * 576).view(2, 12, 576)
+        q = q.to(query_dtype)
         q_scale = torch.tensor(0.25)
 
         def decode(q, kv, out, **kwargs):
             out.fill_(2)
 
+        def static_quant(x, scale):
+            # Saturating static quant, as the GPU kernel does.
+            finfo = torch.finfo(fp8_dtype)
+            return (x.float() / scale).clamp(finfo.min, finfo.max).to(fp8_dtype), scale
+
         with (
             mock.patch.object(
                 aiter_backend, "mla_decode_fwd", side_effect=decode, create=True
             ) as kernel,
+            mock.patch.object(
+                aiter_backend, "scaled_fp8_quant", side_effect=static_quant
+            ),
             mock.patch.object(aiter_backend, "is_gfx95_supported", return_value=True),
             mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
         ):
@@ -642,39 +677,55 @@ class TestFp8QAsmQueryCast(CustomTestCase):
                 layer,
                 max_seqlen_q=qlen,
                 q_scale=q_scale,
+                work_meta_data=torch.empty(0) if persistent else None,
             )
 
         q_in = kernel.call_args.args[0]
         self.assertEqual(q_in.shape, (2, 16, 576))
-        torch.testing.assert_close(q_in[:, :12].float(), q.to(q_in.dtype).float())
         self.assertEqual(torch.count_nonzero(q_in[:, 12:].float()).item(), 0)
         self.assertEqual(out.shape, (2, 12, 512))
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertTrue(torch.all(out == 2).item())
-        return q_in, kernel.call_args.kwargs["q_scale"], q_scale
+        return q, q_in, kernel.call_args.kwargs["q_scale"], q_scale
 
     def test_bf16_q_is_cast_inside_the_window(self):
-        for qlen in (1, 4):
+        for qlen in (1, 8):
             with self.subTest(qlen=qlen):
-                q, scale, _ = self._run_decode(enabled=True, qlen=qlen)
-                self.assertEqual(q.dtype, fp8_dtype)
+                q, q_in, scale, _ = self._run_decode(enabled=True, qlen=qlen)
+                self.assertEqual(q_in.dtype, fp8_dtype)
+                torch.testing.assert_close(
+                    q_in[:, :12].float(), q.to(fp8_dtype).float()
+                )
                 self.assertEqual(scale.item(), 1.0)
 
+    def test_cast_saturates_out_of_range_q(self):
+        """A query beyond the fp8 range must saturate, not turn into NaN."""
+        _, q_in, _, _ = self._run_decode(enabled=True, qlen=1, q_max=1000.0)
+        self.assertFalse(torch.isnan(q_in.float()).any().item())
+
+    def test_non_persistent_call_keeps_bf16_query(self):
+        """Draft extend under PERSIST=0 has no persist metadata and keeps its bf16 query."""
+        _, q_in, scale, original_scale = self._run_decode(
+            enabled=True, qlen=4, persistent=False
+        )
+        self.assertEqual(q_in.dtype, torch.bfloat16)
+        self.assertIs(scale, original_scale)
+
     def test_default_route_preserves_bf16_query_and_scale(self):
-        q, scale, original_scale = self._run_decode(enabled=False, qlen=4)
-        self.assertEqual(q.dtype, torch.bfloat16)
+        _, q_in, scale, original_scale = self._run_decode(enabled=False, qlen=4)
+        self.assertEqual(q_in.dtype, torch.bfloat16)
         self.assertIs(scale, original_scale)
 
     def test_wide_window_keeps_existing_fp8_cast(self):
-        q, scale, _ = self._run_decode(enabled=False, qlen=8)
-        self.assertEqual(q.dtype, fp8_dtype)
+        _, q_in, scale, _ = self._run_decode(enabled=False, qlen=8)
+        self.assertEqual(q_in.dtype, fp8_dtype)
         self.assertEqual(scale.item(), 1.0)
 
     def test_fp8_query_preserves_existing_scale(self):
-        q, scale, original_scale = self._run_decode(
-            enabled=True, qlen=4, query_dtype=fp8_dtype
+        _, q_in, scale, original_scale = self._run_decode(
+            enabled=True, qlen=8, query_dtype=fp8_dtype
         )
-        self.assertEqual(q.dtype, fp8_dtype)
+        self.assertEqual(q_in.dtype, fp8_dtype)
         self.assertIs(scale, original_scale)
 
 

@@ -808,8 +808,9 @@ class AiterAttnBackend(AttentionBackend):
                     "aiter MLA: aiter plans the KV splits "
                     "(SGLANG_AITER_MLA_AUTO_KV_SPLITS=1)"
                 )
-                # The fp8-Q opt-in takes its modes from _mla_decode_metadata_modes.
-                if not self.use_mla_fp8_q_asm:
+                # Draft extend reads the module modes; the fp8-Q opt-in alone must not
+                # flip them, it takes its own from _mla_decode_metadata_modes.
+                if _use_mla_ps_kernel or self.use_mla_dcp_asm:
                     fast_mode = True
                     intra_batch_mode = False
                 self.max_split_per_batch = -1
@@ -907,6 +908,14 @@ class AiterAttnBackend(AttentionBackend):
             # take what PERSIST=1 would set, with or without auto KV splits.
             return (True, False) if self.use_mla_auto_kv_splits else (False, True)
         return fast_mode, intra_batch_mode
+
+    def _mla_verify_metadata_modes(
+        self, use_asm_cprr_verify: bool
+    ) -> tuple[bool, bool]:
+        """(fast_mode, intra_batch_mode) for target verify metadata."""
+        if use_asm_cprr_verify:
+            return self.cprr_fast_mode, self.cprr_intra_batch_mode
+        return self._mla_decode_metadata_modes()
 
     def make_mla_decode_meta_data_buffer(
         self,
@@ -1603,16 +1612,18 @@ class AiterAttnBackend(AttentionBackend):
             # their KV, and that KV can be NaN. Gluon, the kernel this path
             # replaces, does not read row 0.
             k_buffer_flat[0].zero_()
+        # Draft extend has no persist metadata under PERSIST=0 and keeps its bf16 query.
+        fp8_q_asm_call = (
+            self.use_mla_fp8_q_asm and kwargs.get("work_meta_data") is not None
+        )
         if (
             self.kv_cache_dtype == fp8_dtype
             and self.mla_kernel_num_head_padded == 16
             and is_gfx95_supported()
-            and (self.use_mla_fp8_q_asm or max_q_len > _MLA_ASM_PS_MAX_QLEN)
+            and (fp8_q_asm_call or max_q_len > _MLA_ASM_PS_MAX_QLEN)
             and q.dtype != fp8_dtype
         ):
-            q_flat = q.reshape(q.shape[0], -1).to(fp8_dtype)
-            kwargs["q_scale"] = torch.ones((), dtype=torch.float32, device=q.device)
-            q = q_flat.view(q.shape)
+            q, kwargs["q_scale"] = self._quantize_q_fp8(q)
         if self.head_pad_mode == "repeat" or (
             self.head_pad_mode == "none" and self.num_head_padded != self.num_head
         ):
@@ -2564,9 +2575,7 @@ class AiterAttnBackend(AttentionBackend):
                         self.cprr_kernel_heads if use_asm_cprr_verify else None
                     )
                     verify_fast_mode, verify_intra_batch_mode = (
-                        (self.cprr_fast_mode, self.cprr_intra_batch_mode)
-                        if use_asm_cprr_verify
-                        else self._mla_decode_metadata_modes()
+                        self._mla_verify_metadata_modes(use_asm_cprr_verify)
                     )
                     (
                         work_metadata,
@@ -3408,9 +3417,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits = self.max_split_per_batch
                     is_cp_round_robin = self.dcp_world_size > 1
                     verify_fast_mode, verify_intra_batch_mode = (
-                        (self.cprr_fast_mode, self.cprr_intra_batch_mode)
-                        if use_asm_cprr_verify
-                        else self._mla_decode_metadata_modes()
+                        self._mla_verify_metadata_modes(use_asm_cprr_verify)
                     )
 
                     self.make_mla_meta_data(
