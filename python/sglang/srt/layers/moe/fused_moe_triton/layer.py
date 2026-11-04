@@ -1442,6 +1442,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_rank = self._orig_moe_tp_rank
         self.moe_ep_size = 1
         self.moe_ep_rank = 0
+        self._expert_storage_rank = 0
         self._num_local_routed = self._num_global_routed
         self.num_local_experts = self._num_global_routed + num_shared
         self.intermediate_size_per_partition = (
