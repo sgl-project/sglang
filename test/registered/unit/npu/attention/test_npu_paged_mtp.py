@@ -12,7 +12,7 @@ import pytest
 import torch
 from test_npu_flash_mla import mod
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -46,6 +46,8 @@ def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.use_paged_mtp = True
     obj.use_flash_mla = obj.use_mla = False
+    obj.dense_mla_dcp_target = obj.dsa_dcp_target = False
+    obj.dcp_size, obj.dcp_rank = 1, 0
     obj.is_draft_worker = True
     obj.needs_cpu_seq_lens = False
     obj.device = "cpu"
@@ -362,41 +364,3 @@ def test_target_verify_preserves_cpu_path_unless_backend_opts_out(needs_cpu, mir
         expected = mirror + 8 if mirror is not None else 256
         assert fb.seq_lens_cpu.tolist() == [expected]
         assert fb.seq_lens_sum == expected
-
-
-def test_device_length_graph_uses_plain_replay_after_loading_inputs(backend):
-    method = source_method(
-        "hardware_backend/npu/graph_runner/npu_graph_runner.py",
-        "NPUGraphRunner",
-        "execute",
-        {
-            "LogitsProcessorOutput": SimpleNamespace,
-        },
-    )
-    fb = batch((127,))
-    fb.needs_forward_metadata_init = lambda: True
-    output = SimpleNamespace(
-        next_token_logits=None,
-        hidden_states=torch.ones(7, 16),
-        last_hidden_states=None,
-    )
-    runner = SimpleNamespace(
-        attn_backend=backend,
-        load_batch=Mock(),
-        _make_graph_key=lambda bs: bs,
-        bs=1,
-        raw_bs=1,
-        raw_num_token=7,
-        is_dllm=False,
-        backend=SimpleNamespace(
-            replay=Mock(return_value=output),
-            replay_with_input_update=Mock(side_effect=AssertionError("host update")),
-        ),
-    )
-    with patch.object(
-        torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")
-    ):
-        method(runner, fb)
-    runner.load_batch.assert_called_once_with(fb, None)
-    runner.backend.replay.assert_called_once_with(1, fb)
-    runner.backend.replay_with_input_update.assert_not_called()

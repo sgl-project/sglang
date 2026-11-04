@@ -22,21 +22,11 @@ logger = logging.getLogger(__name__)
 
 # Eager rounds per post-verify key before its graphs are captured.
 _NUM_WARMUP = 2
-# XORed into the server seed so these draws differ from other samplers'.
-_SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 # Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
 # past it runs SGLang's eager path.
 _MAX_POST_VERIFY_STATES = 64
-# SGLANG_Q35MF_MKH_N3C: a round's inputs and its forced length staged in one launch.
-_ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
-
-
-def simulated_acc_len_generator(seed: int) -> torch.Generator:
-    """The forced acceptance lengths' generator (SGLANG_SIMULATE_ACC_LEN), seeded
-    alike on every rank from the server seed."""
-    return torch.Generator().manual_seed(
-        (int(seed) ^ _SIM_ACC_LEN_DOMAIN) & 0x7FFFFFFFFFFFFFFF
-    )
+# SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: a round's inputs and its forced length staged in one launch.
+_ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
 
 class EaglePostVerifyGraphs:

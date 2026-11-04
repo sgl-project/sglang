@@ -15,6 +15,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Loaded before the torch_npu mock below: importing transformers runs
+# accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
+import sglang.srt.utils.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=9, suite="base-a-test-npu")

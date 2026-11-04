@@ -29,7 +29,7 @@ for name in (
 from sglang.srt.hardware_backend.npu import memory_pool_npu as pool_mod
 from sglang.srt.hardware_backend.npu.attention import ascend_backend as mod
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 @pytest.fixture
@@ -37,6 +37,9 @@ def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.use_flash_mla = obj.use_mla = True
     obj.use_paged_mtp = False
+    obj.use_dsa = False
+    obj.dense_mla_dcp_target = obj.dsa_dcp_target = False
+    obj.dcp_size, obj.dcp_rank = 1, 0
     obj.needs_cpu_seq_lens = False
     obj.device = "cpu"
     obj.tp_q_head_num = 2
@@ -243,7 +246,7 @@ def test_non_speculative_decode_keeps_default_operators(backend, graph, use_fia)
     mirror = torch.tensor([125, 0], dtype=torch.int32)
     backend.forward_metadata = mod.ForwardMetadata(
         seq_lens_cpu_int=None if graph else mirror,
-        seq_lens_cpu_list=mirror.tolist() if graph else None,
+        seq_lens_cpu_list=mirror.tolist(),
         block_tables=torch.zeros(2, 4, dtype=torch.int32),
     )
     layer = SimpleNamespace(
@@ -293,7 +296,7 @@ def test_non_speculative_decode_keeps_default_operators(backend, graph, use_fia)
         paged_mla.assert_not_called()
     elif use_fia:
         eager_fia.assert_called_once()
-        assert eager_fia.call_args.kwargs["actual_seq_lengths_kv"] is mirror
+        assert eager_fia.call_args.kwargs["actual_seq_lengths_kv"] == mirror.tolist()
         paged_mla.assert_not_called()
     else:
         paged_mla.assert_called_once()
@@ -357,6 +360,7 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         page_size=128,
         model_config=model_config,
         kv_cache_dtype=torch.bfloat16,
+        kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
         req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 512)),
         token_to_kv_pool=object(),
         use_mla_backend=not is_draft,
@@ -408,7 +412,11 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
             mod,
             "get_parallel",
             return_value=SimpleNamespace(
-                attn_cp_size=1, attn_tp_size=4, dcp_enabled=False
+                attn_cp_size=1,
+                attn_tp_size=4,
+                attn_dcp_size=1,
+                attn_dcp_rank=0,
+                dcp_enabled=False,
             ),
         ),
         patch.object(mod.logger, "warning") as warning,
@@ -588,6 +596,7 @@ def test_pool_configurator_only_merges_dspark_target_cache(
 
     config = config_mod.KVCacheConfigurator.__new__(config_mod.KVCacheConfigurator)
     config.is_draft_worker = is_draft
+    config.modelslim_cache_layout = None
     config.spec_algorithm = SimpleNamespace(is_dspark=lambda: dspark)
     config.model_config = SimpleNamespace(
         kv_lora_rank=512,

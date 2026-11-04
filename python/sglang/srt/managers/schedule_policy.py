@@ -44,7 +44,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Union
 
 import torch
 
@@ -204,11 +204,13 @@ class SchedulePolicy:
 
     def calc_priority(
         self,
-        waiting_queue: List[Req],
+        waiting: Iterable[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
-        bootstrap_queue: List[Req] = [],
-    ) -> None:
+        bootstrap_queue: Iterable[Req] = (),
+    ) -> List[Req]:
+        """The waiting requests in the order the policy admits them."""
+        waiting_queue = list(waiting)
         policy = self._determine_active_policy(waiting_queue)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
@@ -271,12 +273,13 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
         self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
+        return waiting_queue
 
     def _touch_waiting_prefixes(
         self,
         policy: Policy,
         waiting_queue: List[Req],
-        bootstrap_queue: List[Req] = [],
+        bootstrap_queue: Iterable[Req] = (),
     ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
         # already touch while matching, and other eviction strategies ignore recency.
@@ -286,7 +289,7 @@ class SchedulePolicy:
             or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
-            or get_memory().radix_eviction_policy.lower() != "lru"
+            or get_memory().radix_eviction_policy.lower() not in ("lru", "joint_lru")
             or self.tree_cache.supports_fast_match_prefix()
             or not self.tree_cache.supports_prefix_sharing()
         ):
@@ -298,7 +301,7 @@ class SchedulePolicy:
         if not refresh:
             return
         # Bootstrap-queued requests run after the waiting queue, so touch them first.
-        for r in reversed(bootstrap_queue[:bootstrap_max]):
+        for r in reversed(list(bootstrap_queue)[:bootstrap_max]):
             touch_waiting_prefix(r, self.tree_cache)
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
@@ -1382,6 +1385,19 @@ class PrefillAdder:
             return
         if self.tree_cache.buffer_pipeline is not None:
             self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
+
+    @staticmethod
+    def release_request_slot(tree_cache, waiting_queue) -> bool:
+        """reclaim a cache-owned request row when admission has no free row"""
+        return False
+
+    def should_defer(self, req: Req) -> bool:
+        """whether admission must wait before staging cache transfers for this candidate"""
+        return False
+
+    def batch_is_full_after_rejection(self, req: Req) -> bool:
+        """whether running work must finish before another admission attempt"""
+        return bool(self.can_run_list) or not self.running_batch.is_empty()
 
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
