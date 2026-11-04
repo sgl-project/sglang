@@ -65,6 +65,11 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+# A fork-started ProcessPoolExecutor forks all max_workers on the first submit, so
+# defaulting to os.cpu_count() on a many-core host (e.g. 512) makes the first
+# preprocess request blow its REQUEST_TIMEOUT budget. SGLANG_CPU_WORKERS overrides.
+_DEFAULT_MAX_CPU_WORKERS = 16
+
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
@@ -535,7 +540,12 @@ class BaseMultimodalProcessor(ABC):
         start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            max_workers=int(
+                os.environ.get(
+                    "SGLANG_CPU_WORKERS",
+                    min(os.cpu_count() or 1, _DEFAULT_MAX_CPU_WORKERS),
+                )
+            ),
             initializer=_forget_parent_executor_wakeups,
         )
 
