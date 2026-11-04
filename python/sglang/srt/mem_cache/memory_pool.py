@@ -46,6 +46,13 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_dcp_sharded_triton,
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
+    set_mla_kv_scale_buffer_triton,
+)
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -76,14 +83,7 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
-from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
-    maybe_init_custom_mem_pool,
-    set_mla_kv_buffer_dcp_sharded_triton,
-    set_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton_fp8_quant,
-    set_mla_kv_scale_buffer_triton,
-)
+from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
@@ -515,6 +515,7 @@ class ReqToTokenPool:
 
 class MambaPool:
     host_capacity_tokens: Optional[int] = None
+    host_capacity_bytes: Optional[int] = None
 
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
@@ -4127,6 +4128,7 @@ class HybridLinearKVPool(KVCache):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        kv_scale_ue8m0: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
@@ -4205,6 +4207,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                kv_scale_ue8m0=kv_scale_ue8m0,
             )
         else:
             MLAPoolClass = (
@@ -4252,6 +4255,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def kv_scale_ue8m0(self) -> bool:
+        return getattr(self.full_kv_pool, "kv_scale_ue8m0", False)
+
+    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
@@ -4290,6 +4297,10 @@ class HybridLinearKVPool(KVCache):
 
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        # Pools owned beside full_kv_pool, which describes the full KV itself.
+        return ()
 
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
@@ -4641,6 +4652,9 @@ class HybridLinearKVPool(KVCache):
 
 
 class MLATokenToKVPool(KVCache, MLAKVView):
+    # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
+    kv_scale_ue8m0 = False
+
     def __init__(
         self,
         size: int,
@@ -4877,7 +4891,12 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+        if (
+            _is_hip
+            and self.use_dsa
+            and self.dtype == fp8_dtype
+            and not self.dsa_kv_cache_store_fp8
+        ):
             # HIP TileLang FP8 consumes the model's raw MLA layout
             # (NoPE + optional RoPE) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4895,7 +4914,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
+                cache_k_nope, cache_k_rope, scale_ue8m0=self.kv_scale_ue8m0
             )
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
@@ -5221,6 +5240,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
+        kv_scale_ue8m0: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5241,6 +5261,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             override_kv_cache_dim=override_dim,
             dcp_replicated=dcp_replicated,
         )
+        self.kv_scale_ue8m0 = kv_scale_ue8m0
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
@@ -5682,6 +5703,32 @@ class MHATokenToKOnlyPool(KVCache):
     """K-only pool for MiniMax sparse layers whose index branch never reads V
     (``sparse_disable_index_value``); allocating V would waste memory."""
 
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            IndexKeyBufferInfo,
+            IndexKeyLayout,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=IndexKeyBufferInfo(
+                    page_size=self.page_size,
+                    compress_ratio=1,
+                    key_layout=IndexKeyLayout.KEY_ROWS,
+                    # NPU stores these rows with an explicit physical page axis.
+                    buffers=tuple(
+                        buffer.view(-1, self.head_num, self.head_dim)
+                        for buffer in self.k_buffer
+                    ),
+                ),
+            ),
+        )
+
     def __init__(
         self,
         size: int,
@@ -5704,6 +5751,9 @@ class MHATokenToKOnlyPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.head_num = head_num
         self.head_dim = head_dim
@@ -5963,6 +6013,7 @@ class MiniMaxSparseKVPool(KVCache):
         if self.index_kv_pool is not None:
             self.mem_usage += self.index_kv_pool.mem_usage
         if self.index_k_pool is not None:
+            self.index_k_pool.model_layer_ids = tuple(local_k_only_sparse_layer_ids)
             self.mem_usage += self.index_k_pool.mem_usage
 
         # HiCacheController reads these from the top-level KV pool wrapper.
