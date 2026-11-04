@@ -11,6 +11,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -98,6 +99,13 @@ class _Scheduler(SchedulerDllmMixin):
             free_group_end=Mock(),
         )
         self.tree_cache = object()
+        self.request_retirer = RequestRetirer(
+            tree_cache=self.tree_cache,
+            beam_coordinator=None,
+            hisparse_coordinator=None,
+            uocr_runtime=None,
+            send_abort_output=None,
+        )
         self.output_streamer = SimpleNamespace(stream_output=Mock())
         self.model_config = SimpleNamespace(context_len=context_len)
 
@@ -273,7 +281,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         state = {"step": 7}
         next_canvas = torch.tensor([9, 8, 7, 6])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             SchedulerDllmMixin.process_batch_result_dllm(
                 scheduler,
                 _Batch([req]),
@@ -315,7 +325,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req.finish_on_update = True
         canvas = torch.tensor([3, 2, 1, 0])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             SchedulerDllmMixin.process_batch_result_dllm(
                 scheduler, _Batch([req]), _result([canvas])
             )
@@ -336,7 +348,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 )
 
                 with patch(
-                    "sglang.srt.dllm.mixin.scheduler.release_kv_cache"
+                    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
                 ) as release:
                     SchedulerDllmMixin.process_batch_result_dllm(
                         scheduler, _Batch([req]), result

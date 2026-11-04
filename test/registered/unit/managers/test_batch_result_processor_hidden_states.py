@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
@@ -57,6 +58,13 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         logprob_result_processor=None,
         output_streamer=Mock(),
         beam_coordinator=Mock(),
+        request_retirer=RequestRetirer(
+            tree_cache=None,
+            beam_coordinator=None,
+            hisparse_coordinator=None,
+            uocr_runtime=None,
+            send_abort_output=None,
+        ),
         abort_request=lambda *args, **kwargs: None,
     )
 
@@ -100,8 +108,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
         processor = replace(_make_processor(self), is_generation=False)
 
         with patch(
-            "sglang.srt.managers.scheduler_components."
-            "batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_prefill(batch, result)
 
@@ -421,7 +428,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
         with (
             patch(
                 "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.release_kv_cache"
+                "request_retirer.release_kv_cache"
             ) as release,
             patch.object(
                 SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
@@ -489,7 +496,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             next_token_ids=torch.tensor([8]),
         )
         with patch(
-            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_decode(batch, result)
 

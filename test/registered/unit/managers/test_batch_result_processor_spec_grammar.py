@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
@@ -93,6 +94,13 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
+        request_retirer=RequestRetirer(
+            tree_cache=None,
+            beam_coordinator=None,
+            hisparse_coordinator=None,
+            uocr_runtime=None,
+            send_abort_output=None,
+        ),
         abort_request=lambda *a, **k: None,
     )
 

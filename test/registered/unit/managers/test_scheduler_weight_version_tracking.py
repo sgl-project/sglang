@@ -21,6 +21,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
@@ -139,6 +140,13 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             logprob_result_processor=None,
             output_streamer=MagicMock(),
             beam_coordinator=MagicMock(),
+            request_retirer=RequestRetirer(
+                tree_cache=scheduler.tree_cache,
+                beam_coordinator=None,
+                hisparse_coordinator=None,
+                uocr_runtime=None,
+                send_abort_output=None,
+            ),
             abort_request=lambda *args, **kwargs: None,
         )
         for name, value in (

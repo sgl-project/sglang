@@ -50,8 +50,14 @@ if _HAS_MLX:
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
+    from sglang.srt.managers.scheduler_components import (
+        request_retirer as request_retirer_module,
+    )
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
+    )
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
     )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
@@ -1219,6 +1225,13 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             logprob_result_processor=None,
             output_streamer=None,
             beam_coordinator=None,
+            request_retirer=RequestRetirer(
+                tree_cache=tree_cache,
+                beam_coordinator=None,
+                hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
+                uocr_runtime=None,
+                send_abort_output=None,
+            ),
             abort_request=lambda req: None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
@@ -1254,14 +1267,14 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         result = GenerationBatchResult()
         i = 0
         logits_output = SimpleNamespace(customized_info=None)
-        original_release = batch_result_processor_module.release_kv_cache
+        original_release = request_retirer_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
 
         def fake_release_kv_cache(release_req, tree_cache, checkpoint=False):
             events.append(("release", release_req.rid))
             self.assertIs(tree_cache, processor.tree_cache)
 
-        batch_result_processor_module.release_kv_cache = fake_release_kv_cache
+        request_retirer_module.release_kv_cache = fake_release_kv_cache
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
         # The lazy predicate reads the published bags; publish the non-lazy
         # strategy instead of stubbing the accessor.
@@ -1279,7 +1292,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             override.restore()
             for name, original in saved.items():
                 setattr(SchedulerBatchResultProcessor, name, original)
-            batch_result_processor_module.release_kv_cache = original_release
+            request_retirer_module.release_kv_cache = original_release
             batch_result_processor_module.get_global_indexer_capturer = (
                 original_get_indexer
             )
