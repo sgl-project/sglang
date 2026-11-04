@@ -1413,13 +1413,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if image_gen_indicators is None:
             exist_non_image_gen_tokens = True
             exist_image_gen_tokens = False
-        elif (
-            exist_image_gen_tokens is not None
-            and exist_non_image_gen_tokens is not None
-        ):
-            # Callers that know the token kinds skip the device readback below.
-            pass
-        else:
+        # Callers that pass both token kinds skip this device readback.
+        elif exist_image_gen_tokens is None or exist_non_image_gen_tokens is None:
             # Normalize once before the decoder loop. Leaving these as CUDA
             # scalar tensors makes every layer's Python branch read them back
             # to the host, serializing the compute stream and defeating weight

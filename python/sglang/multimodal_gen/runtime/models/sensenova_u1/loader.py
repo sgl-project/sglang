@@ -64,13 +64,14 @@ def load_model_and_tokenizer(
     model = AutoModel.from_pretrained(model_path, **model_kwargs).eval()
     device = get_local_torch_device()
     current_platform.set_device(device)
-    if get_tp_world_size() > 1:
+    tp_world_size = get_tp_world_size()
+    if tp_world_size > 1:
         shard_decoder_for_tensor_parallel(
-            model=model, rank=get_tp_rank(), world_size=get_tp_world_size()
+            model=model, rank=get_tp_rank(), world_size=tp_world_size
         )
-    else:
-        pass
-    model = place_model(model=model, device=device)
+    model = place_model(
+        model=model, device=device, allow_layer_split=tp_world_size == 1
+    )
     return {"model": model, "tokenizer": tokenizer}
 
 
@@ -79,7 +80,9 @@ def module_weight_bytes(module: torch.nn.Module) -> int:
     return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
 
-def place_model(model: NEOChatModel, device: torch.device) -> NEOChatModel:
+def place_model(
+    model: NEOChatModel, device: torch.device, allow_layer_split: bool
+) -> NEOChatModel:
     weight_budget_bytes = int(
         current_platform.get_device_total_memory(device.index or 0)
         * WEIGHT_MEMORY_FRACTION
@@ -92,6 +95,12 @@ def place_model(model: NEOChatModel, device: torch.device) -> NEOChatModel:
     )
     if required_device_count <= 1:
         return model.to(device)
+    elif not allow_layer_split:
+        # Every tensor-parallel rank owns one device, so a shard cannot spill onto the next.
+        raise ValueError(
+            f"SenseNova-U1 tensor-parallel shard needs {total_weight_bytes / 2**30:.1f} GiB, "
+            f"more than {WEIGHT_MEMORY_FRACTION:.0%} of {device}; raise --tp-size."
+        )
     elif required_device_count > visible_device_count:
         raise ValueError(
             f"SenseNova-U1 weights need {total_weight_bytes / 2**30:.1f} GiB across "
@@ -99,7 +108,7 @@ def place_model(model: NEOChatModel, device: torch.device) -> NEOChatModel:
             f"visible from {device}; expose more devices or use larger ones."
         )
     else:
-        # The pipeline has no tensor parallelism, so oversized weights are split by layer.
+        # Without tensor parallelism, oversized weights are split by layer.
         split_devices = [
             torch.device(device.type, first_device_index + offset)
             for offset in range(required_device_count)
@@ -152,8 +161,6 @@ def assign_layer_devices(
             and device_index < len(devices) - 1
         ):
             device_index, assigned_bytes = device_index + 1, 0
-        else:
-            pass
         layer_devices.append(devices[device_index])
         assigned_bytes += layer_bytes
     return layer_devices
@@ -190,8 +197,6 @@ def _install_device_hooks(
         layer_device = device_by_layer[layer]
         if layer in segment_start_layers:
             copied_inputs_by_device.pop(layer_device, None)
-        else:
-            pass
         copied_inputs = copied_inputs_by_device.setdefault(layer_device, {})
         moved_kwargs: dict[str, DecoderLayerInput] = {}
         for name, value in kwargs.items():
@@ -232,29 +237,34 @@ def shard_decoder_for_tensor_parallel(
             f"{config.num_key_value_heads} key/value) and intermediate size "
             f"({config.intermediate_size}) must divide by --tp-size {world_size}."
         )
-    else:
-        pass
     for layer in model.language_model.model.layers:
-        for suffix in ("", "_mot_gen"):
-            attention, mlp = layer.self_attn, getattr(layer, "mlp" + suffix)
+        attention = layer.self_attn
+        branches = [
+            (
+                attention.q_proj,
+                attention.k_proj,
+                attention.v_proj,
+                attention.o_proj,
+                layer.mlp,
+            ),
+            (
+                attention.q_proj_mot_gen,
+                attention.k_proj_mot_gen,
+                attention.v_proj_mot_gen,
+                attention.o_proj_mot_gen,
+                layer.mlp_mot_gen,
+            ),
+        ]
+        for q_proj, k_proj, v_proj, o_proj, mlp in branches:
             if not isinstance(mlp, Qwen3MLP):
                 raise ValueError("SenseNova-U1 tensor parallelism needs dense MLPs.")
-            else:
-                pass
-            column_parallel = [
-                *(
-                    getattr(attention, name + suffix)
-                    for name in ("q_proj", "k_proj", "v_proj")
-                ),
-                mlp.gate_proj,
-                mlp.up_proj,
-            ]
-            row_parallel = [getattr(attention, "o_proj" + suffix), mlp.down_proj]
-            for linear in column_parallel:
+            for linear in (q_proj, k_proj, v_proj, mlp.gate_proj, mlp.up_proj):
                 _keep_shard(linear=linear, rank=rank, world_size=world_size, dim=0)
-            for linear in row_parallel:
+            for linear in (o_proj, mlp.down_proj):
                 _keep_shard(linear=linear, rank=rank, world_size=world_size, dim=1)
                 linear.register_forward_hook(_all_reduce_output)
+            # The NPU fused MLP splits its packed gate/up weight at this width.
+            mlp.intermediate_size = mlp.gate_proj.out_features
     logger.info(
         f"SenseNova-U1 decoder sharded for tensor parallelism: rank {rank} of {world_size}"
     )
@@ -265,8 +275,6 @@ def _keep_shard(linear: torch.nn.Linear, rank: int, world_size: int, dim: int) -
         raise ValueError(
             "SenseNova-U1 tensor parallelism expects bias-free projections."
         )
-    else:
-        pass
     shard = linear.weight.data.chunk(world_size, dim=dim)[rank].clone()
     linear.weight = torch.nn.Parameter(shard, requires_grad=False)
     linear.out_features, linear.in_features = shard.shape

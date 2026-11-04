@@ -24,7 +24,7 @@ MAX_DIFF_IN_ROUNDING_STEPS = 2
 def accelerator_device() -> torch.device | None:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    elif torch.xpu.is_available():
         return torch.device("xpu")
     else:
         return None
@@ -96,9 +96,7 @@ class TestRMSNormCastBeforeMul(CustomTestCase):
             output = rmsnorm_cast_before_mul(x, weight, 1e-6)
             assert_hf_rounding(self, output, hf_rmsnorm(x, weight, 1e-6))
 
-    @unittest.skipUnless(
-        hasattr(torch, "xpu") and torch.xpu.is_available(), "needs an XPU device"
-    )
+    @unittest.skipUnless(torch.xpu.is_available(), "needs an XPU device")
     def test_xpu_forward_keeps_hf_rounding(self):
         """XPU RMSNorm with cast_x_before_out_mul once multiplied the weight before rounding (~25 % of outputs off)."""
         norm = RMSNorm(4096, eps=1e-6, cast_x_before_out_mul=True).to(
@@ -109,10 +107,47 @@ class TestRMSNormCastBeforeMul(CustomTestCase):
         assert_hf_rounding(
             self, norm.forward_xpu(x), hf_rmsnorm(x, norm.weight.data, 1e-6)
         )
+        # The residual form took sgl_kernel fused_add_rmsnorm, which also multiplies first.
+        residual = torch.randn_like(x)
+        output, new_residual = norm.forward_xpu(x.clone(), residual.clone())
+        expected, expected_residual = norm.forward_native(x, residual)
+        torch.testing.assert_close(new_residual, expected_residual, rtol=0, atol=0)
+        assert_hf_rounding(self, output, expected)
 
-    @unittest.skipUnless(
-        hasattr(torch, "xpu") and torch.xpu.is_available(), "needs an XPU device"
-    )
+    def test_residual_matches_native_and_leaves_inputs_untouched(self):
+        """With a residual the kernel must return forward_native's (output, residual) and not write its inputs."""
+        device = accelerator_device()
+        norm = RMSNorm(4096, eps=1e-6, cast_x_before_out_mul=True).to(
+            device, torch.bfloat16
+        )
+        norm.weight.data.normal_(1.0, 0.2)
+        x = torch.randn(512, 4096, device=device, dtype=torch.bfloat16) * 3
+        residual = torch.randn_like(x)
+        post = torch.randn_like(x)
+        for post_residual_addition in (None, post):
+            with self.subTest(
+                post_residual_addition=post_residual_addition is not None
+            ):
+                inputs = (x.clone(), residual.clone(), post.clone())
+                output, new_residual = rmsnorm_cast_before_mul(
+                    x,
+                    norm.weight.data,
+                    1e-6,
+                    residual=residual,
+                    post_residual_addition=post_residual_addition,
+                )
+                expected, expected_residual = norm.forward_native(
+                    x, residual, post_residual_addition
+                )
+                # The residual sum is exact fp32 in both, so only the norm's reduction differs.
+                torch.testing.assert_close(
+                    new_residual, expected_residual, rtol=0, atol=0
+                )
+                assert_hf_rounding(self, output, expected)
+                for before, after in zip(inputs, (x, residual, post)):
+                    torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.xpu.is_available(), "needs an XPU device")
     def test_xpu_default_norms_still_use_sgl_kernel(self):
         """Norms without cast_x_before_out_mul must keep the upstream sgl_kernel results on XPU."""
         norm = RMSNorm(4096, eps=1e-6).to("xpu", torch.bfloat16)

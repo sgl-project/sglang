@@ -1442,6 +1442,20 @@ def _tiny_neo_chat_model(
     return NEOChatModel(config).to(dtype).eval()
 
 
+def test_sensenova_u1_tensor_parallel_shard_does_not_layer_split(monkeypatch):
+    """Each tensor-parallel rank owns one device, so an oversized shard must fail, not spill onto a peer's device."""
+    model = _tiny_neo_chat_model(
+        intermediate_size=64, num_key_value_heads=2, dtype=torch.float32
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_total_memory",
+        lambda device_id: module_weight_bytes(model),
+    )
+    with pytest.raises(ValueError, match="raise --tp-size"):
+        place_model(model=model, device=torch.device("cpu"), allow_layer_split=False)
+
+
 @pytest.mark.skipif(
     not torch.accelerator.is_available() or torch.accelerator.device_count() < 2,
     reason="needs two accelerator devices",
@@ -1458,7 +1472,7 @@ def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
         "sglang.multimodal_gen.runtime.models.sensenova_u1.loader.WEIGHT_MEMORY_FRACTION",
         0.6 * module_weight_bytes(model) / current_platform.get_device_total_memory(0),
     )
-    split = place_model(model=model, device=device)
+    split = place_model(model=model, device=device, allow_layer_split=True)
     layer_devices = [
         next(layer.parameters()).device for layer in split.language_model.model.layers
     ]
@@ -1514,9 +1528,11 @@ def test_sensenova_u1_tensor_parallel_decoder_matches_unsharded(monkeypatch):
     )
     for rank, shard in enumerate(shards):
         shard_decoder_for_tensor_parallel(model=shard, rank=rank, world_size=world_size)
-    attention = shards[0].language_model.model.layers[0].self_attn
-    assert attention.q_proj_mot_gen.weight.shape == (16, 32)
-    assert attention.o_proj_mot_gen.weight.shape == (32, 16)
+    layer = shards[0].language_model.model.layers[0]
+    assert layer.self_attn.q_proj_mot_gen.weight.shape == (16, 32)
+    assert layer.self_attn.o_proj_mot_gen.weight.shape == (32, 16)
+    # The NPU fused MLP splits its packed gate/up weight at intermediate_size.
+    assert layer.mlp.intermediate_size == layer.mlp_mot_gen.intermediate_size == 32
 
     tokens = torch.tensor([[1, 2, 3]])
     image = torch.randn(1, 4, 32)
@@ -1582,7 +1598,7 @@ def test_sensenova_u1_rope_uses_bitexact_kernel_on_accelerators():
 
 
 @pytest.mark.skipif(
-    not (hasattr(torch, "xpu") and torch.xpu.is_available()),
+    not torch.xpu.is_available(),
     reason="needs an XPU device",
 )
 @torch.inference_mode()
