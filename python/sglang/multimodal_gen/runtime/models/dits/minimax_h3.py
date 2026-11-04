@@ -22,6 +22,10 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
+from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
+    can_use_silu_mul_mxfp8,
+    silu_mul_mxfp8,
+)
 from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     BitExactFusionGate,
@@ -29,9 +33,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
-    can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
-    can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
@@ -42,10 +44,12 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
-    silu_mul_mxfp8,
     tensors_equal,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+    can_use_mxfp8_swizzled,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
