@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.kv.advance import advance_tracking
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,6 +43,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
+    batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
     batch.tree_cache = SimpleNamespace(
         page_size=TRACK_INTERVAL, supports_mamba=lambda: False
     )
@@ -275,8 +277,10 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         batch.seq_lens = torch.tensor([2 * TRACK_INTERVAL - 1], dtype=torch.int64)
         batch.seq_lens_cpu = batch.seq_lens.clone()
         batch.req_to_token_pool = None
+        storage = SimpleNamespace(take_tracking_slot=lambda req, position: took)
+        storage.advance = lambda req, tracking: advance_tracking(storage, req, tracking)
         batch.token_to_kv_pool_allocator = SimpleNamespace(
-            storage=SimpleNamespace(take_tracking_slot=lambda req, position: took),
+            storage=storage,
             state=SimpleNamespace(
                 slots=SimpleNamespace(schedulable_available_size=lambda: int(took))
             ),

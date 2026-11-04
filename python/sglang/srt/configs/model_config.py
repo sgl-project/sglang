@@ -37,7 +37,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
@@ -212,7 +212,7 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
-    )
+    ) or is_kimi_k31(config)
 
 
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
@@ -222,6 +222,23 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     with dcp_size 1.
     """
     return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
+
+
+def mla_attention_dcp_size(config, *, dcp_size: int, is_nextn: bool) -> int:
+    """The DCP width used by MLA execution, including platform draft policies.
+
+    KV planning must use this same width before the attention module is built.
+    """
+    # Ascend draft backends use allocator-global slots and non-DCP attention.
+    if is_nextn and is_npu():
+        return 1
+    if (
+        is_nextn
+        and is_deepseek_dsa(config)
+        and not dsa_draft_shards_under_dcp(config, dcp_size)
+    ):
+        return 1
+    return dcp_size
 
 
 def is_glm_moe_dsa(config) -> bool:
@@ -235,7 +252,23 @@ def is_glm_moe_dsa(config) -> bool:
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+    )
+
+
+_KIMI_K31_ARCHS = (
+    "KimiK31ForConditionalGeneration",
+    "KimiLinearForCausalLM",
+    "KimiK3LinearForCausalLM",
+)
+
+
+def is_kimi_k31(config) -> bool:
+    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
+    return (
+        _hf_arch(config) in _KIMI_K31_ARCHS
+        and _hf_attr(config, "index_topk") is not None
     )
 
 
@@ -1551,6 +1584,7 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -1559,6 +1593,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
             # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
@@ -2617,6 +2654,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "MuseGlimmerForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
