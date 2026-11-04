@@ -4898,3 +4898,9 @@ root 独立 proof：最终 transfers 42 passed、25 subtests，16.19s；cache/se
 新增 analyze_stress.py 与验证测试。root 审阅全部实现及测试，补充“恢复完成但 cache metadata 不可验证”仍保留延迟与吞吐的回归。独立验证共 39 项通过（1.915s）；对已完成显式 L2 六组实际记录运行离线 CLI，366 条请求、12 条释放 tombstone、3 组各 4 条 active/full PIN 均通过，数值重算及 SHA-256 无错误。
 
 监控语义经源码核对：token_usage/kv_used_tokens 仅为 active，不能冒充全部缓存占用。分开记录 active/evictable/free，并用实际启动容量减 free 推导 resident/reserved；自然驱逐实验已观察到 free=2880/346944，即约 99.17% 分配占用。资源为 2s 采样、边界估计，物理 I/O 与精确峰值不推断。失败/未完成实验及负收益保持可见。
+
+### 计时复核：实验重置成本
+
+自然 L2 首轮两组 flush 分别约 11.9s/59.3s，足以改变整组吞吐。分析器增加全部初始 flush 原始时长、保留 inclusive wall，同时仅扣除实验 flush 计算 work throughput；capability refresh、真实发布/压力/恢复及控制清理仍计入。资源窗口从 raw arm_result 时间减 arm.wall_ms 推导，注明未知 logging/validation gap，防止用 earliest request 加 full wall 把 59s 重置误移到下一组。
+
+root 阅读全部差异并独立验证：40 项通过（analysis-reset-tests-root.log）。新用例两组实际工作均 150s、flush 为 10s/60s，inclusive 吞吐不同而 work 吞吐相同；原始窗口无跨组重叠。已完成显式 L2 的 work 总时长按需 421.662s、PIN 422.218s，仍为约持平，未借调整口径抹去负差异。

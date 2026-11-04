@@ -106,6 +106,9 @@ def aggregate(arms):
     pressure = [r for r in completed if r.get("phase") == "pressure"]
     wall_s = sum(a["wall_ms"] for a in arms)/1000
     foreground_s = sum(a.get("foreground_wall_ms", 0) for a in arms)/1000
+    reset_rows = [a.get("experiment_reset", {}) for a in arms]
+    known_work = [r["work_excluding_flush_wall_ms"] for r in reset_rows if r.get("work_excluding_flush_wall_ms") is not None]
+    work_s = sum(known_work)/1000 if len(known_work) == len(arms) and arms else None
     planned = sum(a["planned_requests"] for a in arms)
     count_tokens = lambda items: sum(r["generation"]["meta_info"].get("completion_tokens", 0) for r in items)
     return {"arms": len(arms), "valid_arms": sum(a["valid"] for a in arms),
@@ -114,6 +117,12 @@ def aggregate(arms):
             "unattempted_requests": planned-len(rows), "output_tokens": count_tokens(completed),
             "sum_arm_wall_s": wall_s, "completed_requests_per_s": len(completed)/wall_s if wall_s else None,
             "output_tokens_per_s": count_tokens(completed)/wall_s if wall_s else None,
+            "arms_with_flush_timing": len(known_work),
+            "flush_rpc_ms": distribution([r["flush_elapsed_ms"] for r in reset_rows if r.get("flush_elapsed_ms") is not None]),
+            "sum_work_excluding_flush_s": work_s,
+            "work_excluding_flush_completed_requests_per_s": len(completed)/work_s if work_s else None,
+            "work_excluding_flush_output_tokens_per_s": count_tokens(completed)/work_s if work_s else None,
+            "work_time_definition": "only initial laboratory cache-flush RPC excluded; all other arm costs retained; null when any reset duration is unobserved",
             "resumed_requests": len(resumed), "resume_ttft_ms": distribution([r["generation"]["ttft_ms"] for r in resumed]),
             "resume_latency_ms": distribution([r["generation"]["latency_ms"] for r in resumed]),
             "client_cycle_ms": distribution([r["client_cycle_ms"] for r in rows if "client_cycle_ms" in r]),
@@ -213,6 +222,8 @@ def verify_rows(arms, manifest):
 def raw_pin_proofs(evidence, arms, manifest):
     path = evidence.path("raw.jsonl")
     acquired, errors, generation_counts = {}, [], {"attempted": 0, "by_origin": {}}
+    timeline = {arm["id"]: {"flush_rpcs": [], "capability_refresh": None, "arm_result_monotonic": None} for arm in arms}
+    pending_refresh = None
     with open_text(path) as handle:
         for number, line in enumerate(handle, 1):
             try:
@@ -220,6 +231,18 @@ def raw_pin_proofs(evidence, arms, manifest):
             except ValueError as exc:
                 errors.append(f"raw line {number}: {exc}")
                 continue
+            trial = row.get("trial")
+            if row.get("kind") == "http" and str(row.get("path", "")).startswith("/flush_cache") and trial in timeline:
+                timeline[trial]["flush_rpcs"].append({k: row.get(k) for k in
+                    ("path", "started_monotonic", "elapsed_ms", "status_code", "monotonic")})
+                pending_refresh = trial
+            elif (row.get("kind") == "http" and row.get("path") == "/v1/kv/capabilities"
+                  and pending_refresh is not None and row.get("url", "").rstrip("/") == manifest["args"]["engine_b"].rstrip("/")):
+                timeline[pending_refresh]["capability_refresh"] = {k: row.get(k) for k in
+                    ("path", "started_monotonic", "elapsed_ms", "status_code", "monotonic")}
+                pending_refresh = None
+            if row.get("kind") == "arm_result" and row.get("id") in timeline:
+                timeline[row["id"]]["arm_result_monotonic"] = row.get("monotonic")
             if row.get("kind") == "generate":
                 generation_counts["attempted"] += 1
                 origin = row.get("origin", "unknown")
@@ -239,7 +262,7 @@ def raw_pin_proofs(evidence, arms, manifest):
     for arm in arms:
         if arm["arm"] == "pin" and arm["valid"] and len(acquired.get(arm["id"], set())) != manifest["args"]["hot_sessions"]:
             errors.append(arm["id"]+": missing full active PIN acquisition proofs")
-    return errors, {k: len(v) for k, v in acquired.items()}, generation_counts
+    return errors, {k: len(v) for k, v in acquired.items()}, generation_counts, timeline
 
 
 def analyze_cell(directory):
@@ -278,7 +301,18 @@ def analyze_cell(directory):
         recomputed = summarize(arms)
         errors = numeric_differences(recomputed, observed)
         row_errors, proofs = verify_rows(arms, manifest)
-        pin_errors, acquisitions, generation_counts = raw_pin_proofs(evidence, arms, manifest)
+        pin_errors, acquisitions, generation_counts, timeline = raw_pin_proofs(evidence, arms, manifest)
+        for arm in arms:
+            raw = timeline[arm["id"]]
+            reset = raw["flush_rpcs"][0] if raw["flush_rpcs"] else None
+            reset_ms = reset.get("elapsed_ms") if reset else None
+            work_ms = arm["wall_ms"]-reset_ms if isinstance(reset_ms, (int, float)) else None
+            if work_ms is not None and (not math.isfinite(work_ms) or work_ms < 0):
+                pin_errors.append(arm["id"]+": flush duration exceeds measured arm wall time")
+                work_ms = None
+            arm["experiment_reset"] = {**raw, "initial_flush_rpc": reset, "flush_elapsed_ms": reset_ms,
+                "inclusive_arm_wall_ms": arm["wall_ms"], "work_excluding_flush_wall_ms": work_ms,
+                "definition": "subtract ONLY initial laboratory cache-flush RPC; capability refresh, priming/publication, all workload and cleanup remain included"}
         errors += row_errors+pin_errors
         source = evidence.load("source-publication.json", False)
         source_rows = (source or {}).get("rows", [])
@@ -302,7 +336,7 @@ def analyze_cell(directory):
                                              for k in ("max_total_num_tokens", "memory_usage")},
                     verification_errors=errors, checked_files=evidence.checked,
                     groups={name: aggregate([a for a in arms if a["arm"] == name]) for name in sorted({a["arm"] for a in arms})},
-                    paired=recomputed["paired"], recomputed_summary=recomputed, proofs={**proofs, "pin_acquisitions": acquisitions},
+                    paired=work_pairs(recomputed["paired"], arms), recomputed_summary=recomputed, proofs={**proofs, "pin_acquisitions": acquisitions},
                     source_publication={"planned_requests": args.get("sessions", 0) if args["command"] == "l3" else 0,
                         "recorded_requests": len(source_rows), "completed_requests": sum(bool(r.get("generation")) for r in source_rows),
                         "invalid_requests": sum(not r["valid"] for r in source_rows),
@@ -310,6 +344,7 @@ def analyze_cell(directory):
                         "wall_ms": (source or {}).get("wall_ms", 0)},
                     raw_generation_counts=generation_counts,
                     total_generation_requests_including_source=generation_counts["attempted"],
+                    experiment_resets=[{"id": a["id"], "arm": a["arm"], "block": a["block"], **a["experiment_reset"]} for a in arms],
                     arm_windows=[arm_window(a) for a in arms],
                     total_completed_generation_requests_including_source=aggregate(arms)["completed_requests"]+sum(bool(r.get("generation")) for r in source_rows),
                     total_planned_generation_requests_including_source=sum(a["planned_requests"] for a in arms)+(args.get("sessions", 0) if args["command"] == "l3" else 0))
@@ -319,16 +354,37 @@ def analyze_cell(directory):
     return cell
 
 
+def work_pairs(pairs, arms):
+    result = []
+    for pair in pairs:
+        members = [a for a in arms if a["block"] == pair["block"]]
+        base = next(a for a in members if a["arm"] == "on_demand")
+        candidate = next(a for a in members if a["arm"] == pair["candidate"])
+        bg, cg = aggregate([base]), aggregate([candidate])
+        delta = lambda key: cg[key]-bg[key] if cg[key] is not None and bg[key] is not None else None
+        result.append({**pair,
+            "work_excluding_flush_wall_delta_ms": delta("sum_work_excluding_flush_s")*1000 if delta("sum_work_excluding_flush_s") is not None else None,
+            "work_excluding_flush_requests_per_s_delta": delta("work_excluding_flush_completed_requests_per_s"),
+            "work_excluding_flush_output_tokens_per_s_delta": delta("work_excluding_flush_output_tokens_per_s")})
+    return result
+
+
 def arm_window(arm):
     starts = [r.get("started_monotonic", r.get("client_cycle_started_monotonic", r.get("generation", {}).get("started_monotonic"))) for r in arm["rows"]]
     starts = [s for s in starts if s is not None]
     ends = [r.get("completed_monotonic", r.get("generation", {}).get("completed_monotonic")) for r in arm["rows"]]
     ends = [e for e in ends if e is not None]
-    return {"id": arm["id"], "arm": arm["arm"], "block": arm["block"],
-            "start": min(starts) if starts else None,
-            "end": min(starts)+arm["wall_ms"]/1000 if starts else None,
+    reset = arm.get("experiment_reset", {})
+    raw_end = reset.get("arm_result_monotonic")
+    start = raw_end-arm["wall_ms"]/1000 if raw_end is not None else min(starts) if starts else None
+    end = raw_end if raw_end is not None else start+arm["wall_ms"]/1000 if start is not None else None
+    flush_ms = reset.get("flush_elapsed_ms")
+    return {"id": arm["id"], "arm": arm["arm"], "block": arm["block"], "start": start, "end": end,
+            "work_start": start+flush_ms/1000 if start is not None and flush_ms is not None else None,
             "last_row_end": max(ends) if ends else None,
-            "bounds": "approximate: earliest row start plus full arm wall time; includes shifted flush/cleanup boundary; may include adjacent idle/work"}
+            "bounds": ("approximate raw arm_result logging time minus recorded arm duration; unknown output-validation/logging gap shifts both bounds"
+                       if raw_end is not None else "fallback approximate earliest row start plus full arm duration; reset boundary unavailable"),
+            "logging_validation_gap_ms": None}
 
 
 def prometheus(text):
@@ -420,14 +476,22 @@ def attach_resources(cells, path):
         if capacity is None:
             capacity = (server.get("memory_usage") or {}).get("token_capacity")
         samples = [with_capacity(s, capacity) for s in by_url[cell["args"]["engine_b"]]]
-        selected = []
-        cell["resources_by_arm"] = {}
+        selected, inclusive_selected, groups = [], [], {}
+        cell["resources_by_arm"], cell["work_resources_by_arm"] = {}, {}
         for window in cell["arm_windows"]:
             subset = [s for s in samples if window["start"] is not None and window["start"] <= s["monotonic"] <= window["end"]]
-            selected += subset
+            work_start = window["work_start"] if window["work_start"] is not None else window["start"]
+            work_subset = [s for s in subset if s["monotonic"] >= work_start]
+            selected += work_subset
+            inclusive_selected += subset
+            groups.setdefault(window["arm"], []).extend(work_subset)
             cell["resources_by_arm"][window["id"]] = resource_peaks(subset)
-        unique = {s["monotonic"]: s for s in selected}
-        cell["resources"] = resource_peaks(list(unique.values()))
+            cell["work_resources_by_arm"][window["id"]] = resource_peaks(work_subset)
+        unique = lambda selected: list({s["monotonic"]: s for s in selected}.values())
+        cell["resources"] = resource_peaks(unique(selected))
+        cell["resources_including_flush"] = resource_peaks(unique(inclusive_selected))
+        cell["resources_by_group"] = {name: resource_peaks(unique(items)) for name, items in groups.items()}
+        cell["resource_window_definition"] = "primary resources and group peaks exclude initial flush using raw arm-result bounds; missing raw timing falls back to marked inclusive approximate windows"
     return {"available": True, "path": str(path.resolve()), "sha256": sha256(path), "parse_errors": parse_errors,
             "note": "external observer data; sampled 2s nominal cadence, observed cadence recorded; no synchronization beyond local monotonic clock"}
 
@@ -443,11 +507,26 @@ def report_text(analysis):
             continue
         for name, group in cell["groups"].items():
             lines.append(f"| {cell['name']} | {cell['args'].get('retention_mode', 'demote')} | {name} | {cell['verified']} / {cell['valid']} | {group['planned_requests']} / {group['completed_requests']} / {group['invalid_requests']} | {fmt(group['resume_ttft_ms']['mean'])} / {fmt(group['resume_ttft_ms']['p95'])} | {fmt(group['sum_arm_wall_s'])} | {fmt(group['completed_requests_per_s'])} | {fmt(group['output_tokens_per_s'])} | {group['resume_tier_tokens']['cpu']} / {group['resume_tier_tokens']['storage']} |")
-    lines += ["", "| Cell / paired block | candidate | valid | mean TTFT delta ms | whole arm delta ms | requests/s delta |", "| --- | --- | --- | ---: | ---: | ---: |"]
+    lines += ["", "Only the initial laboratory cache-flush RPC is excluded from work rates below. Capability refresh, priming/publication, pressure, waits, inference, control drain and cleanup remain included. Inclusive arm rates above remain available.", "",
+              "| Cell / group | flush timing arms | flush mean seconds | work seconds | work requests/s | work output tokens/s |",
+              "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    for cell in cells:
+        for name, group in cell.get("groups", {}).items():
+            mean_flush = group["flush_rpc_ms"]["mean"]
+            lines.append(f"| {cell['name']} / {name} | {group['arms_with_flush_timing']} / {group['arms']} | {fmt(mean_flush/1000 if mean_flush is not None else None)} | {fmt(group['sum_work_excluding_flush_s'])} | {fmt(group['work_excluding_flush_completed_requests_per_s'])} | {fmt(group['work_excluding_flush_output_tokens_per_s'])} |")
+    lines += ["", "| Cell / paired block | candidate | valid | mean TTFT delta ms | inclusive arm delta ms | work delta ms | work requests/s delta |", "| --- | --- | --- | ---: | ---: | ---: | ---: |"]
     for cell in cells:
         for pair in cell.get("paired", []):
-            lines.append(f"| {cell['name']} / {pair['block']} | {pair['candidate']} | {pair['valid']} | {fmt(pair['mean_resume_ttft_delta_ms'])} | {fmt(pair['wall_delta_ms'])} | {fmt(pair['completed_requests_per_s_delta'])} |")
-    lines += ["", "GPU and host peaks in analysis.json are sampled maxima. Arm attribution uses approximate bounds inferred from row starts and arm duration. GPU allocated memory does not establish occupied KV capacity. Active token_usage/kv_used exclude evictable radix KV; resident/reserved tokens use boot capacity minus kv_available and can include allocation/transfer work. Three blocks do not establish independent request-level confidence intervals or stable p99.", "", "L2 foreground, pressure, complete arm metrics and L3 tool-wait client cycles are separate in analysis.json. The natural profile preserves native GPU residency; the demote profile deliberately removes GPU prefixes. Compare profiles separately.", ""]
+            lines.append(f"| {cell['name']} / {pair['block']} | {pair['candidate']} | {pair['valid']} | {fmt(pair['mean_resume_ttft_delta_ms'])} | {fmt(pair['wall_delta_ms'])} | {fmt(pair['work_excluding_flush_wall_delta_ms'])} | {fmt(pair['work_excluding_flush_requests_per_s_delta'])} |")
+    lines += ["", "GPU and host peaks in analysis.json are sampled maxima. Arm attribution uses raw arm-result logging time minus arm duration when available, with an unknown output-validation/logging gap; row-start bounds are a marked fallback. GPU allocated memory does not establish occupied KV capacity. Active token_usage/kv_used exclude evictable radix KV; resident/reserved tokens use boot capacity minus kv_available and can include allocation/transfer work. Three blocks do not establish independent request-level confidence intervals or stable p99.", "", "L2 foreground, pressure, complete arm metrics and L3 tool-wait client cycles are separate in analysis.json. The natural profile preserves native GPU residency; the demote profile deliberately removes GPU prefixes. Compare profiles separately.", ""]
+    lines += ["", "| Cell / arm | initial flush seconds | capability refresh seconds (included) | inclusive arm seconds | work seconds |",
+              "| --- | ---: | ---: | ---: | ---: |"]
+    for cell in cells:
+        for reset in cell.get("experiment_resets", []):
+            refresh = reset.get("capability_refresh") or {}
+            flush_ms, refresh_ms, work_ms = reset.get("flush_elapsed_ms"), refresh.get("elapsed_ms"), reset.get("work_excluding_flush_wall_ms")
+            lines.append(f"| {cell['name']} / {reset['id']} | {fmt(flush_ms/1000 if flush_ms is not None else None)} | {fmt(refresh_ms/1000 if refresh_ms is not None else None)} | {fmt(reset['inclusive_arm_wall_ms']/1000)} | {fmt(work_ms/1000 if work_ms is not None else None)} |")
+    lines.append("")
     for cell in cells:
         source = cell.get("source_publication")
         if source and source["planned_requests"]:
@@ -470,7 +549,10 @@ def export_plot_csv(output, cells):
             records.append({"cell": cell["name"], "group": name, "retention_mode": cell["args"].get("retention_mode", "demote"),
                             "verified": cell["verified"], "valid": cell["valid"], "completed": group["completed_requests"],
                             "invalid": group["invalid_requests"], "ttft_mean_ms": group["resume_ttft_ms"]["mean"],
-                            "requests_per_s": group["completed_requests_per_s"], "output_tokens_per_s": group["output_tokens_per_s"]})
+                            "requests_per_s": group["completed_requests_per_s"], "output_tokens_per_s": group["output_tokens_per_s"],
+                            "work_excluding_flush_s": group["sum_work_excluding_flush_s"],
+                            "work_requests_per_s": group["work_excluding_flush_completed_requests_per_s"],
+                            "work_output_tokens_per_s": group["work_excluding_flush_output_tokens_per_s"]})
     if not records:
         return {"generated": False, "reason": "no completed cells"}
     with (output/"groups.csv").open("w", newline="") as handle:
@@ -481,8 +563,8 @@ def export_plot_csv(output, cells):
     labels = [r["cell"]+"\n"+r["group"] for r in records]
     axes[0].bar(labels, [r["ttft_mean_ms"] if r["ttft_mean_ms"] is not None else math.nan for r in records])
     axes[0].set_ylabel("All completed resume TTFT mean (ms)")
-    axes[1].bar(labels, [r["requests_per_s"] if r["requests_per_s"] is not None else math.nan for r in records])
-    axes[1].set_ylabel("Whole arm completed requests/s")
+    axes[1].bar(labels, [r["work_requests_per_s"] if r["work_requests_per_s"] is not None else math.nan for r in records])
+    axes[1].set_ylabel("Completed requests/s excluding initial lab flush")
     for axis in axes:
         axis.tick_params(axis="x", labelrotation=60)
         axis.grid(axis="y", alpha=.2)

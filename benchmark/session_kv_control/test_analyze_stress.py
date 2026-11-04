@@ -173,6 +173,7 @@ class AnalysisChecks(unittest.TestCase):
         self.assertEqual(cell["groups"]["pin"]["resume_ttft_ms"]["n"], 3)
         self.assertTrue(any("cached_tokens_details missing" in error for error in cell["verification_errors"]))
 
+
     def test_output_text_and_ids_are_checked_independently(self):
         directory = self.root/"outputs"
         fixture(directory)
@@ -296,6 +297,50 @@ class AnalysisChecks(unittest.TestCase):
         self.assertAlmostEqual(metrics["b_gpu_resident_or_reserved_fraction"], 344064/346944)
         self.assertNotIn("b_gpu_used_tokens", metrics)
         self.assertNotIn("b_gpu_resident_or_reserved_tokens", analyze.resource_sample(row, "http://b")["metrics"])
+
+    def test_reset_cost_is_separate_and_raw_windows_do_not_overlap(self):
+        directory = self.root/"resets"
+        arms = fixture(directory)
+        previous_raw = [json.loads(line) for line in (directory/"raw.jsonl").read_text().splitlines()]
+        raw, next_start = [], 1000.
+        for arm in arms:
+            flush_s = 60. if arm["arm"] == "on_demand" else 10.
+            arm["wall_ms"] = (150.+flush_s)*1000
+            raw += [{"kind": "http", "trial": arm["id"], "path": "/flush_cache?timeout=120",
+                     "url": "http://127.0.0.1:51803", "elapsed_ms": flush_s*1000,
+                     "started_monotonic": next_start, "monotonic": next_start+flush_s, "status_code": 200},
+                    {"kind": "http", "trial": None, "path": "/v1/kv/capabilities",
+                     "url": "http://127.0.0.1:51803", "elapsed_ms": 100.,
+                     "started_monotonic": next_start+flush_s, "monotonic": next_start+flush_s+.1, "status_code": 200}]
+            for index, row in enumerate(arm["rows"]):
+                row["started_monotonic"] = next_start+flush_s+index+1
+            raw.append({"kind": "arm_result", "id": arm["id"], "monotonic": next_start+150.+flush_s})
+            write(directory/(arm["id"]+".json"), arm)
+            next_start += 150.+flush_s+.1
+        (directory/"raw.jsonl").write_text("".join(json.dumps(row)+"\n" for row in raw+previous_raw))
+        write(directory/"summary.json", summarize(arms))
+        checksums(directory)
+        cell = analyze.analyze_cell(directory)
+        self.assertTrue(cell["verified"], cell["verification_errors"])
+        base, pin = cell["groups"]["on_demand"], cell["groups"]["pin"]
+        self.assertAlmostEqual(base["sum_arm_wall_s"], 630.)
+        self.assertAlmostEqual(pin["sum_arm_wall_s"], 480.)
+        self.assertGreater(pin["completed_requests_per_s"], base["completed_requests_per_s"])
+        self.assertEqual(base["sum_work_excluding_flush_s"], 450.)
+        self.assertEqual(pin["sum_work_excluding_flush_s"], 450.)
+        self.assertEqual(base["work_excluding_flush_completed_requests_per_s"], pin["work_excluding_flush_completed_requests_per_s"])
+        self.assertEqual(base["work_excluding_flush_output_tokens_per_s"], pin["work_excluding_flush_output_tokens_per_s"])
+        self.assertTrue(all(pair["work_excluding_flush_wall_delta_ms"] == 0 for pair in cell["paired"]))
+        self.assertEqual(cell["experiment_resets"][0]["capability_refresh"]["elapsed_ms"], 100.)
+        windows = cell["arm_windows"]
+        self.assertEqual(windows[0]["start"], 1000.)
+        self.assertEqual(windows[0]["work_start"], 1060.)
+        self.assertEqual(windows[0]["end"], 1210.)
+        self.assertTrue(all(first["end"] < second["start"] for first, second in zip(windows, windows[1:])))
+        self.assertTrue(all(window["logging_validation_gap_ms"] is None for window in windows))
+        report = analyze.report_text({"cells": [cell]})
+        self.assertIn("initial flush seconds", report)
+        self.assertIn("capability refresh seconds (included)", report)
 
     def test_analysis_preserves_all_cell_states_and_negative_deltas(self):
         fixture(self.root/"good")
