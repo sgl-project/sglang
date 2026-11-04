@@ -1260,8 +1260,15 @@ def disable_batch_invariant_mode():
 
 @contextlib.contextmanager
 def set_batch_invariant_mode(enabled: bool = True):
-    global _batch_invariant_MODE, _batch_invariant_LIB
-    old_data = (_batch_invariant_MODE, _batch_invariant_LIB)
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
+    # enable_batch_invariant_mode() also replaces torch.bmm; restore it on exit,
+    # or every later torch.bmm in the process stays batch-invariant.
+    old_data = (
+        _batch_invariant_MODE,
+        _batch_invariant_LIB,
+        _original_torch_bmm,
+        torch.bmm,
+    )
     dg = globals().get("deep_gemm") if ENABLE_JIT_DEEPGEMM else None
     get_det = getattr(dg, "get_deterministic_algorithms", None)
     old_dg_det = get_det() if get_det is not None else _batch_invariant_MODE
@@ -1274,7 +1281,12 @@ def set_batch_invariant_mode(enabled: bool = True):
     finally:
         if _batch_invariant_LIB is not None:
             _batch_invariant_LIB._destroy()
-        _batch_invariant_MODE, _batch_invariant_LIB = old_data
+        (
+            _batch_invariant_MODE,
+            _batch_invariant_LIB,
+            _original_torch_bmm,
+            torch.bmm,
+        ) = old_data
         _sync_deepgemm_deterministic_mode(old_dg_det)
 
 

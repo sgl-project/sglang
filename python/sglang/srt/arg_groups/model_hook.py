@@ -8,6 +8,14 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
@@ -18,16 +26,10 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
-    attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
     validate_declarations,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
@@ -863,6 +865,20 @@ def handle_model_capability_adjustments(server_args: Any):
             "_handle_model_capability_adjustments",
             chunked_prefill_size=-1,
         )
+    # Encoder-only embedding models run one bidirectional prefill per request,
+    # so the KV pool is never read back; the FA backend then uses raw K/V.
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_kv_cache
+        and embedding_model_spec.encoder_only_attention
+        and attention_backends_of(cfg)[0] in ("fa3", "fa4")
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            prefill_only_disable_kv_cache=True,
+        )
+        run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
 
     is_embedding_gemma = (
         embedding_model_spec is not None

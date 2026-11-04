@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -49,6 +50,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_timer_ctx
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 
@@ -1019,8 +1021,7 @@ class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
-            waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
             pool_stats_observer=types.SimpleNamespace(
@@ -1044,8 +1045,6 @@ class TestIdleMetrics(CustomTestCase):
 
     def test_idle_publishes_refreshed_kv_metrics(self):
         self.reporter.current_scheduler_metrics_enabled = True
-        self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(queue=[])
-        self.scheduler.disagg_prefill_transfer_queue = []
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
             queue=[], pre_allocated_token_counts=lambda: (0, 0)
         )
@@ -1136,11 +1135,12 @@ class TestIdleMetrics(CustomTestCase):
             queue=[], pre_allocated_token_counts=lambda: (0, 0)
         )
         host_reqs = [
-            types.SimpleNamespace(host_staged=True, priority=priority)
+            types.SimpleNamespace(req=FakeReq(priority=priority), host_staged=True)
             for priority in (1, 2)
         ]
+        device_req = types.SimpleNamespace(req=FakeReq(priority=1), host_staged=False)
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
-            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)],
+            queue=decode_queue(ListKind.PD_RECEIVING, [*host_reqs, device_req]),
             num_pending_deferred_releases=lambda: 0,
         )
         for _ in host_reqs:
