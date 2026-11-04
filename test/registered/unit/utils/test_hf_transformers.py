@@ -1180,6 +1180,92 @@ class TestApplyModelOverrideArgs(CustomTestCase):
             lower_priority_text_cfg.rope_parameters["rope_type"], "default"
         )
 
+    def test_flat_rope_override_reaches_thinker_text_config(self):
+        # Omni configs keep the language model under thinker_config.text_config.
+        cfg, text_cfg = self._make_composite_config()
+        thinker = PretrainedConfig()
+        thinker.text_config = {
+            "rope_parameters": {"rope_type": "default", "rope_theta": 1e6}
+        }
+        cfg.thinker_config = thinker
+        apply_model_override_args(cfg, {"rope_parameters": dict(self.YARN)})
+        inner = cfg.thinker_config.text_config
+        self.assertIsInstance(inner, PretrainedConfig)
+        self.assertEqual(inner.rope_parameters["rope_type"], "yarn")
+        self.assertEqual(inner.rope_parameters["rope_theta"], 1e6)
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "default")
+
+    def test_nested_override_converts_dict_sub_config(self):
+        cfg = PretrainedConfig()
+        cfg.text_config = {
+            "num_attention_heads": 8,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 1e7},
+        }
+        apply_model_override_args(
+            cfg, {"text_config": {"rope_parameters": {"rope_theta": 2e7}}}
+        )
+        self.assertIsInstance(cfg.text_config, PretrainedConfig)
+        self.assertEqual(cfg.text_config.num_attention_heads, 8)
+        self.assertEqual(
+            cfg.text_config.rope_parameters,
+            {"rope_type": "default", "rope_theta": 2e7},
+        )
+
+    def test_dict_override_of_non_sub_config_key_is_flat(self):
+        # A dict-valued key that is not a sub-config (here vision_config held
+        # as a dict) is still a plain flat update.
+        cfg = PretrainedConfig()
+        cfg.vision_config = {"hidden_size": 10, "patch": 14}
+        apply_model_override_args(cfg, {"vision_config": {"hidden_size": 20}})
+        self.assertEqual(cfg.vision_config, {"hidden_size": 20})
+
+    def _qwen3_5_config_dir(self):
+        try:
+            from transformers import Qwen3_5Config
+        except ImportError:
+            self.skipTest("Qwen3_5Config requires transformers v5")
+        model = tempfile.TemporaryDirectory()
+        self.addCleanup(model.cleanup)
+        Qwen3_5Config().save_pretrained(model.name)
+        return model.name
+
+    def test_both_rope_keys_in_one_override_keep_each_other(self):
+        # Under transformers v5 rope_scaling and rope_parameters share one
+        # dict, so the second key must merge over the first, not replace it.
+        from transformers import LlamaConfig
+
+        override = {
+            "rope_scaling": dict(self.YARN),
+            "rope_parameters": {"rope_theta": 20000.0},
+        }
+        llama = LlamaConfig()
+        apply_model_override_args(llama, override)
+        model = self._qwen3_5_config_dir()
+        config = get_config(
+            model, trust_remote_code=False, model_override_args=override
+        )
+        text_config = get_hf_text_config(config)
+        for cfg in (llama, text_config):
+            theta, params = get_rope_config(cfg)
+            self.assertEqual(theta, 20000.0)
+            self.assertEqual(params["rope_type"], "yarn")
+            self.assertEqual(params["factor"], 4.0)
+        self.assertEqual(get_rope_config(text_config)[1]["partial_rotary_factor"], 0.25)
+
+    def test_null_rope_override_leaves_text_config_rope(self):
+        # Only dict overrides are merged into the language sub-config; a null
+        # must not wipe its rope_theta and partial_rotary_factor.
+        model = self._qwen3_5_config_dir()
+        expected = get_rope_config(
+            get_hf_text_config(get_config(model, trust_remote_code=False))
+        )
+        config = get_config(
+            model,
+            trust_remote_code=False,
+            model_override_args={"rope_scaling": None},
+        )
+        self.assertEqual(get_rope_config(get_hf_text_config(config)), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -97,39 +97,54 @@ def _merged_rope_override(config, key: str, value):
     return value
 
 
+def _sub_config_for_override(config, key: str, value):
+    """The sub-config a dict override updates in place, or None."""
+    existing = getattr(config, key, None)
+    if (
+        key in _TEXT_SUB_CONFIG_ATTRS
+        and isinstance(value, dict)
+        and isinstance(existing, dict)
+    ):
+        existing = PretrainedConfig(**existing)
+        setattr(config, key, existing)
+    if isinstance(value, dict) and isinstance(existing, PretrainedConfig):
+        return existing
+    return None
+
+
+def _mirror_rope_overrides(config, rope_overrides: dict) -> None:
+    """Merge flat RoPE dict overrides into the language sub-config.
+
+    Only dicts: a non-dict value (null) would replace the sub-config's whole
+    RoPE dict, rope_theta included.
+    """
+    text_config = _resolve_text_sub_config(config)
+    if text_config is None:
+        return
+    for key, value in rope_overrides.items():
+        text_config.update({key: _merged_rope_override(text_config, key, value)})
+
+
 def apply_model_override_args(config, model_override_args: dict) -> None:
     """Preserve sub-configs and checkpoint RoPE keys when applying CLI overrides."""
     flat_overrides = {}
+    rope_overrides = {}
     for key, value in model_override_args.items():
-        existing = getattr(config, key, None)
-        if (
-            key in _TEXT_SUB_CONFIG_ATTRS
-            and isinstance(value, dict)
-            and isinstance(existing, dict)
-        ):
-            existing = PretrainedConfig(**existing)
-            setattr(config, key, existing)
-        if isinstance(value, dict) and isinstance(existing, PretrainedConfig):
-            apply_model_override_args(existing, value)
+        sub_config = _sub_config_for_override(config, key, value)
+        if sub_config is not None:
+            apply_model_override_args(sub_config, value)
         elif key in _ROPE_OVERRIDE_KEYS:
-            flat_overrides[key] = _merged_rope_override(config, key, value)
+            # One key at a time: under transformers v5 both keys share one
+            # dict, so each merge has to see the previous one.
+            config.update({key: _merged_rope_override(config, key, value)})
+            if isinstance(value, dict):
+                rope_overrides[key] = value
         else:
             flat_overrides[key] = value
     if flat_overrides:
         config.update(flat_overrides)
-
-    rope_keys = [k for k in _ROPE_OVERRIDE_KEYS if k in flat_overrides]
-    if rope_keys:
-        text_config = _resolve_text_sub_config(config)
-        if text_config is not None:
-            text_config.update(
-                {
-                    key: _merged_rope_override(
-                        text_config, key, model_override_args[key]
-                    )
-                    for key in rope_keys
-                }
-            )
+    if rope_overrides:
+        _mirror_rope_overrides(config, rope_overrides)
 
 
 def _apply_deepseek_ocr_overrides(config, model):
