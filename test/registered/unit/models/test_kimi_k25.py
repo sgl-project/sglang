@@ -538,9 +538,12 @@ def test_kimi_lazy_ipc_feature_skips_scheduler_reconstruction():
         hash=123,
         pad_value=456,
         offsets=[(0, 1)],
-        feature=proxy,
+        feature=torch.zeros(1, 2),
         model_specific_data={DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY: True},
     )
+
+    item.set_pad_value()
+    item.feature = proxy
 
     with patch(
         "sglang.srt.managers.schedule_batch.torch.cuda.current_device", return_value=0
@@ -1136,7 +1139,7 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     composed_item = processor.compose_request([1, 99, 2], [artifact]).mm_items[0]
 
     expected_hash = resolve_multimodal_item_hash(
-        existing_hash=direct_item.hash,
+        feature=direct_item.feature,
         namespace=artifact.artifact_key,
     )
     assert artifact.feature_hash == expected_hash
