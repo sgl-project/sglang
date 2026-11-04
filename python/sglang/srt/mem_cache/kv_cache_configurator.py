@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
 from sglang.srt.arg_groups.kv_cache_hook import draft_rows_refusal
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
@@ -32,6 +33,7 @@ from sglang.srt.configs.model_config import (
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_kimi_k31,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
 )
@@ -2279,6 +2281,7 @@ class KVCacheConfigurator:
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
+            kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -2549,6 +2552,7 @@ class KVCacheConfigurator:
                     index_kpool_compress=get_dsa_index_kpool_compress(
                         self.model_config.hf_config
                     ),
+                    kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
                     skip_topk_layers=(
                         None
                         if self.is_draft_worker
@@ -3366,9 +3370,14 @@ def calculate_mla_kv_cache_dim(
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
-    if _is_hip and (
-        get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
-        or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+    # Kimi-K3.1 keeps the reference scaled layout; its Triton kernels dequantize it.
+    if (
+        _is_hip
+        and not is_kimi_k31(model_config.hf_config)
+        and (
+            get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
+            or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+        )
     ):
         return kv_cache_dim
 
@@ -3381,20 +3390,13 @@ def calculate_mla_kv_cache_dim(
         return kv_cache_dim
 
     quant_block_size = DSATokenToKVPool.quant_block_size
-    rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
-    # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
-    # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:
         assert kv_lora_rank % quant_block_size == 0, (
             f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
         )
 
-        return (
-            kv_lora_rank
-            + kv_lora_rank // quant_block_size * 4
-            + qk_rope_head_dim * rope_storage_dtype.itemsize
-        )
+        return fp8_ds_mla_row_width(kv_lora_rank, qk_rope_head_dim)
 
     return kv_cache_dim
