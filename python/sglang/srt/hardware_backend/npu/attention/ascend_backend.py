@@ -994,27 +994,15 @@ class AscendAttnBackend(AttentionBackend):
         if self.graph_mode and offset:
             # Zero is the existing graph-padding sentinel, not a real KV prefix.
             metadata.actual_seq_lengths_kv.masked_fill_(seq_lens == 0, 0)
-        # Build the page table on device; the static width avoids host max()
-        # and keeps graph addresses fixed.
-        token_positions = (
-            torch.arange(
-                metadata.block_tables.shape[1],
-                dtype=torch.int64,
-                device=metadata.block_tables.device,
-            )
-            * self.page_size
+        # Use a fixed page-table width; QFA bounds KV reads with seqused_kv.
+        num_pages = metadata.block_tables.shape[1]
+        metadata.block_tables.copy_(
+            self.req_to_token[
+                forward_batch.req_pool_indices[:bs],
+                0 : num_pages * self.page_size : self.page_size,
+            ]
+            // self.page_size
         )
-        valid_pages = token_positions[None, :] < metadata.actual_seq_lengths_kv[:, None]
-        # Use in-bounds indices for padding without data-dependent tensor shapes.
-        request_indices = torch.where(
-            metadata.actual_seq_lengths_kv > 0,
-            forward_batch.req_pool_indices[:bs],
-            0,
-        )
-        token_positions = torch.where(valid_pages, token_positions, 0)
-        page_ids = self.req_to_token[request_indices[:, None], token_positions]
-        page_ids = page_ids // self.page_size
-        metadata.block_tables.copy_(page_ids.masked_fill_(~valid_pages, 0))
         if metadata.uniform_query_len is None:
             torch.cumsum(
                 forward_batch.extend_seq_lens[:bs],
