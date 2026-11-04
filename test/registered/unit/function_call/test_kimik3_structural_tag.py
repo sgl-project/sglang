@@ -25,7 +25,6 @@ from sglang.srt.function_call.kimik3_format import (
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
-    get_kimik3_no_tool_call_structural_tag,
     get_kimik3_structural_tag,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -227,7 +226,7 @@ def test_required_rejects_message_close_before_tools():
 
 
 def test_tool_choice_none_rejects_tools_section():
-    grammar = xgr.Grammar.from_structural_tag(get_kimik3_no_tool_call_structural_tag())
+    grammar = _grammar([_tool()], tool_choice="none")
     plain = "<|open|>response<|sep|>Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE
 
     assert _accepts(grammar, plain)
@@ -976,6 +975,24 @@ def test_reasoning_prefix_is_owned_by_exactly_one_layer():
     assert _accepts(wrapped_by_xgrammar, output)
     assert not _accepts(post_reasoning_only, output)
     assert _accepts(post_reasoning_only, _tools_section(_valid_weather_call()))
+
+
+def test_output_may_start_inside_the_prefilled_response():
+    # Without thinking the prompt ends with the response open marker.
+    call = _tools_section(_valid_weather_call())
+    required = _grammar([_tool()], tool_choice="required")
+    assert _accepts(
+        required, "Hi there!<|close|>response<|sep|>" + call + MESSAGE_CLOSE
+    )
+    assert not _accepts(required, "Hi there!<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(
+        required, "Hi<|close|>response<|sep|>" + MESSAGE_CLOSE + call + MESSAGE_CLOSE
+    )
+
+    none = _grammar([_tool()], tool_choice="none")
+    assert _accepts(none, "Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "Sunny.<|close|>response<|sep|>" + call)
 
 
 def test_single_call_auto_admits_the_turn_close():

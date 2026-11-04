@@ -104,9 +104,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.kimik3_structural_tag import (
-    get_kimik3_no_tool_call_structural_tag,
-)
+from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1962,8 +1960,10 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             tool_call_constraint = (
                 "structural_tag",
-                get_kimik3_no_tool_call_structural_tag(
-                    thinking_mode=xgrammar_reasoning
+                get_kimik3_structural_tag(
+                    effective_tools,
+                    tool_choice="none",
+                    thinking_mode=xgrammar_reasoning,
                 ),
             )
 

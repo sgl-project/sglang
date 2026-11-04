@@ -47,9 +47,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
-from sglang.srt.function_call.kimik3_structural_tag import (
-    get_kimik3_no_tool_call_structural_tag,
-)
+from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
@@ -2805,8 +2803,8 @@ class ServingChatTestCase(CustomTestCase):
         self.assertIn(
             tag.model_dump_json(),
             {
-                get_kimik3_no_tool_call_structural_tag(
-                    thinking_mode=m
+                get_kimik3_structural_tag(
+                    [], tool_choice="none", thinking_mode=m
                 ).model_dump_json()
                 for m in (False, True)
             },
