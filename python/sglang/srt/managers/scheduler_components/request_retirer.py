@@ -37,7 +37,7 @@ class RequestRetirer:
         self.uocr_runtime = uocr_runtime
         self.send_abort_output = send_abort_output
 
-    def retire_queued_abort(
+    def abort_queued(
         self,
         req: Req,
         *,

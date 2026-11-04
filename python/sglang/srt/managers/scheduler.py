@@ -3738,7 +3738,7 @@ class Scheduler(
         self.request_retirer.release_aborted_request(req)
 
     def _retire_unavailable(self, req: Req, *, message: str) -> None:
-        self.request_retirer.retire_queued_abort(
+        self.request_retirer.abort_queued(
             req,
             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
             finished_reason={
@@ -3757,9 +3757,7 @@ class Scheduler(
     ) -> None:
         """Abort document windows held off the waiting queue."""
         for req in reqs:
-            self.request_retirer.retire_queued_abort(
-                req, finished_reason=finished_reason
-            )
+            self.request_retirer.abort_queued(req, finished_reason=finished_reason)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -6037,7 +6035,7 @@ class Scheduler(
         for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
-            self.request_retirer.retire_queued_abort(
+            self.request_retirer.abort_queued(
                 req,
                 finished_reason=recv_req.finished_reason,
                 backup_backend="host_pool" if host_backup else None,
