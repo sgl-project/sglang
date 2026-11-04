@@ -139,7 +139,7 @@ torch_release = pkg_version.parse(torch.__version__).release
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
 def is_hip() -> bool:
-    return torch.version.hip is not None
+    return torch.version.hip is not None and torch.cuda.is_available()
 
 
 if is_hip():
@@ -1241,7 +1241,7 @@ def is_gfx95_supported():
 
     False on every non-HIP build, so callers do not need their own is_hip().
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
@@ -1253,9 +1253,21 @@ def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx115_supported():
+    """
+    Returns whether the current platform is AMD RDNA3.5 (gfx115x, e.g. gfx1150, gfx1151).
+    """
+    if torch.version.hip and torch.cuda.is_available():
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return gcn_arch.startswith("gfx115")
     else:
         return False
 
@@ -1265,7 +1277,7 @@ def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx1250"])
     else:
@@ -1897,9 +1909,12 @@ def get_mm_http_session() -> requests.Session:
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+# Pillow raises DecompressionBombError from Image.open, before any decode, for an
+# image above twice Image.MAX_IMAGE_PIXELS; it subclasses Exception, not OSError.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
     UnidentifiedImageError,
+    Image.DecompressionBombError,
     requests.exceptions.RequestException,
 )
 
@@ -3600,7 +3615,7 @@ def build_model_info_fields(model_config, server_args) -> Dict[str, Any]:
 
     Shared by the HTTP server and the Rust frontend's launch configuration.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.model_override_base import resolving_view
     from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 
     result = {
@@ -4193,8 +4208,11 @@ def require_mlp_sync():
 
 
 def get_cuda_graph_batch_size_alignment(
-    *, gathered_buffer_required: Optional[bool] = None
+    *,
+    gathered_buffer_required: Optional[bool] = None,
+    include_cp_alignment: bool = True,
 ) -> int:
+    """Decode may waive CP alignment only when no gathered buffer needs it."""
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
     alignment = 1
@@ -4203,7 +4221,11 @@ def get_cuda_graph_batch_size_alignment(
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
-    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
+    if (
+        (include_cp_alignment or gathered_buffer_required)
+        and not is_hip()
+        and alignment % get_parallel().attn_cp_size != 0
+    ):
         alignment *= get_parallel().attn_cp_size
     return alignment
 

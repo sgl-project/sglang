@@ -9,13 +9,13 @@ import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     declare_resolution,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -25,7 +25,6 @@ from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
 )
-from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -114,6 +113,10 @@ def validate_response_store(server_args: Any) -> None:
             "--disaggregation-mode=prefill or decode; response storage must "
             "remain disabled in PD mode."
         )
+
+
+def validate_uocr_document_config(server_args: Any) -> None:
+    UocrDocumentConfig.from_args(resolving_view(server_args))
 
 
 def check_pipeline_parallel_compat(cfg: Any) -> None:
@@ -261,31 +264,6 @@ def check_server_args(server_args: Any):
             "chunked_prefill_size must be divisible by page_size"
         )
 
-    # Check pdmux
-    if cfg.enable_pdmux:
-        assert cfg.pp_size == 1, (
-            "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-        )
-        assert cfg.chunked_prefill_size == -1, (
-            "PD-Multiplexing is not compatible with chunked prefill."
-        )
-        assert cfg.disaggregation_mode == "null", (
-            "PD-Multiplexing is not compatible with disaggregation mode."
-        )
-        assert cfg.disable_overlap_schedule, (
-            "PD-Multiplexing is not compatible with overlap schedule."
-        )
-
-        # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
-        import torch
-
-        if torch_release >= (2, 7):
-            logger.warning(
-                "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
-                f"  Current torch version is {torch.__version__}.\n"
-                "  Please manually install torch 2.6.x."
-            )
-
     assert cfg.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
     assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
     assert cfg.mm_processor_worker_num >= 0, "Multimodal processor worker num must >= 0"
@@ -342,6 +320,19 @@ def check_server_args(server_args: Any):
             "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
             f"got {cfg.device!r}."
         )
+
+    # Mooncake's custom memory pools (NVLINK, BAREX, INTRA_NODE_NVLINK) use CUDA
+    # allocators, which XPU lacks; MUSA and Ascend NPU have their own paths.
+    if cfg.device == "xpu":
+        from sglang.srt.disaggregation.mooncake.utils import (
+            check_mooncake_custom_mem_pool_enabled,
+        )
+
+        if check_mooncake_custom_mem_pool_enabled()[0]:
+            raise ValueError(
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported on --device xpu; "
+                "unset it."
+            )
 
     # Check metrics labels
     if (

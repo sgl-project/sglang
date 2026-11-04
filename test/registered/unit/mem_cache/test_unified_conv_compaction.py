@@ -6,9 +6,13 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv.layout.state import StateView
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
@@ -57,6 +61,11 @@ def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
 
 
 class TestConvCompaction(CustomTestCase):
+    def setUp(self):
+        # The pool fixtures read the published server args and parallel config.
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def _exercise(self, device, page_size, mode):
         bundle = make_conv_bundle(device, page_size, lazy=mode != "eager")
         pool = bundle.arena

@@ -12,11 +12,10 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     prefill_graph_tolerates_sum_len,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
