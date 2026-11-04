@@ -29,11 +29,12 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import is_unadmitted_reject
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -82,7 +83,7 @@ def _make_scheduler():
 def _prefill_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
-        queue=_RequestList(ListKind.PD_BOOTSTRAP),
+        queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(return_value=True),
     )
     return q
@@ -92,7 +93,7 @@ def _decode_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
         token_to_kv_pool_allocator=MagicMock(),
-        retracted_queue=_RequestList(ListKind.PD_RETRACTED),
+        retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
         pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
         _create_receiver_and_enqueue=MagicMock(
@@ -288,14 +289,14 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         sched = SimpleNamespace(
             uocr_runtime=None,
             disaggregation_mode=DisaggregationMode.NULL,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),
         )
         Scheduler._add_request_to_queue(sched, req)
-        self.assertEqual(sched.waiting_queue, [req])
+        self.assertEqual(list(sched.waiting_queue), [req])
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
     def test_retire_detaches_a_streaming_session(self):
