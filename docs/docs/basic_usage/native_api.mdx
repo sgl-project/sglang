@@ -6,6 +6,7 @@ metatags:
 Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its native server APIs. We introduce the following APIs:
 
 - `/generate` (text generation model)
+- `/abort_request`
 - `/get_model_info`
 - `/server_info`
 - `/health`
@@ -51,6 +52,35 @@ data = {"text": "What is the capital of France?"}
 response = requests.post(url, json=data)
 print_highlight(response.json())
 ```
+
+## Cancel a request and wait for retirement
+
+By default, `/abort_request` sends a cancellation and returns an empty HTTP 200 response. It does not confirm that the scheduler has released the request's resources.
+
+Experimental retirement receipts require `SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS=1` before server startup. The initial scope is one Python tokenizer, unified serving, one scheduler rank, and single text generation with built-in full-attention caches and static pools. This includes the default `UnifiedRadixCache` and the legacy `RadixCache`. Distributed serving, multimodal requests, parallel sampling, beam search, sessions, LoRA, speculative decoding, hybrid caches, HiCache, external storage and offload are unsupported.
+
+While a `/generate` request with a caller-supplied `rid` is active, send:
+
+```bash
+curl -sS http://localhost:30000/abort_request \
+  -H 'Content-Type: application/json' \
+  -d '{"rid":"example-request","wait_for_retirement":true,"cancellation_id":"example-cancel-1","timeout_seconds":1.0}'
+```
+
+Replace `30000` and `example-request` with your server port and active request ID. `timeout_seconds` must be finite and between 0 and 30. `cancellation_id` must contain 1 to 128 characters. Waiting does not support `abort_all` or prefix matching.
+
+The response includes `rid`, `cancellation_id`, `status`, `reason`, and `completion_scope: "scheduler_owned_request"`:
+
+| HTTP status | `status` | Meaning |
+| --- | --- | --- |
+| 200 | `retired` | The captured request instance has finished, has no in-flight scheduler steps or request-owned pool rows/state, and is absent from live scheduler holders. |
+| 202 | `pending` | The wait expired before retirement was confirmed. Retry using the same cancellation ID. |
+| 409 | `unknown` | There is no confirmed result for the request instance, for example because it left the scheduler before the cancellation arrived. |
+| 422 | `unsupported` | Receipts are disabled or the request/configuration is outside the supported scope. This operation does not cancel the request. |
+
+`retired` does not attest device-wide CUDA idleness, native preprocessing completion, or eviction of prefix-cache-owned KV pages. An ordinary generation terminal message or a disconnected HTTP waiter cannot establish retirement.
+
+Retries share the original captured request instance, even after generation output cleanup or reuse of the same `rid`. This also applies to `unknown` and `unsupported` results. Reusing a cancellation ID with a different `rid` returns HTTP 400. The process-local retry window is five minutes from the first operation; use a new cancellation ID for each new operation. Do not retry an old cancellation ID after that window or across a server restart. Receipt storage is bounded to 256 operations per tokenizer process; a full registry rejects new operations with HTTP 400 without canceling them. A wait timeout or client disconnect leaves the shared receipt intact.
 
 ## Get Model Info
 

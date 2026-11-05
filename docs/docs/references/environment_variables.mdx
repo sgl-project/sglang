@@ -121,6 +121,10 @@ SGLang supports various environment variables that can be used to configure its 
 </tbody>
 </table>
 
+### Cancellation retirement receipts
+
+`SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS` defaults to `false`. Set it to `true` before server startup to enable the experimental, bounded per-request retirement receipt path on a single scheduler rank. See [Cancel a request and wait for retirement](/docs/basic_usage/native_api#cancel-a-request-and-wait-for-retirement) for the API, supported configurations and completion boundary.
+
 ## Performance Tuning
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

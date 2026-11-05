@@ -1719,6 +1719,25 @@ async def configure_logging(
 async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
+        if obj.wait_for_retirement:
+            if obj.abort_all:
+                raise ValueError(
+                    "Retirement receipts require one exact rid, not abort_all"
+                )
+            result = await _global_state.tokenizer_manager.abort_request_and_wait(
+                rid=obj.rid,
+                cancellation_id=obj.cancellation_id,
+                timeout_seconds=obj.timeout_seconds,
+            )
+            return ORJSONResponse(
+                result,
+                status_code={
+                    "retired": 200,
+                    "pending": 202,
+                    "unknown": 409,
+                    "unsupported": 422,
+                }[result["status"]],
+            )
         _global_state.tokenizer_manager.abort_request(
             rid=obj.rid, abort_all=obj.abort_all
         )

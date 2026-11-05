@@ -145,6 +145,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BeginWeightUpdateReqInput,
+    CancellationRetirementOutput,
+    CancellationRetirementReq,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -333,6 +335,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -448,6 +451,24 @@ PAUSE_WINDOWS_MAX = 1024
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
 LOAD_STALL_REFRESH_S = 0.05
+
+# Retain operation identities, including completed results, for bounded retries.
+CANCELLATION_RETIREMENT_MAX_ENTRIES = 256
+CANCELLATION_RETIREMENT_TTL_S = 300.0
+CANCELLATION_RETIREMENT_MAX_ROUTES = 8
+
+
+@dataclasses.dataclass
+class _CancellationRetirement:
+    rid: str
+    request_instance_id: str
+    expires_at: float
+    req: Optional[Req] = None
+    replies: Dict[Optional[str], CancellationRetirementReq] = dataclasses.field(
+        default_factory=dict
+    )
+    status: Optional[str] = None
+    reason: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1438,6 +1459,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=self._abort_chunked)
         self._pending_chunked_abort_req = None
+        self._pending_chunked_abort_target: Optional[Req] = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1909,6 +1931,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (CancellationRetirementReq, self.handle_cancellation_retirement),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (ReleaseUocrDocReqInput, self.release_uocr_doc),
@@ -2255,6 +2278,7 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        self._check_cancellation_retirements()
         if self.uocr_runtime is not None:
             # Document windows released while their predecessor's KV was freed.
             for req in self.uocr_runtime.take_released():
@@ -3202,6 +3226,7 @@ class Scheduler(
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
                 cache_salt=recv_req.cache_salt,
+                request_instance_id=recv_req.request_instance_id,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -4008,11 +4033,21 @@ class Scheduler(
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
                 self._pending_chunked_abort_req = None
+                self._pending_chunked_abort_target = None
+                self._check_cancellation_retirements()
                 return
             # The request moved to another scheduler queue after abort_request
             # deferred it, so retry against its current location.
+            target = (
+                req
+                if getattr(self, "_pending_chunked_abort_target", None) is req
+                else None
+            )
             self._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
+            self._pending_chunked_abort_target = None
+            # Only receipt cancellation captures an object. Legacy prefix and
+            # PD transport dispatch retain their existing retry semantics.
+            self.abort_request(AbortReq(rid=req.rid), target=target)
             return
 
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
@@ -4035,12 +4070,14 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._pending_chunked_abort_target = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         self.send_abort_output(
             make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        self._check_cancellation_retirements()
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -4772,6 +4809,7 @@ class Scheduler(
         # Requests finish only in a step's processing.
         self.running_reqs.leave_finished()
         self.prefill_launched_reqs.leave_finished()
+        self._check_cancellation_retirements()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose step in flight commits their last output by length."""
@@ -6026,10 +6064,297 @@ class Scheduler(
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
-    def _abort_waiting(self, recv_req: AbortReq) -> None:
+    def _cancellation_retirement_cache_supported(self) -> bool:
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = self.tree_cache
+        if type(cache) not in (RadixCache, UnifiedRadixCache):
+            return False
+        allocator = cache.token_to_kv_pool_allocator
+        # UnifiedRadixCache is also the default tree over ordinary static pools.
+        # Limit receipts to the same request-row/token owners as the old tree;
+        # unified arenas, recurrent state and custom allocators need other fences.
+        if (
+            type(cache.req_to_token_pool) is not ReqToTokenPool
+            or type(allocator)
+            not in (TokenToKVPoolAllocator, PagedTokenToKVPoolAllocator)
+            or allocator.storage is not None
+            or allocator.state is not None
+        ):
+            return False
+        if type(cache) is RadixCache:
+            return True
+        if (
+            type(cache) is not UnifiedRadixCache
+            or set(cache.components) != {ComponentType.FULL}
+            or type(cache.components[ComponentType.FULL]) is not FullComponent
+            or cache.components[ComponentType.FULL].slot.family != TREE_TOKEN
+            or cache.enable_session_radix_cache
+            or cache.cache_controller is not None
+            or cache.linker is not None
+        ):
+            return False
+        # Custom cores may introduce owners beyond the built-in release path.
+        if cache._tree_core_backend == "python":
+            from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+                UnifiedTreeCore,
+            )
+
+            return type(cache.tree_core) is UnifiedTreeCore
+        if cache._tree_core_backend == "rust":
+            # A live Rust core has already loaded its extension at construction.
+            from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
+
+            return type(cache.tree_core) is RustUnifiedTreeCore
+        return False
+
+    def _cancellation_retirement_scope_error(self, req: Optional[Req] = None) -> str:
+        if not envs.SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS.get():
+            return "feature_disabled"
+        parallel = get_parallel()
+        if any(
+            getattr(parallel, name) != 1
+            for name in (
+                "nnodes",
+                "tp_size",
+                "dp_size",
+                "pp_size",
+                "attn_cp_size",
+                "dcp_size",
+                "attn_dp_size",
+            )
+        ):
+            return "distributed_scheduler"
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return "disaggregated_scheduler"
+        if (
+            not self._cancellation_retirement_cache_supported()
+            or self.enable_hierarchical_cache
+            or self.enable_hicache_storage
+            or self.enable_lmcache
+            or self.enable_session_radix_cache
+            or self.is_hybrid_swa
+            or self.is_hybrid_ssm
+            or self.enable_hisparse
+            or get_memory().enable_unified_cache_external_linker
+            or get_memory().radix_cache_backend is not None
+            or self.tree_cache.req_to_token_pool.holds_state_slots
+            or self.decode_offload_manager is not None
+        ):
+            return "unsupported_cache_ownership"
+        if (
+            self.rust_server is not None
+            or not self.spec_algorithm.is_none()
+            or self.dllm_config is not None
+            or self.uocr_runtime is not None
+            or self.model_config.is_multimodal
+            or self.mm_receiver is not None
+        ):
+            return "unsupported_execution_mode"
+        if req is not None and (
+            req.session is not None
+            or req.session_id is not None
+            or req.beam_group is not None
+            or req.sampling_params.n != 1
+            or req.multimodal_inputs is not None
+            or req.input_embeds is not None
+            or req.lora_id is not None
+            or req.kv.holds_mamba
+            or req.kv.retraction_backup is not None
+            or req.kv.restore_done_event is not None
+        ):
+            return "unsupported_request_ownership"
+        return ""
+
+    def _reply_cancellation_retirement(
+        self, recv_req: CancellationRetirementReq, status: str, reason: str = ""
+    ) -> None:
+        try:
+            self.send_control_output(
+                CancellationRetirementOutput(
+                    rid=recv_req.rid,
+                    cancellation_id=recv_req.cancellation_id,
+                    request_instance_id=recv_req.request_instance_id,
+                    status=status,
+                    reason=reason,
+                ),
+                recv_req,
+            )
+        except Exception:
+            # A lost optional receipt must not interrupt inference. The bounded
+            # result cache lets the caller retry its operation identity.
+            logger.warning(
+                "Failed to send cancellation retirement receipt", exc_info=True
+            )
+
+    def _complete_cancellation_retirement(
+        self, entry: _CancellationRetirement, status: str, reason: str = ""
+    ) -> None:
+        entry.status, entry.reason = status, reason
+        entry.req = None
+        entry.expires_at = time.monotonic() + CANCELLATION_RETIREMENT_TTL_S
+        replies, entry.replies = entry.replies, {}
+        for recv_req in replies.values():
+            self._reply_cancellation_retirement(recv_req, status, reason)
+
+    def _check_cancellation_retirements(self) -> None:
+        """Observe scheduler-owned row/state and host-step retirement only.
+
+        Processed batches may still reference a finished request. Its explicit
+        inflight counter, rather than those historical references, fences host
+        result processing. This does not guarantee device-wide CUDA quiescence
+        or evict shared prefix-cache entries.
+        """
+        entries = getattr(self, "_cancellation_retirements", None)
+        if not entries:
+            return
+        now = time.monotonic()
+        pending = []
+        for operation, entry in list(entries.items()):
+            if entry.status is not None:
+                if now >= entry.expires_at:
+                    del entries[operation]
+            elif now >= entry.expires_at:
+                self._complete_cancellation_retirement(
+                    entry, "unknown", "receipt_expired"
+                )
+            else:
+                pending.append(entry)
+        if not pending:
+            return
+        scope_error = self._cancellation_retirement_scope_error()
+        live_reqs = {
+            req for requests in self.request_lists().values() for req in requests
+        }
+        for entry in pending:
+            req = entry.req
+            if scope_error:
+                self._complete_cancellation_retirement(
+                    entry, "unsupported", scope_error
+                )
+            elif (
+                req.finished()
+                and req.inflight_steps == 0
+                and not req.kv.holds_kv
+                and not req.kv.holds_mamba
+                and req.kv.is_kv_released
+                and req.lock is None
+                and req not in live_reqs
+                and self._pending_chunked_abort_req is not req
+            ):
+                self._complete_cancellation_retirement(entry, "retired")
+
+    def handle_cancellation_retirement(
+        self, recv_req: CancellationRetirementReq
+    ) -> None:
+        """Cancel one captured request instance, then observe its retirement."""
+        self._check_cancellation_retirements()
+        entries = getattr(self, "_cancellation_retirements", None)
+        if entries is None:
+            entries = self._cancellation_retirements = {}
+        if (entry := entries.get(recv_req.cancellation_id)) is not None:
+            if (entry.rid, entry.request_instance_id) != (
+                recv_req.rid,
+                recv_req.request_instance_id,
+            ):
+                self._reply_cancellation_retirement(
+                    recv_req, "unknown", "operation_conflict"
+                )
+            elif entry.status is not None:
+                self._reply_cancellation_retirement(
+                    recv_req, entry.status, entry.reason
+                )
+            elif (
+                recv_req.http_worker_ipc in entry.replies
+                or len(entry.replies) < CANCELLATION_RETIREMENT_MAX_ROUTES
+            ):
+                entry.replies[recv_req.http_worker_ipc] = recv_req
+            else:
+                self._reply_cancellation_retirement(
+                    recv_req, "unknown", "too_many_waiters"
+                )
+            return
+        if len(entries) >= CANCELLATION_RETIREMENT_MAX_ENTRIES:
+            # Completed entries own no resources and can yield room for a new
+            # operation. Never evict an outstanding request's observation.
+            completed = next(
+                (key for key, value in entries.items() if value.status), None
+            )
+            if completed is None:
+                self._reply_cancellation_retirement(
+                    recv_req, "unknown", "receipt_capacity"
+                )
+                return
+            del entries[completed]
+        entry = _CancellationRetirement(
+            rid=recv_req.rid,
+            request_instance_id=recv_req.request_instance_id,
+            expires_at=time.monotonic() + CANCELLATION_RETIREMENT_TTL_S,
+            replies={recv_req.http_worker_ipc: recv_req},
+        )
+        entries[recv_req.cancellation_id] = entry
+        if scope_error := self._cancellation_retirement_scope_error():
+            self._complete_cancellation_retirement(entry, "unsupported", scope_error)
+            return
+
+        lists = self.request_lists()
+        candidates = {req for requests in lists.values() for req in requests}
+        batches = self._collect_inflight_batches()
+        # Result intake may run between launches even without continuous input
+        # polling. Include each launch's immutable snapshot in identity lookup.
+        batches.extend(batch for batch, _ in self.result_queue)
+        for batch in batches:
+            if batch is not None:
+                candidates.update(batch.reqs)
+                candidates.update(getattr(batch, "launched_reqs", None) or ())
+        if self._pending_chunked_abort_req is not None:
+            candidates.add(self._pending_chunked_abort_req)
+        matches = [
+            req
+            for req in candidates
+            if req.rid == recv_req.rid
+            and req.request_instance_id == recv_req.request_instance_id
+            and recv_req.request_instance_id
+        ]
+        if len(matches) != 1:
+            self._complete_cancellation_retirement(
+                entry, "unknown", "request_instance_not_found"
+            )
+            return
+        req = matches[0]
+        allowed = {
+            ListKind.WAITING,
+            ListKind.CHUNKED,
+            ListKind.DECODING,
+            ListKind.PREFILL_LAUNCHED,
+        }
+        if any(
+            req in requests for kind, requests in lists.items() if kind not in allowed
+        ):
+            self._complete_cancellation_retirement(
+                entry, "unsupported", "unsupported_request_queue"
+            )
+            return
+        if scope_error := self._cancellation_retirement_scope_error(req):
+            self._complete_cancellation_retirement(entry, "unsupported", scope_error)
+            return
+        entry.req = req
+        self.abort_request(AbortReq(rid=req.rid), target=req)
+
+    def _abort_waiting(self, recv_req: AbortReq, target: Optional[Req] = None) -> None:
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
-        for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
+        for req in self.waiting_queue.take(
+            lambda req: (
+                req is target if target is not None else recv_req.matches(req.rid)
+            )
+        ):
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.request_retirer.abort_queued(
@@ -6044,25 +6369,38 @@ class Scheduler(
                 self.release_aborted_prefill_waiting_req(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-    def _abort_chunked(self, recv_req: AbortReq) -> None:
+    def _abort_chunked(self, recv_req: AbortReq, target: Optional[Req] = None) -> None:
         """Mark the chunked request; `process_pending_chunked_abort` aborts it at
         the next schedule."""
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.matches(chunked_req.rid):
+            if (
+                chunked_req is target
+                if target is not None
+                else recv_req.matches(chunked_req.rid)
+            ):
                 self._pending_chunked_abort_req = chunked_req
+                self._pending_chunked_abort_target = target
 
-    def abort_request(self, recv_req: AbortReq):
+    def abort_request(self, recv_req: AbortReq, target: Optional[Req] = None):
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
-        if self.mm_receiver is not None:
+        if target is None and self.mm_receiver is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)
 
-        for request_list in self.request_lists().values():
-            request_list.abort(recv_req)
+        if target is None:
+            for request_list in self.request_lists().values():
+                request_list.abort(recv_req)
+        else:
+            self._abort_waiting(recv_req, target)
+            self._abort_chunked(recv_req, target)
 
         # Delete requests in the running batch
-        for req in self.collect_inflight_reqs():
-            if not req.finished() and recv_req.matches(req.rid):
+        running = self.collect_inflight_reqs()
+        if target is not None:
+            running.add(target)
+        for req in running:
+            matches = req is target if target is not None else recv_req.matches(req.rid)
+            if not req.finished() and matches:
                 # A running request is finished through `request_finish` and
                 # still runs one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
@@ -6076,6 +6414,7 @@ class Scheduler(
                     )
                 else:
                     req.request_finish(FINISH_ABORT())
+        self._check_cancellation_retirements()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
