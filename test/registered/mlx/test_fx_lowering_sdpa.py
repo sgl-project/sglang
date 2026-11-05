@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 
 from sglang.srt.hardware_backend.mlx.fx_lowering import (
     MlxFxLoweringRegistry,
@@ -13,14 +14,21 @@ from sglang.srt.hardware_backend.mlx.fx_lowering import (
     _lower_mlx_node,
     build_mlx_fx_plan,
     make_mlx_fx_executor,
+    strip_export_guards,
 )
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=10, suite="stage-a-unit-test-mlx")
 
+# Same floor as the other two files: the exported-executor test crosses the
+# Torch/MLX bridge, which needs Torch >= 2.13.
 pytestmark = pytest.mark.skipif(
-    not (torch.backends.mps.is_available() and importlib.util.find_spec("mlx")),
-    reason="requires MLX on Apple Silicon",
+    not (
+        torch.backends.mps.is_available()
+        and importlib.util.find_spec("mlx")
+        and Version(torch.__version__) >= Version("2.13")
+    ),
+    reason="requires Torch 2.13 and MLX on Apple Silicon",
 )
 
 
@@ -131,13 +139,9 @@ def test_sdpa_exported_executor_matches_torch(mask_kind, query_len, key_len, cau
     args = tuple(
         t.to("mps") if isinstance(t, torch.Tensor) else t for t in (*inputs, mask)
     )
-    graph = torch.export.export(Attention(), args, strict=False).module()
-    # Match the serving consumer's removal of the side-effect-only export guard.
-    for node in tuple(graph.graph.nodes):
-        if node.op == "call_module" and str(node.target) == "_guards_fn":
-            assert not node.users
-            graph.graph.erase_node(node)
-    graph.recompile()
+    graph = strip_export_guards(
+        torch.export.export(Attention(), args, strict=False).module()
+    )
     plan = build_mlx_fx_plan(graph, MlxFxLoweringRegistry.standard_export_decoder())
     plan.require_fully_supported()
     executor = make_mlx_fx_executor(plan, list(args))

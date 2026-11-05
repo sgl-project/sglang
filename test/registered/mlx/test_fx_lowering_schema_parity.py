@@ -121,6 +121,7 @@ _RECIPES: dict[str, dict] = {
     "rms_norm": dict(
         args=lambda: (_t(4, 8), [8], _t(8)),
         pools={"eps": [1e-3]},
+        rejects=[lambda: ((_t(4, 8), [4, 8], _t(4, 8)), {})],  # not last-axis only
     ),
     "linear": dict(args=lambda: (_t(3, 8), _t(5, 8)), pools={"bias": [_t(5)]}),
     "matmul": dict(args=lambda: (_t(3, 4), _t(4, 5))),
@@ -141,6 +142,8 @@ _RECIPES: dict[str, dict] = {
     "sdpa": dict(
         args=lambda: (_t(2, 3, 5, 4), _t(2, 3, 5, 4), _t(2, 3, 5, 4)),
         pools={"is_causal": [True], "scale": [0.5]},
+        # Masks, GQA and their interactions are hand-written cases in
+        # test_fx_lowering_sdpa.py; dropout has no deterministic oracle.
         exclude={"dropout_p", "attn_mask", "enable_gqa"},
     ),
     "slice": dict(

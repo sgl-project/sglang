@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.mlx.fx_lowering import (
     build_mlx_fx_plan,
     export_mlx_plan,
     make_mlx_fx_executor,
+    strip_export_guards,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
@@ -233,20 +234,11 @@ def test_generic_mlx_executor_reuses_one_torch_graph_across_token_counts():
     assert len(backend.plans) == 1
 
 
-@pytest.mark.skipif(
-    not _HAS_WHOLE_GRAPH_MLX_RUNTIME,
-    reason="requires Torch 2.13 and MLX on MPS",
-)
 def _exported_executor(model, args):
     """The executor over a non-strict export, the way serving builds it."""
-    graph_module = torch.export.export(model, args, strict=False).module()
-    # The export guard submodule is dead weight the consumer erases before
-    # planning; do the same here.
-    for node in tuple(graph_module.graph.nodes):
-        if node.op == "call_module" and str(node.target) == "_guards_fn":
-            assert not node.users
-            graph_module.graph.erase_node(node)
-    graph_module.recompile()
+    graph_module = strip_export_guards(
+        torch.export.export(model, args, strict=False).module()
+    )
     plan = build_mlx_fx_plan(
         graph_module, MlxFxLoweringRegistry.standard_export_decoder()
     )

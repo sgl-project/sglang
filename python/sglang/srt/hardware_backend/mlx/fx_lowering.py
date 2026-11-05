@@ -15,7 +15,6 @@ import math
 import operator
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
 from math import sqrt
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -74,8 +73,7 @@ class MlxLowering(msgspec.Struct, frozen=True):
     admit: Any = None
 
 
-@dataclass(frozen=True)
-class MlxFxNodePlan:
+class MlxFxNodePlan(msgspec.Struct, frozen=True):
     node_name: str
     node_op: str
     target: Any
@@ -88,8 +86,7 @@ class MlxFxNodePlan:
         return self.lowering is not None
 
 
-@dataclass(frozen=True)
-class MlxFxGraphPlan:
+class MlxFxGraphPlan(msgspec.Struct, frozen=True):
     """One captured forward and its operation-level MLX coverage."""
 
     graph_module: torch.fx.GraphModule
@@ -304,12 +301,19 @@ def _lower_mlx_node(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
-    """Run one built-in lowering by name; the catalogue entry for tests."""
+    """Run one built-in lowering by name; the catalogue entry for tests.
+
+    The plan-time ``admit`` predicate runs first, so a variant the plan would
+    decline is declined here too rather than reaching the implementation.
+    """
     import mlx.core as mx
 
     spec = _LOWERINGS.get(lowering)
     if spec is None:
         raise UnsupportedMlxFxGraphError(f"missing MLX lowering: {lowering}")
+    reason = spec.admit(args, kwargs) if spec.admit else None
+    if reason is not None:
+        raise UnsupportedMlxFxGraphError(reason)
     return spec.fn(mx, args, kwargs)
 
 
@@ -359,6 +363,12 @@ def _lower_functional_embedding(mx, args, kwargs):
 
 
 def _admit_rms_norm(args, kwargs) -> Optional[str]:
+    normalized_shape = _arg(args, kwargs, 1, "normalized_shape")
+    if isinstance(normalized_shape, Sequence) and len(normalized_shape) != 1:
+        return (
+            "MLX rms_norm only normalizes the last axis, found "
+            f"normalized_shape={tuple(normalized_shape)}"
+        )
     if _arg(args, kwargs, 2, "weight") is None:
         return "MLX RMSNorm requires an explicit weight"
     return None
@@ -371,9 +381,14 @@ def _admit_rms_norm(args, kwargs) -> Optional[str]:
     admit=_admit_rms_norm,
 )
 def _lower_rms_norm(mx, args, kwargs):
-    value = args[0]
+    value, normalized_shape = args[:2]
     weight = _arg(args, kwargs, 2, "weight")
     epsilon = _arg(args, kwargs, 3, "eps")
+    if len(normalized_shape) != 1 or normalized_shape[0] != value.shape[-1]:
+        raise UnsupportedMlxFxGraphError(
+            "MLX rms_norm only normalizes the last axis, found "
+            f"normalized_shape={tuple(normalized_shape)}"
+        )
     if weight is None:
         raise UnsupportedMlxFxGraphError("MLX RMSNorm requires an explicit weight")
     if epsilon is None:
@@ -895,8 +910,24 @@ def make_mlx_fx_executor(
     return execute
 
 
-@dataclass(frozen=True)
-class MlxExportPlan:
+def strip_export_guards(graph_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """Erase the ``_guards_fn`` call ``ExportedProgram.module()`` prepends.
+
+    The guard submodule re-checks export-time shape assertions; it has no
+    users and no MLX lowering, so a consumer removes it before planning.
+    """
+    for node in tuple(graph_module.graph.nodes):
+        if node.op == "call_module" and str(node.target) == "_guards_fn":
+            if node.users:
+                raise UnsupportedMlxFxGraphError(
+                    "export guard node has users and cannot be stripped"
+                )
+            graph_module.graph.erase_node(node)
+    graph_module.recompile()
+    return graph_module
+
+
+class MlxExportPlan(msgspec.Struct, frozen=True):
     """Functional Export IR plus explicit serving-state mutations."""
 
     exported_program: Any
@@ -1016,4 +1047,5 @@ __all__ = [
     "export_mlx_plan",
     "make_mlx_fx_executor",
     "mlx_lowering",
+    "strip_export_guards",
 ]
