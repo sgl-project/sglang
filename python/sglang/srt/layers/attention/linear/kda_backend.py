@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 from typing import Optional, Tuple, Union
 
@@ -1191,42 +1192,55 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        core_attn_out = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=layer.lower_bound,
-            beta_is_raw=True,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
-            layer_id=layer.layer_id,
-            # draft_extend_v2 must stay rollback-able, so kernels that commit state
-            # in place (e.g. FlashKDA) must not run for it.
-            is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
-            # Which global chunk rows of h the track snapshot will read; lets
-            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
-            # fast path when the snapshot only needs the final state.
-            track_ssm_h_src=(
-                self.forward_metadata.track_ssm_h_src if track_ssm else None
-            ),
-            track_state=h_track_buf,
-            track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
-            state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=(
-                self.forward_metadata.state_checkpoint_every_n_tokens
-            ),
-            state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
-            track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
-        )
+        hint = contextlib.nullcontext()
+        lens_cpu = forward_batch.extend_seq_lens_cpu
+        if (
+            envs.SGLANG_ROCM_NO_EXTEND_SYNC.get()
+            and lens_cpu is not None
+            and query_start_loc is not None
+            and query_start_loc.numel() == len(lens_cpu) + 1
+            and sum(lens_cpu) == q.shape[1]
+        ):
+            from sglang.kernels.ops.attention.fla.index import cpu_seqlens_hint
+
+            hint = cpu_seqlens_hint(query_start_loc, lens_cpu)
+        with hint:
+            core_attn_out = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=layer.lower_bound,
+                beta_is_raw=True,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_prefix_lens=forward_batch.extend_prefix_lens,
+                layer_id=layer.layer_id,
+                # draft_extend_v2 must stay rollback-able, so kernels that commit state
+                # in place (e.g. FlashKDA) must not run for it.
+                is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
+                return_intermediate_states=track_ssm,
+                # Which global chunk rows of h the track snapshot will read; lets
+                # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
+                # fast path when the snapshot only needs the final state.
+                track_ssm_h_src=(
+                    self.forward_metadata.track_ssm_h_src if track_ssm else None
+                ),
+                track_state=h_track_buf,
+                track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+                state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
+                num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=(
+                    self.forward_metadata.state_checkpoint_every_n_tokens
+                ),
+                state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
+                track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
+            )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
