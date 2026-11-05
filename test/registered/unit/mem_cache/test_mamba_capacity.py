@@ -8,8 +8,8 @@ from sglang.srt.disaggregation.decode import (
     HybridMambaDecodeReqToTokenPool,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -246,7 +246,7 @@ class TestMambaCapacity(unittest.TestCase):
         queue.pp_size = 1
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         queue.pending_reqs = []
-        queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+        queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
         queue.retracted_queue.join([req])
         queue.req_to_token_pool = pool
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
