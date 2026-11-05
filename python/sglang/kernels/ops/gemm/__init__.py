@@ -26,6 +26,24 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+# SAIL executes through CUDA-compatible devices; the vendor API and platform
+# checks stay inside the entrypoint.
+for _name in (
+    "grouped_gemm_nt_bf16bf16bf16_fused",
+    "grouped_gemm_nt_bf16i4bf16_fused",
+    "grouped_gemm_nt_f4f4bf16_fused",
+    "grouped_gemm_nt_f8f8bf16_fused",
+    "grouped_gemm_nt_i8i8bf16_fused",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_name}",
+            backend=KernelBackend.DEEPGEMM,
+            target=f"sglang.kernels.ops.gemm.sail_deepgemm:{_name}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+
 
 for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
     register_kernel(

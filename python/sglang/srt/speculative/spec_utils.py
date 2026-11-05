@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
     next_power_of_2,
 )
@@ -1387,7 +1388,7 @@ def commit_mamba_states_after_verify(
         ring_indices = None
         if mamba_pool.replayssm_request_ring:
             ring_indices = batch.req_pool_indices[: state_batch_indices.shape[0]]
-        commit_kda_replayssm_after_verify(
+        commit_kwargs = dict(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,  # incl. bonus token
@@ -1398,6 +1399,14 @@ def commit_mamba_states_after_verify(
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             ring_indices=ring_indices,
         )
+        if is_sail():
+            # SAIL folds the accepted window and rolls back conv in one PLA
+            # launch; False hands the batch back to the Triton path below.
+            from sglang.srt.hardware_backend.sail.kernels import kda as sail_kda
+
+            if sail_kda.commit_after_verify(**commit_kwargs):
+                return
+        commit_kda_replayssm_after_verify(**commit_kwargs)
         return
 
     attn_backend = model_runner.attn_backend

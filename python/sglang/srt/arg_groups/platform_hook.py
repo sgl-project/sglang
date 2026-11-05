@@ -195,9 +195,45 @@ def handle_xpu_backends(server_args: Any):
 def handle_sail_backends(server_args: Any):
     if not get_platform().is_sail:
         return
+    # PLA ships as its own wheel, so its absence is a supported setup: every
+    # PLA kernel stays off and the KDA paths run on the community Triton
+    # kernels. An explicit SGLANG_SAIL_PLA=0 still keeps them there.
+    try:
+        import pla  # noqa: F401
+    except ImportError:
+        logger.warning(
+            "PLA is not installed; SGLANG_SAIL_PLA stays off and the KDA "
+            "kernels use the community Triton implementations."
+        )
+        envs.SGLANG_SAIL_PLA.set(False)
+    else:
+        if not envs.SGLANG_SAIL_PLA.is_set():
+            envs.SGLANG_SAIL_PLA.set(True)
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
+    if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+    if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+
     cfg = resolving_view(server_args)
+    if cfg.moe_a2a_backend == "megamoe":
+        raise ValueError(
+            "SAIL does not support MegaMoE; please use --moe-a2a-backend none."
+        )
+    valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+    mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+    if valu_enabled and mma_enabled:
+        raise ValueError("SAIL MXFP4 W4A16 VALU and MMA modes are mutually exclusive.")
+    if valu_enabled or mma_enabled:
+        if cfg.moe_runner_backend != "deep_gemm":
+            raise ValueError(
+                "SAIL MXFP4 W4A16 requires --moe-runner-backend deep_gemm."
+            )
+        if cfg.moe_a2a_backend not in ("none", "deepep"):
+            raise ValueError(
+                "SAIL MXFP4 W4A16 only supports --moe-a2a-backend none or deepep."
+            )
     # A captured prefill graph pins MLA to the absorbed path, which hands the
     # backend a non-None q_v; the SAIL FA3 interface rejects that argument, so
     # MLA prefill must stay eager on SAIL. DSA models keep their own policy.

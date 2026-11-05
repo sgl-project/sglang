@@ -30,6 +30,8 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -52,8 +54,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Int8MoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+    CompressedTensorsWNA16DeepGemmMoE,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
@@ -77,12 +81,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sail, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_sail = is_sail()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -992,6 +997,21 @@ class CompressedTensorsConfig(QuantizationConfig):
                         return CompressedTensorsWNA16TritonMoE(
                             self, weight_quant=weight_quant
                         )
+                    if (
+                        _is_sail
+                        and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                        and weight_quant.type == QuantizationType.INT
+                        and weight_quant.num_bits == 4
+                        and weight_quant.group_size == 32
+                    ):
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16DeepGemmMoE "
+                            "(moe_runner_backend=deep_gemm)"
+                        )
+                        return CompressedTensorsWNA16DeepGemmMoE(
+                            self, weight_quant=weight_quant
+                        )
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             else:
@@ -1037,9 +1057,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
+            elif _is_sail:
+                # SAIL uses the generic Triton/DeepGEMM W8A8 INT8 MoE scheme (the
+                # weight layout matches the NPU scheme, only the runner differs).
+                logger.info_once("Using CompressedTensorsW8A8Int8MoE (SAIL)")
+                return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
             else:
                 raise NotImplementedError(
-                    "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W8A8Int8 Fused MoE scheme is implemented only for "
+                    "NPU and SAIL for now."
                 )
         elif self._is_wint4afp8(weight_quant, input_quant):
             # On NPU prefer the dedicated NPU W4A8Int8 path when activations are INT8.

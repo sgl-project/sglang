@@ -140,7 +140,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, make_pp_layers
+from sglang.srt.utils import is_hip, is_npu, is_sail, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -2017,8 +2017,18 @@ class KimiK3DeltaAttention(nn.Module):
 
         heads = self.local_num_heads
         seg = heads * 128
+        # SAIL serves the same path through PLA, which covers a wider head set.
+        sail_kda = None
+        if is_sail():
+            from sglang.srt.hardware_backend.sail.kernels import kda as sail_kda
+
+        supported_heads = (
+            sail_kda.supported_fused_decode_heads(kda_fused_decode.SUPPORTED_HEADS)
+            if sail_kda is not None
+            else kda_fused_decode.SUPPORTED_HEADS
+        )
         if (
-            heads not in kda_fused_decode.SUPPORTED_HEADS
+            heads not in supported_heads
             or w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
@@ -2032,7 +2042,7 @@ class KimiK3DeltaAttention(nn.Module):
         ):
             rank0_log(
                 f"K3 fused KDA decode disabled: {heads} local heads "
-                f"(kernel supports {sorted(kda_fused_decode.SUPPORTED_HEADS)}) or "
+                f"(kernel supports {sorted(supported_heads)}) or "
                 "unexpected conv/A_log/dt_bias "
                 f"layout (conv {None if w is None else tuple(w.shape)}, "
                 f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
@@ -2057,6 +2067,8 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
+        if sail_kda is not None:
+            sail_kda.bind_fused_decode_weight(layer)
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(
@@ -2758,8 +2770,13 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
-        # (matching the idle skip in other DP-attention models).
-        if forward_batch.forward_mode.is_idle():
+        # (matching the idle skip in other DP-attention models). Hybrid
+        # speculative sync temporarily rewrites IDLE to TARGET_VERIFY, so use
+        # the saved logical mode as well as the physical routing mode.
+        original_mode = getattr(forward_batch, "_original_forward_mode", None)
+        if forward_batch.forward_mode.is_idle() or (
+            original_mode is not None and original_mode.is_idle()
+        ):
             return hidden_states
 
         # MLA layers with q_lora_rank read their latent inputs from the
@@ -3293,6 +3310,16 @@ class KimiK3LinearForCausalLM(nn.Module):
             _EXPERT_WEIGHT_NAME.fullmatch(key) for key in expert_params_lookup
         ), "ckpt expert names diverged from _EXPERT_WEIGHT_NAME; no expert would load"
 
+        # Only MXFP4 remaps the checkpoint's packed names onto weight; WNA16 and
+        # NPU keep the original names. compressed-tensors reports its own name,
+        # so ask it to detect MXFP4 from the format or the resolved target
+        # scheme -- a mixed-precision checkpoint puts neither in quant_format.
+        detect_mxfp4 = getattr(self.quant_config, "_is_mxfp4_moe", None)
+        is_mxfp4 = self.quant_config is not None and (
+            self.quant_config.get_name() == "mxfp4"
+            or (detect_mxfp4 is not None and detect_mxfp4(layer_name=""))
+        )
+
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
             name, loaded_weight = args[:2]
@@ -3314,9 +3341,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
-            if "weight_packed" in name and not _is_npu:
+            if "weight_packed" in name and is_mxfp4 and not _is_npu:
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa

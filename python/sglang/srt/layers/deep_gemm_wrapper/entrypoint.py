@@ -12,36 +12,44 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
+from sglang.srt.utils import is_sail
 
 logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import (
-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
-    )
 
-    def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
-        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+    # Only the CUDA build consumes TMA-aligned scales: the SAIL build applies
+    # the layout inside its GEMMs, so this wrapper is unused there.
+    if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        from deep_gemm.utils.layout import (
+            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+        )
 
-        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
-        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
-        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
-        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
-        which frees the storage while the GEMM still reads through the alias
-        -- a use-after-free that surfaces as NaN logits or "pointer resides
-        on host memory" during CUDA graph capture once the allocator reuses
-        the block. Hand back ``sf`` itself in that case so ownership is
-        preserved.
-        """
-        out = _get_mn_major_tma_aligned_tensor(sf)
-        if out.data_ptr() == sf.data_ptr():
-            assert out.shape == sf.shape and out.stride() == sf.stride()
-            return sf
-        return out
+        def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
+            """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+
+            When ``sf`` is already in that layout, sgl-deep-gemm's fast path
+            (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
+            ``sf`` across the TVM-FFI boundary. Callers rebind the result over
+            their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
+            which frees the storage while the GEMM still reads through the alias
+            -- a use-after-free that surfaces as NaN logits or "pointer resides
+            on host memory" during CUDA graph capture once the allocator reuses
+            the block. Hand back ``sf`` itself in that case so ownership is
+            preserved.
+            """
+            out = _get_mn_major_tma_aligned_tensor(sf)
+            if out.data_ptr() == sf.data_ptr():
+                assert out.shape == sf.shape and out.stride() == sf.stride()
+                return sf
+            return out
 
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+
+
+_is_sail = is_sail()
 
 
 # TODO maybe rename these functions
@@ -59,6 +67,10 @@ def grouped_gemm_nt_f8f8bf16_masked(
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+    if _is_sail and lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL
+        )
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -86,10 +98,18 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 expected_m,
                 **fp4_kwargs,
                 **(
-                    dict(
-                        enable_overlap=True,
-                        max_block_n=max_block_n,
-                        signal=overlap_args.signal,
+                    (
+                        dict(
+                            enable_overlap=True,
+                            max_block_n=max_block_n,
+                            signal=overlap_args.signal,
+                        )
+                        if not _is_sail  # SAIL names its SBO argument differently
+                        else dict(
+                            enable_sbo_overlap=True,
+                            max_block_n=max_block_n,
+                            signal=overlap_args.signal,
+                        )
                     )
                     if overlap_args is not None
                     else {}
@@ -112,6 +132,8 @@ def grouped_gemm_nt_bf16_masked(
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
 ):
     num_groups, _, k = a.shape
     _, n, _ = b.shape
@@ -126,6 +148,19 @@ def grouped_gemm_nt_bf16_masked(
             d,
             masked_m,
             expected_m,
+            **(
+                dict(
+                    **(
+                        {"enable_sbo_overlap": True}
+                        if _is_sail
+                        else {"enable_overlap": True}
+                    ),
+                    max_block_n=max_block_n,
+                    signal=overlap_args.signal,
+                )
+                if overlap_args is not None
+                else {}
+            ),
         )
 
 
@@ -140,6 +175,10 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
+    if _is_sail and lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL
+        )
 
     if m == 0:
         return
@@ -171,7 +210,11 @@ def grouped_gemm_nt_bf16_contig(
 
 
 def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
-    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    alignment = (
+        deep_gemm.get_m_alignment_for_contiguous_layout()
+        if _is_sail
+        else deep_gemm.get_mk_alignment_for_contiguous_layout()
+    )
     if isinstance(alignment, tuple):
         alignment = alignment[0]
 
@@ -230,6 +273,8 @@ def gemm_nt_f8f8bf16(
         if recipe == (1, 32, 32)
         else compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
     )
+    if _is_sail and recipe is None and lhs[1].shape[-1] == rhs[1].shape[-1] == 1:
+        kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -292,7 +337,522 @@ def tf32_hc_prenorm_gemm(
 ):
     if x.shape[0] == 0:
         return
+    if _is_sail:
+        raise NotImplementedError(
+            "This SAIL adaptation does not enable the DeepGEMM TF32 MHC contract; "
+            "please use the existing TileLang/PyTorch MHC path."
+        )
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
+
+
+def grouped_gemm_nt_f8f8bf16_nopad(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor = None,
+):
+    assert _is_sail, "grouped_gemm_nt_f8f8bf16_nopad is only supported by SAIL DeepGEMM"
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD
+    if _is_sail and lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL
+        )
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs, rhs, out, m_indices, m_rows)
+
+
+# int8 implementation
+def gemm_nt_i8i8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+):
+    assert _is_sail, "gemm_nt_i8i8bf16 is only supported by SAIL DeepGEMM"
+
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_I8I8BF16
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.gemm_int8_int8_bf16_nt(lhs, rhs, out)
+
+
+def grouped_gemm_nt_i8i8bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+):
+    assert _is_sail, (
+        "grouped_gemm_nt_i8i8bf16_contig is only supported by SAIL DeepGEMM"
+    )
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs, rhs, out, m_indices)
+
+
+def grouped_gemm_nt_i8i8bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+):
+    assert _is_sail, (
+        "grouped_gemm_nt_i8i8bf16_masked is only supported by SAIL DeepGEMM"
+    )
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            **(
+                dict(
+                    enable_sbo_overlap=True,
+                    max_block_n=max_block_n,
+                    signal=overlap_args.signal,
+                )
+                if overlap_args is not None
+                else {}
+            ),
+        )
+
+
+def grouped_gemm_nt_i8i8bf16_nopad(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor = None,
+):
+    assert _is_sail, "grouped_gemm_nt_i8i8bf16_nopad is only supported by SAIL DeepGEMM"
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(
+            lhs, rhs, out, m_indices, m_rows
+        )
+
+
+def grouped_gemm_nt_bf16_nopad(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor = None,
+):
+    assert _is_sail, "grouped_gemm_nt_bf16_nopad is only supported by SAIL DeepGEMM"
+
+    m, k = lhs.shape
+    num_groups, n, _ = rhs.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
+            lhs, rhs, out, m_indices, m_rows
+        )
+
+
+# mxfp4 implementation
+def gemm_nt_f4f4bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+):
+    assert _is_sail, "gemm_nt_f4f4bf16 is only supported by SAIL DeepGEMM"
+
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GEMM_NT_F4F4BF16
+        if bias is None
+        else compile_utils.DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS
+    )
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.gemm_fp4_fp4_bf16_nt(lhs, rhs, bias, out)
+
+
+def grouped_gemm_nt_f4f4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+):
+    assert _is_sail, (
+        "grouped_gemm_nt_f4f4bf16_masked is only supported by SAIL DeepGEMM"
+    )
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED
+        if bias is None
+        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS
+    )
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        with configure_deep_gemm_num_sms(
+            overlap_args.num_sms if overlap_args is not None else None
+        ):
+            return deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
+                lhs,
+                rhs,
+                bias,
+                out,
+                masked_m,
+                expected_m,
+                **(
+                    dict(
+                        enable_sbo_overlap=True,
+                        max_block_n=max_block_n,
+                        signal=overlap_args.signal,
+                    )
+                    if overlap_args is not None
+                    else {}
+                ),
+            )
+
+
+def grouped_gemm_nt_f4f4bf16_nopad(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor = None,
+):
+    assert _is_sail, "grouped_gemm_nt_f4f4bf16_nopad is only supported by SAIL DeepGEMM"
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD
+        if bias is None
+        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS
+    )
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
+            lhs, rhs, bias, out, m_indices, m_rows
+        )
+
+
+def _get_w4a16_weight_shape(weight: torch.Tensor) -> Tuple[int, int, int]:
+    """Return the logical E/N/K; MMA consumes FP4 directly while VALU/INT4 use the
+    Marlin layout."""
+    if weight.dtype == torch.uint8:
+        num_groups, n, packed_k = weight.shape
+        return num_groups, n, packed_k * 2
+    return weight.shape[0], weight.shape[2] // 2, weight.shape[1] * 16
+
+
+def grouped_gemm_nt_bf16i4bf16_masked(
+    lhs: torch.Tensor,
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    # lhs: shape [e, m, k], dtype bf16
+    # VALU/INT4: int32 weights [e, k//16, n*2], scales [e, k//32, n].
+    # Scales are uint8 E8M0 (VALU) or BF16 (INT4).
+    # MMA: uint8 FP4 weights [e, n, k//2], uint8 tiled scales [e, n//64, k*2].
+
+    assert _is_sail, (
+        "grouped_gemm_nt_bf16i4bf16_masked is only supported by SAIL DeepGEMM"
+    )
+
+    num_groups, _, k = lhs.shape
+    _, n, _ = _get_w4a16_weight_shape(rhs[0])
+
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED
+        if rhs[0].dtype == torch.uint8
+        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED
+    )
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        # W4A16 masked has no SBO entry point, so there is nothing to forward.
+        deep_gemm.m_grouped_gemm_w4a16_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+        )
+
+
+def grouped_gemm_nt_bf16i4bf16_nopad(
+    lhs: torch.Tensor,
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: Optional[torch.Tensor] = None,
+):
+    # lhs: shape [m, k], dtype bf16
+    # VALU/INT4: int32 weights [e, k//16, n*2], scales [e, k//32, n].
+    # Scales are uint8 E8M0 (VALU) or BF16 (INT4).
+    # MMA: uint8 FP4 weights [e, n, k//2], uint8 tiled scales [e, n//64, k*2].
+
+    assert _is_sail, (
+        "grouped_gemm_nt_bf16i4bf16_nopad is only supported by SAIL DeepGEMM"
+    )
+
+    m, k = lhs.shape
+    num_groups, n, _ = _get_w4a16_weight_shape(rhs[0])
+
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD
+        if rhs[0].dtype == torch.uint8
+        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD
+    )
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_w4a16_nopad(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            m_rows,
+        )
+
+
+def _require_sail_fused_api(gemm_name: str) -> None:
+    if not _is_sail:
+        raise ValueError("gather-read fused MoE is only supported by SAIL DeepGEMM.")
+    if not ENABLE_JIT_DEEPGEMM:
+        raise RuntimeError("SAIL fused MoE requires DeepGEMM JIT to be enabled.")
+    for name in ("moe_align_block_size", gemm_name):
+        if not callable(getattr(deep_gemm, name, None)):
+            raise RuntimeError(
+                f"SAIL fused MoE is missing the DeepGEMM API {name}; please install "
+                "a version that includes the fused MoE API refactor (53ea8ff)."
+            )
+
+
+def grouped_gemm_nt_bf16i4bf16_fused(
+    lhs: torch.Tensor,
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    gemm_name = "m_grouped_gemm_w4a16_fused"
+    _require_sail_fused_api(gemm_name)
+    m, k = lhs.shape
+    num_groups, n, _ = _get_w4a16_weight_shape(rhs[0])
+    if rhs[0].dtype == torch.uint8:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED
+        )
+    elif rhs[1].dtype == torch.uint8:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED
+        )
+    else:
+        kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_w4a16_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def grouped_gemm_nt_bf16bf16bf16_fused(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    gemm_name = "m_grouped_gemm_bf16_bf16_bf16_nt_fused"
+    _require_sail_fused_api(gemm_name)
+    m, k = lhs.shape
+    num_groups, n, _ = rhs.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def grouped_gemm_nt_i8i8bf16_fused(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    gemm_name = "m_grouped_gemm_int8_int8_bf16_nt_fused"
+    _require_sail_fused_api(gemm_name)
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def grouped_gemm_nt_f8f8bf16_fused(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+    perchannel_quant: bool = False,
+):
+    gemm_name = "m_grouped_gemm_fp8_fp8_bf16_nt_fused"
+    _require_sail_fused_api(gemm_name)
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    # At K=128 the last dim of block scales is also 1, so it cannot be used to
+    # infer channel mode.
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL
+        if perchannel_quant
+        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED
+    )
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def grouped_gemm_nt_f4f4bf16_fused(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    gemm_name = "m_grouped_gemm_fp4_fp4_bf16_nt_fused"
+    _require_sail_fused_api(gemm_name)
+    if lhs[1].dtype != torch.uint16 or not lhs[1].is_contiguous():
+        raise ValueError(
+            "SAIL FP4 gather-read requires uint16 K-major contiguous activation scales."
+        )
+    # Consistent with the existing FP4 wrapper, warmup and tuning use the packed
+    # byte width for K.
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
+def moe_align_block_size(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    topk_ids: torch.Tensor,
+    perchannel_quant: bool = False,
+):
+    gemm_names = {
+        torch.float8_e4m3fn: "m_grouped_gemm_fp8_fp8_bf16_nt_fused",
+        torch.int8: "m_grouped_gemm_int8_int8_bf16_nt_fused",
+        torch.bfloat16: "m_grouped_gemm_bf16_bf16_bf16_nt_fused",
+        torch.uint8: "m_grouped_gemm_fp4_fp4_bf16_nt_fused",
+    }
+    if A.dtype not in gemm_names:
+        raise ValueError(f"SAIL fused MoE does not support activation dtype {A.dtype}.")
+    gemm_name = gemm_names[A.dtype]
+    if A.dtype == torch.bfloat16 and B.dtype in (torch.int32, torch.uint8):
+        gemm_name = "m_grouped_gemm_w4a16_fused"
+    _require_sail_fused_api(gemm_name)
+    return deep_gemm.moe_align_block_size(
+        A, B, topk_ids, perchannel_quant=perchannel_quant
+    )
 
 
 def update_deep_gemm_config(gpu_id: int):
