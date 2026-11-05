@@ -769,6 +769,45 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### Prefill and decode disaggregation
+
+STANDALONE can pass its draft seed from prefill to decode through the existing
+PD metadata buffers. It transfers draft token probabilities and indices without
+requiring target hidden states; the existing PD transport transfers target and
+draft KV. Configure **both** workers with STANDALONE and the same target, draft,
+tokenizer and speculative settings. A non-speculative prefill worker cannot
+initialize a STANDALONE decode worker.
+
+The initial support scope is synchronous, single-rank PD with
+`--speculative-eagle-topk 1`. Set these flags on both workers, in addition to the
+role and transport settings in [PD disaggregation](/docs/advanced_features/pd_disaggregation):
+
+```bash
+--speculative-algorithm STANDALONE \
+--speculative-draft-model-path Qwen/Qwen3-0.6B \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4 \
+--disable-overlap-schedule \
+--tp-size 1 \
+--pp-size 1
+```
+
+The tested target is `Qwen/Qwen3-4B` on NVIDIA Hopper GPUs with BF16, FA3,
+page size 1 and CUDA graphs disabled. Use target and draft models with matching
+full vocabulary/token IDs and compatible KV layouts. Keep DP and context
+parallel sizes at one and the decode allocation policy at its default `early`.
+Overlap scheduling, multi-rank execution, decode host receive, staging buffers
+and hierarchical caches are outside this initial scope and are rejected at
+startup. This restriction applies to STANDALONE PD, not monolithic STANDALONE
+or EAGLE PD.
+
+Malformed or unwritten draft seeds abort the affected request before decode
+admission. A valid terminal request still needs a valid seed. Cross-host/RDMA
+operation, additional model families and performance require separate
+validation; the same-GPU Mooncake TCP regression does not establish those
+results.
+
 ---
 
 ## Speculative Decoding V2 (Overlap Scheduler)

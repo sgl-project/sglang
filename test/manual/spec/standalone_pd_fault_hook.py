@@ -165,7 +165,7 @@ def install_decode():
     @functools.wraps(original_poll)
     def poll(self):
         result = original_poll(self)
-        for entry, status in zip(self.queue, result):
+        for entry, status in zip(self.queue.items(), result):
             if status == KVPoll.Success and entry.req.rid not in _success:
                 _success.add(entry.req.rid)
                 slot = entry.metadata_buffer_index
@@ -206,7 +206,7 @@ def install_decode():
 
     @functools.wraps(original_pop)
     def pop(self, *args, **kwargs):
-        entries = {entry.req.rid: entry for entry in self.queue}
+        entries = {entry.req.rid: entry for entry in self.queue.items()}
         result = original_pop(self, *args, **kwargs)
         admitted, outcomes = result
         if outcomes:

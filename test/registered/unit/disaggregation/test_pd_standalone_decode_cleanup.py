@@ -14,21 +14,26 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
-    Req,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -79,10 +84,21 @@ class TestPdStandaloneDecodeCleanup(unittest.TestCase):
             token_to_kv_pool_allocator=tokens,
             output_streamer=Mock(),
             disaggregation_mode=DisaggregationMode.DECODE,
+            request_retirer=RequestRetirer(
+                tree_cache=cache,
+                beam_coordinator=None,
+                hisparse_coordinator=None,
+                uocr_runtime=None,
+                send_abort_output=Mock(),
+            ),
         )
         processor = SchedulerBatchResultProcessor(**fields)
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        queue.queue = []
+        queue.queue = IndexedReqList(
+            ListKind.PD_RECEIVING,
+            abort=queue._abort_receiving,
+            req_of=lambda entry: entry.req,
+        )
         queue.scheduler = SimpleNamespace(
             kv_checksum_computer=None,
             model_config=fields["model_config"],
@@ -141,7 +157,7 @@ class TestPdStandaloneDecodeCleanup(unittest.TestCase):
         receiver = Mock(spec=["poll", "clear"])
         receiver.poll.return_value = KVPoll.Success
         entry = DecodeRequest(decode, receiver, metadata_buffer_index=slot)
-        queue.queue.append(entry)
+        queue.add(entry)
         return entry, receiver, locations
 
     def draft_input(self, queue, reqs):
@@ -175,7 +191,7 @@ class TestPdStandaloneDecodeCleanup(unittest.TestCase):
                 admitted, outcomes = queue.pop_transferred_with_outcomes()
                 self.assertEqual(admitted, [good.req])
                 self.assertEqual(outcomes, {"bad": True, "good": False})
-                self.assertEqual(queue.queue, [])
+                self.assertEqual(list(queue.queue.items()), [])
                 self.assertIsInstance(bad.req.finished_reason, FINISH_ABORT)
                 self.assertEqual(bad.req.finished_reason.status_code, 500)
                 self.assertIn("Invalid or unwritten", bad.req.finished_reason.message)
@@ -275,7 +291,8 @@ class TestPdStandaloneDecodeCleanup(unittest.TestCase):
                         queue.pop_transferred_with_outcomes()
                 self.assertIsNone(entry.req.finished_reason)
                 self.assertEqual(list(entry.req.output_ids), [])
-                self.assertEqual(queue.queue, [entry])
+                self.assertEqual(list(queue.queue.items()), [entry])
+                self.assertEqual(list(queue.queue), [entry.req])
                 self.assertTrue(entry.req.kv.holds_kv)
                 receiver.clear.assert_not_called()
                 self.assertEqual(
