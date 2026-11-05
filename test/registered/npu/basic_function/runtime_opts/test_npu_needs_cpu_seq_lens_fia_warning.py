@@ -38,6 +38,9 @@ class TestNpuNeedsCpuSeqLensFiaWarning(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        os.environ["PYTORCH_NPU_ALLOC_CONF"] = (
+            "expandable_segments:True,pin_memory_expandable_segments:True"
+        )
         cls.out_log_file = open(cls.OUT_LOG_PATH, "w+", encoding="utf-8")
         cls.err_log_file = open(cls.ERR_LOG_PATH, "w+", encoding="utf-8")
         cls.process = popen_launch_server(
