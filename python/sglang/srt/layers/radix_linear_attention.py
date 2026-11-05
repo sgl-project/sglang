@@ -83,7 +83,12 @@ class RadixLinearAttention(nn.Module):
         self._k3_deferred_f_b = False
         self._k3_onorm_gate = None
         self._k3_onorm_consumed = False
-        # (f_b_weight, norm_weight, norm_eps, A_log) once the HIP fused verify is armed.
+        # (f_b_weight, norm_weight, norm_eps, A_log) once the HIP fused decode is armed,
+        # with its backend name and adapter module.
+        self._k3_hip_fused_decode_args = None
+        self._k3_hip_fused_decode_backend = ""
+        self._k3_hip_fused_decode_ops = None
+        # The decode's static inputs once the HIP fused verify is armed too.
         self._k3_hip_fused_verify_args = None
 
     def refresh_conv_weights(self, weight: torch.Tensor) -> None:

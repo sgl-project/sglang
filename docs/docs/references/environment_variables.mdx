@@ -1918,6 +1918,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_KDA_FUSED_VERIFY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run Kimi-K3 KDA target verify on ROCm as one AITER FlyDSL kernel (<code>flydsl_kda_verify_with_f_b</code>: <code>f_b</code>, convolution, gate, recurrence, gated RMSNorm). Arms only after the <code>SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter</code> fused decode arms, and only when the installed AITER ships the verify kernel for the pool's state dtype and draft token count. Covers the dense chain verify only; ragged layouts, tree verify, and a request-indexed ReplaySSM ring keep the unfused path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx942, run dense block-FP8 linears with the AITER CK blockscale GEMM instead of the AITER Triton one for faster decode. Accuracy differences depend on the evaluation setting: Qwen3-32B-FP8 is 1 point lower on 8-shot GSM8K with 512 output tokens, but only 0.26 points lower with 5 shots and 2048 output tokens, with MMLU unchanged (see <a href="https://github.com/sgl-project/sglang/issues/43526">#43526</a>). Set to <code>false</code> to use Triton.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>

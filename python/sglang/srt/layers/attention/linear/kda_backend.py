@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.device import is_gfx95_supported
-from sglang.srt.utils.log_utils import print_warning_once, rank0_log
+from sglang.srt.utils.log_utils import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -471,17 +471,6 @@ def ragged_verify_dense_scatter_indices(
     ).clamp_(max=batch_size * draft_token_num)
 
 
-def _materialize_k3_f_b(layer: RadixLinearAttention, f_a: torch.Tensor) -> torch.Tensor:
-    """Apply the f_b projection the model deferred to the fused verify: [1, tokens, H, K]."""
-    from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
-
-    f_b_weight = layer._k3_hip_fused_verify_args[0]
-    gate = kimi_k3_tiny_gemm(
-        f_a, f_b_weight.view(layer.num_v_heads * layer.head_k_dim, layer.head_k_dim)
-    )
-    return gate.unflatten(-1, (layer.num_v_heads, layer.head_k_dim)).unsqueeze(0)
-
-
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
@@ -819,9 +808,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
         if deferred_f_b and is_gfx95_supported():
-            fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
-            fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
-            fused_ops = getattr(layer, "_k3_hip_fused_decode_ops", None)
+            fused_static = layer._k3_hip_fused_decode_args
+            fused_backend = layer._k3_hip_fused_decode_backend
+            fused_ops = layer._k3_hip_fused_decode_ops
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             # The ReplaySSM ring path has no fused kernel, but still needs f_b applied.
             if (
@@ -1359,26 +1348,41 @@ class KDAAttnBackend(MambaAttnBackendBase):
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout
         if layer._k3_deferred_f_b:
-            core_attn_out = self._run_k3_hip_fused_verify(
-                layer=layer,
-                mixed_qkv=mixed_qkv,
-                f_a=a,
-                b=b,
-                conv_states=conv_states,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                intermediate_state_indices=intermediate_state_indices,
-                intermediate_state_cache=intermediate_state_cache,
-                intermediate_conv_window_cache=intermediate_conv_window_cache,
-                draft_token_num=draft_token_num,
-                ragged_layout=ragged_layout,
-                retrieve_parent_token=retrieve_parent_token,
-                mamba_cache_params=mamba_cache_params,
-                replayssm_on=replayssm_on,
+            from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip
+
+            request_ring = (
+                replayssm_on
+                and self.state_pool is not None
+                and self.state_pool.replayssm_request_ring
             )
-            if core_attn_out is not None:
-                return core_attn_out
-            a = _materialize_k3_f_b(layer, a)
+            # The fused verify covers the dense chain with a slot-indexed ring only.
+            if (
+                ragged_layout is None
+                and retrieve_parent_token is None
+                and not request_ring
+            ):
+                core_attn_out = kda_fused_verify_aiter_hip.run_layer(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
+                    f_a=a,
+                    raw_beta=b,
+                    conv_states=conv_states,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    intermediate_state_indices=intermediate_state_indices,
+                    intermediate_state_cache=intermediate_state_cache,
+                    intermediate_conv_window_cache=intermediate_conv_window_cache,
+                    num_draft_tokens=draft_token_num,
+                    replay_ring=(
+                        (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+                        if replayssm_on
+                        else None
+                    ),
+                )
+                if core_attn_out is not None:
+                    layer._k3_onorm_consumed = True
+                    return core_attn_out
+            a = kda_fused_verify_aiter_hip.materialize_f_b(layer=layer, f_a=a)
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
@@ -1565,94 +1569,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
-
-    def _run_k3_hip_fused_verify(
-        self,
-        *,
-        layer: RadixLinearAttention,
-        mixed_qkv: torch.Tensor,
-        f_a: torch.Tensor,
-        b: torch.Tensor,
-        conv_states: torch.Tensor,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        intermediate_state_indices: torch.Tensor,
-        intermediate_state_cache: Optional[torch.Tensor],
-        intermediate_conv_window_cache: torch.Tensor,
-        draft_token_num: int,
-        ragged_layout,
-        retrieve_parent_token: Optional[torch.Tensor],
-        mamba_cache_params,
-        replayssm_on: bool,
-    ) -> Optional[torch.Tensor]:
-        """AITER fused verify (f_b, conv, gate, recurrence, gated RMSNorm), or None.
-
-        The kernel covers the dense chain verify only: no ragged layout, no tree,
-        and a ReplaySSM ring indexed by the mamba slot.
-        """
-        from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip
-
-        if (
-            ragged_layout is not None
-            or retrieve_parent_token is not None
-            or (
-                replayssm_on
-                and self.state_pool is not None
-                and self.state_pool.replayssm_request_ring
-            )
-        ):
-            return None
-        f_b_weight, norm_weight, norm_eps, a_log = layer._k3_hip_fused_verify_args
-        batch_size = mixed_qkv.shape[0] // draft_token_num
-        output_gate = layer._k3_onorm_gate[: mixed_qkv.shape[0]].view(
-            -1, layer.num_v_heads, layer.head_v_dim
-        )
-        replay_ring = (
-            (
-                mamba_cache_params.replayssm_rawv,
-                mamba_cache_params.replayssm_rawk,
-                mamba_cache_params.replayssm_g,
-                mamba_cache_params.replayssm_beta,
-            )
-            if replayssm_on
-            else None
-        )
-        kwargs = dict(
-            f_a=f_a,
-            mixed_qkv=mixed_qkv,
-            raw_beta=b,
-            output_gate=output_gate,
-            conv_state=conv_states.transpose(-1, -2),
-            state=ssm_states,
-            cache_indices=cache_indices[:batch_size],
-            intermediate_indices=intermediate_state_indices[:batch_size],
-            intermediate_conv_window=intermediate_conv_window_cache.transpose(-1, -2),
-            intermediate_states=None if replayssm_on else intermediate_state_cache,
-            replay_ring=replay_ring,
-            num_draft_tokens=draft_token_num,
-        )
-        if not kda_fused_verify_aiter_hip.covered(**kwargs):
-            print_warning_once(
-                "K3 HIP fused KDA verify rejected a batch: "
-                f"tokens={mixed_qkv.shape[0]}, draft_tokens={draft_token_num}, "
-                f"cache_indices={cache_indices.dtype}, "
-                f"inter_indices={intermediate_state_indices.dtype}, "
-                f"state={tuple(ssm_states.shape)}/{ssm_states.dtype}; "
-                "verify runs the unfused chain"
-            )
-            return None
-        out = kda_fused_verify_aiter_hip.run(
-            **kwargs,
-            f_b_weight=f_b_weight,
-            conv_weight=layer.conv_weights,
-            A_log=a_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=float(layer.lower_bound),
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-        )
-        layer._k3_onorm_consumed = True
-        return out
 
     def _can_run_fused_chain_verify(
         self,

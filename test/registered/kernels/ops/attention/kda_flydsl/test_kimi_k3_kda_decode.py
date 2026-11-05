@@ -783,12 +783,6 @@ def test_vendored_and_aiter_kda_decode_agree(select_fused_backend, batch: int) -
     assert torch.equal(vendored_inputs.conv_state, aiter_inputs.conv_state)
 
 
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 def _aiter_has_kda_verify() -> bool:
     try:
         from aiter.ops.flydsl.linear_attention_kernels import (  # noqa: F401
@@ -811,7 +805,9 @@ def _verify_backend(state, slots: torch.Tensor, steps: int):
     backend.state_pool = SimpleNamespace(replayssm_request_ring=False)
     backend.req_to_token_pool = SimpleNamespace(size=state.temporal.shape[1])
     backend.forward_metadata = SimpleNamespace(
-        query_start_loc=torch.arange(slots.numel() + 1, device=_DEVICE, dtype=torch.int32)
+        query_start_loc=torch.arange(
+            slots.numel() + 1, device=_DEVICE, dtype=torch.int32
+        )
         * steps,
         mamba_cache_indices=slots,
         retrieve_next_token=None,
@@ -841,10 +837,10 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     gate, the slot/scratch index slices and the transposed conv-cache views.
     """
     from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
-    from sglang.srt.layers.attention.linear.kda_backend import _materialize_k3_f_b
+    from sglang.kernels.ops.attention.kda_fused_verify_aiter_hip import materialize_f_b
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
     from sglang.srt.mem_cache.memory_pool import MambaPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     torch.manual_seed(20261104)
     batch, steps, num_slots, ring_len = 3, 5, 7, 8
@@ -884,8 +880,12 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     template = MambaPool.SpeculativeState(
         conv=[randn(1, num_slots, _CONV_WIDTH - 1, _CHANNELS)],
         temporal=randn(1, num_slots, _HEADS, _DIM, _DIM, scale=0.05),
-        intermediate_ssm=None if ring else randn(1, num_slots, steps, _HEADS, _DIM, _DIM),
-        intermediate_conv_window=[randn(1, num_slots, steps, _CONV_WIDTH - 1, _CHANNELS)],
+        intermediate_ssm=None
+        if ring
+        else randn(1, num_slots, steps, _HEADS, _DIM, _DIM),
+        intermediate_conv_window=[
+            randn(1, num_slots, steps, _CONV_WIDTH - 1, _CHANNELS)
+        ],
         replayssm_rawv=randn(1, num_slots, _HEADS, ring_len, _DIM) if ring else None,
         replayssm_rawk=randn(1, num_slots, _HEADS, ring_len, _DIM) if ring else None,
         replayssm_g=(
@@ -936,7 +936,7 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     layer._k3_deferred_f_b = False
     layer._k3_onorm_gate = None
     unfused = _verify_backend(ref_state, slots, steps).forward_extend(
-        layer, forward_batch, mixed_qkv, _materialize_k3_f_b(layer, f_a), beta
+        layer, forward_batch, mixed_qkv, materialize_f_b(layer=layer, f_a=f_a), beta
     )[:, :tokens]
     unfused = rms_norm_gated(
         unfused,
@@ -959,9 +959,17 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
     )
     torch.testing.assert_close(fused_state.temporal, template.temporal, rtol=0, atol=0)
     if ring:
-        for name in ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta"):
+        for name in (
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_g",
+            "replayssm_beta",
+        ):
             torch.testing.assert_close(
-                getattr(fused_state, name), getattr(ref_state, name), rtol=1e-2, atol=1e-2
+                getattr(fused_state, name),
+                getattr(ref_state, name),
+                rtol=1e-2,
+                atol=1e-2,
             )
     else:
         torch.testing.assert_close(
@@ -970,3 +978,73 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
             rtol=1e-2,
             atol=1e-4,
         )
+
+
+def _verify_warmup(adapter, *, replay_ring: bool) -> None:
+    def randn(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, device=_DEVICE).to(dtype)
+
+    adapter.warmup(
+        f_b_weight=randn(_HEADS, _DIM, _DIM),
+        conv_weight=randn(_CHANNELS, _CONV_WIDTH, dtype=torch.float32),
+        A_log=randn(_HEADS, dtype=torch.float32),
+        dt_bias=randn(_HEADS * _DIM, dtype=torch.float32),
+        lower_bound=_LOWER_BOUND,
+        norm_weight=randn(_DIM),
+        norm_eps=_NORM_EPS,
+        state_dtype=torch.bfloat16,
+        num_draft_tokens=5,
+        replay_ring=replay_ring,
+    )
+
+
+@pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")
+@pytest.mark.parametrize("ring", [False, True])
+def test_verify_warmup_builds_every_wave_count(monkeypatch, ring: bool) -> None:
+    """A wave count left cold compiles during CUDA graph capture; warmup must build
+    each one AITER can dispatch, from batch-1 calls rather than max-batch buffers."""
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_kda_verify_with_f_b
+
+    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
+
+    built = []
+    real_run = adapter.run
+
+    def recording_run(**kwargs):
+        built.append((kwargs["cache_indices"].numel(), kwargs["num_warps"]))
+        return real_run(**kwargs)
+
+    monkeypatch.setattr(adapter, "run", recording_run)
+    monkeypatch.setattr(adapter, "_WARMED", set())
+    _verify_warmup(adapter, replay_ring=ring)
+
+    assert sorted(flydsl_kda_verify_with_f_b.num_warps) == [4, 8]
+    assert built == [(1, n) for n in flydsl_kda_verify_with_f_b.num_warps]
+
+
+def test_verify_warmup_without_wave_tag_builds_both_policy_batches(
+    monkeypatch,
+) -> None:
+    """An AITER verify op without the num_warps tag picks the wave count from the
+    batch (8 up to 16, 4 above), so warmup must run one batch on each side."""
+    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
+
+    built = []
+    monkeypatch.setattr(adapter, "_op", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        adapter,
+        "run",
+        lambda **kwargs: built.append(
+            (kwargs["cache_indices"].numel(), kwargs["num_warps"])
+        ),
+    )
+    monkeypatch.setattr(adapter, "_WARMED", set())
+    _verify_warmup(adapter, replay_ring=False)
+
+    assert built == [(1, None), (17, None)]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

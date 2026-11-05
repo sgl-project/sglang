@@ -161,16 +161,19 @@ class TestHipFusedDecodeArming(CustomTestCase):
 
     def test_failed_rearm_drops_the_previous_arming(self):
         """A re-run that cannot arm (here the backend reports unavailable) must not
-        leave the previous f_b serving the fused decode."""
+        leave the previous f_b serving the fused decode or verify."""
+        stale = ("stale f_b", None, 1e-5, None)
         layer = SimpleNamespace(
             conv_weights=None,
-            _k3_hip_fused_decode_args=("stale f_b", None, 1e-5, None),
+            _k3_hip_fused_decode_args=stale,
             _k3_hip_fused_decode_backend="aiter",
             _k3_hip_fused_decode_ops=kda_fused_decode_aiter_hip,
+            _k3_hip_fused_verify_args=stale,
         )
         attention = SimpleNamespace(
             attn=layer,
             _kda_hip_fused_decode_ready=True,
+            _kda_hip_fused_verify_ready=True,
             f_b_proj=SimpleNamespace(weight=torch.empty(12 * 128, 128)),
             config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(
@@ -189,8 +192,10 @@ class TestHipFusedDecodeArming(CustomTestCase):
             KimiK3DeltaAttention._prepare_fused_decode(attention)
 
         self.assertFalse(attention._kda_hip_fused_decode_ready)
+        self.assertFalse(attention._kda_hip_fused_verify_ready)
         self.assertIsNone(layer._k3_hip_fused_decode_args)
         self.assertIsNone(layer._k3_hip_fused_decode_ops)
+        self.assertIsNone(layer._k3_hip_fused_verify_args)
 
     def test_block_fp8_f_b_arms_from_the_merged_bf16_copy(self):
         """A block-FP8 f_b_proj holds FP8 with no Quark scheme; the fused decode must

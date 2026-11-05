@@ -138,7 +138,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
-    get_schedule,
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1979,11 +1978,13 @@ class KimiK3DeltaAttention(nn.Module):
             )
 
             layer = self.attn
-            # A re-run that fails to arm must not leave the previous f_b serving decode.
+            # A failed re-run must not leave the previous f_b serving decode or verify.
             self._kda_hip_fused_decode_ready = False
+            self._kda_hip_fused_verify_ready = False
             layer._k3_hip_fused_decode_args = None
             layer._k3_hip_fused_decode_backend = ""
             layer._k3_hip_fused_decode_ops = None
+            layer._k3_hip_fused_verify_args = None
             w = layer.conv_weights
             backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
@@ -2097,14 +2098,11 @@ class KimiK3DeltaAttention(nn.Module):
         layer = self.attn
         f_b_weight, norm_weight, norm_eps, a_log = layer._k3_hip_fused_decode_args
         if not kda_fused_verify_aiter_hip.available(
-            f_b_weight.device, state_dtype, num_draft_tokens
+            device=f_b_weight.device,
+            state_dtype=state_dtype,
+            num_draft_tokens=num_draft_tokens,
         ):
             return
-        max_batch = max(
-            get_schedule().max_running_requests or 0,
-            get_exec().graph.cuda_graph_config.decode.max_bs or 0,
-            1,
-        )
         kda_fused_verify_aiter_hip.warmup(
             f_b_weight=f_b_weight,
             conv_weight=layer.conv_weights,
@@ -2116,7 +2114,6 @@ class KimiK3DeltaAttention(nn.Module):
             state_dtype=state_dtype,
             num_draft_tokens=num_draft_tokens,
             replay_ring=get_exec().mamba.enable_linear_replayssm_spec,
-            max_batch=max_batch,
         )
         layer._k3_hip_fused_verify_args = layer._k3_hip_fused_decode_args
         self._kda_hip_fused_verify_ready = True
