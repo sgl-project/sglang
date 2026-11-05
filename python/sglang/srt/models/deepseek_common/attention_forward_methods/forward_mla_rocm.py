@@ -445,6 +445,18 @@ def _rope_cache_q_out_dtype(
     return fp8_dtype
 
 
+def _fused_kv_cache_write_target(
+    *, layer_id: int, out_cache_loc: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """KV buffer and device slots for an AITER kernel that writes the cache itself."""
+    kv_pool = get_token_to_kv_pool()
+    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
+        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
+        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
+    # AITER reads slot_mapping with stride 1, including on the resident path.
+    return kv_pool.layer_router.read(layer_id).key(), out_cache_loc.contiguous()
+
+
 def _fused_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
@@ -456,19 +468,16 @@ def _fused_rope_cat_and_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95."""
     q_out_dtype = _rope_cache_q_out_dtype(attn, q_nope=q_nope_out)
-    kv_pool = get_token_to_kv_pool()
-    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
-        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
-        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
-    # AITER reads slot_mapping with stride 1, including on the resident path.
-    out_cache_loc = out_cache_loc.contiguous()
+    kv_cache, slot_mapping = _fused_kv_cache_write_target(
+        layer_id=attn.attn_mqa.layer_id, out_cache_loc=out_cache_loc
+    )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
         k_nope,
         k_pe,
-        kv_pool.layer_router.read(attn.attn_mqa.layer_id).key(),
-        out_cache_loc,
+        kv_cache,
+        slot_mapping,
         positions,
         attn.rotary_emb.cos_cache,
         attn.rotary_emb.sin_cache,
@@ -575,8 +584,9 @@ def _fused_bmm_rope_cat_and_cache(
         w_scale = attn.w_scale
         kernel_kwargs = {"group_size": 128}
     q_out_dtype = _rope_cache_q_out_dtype(attn, q_nope=q_nope)
-    # AITER reads slot_mapping with stride 1, as in _fused_rope_cat_and_cache.
-    out_cache_loc = out_cache_loc.contiguous()
+    kv_cache, slot_mapping = _fused_kv_cache_write_target(
+        layer_id=attn.attn_mqa.layer_id, out_cache_loc=out_cache_loc
+    )
     # rocm_absorb_q_bmm takes q_nope as (B, QH, P) and transposes internally,
     # while these kernels want (QH, B, P) up front.
     return kernel(
@@ -586,8 +596,8 @@ def _fused_bmm_rope_cat_and_cache(
         q_pe,
         k_nope,
         k_pe,
-        get_kv_layers().read(attn.attn_mqa.layer_id).key(),
-        out_cache_loc,
+        kv_cache,
+        slot_mapping,
         positions,
         attn.rotary_emb.cos_cache,
         attn.rotary_emb.sin_cache,

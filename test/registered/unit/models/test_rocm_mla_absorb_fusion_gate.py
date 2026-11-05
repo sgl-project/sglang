@@ -252,7 +252,7 @@ class TestFusedAbsorbQDtype(CustomTestCase):
         q_nope = torch.empty(3, num_heads, 4, dtype=torch.bfloat16)
         fp4_kernel = mock.Mock()
         fp8_kernel = mock.Mock()
-        layers = mock.Mock()
+        kv_pool = mock.Mock()
         with (
             mock.patch.object(
                 forward_mla_rocm,
@@ -266,7 +266,9 @@ class TestFusedAbsorbQDtype(CustomTestCase):
                 fp8_kernel,
                 create=True,
             ),
-            mock.patch.object(forward_mla_rocm, "get_kv_layers", return_value=layers),
+            mock.patch.object(
+                forward_mla_rocm, "get_token_to_kv_pool", return_value=kv_pool
+            ),
         ):
             forward_mla_rocm._fused_bmm_rope_cat_and_cache(
                 attn,
