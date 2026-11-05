@@ -299,6 +299,7 @@ def test_real_model_index_is_accepted_by_the_module_loading_path(
     server_args = SimpleNamespace(
         model_subfolder=None,
         revision=None,
+        model_checksum=None,
         comfyui_mode=False,
         component_paths={},
         component_direct_gpu_weight_loading={},
@@ -347,7 +348,9 @@ def test_legacy_bundle_requires_official_diffusers_layout(tmp_path):
         (tmp_path / name).mkdir()
         (tmp_path / name / "diffusion_pytorch_model.safetensors").touch()
     pipeline = object.__new__(Kandinsky6SRPipeline)
-    pipeline.server_args = SimpleNamespace(model_subfolder=None, revision=None)
+    pipeline.server_args = SimpleNamespace(
+        model_subfolder=None, revision=None, model_checksum=None
+    )
     pipeline.model_path = str(tmp_path)
     with pytest.raises(
         ValueError, match="k6_video SR bundle.*kandinskylab/Kandinsky-6.0-VSR"
