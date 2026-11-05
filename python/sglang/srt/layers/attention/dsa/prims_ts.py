@@ -17,6 +17,9 @@ import torch
 # power-of-two capacity plans, so prefill chunks do not plan one kernel per size.
 _EXACT_PLAN_MAX_ROWS = 1024
 
+# B200, B300/GB300 and Rubin; SM107 needs flashinfer-ai/flashinfer#8186.
+_SUPPORTED_DEVICE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+
 
 def _plan_capacity(rows: int) -> Optional[int]:
     """None plans exactly ``rows`` fixed rows; otherwise the packed row capacity."""
@@ -36,8 +39,8 @@ def check_prims_ts_sparse_mla_support(
             f"(kv_lora_rank 512, qk_rope_head_dim 64); got {kv_lora_rank}, "
             f"{qk_rope_head_dim}."
         )
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        raise ValueError("Prims-TS sparse MLA requires SM100 or SM103.")
+    if torch.cuda.get_device_capability(device) not in _SUPPORTED_DEVICE_CAPABILITIES:
+        raise ValueError("Prims-TS sparse MLA requires SM100, SM103 or SM107.")
     try:
         from flashinfer.attention.prims_ts import (
             get_prims_ts_sparse_mla_decode_workspace_size,
@@ -56,7 +59,8 @@ def check_prims_ts_sparse_mla_support(
     except (ImportError, TypeError, ValueError, NotImplementedError) as exc:
         raise RuntimeError(
             "--dsa-*-backend prims_ts needs FlashInfer Prims-TS with D576 native-FP8 "
-            "sparse MLA (flashinfer-ai/flashinfer#7410 and #7984)."
+            "sparse MLA (flashinfer-ai/flashinfer#7410 and #7984; #8186 on SM107): "
+            f"{exc}"
         ) from exc
 
 

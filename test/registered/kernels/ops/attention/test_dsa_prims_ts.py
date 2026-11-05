@@ -35,7 +35,7 @@ def _sm100() -> bool:
 class TestPrimsTsSparseMla(CustomTestCase):
     def _require_prims_ts(self, heads: int):
         if not _sm100():
-            self.skipTest("Prims-TS sparse MLA needs SM100/SM103")
+            self.skipTest("Prims-TS sparse MLA needs SM100/SM103/SM107")
         try:
             check_prims_ts_sparse_mla_support(
                 device=torch.device("cuda"),
