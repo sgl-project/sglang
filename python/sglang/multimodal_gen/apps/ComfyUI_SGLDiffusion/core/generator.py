@@ -82,20 +82,33 @@ def _check_h3_single_file(path: str, sgld_options: dict) -> None:
 def _default_fasth3_attention(path: str, sgld_options: dict) -> None:
     """A FastH3 single file runs the VSA-H3 attention it was distilled with.
 
-    FastH3 8-Step V2 trains at 0.8 sparsity, as the native loader defaults.
-    ComfyUI's BlockSparseAttention / attention-backend nodes are dropped for
-    SGLD models, so this replaces them. An explicit attention_backend wins.
+    FastH3 8-Step V2 trains at 0.8 sparsity, as the native loader defaults, and
+    the same GPU and execution-mode gates apply: elsewhere, and for Ref2VA files
+    (VSA-H3 does not tile the ComfyUI Ref2VA layout), attention stays dense. An
+    explicit attention_backend wins.
     """
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        vsa_h3_device_supported,
+        vsa_h3_execution_supported,
+    )
     from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.minimax_h3 import (
         has_vsa_gate,
+        is_reference_checkpoint,
     )
 
     if "attention_backend" in sgld_options or not has_vsa_gate(path):
         return
-    name = os.path.basename(path).lower()
-    if "ref2va" in name or "omniref" in name:
-        # VSA-H3 tiles references only on the native packed layout, not the
-        # ComfyUI Ref2VA layout; keep the default dense attention.
+    if is_reference_checkpoint(path):
+        return
+    if not vsa_h3_device_supported() or not vsa_h3_execution_supported(
+        enable_torch_compile=sgld_options.get("enable_torch_compile"),
+        enable_breakable_cuda_graph=sgld_options.get("enable_breakable_cuda_graph"),
+        ring_degree=sgld_options.get("ring_degree"),
+    ):
+        logger.info(
+            "FastH3 single file runs dense attention: VSA-H3 needs a supported "
+            "GPU and no torch.compile, CUDA graph or ring attention"
+        )
         return
     sgld_options["attention_backend"] = "video_sparse_attn_h3"
     sgld_options.setdefault("attention_backend_config", '{"VSA_sparsity": 0.8}')

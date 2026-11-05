@@ -40,6 +40,24 @@ def has_vsa_gate(path: str | None) -> bool:
         return any(".attn.to_gate_compress." in key for key in f.keys())
 
 
+def is_reference_checkpoint(path: str) -> bool:
+    """Whether a single file holds the Ref2VA (reference) transformer.
+
+    FastVideo's Comfy exports record the source component in the header
+    (``source: transformer_ref`` for OmniRef); the file name is the fallback.
+    """
+    name = os.path.basename(path).lower()
+    if "ref2va" in name or "omniref" in name:
+        return True
+    if not path.endswith(".safetensors") or not os.path.isfile(path):
+        return False
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        metadata = f.metadata() or {}
+    return metadata.get("source") == "transformer_ref"
+
+
 register_comfyui_checkpoint(
     "MiniMaxH3Pipeline",
     ComfyUICheckpointSpec(

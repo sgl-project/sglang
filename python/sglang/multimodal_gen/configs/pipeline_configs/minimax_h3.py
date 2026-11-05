@@ -340,6 +340,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return safetensors_list
 
 
+def vsa_h3_device_supported() -> bool:
+    """Whether this GPU runs the VSA-H3 kernels FastH3 was distilled with."""
+    if not current_platform.is_cuda():
+        return False
+    from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
+
+    capability = current_platform.get_device_capability()
+    return (
+        capability is not None
+        and (capability.major, capability.minor) in VSA_H3_CAPABILITIES
+    )
+
+
+def vsa_h3_execution_supported(
+    *, enable_torch_compile, enable_breakable_cuda_graph, ring_degree
+) -> bool:
+    """VSA-H3 does not serve torch.compile, the breakable CUDA graph or ring."""
+    return not (
+        enable_torch_compile or enable_breakable_cuda_graph or int(ring_degree or 1) > 1
+    )
+
+
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
@@ -374,20 +396,12 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
         # trained compression gate and runs slower.
         if self.resolve_transformer_attention_backend(server_args) is not None:
             return
-        if not current_platform.is_cuda():
+        if not vsa_h3_device_supported():
             return
-        from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
-
-        capability = current_platform.get_device_capability()
-        if (
-            capability is None
-            or (capability.major, capability.minor) not in VSA_H3_CAPABILITIES
-        ):
-            return
-        if (
-            server_args.enable_torch_compile
-            or server_args.enable_breakable_cuda_graph
-            or int(server_args.ring_degree or 1) > 1
+        if not vsa_h3_execution_supported(
+            enable_torch_compile=server_args.enable_torch_compile,
+            enable_breakable_cuda_graph=server_args.enable_breakable_cuda_graph,
+            ring_degree=server_args.ring_degree,
         ):
             logger.info(
                 "FastH3 runs dense attention: VSA-H3 does not serve torch.compile, "
