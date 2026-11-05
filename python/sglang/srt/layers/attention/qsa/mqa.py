@@ -1383,6 +1383,19 @@ def torch_qsa_mqa_prefill_relative(
 
 
 _QSA_PREFILL_SCALE_FOLD = envs.SGLANG_ENABLE_QSA_PREFILL_SCALE_FOLD.get()
+_QSA_PREFILL_TILE_V2 = envs.SGLANG_QSA_PREFILL_TILE_V2.get()
+
+
+def _prefill_relative_resources(q_dtype, k_dtype, heads: int, head_dim: int):
+    """Opt-in BF16 tile; preserve the stock specialization elsewhere."""
+    if (
+        _QSA_PREFILL_TILE_V2
+        and q_dtype == k_dtype == torch.bfloat16
+        and heads == 4
+        and head_dim == 128
+    ):
+        return 128, 2, 256
+    return 64, 3, 512
 
 
 def _prefill_scale_fold_applies(score_scale: Optional[float], head_dim: int) -> bool:
@@ -1440,7 +1453,9 @@ def tilelang_qsa_mqa_prefill_relative(
         )
     heads, head_dim = q.shape[1:]
     block_q = max(1, 128 // heads)
-    block_n = 64
+    block_n, num_stages, threads = _prefill_relative_resources(
+        q.dtype, k.dtype, heads, head_dim
+    )
     padding = (-rows) % block_q
     padded_rows = rows + padding
     logits = torch.empty((padded_rows, width), dtype=torch.float32, device=q.device)
@@ -1464,6 +1479,8 @@ def tilelang_qsa_mqa_prefill_relative(
         head_dim=head_dim,
         block_n=block_n,
         block_q=block_q,
+        num_stages=num_stages,
+        threads=threads,
         key_splits=_prefill_key_splits(
             padded_rows // block_q, width, block_n, q.device
         ),

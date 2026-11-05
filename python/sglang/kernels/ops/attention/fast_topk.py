@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 _FAST_TOPK_SUPPORTED_K = (512, 2048)
 _Q38C_TOPK_ZERO_START = os.environ.get("SGLANG_Q38C_TOPK_ZERO_START", "0") == "1"
+_QSA_PREFILL_SELECT_V2 = os.environ.get("SGLANG_QSA_PREFILL_SELECT_V2", "0") == "1"
+_QSA_PREFILL_SELECT_V2_HIST11 = os.environ.get("SGLANG_QSA_PREFILL_SELECT_V2_HIST11", "0") == "1"
 
 
 @cache_once
@@ -34,6 +36,28 @@ def _jit_fast_topk_module(topk: int, zero_start: bool = False) -> Module:
         *args,
         cuda_files=["elementwise/fast_topk.cuh"],
         cuda_wrappers=[("fast_topk", f"FastTopKKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_fast_topk_keycache_module(topk: int, zero_start: bool = False) -> Module:
+    assert topk == 512
+    args = make_cpp_args(topk, is_arch_support_pdl(), zero_start)
+    return load_jit(
+        "fast_topk_keycache_v1", *args,
+        cuda_files=["elementwise/cache_fast_topk.cuh"],
+        cuda_wrappers=[("fast_topk", f"KeyCacheFastTopKKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_fast_topk_hist11_module(topk: int, zero_start: bool = False) -> Module:
+    assert topk == 512
+    args = make_cpp_args(topk, is_arch_support_pdl(), zero_start)
+    return load_jit(
+        "fast_topk_keycache_hist11_v1", *args,
+        cuda_files=["elementwise/hist11_fast_topk.cuh"],
+        cuda_wrappers=[("fast_topk", f"KeyCacheHist11FastTopKKernel<{args}>::run")],
     )
 
 
@@ -68,6 +92,11 @@ def fast_topk(
         row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
     indices = score.new_empty((batch, topk), dtype=torch.int32)
 
-    module = _jit_fast_topk_module(topk, zero_start)
+    if _QSA_PREFILL_SELECT_V2 and topk == 512:
+        module = (_jit_fast_topk_hist11_module(topk, zero_start)
+                  if _QSA_PREFILL_SELECT_V2_HIST11
+                  else _jit_fast_topk_keycache_module(topk, zero_start))
+    else:
+        module = _jit_fast_topk_module(topk, zero_start)
     module.fast_topk(score, row_starts, indices, lengths)
     return indices

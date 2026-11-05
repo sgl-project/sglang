@@ -2557,6 +2557,7 @@ class Envs:
     # Fold the relative prefill scorer's 1/sqrt(128) into its store instead of a
     # separate divide over the logits (bit-identical on CUDA).
     SGLANG_ENABLE_QSA_PREFILL_SCALE_FOLD = EnvBool(False)
+    SGLANG_QSA_PREFILL_TILE_V2 = EnvBool(False)
 
     # ===================================================================
     # Symmetric memory
