@@ -1146,7 +1146,7 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            "cudaDevAttrPageableMemoryAccess (GB10, or HMM).",
             choices=["pinned", "file"],
         ),
     ] = "pinned"
