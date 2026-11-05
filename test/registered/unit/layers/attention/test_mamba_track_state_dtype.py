@@ -234,6 +234,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                         self.assertEqual(kwargs["layer_id"], layer.layer_id)
                         self.assertIs(kwargs["A_log"], layer.A_log)
                         self.assertIs(kwargs["dt_bias"], layer.dt_bias)
+                        self.assertTrue(kwargs["needs_track_state"])
                         self.assertIs(
                             kwargs["extend_prefix_lens"], batch.extend_prefix_lens
                         )

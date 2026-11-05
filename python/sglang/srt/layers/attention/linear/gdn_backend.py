@@ -1468,6 +1468,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
                 track_state=h_track_buf,
+                needs_track_state=(
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                ),
                 track_chunk_idx=(
                     forward_metadata.track_chunk_idx
                     if h_track_buf is not None

@@ -164,6 +164,107 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
                     )
             decode.assert_called_once()
 
+    def test_unaligned_tracked_prefill_uses_triton_intermediate_state(self):
+        kernel = XpuGDNKernel()
+        self.assertFalse(kernel.supports_track_state_snapshot)
+        q = k = v = torch.zeros(1, 100, 1, 2)
+        indices = torch.tensor([0], dtype=torch.int32)
+        starts = torch.tensor([0, 100], dtype=torch.int32)
+        h = torch.zeros(1, 2, 1, 2, 2)
+        with (
+            patch.object(
+                TritonGDNKernel, "extend", return_value=(v, None, h)
+            ) as triton,
+            patch.object(gdn_xpu, "gated_delta_rule") as sycl,
+        ):
+            result = kernel.extend(
+                q,
+                k,
+                v,
+                sentinel.g,
+                sentinel.beta,
+                ssm_states=sentinel.states,
+                cache_indices=indices,
+                query_start_loc=starts,
+                a=sentinel.a,
+                b=sentinel.b,
+                needs_track_state=True,
+            )
+        self.assertIs(result[2], h)
+        triton.assert_called_once()
+        sycl.assert_not_called()
+
+    @unittest.skipUnless(torch.xpu.is_available(), "requires XPU")
+    def test_tracked_prefill_returns_real_intermediate_state(self):
+        kernel = XpuGDNKernel()
+        q = torch.randn(1, 80, 1, 128, device="xpu", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        g = torch.full((1, 80, 1), -0.5, device="xpu")
+        beta = torch.full_like(g, 0.3)
+        cache_indices = torch.tensor([0], device="xpu", dtype=torch.int32)
+        ssm_states = torch.zeros(1, 1, 128, 128, device="xpu")
+
+        output, final, h = kernel.extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=torch.tensor([0, 80], device="xpu", dtype=torch.int32),
+            needs_track_state=True,
+        )
+        self.assertEqual(output.shape, v.shape)
+        self.assertIsNone(final)
+        self.assertEqual(h.shape, (1, 2, 1, 128, 128))
+
+        prefix_states = torch.zeros_like(ssm_states)
+        _, _, prefix_h = kernel.extend(
+            q[:, :64],
+            k[:, :64],
+            v[:, :64],
+            g[:, :64],
+            beta[:, :64],
+            ssm_states=prefix_states,
+            cache_indices=cache_indices,
+            query_start_loc=torch.tensor([0, 64], device="xpu", dtype=torch.int32),
+            needs_track_state=True,
+        )
+        torch.testing.assert_close(h[:, 0], prefix_h[:, 0])
+
+    def test_plain_prefill_keeps_sycl_kernel(self):
+        kernel = XpuGDNKernel()
+        q = k = v = torch.zeros(1, 100, 1, 2)
+        indices = torch.tensor([0], dtype=torch.int32)
+        starts = torch.tensor([0, 100], dtype=torch.int32)
+        with (
+            patch.object(TritonGDNKernel, "extend") as triton,
+            patch.object(gdn_xpu, "gated_delta_rule") as sycl,
+        ):
+            result = kernel.extend(
+                q,
+                k,
+                v,
+                sentinel.g,
+                sentinel.beta,
+                ssm_states=sentinel.states,
+                cache_indices=indices,
+                query_start_loc=starts,
+                a=sentinel.a,
+                b=sentinel.b,
+                A_log=sentinel.A_log,
+                dt_bias=sentinel.dt_bias,
+                has_initial_state=sentinel.has_initial_state,
+                needs_track_state=False,
+            )
+        self.assertEqual(result[0].shape, v.shape)
+        self.assertIsNone(result[1])
+        self.assertIsNone(result[2])
+        sycl.assert_called_once()
+        triton.assert_not_called()
+
     def test_prefill_conv_uses_device_kernel_and_optional_block_table(self):
         backend = object.__new__(GDNAttnBackend)
         x = torch.zeros(3, 4)
