@@ -33,7 +33,7 @@ import itertools
 import math
 import re
 from io import BytesIO
-from typing import Callable, Literal, Optional, Sequence
+from typing import Callable, Iterator, Literal, Optional, Sequence
 
 import numpy as np
 import pybase64
@@ -563,6 +563,7 @@ def run_dp_sharded_mrope_vision_model(
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
     pass_grid_thw_list: bool = False,
+    encode_local_items: Optional[Callable[[list[int]], torch.Tensor]] = None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -582,6 +583,9 @@ def run_dp_sharded_mrope_vision_model(
         pool_temporal_dimension: Whether the vision model pools away the temporal
                    grid dimension. Its output length is then h * w divided by
                    the spatial merge area instead of t * h * w divided by it.
+        encode_local_items: Return packed embeddings for the assigned item indices,
+            owning both preprocessing and encoding. This permits bounded local
+            batches without gathering a full rank-local pixel buffer first.
         pass_grid_thw_list: Forward the existing host grid list to the vision
             model so graph-aware towers do not materialize it from a CUDA tensor.
     Returns:
@@ -598,8 +602,14 @@ def run_dp_sharded_mrope_vision_model(
         ```
 
     """
-    if pixel_values is None and load_local_pixel_values is None:
-        raise ValueError("pixel_values or load_local_pixel_values must be provided")
+    if (
+        pixel_values is None
+        and load_local_pixel_values is None
+        and encode_local_items is None
+    ):
+        raise ValueError(
+            "pixel values, a local loader or a local encoder must be provided"
+        )
 
     input_device = (
         pixel_values.device if pixel_values is not None else pixel_values_device
@@ -612,6 +622,8 @@ def run_dp_sharded_mrope_vision_model(
 
     tp_size = get_parallel().attn_tp_size
     if tp_size == 1:
+        if encode_local_items is not None:
+            return encode_local_items(list(range(len(grid_thw_list))))
         if pixel_values is None:
             pixel_values = load_local_pixel_values(list(range(len(grid_thw_list))))
         grid_thw = torch.tensor(
@@ -671,7 +683,9 @@ def run_dp_sharded_mrope_vision_model(
 
     # Get the pixel values for the local images based on the image_idxs_local
     if len(image_idxs_local) > 0:
-        if load_local_pixel_values is not None:
+        if encode_local_items is not None:
+            pixel_values_local = None
+        elif load_local_pixel_values is not None:
             pixel_values_local = load_local_pixel_values(image_idxs_local)
         else:
             assert pixel_values is not None
@@ -720,7 +734,9 @@ def run_dp_sharded_mrope_vision_model(
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
     # Run the vision model on the local pixel_values_local
-    if packed_2d_rope:
+    if encode_local_items is not None and image_idxs_local:
+        image_embeds_local = encode_local_items(image_idxs_local)
+    elif packed_2d_rope:
         if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
             # Packed MoonViT reads grid_thw as CPU shape metadata. Placing it
             # on CUDA would make each .tolist() call synchronize with the host.
@@ -887,3 +903,25 @@ def run_dp_presharded_mrope_vision_model(
         start = rank * max_output_length
         pieces.append(gathered[start : start + output_length])
     return torch.cat(pieces, dim=0)
+
+
+def iter_frame_bounded_image_batches(
+    indices: Sequence[int], grid_thw_list: Sequence[Sequence[int]], max_frames: int
+) -> Iterator[list[int]]:
+    """Preserve whole temporal items and their order within a frame budget."""
+    if max_frames <= 0:
+        raise ValueError("max_frames must be positive")
+    group = []
+    frames = 0
+    for index in indices:
+        count = int(grid_thw_list[index][0])
+        if not 1 <= count <= max_frames:
+            raise ValueError("A temporal item does not fit the vision frame budget")
+        if group and frames + count > max_frames:
+            yield group
+            group = []
+            frames = 0
+        group.append(index)
+        frames += count
+    if group:
+        yield group
