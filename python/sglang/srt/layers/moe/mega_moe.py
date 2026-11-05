@@ -68,8 +68,8 @@ def _mega_moe_mma_type(experts) -> str:
     return "fp8xfp8" if experts.w13_weight.dtype == torch.float8_e4m3fn else "fp8xfp4"
 
 
-@functools.lru_cache(maxsize=2)
-def _mega_moe_max_num_sms(decode_like: bool = False) -> Optional[int]:
+@functools.cache
+def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
     if _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
@@ -78,13 +78,13 @@ def _mega_moe_max_num_sms(decode_like: bool = False) -> Optional[int]:
     # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
     # indexer reconfigure that process-wide, so reserving on top would compound.
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    reserved_num_sms = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get()
-    decode_reserved_num_sms = (
+    reserved_num_sms = max(
+        0,
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(),
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_RESERVED_SMS.get()
+        if decode_like
+        else 0,
     )
-    if decode_like and decode_reserved_num_sms is not None:
-        reserved_num_sms = max(reserved_num_sms, decode_reserved_num_sms)
-    reserved_num_sms = max(reserved_num_sms, 0)
     return max(2, num_sms - reserved_num_sms)
 
 
@@ -452,6 +452,8 @@ def _run_mega_routed(
             else float(moe.routed_scaling_factor)
         )
 
+    mode = forward_batch.forward_mode if forward_batch is not None else None
+    decode_like = mode is not None and (mode.is_decode() or mode.is_target_verify())
     return run_mega_routed_experts(
         moe.experts,
         hidden_states,
@@ -471,11 +473,7 @@ def _run_mega_routed(
         routing_in_buffer=routing is not None and routing.in_buffer,
         buf=buf,
         eplb_load_row=eplb_load_row,
-        decode_like=forward_batch is not None
-        and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        ),
+        decode_like=decode_like,
     )
 
 

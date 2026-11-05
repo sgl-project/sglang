@@ -1575,7 +1575,7 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     # Decode and target-verify only; never below SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_RESERVED_SMS = EnvInt(None)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_RESERVED_SMS = EnvInt(0)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)

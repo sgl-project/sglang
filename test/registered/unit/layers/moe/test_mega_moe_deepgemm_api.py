@@ -36,7 +36,7 @@ from sglang.srt.runtime_context import (
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-_REAL_MEGA_MOE_MAX_NUM_SMS = mega_moe._mega_moe_max_num_sms
+_UNCACHED_MEGA_MOE_MAX_NUM_SMS = mega_moe._mega_moe_max_num_sms.__wrapped__
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
@@ -145,24 +145,18 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
 
     def test_decode_reserved_sms_applies_to_decode_only(self):
-        max_num_sms = _REAL_MEGA_MOE_MAX_NUM_SMS
-        self.addCleanup(max_num_sms.cache_clear)
+        max_num_sms = _UNCACHED_MEGA_MOE_MAX_NUM_SMS
         props = SimpleNamespace(multi_processor_count=212)
         with (
             patch.object(mega_moe, "_device_sm", 107),
             patch.object(torch.cuda, "get_device_properties", return_value=props),
         ):
-            for decode_reserved, prefill, decode in (
-                (None, 210, 210),
-                (18, 210, 194),
-                (0, 210, 210),
-            ):
+            for decode_reserved, decode in ((0, 210), (1, 210), (18, 194)):
                 with self.subTest(decode_reserved=decode_reserved):
-                    max_num_sms.cache_clear()
                     with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_RESERVED_SMS.override(
                         decode_reserved
                     ):
-                        self.assertEqual(max_num_sms(False), prefill)
+                        self.assertEqual(max_num_sms(False), 210)
                         self.assertEqual(max_num_sms(True), decode)
 
     def test_buffer_cache_separates_activation_contracts(self):
