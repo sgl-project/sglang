@@ -11,6 +11,7 @@ radix remaps of resident blocks and rejected speculative tokens.
 import random
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -211,6 +212,20 @@ class TestOffloadArgs(CustomTestCase):
             ),
             _QSA_HF_CONFIG,
         )
+
+    def test_rocm_needs_eager_decode(self):
+        # ROCm runs the eager torch resolve, so decode CUDA graphs are refused
+        # before the weights load.
+        decode_graphs = SimpleNamespace(
+            decode=SimpleNamespace(backend=Backend.FULL),
+            prefill=SimpleNamespace(backend=Backend.DISABLED),
+        )
+        with patch("sglang.srt.utils.is_hip", return_value=True):
+            check_qsa_kv_offload_args(_offload_args(), _QSA_HF_CONFIG)
+            with self.assertRaisesRegex(ValueError, "ROCm.*disable-cuda-graph"):
+                check_qsa_kv_offload_args(
+                    _offload_args(cuda_graph_config=decode_graphs), _QSA_HF_CONFIG
+                )
 
     def test_refusals(self):
         cases = {

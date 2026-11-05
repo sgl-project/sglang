@@ -22,6 +22,7 @@ def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
     from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.mem_cache.qsa_kv_offload import compute_offload_layout
     from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.utils import is_hip
 
     profile = parse_qsa_profile(hf_config)
     if profile is None:
@@ -65,11 +66,12 @@ def check_qsa_kv_offload_args(cfg: Any, hf_config: Any) -> None:
             raise ValueError(f"--enable-qsa-kv-offload does not support {flag}.")
 
     graphs = cfg.cuda_graph_config
-    torch_resolve = envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
+    # Same condition as QSAKVHostOffload.use_fused: ROCm runs the torch resolve.
+    torch_resolve = envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get() or is_hip()
     if torch_resolve and graphs.decode.backend != Backend.DISABLED:
         raise ValueError(
-            "The torch reference resolve of the QSA K/V offload runs eagerly; add "
-            "--disable-cuda-graph."
+            "The QSA K/V offload resolves eagerly on ROCm and with "
+            "SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE=1; add --disable-cuda-graph."
         )
     if graphs.prefill.backend != Backend.DISABLED:
         raise ValueError(
