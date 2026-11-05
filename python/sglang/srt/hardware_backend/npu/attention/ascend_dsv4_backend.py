@@ -1576,6 +1576,15 @@ class DeepseekV4AscendAttnBackend(
         values = positions[: request_num * n_draft].reshape(-1) + (1 - ratio)
         self._stable_compact_1d(dst, values, boundary_mask.reshape(-1))
 
+    def _h2d_pinned_async(
+        self, cpu_tensor: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Async H2D via pinned staging: .to(device) from pageable memory
+        blocks until the whole queue drains on NPU."""
+        pin = torch.empty(cpu_tensor.numel(), dtype=dtype, pin_memory=True)
+        pin.copy_(cpu_tensor.reshape(-1))
+        return pin.to(self.device, non_blocking=True)
+
     def _build_dsv4_graph_replay_ctx(self, forward_batch: ForwardBatch):
         graph_mode = forward_batch.forward_mode
         runtime_mode = getattr(forward_batch, "actual_forward_mode", None) or graph_mode
@@ -1658,7 +1667,7 @@ class DeepseekV4AscendAttnBackend(
                 # seq_lens_cpu at the committed/live prefix length.
                 live_seq_lens_cpu = raw_seq_lens_cpu
                 final_seq_lens_cpu = live_seq_lens_cpu + int(tokens_per_bs)
-            live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
+            live_seq_lens = self._h2d_pinned_async(live_seq_lens_cpu, torch.int32)
         elif (
             forward_batch.seq_lens is not None
             and forward_batch.seq_lens.device.type != "cpu"
@@ -1669,7 +1678,7 @@ class DeepseekV4AscendAttnBackend(
         else:
             live_seq_lens_cpu = seq_lens_cpu[:bs]
             final_seq_lens_cpu = live_seq_lens_cpu
-            live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
+            live_seq_lens = self._h2d_pinned_async(live_seq_lens_cpu, torch.int32)
         has_compress = self._dsv4_has_c4 or self._dsv4_has_c128
         active_target_verify = (
             graph_mode.is_target_verify() and not is_idle_replay and has_compress
@@ -1677,7 +1686,7 @@ class DeepseekV4AscendAttnBackend(
         compress_seq_lens = live_seq_lens
         compress_seq_lens_max = int(final_seq_lens_cpu.max()) if bs > 0 else 0
         if active_target_verify:
-            compress_seq_lens = final_seq_lens_cpu.to(device=device, dtype=torch.int32)
+            compress_seq_lens = self._h2d_pinned_async(final_seq_lens_cpu, torch.int32)
 
         return SimpleNamespace(
             forward_batch=forward_batch,
@@ -1713,9 +1722,7 @@ class DeepseekV4AscendAttnBackend(
         attn_seq_lens = ctx.live_seq_lens
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
-            final_seq_lens = ctx.final_seq_lens_cpu.to(
-                device=ctx.device, dtype=torch.int32
-            )
+            final_seq_lens = self._h2d_pinned_async(ctx.final_seq_lens_cpu, torch.int32)
             attn_seq_lens = torch.where(
                 valid_verify_rows, final_seq_lens, ctx.live_seq_lens
             )
@@ -2546,7 +2553,7 @@ class DeepseekV4AscendAttnBackend(
 
         if not indices:
             return
-        gather = torch.cat(indices)[: dst.numel()].to(device=positions.device)
+        gather = self._h2d_pinned_async(torch.cat(indices)[: dst.numel()], torch.int64)
         dst[: gather.numel()].copy_(torch.gather(positions, 0, gather))
 
     def _fill_verify_positions_cmp_padding_one(
@@ -2578,10 +2585,7 @@ class DeepseekV4AscendAttnBackend(
 
         if indices.numel() == 0:
             return
-        # This tiny H2D copy runs on the verify metadata path. Keep it blocking:
-        # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
-        # surface later as an unrelated CopyKernel stream failure.
-        indices = indices[: dst.numel()].to(device=positions.device)
+        indices = self._h2d_pinned_async(indices[: dst.numel()], torch.int64)
         # ``indices`` selects the final token of each newly completed group.
         # The compressed KV applies RoPE at the group's first token, matching
         # the decode path and ``comp_pos = (position // ratio) * ratio``.
