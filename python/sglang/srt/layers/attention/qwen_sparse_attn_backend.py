@@ -346,6 +346,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         return group, runtime
 
+    def _store_kv_cache(self, layer, loc, k, v) -> None:
+        pool = self.token_to_kv_pool
+        if getattr(pool, "qsa_raw_kv_sharding", None) is not None:
+            pool.set_kv_buffer(layer, loc, k, v)
+            return
+        self.kv_layers.layer(layer.layer_id).store(layer, loc, k, v)
+
     def _dispatch_owner_sparse_attention(
         self,
         q: torch.Tensor,
@@ -1593,6 +1600,8 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _supports_fused_kv_pool(pool):
+        if getattr(getattr(pool, "cache_sharding_runtime", None), "enabled", False):
+            return False
         if type(pool) in (HybridLinearKVPool, QSATokenToKVPool):
             storage = pool.full_kv_pool
         elif type(pool) is MHATokenToKVPool:
@@ -1724,9 +1733,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self.kv_layers.layer(layer.layer_id).store(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv_cache(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1867,9 +1874,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if save_kv_cache:
             # out_cache_loc was trimmed to the full extend token count by
             # prepare_cp_forward; write all new tokens on every rank.
-            self.kv_layers.layer(layer.layer_id).store(
-                layer, forward_batch.out_cache_loc, k_full, v_full
-            )
+            self._store_kv_cache(layer, forward_batch.out_cache_loc, k_full, v_full)
         num_local_rows = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
         q = q[:num_local_rows].contiguous()
         indices = topk_indices[:num_local_rows].to(torch.int32).contiguous()
@@ -2156,9 +2161,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self.kv_layers.layer(layer.layer_id).store(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv_cache(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         output = self._forward_paged_attention(
             q, layer, forward_batch, topk_indices
