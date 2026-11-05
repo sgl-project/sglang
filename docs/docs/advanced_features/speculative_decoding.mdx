@@ -425,7 +425,8 @@ accept the same prefixes; the server warns that the flag has no effect.
 keeps the longest accepted prefix, including when an earlier prefix was rejected.
 It uses a corresponding correction distribution to preserve target sampling.
 Use `--speculative-use-rejection-sampling` alone for token-wise verification, which
-stops at the first rejected token.
+stops at the first rejected token. Neither flag is available on Intel XPU, where
+EAGLE-family verification is greedy.
 Greedy requests keep their existing verification behavior.
 
 Block verification adds vocabulary reductions during verification. Benchmark your

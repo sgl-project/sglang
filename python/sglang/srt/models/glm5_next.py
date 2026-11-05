@@ -114,6 +114,7 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_lora,
     get_mm,
@@ -1963,8 +1964,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
