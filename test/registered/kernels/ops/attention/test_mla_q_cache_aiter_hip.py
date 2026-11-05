@@ -209,6 +209,31 @@ def test_writer_matches_split_chain_bytes(writer, cache_dtype):
     assert torch.count_nonzero(cache[untouched]).item() == 0
 
 
+@pytest.mark.parametrize("tokens", [1, 8, 33])
+def test_writer_fp8_q_out_matches_quant_then_pad(tokens):
+    """With the backend's fp8 query buffer, the writer must store the bytes the asm
+    verify used to build itself: static FP8 quant of cat(q_nope, q_pe), which
+    saturates at +-448, copied into a zeroed 16-head buffer. The q_pe part
+    saturates only with an AITER that clamps its rope output, so it stays in range."""
+    from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+
+    writer = KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64).cuda()
+    values = _inputs(tokens, cache_dtype=dtypes.fp8)
+    values["q_nope"][:, 0, :4] = 1.0e4
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    buf = torch.zeros(64, 16, 576, device="cuda", dtype=dtypes.fp8)[:tokens]
+
+    q, _ = writer.write(**_writer_inputs(values), get_fp8_q_out=lambda: (buf, scale))
+    torch.cuda.synchronize()
+
+    bf16_q = torch.cat((values["q_nope"], values["q_pe"]), dim=-1)
+    quant, _ = scaled_fp8_quant(bf16_q.reshape(tokens, -1), scale)
+    expected = torch.zeros(tokens, 16, 576, device="cuda", dtype=dtypes.fp8)
+    expected[:, :12] = quant.view(tokens, 12, 576)
+    assert q.data_ptr() == buf.data_ptr()
+    assert torch.equal(q.view(torch.uint8), expected.view(torch.uint8))
+
+
 def test_writer_graph_survives_a_larger_eager_batch(writer):
     """A captured step keeps reading the zero positions it saw,
     even after a larger eager batch replaces the shared buffer."""

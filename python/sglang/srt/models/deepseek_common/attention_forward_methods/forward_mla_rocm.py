@@ -9,6 +9,7 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -51,6 +52,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
     get_kv_layers,
     get_token_to_kv_pool,
 )
@@ -1245,6 +1247,14 @@ class DeepseekMLARocmForwardMixin:
         # the owner sub-pool, and at the batch's swa_loc for any other.
         if not kv_layer.owner:
             return None
+        # The writer calls this only when it runs the AITER op, so a declined
+        # write allocates no fp8 buffer.
+        get_fp8_q_out = functools.partial(
+            get_attn_backend().mla_fp8_q_out,
+            forward_batch=forward_batch,
+            num_tokens=q_nope_out.shape[0],
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+        )
         return self.rocm_mla_q_cache_writer.write(
             q_nope=q_nope_out,
             q_pe=q_pe,
@@ -1255,6 +1265,7 @@ class DeepseekMLARocmForwardMixin:
             k_scale_float=self.attn_mqa.k_scale_float,
             attention_backend=self.current_attention_backend,
             is_target_verify=mode.is_target_verify(),
+            get_fp8_q_out=get_fp8_q_out,
         )
 
     def _dcp_q_gather_dtype(self: DeepseekV2AttentionMLA) -> Optional[torch.dtype]:

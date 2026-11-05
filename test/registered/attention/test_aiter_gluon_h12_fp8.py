@@ -812,5 +812,94 @@ class TestFp8QAsmQueryCast(CustomTestCase):
         self.assertIs(scale, original_scale)
 
 
+class TestFp8QOut(CustomTestCase):
+    """The query writer's FP8 buffer exists only where the asm verify reads it."""
+
+    def _make_backend(self):
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        be = AiterAttnBackend.__new__(AiterAttnBackend)
+        be.use_mla_fp8_q_asm = True
+        be.num_head = 12
+        be.num_head_padded = 16
+        be.mla_kernel_num_head_padded = 16
+        be.head_pad_mode = "zero"
+        be.kv_cache_dtype = fp8_dtype
+        be.mla_verify_backend = "asm"
+        be.dcp_world_size = 1
+        be.device = "cpu"
+        be.input_dtype = torch.bfloat16
+        be.q_scale = torch.ones(1)
+        be._fp8_q_buffer = None
+        be._retired_fp8_q_buffers = []
+        be.forward_metadata = mock.Mock(
+            max_q_len=8, work_metadata=torch.empty(1, dtype=torch.int32)
+        )
+        return be
+
+    def _fb(self, *, verify):
+        mode = mock.Mock()
+        mode.is_target_verify.return_value = verify
+        return mock.Mock(forward_mode=mode)
+
+    @mock.patch(
+        "sglang.srt.layers.attention.aiter_backend.is_gfx95_supported",
+        return_value=True,
+    )
+    def test_only_asm_target_verify_gets_a_buffer(self, _gfx95):
+        """forward_decode reshapes q by the model head count, so a 16-head buffer
+        there would be misread; Gluon verify reads bf16 at 12 heads."""
+        be = self._make_backend()
+        self.assertIsNone(
+            be.mla_fp8_q_out(
+                forward_batch=self._fb(verify=False), num_tokens=8, head_dim=576
+            )
+        )
+        with mock.patch.object(be, "_mla_verify_runs_gluon", return_value=True):
+            self.assertIsNone(
+                be.mla_fp8_q_out(
+                    forward_batch=self._fb(verify=True), num_tokens=8, head_dim=576
+                )
+            )
+        buf, scale = be.mla_fp8_q_out(
+            forward_batch=self._fb(verify=True), num_tokens=8, head_dim=576
+        )
+        self.assertEqual((buf.shape, buf.dtype), ((8, 16, 576), fp8_dtype))
+        self.assertIs(scale, be.q_scale)
+        # The writer fills heads 0..11 only; the pad heads must start zero.
+        self.assertEqual(torch.count_nonzero(buf.view(torch.uint8)).item(), 0)
+
+    def test_capture_never_allocates(self):
+        """A buffer created during capture would be zeroed only at replay."""
+        be = self._make_backend()
+        with mock.patch.object(be, "_mla_verify_runs_gluon", return_value=False):
+            with mock.patch(
+                "torch.cuda.is_current_stream_capturing", return_value=True
+            ):
+                self.assertIsNone(
+                    be.mla_fp8_q_out(
+                        forward_batch=self._fb(verify=True), num_tokens=8, head_dim=576
+                    )
+                )
+
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd", create=True)
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.scaled_fp8_quant")
+    def test_padded_fp8_q_goes_straight_to_the_kernel(self, mock_quant, mock_mla):
+        be = self._make_backend()
+        be._mla_ps_kernel_enabled = mock.Mock(return_value=False)
+        q = torch.zeros(8, 16, 576, dtype=fp8_dtype)
+        out = be._mla_decode_fwd_with_head_pad(
+            q,
+            torch.zeros(4, 1, 1, 576, dtype=fp8_dtype),
+            _layer(),
+            max_seqlen_q=8,
+            q_scale=torch.full((1,), 3.0),
+        )
+        mock_quant.assert_not_called()
+        self.assertIs(mock_mla.call_args.args[0], q)
+        self.assertIs(mock_mla.call_args.kwargs["q_scale"], be.q_scale)
+        self.assertEqual(out.shape, (8, 12, 512))
+
+
 if __name__ == "__main__":
     unittest.main()

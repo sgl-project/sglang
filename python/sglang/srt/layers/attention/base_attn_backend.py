@@ -481,3 +481,13 @@ class AttentionBackend(ABC):
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
         return None
+
+    def mla_fp8_q_out(
+        self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Where an MLA query writer stores q when this forward's kernel reads it
+        as FP8 padded to the kernel head count: ``(buffer, q_scale)``, the
+        buffer ``[num_tokens, kernel_heads, head_dim]`` with zero pad heads.
+        None means the backend takes q in the model dtype at the model head count.
+        """
+        return None

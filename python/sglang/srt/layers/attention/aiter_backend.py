@@ -714,6 +714,11 @@ class AiterAttnBackend(AttentionBackend):
         self.q_scale = self.k_scale = self.v_scale = torch.tensor(
             [1.0], dtype=torch.float32
         ).to(self.device)
+        # Target-verify FP8 query for the fp8-Q asm MLA kernel, written by the
+        # model's query writer (mla_fp8_q_out); pad heads are zeroed once.
+        self._fp8_q_buffer: Optional[torch.Tensor] = None
+        # Captured graphs keep reading a replaced buffer's pointer.
+        self._retired_fp8_q_buffers: list[torch.Tensor] = []
 
         self.logits_soft_cap = 0.0
 
@@ -1628,6 +1633,52 @@ class AiterAttnBackend(AttentionBackend):
             and _asm_cprr_supports_shape(self.cprr_kernel_heads, q_len)
         )
 
+    def _mla_verify_runs_gluon(self, q_len: int) -> bool:
+        """Whether MLA target verify runs on Gluon instead of the asm kernel."""
+        return prefer_mla_gluon_decode(
+            head_pad_mode=self.head_pad_mode,
+            num_head=self.num_head,
+            kv_cache_dtype=self.kv_cache_dtype,
+        ) and not (
+            self._mla_ps_kernel_enabled()
+            and self.mla_verify_backend == "asm"
+            and self._asm_ps_supports_qlen(q_len)
+        )
+
+    def mla_fp8_q_out(
+        self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        # Target verify only: forward_decode reshapes q to the model head count.
+        if not (
+            self.use_mla_fp8_q_asm
+            and forward_batch.forward_mode.is_target_verify()
+            and self.forward_metadata is not None
+            and self.forward_metadata.work_metadata is not None
+            and not self._mla_verify_runs_gluon(self.forward_metadata.max_q_len or 1)
+        ):
+            return None
+        buf = self._fp8_q_buffer
+        if buf is None or buf.shape[0] < num_tokens or buf.shape[2] != head_dim:
+            if torch.cuda.is_current_stream_capturing():
+                # A zero fill recorded into a graph runs only at replay.
+                return None
+            if buf is None:
+                logger.info(
+                    "aiter MLA: target verify reads the fp8 query the Q/cache writer "
+                    "padded to %d heads",
+                    self.num_head_padded,
+                )
+            else:
+                self._retired_fp8_q_buffers.append(buf)
+            rows = 1 << (num_tokens - 1).bit_length()
+            buf = torch.zeros(
+                (rows, self.num_head_padded, head_dim),
+                dtype=fp8_dtype,
+                device=self.device,
+            )
+            self._fp8_q_buffer = buf
+        return buf[:num_tokens], self.q_scale
+
     def _mla_decode_fwd_with_head_pad(
         self,
         q: torch.Tensor,
@@ -1654,6 +1705,19 @@ class AiterAttnBackend(AttentionBackend):
             # their KV, and that KV can be NaN. Gluon, the kernel this path
             # replaces, does not read row 0.
             k_buffer_flat[0].zero_()
+        if (
+            self.head_pad_mode == "zero"
+            and q.dtype == fp8_dtype
+            and q.shape[1] == self.num_head_padded
+        ):
+            # The query writer quantized and padded q into mla_fp8_q_out's buffer.
+            kwargs["q_scale"] = self.q_scale
+            o = q.new_empty(
+                (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            mla_decode_fwd(q, k_buffer_flat, o, **kwargs)
+            return o[:, :num_head, :]
         # Draft extend has no persist metadata under PERSIST=0 and keeps its bf16 query.
         fp8_q_asm_call = (
             self.use_mla_fp8_q_asm and kwargs.get("work_meta_data") is not None
@@ -4225,15 +4289,7 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
-                if prefer_mla_gluon_decode(
-                    head_pad_mode=getattr(self, "head_pad_mode", "none"),
-                    num_head=getattr(self, "num_head", layer.tp_q_head_num),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                ) and not (
-                    self._mla_ps_kernel_enabled()
-                    and self.mla_verify_backend == "asm"
-                    and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
-                ):
+                if self._mla_verify_runs_gluon(self.forward_metadata.max_q_len or 1):
                     return mla_gluon_decode(
                         q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         k_buffer=K_Buffer,

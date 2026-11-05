@@ -106,9 +106,17 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
         k_scale_float: Optional[float],
         attention_backend: str,
         is_target_verify: bool,
+        get_fp8_q_out: Optional[
+            Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]
+        ] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Return (q, k placeholder) after writing Q and the KV cache,
-        or None to leave both to the split rope/concat/cache chain."""
+        or None to leave both to the split rope/concat/cache chain.
+
+        ``get_fp8_q_out`` calls the attention backend's ``mla_fp8_q_out``, only once
+        the AITER op will run: q is then written to that buffer in FP8, and the
+        padded buffer is returned as q.
+        """
         backends = _TARGET_VERIFY_BACKENDS if is_target_verify else _DECODE_BACKENDS
         if (
             attention_backend not in backends
@@ -136,7 +144,9 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
             slot_mapping=out_cache_loc.contiguous(),
             k_scale=self._unit_scale,
         )
-        q = self._write_aiter(kernel_args=kernel_args, num_heads=num_heads)
+        q = self._write_aiter(
+            kernel_args=kernel_args, num_heads=num_heads, get_fp8_q_out=get_fp8_q_out
+        )
         if q is None:
             q = self._write_triton(kernel_args=kernel_args)
         if q is None:
@@ -167,7 +177,13 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
         )
 
     def _write_aiter(
-        self, *, kernel_args: dict, num_heads: int
+        self,
+        *,
+        kernel_args: dict,
+        num_heads: int,
+        get_fp8_q_out: Optional[
+            Callable[[], Optional[Tuple[torch.Tensor, torch.Tensor]]]
+        ],
     ) -> Optional[torch.Tensor]:
         if not mla_q_cache_aiter_hip.available():
             print_warning_once(
@@ -177,6 +193,16 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
             )
             return None
         q_nope = kernel_args["q_nope"]
+        fp8_q_out = None if get_fp8_q_out is None else get_fp8_q_out()
+        if fp8_q_out is None:
+            q_out = torch.empty(
+                (q_nope.shape[0], num_heads, self._head_dim),
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            q_scale = self._unit_scale
+        else:
+            q_out, q_scale = fp8_q_out
         aiter_args = dict(
             kernel_args,
             # The identity tables have one row and not every kernel clamps positions,
@@ -186,12 +212,8 @@ class KimiK3RocmMlaQCacheWriter(nn.Module):
             ),
             cos_cache=self._identity_cos,
             sin_cache=self._identity_sin,
-            out=torch.empty(
-                (q_nope.shape[0], num_heads, self._head_dim),
-                dtype=q_nope.dtype,
-                device=q_nope.device,
-            ),
-            q_scale=self._unit_scale,
+            out=q_out,
+            q_scale=q_scale,
         )
         if not mla_q_cache_aiter_hip.covered(**aiter_args):
             print_warning_once(
