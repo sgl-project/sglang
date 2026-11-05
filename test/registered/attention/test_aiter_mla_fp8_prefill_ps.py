@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -17,6 +18,7 @@ if _RUNNABLE:
     from sglang.srt.layers.attention.aiter_backend import (
         AiterAttnBackend,
         ForwardMetadata,
+        _aiter_has_mla_reduce_v1_instance,
     )
     from sglang.srt.layers.attention.merge_state import merge_state
     from sglang.srt.utils import is_gfx95_supported
@@ -25,7 +27,7 @@ if _RUNNABLE:
 
 QK_NOPE, QK_ROPE, V_HEAD = 128, 64, 128
 SCALE = (QK_NOPE + QK_ROPE) ** -0.5
-# Kimi-K3 at TP8: no mla_reduce_v1 instance in the pinned AITER, so it pads to 16.
+# Kimi-K3 at TP8: runs natively when the compiled mla_reduce_v1 has 12 heads, else pads to 16.
 KIMI_K3_TP8_HEADS = 12
 
 
@@ -50,6 +52,20 @@ def _backend(num_heads, q_lens):
         max_kv_len=None,
     )
     return backend
+
+
+def _backend_without_reduce_instance(num_heads, q_lens):
+    """The backend as built against an AITER whose compiled mla_reduce_v1 lacks num_heads."""
+    _aiter_has_mla_reduce_v1_instance.cache_clear()
+    try:
+        with mock.patch(
+            "aiter.ops.attention.mla_reduce_v1_supports",
+            return_value=False,
+            create=True,
+        ):
+            return _backend(num_heads, q_lens)
+    finally:
+        _aiter_has_mla_reduce_v1_instance.cache_clear()
 
 
 def _layer(num_heads):
@@ -101,9 +117,18 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         """Heads without an mla_reduce_v1 instance pad up to one;
         padding must not perturb the real heads' output or LSE, nor reach a missing instance."""
         q_lens, kv_lens = [300, 77], [517, 1200]
-        for num_heads in (KIMI_K3_TP8_HEADS, 16):
-            with self.subTest(num_heads=num_heads):
-                backend = _backend(num_heads, q_lens)
+        # Which 12-head path runs depends on the installed AITER, so also force the padded one.
+        for num_heads, pad in (
+            (KIMI_K3_TP8_HEADS, False),
+            (KIMI_K3_TP8_HEADS, True),
+            (16, False),
+        ):
+            with self.subTest(num_heads=num_heads, pad=pad):
+                if pad:
+                    backend = _backend_without_reduce_instance(num_heads, q_lens)
+                    self.assertEqual(backend.fp8_prefill_num_head, 16)
+                else:
+                    backend = _backend(num_heads, q_lens)
                 kv_indptr = torch.zeros(len(kv_lens) + 1, dtype=torch.int32)
                 kv_indptr[1:] = torch.tensor(kv_lens).cumsum(0)
                 ps = backend._build_prefill_ps_metadata(

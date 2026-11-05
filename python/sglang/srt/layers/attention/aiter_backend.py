@@ -161,18 +161,13 @@ _MLA_REDUCE_V1_OPTIONAL_HEADS = {128: frozenset({12})}
 @functools.lru_cache(maxsize=None)
 def _aiter_has_mla_reduce_v1_instance(num_head: int, head_dim: int) -> bool:
     # mla_reduce_v1 aborts the process on a shape it has no instance for,
-    # so probe the source it is built from: one reduce_instances/nh<H>_hd<D>.cu per shape.
+    # so ask the compiled AITER, as its own planner does;
+    # an AITER without the query (ROCm/aiter#6107) pads instead.
     try:
-        from aiter.jit.core import AITER_CSRC_DIR
+        from aiter.ops.attention import mla_reduce_v1_supports
     except ImportError:
         return False
-    return os.path.isfile(
-        os.path.join(
-            AITER_CSRC_DIR,
-            "kernels/mla/reduce_instances",
-            f"nh{num_head}_hd{head_dim}.cu",
-        )
-    )
+    return mla_reduce_v1_supports(num_heads=num_head, head_dim=head_dim)
 
 
 # Persist
