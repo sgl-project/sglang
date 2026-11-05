@@ -48,12 +48,12 @@ class TunedFrontGemm:
 
 
 @functools.cache
-def _first_untuned_tokens(*, n: int, k: int, min_tokens: int, max_tokens: int):
+def _first_untuned_tokens(
+    *, get_tuned_config: Callable, n: int, k: int, min_tokens: int, max_tokens: int
+):
     """First batch size in the window with no tuned bf16 row, or None."""
-    from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config
-
     for m in range(min_tokens, max_tokens + 1):
-        config = get_GEMM_A16W16_tuned_config(
+        config = get_tuned_config(
             M=m,
             N=n,
             K=k,
@@ -71,31 +71,35 @@ def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
         envs.SGLANG_USE_AITER.get() and envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.get()
     ):
         return None
-    try:
-        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-        from aiter.tuned_gemm import tgemm
-    except ImportError as e:
-        raise ImportError(
-            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT=1 needs aiter.tuned_gemm.tgemm and "
-            "get_GEMM_A16W16_tuned_config, which this AITER build lacks."
-        ) from e
-
+    # Declines that need no AITER come first, so they warn even on an AITER without tgemm.
     if unquant._skip_aiter_unquant:
         print_warning_once(
             "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT is ignored with deterministic "
             "inference: AITER picks the kernel and split-K by batch size."
         )
         return None
-    shape, target = tuple(weight.shape), (get_gfx(), get_cu_num())
-    if (
-        weight.dtype != torch.bfloat16
-        or shape != _TUNED_FRONT_SHAPE
-        or target != _TUNED_FRONT_TARGET
-    ):
+    shape = tuple(weight.shape)
+    if weight.dtype != torch.bfloat16 or shape != _TUNED_FRONT_SHAPE:
         print_warning_once(
             "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT is set but only covers a bf16 "
-            f"{_TUNED_FRONT_SHAPE} front (TP8) on {_TUNED_FRONT_TARGET}; got "
-            f"{weight.dtype} {shape} on {target}, keeping the default GEMM."
+            f"{_TUNED_FRONT_SHAPE} front (TP8); got {weight.dtype} {shape}, "
+            "keeping the default GEMM."
+        )
+        return None
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+        from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config, tgemm
+    except ImportError as e:
+        raise ImportError(
+            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT=1 needs aiter.tuned_gemm.tgemm and "
+            "get_GEMM_A16W16_tuned_config, which this AITER build lacks."
+        ) from e
+
+    target = (get_gfx(), get_cu_num())
+    if target != _TUNED_FRONT_TARGET:
+        print_warning_once(
+            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT is set but only covers the "
+            f"front on {_TUNED_FRONT_TARGET}; got {target}, keeping the default GEMM."
         )
         return None
     min_tokens = envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.get()
@@ -107,7 +111,11 @@ def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
         )
     # Without its tuned rows tgemm silently falls back to a default kernel.
     untuned = _first_untuned_tokens(
-        n=shape[0], k=shape[1], min_tokens=min_tokens, max_tokens=max_tokens
+        get_tuned_config=get_GEMM_A16W16_tuned_config,
+        n=shape[0],
+        k=shape[1],
+        min_tokens=min_tokens,
+        max_tokens=max_tokens,
     )
     if untuned is not None:
         raise RuntimeError(

@@ -37,10 +37,11 @@ _MAX_REL_ERR = 2e-2
 class TestTunedFrontGemmGfx950(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
-        if get_gfx() != "gfx950":
-            raise unittest.SkipTest("AITER's tuned front rows are gfx950 only")
+        # A partitioned gfx950 has fewer CUs, and AITER keys its rows on the CU count.
+        if (get_gfx(), get_cu_num()) != ("gfx950", 256):
+            raise unittest.SkipTest("AITER's tuned front rows are 256-CU gfx950 only")
         gen = torch.Generator(device="cuda").manual_seed(0)
         cls.weight = (
             torch.randn(_FRONT_N, _FRONT_K, device="cuda", generator=gen) * 0.02
@@ -73,11 +74,17 @@ class TestTunedFrontGemmGfx950(CustomTestCase):
     def test_default_window_is_tuned_up_to_its_last_batch(self):
         """tgemm silently runs an untuned kernel for a batch without a row; the
         default window must end at the pinned AITER's last contiguous front row (M=128)."""
+        from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config
+
         self.assertTrue(self.tuned.covers(_LAST_TUNED_M))
         self.assertFalse(self.tuned.covers(_LAST_TUNED_M + 1))
         self.assertIsNone(
             _first_untuned_tokens(
-                n=_FRONT_N, k=_FRONT_K, min_tokens=1, max_tokens=_LAST_TUNED_M
+                get_tuned_config=get_GEMM_A16W16_tuned_config,
+                n=_FRONT_N,
+                k=_FRONT_K,
+                min_tokens=1,
+                max_tokens=_LAST_TUNED_M,
             )
         )
 

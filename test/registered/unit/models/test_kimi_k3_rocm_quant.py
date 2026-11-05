@@ -164,13 +164,17 @@ class TestTunedFrontGemm(CustomTestCase):
         for name, kwargs in (
             ("SGLANG_USE_AITER off", dict(use_aiter=False, aiter=no_aiter)),
             ("switch off", dict(enabled=False, aiter=no_aiter)),
-            ("TP4 front shape", dict(weight=_shaped(7552, 7168))),
-            ("fp16 front", dict(weight=_shaped(6016, 7168, torch.float16))),
+            # Shape and dtype declines need no AITER, so they hold even without tgemm.
+            ("TP4 front shape", dict(weight=_shaped(7552, 7168), aiter=no_aiter)),
+            (
+                "fp16 front",
+                dict(weight=_shaped(6016, 7168, torch.float16), aiter=no_aiter),
+            ),
             ("gfx942", dict(aiter=_fake_aiter(gfx="gfx942"))),
             # A partitioned gfx950 has fewer CUs, and AITER keys rows on the CU count.
             ("gfx950 with 32 CUs", dict(aiter=_fake_aiter(cu_num=32))),
             # AITER picks the kernel and split-K by batch size.
-            ("deterministic inference", dict(deterministic=True)),
+            ("deterministic inference", dict(deterministic=True, aiter=no_aiter)),
         ):
             with self.subTest(name):
                 self.assertIsNone(self._build(**kwargs))
@@ -179,6 +183,10 @@ class TestTunedFrontGemm(CustomTestCase):
         without_tgemm = {**_fake_aiter(), "aiter.tuned_gemm": None}
         with self.assertRaises(ImportError):
             self._build(aiter=without_tgemm)
+        without_probe = _fake_aiter()
+        del without_probe["aiter.tuned_gemm"].get_GEMM_A16W16_tuned_config
+        with self.assertRaisesRegex(ImportError, "get_GEMM_A16W16_tuned_config"):
+            self._build(aiter=without_probe)
         with self.assertRaises(RuntimeError):
             self._build(aiter=_fake_aiter(rows_up_to=0))
 

@@ -755,8 +755,6 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
-        if _is_hip and not self._front_is_ep_pair:
-            self._tuned_front = build_tuned_front_gemm(weight=self._front_w)
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
@@ -765,6 +763,9 @@ class KimiK3MoE(nn.Module):
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+        # _forward_fused is the only reader; skip the AITER probe when it never runs.
+        if _is_hip and self._eligible_for_fused_front:
+            self._tuned_front = build_tuned_front_gemm(weight=self._front_w)
 
     @cached_property
     def _routed_needs_reduce(self):
