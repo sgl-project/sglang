@@ -30,6 +30,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_xpu_ci,
 )
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -60,7 +61,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         origin_input_ids = list(range(64))
     if output_ids is None:
         output_ids = []
-    req = SimpleNamespace(
+    req = FakeReq(
         rid=rid,
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
@@ -70,7 +71,6 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         finished_reason=None,
         hisparse_staging=False,
         staging=False,
-        inflight_middle_chunks=0,
     )
     req.finished = lambda: req.finished_reason is not None
     return req
