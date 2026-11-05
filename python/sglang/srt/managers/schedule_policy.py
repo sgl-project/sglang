@@ -353,12 +353,23 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        buffer_pipeline = (
+            getattr(self.tree_cache, "buffer_pipeline", None)
+            if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            else None
+        )
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
             match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
+            if buffer_pipeline is not None:
+                staged_prefix_len = buffer_pipeline.peek_staged_prefix_len(r)
+                r.num_matched_prefix_tokens = max(
+                    r.num_matched_prefix_tokens,
+                    min(staged_prefix_len, r._compute_max_prefix_len(len(prefix_ids))),
+                )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -367,7 +378,12 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            matched_prefix_len = (
+                r.num_matched_prefix_tokens
+                if buffer_pipeline is not None
+                else r.prefix_len
+            )
+            if matched_prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(
