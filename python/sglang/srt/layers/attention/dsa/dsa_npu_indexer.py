@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import torch
 
@@ -83,8 +82,7 @@ def plan_indexer_query_shard(
     )
 
 
-@dataclass
-class _IndexerQueryShard:
+class _IndexerQueryShard(NamedTuple):
     """This rank's rows of an extend batch, and how to reassemble the top-k."""
 
     start: int
