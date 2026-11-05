@@ -44,6 +44,7 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter.__path__ = []
     fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
     fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
+    fake_aiter.dtypes = SimpleNamespace(fp8="fp8")
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
@@ -321,6 +322,8 @@ def test_aiter_runner_requests_deterministic_mxfp4_moe(
     )
 
     assert captured.get("deterministic", False) is expected
+    # Deterministic mode passes its one activation dtype explicitly.
+    assert (captured.get("quant_dtype_a") == "fp8") is expected
 
 
 if __name__ == "__main__":

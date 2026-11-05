@@ -264,7 +264,12 @@ class AiterRunnerCore(MoeRunnerCore):
         if _use_aiter_deterministic_moe(
             self.config, quant_info.w13_weight, quant_info.expert_mask
         ):
+            from aiter import dtypes
+
             extra["deterministic"] = True
+            # Deterministic mode takes one activation dtype for every token
+            # count from the caller: MXFP8.
+            extra["quant_dtype_a"] = dtypes.fp8
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
