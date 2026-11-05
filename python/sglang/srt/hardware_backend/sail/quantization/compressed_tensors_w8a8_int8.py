@@ -18,10 +18,11 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.utils import is_sail, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -165,7 +166,7 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
                 or (requested_backend.is_auto() and envs.SGLANG_SAIL_DEEPGEMM_MOE.get())
             ):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-                import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401
+                import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401
             elif get_moe_a2a_backend().is_deepep() or requested_backend.is_deep_gemm():
                 raise ValueError(
                     "SAIL INT8 DeepEP requires an available DeepGEMM backend"

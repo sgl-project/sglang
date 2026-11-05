@@ -3,7 +3,7 @@
 The upstream ``DeepGemmRunnerCore`` dispatches FP8/blockwise, MXFP4 and INT4
 grouped GEMMs. SAIL's EP path additionally needs per-channel FP8, INT8 and a
 separate MXFP4/INT4 weight layout, none of which upstream supports, so they are
-kept here instead of growing the shared runner. ``sail_deepgemm_moe.py`` is the
+kept here instead of growing the shared runner. ``deepgemm_moe.py`` is the
 tensor-parallel counterpart of this module.
 
 SAIL's DeepGEMM also takes the per-expert row counts explicitly (``nopad``
