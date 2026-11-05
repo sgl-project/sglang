@@ -96,7 +96,7 @@ class RippleDetector(HermesDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<tool_call>\n{{"name": {json.dumps(name)}, "arguments": ',
+            begin=f'<tool_call>\n{{"name": {json.dumps(name, ensure_ascii=False)}, "arguments": ',
             end="}\n</tool_call>",
             trigger="<tool_call>",
         )

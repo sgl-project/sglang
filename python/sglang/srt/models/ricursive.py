@@ -24,7 +24,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import attention_backends, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 _is_cuda = is_cuda()
@@ -279,12 +279,6 @@ class RicursiveForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if "flashinfer" in attention_backends():
-            raise ValueError(
-                "Ricursive mixes sliding and full attention layers, and "
-                "--attention-backend flashinfer drops the window in prefill. "
-                "Use fa3, fa4, trtllm_mha or triton."
-            )
         self.config = config
         self.model = RicursiveModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)

@@ -1612,8 +1612,11 @@ class RippleDetector(BaseReasoningFormatDetector):
                     break
                 else:
                     # A trailing newline may be the one before </think>.
-                    held = self._ends_with_partial_token(
-                        buffer, "\n" + self.think_end_token
+                    held = max(
+                        self._ends_with_partial_token(
+                            buffer, "\n" + self.think_end_token
+                        ),
+                        self._ends_with_partial_token(buffer, self.think_end_token),
                     )
                     reasoning += buffer[: len(buffer) - held]
                     self._buffer = buffer[len(buffer) - held :]

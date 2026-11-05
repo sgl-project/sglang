@@ -1,0 +1,43 @@
+"""Config-time override declarations for ricursive."""
+
+from typing import Any, Dict
+
+from sglang.srt.arg_groups.model_override_base import (
+    _register_for,
+    is_attention_backend_not_set,
+    resolving_view,
+)
+from sglang.srt.runtime_context import get_platform
+
+
+@_register_for("RicursiveForCausalLM")
+def _ricursive_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    # forward_extend's no-prefix branch runs without window_left, and Ripple's
+    # sliding layers need the window as soon as a prompt outgrows it.
+    if "flashinfer" in (
+        cfg.attention_backend,
+        cfg.prefill_attention_backend,
+        cfg.decode_attention_backend,
+    ):
+        raise ValueError(
+            "Ricursive's sliding attention layers can't use "
+            "--attention-backend flashinfer: it drops the window in prefill."
+        )
+    overrides: Dict[str, Any] = {}
+    if not get_platform().is_cuda:
+        return overrides
+    if get_platform().is_sm100:
+        default_backend = "trtllm_mha"
+    elif get_platform().is_sm90:
+        default_backend = "fa3"
+    else:
+        default_backend = "triton"
+    if is_attention_backend_not_set(cfg):
+        overrides["attention_backend"] = default_backend
+    elif cfg.attention_backend is None:
+        if cfg.prefill_attention_backend is None:
+            overrides["prefill_attention_backend"] = default_backend
+        if cfg.decode_attention_backend is None:
+            overrides["decode_attention_backend"] = default_backend
+    return overrides

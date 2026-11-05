@@ -1892,6 +1892,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {},
         )
 
+    def test_ricursive_never_resolves_to_flashinfer(self):
+        from sglang.srt.arg_groups.model_overrides.ricursive import (
+            _ricursive_overrides,
+        )
+
+        def args(attention=None, prefill=None, decode=None):
+            return SimpleNamespace(
+                attention_backend=attention,
+                prefill_attention_backend=prefill,
+                decode_attention_backend=decode,
+            )
+
+        with patch(
+            "sglang.srt.arg_groups.model_overrides.ricursive.resolving_view",
+            side_effect=lambda cfg: cfg,
+        ):
+            for facts, backend in (
+                ({"is_sm100": True, "is_sm90": False}, "trtllm_mha"),
+                ({"is_sm100": False, "is_sm90": True}, "fa3"),
+                ({"is_sm100": False, "is_sm90": False}, "triton"),
+            ):
+                with override_platform(is_cuda=True, **facts):
+                    self.assertEqual(
+                        _ricursive_overrides(args(), None),
+                        {"attention_backend": backend},
+                    )
+                    self.assertEqual(
+                        _ricursive_overrides(args(prefill="triton"), None),
+                        {"decode_attention_backend": backend},
+                    )
+            with override_platform(is_cuda=True, is_sm100=False, is_sm90=False):
+                self.assertEqual(_ricursive_overrides(args("fa3"), None), {})
+            for explicit in (
+                args("flashinfer"),
+                args(prefill="flashinfer"),
+                args(decode="flashinfer"),
+            ):
+                with self.assertRaisesRegex(ValueError, "flashinfer"):
+                    _ricursive_overrides(explicit, None)
+
     def test_gpt_oss_mxfp4_forces_bfloat16(self):
         from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 
