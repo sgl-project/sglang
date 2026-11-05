@@ -97,8 +97,8 @@ def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
         _warn_aiter_get_config_failed()
         return None
     if config["NUM_KSPLIT"] != 1:
-        # Split-K configs are left to AITER's get_splitk;
-        # the stale-LDS NaN did not reproduce on the M <= 8 split-K defaults on MI355X.
+        # Split-K configs are left to AITER's get_splitk; its uneven one-split fallback (M <= 8 defaults)
+        # loads scales via registers, not direct-to-LDS, so triton#11256 does not hit it (Triton 3.7.0).
         return None
     k = 2 * k_packed
     even_block_k = _afp4wfp4_even_k_block(block_k=config["BLOCK_SIZE_K"], k=k)
