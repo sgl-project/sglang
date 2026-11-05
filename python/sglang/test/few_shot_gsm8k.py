@@ -117,9 +117,16 @@ def run_eval(args):
     )
     latency = time.perf_counter() - tic
 
-    # A request that failed server-side never sets "answer"; score it as invalid
-    # instead of aborting the whole eval on one transient error.
-    num_errors = sum(1 for s in states if s.error() is not None)
+    # Request errors are fatal unless the caller opts into a bounded tolerance;
+    # tolerated failures are scored as invalid.
+    max_request_errors = getattr(args, "max_request_errors", 0)
+    errors = [s.error() for s in states if s.error() is not None]
+    num_errors = len(errors)
+    if num_errors > max_request_errors:
+        raise RuntimeError(
+            f"{num_errors}/{len(states)} requests failed "
+            f"(max_request_errors={max_request_errors}): {errors[0]}"
+        ) from errors[0]
     if num_errors:
         warnings.warn(f"{num_errors}/{len(states)} requests failed; scored as invalid")
 

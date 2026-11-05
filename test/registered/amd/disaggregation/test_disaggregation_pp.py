@@ -16,6 +16,10 @@ from sglang.test.test_utils import (
 
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
 
+# Mooncake's same-node RDMA aux send stalls about once per run and 500s a few
+# requests; drop once https://github.com/sgl-project/sglang/issues/45849 is fixed.
+MAX_REQUEST_ERRORS = 5
+
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     @classmethod
@@ -98,6 +102,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
+            max_request_errors=MAX_REQUEST_ERRORS,
             host=self.base_host,
             port=int(self.lb_port),
         )
@@ -192,6 +197,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
+            max_request_errors=MAX_REQUEST_ERRORS,
             host=self.base_host,
             port=int(self.lb_port),
         )
@@ -287,6 +293,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
+            max_request_errors=MAX_REQUEST_ERRORS,
             host=self.base_host,
             port=int(self.lb_port),
         )
