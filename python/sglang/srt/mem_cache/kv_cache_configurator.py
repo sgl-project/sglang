@@ -2415,7 +2415,9 @@ class KVCacheConfigurator:
                 )
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-        kv_capability = resolve_npu_kv_capability(self.kv_cache_dtype)
+        kv_capability = resolve_npu_kv_capability(
+            self.kv_cache_dtype, is_draft_worker=self.is_draft_worker
+        )
         dsa_pool_kwargs = {}
         if is_dsa_model and get_dsa_index_kpool(self.model_config.hf_config) > 1:
             hf_config = self.model_config.hf_config

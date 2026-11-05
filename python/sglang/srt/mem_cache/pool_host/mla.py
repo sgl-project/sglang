@@ -1284,6 +1284,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             index_k_item_size = (
                 index_k_buffer.element_size() if index_k_buffer is not None else 0
             )
+            scale_item_size = (
+                scale_buffer.element_size() if scale_buffer is not None else 0
+            )
             # FP8 DSA packs V into k_buffer; the device v_buffer is empty and
             # never transferred, so the host v mirror holds no valid data and
             # must not be persisted to storage.
@@ -1316,14 +1319,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # index_page_size, 1, 1) FP32: one scale value per entry per
+                    # index_page_size, 1, 1): one scale value per entry per
                     # indexer layer.
                     ptr_list.append(
                         scale_buffer_data_ptr
                         + (indices[index] // self.page_size)
                         * index_page_size
                         * num_indexer_layers
-                        * 4
+                        * scale_item_size
                     )
             k_element_size = self.layer_num * k_item_size * self.page_size * k_width
             v_element_size = (
@@ -1335,7 +1338,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             index_k_element_size = (
                 num_indexer_layers * index_k_item_size * index_page_size * index_k_width
             )
-            scale_element_size = num_indexer_layers * 4 * index_page_size
+            scale_element_size = num_indexer_layers * scale_item_size * index_page_size
             element_size_list = []
             for _ in range(0, len(indices), self.page_size):
                 element_size_list.append(k_element_size)

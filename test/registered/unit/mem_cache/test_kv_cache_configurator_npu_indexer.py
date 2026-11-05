@@ -43,7 +43,10 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         configurator.server_args = SimpleNamespace(indexer_kv_cache_dtype="int8")
         pool = object()
 
+        from sglang.srt.runtime_context import get_context
+
         with (
+            get_context().override_server_args(),
             patch.object(
                 kcc,
                 "get_parallel",

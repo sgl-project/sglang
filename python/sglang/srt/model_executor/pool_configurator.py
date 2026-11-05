@@ -400,6 +400,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
+                        is_draft_worker=True,
                         allocate_all_layers=True,
                     )
                     draft_kv_size *= dcp_size
@@ -707,8 +708,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         *,
         kvc: KVCacheConfigurator,
         num_layers: int,
+        is_draft_worker: Optional[bool] = None,
         allocate_all_layers: bool = False,
     ) -> int:
+        if is_draft_worker is None:
+            is_draft_worker = kvc.is_draft_worker
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
@@ -722,34 +726,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.mem_cache.kv_cache_dtype import (
-                QUANT_MODE_TOKEN_INT8,
-                resolve_indexer_quant_mode,
-            )
+            from sglang.srt.hardware_backend.npu.kv_capability import resolve_npu_kv_capability
+            from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8, resolve_indexer_quant_mode
 
-            dtype = kvc.kv_cache_dtype
-            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
-            if dtype != torch.float8_e4m3fn:
-                indexer_quant_mode = resolve_indexer_quant_mode(
-                    kvc.server_args.indexer_kv_cache_dtype, dtype
-                )
-                if indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
-                    if get_dsa_index_kpool(kvc.model_config.hf_config) > 1:
-                        raise ValueError(
-                            "INT8 indexer KV cache is not supported with NPU KPool."
-                        )
-                    indexer_size_per_token = (
-                        index_head_dim + torch._utils._element_size(torch.float16)
-                    )
-                    element_size = 1
-                else:
-                    indexer_size_per_token = ceil_div(
-                        index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
-                    )
-                    # Packed INT8 MLA uses a separate BF16 indexer unless quantized.
-                    element_size = torch._utils._element_size(
-                        torch.bfloat16 if dtype == torch.int8 else dtype
-                    )
+            capability = resolve_npu_kv_capability(kvc.kv_cache_dtype, is_draft_worker=is_draft_worker)
+            legacy_int8 = resolve_indexer_quant_mode(
+                kvc.server_args.indexer_kv_cache_dtype, kvc.kv_cache_dtype
+            ) == QUANT_MODE_TOKEN_INT8
+            compression = get_dsa_index_kpool(kvc.model_config.hf_config)
+            if (legacy_int8 or capability.indexer_kv_dtype == torch.int8) and compression > 1:
+                raise ValueError("INT8 indexer KV cache is not supported with NPU KPool.")
+            index_dtype = torch.int8 if legacy_int8 else capability.indexer_kv_dtype
+            scale_dtype = torch.float16 if legacy_int8 else capability.indexer_scale_dtype
+            index_bytes = index_head_dim * index_dtype.itemsize
+            if scale_dtype is not None:
+                index_bytes += scale_dtype.itemsize
+            indexer_size_per_token = ceil_div(index_bytes, compression)
+            element_size = 1
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
