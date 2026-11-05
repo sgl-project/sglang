@@ -62,6 +62,10 @@ The implementation reuses the community K3 executor from
 [sgl-nvidia-mega #17](https://github.com/sgl-project/sgl-nvidia-mega/pull/17), with
 file-level attribution and notices retained in the source package.
 
+Shipping the binding and runtime together keeps their internal contracts
+versioned with SGLang. The native-MLA profile provides an attention control while
+retaining the same specialized executor and SGLang-owned cache state.
+
 ### Configuration
 
 The DCP/HiCache profiles support this configuration:
@@ -104,16 +108,28 @@ configured context up to 1,048,576 tokens is an admission limit, not a full
 Auxiliary hidden-state capture (`--enable-return-aux-hidden-states`) is not
 supported by these profiles. Use the native model path for layer-tap outputs.
 
+### Resource lifetime
+
+Retaining a Torch `Parameter` does not preserve its previous storage when a
+backend replaces its `.data`. Replicated-Q setup can keep the parameter's shape
+and identity while moving the local Q shard into a gathered buffer.
+
+Providers, workspaces and prefetch tables are allocated before KV sizing.
+After backend setup, `ResourceSet.bind()` prepares the attention caches and
+binds CuTe views and prefetch ranges to the final weight storage before graph
+capture. Prefetch ranges update the existing table in place, preserving its
+CuTe and driver pointers. Layout changes are rejected; replay does not rebind
+addresses or allocate replacement tables.
+
 ### Correctness and measurement scope
 
 The implementation uses a direct residual-vector norm in both AttnRes consumers
 to avoid cancellation-induced NaNs and a monotonic incremental detokenization
-cursor to avoid duplicate Unicode streaming text. MLA weight views and prefetch
-address tables bind to the final weight storage after replicated-Q setup, before
-graph capture. CPU regressions cover these host-side boundaries and numerical
-counterexamples. Earlier isolated SM103 consumer tests covered B1/B64,
-eager/graph, empty-bank and final branches; the relocated implementation still
-needs its own CUDA and full-model validation.
+cursor to avoid duplicate Unicode streaming text. CPU regressions cover these
+counterexamples, late weight-address binding and auxiliary-capture admission.
+Earlier isolated SM103 consumer tests covered B1/B64, eager/graph, empty-bank
+and final branches; the relocated implementation still needs its own CUDA and
+full-model validation.
 
 ![Historical pre-fix integrated-build throughput and p95 time to first token](/images/kimi-k3-specialized-decode/integrated-comparison.png)
 
@@ -125,6 +141,23 @@ requests reached the output cap. The original 120-second after-peer metadata
 deadline failed. Later metadata-only closure sent no generation requests and did
 not change the original strict-comparator failure. These measurements do not
 qualify the current code's task quality, capacity or performance.
+
+### Qualifying an in-tree build
+
+The remaining GPU qualification must use the exact in-tree revision under
+review. Pin the model, dependencies, launch settings and memory budget, then:
+
+- Compare stock, `k3_native_mla` and `k3_full_decode` at TP8/DCP8; include a
+  focused DCP1 check for the other advertised mode.
+- Check numerical differences and representative task outputs, including
+  naturally terminated answers and HiCache host/store restoration. Compare
+  numerical drift with stock-run variability.
+- Measure TTFT, decode latency/throughput, peak GPU memory and available KV
+  capacity with the same workload. Repeat representative points to report
+  variability, and separate decode timing from prefill and cache-restore time.
+
+These are pending checks. Earlier integration results and configured context
+limits do not replace qualification of this build.
 
 ## Architecture
 
