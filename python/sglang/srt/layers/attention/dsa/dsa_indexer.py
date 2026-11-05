@@ -1346,11 +1346,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
         dcp_size, _ = _index_k_dcp()
-        assert (
-            dcp_size == 1
-            or forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ), "DSA DCP runs the paged top-k in decode and target verify only"
+        assert dcp_size == 1 or forward_batch.forward_mode.is_decode_or_idle(), (
+            "DSA DCP runs the paged top-k in decode only"
+        )
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1938,12 +1936,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        if dsa_shards_index_k() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
-            # Widened slots of every visible position; verify rows pass their
-            # per-row (causal) global lengths.
+        if dsa_shards_index_k() and forward_batch.forward_mode.is_decode_or_idle():
+            # Widened slots of every visible position
             raw_topk_result = dcp_all_visible(
                 seq_lens_expanded,
                 metadata.get_page_table_64(),

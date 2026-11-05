@@ -5608,8 +5608,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def _index_k_rows(self, indices):
-        """Logical slots -> index-K buffer rows. Index-K sharded by token like the
-        MLA KV (K3.1 DCP) keeps this rank's rows, as the KV copy does."""
+        """Logical slots -> this rank's index-K rows (identity unless index-K is token-sharded)."""
         if not dsa_shards_index_k():
             return indices
         return maybe_dcp_kernel_indices(

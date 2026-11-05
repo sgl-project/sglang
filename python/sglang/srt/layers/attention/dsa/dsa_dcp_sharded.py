@@ -30,7 +30,7 @@ decode rows instead merge in one kernel (``DcpTopKMerge``).
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import triton
@@ -107,10 +107,7 @@ class DcpCandidateAllGather:
         return out.view(self.group.world_size * t.shape[0], *t.shape[1:])
 
     def merge_scores(self, rows: int, width: int) -> torch.Tensor:
-        # Like the candidate buffer, this scratch is consumed before the next
-        # merge. Reserve it during eager warmup and reuse it across graph batch
-        # sizes: a context-sized allocation per capture can exhaust VRAM.
-        # Never replace storage that a captured graph may still reference.
+        # Reserved outside capture and reused by every graph; never rebound once captured.
         if (
             self.merge_buffer is None
             and 0 < rows <= self.max_rows
@@ -242,17 +239,17 @@ _TOPK_MERGE: Optional[DcpTopKMerge] = None
 _TOPK_MERGE_CREATED = False
 
 
-def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
+def init_dcp_topk_merge(max_rows: int, topk: int) -> bool:
     """Collective over the DCP group; call on every rank before CUDA graph
-    capture."""
+    capture. Returns whether decode rows merge in one kernel."""
     global _TOPK_MERGE, _TOPK_MERGE_CREATED
-    if _TOPK_MERGE_CREATED:  # one buffer per process, also when create declined
-        return
-    _TOPK_MERGE_CREATED = True
-    parallel = get_parallel()
-    _TOPK_MERGE = DcpTopKMerge.create(
-        parallel.dcp_group, max_rows, topk, parallel.attn_dcp_rank
-    )
+    if not _TOPK_MERGE_CREATED:  # one buffer per process, also when create declined
+        _TOPK_MERGE_CREATED = True
+        parallel = get_parallel()
+        _TOPK_MERGE = DcpTopKMerge.create(
+            parallel.dcp_group, max_rows, topk, parallel.attn_dcp_rank
+        )
+    return _TOPK_MERGE is not None
 
 
 def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
@@ -391,22 +388,16 @@ def dcp_global_topk(
     topk: int,
     page_size: int,
     plan: torch.Tensor,
-    *,
-    all_gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Decode / target verify: global top-k over the DCP group as widened KV
-    slots, -1 padded.
+    """Decode: global top-k over the DCP group as widened KV slots, -1 padded.
 
-    Row i is a query row (decode: request i; target verify: request i // n,
-    draft step i % n). ``local_lens`` / ``global_lens``: [rows] visible keys
-    of this rank / of the whole sequence for that row. ``page_table``: [rows,
-    pages] this rank's physical page ids, which are the widened page ids of the
-    row's request:
+    Row i is request i. ``local_lens`` / ``global_lens``: [rows] visible keys
+    of this rank / of the whole sequence. ``page_table``: [rows, pages] this
+    rank's physical page ids, which are the widened page ids of the request:
     global position p maps to slot ``page_table[p // span] * span + p % span``
     with span ``page_size * dcp_size``. ``plan``: the v2 top-k plan of
-    ``global_lens``. ``all_gather`` replaces the group all-gather (tests run
-    every rank in one process). Every rank must call this with the same number
-    of rows, also when it has no local keys.
+    ``global_lens``. Every rank must call this with the same number of rows,
+    also when it has no local keys.
 
     With ``DcpTopKMerge`` the result holds only this rank's slots, which is all
     ``dcp_localize_compact`` keeps.
@@ -418,15 +409,16 @@ def dcp_global_topk(
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     if rows == 0:
         return out
-    if all_gather is None and _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
+    if _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
         return out
-    workspace = _CANDIDATE_ALL_GATHER if all_gather is None else None
-    if workspace is not None:
-        all_gather = workspace
-    if all_gather is None:
-        all_gather = partial(parallel.dcp_group.all_gather, dim=0)
+    workspace = _CANDIDATE_ALL_GATHER
+    all_gather = (
+        workspace
+        if workspace is not None
+        else partial(parallel.dcp_group.all_gather, dim=0)
+    )
 
     # Row i of `dense` holds the candidate scores at their global positions.
     # Its -inf fill depends on the lengths only, so it overlaps the local top-k
@@ -469,7 +461,7 @@ def dcp_all_visible(
     topk: int,
     page_size: int,
 ) -> torch.Tensor:
-    """Decode / target verify: every visible position as widened KV slots, for
+    """Decode: every visible position as widened KV slots, for
     rows that see at most ``topk`` keys (the indexer's k-only path), -1 padded."""
     span = page_size * get_parallel().attn_dcp_size
     rows = global_lens.shape[0]

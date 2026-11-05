@@ -690,9 +690,7 @@ class DeepseekMHAForwardMixin:
 
         kv_cache_fp8 = get_kv_layers().read(self.attn_mha.layer_id).key()
         if dsa_shards_index_k():
-            # K3.1 DCP: page_table_1_flattened holds widened slots spread over
-            # the DCP ranks: gather every rank's rows first; they come back in
-            # the order of page_table_1_flattened.
+            # K3.1 DCP: gather all ranks' rows, returned in page_table_1_flattened order.
             kv_cache_fp8 = backend.dcp_gather_kv_cache(
                 kv_cache_fp8, forward_batch, backend.forward_metadata
             )

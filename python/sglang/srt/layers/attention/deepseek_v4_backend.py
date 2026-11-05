@@ -260,8 +260,8 @@ def _create_flashmla_metadata():
     return get_mla_metadata()[0]
 
 
-# FlashMLA's head64 sm100 decode scheduling constants; not exported, so they hold
-# only for that shape and go stale silently if FlashMLA retunes it.
+# FlashMLA's sm100 head64 (and head64x2: h128/d576) decode schedule constants;
+# not exported, so they go stale silently if FlashMLA retunes them.
 _FLASHMLA_SCHED_BLOCK_SIZE_N = 64
 _FLASHMLA_SCHED_FIXED_OVERHEAD = 5
 

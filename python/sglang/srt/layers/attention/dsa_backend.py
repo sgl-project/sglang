@@ -614,11 +614,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_packed_extend_topk = _is_hip or kimi_k31
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
-        # Kimi-K3.1 DCP (index-K sharded by token, attn_dcp_size > 1): one
-        # allocator page spans physical_page_size rows on each of the
-        # attn_dcp_size ranks: req_to_token holds widened slots, and this rank's
-        # physical page id of a slot is slot // real_page_span. Other models'
-        # DSA DCP (index-K replicated) is dcp_size below.
+        # K3.1 DCP: req_to_token holds widened slots; a slot's page is slot // real_page_span.
         sharded_dcp = dsa_shards_index_k()
         self.attn_dcp_size = get_parallel().attn_dcp_size if sharded_dcp else 1
         self.attn_dcp_rank = get_parallel().attn_dcp_rank if sharded_dcp else 0
@@ -775,16 +771,13 @@ class DeepseekSparseAttnBackend(
                 prefill_impl=self.dsa_prefill_impl,
                 decode_impl=self.dsa_decode_impl,
             )
-            # decode merges top-k candidates of every request row; target
-            # verify of every draft-token row. The fused merge returns only
-            # this rank's slots, so not when indexer top-k capture needs the
-            # global ones.
-            max_rows = max(model_runner.max_running_requests, 1) * max(
-                self.speculative_num_draft_tokens or 1, 1
-            )
-            init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            if not get_exec().features.enable_return_indexer_topk:
-                init_dcp_topk_merge(max_rows, self.dsa_index_topk)
+            max_rows = max(model_runner.max_running_requests, 1)
+            # The fused merge returns only this rank's slots; top-k capture needs all.
+            if (
+                get_exec().features.enable_return_indexer_topk
+                or not init_dcp_topk_merge(max_rows, self.dsa_index_topk)
+            ):
+                init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
 
         if _is_xpu:
             self.device_capability = (0, 0)
@@ -2434,9 +2427,8 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
-        if self.attn_dcp_size > 1 and not forward_batch.forward_mode.is_target_verify():
-            # Prefill attends over the gathered KV; target verify, like decode,
-            # attends over this rank's shard and returns a partial for the merge.
+        if self.attn_dcp_size > 1:
+            # Prefill attends over the KV gathered from all ranks.
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
@@ -3541,6 +3533,12 @@ class DeepseekSparseAttnBackend(
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         num_q_heads = q_all.shape[2]
         target_q_heads = _flashmla_kv_padded_heads(num_q_heads)
+        # The schedule metadata was built for this head count
+        assert target_q_heads == (
+            self.flashmla_kv_num_q_heads_prefill
+            if self.attn_dcp_size > 1 and not dcp_partial
+            else self.flashmla_kv_num_q_heads
+        ), (target_q_heads, dcp_partial)
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
             q_input = q_all.new_zeros(
@@ -3561,9 +3559,7 @@ class DeepseekSparseAttnBackend(
         tile_scheduler_metadata = metadata.flashmla_metadata.flashmla_metadata
         num_splits = metadata.flashmla_metadata.num_splits
         if dcp_partial:
-            # Global top-k slots -> this rank's rows at the front, so the kernel
-            # walks only the keys this rank owns; it schedules its split-KV
-            # work from topk_length itself (FlashMLASchedMeta, as for DSv4).
+            # Move this rank's slots to the front; topk_length bounds the kernel's walk.
             page_table_1, topk_length = dcp_localize_compact(page_table_1)
             if get_platform().is_sm90:
                 # SM90 needs static top-k; -1 padding masks nonlocal keys.
