@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+NGRAM_EXTEND_PROMPT_WINDOW = 1024
 
 
 def _derive_tree_links(
@@ -135,6 +136,11 @@ class NGRAMWorker(BaseSpecWorker):
             )
             loaded = self.add_external_corpus(corpus_path, chunks)
             self.commit_corpus_load(corpus_path, loaded)
+            clean_chunks = [[t for t in ch if t >= 0] for ch in chunks if ch]
+            self._preloaded_trie_chunks = [ch for ch in clean_chunks if ch]
+            if self._preloaded_trie_chunks:
+                self.ngram_corpus.batch_put(self._preloaded_trie_chunks)
+                self.ngram_corpus.synchronize()
             logger.info(
                 "Loaded external ngram corpus '%s' (%d tokens).",
                 corpus_path,
@@ -149,6 +155,9 @@ class NGRAMWorker(BaseSpecWorker):
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
+        if getattr(self, "_preloaded_trie_chunks", None):
+            self.ngram_corpus.batch_put(self._preloaded_trie_chunks)
+            self.ngram_corpus.synchronize()
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -531,6 +540,13 @@ class NGRAMWorker(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            if batch.forward_mode.is_extend():
+                ext_tokens = [
+                    list(req.origin_input_ids[-NGRAM_EXTEND_PROMPT_WINDOW:])
+                    + list(req.output_ids[-self.max_trie_depth :])
+                    for req in batch.reqs
+                ]
+                self.ngram_corpus.batch_put(ext_tokens)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
