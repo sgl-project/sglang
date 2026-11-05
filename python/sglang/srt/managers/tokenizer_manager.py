@@ -3711,14 +3711,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
-        is_stream = getattr(state.obj, "stream", False)
+        is_generate = isinstance(state.obj, GenerateReqInput)
+        is_stream = is_generate and state.obj.stream
         # The scheduler echoes an abort only for a request that holds no KV
         # (queued, retracted or mid-chunk), so the routed experts of the tokens
         # it produced are gone. A non-streaming reply then carries no output
         # tokens rather than tokens without routed-experts rows.
-        drop_output = not is_stream and getattr(
-            state.obj, "return_routed_experts", False
-        )
+        drop_output = is_generate and not is_stream and state.obj.return_routed_experts
         if recv_obj.weight_versions is not None:
             add_weight_versions_to_meta_info(
                 meta_info,
