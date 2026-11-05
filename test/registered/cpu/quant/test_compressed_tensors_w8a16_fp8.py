@@ -29,6 +29,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu-intel")
 
 
+class TestCompressedTensorsW8A16Fp8MoEStrategy(CustomTestCase):
+    def test_unsupported_weight_strategies_raise_not_implemented(self):
+        for strategy in (QuantizationStrategy.BLOCK, QuantizationStrategy.TENSOR):
+            with self.subTest(strategy=strategy):
+                with self.assertRaisesRegex(
+                    NotImplementedError, f"CHANNEL.*{strategy}"
+                ):
+                    CompressedTensorsW8A16Fp8MoE(
+                        weight_quant=SimpleNamespace(strategy=strategy),
+                        input_quant=None,
+                    )
+
+
 def _quantize_fp8_channelwise(w: torch.Tensor):
     """Per-output-channel symmetric fp8_e4m3; returns (w_fp8, scale fp32
     with a trailing dim of 1, dequant) all with a channel dim of `w.size(-2)`."""

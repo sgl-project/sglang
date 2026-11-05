@@ -35,7 +35,11 @@ class CompressedTensorsW8A16Fp8MoE(CompressedTensorsMoEScheme):
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        assert self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        if self.weight_quant.strategy != QuantizationStrategy.CHANNEL:
+            raise NotImplementedError(
+                "CPU compressed-tensors FP8 MoE fallback only supports CHANNEL "
+                f"weight quantization; got {self.weight_quant.strategy}."
+            )
         assert input_quant is None or input_quant.dynamic
         self.static_input_scales = False
 
