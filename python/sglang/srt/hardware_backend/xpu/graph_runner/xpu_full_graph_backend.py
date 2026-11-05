@@ -35,31 +35,68 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-def _allocate_output_buffer(output: Any) -> Optional[torch.Tensor]:
-    if not torch.is_tensor(output) or output.ndim == 0:
-        return None
-    return torch.empty_like(output)
+def _allocate_output_buffer(output: Any) -> Optional[Any]:
+    """Same-structure buffer for a tensor or a (nested) list/tuple of
+    row-major tensors; None when any leaf is something else."""
+    if torch.is_tensor(output):
+        return None if output.ndim == 0 else torch.empty_like(output)
+    if isinstance(output, (list, tuple)) and output:
+        buffers = [_allocate_output_buffer(item) for item in output]
+        if any(buffer is None for buffer in buffers):
+            return None
+        if isinstance(output, tuple) and hasattr(output, "_fields"):
+            return type(output)(*buffers)
+        return tuple(buffers) if isinstance(output, tuple) else buffers
+    return None
 
 
-def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
-    return (
-        torch.is_tensor(output)
-        and output.ndim == output_buffer.ndim
-        and output.shape[1:] == output_buffer.shape[1:]
-        and output.shape[0] <= output_buffer.shape[0]
-        and output.dtype == output_buffer.dtype
-        and output.device == output_buffer.device
-    )
+def _output_fits_buffer(output: Any, output_buffer: Any) -> bool:
+    if torch.is_tensor(output):
+        return (
+            torch.is_tensor(output_buffer)
+            and output.ndim == output_buffer.ndim
+            and output.shape[1:] == output_buffer.shape[1:]
+            and output.shape[0] <= output_buffer.shape[0]
+            and output.dtype == output_buffer.dtype
+            and output.device == output_buffer.device
+        )
+    if isinstance(output, (list, tuple)):
+        expected_container = type(output)
+        if isinstance(output, tuple) and not hasattr(output, "_fields"):
+            expected_container = tuple
+        return (
+            isinstance(output_buffer, expected_container)
+            and len(output) == len(output_buffer)
+            and all(
+                _output_fits_buffer(item, buffer)
+                for item, buffer in zip(output, output_buffer)
+            )
+        )
+    return False
 
 
-def _copy_output_to_buffer(
-    output: Any, output_buffer: torch.Tensor
-) -> Optional[torch.Tensor]:
+def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
+    """Copy ``output`` leaf-wise into the leading rows of ``output_buffer`` and
+    return the same structure of buffer views; None when it does not fit."""
     if not _output_fits_buffer(output, output_buffer):
         return None
-    shared_output = output_buffer[: output.shape[0]]
-    shared_output.copy_(output)
-    return shared_output
+    return _copy_output_to_buffer_unchecked(output, output_buffer)
+
+
+def _copy_output_to_buffer_unchecked(output: Any, output_buffer: Any) -> Any:
+    if torch.is_tensor(output):
+        shared_output = output_buffer[: output.shape[0]]
+        shared_output.copy_(output)
+        return shared_output
+    if isinstance(output, (list, tuple)):
+        shared = [
+            _copy_output_to_buffer_unchecked(item, buffer)
+            for item, buffer in zip(output, output_buffer)
+        ]
+        if isinstance(output, tuple) and hasattr(output, "_fields"):
+            return type(output)(*shared)
+        return tuple(shared) if isinstance(output, tuple) else shared
+    raise TypeError(f"Unsupported graph output type: {type(output).__name__}")
 
 
 logger = logging.getLogger(__name__)
@@ -83,7 +120,7 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
         self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.xpu.Stream] = None
         self._reuse_output_buffer = reuse_output_buffer
-        self._output_buffer: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[Any] = None
 
     def capture_profile_context(self, options):
         profile_context = profile(

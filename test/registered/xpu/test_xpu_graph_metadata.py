@@ -1,4 +1,5 @@
 import unittest
+from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,9 +7,12 @@ import torch
 
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
     FullXPUGraphBackend,
+    _allocate_output_buffer,
+    _copy_output_to_buffer,
 )
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -261,6 +265,235 @@ class TestXPUGraphMetadata(CustomTestCase):
                     ),
                 ):
                     PrefillCudaGraphRunner(_FakeModelRunner())
+
+    def test_full_prefill_context_aware_max_context_override(self):
+        """Verify that max_seq_len_override sizes the capture page table and bounds max_seq_len_k."""
+        page_size = 16
+        configured_max_context = 1024
+        override_max_context = 64
+
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.attention_chunk_size = None
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        backend.max_context_len = configured_max_context
+        backend.full_cg_prefill_metadata = None
+        backend.req_to_token = torch.zeros((1, override_max_context), dtype=torch.int32)
+
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            seq_lens=torch.tensor([32], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([32], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([32], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            out_cache_loc=None,
+            positions=torch.arange(32, dtype=torch.int64),
+            max_seq_len_override=override_max_context,
+        )
+
+        backend._init_full_cg_prefill_metadata(forward_batch, in_capture=True)
+
+        m = backend.full_cg_prefill_metadata
+        expected_pages = (override_max_context + page_size - 1) // page_size
+        self.assertEqual(m.page_table.shape[1], expected_pages)
+        self.assertEqual(
+            backend.full_cg_prefill_strided_indices.numel(), expected_pages
+        )
+        self.assertEqual(m.max_seq_len_k, override_max_context)
+
+    def test_xpu_attention_backend_max_context_capabilities(self):
+        """Verify that XPUAttentionBackend declares prefill max context capability,
+        while keeping chunked-prefix FullCG disabled (as XPU uses plain EXTEND full graph).
+        """
+        from sglang.srt.arg_groups.choices import (
+            CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+        )
+
+        self.assertTrue(
+            XPUAttentionBackend.supports_prefill_cuda_graph_max_context_size
+        )
+        self.assertFalse(
+            getattr(
+                XPUAttentionBackend,
+                "supports_full_cuda_graph_chunked_prefix",
+                False,
+            )
+        )
+        self.assertNotIn("intel_xpu", CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS)
+
+    def test_decode_full_graph_context_optimization_and_bakes_bound(self):
+        """Verify:
+        1. In capture, metadata.max_seq_len_k is baked to max_context_len (or variant bound, not 1).
+        2. In replay, metadata.max_seq_len_k dynamically reflects actual sequence length.
+        """
+        page_size = 64
+        max_context_len = 8192
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.attention_chunk_size = None
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        backend.max_context_len = max_context_len
+        backend.is_encoder_decoder = False
+        backend.device = "cpu"
+
+        backend.req_to_token = torch.zeros((4, max_context_len), dtype=torch.int32)
+        backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
+
+        # 8192 // 64 = 128 pages
+        self.assertEqual(
+            backend.decode_cuda_graph_metadata["page_table"].shape, (2, 128)
+        )
+
+        forward_batch_capture = SimpleNamespace(
+            batch_size=2,
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: False,
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+                is_dllm_extend=lambda: False,
+                is_decode_or_idle=lambda: True,
+            ),
+            spec_info=None,
+            out_cache_loc=None,
+            encoder_lens=None,
+        )
+
+        with patch(
+            "sglang.srt.layers.attention.xpu_backend.normal_decode_set_metadata"
+        ):
+            backend._init_full_cg_decode_metadata(
+                forward_batch_capture, in_capture=True
+            )
+            self.assertEqual(backend.forward_metadata.max_seq_len_k, 8192)
+
+            forward_batch_replay = SimpleNamespace(
+                batch_size=2,
+                seq_lens=torch.tensor([128, 64], dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([128, 64], dtype=torch.int32),
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                forward_mode=SimpleNamespace(
+                    is_extend=lambda: False,
+                    is_target_verify=lambda: False,
+                    is_draft_extend_v2=lambda: False,
+                    is_dllm_extend=lambda: False,
+                    is_decode_or_idle=lambda: True,
+                ),
+                spec_info=None,
+                out_cache_loc=None,
+                encoder_lens=None,
+            )
+            backend._init_full_cg_decode_metadata(
+                forward_batch_replay, in_capture=False
+            )
+            self.assertEqual(backend.forward_metadata.max_seq_len_k, 128)
+
+    def test_xpu_context_graph_variants_splits(self):
+        """Verify XPUAttentionBackend.get_decode_graph_variants generates appropriate tiers based on split rules."""
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.page_size = 128  # 32 * 128 = 4096 threshold
+
+        # 1. Short context (<= 4096): single default tier (None returned -> 1 graph)
+        backend.max_context_len = 2048
+        variants_short = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
+        self.assertIsNone(variants_short)
+
+        # 2. Medium context (8192): short and long tiers
+        backend.max_context_len = 8192
+        variants_med = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
+        self.assertIsNotNone(variants_med)
+        self.assertEqual(variants_med.capture_labels, ("short", "long"))
+        self.assertEqual(variants_med.graph_limits, (("short", 4096),))
+        self.assertEqual(variants_med.fallback_label, "long")
+
+        # 3. Large context (32768): short, medium, long tiers
+        backend.max_context_len = 32768
+        variants_large = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
+        self.assertIsNotNone(variants_large)
+        self.assertEqual(variants_large.capture_labels, ("short", "medium", "long"))
+        self.assertEqual(
+            variants_large.graph_limits, (("short", 4096), ("medium", 16384))
+        )
+        self.assertEqual(variants_large.fallback_label, "long")
+
+        # 4. Selection based on seq_lens_cpu
+        fb_short = SimpleNamespace(seq_lens_cpu=torch.tensor([512], dtype=torch.int32))
+        self.assertEqual(variants_large.select(fb_short), "short")
+        fb_med = SimpleNamespace(seq_lens_cpu=torch.tensor([8192], dtype=torch.int32))
+        self.assertEqual(variants_large.select(fb_med), "medium")
+        fb_long = SimpleNamespace(seq_lens_cpu=torch.tensor([24000], dtype=torch.int32))
+        self.assertEqual(variants_large.select(fb_long), "long")
+
+        # A large page size must not create a duplicate or descending medium tier.
+        backend.page_size = 512
+        backend.max_context_len = 32768
+        variants_large_page = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
+        self.assertEqual(variants_large_page.capture_labels, ("short", "long"))
+        self.assertEqual(variants_large_page.graph_limits, (("short", 16384),))
+
+        backend.page_size = 64
+        variants_small_page = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
+        self.assertEqual(
+            variants_small_page.graph_limits, (("short", 2048), ("medium", 16384))
+        )
+
+    def test_full_prefill_metadata_rejects_mismatched_capture_override(self):
+        page_size = 16
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.attention_chunk_size = None
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        backend.max_context_len = 1024
+        backend.full_cg_prefill_metadata = None
+        backend.req_to_token = torch.zeros((2, 128), dtype=torch.int32)
+
+        def capture_batch(max_seq_len_override, batch_size=1):
+            return SimpleNamespace(
+                batch_size=batch_size,
+                seq_lens=torch.tensor([32] * batch_size, dtype=torch.int32),
+                extend_seq_lens=torch.tensor([32] * batch_size, dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([32] * batch_size, dtype=torch.int32),
+                req_pool_indices=torch.tensor(
+                    list(range(batch_size)), dtype=torch.int64
+                ),
+                out_cache_loc=None,
+                positions=torch.arange(32 * batch_size, dtype=torch.int64),
+                max_seq_len_override=max_seq_len_override,
+            )
+
+        backend._init_full_cg_prefill_metadata(capture_batch(64), in_capture=True)
+        self.assertEqual(backend.full_cg_prefill_metadata.page_table.shape[1], 4)
+
+        with self.assertRaisesRegex(ValueError, "one fixed max_seq_len_override"):
+            backend._init_full_cg_prefill_metadata(capture_batch(128), in_capture=True)
+
+        with self.assertRaisesRegex(ValueError, "one fixed max_seq_len_override"):
+            backend._init_full_cg_prefill_metadata(capture_batch(32), in_capture=True)
+
+        with self.assertRaisesRegex(ValueError, "one fixed max_seq_len_override"):
+            backend._init_full_cg_prefill_metadata(
+                capture_batch(64, batch_size=2), in_capture=True
+            )
+
+    def test_nested_output_copy_is_atomic_on_shape_mismatch(self):
+        output_buffer = (torch.zeros(2, 3), torch.zeros(2, 4))
+        output = (torch.ones(1, 3), torch.ones(1, 5))
+        first_leaf_before = output_buffer[0].clone()
+
+        self.assertIsNone(_copy_output_to_buffer(output, output_buffer))
+        self.assertTrue(torch.equal(output_buffer[0], first_leaf_before))
+
+    def test_namedtuple_output_buffer_reuse_preserves_type(self):
+        Output = namedtuple("Output", ("hidden", "aux"))
+        output = Output(torch.ones(1, 3), torch.ones(1, 2))
+        output_buffer = _allocate_output_buffer(output)
+
+        self.assertIsInstance(output_buffer, Output)
+        shared_output = _copy_output_to_buffer(output, output_buffer)
+        self.assertIsInstance(shared_output, Output)
+        self.assertTrue(torch.equal(shared_output.hidden, output.hidden))
 
 
 if __name__ == "__main__":
