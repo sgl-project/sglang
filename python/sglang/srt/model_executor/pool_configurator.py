@@ -342,56 +342,47 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # address space that KVCacheConfigurator allocates below.
                     draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
+                    from sglang.srt.layers.cp.utils import (
+                        get_glm_dsa_layer_split_effective_num_layers,
+                    )
+
+                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+                        kvc, num_layers
+                    )
                     if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
                         from sglang.srt.mem_cache.kv_cache_configurator import (
                             calculate_mla_kv_cache_dim,
                         )
 
-                        # The target's index-only price contains no attention
-                        # KV to scale. Charge the draft's full native KV layout.
-                        draft_kv_size = (
+                        # Restore the native attention-KV price for draft sizing.
+                        target_kv_size = (
                             calculate_mla_kv_cache_dim(
                                 model_config=kvc.model_config,
                                 kv_cache_dtype=kvc.kv_cache_dtype,
                             )
                             * torch._utils._element_size(kvc.kv_cache_dtype)
-                            * draft_num_layers
-                            * draft_loc_space_scale
-                            * dcp_size
+                            * target_kv_num_layers
                         )
                     else:
-                        target_indexer_size = (
-                            self._compute_dsa_indexer_cell_size(
-                                kvc=kvc, num_layers=num_layers
-                            )
-                            * dcp_size
-                        )
-                        target_kv_size = self._cell_size - target_indexer_size
-                        from sglang.srt.layers.cp.utils import (
-                            get_glm_dsa_layer_split_effective_num_layers,
-                        )
-
-                        target_kv_num_layers = (
-                            get_glm_dsa_layer_split_effective_num_layers(
-                                kvc, num_layers
-                            )
-                        )
-                        draft_kv_size = (
-                            int(
-                                target_kv_size * draft_num_layers / target_kv_num_layers
-                            )
-                            * draft_loc_space_scale
-                            * dcp_size
-                        )
-                    # This helper already applies the logical-space ratio.
-                    draft_indexer_size = (
-                        self._compute_dsa_indexer_cell_size(
+                        target_indexer_size = self._compute_dsa_indexer_cell_size(
                             kvc=kvc,
-                            num_layers=draft_num_layers,
-                            allocate_all_layers=True,
+                            num_layers=num_layers,
                         )
-                        * dcp_size
+                        target_indexer_size *= dcp_size
+                        target_kv_size = self._cell_size - target_indexer_size
+                    draft_kv_size = (
+                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
+                        * draft_loc_space_scale
                     )
+                    # _compute_dsa_indexer_cell_size already applies the
+                    # HiSparse logical-space ratio to the draft indexer.
+                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=draft_num_layers,
+                        allocate_all_layers=True,
+                    )
+                    draft_kv_size *= dcp_size
+                    draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     draft_kv_size = int(
