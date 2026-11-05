@@ -467,7 +467,6 @@ class TestMegakernelRuntime(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "decode_graph_aux_hidden_states"):
             lm.context.binding.assert_live()
 
-
     def test_prefill_step_uses_prefill_view_not_forward_view(self):
         """A prefill step must call prefill_view(), not forward_view(forward_batch),
         and must not seal graph-static tensors (prefill runs eagerly, never captured)."""
