@@ -17,8 +17,8 @@ from sglang.kernels.ops.gemm.router_gate_matvec import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
 )
-from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -597,7 +597,10 @@ class BailingMoE(nn.Module):
                 and getattr(quant_config, "is_fp4_experts", False)
             ),
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         # Whether to apply routed_scaling_factor at model layer.
         # For A2A MoE paths (e.g., DeepEP), the runner/post_permute does not apply it,

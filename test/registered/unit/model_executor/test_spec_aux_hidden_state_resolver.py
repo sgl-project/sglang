@@ -112,7 +112,6 @@ class TestDSparkResolverStages(unittest.TestCase):
         with (
             patch.object(_mod, "get_spec", return_value=spec),
             patch.object(_mod.ModelConfig, "from_server_args", return_value=draft),
-            patch.object(_mod, "_resolve_dflash_draft_cell_size", return_value=None),
         ):
             _mod._resolve_dflash_aux_hidden_state(
                 config=config,
