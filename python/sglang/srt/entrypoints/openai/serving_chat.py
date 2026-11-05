@@ -114,7 +114,7 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
-from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.conversation import chat_templates, generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
     uses_hunyuan_reasoning_effort,
@@ -2017,6 +2017,27 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            # The template is not rendered, but its configured stop strings
+            # still apply: without them the model can generate past the turn
+            # boundary. This mirrors _apply_conversation_template, which
+            # merges conv.stop_str with request.stop. The registered template
+            # is read directly instead of building a conversation, so no
+            # rendering happens here. An unregistered name (e.g. a Jinja
+            # template resolved elsewhere) simply contributes no stops.
+            stop: list[str] = []
+            template = chat_templates.get(self.template_manager.chat_template_name)
+            if template is not None and not request.ignore_eos:
+                template_stop = template.stop_str
+                stop = (
+                    [template_stop]
+                    if isinstance(template_stop, str)
+                    else copy.copy(template_stop or [])
+                )
+            if request.stop:
+                if isinstance(request.stop, str):
+                    stop.append(request.stop)
+                else:
+                    stop.extend(request.stop)
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
@@ -2024,7 +2045,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data=None,
                 video_data=None,
                 modalities=[],
-                stop=request.stop or [],
+                stop=stop,
             )
         elif self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
