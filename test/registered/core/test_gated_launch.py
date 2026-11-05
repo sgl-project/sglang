@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(
-    est_time=180, stage="nightly", runner_config="1-gpu-large", nightly=True
+    est_time=180, stage="nightly", runner_config="1-gpu-small", nightly=True
 )
 
 MEM_FRACTION_STATIC = 0.6
