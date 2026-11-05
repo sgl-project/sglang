@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     kill_process_tree,
 )
+from sglang.srt.utils.common import freeze_gc
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
@@ -573,6 +574,8 @@ class MultiDetokenizerRouter:
 
             # Control messages must reach every detokenizer process.
             if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
+                if isinstance(recv_obj, FreezeGCReq):
+                    freeze_gc("Detokenizer Router", recv_obj.gc_threshold)
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
                 continue

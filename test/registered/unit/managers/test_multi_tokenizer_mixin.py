@@ -1,3 +1,4 @@
+import gc
 import pickle
 import unittest
 from array import array
@@ -27,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
+    FreezeGCReq,
     RequestOutputStats,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
@@ -187,6 +189,34 @@ def _make_router(targets_by_rid=None) -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def test_router_freezes_locally_and_broadcasts_freeze_request(self):
+        original_threshold = gc.get_threshold()
+        self.addCleanup(gc.set_threshold, *original_threshold)
+        for threshold in (None, [700, 10, 1000]):
+            with self.subTest(threshold=threshold):
+                gc.set_threshold(*original_threshold)
+                router = _make_router()
+                router.recv_from_scheduler = object()
+                message = FreezeGCReq(gc_threshold=threshold)
+                sent = []
+                router._send = lambda target, obj: sent.append((target, obj))
+                with (
+                    patch.object(gc, "freeze") as freeze,
+                    patch.object(
+                        multi_tokenizer_mixin,
+                        "sock_recv",
+                        side_effect=[message, EOFError("end of input")],
+                    ),
+                    self.assertRaisesRegex(EOFError, "end of input"),
+                ):
+                    router.event_loop()
+
+                freeze.assert_called_once_with()
+                self.assertEqual(
+                    gc.get_threshold(), tuple(threshold or original_threshold)
+                )
+                self.assertEqual(sent, [(ipc, message) for ipc in router.ipc_name_list])
+
     def test_each_tokenizer_worker_freezes_locally(self):
         threshold = [700, 10, 1000]
         server_args = mock.Mock(gc_threshold=threshold)
