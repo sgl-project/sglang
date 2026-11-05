@@ -9,7 +9,7 @@ from collections.abc import Callable
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     model_parallel_is_initialized,
