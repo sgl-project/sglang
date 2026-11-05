@@ -115,6 +115,7 @@ from sglang.srt.speculative.spec_utils import (
     simulated_acc_len_generator,
     spec_stage_span,
 )
+from sglang.srt.utils import overlap_events
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -1170,8 +1171,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
-            self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
+            overlap_events.wait_stream(
+                self.plan_stream, torch.get_device_module(self.device).current_stream()
             )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
@@ -1186,8 +1187,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+            overlap_events.wait_stream(
+                torch.get_device_module(self.device).current_stream(), self.plan_stream
             )
 
         # Run draft extend batch in the main compute stream

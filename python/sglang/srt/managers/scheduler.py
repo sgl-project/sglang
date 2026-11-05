@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
+from sglang.srt.utils import overlap_events
 
 from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 
@@ -5315,7 +5316,9 @@ class Scheduler(
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    overlap_events.wait_stream(
+                        self.forward_stream, self.schedule_stream
+                    )
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -5375,7 +5378,9 @@ class Scheduler(
                                 )
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = overlap_events.copy_done_event(
+                            self.device_module
+                        )
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
@@ -5565,7 +5570,9 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    overlap_events.wait_stream(
+                        self.forward_stream, self.schedule_stream
+                    )
                     self.resolve_forward_inputs(batch, self.future_map)
                     pooler_output, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_embedding(batch)
@@ -5713,7 +5720,7 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        self.copy_stream.wait_stream(self.forward_stream)
+        overlap_events.wait_stream(self.copy_stream, self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
@@ -5734,7 +5741,7 @@ class Scheduler(
             return
 
         with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.schedule_stream)
+            overlap_events.wait_stream(self.forward_stream, self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
