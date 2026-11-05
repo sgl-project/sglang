@@ -162,6 +162,32 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
 
 
 class TestLoadImage(CustomTestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.cuda is not None,
+        "requires CUDA JPEG decoding",
+    )
+    def test_gpu_jpeg_normalizes_grayscale_and_rgb_channels(self):
+        from torchvision.io import ImageReadMode, decode_jpeg
+
+        for mode, color in [("L", 128), ("RGB", (40, 120, 200))]:
+            with self.subTest(mode=mode):
+                buf = io.BytesIO()
+                Image.new(mode, (630, 525), color).save(buf, format="JPEG")
+                data = buf.getvalue()
+                actual = _load_image(image_bytes=data, gpu_image_decode=True)
+                self.assertIsInstance(actual, torch.Tensor)
+                self.assertEqual(actual.device.type, "cuda")
+                self.assertEqual(actual.shape, (3, 525, 630))
+                expected = decode_jpeg(
+                    torch.frombuffer(data, dtype=torch.uint8),
+                    mode=ImageReadMode.RGB,
+                    device="cuda",
+                )
+                self.assertTrue(torch.equal(actual, expected))
+                if mode == "L":
+                    self.assertTrue(torch.equal(actual[0], actual[1]))
+                    self.assertTrue(torch.equal(actual[1], actual[2]))
+
     def test_corrupt_image_bytes_raise_value_error(self):
         buf = io.BytesIO()
         Image.new("RGB", (16, 16), (10, 120, 200)).save(buf, format="PNG")

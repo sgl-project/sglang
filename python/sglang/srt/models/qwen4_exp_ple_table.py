@@ -6,6 +6,9 @@ rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
     ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    ``SGLANG_QWEN4_PLE_HOST_REGISTER_CHUNK_MB`` optionally uses a contiguous
+    private mapping registered in bounded chunks. This avoids a single large
+    driver pin request on hosts with fragmented kernel allocation metadata.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -32,9 +35,12 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import math
+import mmap
 import os
 import re
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Sequence
 
@@ -62,6 +68,108 @@ PLE_FILE_RSS_TRIM_CHUNK_BYTES = 1 << 30
 # Below this many rows a gather is decode-sized (16 rows per token): the page
 # faults are cheap and the host-side hint would cost more than it saves.
 PLE_FILE_PREFETCH_MIN_ROWS = 2048
+
+# A failed unregister must never leave a mapping available for reuse while the
+# driver still owns its pages. Such mappings remain alive until process exit.
+_PLE_RETAINED_MAPPINGS = []
+
+
+def _release_registered_ple_mapping(mm, cuda_rt, device, ranges) -> None:
+    """Release every registration before the last storage view unmaps memory."""
+    previous = None
+    remaining = list(ranges)
+    try:
+        error, previous = cuda_rt.cudaGetDevice()
+        if int(error):
+            raise RuntimeError(f"cudaGetDevice failed: {error}")
+        (error,) = cuda_rt.cudaSetDevice(device)
+        if int(error):
+            raise RuntimeError(f"cudaSetDevice failed: {error}")
+        (error,) = cuda_rt.cudaDeviceSynchronize()
+        if int(error):
+            raise RuntimeError(f"cudaDeviceSynchronize failed: {error}")
+        for ptr, size in reversed(ranges):
+            (error,) = cuda_rt.cudaHostUnregister(ptr)
+            if int(error):
+                logger.error(
+                    "PLE cudaHostUnregister(%#x, %d) failed: %s", ptr, size, error
+                )
+            else:
+                remaining.remove((ptr, size))
+    except Exception as exc:
+        logger.error("PLE registered host storage cleanup failed: %s", exc)
+    finally:
+        if remaining:
+            _PLE_RETAINED_MAPPINGS.append((mm, cuda_rt, device, remaining))
+        if previous is not None:
+            cuda_rt.cudaSetDevice(previous)
+
+
+def _allocate_registered_ple_table(shape, dtype, chunk_mb):
+    """One CPU address range, pinned and mapped in bounded CUDA registrations.
+
+    The mapping is private, prefaulted and excluded from fork to avoid COW of
+    pinned pages. The buffer exporter owns the finalizer, so nn.Parameter and
+    other tensor views retain registrations even after the original tensor
+    object dies. Kernel reads retain the existing contiguous host pointer.
+    """
+    import cuda.bindings.runtime as cuda_rt
+
+    from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+        _mmap_private_parallel_prefaulted,
+    )
+
+    dimensions = tuple(int(d) for d in shape)
+    if any(d < 0 for d in dimensions):
+        raise ValueError(f"invalid PLE table shape: {dimensions}")
+    numel = math.prod(dimensions)
+    nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+    if not nbytes:
+        return torch.empty(dimensions, dtype=dtype, device="cpu")
+    chunk_bytes = int(chunk_mb) * 1024**2
+    if chunk_bytes <= 0 or chunk_bytes % mmap.PAGESIZE:
+        raise ValueError("PLE registration chunk must be positive and page aligned")
+    mapped_bytes = ((nbytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE
+    device = torch.cuda.current_device()
+    mm = _mmap_private_parallel_prefaulted(mapped_bytes, 8)
+    # torch's storage retains this exporter, including through Parameter views.
+    buffer = (ctypes.c_uint8 * mapped_bytes).from_buffer(mm)
+    base = ctypes.addressof(buffer)
+    ranges = []
+    try:
+        for offset in range(0, mapped_bytes, chunk_bytes):
+            size = min(chunk_bytes, mapped_bytes - offset)
+            ptr = base + offset
+            (error,) = cuda_rt.cudaHostRegister(
+                ptr, size, cuda_rt.cudaHostRegisterDefault
+            )
+            if int(error):
+                raise RuntimeError(
+                    f"PLE cudaHostRegister failed: {error}, offset={offset}, "
+                    f"size={size}, total={mapped_bytes}"
+                )
+            ranges.append((ptr, size))
+            error, device_ptr = cuda_rt.cudaHostGetDevicePointer(ptr, 0)
+            if int(error) or int(device_ptr) != ptr:
+                raise RuntimeError(
+                    "PLE contiguous host-pointer gathers require identical CUDA "
+                    f"and host addresses; offset={offset}, error={error}"
+                )
+        table = torch.frombuffer(buffer, dtype=dtype, count=numel).reshape(dimensions)
+    except BaseException:
+        _release_registered_ple_mapping(mm, cuda_rt, device, ranges)
+        raise
+    weakref.finalize(
+        buffer, _release_registered_ple_mapping, mm, cuda_rt, device, ranges
+    ).atexit = False
+    table._sglang_ple_registered_ranges = tuple(ranges)
+    logger.info(
+        "PLE table: %.2f GiB contiguous pinned host memory, %d registrations of <= %d MiB",
+        nbytes / 2**30,
+        len(ranges),
+        chunk_mb,
+    )
+    return table
 
 
 class PleFilePrefetcher:
@@ -241,6 +349,11 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
+        chunk_mb = envs.SGLANG_QWEN4_PLE_HOST_REGISTER_CHUNK_MB.get()
+        if chunk_mb < 0:
+            raise ValueError("PLE host registration chunk cannot be negative")
+        if chunk_mb:
+            return _allocate_registered_ple_table(shape, dtype, chunk_mb)
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1

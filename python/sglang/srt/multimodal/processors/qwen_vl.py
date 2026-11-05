@@ -374,6 +374,27 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
+        image_chunk_size = envs.SGLANG_QWEN4_IMAGE_PREPROCESS_CHUNK_SIZE.get()
+        if image_chunk_size and self.model_type == "qwen4_exp":
+            if (
+                self.keep_mm_features_on_device
+                or self.precompute_hash_before_cpu_transfer
+            ):
+                raise ValueError(
+                    "Qwen image chunks require ordinary CPU feature transport"
+                )
+            from sglang.srt.multimodal.processors.qwen_vl_image_chunks import (
+                install_cpu_transport_image_chunks,
+            )
+
+            install_cpu_transport_image_chunks(
+                _processor.image_processor, image_chunk_size
+            )
+            logger.info(
+                "Qwen GPU image preprocessing uses %d-image CPU transport chunks",
+                image_chunk_size,
+            )
+
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.IM_TOKEN_ID = hf_config.image_token_id
