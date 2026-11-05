@@ -19,5 +19,11 @@
       ".github/workflows/pr-benchmark-rust.yml",
       ".github/workflows/ci-model-inventory.yml"
     ]
+  },
+  "mlu": {
+    "label": "run-ci-mlu",
+    "workflows": [
+      ".github/workflows/pr-test-mlu.yml"
+    ]
   }
 }

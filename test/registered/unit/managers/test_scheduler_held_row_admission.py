@@ -78,7 +78,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = None
+        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False

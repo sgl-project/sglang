@@ -199,7 +199,9 @@ class DeepseekMLAForwardMixin:
             mode.is_decode()
             or mode.is_target_verify()
             or mode.is_draft_extend_v2()
-            # K3.1's sharded DSA prefill attends over the gathered KV instead
+            # K3.1's sharded DSA prefill attends over the gathered KV instead.
+            # The draft-extend clause also covers ROCm's DSA draft, which shards
+            # its KV like the target and merges per-rank partials the same way.
             or (self.use_dsa and mode.is_extend() and not dsa_shards_index_k())
         )
 

@@ -861,7 +861,10 @@ class HybridCacheController(BaseHiCacheController):
         host_group = self.mem_pool_host
         if self.is_kv_sharded:
             return self.move_hybrid_indices(op, write_back_jit=True)
-        if self.io_backend != "kernel" or host_group.layout != "page_first":
+        if self.io_backend != "kernel" or host_group.layout not in (
+            "page_first",
+            "page_unified",
+        ):
             return self.move_hybrid_indices(op)
         if not host_group.supports_per_pool_backup_indices:
             if not host_group.can_use_write_back_jit:
@@ -886,6 +889,7 @@ class HybridCacheController(BaseHiCacheController):
                     host_indices=host_indices,
                     device_indices=device_indices,
                     layer_mapper=anchor.layer_mapper,
+                    device_translate=anchor.device_translate,
                 )
             )
         for pool_transfer in pool_transfers or []:
@@ -907,6 +911,7 @@ class HybridCacheController(BaseHiCacheController):
                     host_indices=pool_transfer.host_indices,
                     device_indices=pool_transfer.device_indices,
                     layer_mapper=entry.layer_mapper,
+                    device_translate=entry.device_translate,
                 )
             )
         return transfers

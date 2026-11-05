@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import Cols, IdSpaceKind, KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,

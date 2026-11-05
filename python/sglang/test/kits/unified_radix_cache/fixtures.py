@@ -241,6 +241,10 @@ def build_fixture(
             need_sort=False,
         )
 
+    if cfg.has_mamba:
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
+
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,

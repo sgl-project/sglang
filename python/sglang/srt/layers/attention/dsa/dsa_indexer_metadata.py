@@ -104,6 +104,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     force_unfused_topk: bool = False
     # the PAGED extend runs the exact v2 packed top-k (see DSATopKBackend)
     packed_extend_topk: bool = False
+    dcp_size: int = 1
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32

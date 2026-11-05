@@ -37,6 +37,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         obj.speculative_num_steps = steps
         obj.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         obj.draft_window_size = obj.draft_sink_size = 0
+        obj.window_rail = False
         obj.kv_index_translator = SimpleNamespace(
             read_source=lambda plan, **kw: SimpleNamespace(
                 row_ids=kw["req_pool_indices"],

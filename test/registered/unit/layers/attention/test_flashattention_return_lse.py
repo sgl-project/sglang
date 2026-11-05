@@ -57,7 +57,9 @@ class TestFlashAttentionReturnLse(CustomTestCase):
                 is_draft_worker=False,
                 kv_index_translator=KVIndexTranslator(
                     req_to_token=req_pool.req_to_token,
-                    token_to_kv_pool_allocator=object(),
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        hands_out_virtual_ids=False
+                    ),
                     token_to_kv_pool=pool,
                     page_size=1,
                     device="cuda",

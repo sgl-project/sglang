@@ -3166,7 +3166,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_pool = linear.req_to_token_pool
         if not req_pool.mamba_pool.replayssm_is_kda:
             return None
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        spec_state = linear.state_pool.get_speculative_mamba2_params_all_layers()
         if len(spec_state.conv) != 1:
             return None
         slots.copy_(linear.forward_metadata.mamba_cache_indices[:bs])

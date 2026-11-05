@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
@@ -210,7 +211,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
             origin_input_ids=stored + array("q", range(100, 104)),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        pool.alloc([req])
+        acquire(pool, pool.state, [req])
         first = match_kv_cache(req, cache, req.origin_input_ids, cow_mamba=False)
         self.assertEqual((first.device_prefix_len, first.host_hit_length), (0, 16))
         req.lock = cache.lock(first.last_device_node)

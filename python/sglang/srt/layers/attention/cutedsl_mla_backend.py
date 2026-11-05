@@ -61,6 +61,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
 
     # The cute-dsl DCP kernel's LSE is natural log (is_mla_dcp_lse_base_on_e).
     dcp_lse_base_on_e: bool = True
+    # Its decode kernel takes the global causal bound and returns the
+    # rank-local LSE, so it verifies under DCP (`_run_decode_kernel`).
+    supports_dcp_target_verify = True
 
     def __init__(
         self,

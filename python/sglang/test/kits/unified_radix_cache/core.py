@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
@@ -138,7 +139,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 origin_input_ids=array("q"),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req_to_token_pool.alloc([req])
+            acquire(req_to_token_pool, req_to_token_pool.state, [req])
             params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         cache.insert(params)
 
@@ -266,7 +267,7 @@ class UnifiedMambaLRUMatchRefreshFixtures:
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         return req
 
 
@@ -288,7 +289,7 @@ class MambaCheckpointGridFixtures:
                 origin_input_ids=array("q"),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req_to_token_pool.alloc([req])
+            acquire(req_to_token_pool, req_to_token_pool.state, [req])
             cache.insert(
                 InsertParams(
                     key=RadixKey(array("q", sequence)),
@@ -334,7 +335,7 @@ class UnifiedRadixCacheInt8MambaCheckpointFixtures:
             origin_input_ids=array("q", tokens),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = array("q")
         req.kv.kv_committed_len = len(tokens)
         req.kv.kv_allocated_len = len(tokens)
@@ -365,7 +366,7 @@ class SWADraftHistoryFixtures:
             origin_input_ids=tokens,
             sampling_params=SamplingParams(temperature=0, max_new_tokens=16),
         )
-        pool.alloc([req])
+        acquire(pool, pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = tokens
         req.extend_end = len(tokens)

@@ -40,42 +40,18 @@ batch over its own buffers (`write_slots`).
 
 from __future__ import annotations
 
-import enum
-from typing import TYPE_CHECKING, Callable, Dict, Hashable, Optional, Union
+from typing import TYPE_CHECKING, Dict, Hashable, Optional, Union
 
 import msgspec
 import torch
+
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_index_translator import (
         KVIndexTable,
         KVIndexTranslator,
     )
-
-
-class IdSpaceKind(enum.Enum):
-    """A sub-pool of a runner's KV pool, as the consumers that index it name
-    it."""
-
-    # Full-attention layers: the pool's own token ids.
-    FULL = enum.auto()
-    # The sliding-window layers of a hybrid pool: the same token ids through
-    # the sliding-window sub-pool's table.
-    SLIDING_WINDOW = enum.auto()
-
-
-class IdSpace(msgspec.Struct, frozen=True):
-    """How one sub-pool names the iteration's slots.
-
-    ``write`` maps the iteration's virtual token ids to this sub-pool's ids
-    (None: they index it as they are). ``read_v2p`` is the page table its reads
-    go through (None: reads stay in `req_to_token`, for the consumer to
-    finish). Runners whose pools share a sub-pool share its ``key``, and with
-    it a plan's ids for it."""
-
-    key: Hashable
-    write: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
-    read_v2p: Optional[torch.Tensor] = None
 
 
 def window_read_extent(forward_mode, spec_info, write_ids, batch_size: int) -> int:

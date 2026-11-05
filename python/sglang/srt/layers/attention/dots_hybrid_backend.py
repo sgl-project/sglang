@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -303,8 +304,8 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
             kv_lens.append(tail_len)
 
         full_kv_indices = torch.cat(sliced_indices)
-        kv_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-            full_kv_indices
+        kv_indices = self.kv_index_translator.ids_in(
+            IdSpaceKind.SLIDING_WINDOW, full_kv_indices
         ).to(torch.int32)
         lens_cpu = torch.tensor([0, *kv_lens], dtype=torch.int32, pin_memory=True)
         self._prefill_metadata = DotsSWAMLAPrefillMetadata(

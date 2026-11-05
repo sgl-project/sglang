@@ -346,7 +346,7 @@ class MegakernelBinding:
         }
         states = {}
         for layer in mamba_mapping:
-            state = req_pool.mamba2_layer_cache(layer)
+            state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
             states[layer] = KdaStateView(
                 conv=tuple(state.conv), temporal=state.temporal
             )
@@ -394,7 +394,7 @@ class MegakernelBinding:
         if getattr(pool, "use_dsa", False):
             tensors.extend(full.index_k_with_scale_buffer)
         for layer in req_pool.mamba_map:
-            state = req_pool.mamba2_layer_cache(layer)
+            state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
             tensors.extend((*state.conv, state.temporal))
         return tuple(_identity(tensor) for tensor in tensors)
 
@@ -407,7 +407,7 @@ class MegakernelBinding:
         linear = backend.linear_attn_backend
         req_pool = linear.req_to_token_pool
         last_layer = max(req_pool.mamba_map)
-        state = req_pool.mamba2_layer_cache(last_layer)
+        state = linear.state_layer_cache(last_layer)
         linear._track_mamba_state_decode(
             forward_batch,
             state.conv[0],

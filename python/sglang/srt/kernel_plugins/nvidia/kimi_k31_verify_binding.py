@@ -270,7 +270,9 @@ class K31VerifyHostBinding:
                 index_cache = full.get_index_k_with_scale_buffer(index)
                 layers.append(VerifyLayerPools(layer_id, (), (cache, index_cache)))
             else:
-                state = req_pool.mamba2_layer_cache(layer_id)
+                state = req_pool.mamba_pool.mamba2_layer_cache(
+                    req_pool.mamba_map[layer_id]
+                )
                 if state.intermediate_ssm is not None or state.replayssm_rawv is None:
                     raise ValueError(
                         "K31 verify requires KDA ReplaySSM speculative pools"

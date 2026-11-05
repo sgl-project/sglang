@@ -292,10 +292,15 @@ class TestDecodeRetractionBackup(CustomTestCase):
             torch.arange(self.pool_size, device=self.device),
             shifts=self.pool_size // 2,
         )
-        target_pool.host_transfer_translate = lambda indices: virtual_to_physical[
-            indices
-        ]
-        source_physical_indices = target_pool.host_transfer_translate(source_indices)
+
+        def translate(indices):
+            return virtual_to_physical[indices]
+
+        # The host stack maps the controller's ids to the target pool's rows.
+        anchor = cache.host_pool_group.anchor_entry
+        self.assertIs(anchor.device_pool, target_pool)
+        anchor.device_translate = translate
+        source_physical_indices = translate(source_indices)
         self.assertFalse(torch.equal(source_indices, source_physical_indices))
 
         self._seed_pool(target_pool, source_physical_indices, base=1000)
@@ -325,9 +330,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
-        destination_physical_indices = target_pool.host_transfer_translate(
-            destination_indices
-        )
+        destination_physical_indices = translate(destination_indices)
 
         cache.restore_kv_cache(req, backup)
         self._finish_restores(cache)

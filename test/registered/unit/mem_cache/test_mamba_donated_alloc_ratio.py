@@ -53,7 +53,7 @@ class _RatioCache:
     def __init__(self, pool_size: int):
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.allocator = _BoundedMambaAllocator(pool_size)
-        self.req_to_token_pool = SimpleNamespace(mamba_allocator=self.allocator)
+        self.token_to_kv_pool_allocator = SimpleNamespace(state_slots=self.allocator)
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.prefix_nodes = []

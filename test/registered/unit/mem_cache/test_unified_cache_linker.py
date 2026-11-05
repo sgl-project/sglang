@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -672,7 +673,9 @@ class TestUnifiedCacheLinkerPythonBackend(
         self.assertEqual(set(load_by_pool), {PoolName.KV, PoolName.SWA})
         for transfer in load_by_pool.values():
             self.assertEqual(transfer.keys, all_keys[2:4])
-        translated = consumer_allocator.translate_loc_from_full_to_swa(loaded)
+        translated = consumer_allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
+            loaded
+        )
         self.assertTrue(
             torch.equal(translated, load_by_pool[PoolName.SWA].device_indices)
         )

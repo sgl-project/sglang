@@ -775,6 +775,7 @@ class DeepseekMLARocmForwardMixin:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
+                        dtype=self._dcp_q_gather_dtype(),
                     )
             elif forward_batch.forward_mode.is_extend():
                 # Assemble the full sequence into dcp_kv_buffer, which the
@@ -1096,12 +1097,34 @@ class DeepseekMLARocmForwardMixin:
         else:
             return output, topk_indices
 
+    def _dcp_q_gather_dtype(self: DeepseekV2AttentionMLA) -> Optional[torch.dtype]:
+        """FP8 KV dtype to gather q in, or None to gather it as computed.
+
+        The DCP Triton sparse-MLA kernel is then the only reader of the gathered
+        q, and it casts q to the KV dtype on load anyway: casting before the
+        wire halves the bytes without changing a single dot-product input.
+        """
+        if not (self.use_dsa and self.current_attention_backend in ("dsa", "nsa")):
+            return None
+        kernel = get_exec().kernel
+        if (
+            kernel.dsa_prefill_backend != "triton"
+            or kernel.dsa_decode_backend != "triton"
+        ):
+            return None
+        dtype = get_token_to_kv_pool().dtype
+        if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            return None
+        return dtype
+
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang/Triton DSA on gfx95.
         """
+        # The fused write targets the unsharded loc and its core path takes no LSE.
         return (
             _use_aiter_gfx95
+            and self.dcp_size == 1
             and self.current_attention_backend in ("dsa", "nsa")
             and (
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")

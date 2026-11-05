@@ -289,6 +289,11 @@ class TestHiCacheStorageRandomFailure(HiCacheStorageBaseMixin, CustomTestCase):
         }
         return server_args, env_vars
 
+    # The inherited test requires a storage hit, but an injected failure turns
+    # the prefetch into a miss; test_random_failures_degrade_to_cache_misses
+    # covers this configuration instead.
+    test_basic_backup_and_prefetch = None
+
     def test_random_failures_degrade_to_cache_misses(self):
         base_prompt = self.gen_prompt(768)
         for _ in range(10):

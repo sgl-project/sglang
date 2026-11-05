@@ -26,7 +26,8 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     model_error, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;

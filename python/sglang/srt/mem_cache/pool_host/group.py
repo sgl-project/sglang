@@ -26,6 +26,9 @@ class PoolEntry:
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
+    # Controller ids -> the device pool's rows, for a sub-pool whose ids map
+    # through its allocator (`KVStorage.host_ids`); None when they index it.
+    device_translate: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
 class HostPoolGroup:
