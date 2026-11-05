@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     ForwardMetadata,
 )
 from sglang.srt.hardware_backend.npu.attention.ascend_kpool import AscendKPoolWorkspace
+from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -38,6 +39,37 @@ class AscendDSAForwardMetadata(ForwardMetadata):
 
     # Write-side inputs and scratch owned by this forward/capture bucket.
     kpool: Optional[AscendKPoolWorkspace] = None
+
+
+@dataclass(frozen=True)
+class AscendDSAIndexerMetadata(BaseIndexerMetadata):
+    """Read-only adapter from Ascend attention metadata to the indexer API."""
+
+    attn_metadata: AscendDSAForwardMetadata
+
+    def get_seqlens_int32(self) -> torch.Tensor:
+        assert self.attn_metadata.cache_seqlens_int32 is not None
+        return self.attn_metadata.cache_seqlens_int32
+
+    def get_page_table_64(self) -> torch.Tensor:
+        assert self.attn_metadata.real_page_table is not None
+        return self.attn_metadata.real_page_table
+
+    def get_seqlens_expanded(self) -> torch.Tensor:
+        raise NotImplementedError("NPU pooled-key reads use request-level lengths")
+
+    def get_page_table_1(self) -> torch.Tensor:
+        raise NotImplementedError(
+            "NPU kpool path uses get_page_table_64, not get_page_table_1"
+        )
+
+    def get_token_to_batch_idx(self) -> torch.Tensor:
+        raise NotImplementedError("NPU pooled-key reads use request-level page tables")
+
+    def topk_transform(self, logits: torch.Tensor, topk: int, **_) -> torch.Tensor:
+        raise NotImplementedError(
+            "NPU KPool uses a vendor indexer instead of topk_transform"
+        )
 
 
 class AscendDSAAttnBackend(AscendAttnBackend):
@@ -258,11 +290,13 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         else:
             self._update_dsa_metadata(forward_batch)
 
-    def get_dsa_metadata(self) -> AscendDSAForwardMetadata:
+    def get_indexer_metadata(
+        self, layer_id: int, forward_batch: ForwardBatch
+    ) -> AscendDSAIndexerMetadata:
         metadata = self.forward_metadata
         if not isinstance(metadata, AscendDSAForwardMetadata):
             raise RuntimeError("Ascend DSA metadata is not initialized")
-        return metadata
+        return AscendDSAIndexerMetadata(attn_metadata=metadata)
 
 
 class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):

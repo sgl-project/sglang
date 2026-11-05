@@ -67,9 +67,6 @@ from sglang.srt.runtime_context import get_device, get_exec
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
-        AscendDSAForwardMetadata,
-    )
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
@@ -1950,7 +1947,9 @@ class IndexerKPool(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         """BF16 compression and request-level pooled-key selection on A3/A5."""
 
-        metadata = get_attn_backend().get_dsa_metadata()
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return None
 
         assert forward_batch.seq_lens_cpu is not None
         mode = forward_batch.forward_mode
@@ -1991,11 +1990,12 @@ class IndexerKPool(MultiPlatformOp):
         query,
         x,
         positions,
-        metadata: AscendDSAForwardMetadata,
+        metadata: BaseIndexerMetadata,
         valid_mask,
     ):
         from sgl_kernel_npu.operators.indexer import pool_key_indexer
 
+        metadata = metadata.attn_metadata
         if metadata.pool_query_ends is None:
             raise RuntimeError(
                 "NPU KPool requires request-level pooled-indexer metadata"
@@ -2061,7 +2061,7 @@ class IndexerKPool(MultiPlatformOp):
                     raise ValueError(f"NPU key_pool requires ND {name} storage")
         self._key_pool_weights_validated = True
 
-    def _update_kpool_cache_npu(self, x, layer_id, metadata: AscendDSAForwardMetadata):
+    def _update_kpool_cache_npu(self, x, layer_id, metadata: BaseIndexerMetadata):
         from sgl_kernel_npu.operators.mem_cache import key_pool, key_pool_write_cache
 
         if not getattr(self, "_key_pool_weights_validated", False):
@@ -2070,7 +2070,7 @@ class IndexerKPool(MultiPlatformOp):
             raise ValueError("NPU key_pool requires BF16 hidden states")
         pool = get_token_to_kv_pool()
         tail_k, tail_gate = pool.get_compress_tail_buffers(layer_id)
-        workspace = metadata.kpool
+        workspace = metadata.attn_metadata.kpool
         assert workspace is not None
         state = workspace.pack_history(tail_k, tail_gate)
         pooled = key_pool(
