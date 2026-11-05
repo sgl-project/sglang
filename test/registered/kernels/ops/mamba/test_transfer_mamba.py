@@ -70,7 +70,6 @@ def make_host_pool(dtype, layout):
     host.conv_dtype = dtype
     host.temporal_dtype = dtype
     host.dtype = dtype
-    host.size_per_token = host.get_size_per_token()
 
     # Allocate host buffers (page_first layout)
     temporal_dims = (SIZE, NUM_LAYERS, 1) + TEMPORAL_SHAPE
@@ -94,6 +93,7 @@ def make_host_pool(dtype, layout):
         temporal=device_pool.mamba_cache.temporal,
         conv=tuple(device_pool.mamba_cache.conv),
     )
+    host.size_per_token = host.get_size_per_token()
     host.temporal_device_ptrs = torch.tensor(
         [device_pool.mamba_cache.temporal[i].data_ptr() for i in range(NUM_LAYERS)],
         dtype=torch.uint64,
