@@ -2332,7 +2332,6 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
-    SGLANG_K31_FUSED_ROUTING = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory

@@ -16,14 +16,14 @@ if TYPE_CHECKING:
     from flashinfer.fused_moe.core import TrtllmMoERoutingMetadataSlot
     from tvm_ffi.module import Module
 
-# NOTE(nvpohanh): Kimi-K3.1 only: sigmoid + bias top-16 of 896, no expert groups.
-_K31_HIDDEN_SIZE = 3584
-_K31_NUM_EXPERTS = 896
-_K31_TOP_K = 16
+# NOTE(nvpohanh): The Kimi-K3 / K3.1 MoE only: sigmoid + bias top-16 of 896, no groups.
+_KIMI_K3_HIDDEN_SIZE = 3584
+_KIMI_K3_NUM_EXPERTS = 896
+_KIMI_K3_TOP_K = 16
 _MAX_TOKENS = 256
 
 
-class K31FusedRouting(NamedTuple):
+class FusedRouting(NamedTuple):
     weights: torch.Tensor
     ids: torch.Tensor
     x_q: torch.Tensor
@@ -32,8 +32,8 @@ class K31FusedRouting(NamedTuple):
 
 
 def max_num_ctas(num_tokens: int, tile_tokens: int) -> int:
-    remaining = num_tokens * _K31_TOP_K
-    filled = min(_K31_NUM_EXPERTS, remaining)
+    remaining = num_tokens * _KIMI_K3_TOP_K
+    filled = min(_KIMI_K3_NUM_EXPERTS, remaining)
     return filled + (remaining - filled) // tile_tokens
 
 
@@ -41,10 +41,10 @@ def max_num_ctas(num_tokens: int, tile_tokens: int) -> int:
 def _jit_module() -> Module:
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        "kimi_k31_fused_routing",
+        "kimi_k3_fused_routing",
         *args,
-        cuda_files=["moe/kimi_k31_fused_routing.cuh"],
-        cuda_wrappers=[("run", f"K31FusedRoutingKernel<{args}>::run")],
+        cuda_files=["moe/kimi_k3_fused_routing.cuh"],
+        cuda_wrappers=[("run", f"KimiK3FusedRoutingKernel<{args}>::run")],
         extra_cuda_cflags=["-O3"],
     )
 
@@ -58,7 +58,7 @@ def available() -> bool:
         return True
     except Exception as e:  # pragma: no cover - toolchain dependent
         logging.getLogger(__name__).warning(
-            f"Failed to load the JIT K3.1 fused routing kernel: {e}"
+            f"Failed to load the JIT Kimi-K3 fused routing kernel: {e}"
         )
         return False
 
@@ -82,7 +82,7 @@ def covered(
         moe_route_radix.covered(scores, bias, topk)
         and x.dim() == 2
         and 0 < x.shape[0] <= _MAX_TOKENS
-        and x.shape[1] == _K31_HIDDEN_SIZE
+        and x.shape[1] == _KIMI_K3_HIDDEN_SIZE
         and x.dtype in (torch.bfloat16, torch.float32)
         and x.stride(1) == 1
         and x.data_ptr() % 32 == 0
@@ -90,7 +90,7 @@ def covered(
     )
 
 
-def k31_fused_routing(
+def fused_routing(
     scores: torch.Tensor,
     bias: torch.Tensor,
     x: torch.Tensor,
@@ -104,7 +104,7 @@ def k31_fused_routing(
     num_local_experts: int,
     tile_tokens: int,
     weights_dtype: torch.dtype,
-) -> K31FusedRouting:
+) -> FusedRouting:
     from flashinfer.fused_moe.core import TrtllmMoERoutingMetadataSlot
 
     M = scores.shape[0]
@@ -116,16 +116,18 @@ def k31_fused_routing(
 
     weights = torch.empty((M, topk), dtype=torch.float32, device=device)
     ids = i32(M, topk)
-    x_q = torch.empty((M, _K31_HIDDEN_SIZE), dtype=torch.float8_e4m3fn, device=device)
-    x_s = i32(M, _K31_HIDDEN_SIZE // 32 // 4)
+    x_q = torch.empty(
+        (M, _KIMI_K3_HIDDEN_SIZE), dtype=torch.float8_e4m3fn, device=device
+    )
+    x_s = i32(M, _KIMI_K3_HIDDEN_SIZE // 32 // 4)
     metadata = TrtllmMoERoutingMetadataSlot(
         tile_n=tile_tokens,
         total_num_padded_tokens=i32(1),
         expanded_idx_to_permuted_idx=i32(M * topk),
         permuted_idx_to_token_idx=i32(num_ctas * tile_tokens + 1),
         expert_weights=torch.empty((M, topk), dtype=weights_dtype, device=device),
-        expert_count_histogram=i32(2 * max(_K31_NUM_EXPERTS, 256)),
-        num_tokens_per_expert=i32(_K31_NUM_EXPERTS),
+        expert_count_histogram=i32(2 * max(_KIMI_K3_NUM_EXPERTS, 256)),
+        num_tokens_per_expert=i32(_KIMI_K3_NUM_EXPERTS),
         cta_idx_xy_to_batch_idx=i32(num_ctas),
         cta_idx_xy_to_mn_limit=i32(num_ctas),
         num_non_exiting_ctas=i32(1),
@@ -156,10 +158,10 @@ def k31_fused_routing(
         int(num_local_experts),
         int(tile_tokens),
     )
-    return K31FusedRouting(weights, ids, x_q, x_s, metadata)
+    return FusedRouting(weights, ids, x_q, x_s, metadata)
 
 
-def k31_expert_weights_dtype(num_tokens: int) -> torch.dtype:
+def expert_weights_dtype(num_tokens: int) -> torch.dtype:
     if num_tokens <= moe_route_quant_fused._MAX_TOKENS:
         return torch.bfloat16
     return torch.float32

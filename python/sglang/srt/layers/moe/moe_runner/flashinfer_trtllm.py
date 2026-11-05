@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextvars
+import functools
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generator, Optional, cast
 
 import torch
+from packaging.version import Version
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -208,14 +210,25 @@ _FP4_MXFP8_TILE_NS = (8, 16, 32, 64, 128, 192, 256)
 
 
 def _trtllm_moe_default_tile_n(
-    num_tokens: int, top_k: int, num_local_experts: int, device: torch.device
+    num_tokens: int, top_k: int, num_local_experts: int
 ) -> int:
+    # Must match FlashInfer's selectDefaultTileN: FlashInfer 0.7.2 runs a
+    # [tile, -1] tactic at its own default tile, not at the tile it is given.
     tiles = _FP4_MXFP8_TILE_NS
-    if torch.cuda.get_device_capability(device) == (10, 7):
-        tiles = tuple(t for t in tiles if t != 192)
     average = num_tokens * top_k / num_local_experts
     i = next((i for i, t in enumerate(tiles) if t >= average), len(tiles) - 1)
     return tiles[max(i - 1, 0)]
+
+
+@functools.cache
+def _flashinfer_lacks_sm107_moe_fixes(device: torch.device) -> bool:
+    # FlashInfer < 0.7.3 has no FP4 tile-192 kernels and no MoE PDL on SM107
+    # (flashinfer-ai/flashinfer#6271, #6788); drop once the pin is >= 0.7.3.
+    if torch.cuda.get_device_capability(device) != (10, 7):
+        return False
+    import flashinfer
+
+    return Version(flashinfer.__version__) < Version("0.7.3")
 
 
 def _trtllm_mxfp4_moe_runner(
@@ -224,7 +237,6 @@ def _trtllm_mxfp4_moe_runner(
     num_tokens: int,
     hidden_size: int,
     top_k: int,
-    device: torch.device,
     num_experts: int,
     local_expert_offset: int,
     num_local_experts: int,
@@ -270,9 +282,7 @@ def _trtllm_mxfp4_moe_runner(
         num_experts=num_experts,
         num_fused_shared_experts=0,
     )
-    enable_pdl = trtllm_moe_enable_pdl(
-        num_tokens
-    ) and fi_moe_core._device_support_moe_pdl(device)
+    enable_pdl = trtllm_moe_enable_pdl(num_tokens)
     runner_kwargs = {
         "routing_input_mode": routing_input_mode,
         "num_experts": num_experts,
@@ -320,7 +330,7 @@ def select_trtllm_routed_body(
         and method.flashinfer_mxfp4_moe_precision == "default"
         and method.moe_runner_config.activation == "situ"
         and method.hidden_size == x.shape[-1]
-    ):
+    ) or _flashinfer_lacks_sm107_moe_fixes(x.device):
         return None
     try:
         from flashinfer.autotuner import AutoTuner
@@ -340,7 +350,6 @@ def select_trtllm_routed_body(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         top_k=top_k,
-        device=device,
         num_experts=layer.num_experts,
         local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
         num_local_experts=layer.num_local_experts,
@@ -393,7 +402,7 @@ def select_trtllm_routed_body(
         return DABody(
             tactic=-1,
             tile_n=_trtllm_moe_default_tile_n(
-                num_tokens, top_k, layer.num_local_experts, device
+                num_tokens, top_k, layer.num_local_experts
             ),
         )
     return DABody(tactic=tactic[1], tile_n=tactic[0])
@@ -416,7 +425,6 @@ def _run_trtllm_prepared_routing_moe(
         num_tokens=x_quant.shape[0],
         hidden_size=x_quant.shape[1],
         top_k=topk_ids.shape[1],
-        device=x_quant.device,
         num_experts=quant_info.global_num_experts,
         local_expert_offset=quant_info.local_expert_offset,
         num_local_experts=quant_info.local_num_experts,

@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.moe import kimi_k31_fused_routing
+from sglang.kernels.ops.moe import kimi_k3_fused_routing
 from sglang.kernels.ops.moe.moe_route_radix import route_radix
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
@@ -72,13 +72,13 @@ def _check_metadata(test, ids, meta, first, num_local, tile):
     test.assertTrue(bool((p2t[: num_ctas * tile][padding] == -1).all()))
 
 
-class TestK31FusedRouting(CustomTestCase):
+class TestKimiK3FusedRouting(CustomTestCase):
     def setUp(self):
-        if not kimi_k31_fused_routing.available():
-            self.skipTest("K3.1 fused routing kernel unavailable")
+        if not kimi_k3_fused_routing.available():
+            self.skipTest("Kimi-K3 fused routing kernel unavailable")
 
     def _run(self, scores, bias, x, *, num_valid, first, num_local, tile, wdtype):
-        return kimi_k31_fused_routing.k31_fused_routing(
+        return kimi_k3_fused_routing.fused_routing(
             scores,
             bias,
             x,
