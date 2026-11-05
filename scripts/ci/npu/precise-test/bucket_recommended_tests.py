@@ -716,7 +716,9 @@ def main():
         # succeeded; missing/empty means selection failed, so there is no
         # evidence to narrow anything down.
         decision = "full"
-        decision_reason = "changed-file list unavailable (precision selector did not run)"
+        decision_reason = (
+            "changed-file list unavailable (precision selector did not run)"
+        )
     elif enumeration_empty:
         decision = "full"
         decision_reason = "no suite enumerated any registered test file"
