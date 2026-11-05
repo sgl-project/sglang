@@ -327,6 +327,21 @@ class BaseSpecWorker(ABC):
                 mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
             )
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+                packed_mla_rows_match,
+            )
+
+            if not packed_mla_rows_match(
+                target_model_runner.token_to_kv_pool, draft_pools
+            ):
+                if len(draft_pools) != 1:
+                    raise NotImplementedError(
+                        "Heterogeneous MLA HiCache requires one draft sidecar pool."
+                    )
+                _check_hicache_draft_dcp_layout(HiCacheDraftMode.SIDECAR, draft_pools)
+                return HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.SIDECAR, device_pools=draft_pools
+                )
             _check_hicache_draft_dcp_layout(HiCacheDraftMode.PACKED, draft_pools)
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = (

@@ -6,3 +6,7 @@ metatags:
 - [Hicache Best Practices](./hicache_best_practices)
 - [Hicache Design](./hicache_design)
 - [Hicache Storage Runtime Attach Detach](./hicache_storage_runtime_attach_detach)
+
+## MLA draft storage
+
+HiCache checks the physical MLA layout before packing MTP draft layers into the target host pool. A single draft with a different row dtype, width or split layout uses a separate sidecar pool. An NPU draft with its own indexer also uses a sidecar so its index state is included in backup and restore. Multiple incompatible MLA drafts are rejected during planning. Include the sidecar in host-memory capacity planning.
