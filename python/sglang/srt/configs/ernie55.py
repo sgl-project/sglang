@@ -164,6 +164,10 @@ class Ernie5_5_MoeConfig(PretrainedConfig):
         self.q_head_norm = True
         self.kv_source_layer_ids = ()
         self.is_hybrid_swa = True
+        # Fields the MLA layers' DSA indexer reads: run its fused NeoX-rope kernels,
+        # and keep wk in bf16 (the fp8 release lists no ignored_layers for it).
+        self.index_fused_neox_rope = True
+        self.index_wk_unquantized = True
 
         ratios = [int(r) for r in compress_ratios]
         unsupported = sorted(set(ratios) - {COMPRESS_RATIO_MLA, COMPRESS_RATIO_HCA})

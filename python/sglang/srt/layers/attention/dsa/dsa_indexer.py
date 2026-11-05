@@ -24,7 +24,6 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.configs.model_config import is_ernie5_5
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
@@ -331,7 +330,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
-            and (not is_neox_style or is_ernie5_5(config))
+            and (not is_neox_style or getattr(config, "index_fused_neox_rope", False))
             and not self.skip_rope
             and not self.use_fp4_indexer
         )
@@ -386,9 +385,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
-                # ERNIE 5.5's fp8 release keeps wk in bf16 with no ignored_layers,
-                # as DeepSeek-V4 does its bf16 indexer weights.
-                quant_config=None if is_ernie5_5(config) else quant_config,
+                quant_config=(
+                    None
+                    if getattr(config, "index_wk_unquantized", False)
+                    else quant_config
+                ),
                 prefix=add_prefix("wk", prefix),
             )
             self.weights_proj = ReplicatedLinear(
