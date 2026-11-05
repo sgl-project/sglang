@@ -562,15 +562,6 @@ class ComposedPipelineBase(ABC):
             known,
             unknown,
         )
-        from sglang.multimodal_gen.runtime.managers.memory_managers.initial_residency import (
-            maybe_seed_initial_residency,
-        )
-
-        maybe_seed_initial_residency(
-            server_args,
-            self.component_weight_inventory,
-            excluded_components=self.preload_residency_excluded_components,
-        )
 
     @staticmethod
     def _validate_direct_gpu_component_selection(
