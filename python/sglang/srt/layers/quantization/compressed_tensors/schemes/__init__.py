@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.srt.hardware_backend.sail.quantization.compressed_tensors_w8a8_int8 import (
+    CompressedTensorsW8A8Int8MoE,
+)
+
 from .compressed_tensors_scheme import (
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
@@ -21,7 +25,6 @@ from .compressed_tensors_w8a8_int8 import (
     NPUCompressedTensorsW8A8Int8,
     XPUCompressedTensorsW8A8Int8,
 )
-from .compressed_tensors_w8a8_int8_generic_moe import CompressedTensorsW8A8Int8MoE
 from .compressed_tensors_w8a8_int8_moe import NPUCompressedTensorsW8A8Int8DynamicMoE
 from .compressed_tensors_w8a8_mxfp8 import CompressedTensorsW8A8MXFp8
 from .compressed_tensors_w8a16_fp8 import CompressedTensorsW8A16Fp8
