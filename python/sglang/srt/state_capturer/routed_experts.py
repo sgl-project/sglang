@@ -13,6 +13,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -133,7 +137,17 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         if self.device_cache is None:
             # Joined the all-gather; the output rank keeps the rows.
             return
-        super().capture(layer_id, topk_indices)
+        token_range = (
+            get_forward_context().tbo_parent_token_range
+            if has_forward_context()
+            else None
+        )
+        if token_range is None:
+            super().capture(layer_id, topk_indices)
+            return
+        # TBO children share this buffer and are padded to a common length.
+        start, end = token_range
+        self.device_cache.buffer[start:end, layer_id] = topk_indices[: end - start]
 
     def _get_local_slice(
         self,

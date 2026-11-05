@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
@@ -115,6 +116,17 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
                 self.assertTrue(
                     torch.equal(cap.device_cache.buffer[:4, 1, : self.TOPK_SIZE], ids)
                 )
+
+    def test_tbo_children_write_their_parent_rows(self):
+        """Children must not overwrite each other, even when padded to a common length."""
+        cap = self._capturer()
+        for token_range, value in (((0, 1), 1), ((1, 4), 2)):
+            ids = torch.full((3, self.TOPK_SIZE), value, dtype=torch.int32)
+            with forward_context(
+                ForwardContext(attn_backend=None, tbo_parent_token_range=token_range)
+            ):
+                self._capture(cap, ids, "deepep")
+        self.assertEqual(cap.device_cache.buffer[:4, 1, 0].tolist(), [1, 2, 2, 2])
 
     def test_other_widths_are_rejected(self):
         """Only the routed-only width may be padded; any other width is a caller bug."""
