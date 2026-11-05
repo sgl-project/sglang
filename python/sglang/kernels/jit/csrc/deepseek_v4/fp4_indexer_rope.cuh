@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -293,6 +294,117 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   }
 }
 
+#ifndef USE_ROCM
+/// Threads per CTA of `index_q_block_kernel`: 64 (token, head) rows.
+constexpr uint32_t kIndexQBlockThreads = 256;
+
+/// \brief `index_q_kernel` for prefill-sized row counts: one thread per 32-element
+///        fp4 block instead of one warp per row.
+///
+/// Every fp4 stage of `index_rope_quant_pack` is per element except the two block
+/// absmaxes, and a max is exact in any order, so a thread holding its whole block
+/// computes the same bytes with no shuffles, one 64-byte load and one 16-byte
+/// payload store; the four threads of a row each store one byte of the row's
+/// little-endian scale word.
+template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kWeights>
+__global__ __launch_bounds__(kIndexQBlockThreads) void index_q_block_kernel(const IndexQParams params) {
+  using namespace device;
+  namespace fp4 = deepseek_v4::fp4;
+
+  static_assert(kHeadDim == 128 && kRopeDim == 64, "the block split assumes a 64 + 64 (RoPE tail) row");
+  constexpr uint32_t kBlock = fp4::kBlockSize;
+  constexpr uint32_t kBlocksPerRow = kHeadDim / kBlock;
+  constexpr uint32_t kRopeBlock = (kHeadDim - kRopeDim) / kBlock;
+
+  const auto id = blockIdx.x * kIndexQBlockThreads + threadIdx.x;
+  const auto row = id / kBlocksPerRow;
+  const auto blk = id % kBlocksPerRow;
+  if (row >= params.num_rows) return;
+
+  // The position lookup is independent of the PDL producer.
+  const auto position = static_cast<int64_t>(static_cast<const PosT*>(params.positions)[row / params.heads]);
+  PDLWaitPrimary<kUsePDL>();
+
+  using in_vec_t = AlignedVector<bf16x2_t, 4>;
+  float v[kBlock];
+  const auto* in = params.input + static_cast<int64_t>(row) * kHeadDim + blk * kBlock;
+#pragma unroll
+  for (uint32_t i = 0; i < kBlock / 8; ++i) {
+    in_vec_t x;
+    x.load(in, i);
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      const auto f = cast<fp32x2_t>(x[j]);
+      v[i * 8 + j * 2] = f.x;
+      v[i * 8 + j * 2 + 1] = f.y;
+    }
+  }
+  if (blk >= kRopeBlock) {
+    using freq_vec_t = AlignedVector<float, 4>;
+    const auto* freq = params.freqs_cis + position * kRopeDim + (blk - kRopeBlock) * kBlock;
+#pragma unroll
+    for (uint32_t i = 0; i < kBlock / 4; ++i) {
+      freq_vec_t f;
+      f.load(freq, i);
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        const fp32x2_t tail{v[i * 4 + j * 2], v[i * 4 + j * 2 + 1]};
+        const fp32x2_t fr{f[j * 2], f[j * 2 + 1]};
+        // `index_rope_quant_pack`'s rotation with the contraction nvcc gives it there,
+        // fma(x, fx, -(y * fy)) and fma(x, fy, y * fx), spelled out so the bits match;
+        // rounded to bf16 again as `rope_tail` does.
+        const auto rotated = cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{
+            __fmaf_rn(tail.x, fr.x, -__fmul_rn(tail.y, fr.y)), __fmaf_rn(tail.x, fr.y, __fmul_rn(tail.y, fr.x))}));
+        v[i * 4 + j * 2] = rotated.x;
+        v[i * 4 + j * 2 + 1] = rotated.y;
+      }
+    }
+  }
+
+  float amax = 0.0f;
+#pragma unroll
+  for (uint32_t i = 0; i < kBlock; i += 2)
+    amax = fmaxf(amax, fmaxf(fabsf(v[i]), fabsf(v[i + 1])));
+  const auto [scale, inv_scale] = fp4::block_scale(amax);
+  float amax2 = 0.0f;
+#pragma unroll
+  for (uint32_t i = 0; i < kBlock; i += 2) {
+    const auto q = fp4::fake_quant_x2({v[i], v[i + 1]}, scale, inv_scale);
+    v[i] = q.x;
+    v[i + 1] = q.y;
+    amax2 = fmaxf(amax2, fmaxf(fabsf(q.x), fabsf(q.y)));
+  }
+  const auto exponent = index_pack_exponent(amax2);
+  const auto pack_inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(exponent));
+
+  using out_vec_t = AlignedVector<uint32_t, 4>;
+  out_vec_t out;
+#pragma unroll
+  for (uint32_t w = 0; w < 4; ++w) {
+    uint32_t word = 0;
+#pragma unroll
+    for (uint32_t b = 0; b < 4; ++b) {
+      const auto i = (w * 4 + b) * 2;
+      const auto code = __nv_cvt_float2_to_fp4x2(
+          fp32x2_t{v[i] * pack_inv_scale, v[i + 1] * pack_inv_scale}, __NV_E2M1, cudaRoundNearest);
+      word |= (static_cast<uint32_t>(code) & 0xFFu) << (b * 8);
+    }
+    out[w] = clear_negative_zero(word);
+  }
+  out.store(params.payload + static_cast<int64_t>(row) * (kHeadDim / 2) + blk * (kBlock / 2));
+  reinterpret_cast<uint8_t*>(params.scale)[static_cast<int64_t>(row) * kBlocksPerRow + blk] =
+      static_cast<uint8_t>(exponent);
+
+  if constexpr (kWeights) {
+    // Match `head_weights(x).float()`: the bf16 round-trip is part of the reference.
+    if (blk == 0) {
+      const auto w = cast<float>(params.head_weights[row]) * params.weight_scale;
+      params.weights_out[row] = cast<float>(cast<bf16_t>(w));
+    }
+  }
+}
+#endif  // USE_ROCM
+
 /// \brief Host side of `index_k_kernel`.
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, bool kUsePDL>
 struct IndexKKernel {
@@ -360,6 +472,13 @@ struct IndexQKernel {
 
   template <typename PosT, bool kWeights>
   static constexpr auto kernel = index_q_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
+#ifndef USE_ROCM
+  template <typename PosT, bool kWeights>
+  static constexpr auto block_kernel = index_q_block_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
+  /// (token, head) rows from which SM100-family GPUs take `index_q_block_kernel`:
+  /// prefill chunks. Decode and verify batches keep the warp-per-row kernel.
+  static constexpr uint32_t kBlockKernelMinRows = 8192;
+#endif
 
   /// \param input `[num_tokens, heads, kHeadDim]` bf16, `wq_b(q_lora)`.
   /// \param freqs_cis `[max_pos, kRopeDim]` fp32, real/imag interleaved.
@@ -442,6 +561,16 @@ struct IndexQKernel {
         .heads = static_cast<uint32_t>(H.unwrap()),
     };
     const auto i32 = pos_dtype.is_type<int32_t>();
+#ifndef USE_ROCM
+    if (num_rows >= kBlockKernelMinRows && runtime::get_cc_major(device_.unwrap().device_id) == 10) {
+      const auto bk = weights ? (i32 ? block_kernel<int32_t, true> : block_kernel<int64_t, true>)
+                              : (i32 ? block_kernel<int32_t, false> : block_kernel<int64_t, false>);
+      constexpr uint32_t kRowsPerCTA = kIndexQBlockThreads / (kHeadDim / deepseek_v4::fp4::kBlockSize);
+      LaunchKernel(div_ceil(num_rows, kRowsPerCTA), kIndexQBlockThreads, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(bk, params);
+      return;
+    }
+#endif
     const auto k = weights ? (i32 ? kernel<int32_t, true> : kernel<int64_t, true>)
                            : (i32 ? kernel<int32_t, false> : kernel<int64_t, false>);
     LaunchKernel(div_ceil(num_rows, kFp4RopeWarpsPerCTA), kBlockSize, device_.unwrap())  //
