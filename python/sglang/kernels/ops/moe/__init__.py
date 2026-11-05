@@ -29,6 +29,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.bf16_mega_gate",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
@@ -50,11 +61,22 @@ register_kernel(
         capabilities=_HIP,
     )
 )
+
+
 register_kernel(
     KernelSpec(
-        op="moe.topk_softmax",
+        op="moe.cutlass_prepare_moe_input",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
+        target="sglang.kernels.ops.moe.cutlass_prepare_moe_input:cutlass_prepare_moe_input",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.shuffle_weighted_sum",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",
         capabilities=CUDA_ONLY,
     )
 )
@@ -62,9 +84,40 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
-        op="moe.shuffle_weighted_sum",
+        op="moe.gguf_moe_a8_vec",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.gguf_moe_vec:gguf_moe_a8_vec",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="moe.apply_gguf_moe_weights",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",
+        target="sglang.kernels.ops.moe.gguf_moe_weights:apply_gguf_moe_weights",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="moe.apply_gguf_moe_weights",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.moe.gguf_moe_weights_aot:apply_gguf_moe_weights",
+        capabilities=frozenset(
+            {CapabilityRequirement.CUDA, CapabilityRequirement.MUSA}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.compute_cutlass_w4a8_moe_input_scale",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.ep_moe_kernels:compute_cutlass_w4a8_moe_input_scale",
         capabilities=CUDA_ONLY,
     )
 )
@@ -208,6 +261,22 @@ register_kernel(
     )
 )
 
+# EPLB logical->physical expert id remap fused with the per-expert count.
+register_kernel(
+    KernelSpec(
+        op="moe.eplb_map_and_record",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:eplb_map_and_record",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.record_physical_counts",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:record_physical_counts",
+    )
+)
+
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 register_kernel(
@@ -286,6 +355,15 @@ register_kernel(
         op="moe.muse_spark_post_expert_finalize",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.bailing_moe_biased_grouped_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.bailing_moe_topk:bailing_moe_biased_grouped_topk",
         capabilities=CUDA_ONLY,
     )
 )

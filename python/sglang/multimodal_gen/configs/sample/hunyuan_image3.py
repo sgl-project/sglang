@@ -65,6 +65,10 @@ class HunyuanImage3SamplingParams(SamplingParams):
         ]
     )
 
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"bot_task", "system_prompt", "cot_text"})
+
     def _adjust(self, server_args):
         # Pre-aligning each dimension to a 16-px grid here would distort the
         # processor's aspect-ratio bucket selection.

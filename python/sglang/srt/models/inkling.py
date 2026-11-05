@@ -55,11 +55,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -100,6 +96,7 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -1145,7 +1142,7 @@ class InklingForConditionalGeneration(nn.Module):
         # The MTP chain needs the undivided hidden (the mup division is
         # lm_head-only); passed unconditionally because the target
         # verify/prefill forwards never set return_hidden_states_before_norm.
-        return self.llm.logits_processor(
+        output = self.llm.logits_processor(
             input_ids,
             hidden_states_for_logits,
             self.llm.lm_head,
@@ -1157,6 +1154,10 @@ class InklingForConditionalGeneration(nn.Module):
                 None if aux_hidden_states is not None else hidden_states
             ),
         )
+        if output.last_hidden_states is not None:
+            # Auxiliary capture returns post-norm states before LM-head scaling.
+            output.last_hidden_states = hidden_states
+        return output
 
     def _load_regular_param(
         self,

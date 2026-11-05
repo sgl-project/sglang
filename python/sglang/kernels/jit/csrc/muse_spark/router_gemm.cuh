@@ -177,7 +177,7 @@ struct MuseSparkRouterGemm {
     auto N = SymbolicSize{"num_experts"};
     auto W = SymbolicSize{"workspace"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({T, K}).with_dtype<fp32_t>().with_device(device_).verify(x);
     TensorMatcher({K, N}).with_dtype<fp32_t>().with_device(device_).verify(w);
