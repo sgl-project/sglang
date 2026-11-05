@@ -563,6 +563,13 @@ def get_tokenizer(
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
+    # Callers that pin the model with get_tokenizer(..., revision=<sha>) put
+    # the pin in kwargs. tokenizer_revision stays None unless it was passed
+    # explicitly, and the post-load fixes must use the same pin.
+    pinned_revision = (
+        tokenizer_revision if tokenizer_revision is not None else kwargs.get("revision")
+    )
+
     common_kwargs = dict(
         trust_remote_code=trust_remote_code,
         tokenizer_revision=tokenizer_revision,
@@ -571,7 +578,7 @@ def get_tokenizer(
     )
 
     try:
-        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+        if is_bare_tekken_checkpoint(tokenizer_name, pinned_revision):
             from transformers.tokenization_mistral_common import (
                 MistralCommonTokenizer,
             )
@@ -585,7 +592,7 @@ def get_tokenizer(
             )
 
             tokenizer = MistralCommonTokenizer.from_pretrained(
-                tokenizer_name, revision=tokenizer_revision
+                tokenizer_name, revision=pinned_revision
             )
         else:
             tokenizer = _auto_tokenizer_from_pretrained(
@@ -603,7 +610,7 @@ def get_tokenizer(
                     tokenizer_name, *args, **common_kwargs
                 )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(tokenizer, tokenizer_name, pinned_revision)
     except Exception as e:
         if tokenizer_backend == "fastokens":
             tokenizer = _load_fastokens_over_repaired_backend(
