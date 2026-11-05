@@ -960,7 +960,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                 released = []
                 scheduler.request_retirer = Mock()
-                release = scheduler.request_retirer.release_finished
+                release = scheduler.request_retirer.release
                 release.side_effect = lambda *args, **kwargs: released.append(
                     scheduler.iteration
                 )

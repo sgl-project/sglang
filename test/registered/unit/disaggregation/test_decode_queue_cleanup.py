@@ -302,7 +302,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.pop_transferred(), [])
         self.assertEqual(list(queue.queue.items()), [decode_req])
         mock_prepare_abort.assert_not_called()
-        queue.scheduler.request_retirer.release_aborted.assert_not_called()
+        queue.scheduler.request_retirer.release.assert_not_called()
 
 
 class _PollingReceiver:

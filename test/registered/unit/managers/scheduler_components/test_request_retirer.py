@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -14,18 +15,15 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).parent / "srt"
-_STEPS = ("release_kv_cache", "detach_aborted")
+_STEPS = ("release_kv_cache", "_detach")
 # mem_cache defines the steps; the retirer is where they belong.
 _SKIPPED = ("mem_cache/", "managers/scheduler_components/request_retirer.py")
 
 # The functions outside `RequestRetirer` that still run a release step
 # themselves. It only shrinks: a new exit goes through `RequestRetirer`.
 _STEP_CALLERS = {
-    "disaggregation/prefill.py:PrefillBootstrapQueue._abort",
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue",
     "managers/schedule_batch.py:release_req",
-    "managers/scheduler.py:Scheduler.process_pending_chunked_abort",
-    "managers/scheduler.py:Scheduler.retire_unadmitted_request",
     "managers/scheduler_components/dynamic_chunk_sizer.py:DynamicChunkSizer._profile_prefill_latency",
 }
 
@@ -62,32 +60,50 @@ class TestReleaseStepsLiveInRequestRetirer(CustomTestCase):
         self.assertEqual(_step_callers(), _STEP_CALLERS)
 
 
-class TestReleaseAborted(CustomTestCase):
-    def test_drops_cache_side_state_before_an_uncached_release(self):
-        # A PD transfer or bootstrap failure, or a checksum mismatch, must also
-        # cancel the attempt's cache work and free its streaming session.
-        calls = []
+def _req(finished_reason, calls):
+    return SimpleNamespace(
+        finished_reason=finished_reason,
+        cache_request_handle=object(),
+        session=SimpleNamespace(
+            streaming=True, abort_req=lambda: calls.append("session")
+        ),
+        get_mm_token_counts=lambda: calls.append("counts"),
+        release_mm_inputs_on_abort=lambda: calls.append("mm"),
+        kv=SimpleNamespace(holds_kv=True, holds_mamba=False, retraction_backup=None),
+    )
+
+
+class TestRelease(CustomTestCase):
+    def _release(self, req, calls, checkpoint=False):
         tree_cache = MagicMock()
         tree_cache.finish.side_effect = lambda handle, outcome: calls.append(outcome)
-        req = SimpleNamespace(
-            cache_request_handle=object(),
-            session=SimpleNamespace(
-                streaming=True, abort_req=lambda: calls.append("session")
-            ),
-            release_mm_inputs_on_abort=lambda: calls.append("mm"),
-            kv=SimpleNamespace(
-                holds_kv=True, holds_mamba=False, retraction_backup=None
-            ),
-        )
-
         with patch.object(
             request_retirer,
             "release_kv_cache",
             side_effect=lambda req, cache, *, checkpoint: calls.append(checkpoint),
         ):
-            release_only_retirer(tree_cache).release_aborted(req)
+            release_only_retirer(tree_cache).release(req, checkpoint=checkpoint)
 
-        self.assertEqual(calls, ["mm", CacheRequestOutcome.ABORT, "session", False])
+    def test_drops_cache_side_state_before_an_uncached_release(self):
+        # A PD transfer or bootstrap failure, or a checksum mismatch, must also
+        # cancel the attempt's cache work and free its streaming session.
+        calls = []
+        self._release(_req(FINISH_ABORT(), calls), calls)
+        self.assertEqual(
+            calls, ["counts", "mm", CacheRequestOutcome.ABORT, "session", False]
+        )
+
+    def test_leaves_the_attempt_of_a_checkpointed_release_to_the_cache(self):
+        # A request a step aborted hands its KV to the cache, whose store
+        # settles the attempt.
+        calls = []
+        self._release(_req(FINISH_ABORT(), calls), calls, checkpoint=True)
+        self.assertEqual(calls, ["counts", "mm", "session", True])
+
+    def test_leaves_a_request_that_was_not_aborted_attached(self):
+        calls = []
+        self._release(_req(FINISH_LENGTH(length=0), calls), calls)
+        self.assertEqual(calls, [False])
 
 
 if __name__ == "__main__":

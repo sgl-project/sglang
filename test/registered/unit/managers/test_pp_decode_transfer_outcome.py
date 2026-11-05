@@ -157,8 +157,8 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         self.assertEqual(outcomes, {"s": False, "f": True})
         self.assertEqual(list(queue.queue.items()), [not_yet_agreed])
         queue._commit_transfer_to_req.assert_called_once_with(admitted)
-        queue.scheduler.request_retirer.release_aborted.assert_called_once_with(
-            failed_elsewhere.req
+        queue.scheduler.request_retirer.release.assert_called_once_with(
+            failed_elsewhere.req, checkpoint=False
         )
         queue._record_transfer_failure.assert_called_once_with(
             "Failed due to an unknown reason from another rank"

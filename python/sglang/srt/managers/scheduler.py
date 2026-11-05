@@ -327,10 +327,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.common import (
-    checkpoint_kv_cache,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
@@ -3647,27 +3644,27 @@ class Scheduler(
 
     def retire_unadmitted_request(self, req: Req) -> None:
         """Finish a request the disaggregation queues rejected at their door."""
-        # `create_req` marks a streaming session in-flight, and the pre-abort
-        # detach lives in `StreamingSession.find_active_slot`, which only runs
-        # while scheduling; a session left in-flight rejects every later request.
-        if req.session is not None and req.session.streaming:
-            req.release_mm_inputs_on_abort()
-            req.session.abort_req()
-            req.session = None
         # `beam_coordinator.validate_and_init` counts the group in ahead of the
         # checks that reject; no-op when the request has no group.
         self.beam_coordinator.retire_group(req)
-        # PREFILL runs `_prefetch_kvcache` before its door, so even the
-        # one-token stub is registered with the cache by now:
-        # `prefetch_from_storage` arms the paced-retry set for this attempt's
-        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
-        # that, and a retired request reaches neither.
-        self.request_retirer.detach_aborted(req)
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
+        # The request holds no memory, so the release only detaches it, which
+        # still matters: `create_req` marks a streaming session in-flight, and
+        # the pre-abort detach lives in `StreamingSession.find_active_slot`, which
+        # only runs while scheduling; a session left in-flight rejects every
+        # later request. And PREFILL runs `_prefetch_kvcache` before its door, so
+        # even the one-token stub is registered with the cache by now:
+        # `prefetch_from_storage` arms the paced-retry set for this attempt's
+        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
+        # that, and a retired request reaches neither.
+        self.request_retirer.release(req, checkpoint=False)
+        # Like `find_active_slot`, the detached request also leaves its session.
+        if req.session is not None and req.session.streaming:
+            req.session = None
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -3733,7 +3730,7 @@ class Scheduler(
         return True
 
     def _abort_unavailable(self, req: Req, *, message: str) -> None:
-        self.request_retirer.abort_queued(
+        self.request_retirer.abort(
             req,
             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
             finished_reason={
@@ -3752,7 +3749,7 @@ class Scheduler(
     ) -> None:
         """Abort document windows held off the waiting queue."""
         for req in reqs:
-            self.request_retirer.abort_queued(req, finished_reason=finished_reason)
+            self.request_retirer.abort(req, finished_reason=finished_reason)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -4022,12 +4019,9 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self.request_retirer.detach_aborted(req)
         # No member rows exist before the leader's prefill ends.
         self.beam_coordinator.retire_group(req)
-        if self.enable_hisparse:
-            self.hisparse_coordinator.request_finished(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.request_retirer.release(req, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -6032,7 +6026,7 @@ class Scheduler(
                 self.release_prefill_sender(req, abort_sender=True)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
-            self.request_retirer.abort_queued(
+            self.request_retirer.abort(
                 req, finished_reason=recv_req.finished_reason, checkpoint=is_decode
             )
             logger.debug(f"Abort queued request. {req.rid=}")

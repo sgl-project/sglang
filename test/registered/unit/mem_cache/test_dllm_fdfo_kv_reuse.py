@@ -233,7 +233,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
     def test_dllm_abort_removes_waiting_and_staging(self):
         released = []
         manager = DllmManager(
-            SimpleNamespace(max_running_requests=4), release_aborted=released.append
+            SimpleNamespace(max_running_requests=4), abort=released.append
         )
         staged, waiting, keep = (
             Mock(rid=rid) for rid in ("abort-staged", "abort-waiting", "keep")

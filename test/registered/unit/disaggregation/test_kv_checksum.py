@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -456,7 +457,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(sched.waiting_queue, [])
         self.assertEqual(sched.streamed_aborts, [req])
         mock_abort.assert_called_once()
-        sched.request_retirer.release_aborted.assert_called_once_with(req)
+        sched.request_retirer.release.assert_called_once_with(req, checkpoint=False)
         sched.metrics_collector.increment_transfer_failed_reqs.assert_called_once_with()
 
     def test_mismatch_raises_in_ci(self):
@@ -480,7 +481,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(batch.reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])
         mock_abort.assert_not_called()
-        sched.request_retirer.release_aborted.assert_not_called()
+        sched.request_retirer.release.assert_not_called()
 
     def test_injected_mismatch_aborts_without_raising_in_ci(self):
         """The injector must not trip the in-CI raise it exists to exercise."""
@@ -590,8 +591,11 @@ class TestKvChecksumMismatchHiSparse(unittest.TestCase):
         req.kv = SimpleNamespace(
             holds_kv=True, holds_mamba=False, retraction_backup=None
         )
+        # What the patched `prepare_abort` would set.
+        req.finished_reason = FINISH_ABORT("KV checksum mismatch")
         req.cache_request_handle = None
         req.session = None
+        req.get_mm_token_counts = Mock()
         req.release_mm_inputs_on_abort = Mock()
         with (
             envs.SGLANG_IS_IN_CI.override(False),

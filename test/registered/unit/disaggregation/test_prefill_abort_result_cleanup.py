@@ -42,6 +42,7 @@ class _Req:
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.discard_output_reason = None
         self.session = None
+        self.get_mm_token_counts = Mock()
         self.release_mm_inputs_on_abort = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False

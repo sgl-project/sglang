@@ -483,8 +483,7 @@ class PrefillBootstrapQueue:
         for req in self.queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.scheduler.request_retirer.detach_aborted(req)
-
+                # Only marks the abort; the exit that releases the request detaches it.
                 if hasattr(req.disagg_kv_sender, "abort"):
                     req.disagg_kv_sender.abort()
                 if get_parallel().pp_size > 1:
@@ -1318,7 +1317,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
-                self.request_retirer.release_finished(req, checkpoint=True)
+                self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1393,7 +1392,7 @@ class SchedulerDisaggregationPrefillMixin:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        self.request_retirer.release_aborted(req)
+        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
@@ -1421,7 +1420,7 @@ class SchedulerDisaggregationPrefillMixin:
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
         self.release_prefill_sender(req, abort_sender=True)
-        self.request_retirer.release_aborted(req)
+        self.request_retirer.release(req, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1443,7 +1442,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.release_prefill_sender(req, abort_sender=False)
-        self.request_retirer.release_aborted(req)
+        self.request_retirer.release(req, checkpoint=False)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()

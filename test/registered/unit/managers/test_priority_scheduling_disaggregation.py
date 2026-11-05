@@ -87,6 +87,10 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = MagicMock()
         req.kv.holds_kv = req.kv.holds_mamba = False
         req.kv.retraction_backup = None
+        req.finished_reason = None
+        req.finish_outside_step.side_effect = lambda reason: setattr(
+            req, "finished_reason", reason
+        )
         req.priority = priority
         req.rid = "req"
         req.output_ids = []
@@ -370,6 +374,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.metadata_buffer_index = -1
         req.cache_request_handle = object()
         req.session = None
+        req.get_mm_token_counts = MagicMock()
         req.release_mm_inputs_on_abort = MagicMock()
         req.kv.holds_kv = True
         req.kv.holds_mamba = False
@@ -394,7 +399,12 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
             ) as release_kv_cache,
-            patch("sglang.srt.disaggregation.prefill.prepare_abort"),
+            patch(
+                "sglang.srt.disaggregation.prefill.prepare_abort",
+                side_effect=lambda req, *a, **kw: setattr(
+                    req, "finished_reason", FINISH_ABORT()
+                ),
+            ),
             patch(
                 "sglang.srt.disaggregation.prefill.get_parallel",
                 return_value=SimpleNamespace(tp_rank=0),
@@ -455,6 +465,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         empty_request_lists(scheduler)
         scheduler.mm_receiver = None
         req = MagicMock(rid="req", metadata_buffer_index=3, pending_bootstrap=True)
+        req.finished_reason = None
+        req.finish_outside_step.side_effect = lambda reason: setattr(
+            req, "finished_reason", reason
+        )
         scheduler.waiting_queue.join([req])
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False

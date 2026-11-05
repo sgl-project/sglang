@@ -1083,14 +1083,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
-            self.scheduler.request_retirer.abort_queued(req)
+            self.scheduler.request_retirer.abort(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
             lambda req: recv_req.matches(req.rid)
         ):
-            self.scheduler.request_retirer.abort_queued(
+            self.scheduler.request_retirer.abort(
                 req, finished_reason=recv_req.finished_reason
             )
 
@@ -1787,7 +1787,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
             for decode_req in failed_reqs:
-                self.scheduler.request_retirer.release_aborted(decode_req.req)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
         self.queue.leave([queue[i].req for i in indices_to_remove])
 
@@ -3307,7 +3307,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        self.scheduler.request_retirer.release_aborted(decode_req.req)
+                        self.scheduler.request_retirer.release(
+                            decode_req.req, checkpoint=False
+                        )
                         decode_req.kv_receiver.clear()
                         decode_req.kv_receiver = None
                         indices_to_remove.add(i)
@@ -3334,7 +3336,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.return_logprob,
                     )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    self.scheduler.request_retirer.release_aborted(decode_req.req)
+                    self.scheduler.request_retirer.release(
+                        decode_req.req, checkpoint=False
+                    )
                     self._record_transfer_failure(
                         decode_req.req.finished_reason.message
                     )
@@ -3361,7 +3365,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
-                self.scheduler.request_retirer.release_aborted(decode_req.req)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
                 decode_req.kv_receiver = None
@@ -3434,7 +3438,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self.scheduler.request_retirer.release_aborted(decode_req.req)
+        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -3783,7 +3787,7 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
-        self.request_retirer.release_aborted(req)
+        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
