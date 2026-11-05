@@ -158,6 +158,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "QuarkInt4Fp8LinearMethod",
     "HummingLinearMethod",
     "QuarkLinearMethod",
+    "XPUFp8W8A16LinearMethod",
 ]
 
 _is_cpu = is_cpu()

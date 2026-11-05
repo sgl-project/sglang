@@ -408,6 +408,14 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUMXFP8LinearMethod(self)
+            if _is_xpu:
+                from sglang.srt.hardware_backend.xpu.quantization.fp8_w8a16 import (
+                    XPUFp8W8A16LinearMethod,
+                    use_xpu_fp8_w8a16,
+                )
+
+                if use_xpu_fp8_w8a16(self):
+                    return XPUFp8W8A16LinearMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
