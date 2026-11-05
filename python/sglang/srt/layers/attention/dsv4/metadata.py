@@ -161,6 +161,8 @@ def copy_metadata(
 
 
 DEEP_GEMM_VARLEN_MIN_ROWS = 96
+# DeepGEMM 0.2.6 varlen paged MQA scheduler: (2 * rows + 33) * 4 B of smem <= 232448
+DEEP_GEMM_VARLEN_MAX_ROWS = 29039
 
 
 @dataclass
@@ -263,6 +265,7 @@ class PagedIndexerMetadata:
                 self.deep_gemm_varlen
                 and not use_jit_indexer
                 and num_rows >= DEEP_GEMM_VARLEN_MIN_ROWS
+                and (self.rows_per_chunk or num_rows) <= DEEP_GEMM_VARLEN_MAX_ROWS
             )
             if varlen:
                 assert compressed_seq_lens.shape[1] == 1, compressed_seq_lens.shape

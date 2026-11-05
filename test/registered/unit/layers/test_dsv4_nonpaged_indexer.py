@@ -893,6 +893,21 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         self.assertIsNone(metadata.deep_gemm_indices)
         self.assertEqual(len(deep_gemm.get_paged_mqa_logits_metadata.call_args.args), 3)
 
+    def test_varlen_caps_rows_at_the_scheduler_smem_limit(self):
+        for num_rows, varlen in ((29032, True), (29040, False)):
+            metadata, deep_gemm, _ = self._build(
+                num_rows=num_rows,
+                budget=None,
+                use_topk_v2=False,
+                rows_per_request=8,
+                deep_gemm_varlen=True,
+            )
+            self.assertEqual(metadata.deep_gemm_indices is not None, varlen)
+            self.assertEqual(
+                len(deep_gemm.get_paged_mqa_logits_metadata.call_args.args),
+                4 if varlen else 3,
+            )
+
     def test_no_budget_keeps_the_single_call_shape(self):
         metadata, deep_gemm, plan_topk_v2 = self._build(
             num_rows=4096, budget=None, use_topk_v2=True
