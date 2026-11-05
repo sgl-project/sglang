@@ -2349,6 +2349,72 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+        # HiCache drain gauges — expose pending/queue depths for drain detection.
+        self.hicache_d2h_pending_ops = Gauge(
+            name="sglang:hicache_d2h_pending_ops",
+            documentation="Number of ongoing D2H write-through operations.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_d2h_ack_queue_depth = Gauge(
+            name="sglang:hicache_d2h_ack_queue_depth",
+            documentation="Number of D2H acks waiting for CUDA event confirmation.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_pending_ops = Gauge(
+            name="sglang:hicache_l3_pending_ops",
+            documentation="Number of ongoing Host-to-L3 backup operations.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_backup_queue_depth = Gauge(
+            name="sglang:hicache_l3_backup_queue_depth",
+            documentation="Number of operations waiting for the backup worker thread.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_ack_queue_depth = Gauge(
+            name="sglang:hicache_l3_ack_queue_depth",
+            documentation="Number of completed backup operations waiting for scheduler ack.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_backup_worker_alive = Gauge(
+            name="sglang:hicache_l3_backup_worker_alive",
+            documentation="1 if the backup worker thread is alive, 0 otherwise.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # HiCache L3 backup counters
+        self.hicache_l3_backup_submitted_tokens_total = Counter(
+            name="sglang:hicache_l3_backup_submitted_tokens_total",
+            documentation="Number of tokens submitted for L3 backup.",
+            labelnames=labels.keys(),
+        )
+        self.hicache_l3_backup_failed_ops_total = Counter(
+            name="sglang:hicache_l3_backup_failed_ops_total",
+            documentation="Number of L3 backup operations that failed.",
+            labelnames=labels.keys(),
+        )
+        self.hicache_l3_backup_unwritten_pages_total = Counter(
+            name="sglang:hicache_l3_backup_unwritten_pages_total",
+            documentation="Number of pages not confirmed written to L3 storage.",
+            labelnames=labels.keys(),
+        )
+        self.hicache_l3_backup_unwritten_tokens_total = Counter(
+            name="sglang:hicache_l3_backup_unwritten_tokens_total",
+            documentation="Number of tokens not confirmed written to L3 storage.",
+            labelnames=labels.keys(),
+        )
+        sidecar_labelnames = list(labels.keys()) + ["pool_name"]
+        self.hicache_l3_backup_sidecar_unwritten_pages_total = Counter(
+            name="sglang:hicache_l3_backup_sidecar_unwritten_pages_total",
+            documentation="Number of sidecar pages not confirmed written to L3 storage, by pool.",
+            labelnames=sidecar_labelnames,
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -2404,6 +2470,67 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+    def set_hicache_gauges(
+        self,
+        d2h_pending: int,
+        d2h_ack_queue: int,
+        l3_pending: int,
+        l3_backup_queue: int,
+        l3_ack_queue: int,
+        worker_alive: int,
+    ):
+        """Set all HiCache drain gauges in one call."""
+        labels = self.labels
+        self.hicache_d2h_pending_ops.labels(**labels).set(d2h_pending)
+        self.hicache_d2h_ack_queue_depth.labels(**labels).set(d2h_ack_queue)
+        self.hicache_l3_pending_ops.labels(**labels).set(l3_pending)
+        self.hicache_l3_backup_queue_depth.labels(**labels).set(l3_backup_queue)
+        self.hicache_l3_ack_queue_depth.labels(**labels).set(l3_ack_queue)
+        self.hicache_l3_backup_worker_alive.labels(**labels).set(worker_alive)
+
+    def clear_hicache_gauges(self):
+        """Zero all HiCache drain gauges (for detach/reset)."""
+        self.set_hicache_gauges(0, 0, 0, 0, 0, 0)
+
+    def log_backup_submitted_tokens(self, tokens: int):
+        if tokens > 0:
+            self.hicache_l3_backup_submitted_tokens_total.labels(**self.labels).inc(
+                tokens
+            )
+
+    def log_backup_failed_op(
+        self,
+        page_size: int,
+        unwritten_pages: int,
+        sidecar_unwritten_by_pool: Optional[dict] = None,
+    ):
+        """Record a failed backup operation.
+
+        KV unwritten pages/tokens are tracked separately from sidecar
+        unwritten pages (which are tracked per-pool). ``failed_ops_total``
+        increments once per failed operation regardless of which component
+        failed.
+        """
+        labels = self.labels
+        self.hicache_l3_backup_failed_ops_total.labels(**labels).inc(1)
+        # KV-only unwritten pages/tokens
+        if unwritten_pages > 0:
+            self.hicache_l3_backup_unwritten_pages_total.labels(**labels).inc(
+                unwritten_pages
+            )
+            self.hicache_l3_backup_unwritten_tokens_total.labels(**labels).inc(
+                unwritten_pages * page_size
+            )
+        # Sidecar unwritten pages, tracked per-pool
+        if sidecar_unwritten_by_pool:
+            for pool_name, count in sidecar_unwritten_by_pool.items():
+                if count > 0:
+                    labels_with_pool = dict(labels)
+                    labels_with_pool["pool_name"] = pool_name
+                    self.hicache_l3_backup_sidecar_unwritten_pages_total.labels(
+                        **labels_with_pool
+                    ).inc(count)
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

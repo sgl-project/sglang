@@ -228,6 +228,12 @@ class StorageAttachment:
 
         cache.enable_storage = False
         cache.enable_storage_metrics = False
+        # Gauges keep their last published value forever, so a detached backend
+        # would otherwise leave a frozen non-zero queue depth on the dashboard.
+        if cache.storage_metrics_collector is not None:
+            cache.storage_metrics_collector.clear_hicache_gauges()
+        cache._hicache_gauge_last_state = None
+        cache._hicache_gauge_last_ts = 0.0
         return True, "Detached HiCache storage backend successfully."
 
     def shutdown(self) -> None:
