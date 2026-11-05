@@ -3851,7 +3851,7 @@ class DeepseekSparseAttnBackend(
             topk_length=topk_length,
             extra_indices=None,
             extra_topk_length=None,
-            windowed=True,
+            schedule="windowed",
         )
         return sched_meta
 

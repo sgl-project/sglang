@@ -40,7 +40,6 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     dcp_topk_merge_buffer_numel,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    candidates_cluster_size,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
@@ -416,10 +415,9 @@ def _local_candidates(
         logits,
         local_lens,
         out_candidates=out,
-        world=parallel.attn_dcp_size,
-        rank=parallel.attn_dcp_rank,
-        stable_ties=True,
-        cluster_size=candidates_cluster_size(rows),
+        dcp_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
+        deterministic=True,
         cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
     )
     return out
@@ -509,7 +507,7 @@ def dcp_global_topk(
         BLOCK=block,
     )
     topk_transform_paged_v2(
-        dense, global_lens, page_table, out, span, plan, stable_ties=True
+        dense, global_lens, page_table, out, span, plan, deterministic=True
     )
     return out
 
@@ -535,7 +533,7 @@ def dcp_all_visible(
         out,
         span,
         row_starts=_zeros_i32(rows, global_lens.device),
-        stable_ties=True,
+        deterministic=True,
     )
     return out
 

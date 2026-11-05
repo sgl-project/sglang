@@ -2254,7 +2254,9 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+        if not self.use_full_rank_gate:
+            return False
+        if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
@@ -2463,8 +2465,9 @@ class KimiK3DeltaAttention(nn.Module):
             )
         return qkv, beta, forget_gate, g_proj_states
 
-    def forward(
+    def forward_pre_o_proj(
         self,
+        *,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -2524,8 +2527,22 @@ class KimiK3DeltaAttention(nn.Module):
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
         # Back to the boundary's interleave rows before o_proj, whose input is
         # narrower than its output; o_proj is row-wise.
-        core_attn_out = cp_sequence_to_interleave_order(
+        return cp_sequence_to_interleave_order(
             core_attn_out, forward_batch, gathered_rows
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
+        core_attn_out = self.forward_pre_o_proj(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
         )
         if self.all_reduce_fusion:
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
@@ -2679,6 +2696,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
+            self._pre_o_proj_out: Optional[torch.Tensor] = None
+            self._return_pre_o_proj = False
             _orig_o_proj_forward = self.o_proj.forward
 
             def _gated_o_proj_forward(x, *args, **kwargs):
@@ -2698,6 +2717,26 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # Even a skipped gate must close its capture branch.
                     torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
                     self._gate_pending_stream = None
+                if self._return_pre_o_proj:
+                    # forward_pre_o_proj() sets _return_pre_o_proj. Skipping
+                    # o_proj hands its GEMM and its attention-TP reduction to
+                    # the caller. The MLA cores only unpack a 2-tuple from it.
+                    if isinstance(x, tuple):
+                        # A quantized o_proj makes the core quantize its input,
+                        # and the gate above is skipped along with it.
+                        raise RuntimeError(
+                            f"forward_pre_o_proj: layer {self.layer_id} has a "
+                            "quantized o_proj input, so there is no gated bf16 "
+                            "output to hand back"
+                        )
+                    if self._pre_o_proj_out is not None:
+                        raise RuntimeError(
+                            f"forward_pre_o_proj: layer {self.layer_id} reached "
+                            "o_proj twice in one attention forward; the second "
+                            "output would overwrite the first"
+                        )
+                    self._pre_o_proj_out = x
+                    return x, None
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2760,6 +2799,25 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
+
+    def forward_pre_o_proj(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert self.use_output_gate, "forward_pre_o_proj needs the gated o_proj wrapper"
+        assert not self._return_pre_o_proj, "forward_pre_o_proj is not re-entrant"
+        self._return_pre_o_proj, self._pre_o_proj_out = True, None
+        self.forward(positions, hidden_states, forward_batch, zero_allocator, **kwargs)
+        out = self._pre_o_proj_out
+        self._return_pre_o_proj, self._pre_o_proj_out = False, None
+        if out is None:
+            raise RuntimeError("MLA forward returned without reaching o_proj")
+        return out
 
 
 def _is_moe_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
