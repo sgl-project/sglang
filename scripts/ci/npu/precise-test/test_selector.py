@@ -1973,8 +1973,9 @@ def main():
             f.write(test_name + "\n")
     print(f"\nResults saved to: {output_file}")
 
-    # Changed-path list for bucket_recommended_tests.py's empty-recommendation
-    # confinement check (PR mode only; empty/missing when the diff is absent).
+    # Changed-path list consumed by bucket_recommended_tests.py (PR mode only;
+    # empty/missing when the diff is absent). CI exports this list in the
+    # workflow, so this copy only matters for local runs.
     if args.github_pr and diff_file:
         changed_paths_file = BASE_DIR / "pr_changed_files.txt"
         all_changed_paths = _get_all_changed_paths_from_diff(diff_file)

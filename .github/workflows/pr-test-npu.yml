@@ -681,7 +681,6 @@ jobs:
 
   # ==================== Recommend Tests from Coverage ==================== #
   # Recommends PR-affected test cases from the pre-built coverage baseline.
-  # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
     needs: [check-changes, pr-gate]
@@ -719,11 +718,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # Every step carries step-level continue-on-error so the job conclusion
-      # is ALWAYS 'success' — the fast-fail health check in other jobs filters
-      # by job conclusion, and job-level continue-on-error still reports
-      # 'failure' via the API. Failed steps stay visible (red ✗ + annotation)
-      # but never cascade to test jobs.
       - name: Checkout sglang scripts
         continue-on-error: true
         uses: actions/checkout@v4
@@ -773,23 +767,30 @@ jobs:
 
       - name: Recommend tests for current PR
         continue-on-error: true
+        uses: lb-actions/precision-test@v1.0.7
+        with:
+          repo: sglang
+          github-pr: ${{ github.repository }}#${{ github.event.pull_request.number }}
+          source-dir: ${{ github.workspace }}/outputs/covstub
+          map-file: ${{ github.workspace }}/test_case_map.json
+
+      - name: Export changed-file list for bucketing
+        continue-on-error: true
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          if ! python3 -c "import regex" >/dev/null 2>&1; then
-            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-            python3 get-pip.py --break-system-packages
-            python3 -m pip install --break-system-packages regex
+          if test -f recommended_pytest_paths.txt; then
+            # Paginated files API instead of `gh pr diff --name-only`: the
+            # diff endpoint may truncate large PRs, which would silently
+            # drop a changed pipeline-config path from the full-run gate.
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --paginate --jq '.[].filename' > "$PWD/pr_changed_files.txt"
+            test -s "$PWD/pr_changed_files.txt"
+            echo "Changed files: $(wc -l < "$PWD/pr_changed_files.txt")"
+          else
+            echo "::warning::Precision selector produced no recommendation; dropping the changed-file list so all suites run in full."
+            rm -f pr_changed_files.txt
           fi
-          python3 -c "import regex; print('regex ok:', regex.__file__)"
-          PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
-          echo "Selecting tests for PR: ${PR_SPEC}"
-          # test_selector.py resolves relative paths against the script's own dir,
-          # so pass absolute paths for files downloaded to the workspace root.
-          python3 scripts/ci/npu/precise-test/test_selector.py \
-            --github-pr "${PR_SPEC}" \
-            --source-dir "$PWD/outputs/covstub" \
-            --map-file "$PWD/test_case_map.json"
 
       # Bucket the recommended tests per suite. Downstream jobs consume two
       # outputs per suite: should_run_<suite> ('false' -> skip the job, e.g.
@@ -807,8 +808,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
-            --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
-            --changed-files scripts/ci/npu/precise-test/pr_changed_files.txt \
+            --recommended recommended_pytest_paths.txt \
+            --changed-files pr_changed_files.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --diffusion-suites "multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu" \
             --case-map "$PWD/test_case_map.json" \

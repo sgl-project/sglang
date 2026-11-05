@@ -2,8 +2,10 @@
 """
 Bucket coverage-recommended tests per CI suite.
 
-Runs after test_selector.py has produced recommended_pytest_paths.txt (one
-pytest path per line, repo-relative, optional ::case suffix). For each
+Runs after the precision selector has produced recommended_pytest_paths.txt
+(one pytest path per line, repo-relative, optional ::case suffix). In CI that
+selector is the lb-actions/precision-test step; the in-repo test_selector.py
+still serves local runs and --build-map. For each
 requested suite, enumerate the suite's registered test files via list_tests.py
 and intersect with the recommended files, then write per-suite GitHub Actions
 step outputs:
@@ -710,10 +712,11 @@ def main():
         decision = "full"
         decision_reason = "precision mode disabled (--precision-mode is not 'true')"
     elif not changed_files:
-        # test_selector.py writes this file on every PR run; missing/empty
-        # means it failed, so there is no evidence to narrow anything down.
+        # The workflow writes this file only after the precision selector
+        # succeeded; missing/empty means selection failed, so there is no
+        # evidence to narrow anything down.
         decision = "full"
-        decision_reason = "changed-file list unavailable (test_selector.py did not run)"
+        decision_reason = "changed-file list unavailable (precision selector did not run)"
     elif enumeration_empty:
         decision = "full"
         decision_reason = "no suite enumerated any registered test file"
