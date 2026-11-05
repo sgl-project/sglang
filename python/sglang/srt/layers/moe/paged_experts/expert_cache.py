@@ -544,9 +544,11 @@ def fill_store(step, cache: Optional[ExpertCache], width: int) -> HostExpertStor
     reuse = not ran_check and groups[0] == list(
         range(min(loads.num_slots, loads.num_experts))
     )
-    if not reuse:
-        first = None  # its K-slot table must not stay alive next to the build's
-    store = build_store(step, first, store)
+    if reuse:  # the first group is chunk 0: copied, not run again
+        for name, rows in first.items():
+            store.host[name][: len(groups[0])].copy_(rows)
+    first = rows = None  # its K-slot table must not stay alive next to the build's
+    store = build_store(step, store, first_done=reuse)
     cache.save(store.host)
     return store
 
@@ -556,7 +558,11 @@ def check_groups(step, store: HostExpertStore, groups, first) -> Optional[List[i
     the first group's rows, run already), or None."""
     for i, group in enumerate(groups):
         rows = first if i == 0 else step.run(group)
-        if any(not same_bytes(r.cpu(), store.host[n][group]) for n, r in rows.items()):
+        stale = any(
+            not same_bytes(r.cpu(), store.host[n][group]) for n, r in rows.items()
+        )
+        rows = None  # the next group's run builds another K-slot table
+        if stale:
             return group
     return None
 

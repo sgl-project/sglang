@@ -624,38 +624,63 @@ class TestExpertCache(_CacheCase):
         self.assertTrue(label(long_a).startswith("org--xxx"))
 
 
-class TestFirstGroupReleased(_CacheCase):
+class TestOneSlotTableAtATime(_CacheCase):
     """A repacking step's rows are views of the layer's whole K-slot table (on the GPU when
-    serving). The first checked group's rows must be gone when the next run builds another
-    table, unless the build takes them as its first chunk."""
+    serving): when the step runs again, no rows an earlier run returned may still be alive,
+    or a second table sits at peak VRAM. Checked for a build, a cached start's check and a
+    build without the cache."""
 
-    def _alive_at_second_run(self, folder, width):
-        run, first, alive = PostLoad.run, [], []
+    @contextlib.contextmanager
+    def _tracked(self, hold=None):
+        """Records, at each run after the first, whether rows an earlier run returned are
+        alive; ``hold`` (a list) keeps the first run's rows referenced, as a control."""
+        run, earlier, self.alive = PostLoad.run, [], []
 
         def tracked(step, experts, out=None):
-            if first and not alive:
+            if earlier:
                 gc.collect()
-                alive.append(any(ref() is not None for ref in first))
+                self.alive.append(any(ref() is not None for ref in earlier))
             rows = run(step, experts, out)
-            if not first:
-                first.extend(weakref.ref(t) for t in rows.values())
+            if out is None:
+                if hold is not None and not hold:
+                    hold.append(rows)
+                earlier.extend(weakref.ref(t) for t in rows.values())
             return rows
 
         with patch.object(PostLoad, "run", tracked):
+            yield
+
+    def _runs_alive(self, folder, width, hold=None):
+        with self._tracked(hold):
             self._start(folder, num_slots=K, width=width)
-        return alive[0]
+        self.assertTrue(self.alive)  # the step ran more than once
+        return any(self.alive)
 
-    def test_released_before_the_next_table(self):
+    def test_no_rows_outlive_their_use(self):
         with tempfile.TemporaryDirectory() as d:
-            # No entry, groups narrower than K: the build cannot take them as chunk 0.
-            self.assertFalse(self._alive_at_second_run(d, TOP_K))
-            # The entry is read: the check's next group runs.
-            self.assertFalse(self._alive_at_second_run(d, TOP_K))
+            # No entry, groups narrower than K: built anew, chunk by chunk.
+            self.assertFalse(self._runs_alive(d, TOP_K))
+            # The entry is read: the check runs its other groups.
+            self.assertFalse(self._runs_alive(d, TOP_K))
+        with tempfile.TemporaryDirectory() as d:
+            # No entry, the first group is chunk 0: copied once, not run again.
+            self.assertFalse(self._runs_alive(d, K))
 
-    def test_kept_when_the_build_takes_them(self):
-        # Control: the tracking sees rows that are still in use.
+    def test_no_rows_outlive_their_use_without_the_cache(self):
+        layer = _w13_layer(K, 0.0)
+        loads, _ = _loads(
+            layer, E + 1, wait=True, skip=(), count=lambda e: None, num_slots=K
+        )
+        step = PostLoad(layer, _Repacking(), loads, True, ())
+        with self._tracked(), patch.object(formats, "HostExpertStore", _CpuStore):
+            fill_store(step, None, K)
+        self.assertTrue(self.alive)
+        self.assertFalse(any(self.alive))
+
+    def test_the_tracking_sees_rows_still_held(self):
+        # Control: rows the test itself keeps are reported alive.
         with tempfile.TemporaryDirectory() as d:
-            self.assertTrue(self._alive_at_second_run(d, K))
+            self.assertTrue(self._runs_alive(d, TOP_K, hold=[]))
 
 
 class TestCheckedGroups(CustomTestCase):
