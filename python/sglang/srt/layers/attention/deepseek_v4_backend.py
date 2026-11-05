@@ -36,6 +36,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged_dsv4,
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_paged_varlen,
     flat_index_logits_row_alignment,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
@@ -1618,6 +1619,8 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
             rows_per_request=rows_per_request,
+            # The dsv41 low-ratio indexers call deep_gemm_fp4_paged_mqa_logits.
+            deep_gemm_varlen=compress_ratio != 4 and deep_gemm_paged_varlen(),
         )
 
     def init_forward_metadata_decode(
