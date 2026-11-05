@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -1331,7 +1332,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
             forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            (cache_indices[: query_start_loc.shape[0] - 1] >= 0)
+            if pp_spec_stable_rows_enabled()
+            else None,
             self.req_to_token_pool.size,
         )
 

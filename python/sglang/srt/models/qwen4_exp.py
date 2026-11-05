@@ -24,6 +24,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.linear.utils import (
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -434,7 +435,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         dst_indices_raw = select_verify_intermediate_state_indices(
             None,
             forward_batch.req_pool_indices,
-            batch.lengths.ne(0),
+            batch.lengths.ne(0) if pp_spec_stable_rows_enabled() else None,
             pool.size,
         )
         ngram.set_intermediate_context(
@@ -1238,7 +1239,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 dst_indices_raw = select_verify_intermediate_state_indices(
                     None,
                     forward_batch.req_pool_indices,
-                    batch.lengths.ne(0),
+                    batch.lengths.ne(0) if pp_spec_stable_rows_enabled() else None,
                     get_req_to_token_pool().size,
                 )
                 if dst_indices_raw is None:
