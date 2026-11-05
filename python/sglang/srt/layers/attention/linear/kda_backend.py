@@ -806,12 +806,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
-        deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
-        if deferred_f_b and is_gfx95_supported():
+        if layer._k3_deferred_f_b and is_gfx95_supported():
             fused_static = layer._k3_hip_fused_decode_args
             fused_backend = layer._k3_hip_fused_decode_backend
             fused_ops = layer._k3_hip_fused_decode_ops
-            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+            onorm_gate = layer._k3_onorm_gate
             # The ReplaySSM ring path has no fused kernel, but still needs f_b applied.
             if (
                 replayssm_d is None
@@ -905,7 +904,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # norm itself whenever the stash is left unconsumed.
         if replayssm_d is None:
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
-            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+            onorm_gate = layer._k3_onorm_gate
             if (
                 fused_static is not None
                 and onorm_gate is not None
@@ -1356,11 +1355,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 and self.state_pool.replayssm_request_ring
             )
             # The fused verify covers the dense chain with a slot-indexed ring only.
-            if (
-                ragged_layout is None
-                and retrieve_parent_token is None
-                and not request_ring
-            ):
+            if ragged_layout is not None:
+                rejection = "ragged verify layout"
+            elif retrieve_parent_token is not None:
+                rejection = "tree verify"
+            elif request_ring:
+                rejection = "request-indexed ReplaySSM ring"
+            else:
+                rejection = None
+            if rejection is not None:
+                kda_fused_verify_aiter_hip.warn_rejected_once(rejection)
+            else:
                 core_attn_out = kda_fused_verify_aiter_hip.run_layer(
                     layer=layer,
                     mixed_qkv=mixed_qkv,
@@ -1951,7 +1956,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         # The kernel owns all 128 output channels and can fold gated RMSNorm
         # into the recurrence.
-        onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+        onorm_gate = layer._k3_onorm_gate
         fused_static = getattr(layer, "_k3_fused_decode_args", None)
         apply_onorm = onorm_gate is not None and fused_static is not None
         if apply_onorm:

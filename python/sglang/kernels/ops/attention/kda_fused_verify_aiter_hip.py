@@ -7,16 +7,23 @@ import logging
 
 import torch
 
+from sglang.kernels.ops.attention.kda_fused_decode_aiter_hip import (
+    _CHANNELS,
+    _CONV_SLOT_STRIDES,
+    _DIM,
+    _HEADS,
+    _STATE_SLOT_STRIDES,
+    _dense_slots,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, print_warning_once
 
 logger = logging.getLogger(__name__)
 
-_HEADS = 12
-_DIM = 128
-_CHANNELS = 3 * _HEADS * _DIM
-# [cache, 4608, 3], or SGLang's [cache, 3, 4608] conv cache as transpose(-1, -2).
-_CONV_SLOT_STRIDES = ((3, 1), (1, _CHANNELS))
+# Dense steps of a [4608, 3] conv window, or of SGLang's [3, 4608] one as transpose(-1, -2).
+_WINDOW_STEP = 3 * _CHANNELS
+_WINDOW_LINE_STRIDES = ((_WINDOW_STEP, 3, 1), (_WINDOW_STEP, 1, _CHANNELS))
+_SNAPSHOT_LINE_STRIDES = ((_HEADS * _DIM * _DIM, _DIM * _DIM, _DIM, 1),)
 _WARMED: set[tuple] = set()
 _REJECTION_LOGGED = False
 
@@ -56,10 +63,26 @@ def available(
     )
 
 
-def _dense_slots(tensor: torch.Tensor, inner_strides: tuple[int, ...]) -> bool:
+def _ring_covered(replay_ring: tuple[torch.Tensor, ...], num_draft_tokens: int) -> bool:
+    """ReplaySSM ring (raw_v, raw_k, g, beta) as [slots, 12, L(, 128)], L >= tokens."""
+    raw_v, raw_k, g, beta = replay_ring
+    ring_len = raw_v.shape[2] if raw_v.ndim == 4 else 0
+    step_strides = ((ring_len * _DIM, _DIM, 1),)
     return (
-        tensor.stride()[-len(inner_strides) :] == inner_strides
-        and tensor.stride(0) >= tensor.shape[1:].numel()
+        ring_len >= num_draft_tokens
+        and all(
+            tensor.shape[1:] == (_HEADS, ring_len, _DIM)
+            and tensor.dtype == dtype
+            and _dense_slots(tensor, step_strides)
+            for tensor, dtype in (
+                (raw_v, torch.bfloat16),
+                (raw_k, torch.bfloat16),
+                (g, torch.float32),
+            )
+        )
+        and beta.shape[1:] == (_HEADS, ring_len)
+        and beta.dtype == torch.float32
+        and _dense_slots(beta, ((ring_len, 1),))
     )
 
 
@@ -77,18 +100,29 @@ def covered(
     intermediate_states: torch.Tensor | None,
     replay_ring: tuple[torch.Tensor, ...] | None,
     num_draft_tokens: int,
+    armed_draft_tokens: int,
 ) -> bool:
     """Shape and layout contract of flydsl_kda_verify_with_f_b for a dense verify."""
     tokens = mixed_qkv.shape[0]
     batch = cache_indices.shape[0]
+    op = _op()
+    # Any other count (e.g. adaptive speculative decoding) would JIT-build its
+    # kernel on first use, which may be inside CUDA graph capture.
+    if (
+        op is None
+        or num_draft_tokens != armed_draft_tokens
+        or num_draft_tokens > op.max_tokens
+    ):
+        return False
     if (intermediate_states is None) == (replay_ring is None):
         return False
-    if replay_ring is not None and replay_ring[0].shape[2] < num_draft_tokens:
+    if replay_ring is not None and not _ring_covered(replay_ring, num_draft_tokens):
         return False
     if intermediate_states is not None and (
         intermediate_states.dtype != state.dtype
+        or intermediate_states.ndim != 5
         or intermediate_states.shape[1] < num_draft_tokens
-        or not _dense_slots(intermediate_states, (_DIM * _DIM, _DIM, 1))
+        or not _dense_slots(intermediate_states, _SNAPSHOT_LINE_STRIDES)
     ):
         return False
     return (
@@ -107,17 +141,20 @@ def covered(
         and output_gate.dtype == torch.bfloat16
         and output_gate.stride(-1) == 1
         and conv_state.shape[1:] == (_CHANNELS, 3)
-        and conv_state.stride()[1:] in _CONV_SLOT_STRIDES
+        and conv_state.dtype == torch.bfloat16
+        and _dense_slots(conv_state, _CONV_SLOT_STRIDES)
         and state.shape[1:] == (_HEADS, _DIM, _DIM)
-        and _dense_slots(state, (_DIM * _DIM, _DIM, 1))
+        and _dense_slots(state, _STATE_SLOT_STRIDES)
         and cache_indices.dtype == torch.int32
         and cache_indices.stride(0) == 1
         and intermediate_indices.shape == (batch,)
         and intermediate_indices.dtype == torch.int32
         and intermediate_indices.stride(0) == 1
+        and intermediate_conv_window.ndim == 4
         and intermediate_conv_window.shape[1] >= num_draft_tokens
         and intermediate_conv_window.shape[2:] == (_CHANNELS, 3)
         and intermediate_conv_window.dtype == torch.bfloat16
+        and _dense_slots(intermediate_conv_window, _WINDOW_LINE_STRIDES)
     )
 
 
@@ -196,7 +233,9 @@ def run_layer(
     replay_ring: tuple[torch.Tensor, ...] | None,
 ) -> torch.Tensor | None:
     """Fused dense chain verify of a layer whose f_b the model deferred, or None."""
-    f_b_weight, norm_weight, norm_eps, a_log = layer._k3_hip_fused_verify_args
+    f_b_weight, norm_weight, norm_eps, a_log, armed_draft_tokens = (
+        layer._k3_hip_fused_verify_args
+    )
     tokens = mixed_qkv.shape[0]
     batch = tokens // num_draft_tokens
     kwargs = dict(
@@ -215,9 +254,11 @@ def run_layer(
         replay_ring=replay_ring,
         num_draft_tokens=num_draft_tokens,
     )
-    if not covered(**kwargs):
-        _warn_rejected_once(
-            f"tokens={tokens}, draft_tokens={num_draft_tokens}, "
+    if not covered(**kwargs, armed_draft_tokens=armed_draft_tokens):
+        warn_rejected_once(
+            f"tokens={tokens}, draft_tokens={num_draft_tokens} "
+            f"(armed {armed_draft_tokens}), "
+            f"conv_state={conv_states.dtype}, "
             f"cache_indices={cache_indices.dtype}, "
             f"inter_indices={intermediate_state_indices.dtype}, "
             f"state={tuple(ssm_states.shape)}/{ssm_states.dtype}"
@@ -235,7 +276,7 @@ def run_layer(
     )
 
 
-def _warn_rejected_once(batch: str) -> None:
+def warn_rejected_once(batch: str) -> None:
     # Once per process, not per batch shape: the first shape is enough to debug.
     global _REJECTION_LOGGED
     if _REJECTION_LOGGED:
@@ -277,27 +318,36 @@ def warmup(
     )
     if key in _WARMED:
         return
-    op = _op()
+    build = functools.partial(
+        _run_zeros,
+        f_b_weight=f_b_weight,
+        conv_weight=conv_weight,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        state_dtype=state_dtype,
+        num_draft_tokens=num_draft_tokens,
+        replay_ring=replay_ring,
+    )
     try:
-        builds = [(1, num_warps) for num_warps in op.num_warps]
+        wave_counts = _op().num_warps
     except AttributeError:
-        # Without the num_warps tag, AITER picks 8 waves up to batch 16 and 4 above.
-        builds = [(1, None), (17, None)]
-    for batch, num_warps in builds:
-        _run_zeros(
-            batch=batch,
-            num_warps=num_warps,
-            f_b_weight=f_b_weight,
-            conv_weight=conv_weight,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-            state_dtype=state_dtype,
-            num_draft_tokens=num_draft_tokens,
-            replay_ring=replay_ring,
-        )
+        wave_counts = None
+    if wave_counts is not None:
+        for num_warps in wave_counts:
+            build(batch=1, num_warps=num_warps)
+    else:
+        # An untagged op dispatches 8 waves up to batch 16 and 4 above.
+        try:
+            # The pinned AITER stack's untagged op still takes num_warps.
+            for num_warps in (8, 4):
+                build(batch=1, num_warps=num_warps)
+        except TypeError:
+            # Older ops take no num_warps, so let the batch pick each count.
+            for batch in (1, 17):
+                build(batch=batch, num_warps=None)
     torch.cuda.synchronize(device)
     _WARMED.add(key)
     logger.info(

@@ -869,6 +869,7 @@ def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
         norm_weight,
         _NORM_EPS,
         layer.A_log,
+        steps,
     )
     # The model slices these out of one in-projection: [q,k,v,g | f_a | b | pad].
     wide = randn(padded_tokens, _CHANNELS + _HEADS * _DIM + _DIM + _HEADS + 4)
@@ -1018,30 +1019,92 @@ def test_verify_warmup_builds_every_wave_count(monkeypatch, ring: bool) -> None:
     monkeypatch.setattr(adapter, "_WARMED", set())
     _verify_warmup(adapter, replay_ring=ring)
 
-    assert sorted(flydsl_kda_verify_with_f_b.num_warps) == [4, 8]
-    assert built == [(1, n) for n in flydsl_kda_verify_with_f_b.num_warps]
+    # The pinned AITER stack's op has no tag but takes 8 and 4 waves by keyword.
+    wave_counts = getattr(flydsl_kda_verify_with_f_b, "num_warps", (8, 4))
+    assert sorted(wave_counts) == [4, 8]
+    assert built == [(1, n) for n in wave_counts]
 
 
-def test_verify_warmup_without_wave_tag_builds_both_policy_batches(
-    monkeypatch,
+@pytest.mark.parametrize("takes_num_warps", [True, False])
+def test_verify_warmup_without_wave_tag_builds_both_policy_wave_counts(
+    monkeypatch, takes_num_warps: bool
 ) -> None:
-    """An AITER verify op without the num_warps tag picks the wave count from the
-    batch (8 up to 16, 4 above), so warmup must run one batch on each side."""
+    """An AITER verify op without the num_warps tag picks 8 waves up to batch 16
+    and 4 above; warmup builds both by keyword, else with one batch on each side."""
     from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
 
     built = []
+
+    def recording_run(**kwargs):
+        built.append((kwargs["cache_indices"].numel(), kwargs["num_warps"]))
+        if kwargs["num_warps"] is not None and not takes_num_warps:
+            raise TypeError("unexpected keyword argument 'num_warps'")
+
     monkeypatch.setattr(adapter, "_op", lambda: SimpleNamespace())
-    monkeypatch.setattr(
-        adapter,
-        "run",
-        lambda **kwargs: built.append(
-            (kwargs["cache_indices"].numel(), kwargs["num_warps"])
-        ),
-    )
+    monkeypatch.setattr(adapter, "run", recording_run)
     monkeypatch.setattr(adapter, "_WARMED", set())
     _verify_warmup(adapter, replay_ring=False)
 
-    assert built == [(1, None), (17, None)]
+    if takes_num_warps:
+        assert built == [(1, 8), (1, 4)]
+    else:
+        assert built == [(1, 8), (1, None), (17, None)]
+
+
+@pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")
+@pytest.mark.parametrize("ring", [False, True])
+def test_verify_covered_falls_back_instead_of_aiter_raising(ring: bool) -> None:
+    """A draft-token count other than the warmed one would JIT-build inside graph
+    capture, and a cache dtype or ring shape AITER rejects would raise; both fall back."""
+    from sglang.kernels.ops.attention.kda_fused_verify_aiter_hip import covered
+
+    batch, steps, slots = 3, 5, 7
+    tokens = batch * steps
+
+    def empty(*shape, dtype=torch.bfloat16):
+        return torch.empty(*shape, dtype=dtype, device="meta")
+
+    def make_ring(ring_len, g_dtype=torch.float32):
+        return (
+            empty(slots, _HEADS, ring_len, _DIM),
+            empty(slots, _HEADS, ring_len, _DIM),
+            empty(slots, _HEADS, ring_len, _DIM, dtype=g_dtype),
+            empty(slots, _HEADS, ring_len, dtype=torch.float32),
+        )
+
+    kwargs = dict(
+        f_a=empty(tokens, _DIM),
+        mixed_qkv=empty(tokens, _CHANNELS),
+        raw_beta=empty(1, tokens, _HEADS),
+        output_gate=empty(tokens, _HEADS, _DIM),
+        conv_state=empty(slots, _CONV_WIDTH - 1, _CHANNELS).transpose(-1, -2),
+        state=empty(slots, _HEADS, _DIM, _DIM),
+        cache_indices=empty(batch, dtype=torch.int32),
+        intermediate_indices=empty(batch, dtype=torch.int32),
+        intermediate_conv_window=empty(
+            slots, steps, _CONV_WIDTH - 1, _CHANNELS
+        ).transpose(-1, -2),
+        intermediate_states=None if ring else empty(slots, steps, _HEADS, _DIM, _DIM),
+        replay_ring=make_ring(2 * steps) if ring else None,
+        num_draft_tokens=steps,
+        armed_draft_tokens=steps,
+    )
+    assert covered(**kwargs)
+    rejected = [
+        {"armed_draft_tokens": steps + 1},
+        {
+            "conv_state": empty(
+                slots, _CONV_WIDTH - 1, _CHANNELS, dtype=torch.float16
+            ).transpose(-1, -2)
+        },
+    ]
+    if ring:
+        rejected += [
+            {"replay_ring": make_ring(steps - 1)},
+            {"replay_ring": make_ring(2 * steps, g_dtype=torch.bfloat16)},
+        ]
+    for change in rejected:
+        assert not covered(**{**kwargs, **change}), change
 
 
 if __name__ == "__main__":

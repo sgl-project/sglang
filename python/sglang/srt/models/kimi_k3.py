@@ -2103,6 +2103,12 @@ class KimiK3DeltaAttention(nn.Module):
             num_draft_tokens=num_draft_tokens,
         ):
             return
+        if (get_spec().speculative_eagle_topk or 1) > 1:
+            print_warning_once(
+                "Kimi-K3 fused KDA verify stays off: it covers chain verify only, "
+                "not tree speculative decoding (speculative_eagle_topk > 1)"
+            )
+            return
         kda_fused_verify_aiter_hip.warmup(
             f_b_weight=f_b_weight,
             conv_weight=layer.conv_weights,
@@ -2115,7 +2121,11 @@ class KimiK3DeltaAttention(nn.Module):
             num_draft_tokens=num_draft_tokens,
             replay_ring=get_exec().mamba.enable_linear_replayssm_spec,
         )
-        layer._k3_hip_fused_verify_args = layer._k3_hip_fused_decode_args
+        # The warmed draft-token count is the only one the verify may run.
+        layer._k3_hip_fused_verify_args = (
+            *layer._k3_hip_fused_decode_args,
+            num_draft_tokens,
+        )
         self._kda_hip_fused_verify_ready = True
 
     def forward_qkvbfg_fused(

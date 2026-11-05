@@ -88,7 +88,8 @@ class RadixLinearAttention(nn.Module):
         self._k3_hip_fused_decode_args = None
         self._k3_hip_fused_decode_backend = ""
         self._k3_hip_fused_decode_ops = None
-        # The decode's static inputs once the HIP fused verify is armed too.
+        # The decode's static inputs plus the warmed draft-token count once the HIP
+        # fused verify is armed too.
         self._k3_hip_fused_verify_args = None
 
     def refresh_conv_weights(self, weight: torch.Tensor) -> None:

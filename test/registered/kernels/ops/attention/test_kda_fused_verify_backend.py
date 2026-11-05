@@ -60,6 +60,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 dt_bias=randn(v_heads * head_dim, dtype=torch.float32),
                 lower_bound=lower_bound,
                 _k3_deferred_f_b=False,
+                _k3_onorm_gate=None,
             )
             for i in range(num_layers)
         ]
