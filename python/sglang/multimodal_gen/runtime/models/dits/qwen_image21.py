@@ -65,6 +65,12 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+# Every fast path below is a CUDA-only JIT or PTX kernel except the SiLU-mul
+# activation, which is plain Triton and rounds bit-exactly on HIP as well. That
+# one is gated on the device family instead of the vendor, so ROCm runs it too;
+# its BitExactFusionGate still verifies the first call and falls back on any
+# mismatch.
+_silu_mul_device = _is_cuda or current_platform.is_hip()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -436,7 +442,7 @@ class QwenImage21FeedForward(nn.Module):
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         fused = None
         if (
-            _is_cuda
+            _silu_mul_device
             and gate.dtype is torch.bfloat16
             and _SILU_MUL_FUSION.can_attempt_once()
         ):
