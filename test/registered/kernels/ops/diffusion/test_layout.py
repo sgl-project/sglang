@@ -811,6 +811,29 @@ def test_vsa_tile_to_bhsd(shape, batch, heads, head_dim, dtype, strided):
 
 
 @pytest.mark.skipif(bool(torch.version.hip), reason="VSA layout fast path is CUDA-only")
+@pytest.mark.parametrize("seq_len", [63, 65])
+def test_vsa_tile_to_bhsd_rejects_sequence_length_mismatch(seq_len):
+    from sglang.kernels.ops.diffusion import vsa_tile_to_bhsd
+
+    x = torch.empty((1, seq_len, 1, 64), device=DEVICE, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="sequence length must equal"):
+        vsa_tile_to_bhsd(x=x, dit_seq_shape=(4, 4, 4))
+
+
+@pytest.mark.skipif(bool(torch.version.hip), reason="VSA layout fast path is CUDA-only")
+@pytest.mark.parametrize(
+    "shape",
+    [(0, 4, 4), (4, 0, 4), (4, 4, 0), (-1, 4, 4), (4, -1, 4), (4, 4, -1)],
+)
+def test_vsa_tile_to_bhsd_rejects_nonpositive_dimensions(shape):
+    from sglang.kernels.ops.diffusion import vsa_tile_to_bhsd
+
+    x = torch.empty((1, 64, 1, 64), device=DEVICE, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="three positive dimensions"):
+        vsa_tile_to_bhsd(x=x, dit_seq_shape=shape)
+
+
+@pytest.mark.skipif(bool(torch.version.hip), reason="VSA layout fast path is CUDA-only")
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 6 * 2**30,
     reason="needs a CUDA GPU with 6 GiB free",
