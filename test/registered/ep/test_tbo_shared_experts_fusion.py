@@ -13,7 +13,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=276, stage="extra-b", runner_config="8-gpu-h200")
-register_amd_ci(est_time=449, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=449,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): needs DeepEP (no deep_ep module in the ROCm image)",
+)
 
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 

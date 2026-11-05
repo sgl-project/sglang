@@ -49,7 +49,7 @@ from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=310, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=1155, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(est_time=1363, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 FORCE_RETRY_PROB = 0.1

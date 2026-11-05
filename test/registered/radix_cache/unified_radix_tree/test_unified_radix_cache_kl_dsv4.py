@@ -26,7 +26,12 @@ DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
 register_cuda_ci(est_time=1844, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=3600, stage="extra-b", runner_config="4-gpu-amd")
+register_amd_ci(
+    est_time=2793,
+    stage="extra-b",
+    runner_config="4-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): MXFP4 Marlin requires SM90 or SM120",
+)
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):

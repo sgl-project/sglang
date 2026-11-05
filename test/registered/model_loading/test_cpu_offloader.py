@@ -26,7 +26,7 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: XPU CPU-offload loads host Gemma weights into device buffers
 # and must retain cached GDN/KDA views after checkpoint loading.
 register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
-register_amd_ci(est_time=24, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=25, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class CachedConvolution(nn.Module):

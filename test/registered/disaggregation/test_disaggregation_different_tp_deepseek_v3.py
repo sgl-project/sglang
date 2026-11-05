@@ -15,7 +15,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=275, stage="extra-b", runner_config="8-gpu-h20")
-register_amd_ci(est_time=356, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=356,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): needs lmsys/sglang-ci-dsv3-test, which AMD CI cannot download (HF 404)",
+)
 
 
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):

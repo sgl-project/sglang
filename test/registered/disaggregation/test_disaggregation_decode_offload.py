@@ -21,7 +21,7 @@ register_cuda_ci(
     stage="extra-a",
     runner_config="2-gpu-large",
 )
-register_amd_ci(est_time=1213, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(est_time=1293, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):

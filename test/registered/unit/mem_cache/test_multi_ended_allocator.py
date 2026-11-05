@@ -36,7 +36,7 @@ from sglang.test.unified_allocator_fixtures import (
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=18, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=19, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import contextlib
 import random

@@ -33,7 +33,12 @@ register_cuda_ci(
     stage="extra-b",
     runner_config="8-gpu-h200",
 )
-register_amd_ci(est_time=168, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=168,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): JIT build of sgl_kernel custom_all_reduce fails on gfx942",
+)
 
 
 # ---------------------------------------------------------------------------

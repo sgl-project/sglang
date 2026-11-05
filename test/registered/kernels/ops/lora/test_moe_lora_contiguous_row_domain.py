@@ -27,7 +27,7 @@ register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
 # its four GPUs are allocation granularity, not multi-GPU coverage.
 register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_amd_ci(est_time=13, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=17, stage="jit-kernel-unit", runner_config="amd")
 
 _GB300 = "sm100"
 _H200 = "sm90"

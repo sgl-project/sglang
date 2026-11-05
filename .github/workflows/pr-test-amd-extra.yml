@@ -134,7 +134,7 @@ jobs:
   # hang costs a full per-file timeout. The step timeout then rises to 180 min so
   # a few hangs don't kill the step and drop the files not yet run. The extra-b
   # jobs derive per-file timeouts from est_time, since a few of their files
-  # (e.g. unified_radix_cache_kl_dsv4) run longer than a flat 1800s.
+  # (e.g. unified_radix_cache_kl_mamba, 1783s) come close to a flat 1800s.
 
   # =============================================== extra-a (1-gpu-small) ===============================================
   # ~1h of tests in total; two shards keep each under the step timeout.
@@ -290,7 +290,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3]
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -312,7 +312,7 @@ jobs:
       - name: Run test
         timeout-minutes: ${{ inputs.continue_on_error == true && 180 || 60 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-b-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-from-est-time ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-b-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2--timeout-from-est-time ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job

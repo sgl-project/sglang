@@ -39,7 +39,7 @@ from sglang.test.ci.ci_register import (
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=18, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=19, stage="jit-kernel-unit", runner_config="amd")
 
 KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY", DSV41_CANDIDATE_UNFILTERED)
 HEAD = object()  # the head's event the side stream waits for

@@ -22,7 +22,12 @@ GLM5_MODEL = "zai-org/GLM-5.2-FP8"
 GLM5_LAUNCH_TIMEOUT = 3600
 
 register_cuda_ci(est_time=306, stage="extra-b", runner_config="8-gpu-h200")
-register_amd_ci(est_time=576, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=576,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): zai-org/GLM-5.2-FP8 is not in the AMD CI model cache; the download outlasts the 2376s timeout",
+)
 
 
 class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):

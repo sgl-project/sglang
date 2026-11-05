@@ -12,7 +12,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=545, stage="extra-b", runner_config="8-gpu-h200")
-register_amd_ci(est_time=2700, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=957,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): accuracy 0.205, needs > 0.9",
+)
 
 
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):

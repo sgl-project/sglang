@@ -25,7 +25,7 @@ from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=34, stage="base-b", runner_config="2-gpu-large")
 register_xpu_ci(est_time=60, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
-register_amd_ci(est_time=50, stage="stage-b", runner_config="2-gpu-large-amd")
+register_amd_ci(est_time=52, stage="stage-b", runner_config="2-gpu-large-amd")
 
 NUM_GPUS = 2
 

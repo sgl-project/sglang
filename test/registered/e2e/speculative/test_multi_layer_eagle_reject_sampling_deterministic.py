@@ -10,7 +10,12 @@ from sglang.test.test_deterministic import test_deterministic as run_determinist
 from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
 register_cuda_ci(est_time=480, stage="extra-b", runner_config="8-gpu-h200")
-register_amd_ci(est_time=2700, stage="extra-b", runner_config="large-8-gpu-amd")
+register_amd_ci(
+    est_time=479,
+    stage="extra-b",
+    runner_config="large-8-gpu-amd",
+    disabled="fails in AMD parity run #48317 (MI300, rocm10): Can not import FA3 in sgl_kernel",
+)
 
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 

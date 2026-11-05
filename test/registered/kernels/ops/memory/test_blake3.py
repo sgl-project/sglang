@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=34, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
 
 # BLAKE3-team/BLAKE3/test_vectors/test_vectors.json, unkeyed 32-byte outputs.
 # Input byte i is i % 251. These answers are independent of our implementation.
