@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 import torch
 from PIL import Image
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -163,7 +164,7 @@ class TestNpuJpegInput(unittest.TestCase):
         return decoder, acl
 
     @contextmanager
-    def _npu(self, current=3, chip="Ascend910_9362"):
+    def _npu(self, current=3, arch=2201, arch_error=0):
         state = types.SimpleNamespace(current=current)
         real_device = torch.device
 
@@ -186,13 +187,23 @@ class TestNpuJpegInput(unittest.TestCase):
 
         backend = types.SimpleNamespace(
             current_device=Mock(side_effect=lambda: state.current),
-            get_device_name=Mock(return_value=chip),
+            architecture_query=Mock(return_value=(arch, arch_error)),
             device=select,
         )
         with (
             patch.object(torch, "device", side_effect=device),
             patch.object(torch, "npu", backend, create=True),
-            patch.dict(sys.modules, {"torch_npu": types.ModuleType("torch_npu")}),
+            patch.dict(
+                sys.modules,
+                {
+                    "torch_npu": types.ModuleType("torch_npu"),
+                    "acl": types.SimpleNamespace(
+                        rt=types.SimpleNamespace(
+                            get_device_info=backend.architecture_query
+                        )
+                    ),
+                },
+            ),
         ):
             yield state, backend
 
@@ -352,6 +363,7 @@ class TestNpuJpegInput(unittest.TestCase):
                         self.jpeg.decode_jpeg(data, device=device)
                     self.assertEqual(state.current, 3)
                     factory.assert_called_once_with(target)
+                    backend.architecture_query.assert_called_once_with(target, 601)
                     if device == "npu":
                         backend.current_device.assert_called()
 
@@ -384,21 +396,40 @@ class TestNpuJpegInput(unittest.TestCase):
             self.jpeg, "_decoder", side_effect=AssertionError("decoder constructed")
         ):
             for data in cases:
-                with self.subTest(
-                    dtype=data.dtype, shape=data.shape, device=data.device
-                ), self.assertRaises((TypeError, ValueError)):
+                with (
+                    self.subTest(
+                        dtype=data.dtype, shape=data.shape, device=data.device
+                    ),
+                    self.assertRaises((TypeError, ValueError)),
+                ):
                     self.jpeg.decode_jpeg(data)
 
     def test_public_unsupported_chip_and_invalid_target(self):
         data = _encoded_tensor(_jpeg())
+        for arch in (1001, 3510, 0):
+            with (
+                self.subTest(arch=arch),
+                self._npu(arch=arch) as (state, backend),
+                patch.object(self.jpeg, "_decoder") as factory,
+            ):
+                self.assertIsNone(self.jpeg.decode_jpeg(data, device="npu:1"))
+                backend.architecture_query.assert_called_once_with(1, 601)
+                self.assertEqual(state.current, 3)
+                factory.assert_not_called()
+                with self.assertRaises((TypeError, ValueError)):
+                    self.jpeg.decode_jpeg(data, device="cpu")
+
+    def test_public_architecture_query_error_does_not_construct_decoder(self):
+        data = _encoded_tensor(_jpeg())
         with (
-            self._npu(chip="unsupported"),
+            self._npu(arch_error=17) as (state, backend),
             patch.object(self.jpeg, "_decoder") as factory,
         ):
-            self.assertIsNone(self.jpeg.decode_jpeg(data))
+            with self.assertRaisesRegex(self.dvpp.ACLFailure, "query NPU architecture"):
+                self.jpeg.decode_jpeg(data, device="npu:1")
+            backend.architecture_query.assert_called_once_with(1, 601)
+            self.assertEqual(state.current, 3)
             factory.assert_not_called()
-            with self.assertRaises((TypeError, ValueError)):
-                self.jpeg.decode_jpeg(data, device="cpu")
 
 
 if __name__ == "__main__":

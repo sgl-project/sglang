@@ -25,26 +25,6 @@ _guard = threading.Lock()
 _pid = os.getpid()
 _closed = False
 
-# Known A2/A3 device names. Older Atlas training devices and 950 do not
-# support the V1 VPC color conversion; unknown names keep the PIL path.
-_V1_DEVICE_NAMES = frozenset(
-    {
-        "Ascend910B1",
-        "Ascend910B2",
-        "Ascend910B2C",
-        "Ascend910B3",
-        "Ascend910B4",
-        "Ascend910B4_1",
-        "Ascend910_9362",
-        "Ascend910_9363",
-        "Ascend910_9372",
-        "Ascend910_9381",
-        "Ascend910_9382",
-        "Ascend910_9391",
-        "Ascend910_9392",
-    }
-)
-
 
 @dataclass
 class _Entry:
@@ -176,8 +156,13 @@ def decode_jpeg(
     device_index = target.index
     if device_index is None:
         device_index = torch.npu.current_device()
-    # Check the actual worker before constructing any DVPP resources.
-    if torch.npu.get_device_name(device_index) not in _V1_DEVICE_NAMES:
+    import acl
+
+    # ACL_DEV_ATTR_NPU_ARCH: A2/A3 use 2201 and support V1 VPC conversion.
+    # Query the target device before constructing any DVPP resources.
+    arch, ret = acl.rt.get_device_info(device_index, 601)
+    check(ret, "query NPU architecture")
+    if arch != 2201:
         return None
     with torch.npu.device(device_index):
         return _decoder(device_index).decode(data)

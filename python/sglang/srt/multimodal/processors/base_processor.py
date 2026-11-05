@@ -847,8 +847,10 @@ class BaseMultimodalProcessor(ABC):
 
             npu_apply_glm46v_image_preprocess_patch()
             return f"npu:{server_args.base_gpu_id}"
-        # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
-        return "cpu"
+        if processor.__class__.__name__ == "Glm4vProcessor":
+            # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
+            return "cpu"
+        return None
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
