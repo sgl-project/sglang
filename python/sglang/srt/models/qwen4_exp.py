@@ -1047,7 +1047,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
-        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+        # As in VocabParallelEmbedding.forward: every attention-TP peer of an
+        # empty idle batch is empty too, so all of them skip the collective.
+        if (
+            output.numel() > 0
+            and self.tp_size > 1
+            and not get_attn_tp_context().input_scattered
+        ):
             if self.use_attn_tp_group:
                 return attn_tp_all_reduce(output)
             return tensor_model_parallel_all_reduce(output)

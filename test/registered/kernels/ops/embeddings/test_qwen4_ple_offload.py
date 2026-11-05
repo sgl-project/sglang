@@ -161,6 +161,33 @@ def test_qwen4_ple_pinned_gather_empty_input():
     assert actual.numel() == 0
 
 
+@pytest.mark.parametrize("use_attn_tp_group", [True, False])
+def test_qwen4_ple_pinned_embedding_skips_reduce_for_empty_batch(
+    monkeypatch, use_attn_tp_group
+):
+    # An idle DP-attention batch embeds no tokens; with attention TP > 1 an
+    # all-reduce of a (0, hidden) tensor fails on the custom all-reduce path.
+    reduced = []
+    monkeypatch.setattr(qwen4_exp_module, "attn_tp_all_reduce", reduced.append)
+    monkeypatch.setattr(
+        qwen4_exp_module, "tensor_model_parallel_all_reduce", reduced.append
+    )
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "get_attn_tp_context",
+        lambda: SimpleNamespace(input_scattered=False),
+    )
+    offloaded = Qwen4ExpPinnedHostEmbedding(_make_source_embedding(tp_size=2))
+    offloaded.use_attn_tp_group = use_attn_tp_group
+
+    empty = torch.empty((0, 7), dtype=torch.bfloat16, device=DEVICE)
+    assert offloaded.reduce(empty) is empty
+    assert reduced == []
+
+    offloaded.reduce(torch.zeros((2, 7), dtype=torch.bfloat16, device=DEVICE))
+    assert [tuple(t.shape) for t in reduced] == [(2, 7)]
+
+
 def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():
     with pytest.raises(TypeError, match="requires bfloat16"):
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(dtype=torch.float16))
