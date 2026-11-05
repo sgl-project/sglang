@@ -11,7 +11,8 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from sgl_kernel_npu.operators import attention as npu_attention_ops
-from sgl_kernel_npu.operators import kvcacheio as npu_cache_ops
+from sgl_kernel_npu.operators import indexer as npu_indexer_ops
+from sgl_kernel_npu.operators import mem_cache as npu_cache_ops
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
@@ -876,7 +877,7 @@ class C4IndexerAscendBackendMixin:
         cmp_ratio = int(c4_indexer.compressor.ratio)
         kv_len = fm.actual_seq_lengths_kv.to(torch.int32)
         seqused_k = (kv_len // cmp_ratio).to(torch.int32)
-        topk_idxs, _ = npu_attention_ops.quant_lightning_indexer(
+        topk_idxs, _ = npu_indexer_ops.quant_lightning_indexer(
             q_quant,
             k,
             weights.to(q_scale.dtype),
@@ -2089,7 +2090,7 @@ class DeepseekV4AscendAttnBackend(
                     kv_len.cumsum(0).to(torch.int32),
                 ]
             )
-        return npu_attention_ops.quant_lightning_indexer_metadata(
+        return npu_indexer_ops.quant_lightning_indexer_metadata(
             self._dsv4_index_n_heads,
             1,
             self._dsv4_index_head_dim,

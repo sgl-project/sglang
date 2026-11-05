@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.kvcacheio import get_npu_kv_quant_path, kv_compress_epilog
+from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path, kv_compress_epilog
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
