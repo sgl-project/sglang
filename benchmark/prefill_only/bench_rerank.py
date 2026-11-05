@@ -1,14 +1,24 @@
-"""Closed-loop synthetic benchmark for the cross-encoder /v1/rerank API.
+"""SGLang Rerank Benchmark Script
 
-Example:
-    python benchmark/prefill_only/bench_rerank.py \
-        --model /localdisk2/huggingface/bge-reranker-base \
-        --input-len 256 --query-len 32 --documents 1 \
-        --concurrency 24 --num-requests 1000 --warmup-requests 48
+This script benchmarks the cross-encoder /v1/rerank API with synthetic input.
 
-Input length includes query, document, and pair special tokens. Text generation
-and warmup are excluded from timing. Disable server prefix caching for this
-repeated-input workload. This measures performance, not ranking accuracy.
+Features:
+- HTTP-only implementation
+- Configurable input and query lengths, documents, and concurrency
+- Validates rerank results and server-side prompt token counts
+- Reports throughput and request latency metrics
+- Excludes input generation and warmup from measured timing
+
+Usage:
+- Ensure the SGLang server is running
+- Disable server prefix caching for this repeated-input workload
+- Run: python benchmark/prefill_only/bench_rerank.py \\
+    --model /localdisk2/huggingface/bge-reranker-base \\
+    --input-len 256 --query-len 32 --documents 1 \\
+    --concurrency 24 --num-requests 1000 --warmup-requests 48
+
+Input length includes the query, document, and pair special tokens. This
+benchmark measures performance, not ranking accuracy.
 """
 
 import argparse
