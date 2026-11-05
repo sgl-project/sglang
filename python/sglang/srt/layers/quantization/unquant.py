@@ -1411,7 +1411,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # construction, far from the cause, so decide that here instead.
         sail_deep_gemm_reason = None
         if is_sail() and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            from sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe import (
+            from sglang.srt.hardware_backend.sail.moe.deepgemm_moe import (
                 sail_deepgemm_moe_unsupported_reason,
             )
 
@@ -1472,7 +1472,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         else:
             backend = MoeRunnerBackend.TRITON
         if is_sail() and backend.is_deep_gemm():
-            import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401
+            import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # aiter CK fused-MoE only supports some shapes / activations; else use triton.

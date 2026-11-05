@@ -3165,7 +3165,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_deep_gemm():
             if _is_sail:
-                import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
+                import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401 – triggers @register_fused_func
 
         if (
             moe_runner_backend.is_flashinfer_cutlass()

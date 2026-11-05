@@ -377,7 +377,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if is_sail() and moe_runner_backend.is_deep_gemm():
-            import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401
+            import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401
 
         if (
             moe_runner_backend.is_aiter()

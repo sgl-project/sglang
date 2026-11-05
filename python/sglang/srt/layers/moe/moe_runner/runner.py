@@ -110,8 +110,9 @@ class MoeRunner:
             if is_sail():
                 # SAIL's EP kernels live in a subclass so that the shared
                 # DeepGEMM runner stays free of them; the TP counterparts are
-                # registered as fused funcs by sail_deepgemm_moe.py instead.
-                from sglang.srt.layers.moe.moe_runner.sail_deepgemm_ep import (
+                # registered as fused funcs by hardware_backend/sail/moe/
+                # deepgemm_moe.py instead.
+                from sglang.srt.hardware_backend.sail.moe.deepgemm_ep import (
                     SailDeepGemmEpRunnerCore,
                 )
 
