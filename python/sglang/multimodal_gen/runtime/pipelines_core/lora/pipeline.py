@@ -1527,11 +1527,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         if layer.merged:
                             layer.unmerge_lora_weights()
                         layer.disable_lora = False
-                        layer.strength = strength
-                        layer.lora_weights_list = [
-                            (*entry[:3], strength, *entry[4:])
-                            for entry in layer.lora_weights_list
-                        ]
+                        layer.set_dynamic_strength(strength)
                     self.is_lora_merged[module_name] = False
                     self._record_merge_strength(module_name, strength)
                     logger.info(

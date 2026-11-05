@@ -89,6 +89,9 @@ def _comfy_job_hooks() -> dict:
     }
 
 
+_LORA_MERGE_MODES = ("dynamic", "merge", "auto")
+
+
 class SGLDLoraLoader:
     @classmethod
     def INPUT_TYPES(cls):
@@ -108,10 +111,10 @@ class SGLDLoraLoader:
             },
             "optional": {
                 "merge_mode": (
-                    ["dynamic", "merge"],
+                    list(_LORA_MERGE_MODES),
                     {
                         "default": "dynamic",
-                        "tooltip": "Dynamic keeps base weights unchanged; merge folds LoRA into weights. Use the same mode for all LoRAs chained on one MODEL.",
+                        "tooltip": "Dynamic keeps base weights unchanged; merge folds LoRA into weights; auto merges unless BF16 rounding would drop most of an adapter's update. Use the same mode for all LoRAs chained on one MODEL.",
                     },
                 ),
             },
@@ -132,7 +135,7 @@ class SGLDLoraLoader:
         merge_mode="dynamic",
     ):
         """Load LoRA adapter using SGLang Diffusion API."""
-        if merge_mode not in ("dynamic", "merge"):
+        if merge_mode not in _LORA_MERGE_MODES:
             raise ValueError(f"Unsupported LoRA merge mode: {merge_mode}")
         lora_path = folder_paths.get_full_path("loras", lora_name)
         assert model is not None

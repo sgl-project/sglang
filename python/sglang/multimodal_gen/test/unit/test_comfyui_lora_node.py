@@ -94,7 +94,9 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
     base = _Model(executor)
 
     loader = nodes.SGLDLoraLoader()
-    assert loader.INPUT_TYPES()["optional"]["merge_mode"][1]["default"] == "dynamic"
+    modes, mode_options = loader.INPUT_TYPES()["optional"]["merge_mode"]
+    assert modes == ["dynamic", "merge", "auto"]
+    assert mode_options["default"] == "dynamic"
     (first,) = loader.load_lora(base, "style.safetensors", 1.0, nickname="style")
     (second,) = loader.load_lora(first, "detail.safetensors", 0.8, nickname="detail")
 
@@ -111,6 +113,8 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
     assert set(second.patches) == {"style", "detail"}
     with pytest.raises(ValueError, match="same merge_mode"):
         loader.load_lora(first, "detail.safetensors", merge_mode="merge")
+    (auto,) = loader.load_lora(base, "style.safetensors", merge_mode="auto")
+    assert auto.model_options["sgld_lora_input"]["merge_mode"] == "auto"
 
 
 class _TupleLinear(torch.nn.Linear):
