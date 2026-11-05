@@ -14,6 +14,12 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     throw std::runtime_error(
         "param_.max_trie_depth must be greater than 1, current value: " + std::to_string(param_.max_trie_depth));
   }
+  // The trie root takes one node, and inserting a max_trie_depth suffix needs max_trie_depth more.
+  if (!(capacity > param_.max_trie_depth)) {
+    throw std::runtime_error(
+        "capacity must be greater than max_trie_depth, current capacity: " + std::to_string(capacity) +
+        ", max_trie_depth: " + std::to_string(param_.max_trie_depth));
+  }
   if (!(param_.min_bfs_breadth > 0)) {
     throw std::runtime_error(
         "min_bfs_breadth must be greater than 0, current value: " + std::to_string(param_.min_bfs_breadth));
