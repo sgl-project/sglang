@@ -437,7 +437,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
     prefill_cp_metadata: Optional[ShardedContextParallelMetadata] = None
-    gdn_cp_metadata: Optional[ShardedContextParallelMetadata] = None
 
     # This iteration's KV ids, translated once per sub-pool (`IterationIds`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
@@ -992,7 +991,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             prefill_cp_metadata=batch.prefill_cp_metadata,
-            gdn_cp_metadata=batch.gdn_cp_metadata,
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
@@ -1384,12 +1382,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     @property
     def layer_cp_metadata(self):
         """Token ownership used by hybrid attention and FFN boundaries."""
-        if self.prefill_cp_metadata is not None:
-            return self.prefill_cp_metadata
-        metadata = self.gdn_cp_metadata
-        return (
-            metadata if metadata is not None and metadata.current is not None else None
-        )
+        metadata = self.prefill_cp_metadata
+        # Physical KV sharding owns rows from the first layer. Shared CP/TP
+        # paths activate layer-wide ownership only after the model splits rows;
+        # ordinary MoE keeps its existing attention-local row transport.
+        if metadata is not None and (
+            metadata.kv_read_slots is not None or metadata.current is not None
+        ):
+            return metadata
+        return None
 
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE

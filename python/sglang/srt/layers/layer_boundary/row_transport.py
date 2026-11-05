@@ -227,7 +227,7 @@ class ContiguousContextParallelTransport(ComputeTransport):
         from sglang.srt.layers.cp.utils import is_cp_active
 
         self.rows = rows
-        self.metadata = batch.gdn_cp_metadata
+        self.metadata = batch.prefill_cp_metadata
         self.source_rows = hidden_states.shape[0]
         self.input = hidden_states
         self.sharded = is_cp_active(batch)

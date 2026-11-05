@@ -437,6 +437,7 @@ def _check_backend(cache, packed, seq_lens, query_lens, expected, reference):
     ]
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
+        prefill_cp_metadata=None,
         extend_seq_lens_cpu=query_lens,
         extend_prefix_lens_cpu=tuple(s - n for s, n in zip(seq_lens, query_lens)),
         req_pool_indices=torch.arange(len(seq_lens), device="cuda"),
@@ -481,9 +482,20 @@ def _check_backend(cache, packed, seq_lens, query_lens, expected, reference):
         SimpleNamespace(kv=SimpleNamespace(req_pool_idx=i))
         for i in range(len(seq_lens))
     ]
-    backend._prepare_cp_metadata(batch, query_lens, batch.extend_prefix_lens_cpu)
-    batch.prefill_cp_metadata.upload()
-    batch.prefill_cp_metadata.resolve_kv_slots(table, batch.out_cache_loc)
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    hybrid = object.__new__(HybridLinearAttnBackend)
+    hybrid.full_attn_backend = backend
+    hybrid.linear_attn_backend = SimpleNamespace(
+        device=backend.device, _cp_residual_exchange=None
+    )
+    hybrid.req_to_token_pool = backend.req_to_token_pool
+    hybrid._cp_metadata_plan = None
+    hybrid.prepare_cp_metadata(
+        batch, lengths=query_lens, prefixes=batch.extend_prefix_lens_cpu
+    )
     backend.init_forward_metadata(batch)
     frame = batch.prefill_cp_metadata
     layer = SimpleNamespace(
@@ -1459,9 +1471,17 @@ class TestContextParallelMetadata(unittest.TestCase):
             cp_exchange=SimpleNamespace(capacity=512),
             req_to_token_pool=pool,
         )
-        full._prepare_cp_metadata = lambda *args: AttentionBackend._prepare_cp_metadata(
-            full, *args
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
         )
+
+        hybrid = object.__new__(HybridLinearAttnBackend)
+        hybrid.full_attn_backend = full
+        hybrid.linear_attn_backend = SimpleNamespace(
+            device=table.device, _cp_residual_exchange=None
+        )
+        hybrid.req_to_token_pool = pool
+        hybrid._cp_metadata_plan = None
         runner = SimpleNamespace(
             server_args=SimpleNamespace(
                 attn_cp_size=2,
@@ -1469,7 +1489,7 @@ class TestContextParallelMetadata(unittest.TestCase):
                 disaggregation_mode="prefill",
                 encoder_only=False,
             ),
-            attn_backend=SimpleNamespace(full_attn_backend=full),
+            attn_backend=hybrid,
             req_to_token_pool=pool,
         )
         batch = SimpleNamespace(

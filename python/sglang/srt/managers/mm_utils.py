@@ -672,7 +672,7 @@ def _embed_mm_inputs_with_split(
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
             cp_metadata=(
-                forward_batch.prefill_cp_metadata
+                forward_batch.layer_cp_metadata
                 if forward_batch.input_embeds is None
                 else None
             ),
@@ -721,7 +721,7 @@ def _embed_mm_inputs_with_split(
             extend_seq_lens=sub_seq_lens,
             input_ids=sub_input_ids,
             cp_metadata=(
-                forward_batch.prefill_cp_metadata
+                forward_batch.layer_cp_metadata
                 if forward_batch.input_embeds is None
                 else None
             ),
@@ -833,7 +833,7 @@ def prepare_mm_inputs(
                         placeholder_tokens=placeholder_tokens,
                         use_deepstack=use_deepstack,
                         cp_metadata=(
-                            forward_batch.prefill_cp_metadata
+                            forward_batch.layer_cp_metadata
                             if forward_batch.input_embeds is None
                             else None
                         ),

@@ -346,8 +346,9 @@ def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
 def cp_gather_full_sequence_states(sharded_states, forward_batch, stream=None):
     """Gather CP-sharded states into the full logical sequence order."""
     metadata = getattr(forward_batch, "prefill_cp_metadata", None)
-    if metadata is not None:
-        output = metadata.token_collectives().gather(sharded_states)
+    if metadata is not None and metadata.current is not None:
+        plan = metadata.token_collectives()
+        output = plan.gather(sharded_states[: plan.local_rows])
         forward_batch.num_token_non_padded = metadata.original_non_padded
         return output
     assert is_cp_active(forward_batch)
@@ -361,7 +362,13 @@ def cp_gather_full_sequence_states(sharded_states, forward_batch, stream=None):
 def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
     metadata = getattr(forward_batch, "prefill_cp_metadata", None)
     if metadata is not None:
-        return complete_position_ids.index_select(-1, metadata.query_indices)
+        positions = complete_position_ids.index_select(-1, metadata.query_indices)
+        padding = getattr(forward_batch, "attn_cp_metadata", None)
+        if metadata.kv_read_slots is None and padding is not None:
+            from sglang.srt.layers.cp.padding import pad_local_rows
+
+            positions = pad_local_rows(positions, padding, dim=-1)
+        return positions
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None

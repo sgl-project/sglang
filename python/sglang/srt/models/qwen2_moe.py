@@ -650,8 +650,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         trace_sync("pre_experts")
-        if forward_batch.prefill_cp_metadata is not None:
-            launch_cp_residual_exchange(forward_batch.prefill_cp_metadata)
+        if forward_batch.layer_cp_metadata is not None:
+            launch_cp_residual_exchange(forward_batch.layer_cp_metadata)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -708,8 +708,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_ids = topk_output.topk_ids
             topk_weights = topk_output.topk_weights
 
-        if forward_batch is not None and forward_batch.prefill_cp_metadata is not None:
-            launch_cp_residual_exchange(forward_batch.prefill_cp_metadata)
+        if forward_batch is not None and forward_batch.layer_cp_metadata is not None:
+            launch_cp_residual_exchange(forward_batch.layer_cp_metadata)
         final_hidden_states = run_mega_routed_experts(
             self.experts,
             hidden_states,

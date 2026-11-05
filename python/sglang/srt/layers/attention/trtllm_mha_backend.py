@@ -1942,7 +1942,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        if forward_batch.prefill_cp_metadata is not None:
+        if self.cp_exchange is not None:
             return self.forward_cp(q, k, v, layer, forward_batch, save_kv_cache)
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)

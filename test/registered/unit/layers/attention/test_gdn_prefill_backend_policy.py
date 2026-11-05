@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch, sentinel
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+    MambaAttnBackendBase,
+)
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
@@ -398,7 +401,6 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
-            gdn_cp_metadata=None,
             prefill_cp_metadata=None,
             multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
@@ -536,7 +538,13 @@ class TestFlashQLAGDNPrefillPolicy(CustomTestCase):
     def test_gdn_plan_matches_the_selected_attention_shards(self):
         """A zigzag attention shard must not be routed as round-robin GDN input."""
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+        from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
+        from sglang.srt.layers.cp.utils import (
+            cp_gather_full_sequence_states,
+            cp_shard_position_ids,
+        )
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.runtime_context import get_parallel
 
         for strategy, strategy_type in (
@@ -555,13 +563,17 @@ class TestFlashQLAGDNPrefillPolicy(CustomTestCase):
                                 rank_in_group=rank,
                                 device_group=object(),
                             )
-                            backend = object.__new__(GDNAttnBackend)
-                            backend.device = "cpu"
-                            backend._gdn_cp_plan = None
-                            backend._cp_residual_exchange = None
+                            backend = object.__new__(HybridLinearAttnBackend)
+                            backend.full_attn_backend = SimpleNamespace(
+                                cp_exchange=None
+                            )
+                            backend.linear_attn_backend = SimpleNamespace(
+                                device="cpu", _cp_residual_exchange=None
+                            )
+                            backend._cp_metadata_plan = None
                             batch = SimpleNamespace(
                                 forward_mode=ForwardMode.EXTEND,
-                                gdn_cp_metadata=None,
+                                prefill_cp_metadata=None,
                                 extend_lens=lengths,
                                 prefix_lens=prefixes,
                             )
@@ -592,13 +604,176 @@ class TestFlashQLAGDNPrefillPolicy(CustomTestCase):
                                     [p + n for p, n in zip(prefixes, lengths)],
                                     list(lengths),
                                 )
+                                pad_logical_token_to_physical(batch.attn_cp_metadata)
                                 local = attention.shard_hidden_states(
                                     torch.arange(sum(lengths)), batch
                                 )
-                                indices = batch.gdn_cp_metadata.attention[rank]
+                                indices = batch.prefill_cp_metadata.attention[rank]
                                 torch.testing.assert_close(
                                     local[: len(indices)], torch.tensor(indices)
                                 )
+                                # The common plan must not activate whole-layer
+                                # residual movement before the model splits rows.
+                                self.assertIsNone(
+                                    ForwardBatch.layer_cp_metadata.fget(batch)
+                                )
+                                positions = torch.arange(sum(lengths)).repeat(3, 1)
+                                torch.testing.assert_close(
+                                    cp_shard_position_ids(positions, batch),
+                                    attention.shard_position_ids(positions, batch),
+                                )
+                                frame = batch.prefill_cp_metadata
+                                frame.current = frame.layout_names["attention"]
+                                self.assertIs(
+                                    ForwardBatch.layer_cp_metadata.fget(batch), frame
+                                )
+                                plan = frame.token_collectives()
+                                frame.original_non_padded = torch.tensor(sum(lengths))
+
+                                def gather_rows(output, source, *, group):
+                                    torch.testing.assert_close(
+                                        source[: len(indices)], local[: len(indices)]
+                                    )
+                                    for peer, rows in enumerate(frame.attention):
+                                        start = peer * plan.padded_rows
+                                        output[start : start + len(rows)] = (
+                                            torch.tensor(rows)
+                                        )
+
+                                with patch(
+                                    "torch.distributed.all_gather_into_tensor",
+                                    gather_rows,
+                                ):
+                                    restored = cp_gather_full_sequence_states(
+                                        local, batch
+                                    )
+                                torch.testing.assert_close(
+                                    restored, torch.arange(sum(lengths))
+                                )
+                                self.assertIs(
+                                    batch.num_token_non_padded,
+                                    frame.original_non_padded,
+                                )
+
+    def test_shared_batch_plan_binds_both_backends_without_late_planning(self):
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+        from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.runtime_context import get_parallel
+
+        table = torch.arange(1024, dtype=torch.int32).reshape(2, 512) * 2
+        pool = SimpleNamespace(req_to_token=table)
+        group = SimpleNamespace(world_size=2, rank_in_group=0, device_group=object())
+        for cp_mode in ("round-robin-split", "in-seq-split"):
+            with (
+                self.subTest(cp_mode=cp_mode),
+                get_context().override_server_args(
+                    device="cpu",
+                    tp_size=2,
+                    attn_cp_size=2,
+                    linear_attn_prefill_backend="flashqla",
+                    disaggregation_mode="prefill",
+                ),
+                get_parallel().override(attn_cp_group=group, attn_cp_rank=0),
+                patch("torch.distributed.get_world_size", return_value=2),
+                patch("torch.distributed.get_rank", return_value=0),
+            ):
+                full = SimpleNamespace(
+                    cp_exchange=SimpleNamespace(capacity=512),
+                    prefill_cp_mode=cp_mode,
+                    cp_packed_kv=False,
+                    kv_cache_dtype=torch.bfloat16,
+                    residual_exchange=None,
+                    forward_metadata=None,
+                )
+                linear = object.__new__(GDNAttnBackend)
+                linear.device = "cpu"
+                linear._cp_residual_exchange = None
+                linear.kernel_dispatcher = SimpleNamespace(use_context_parallel=True)
+                linear.req_to_token_pool = SimpleNamespace(
+                    mamba_pool=SimpleNamespace(synchronize=lambda: None),
+                    get_mamba_indices=lambda indices: indices + 5,
+                )
+                hybrid = object.__new__(HybridLinearAttnBackend)
+                hybrid.full_attn_backend = full
+                hybrid.linear_attn_backend = linear
+                hybrid.req_to_token_pool = pool
+                hybrid._cp_metadata_plan = None
+                runner = SimpleNamespace(server_args=None, attn_backend=hybrid)
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    prefill_cp_metadata=None,
+                    extend_lens=[128, 64],
+                    prefix_lens=[7, 3],
+                    reqs=[
+                        SimpleNamespace(kv=SimpleNamespace(req_pool_idx=i))
+                        for i in (1, 0)
+                    ],
+                    out_cache_loc=torch.arange(192) * 2,
+                    num_token_non_padded=torch.tensor(192, dtype=torch.int32),
+                    batch_size=2,
+                    req_pool_indices=torch.tensor([1, 0]),
+                    mamba_track_checkpoints=((), ()),
+                )
+                ModelRunner.prepare_cp_metadata(runner, batch)
+                frame = batch.prefill_cp_metadata
+                self.assertIsNone(full.forward_metadata)
+                self.assertIs(ForwardBatch.layer_cp_metadata.fget(batch), frame)
+                torch.testing.assert_close(
+                    frame.kv_read_slots,
+                    torch.cat((torch.arange(0, 135, 2) + 512, torch.arange(0, 67, 2))),
+                )
+                torch.testing.assert_close(
+                    frame.kv_write_slots,
+                    torch.tensor(frame.layout.new_kv_indices[0]),
+                )
+                with (
+                    patch.object(
+                        ShardedContextParallelMetadata,
+                        "plan_prefill",
+                        side_effect=AssertionError("late plan"),
+                    ),
+                    patch("torch.cuda.current_stream", return_value=None),
+                ):
+                    ModelRunner.prepare_cp_metadata(runner, batch)
+                    AttentionBackend._init_cp_forward_metadata(full, batch)
+                    linear.init_forward_metadata(batch)
+                self.assertIs(full.forward_metadata, frame)
+                self.assertIs(linear.cp_metadata, frame)
+                torch.testing.assert_close(linear.cp_state_slots, torch.tensor([6, 5]))
+                # A later chunk owns new mutable state while reusing only maps.
+                frame.current = frame.layout_names["contiguous"]
+                batch.prefill_cp_metadata = None
+                batch.prefix_lens = [135, 67]
+                ModelRunner.prepare_cp_metadata(runner, batch)
+                next_frame = batch.prefill_cp_metadata
+                self.assertIsNot(next_frame, frame)
+                self.assertIsNone(next_frame.current)
+                self.assertEqual(next_frame.prefixes, (135, 67))
+                self.assertIs(full.forward_metadata, frame)
+                self.assertIs(linear.cp_metadata, frame)
+                self.assertIs(next_frame.query_indices, frame.query_indices)
+
+    def test_cp_preparation_skips_decode_verify_and_idle(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        with get_context().override_server_args(
+            attn_cp_size=2,
+            linear_attn_prefill_backend="flashqla",
+            disaggregation_mode="prefill",
+        ):
+            for mode in (
+                ForwardMode.DECODE,
+                ForwardMode.TARGET_VERIFY,
+                ForwardMode.IDLE,
+            ):
+                with self.subTest(mode=mode):
+                    batch = SimpleNamespace(forward_mode=mode, prefill_cp_metadata=None)
+                    ModelRunner.prepare_cp_metadata(
+                        SimpleNamespace(server_args=None), batch
+                    )
+                    self.assertIsNone(batch.prefill_cp_metadata)
 
 
 if __name__ == "__main__":

@@ -126,6 +126,9 @@ class AttentionBackend(ABC):
     data_type: Optional[torch.dtype] = None
     kv_cache_dtype: Optional[torch.dtype] = None
 
+    # Reserved workspace for physically sharded full-attention KV.
+    cp_exchange = None
+
     # Wrapper backends (e.g. HybridLinearAttnBackend) set this to their child
     # backends; leaves keep None. Lets generic code (metadata glue graph)
     # enumerate every backend whose python-side forward_metadata must be
@@ -591,25 +594,6 @@ class AttentionBackend(ABC):
             stream=torch.cuda.current_stream(),
             transport=get_parallel().attn_cp_transport,
         )
-
-    def _prepare_cp_metadata(self, batch, lengths, prefixes):
-        from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
-
-        metadata = ShardedContextParallelMetadata.plan_prefill(
-            lengths,
-            prefixes,
-            self.device,
-            cp_mode=self.prefill_cp_mode,
-            residual_exchange=self.residual_exchange,
-            previous=self.forward_metadata,
-            request_indices=[req.kv.req_pool_idx for req in batch.reqs],
-            request_stride=self.req_to_token_pool.req_to_token.shape[1],
-            packed_kv=self.cp_packed_kv,
-            needs_kv_descale=self.kv_cache_dtype == torch.float8_e4m3fn,
-        )
-        if metadata.layout.capacity > self.cp_exchange.capacity:
-            raise ValueError("CP frame exceeds the startup KV workspace")
-        batch.prefill_cp_metadata = metadata
 
     def _init_cp_forward_metadata(self, forward_batch):
         if forward_batch.forward_mode.is_idle():

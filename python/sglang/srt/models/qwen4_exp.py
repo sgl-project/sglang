@@ -2162,10 +2162,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 hidden_states, positions, forward_batch
             )
             if (
-                forward_batch.gdn_cp_metadata is not None
+                forward_batch.prefill_cp_metadata is not None
                 and get_exec().moe.enable_mxfp4_mega
             ):
-                metadata = forward_batch.gdn_cp_metadata
+                metadata = forward_batch.prefill_cp_metadata
                 metadata.current = metadata.layout_names["attention"]
 
         breakable_ple = (

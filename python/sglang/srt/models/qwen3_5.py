@@ -1008,8 +1008,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         if (
             forward_batch.prefill_cp_metadata is not None
-            or forward_batch.gdn_cp_metadata is not None
-        ) and hidden_states.shape[0] == 0:
+            and hidden_states.shape[0] == 0
+        ):
             raw = hidden_states.new_empty((0, self.conv_dim))
             gates = hidden_states.new_empty((0, self.num_v_heads))
             self.attn(forward_batch, mixed_qkv=raw, a=gates, b=gates)
@@ -1654,7 +1654,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if forward_batch.prefill_cp_metadata is not None:
+        if (
+            forward_batch.prefill_cp_metadata is not None
+            and forward_batch.prefill_cp_metadata.kv_read_slots is not None
+        ):
             positions = cp_shard_position_ids(positions, forward_batch)
             if hidden_states.shape[0] == 0:
                 q = hidden_states.new_empty((0, self.num_heads * self.head_dim))
@@ -2028,7 +2031,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             skip_empty=True,
         )
 
-        if forward_batch.prefill_cp_metadata is not None:
+        if forward_batch.layer_cp_metadata is not None:
             hidden_states = cp_gather_full_sequence_states(hidden_states, forward_batch)
 
         if len(aux_hidden_states) == 0:

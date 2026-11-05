@@ -1538,7 +1538,7 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias_event=None,
         return_lse: bool = False,
     ):
-        if forward_batch.prefill_cp_metadata is not None:
+        if self.cp_exchange is not None:
             return self.forward_cp(q, k, v, layer, forward_batch, save_kv_cache)
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
