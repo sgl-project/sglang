@@ -19,9 +19,7 @@ from sglang.multimodal_gen.runtime.realtime.video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
     WEBP_FRAME_CONTENT_TYPE,
-    build_delta_gzip_raw_rgb_payload,
     build_raw_rgb_frame_batches,
-    restore_delta_gzip_raw_rgb_payload,
 )
 
 
@@ -146,23 +144,6 @@ def test_output_batch_uses_raw_frame_transport_names():
     assert output_batch.raw_frame_batches == [[b"rgb"]]
     assert output_batch.raw_frame_content_type == RAW_RGB_CONTENT_TYPE
     assert output_batch.raw_frame_metadata == {"format": "rgb24"}
-
-
-def test_delta_gzip_raw_rgb_payload_roundtrips_exactly():
-    frames = [
-        bytes([1, 2, 3, 4, 5, 6]),
-        bytes([1, 2, 4, 4, 6, 6]),
-        bytes([2, 2, 4, 5, 6, 7]),
-    ]
-
-    payload = build_delta_gzip_raw_rgb_payload(frames)
-    restored = restore_delta_gzip_raw_rgb_payload(
-        payload,
-        bytes_per_frame=6,
-        num_frames=3,
-    )
-
-    assert restored == b"".join(frames)
 
 
 @pytest.mark.parametrize(

@@ -41,7 +41,7 @@ from sglang.srt.runtime_context import publish, restore_context, snapshot_contex
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=25, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 # Tokenizer files only, of a chat template that thinks by default.
 TOKENIZER = "Qwen/Qwen3.5-35B-A3B"
@@ -160,6 +160,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
             ),
             decision_config=None,
             joint_head_config=None,
+            pointer_head=None,
         )
         pad, video = (
             tokenizer.encode(token, add_special_tokens=False)[0]
@@ -481,13 +482,17 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(route):
                 events = []
+                encoding_started = asyncio.Event()
                 encode = handler._encode_question
 
                 def recorded(**kwargs):
                     events.append("encode")
+                    encoding_started.set()
                     return encode(**kwargs)
 
                 async def other_request():
+                    # Conversion may now yield before question encoding starts.
+                    await encoding_started.wait()
                     for _ in range(3):
                         events.append("other")
                         await asyncio.sleep(0)
@@ -495,7 +500,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 handler._encode_question = recorded
                 other = asyncio.create_task(other_request())
                 response = await handler.handle_request(request, None)
-                await other
+                await asyncio.wait_for(other, timeout=5)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(events, ["encode", "other"] * 3)
 

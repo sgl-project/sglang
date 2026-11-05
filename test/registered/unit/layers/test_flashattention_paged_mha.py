@@ -52,6 +52,12 @@ def _mha_pool(k_buffer, v_buffer, *, page_size):
     return pool
 
 
+def _pool_reading(k_buffer, v_buffer):
+    """A pool whose every layer reads the given K and V through its router."""
+    kv = SimpleNamespace(kv=Mock(return_value=(k_buffer, v_buffer)))
+    return SimpleNamespace(layer_router=SimpleNamespace(read=Mock(return_value=kv)))
+
+
 def _layer():
     return SimpleNamespace(
         layer_id=0,
@@ -65,13 +71,8 @@ def _layer():
 class TestFlashAttentionPagedMHA(unittest.TestCase):
     def test_get_paged_mha_kv_cache_supports_head_groups(self):
         backend = _backend()
-        backend.token_to_kv_pool = SimpleNamespace(
-            get_kv_buffer=Mock(
-                return_value=(
-                    torch.empty(8, 2, 16),
-                    torch.empty(8, 2, 16),
-                )
-            )
+        backend.token_to_kv_pool = _pool_reading(
+            torch.empty(8, 2, 16), torch.empty(8, 2, 16)
         )
         layer = SimpleNamespace(
             layer_id=3,
@@ -100,9 +101,7 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         self.assertFalse(strided.is_contiguous())
 
         backend = _backend()
-        backend.token_to_kv_pool = SimpleNamespace(
-            get_kv_buffer=Mock(return_value=(strided, strided))
-        )
+        backend.token_to_kv_pool = _pool_reading(strided, strided)
 
         with self.assertRaises(AssertionError) as caught:
             backend.get_paged_mha_kv_cache(layer, head_group_num=2)
