@@ -66,6 +66,8 @@ logger = logging.getLogger(__name__)
 class OpenAIServingTranscription(OpenAIServingBase):
     """Handler for /v1/audio/transcriptions requests"""
 
+    openai_error_envelope = True
+
     def __init__(self, tokenizer_manager: TokenizerManager):
         super().__init__(tokenizer_manager)
         model_config = tokenizer_manager.model_config
