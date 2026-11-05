@@ -13,6 +13,15 @@ pub fn env_bool(name: &str, default: bool) -> bool {
     })
 }
 
+/// Python `utils.get_bool_env_var`, the older reader some knobs still use:
+/// only `true`/`1` (case-insensitive) are true, and any other set value —
+/// `yes` included — is false rather than the default.
+pub fn get_bool_env_var(name: &str, default: bool) -> bool {
+    std::env::var(name).map_or(default, |raw| {
+        matches!(raw.to_lowercase().as_str(), "true" | "1")
+    })
+}
+
 /// Signed integer parser. Accepts the `i64::from_str` grammar, including
 /// negative values, while invalid or out-of-range values warn and use the
 /// default.
@@ -65,6 +74,18 @@ mod tests {
         }
         assert!(env_bool("SGLANG_TEST_ENV_BOOL_UNSET", true));
         assert!(!env_bool("SGLANG_TEST_ENV_BOOL_UNSET", false));
+    }
+
+    /// `get_bool_env_var` copies Python's `get_bool_env_var`, not `EnvBool`:
+    /// `yes` and unrecognized values read false, not the default.
+    #[test]
+    fn get_bool_env_var_matches_python() {
+        for (raw, want) in [("TRUE", true), ("1", true), ("yes", false), ("off", false)] {
+            let name = format!("SGLANG_TEST_GET_BOOL_ENV_VAR_{raw}");
+            unsafe { std::env::set_var(&name, raw) };
+            assert_eq!(get_bool_env_var(&name, true), want, "value {raw:?}");
+        }
+        assert!(get_bool_env_var("SGLANG_TEST_GET_BOOL_ENV_VAR_UNSET", true));
     }
 
     /// `env_i64`: strict `i64::from_str` grammar, including negative values;

@@ -13,6 +13,8 @@ from flashinfer.norm import rmsnorm
 from sglang.kernels.ops.diffusion import (
     can_use_fused_rmsnorm_interleaved_rope,
     fused_rmsnorm_interleaved_rope_,
+    fused_rmsnorm_interleaved_rope_into_blocks,
+    rmsnorm_interleaved_rope_block_cols,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
@@ -74,6 +76,32 @@ def test_matches_rmsnorm_then_rope_bitwise(batch, seq, hidden, head_dim, row_pad
     )
     if row_pad:
         assert buf[:, hidden:].isnan().all()
+
+
+def test_into_blocks_matches_in_place():
+    """Each column run lands in its own block, with the in-place result's bits."""
+    _require_sm90()
+    g = torch.Generator(device="cuda").manual_seed(2)
+    eps, hidden, head_dim, rows = 1e-6, 5120, 128, 300
+    x = (torch.randn(rows, 3 * hidden, generator=g, device="cuda") * 3).bfloat16()
+    x = x[:, hidden : 2 * hidden]  # a strided column slice, as in a fused qkv output
+    weight = (1 + 0.1 * torch.randn(hidden, generator=g, device="cuda")).bfloat16()
+    theta = torch.rand(rows, head_dim // 2, generator=g, device="cuda")
+    cache = torch.cat([theta.cos(), theta.sin()], dim=-1).contiguous()
+    cols = rmsnorm_interleaved_rope_block_cols(hidden)
+    blocks = [
+        torch.full((rows, cols), float("nan"), device="cuda").bfloat16()
+        for _ in range(hidden // cols)
+    ]
+    table = torch.tensor([b.data_ptr() for b in reversed(blocks)], device="cuda")
+    raw = x.clone()
+    fused_rmsnorm_interleaved_rope_into_blocks(x, weight, cache, eps, head_dim, table)
+    assert torch.equal(x.view(torch.int16), raw.view(torch.int16))
+    ref = fused_rmsnorm_interleaved_rope_(x.clone(), weight, cache, eps, head_dim)
+    for i, block in enumerate(reversed(blocks)):
+        assert torch.equal(
+            block.view(torch.int16), ref[:, i * cols : (i + 1) * cols].view(torch.int16)
+        )
 
 
 def test_runs_on_the_current_stream():
