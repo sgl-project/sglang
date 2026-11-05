@@ -5,6 +5,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    pop_buffer,
 )
 
 """
@@ -14,8 +15,10 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import gc
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -330,6 +333,44 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+# Backends that share the process-wide "flashinfer_workspace" buffer.
+_global_workspace_users: weakref.WeakSet = weakref.WeakSet()
+
+
+def get_workspace_buffer(init_new_workspace: bool, device) -> torch.Tensor:
+    """A private workspace, or the process-wide shared one.
+
+    A backend with its own workspace never creates the shared one, so a shared
+    workspace dropped by release_unused_global_workspace stays dropped.
+    """
+    # different from flashinfer zero_init_global_workspace_buffer
+    allocate = lambda: torch.empty(
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(), dtype=torch.uint8, device=device
+    )
+    if init_new_workspace:
+        return allocate()
+    return get_buffer("flashinfer_workspace", allocate)
+
+
+def release_unused_global_workspace() -> int:
+    """Drop the shared FlashInfer workspace once no backend uses it.
+
+    A model-level wrapper can replace the full-attention backend it was handed
+    (hybrid QSA models do), which leaves the workspace allocated for nobody.
+    Returns the number of bytes released.
+    """
+    # A discarded backend can sit in a reference cycle.
+    gc.collect()
+    if _global_workspace_users:
+        return 0
+    workspace = pop_buffer("flashinfer_workspace")
+    if workspace is None:
+        return 0
+    nbytes = workspace.numel() * workspace.element_size()
+    logger.info("Released the unused FlashInfer workspace (%.3f GiB).", nbytes / 2**30)
+    return nbytes
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -470,23 +511,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
         # Allocate buffers
-        # different from flashinfer zero_init_global_workspace_buffer
-        global_workspace_buffer = get_buffer(
-            "flashinfer_workspace",
-            lambda: torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            ),
+        self.workspace_buffer = get_workspace_buffer(
+            init_new_workspace=init_new_workspace, device=model_runner.device
         )
-        if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        else:
-            self.workspace_buffer = global_workspace_buffer
+        if not init_new_workspace:
+            _global_workspace_users.add(self)
         max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:
             self.kv_indptr = [
