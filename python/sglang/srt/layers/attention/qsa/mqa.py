@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_gfx95_supported, is_hip
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -697,10 +697,29 @@ def tilelang_qsa_mqa_decode(
         )
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
+    use_grouped = (
+        rows_per_request == 4
+        and q.shape[0] <= 380
+        and q.shape[0] % 4 == 0
+        and (query_heads if num_query_heads is None else num_query_heads) == 4
+        and query_heads <= 8
+        and head_dim == 128
+        and page_size == 16
+        and q.is_cuda
+        and (
+            is_gfx95_supported()
+            or (
+                not is_hip()
+                and q.shape[0] >= 64
+                and torch.cuda.get_device_capability(q.device) == (10, 7)
+            )
+        )
+    )
+    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
+    # sixteen; the grouped kernel's N is four rows of four heads on both.
+    # Zero-padding preserves the weight-free head sum on every path.
+    head_alignment = 16 if is_hip() and not use_grouped else 8
     kernel_heads = max(
         head_alignment,
         ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
@@ -715,24 +734,15 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
-    use_grouped = (
-        rows_per_request == 4
-        and 64 <= q.shape[0] <= 380
-        and q.shape[0] % 4 == 0
-        and (query_heads if num_query_heads is None else num_query_heads) == 4
-        and kernel_heads == 8
-        and head_dim == 128
-        and page_size == 16
-        and not is_hip()
-        and q.is_cuda
-        and torch.cuda.get_device_capability(q.device) == (10, 7)
-    )
     kernel = (
         _tilelang_qsa_mqa_decode_grouped_kernel
         if use_grouped
         else _tilelang_qsa_mqa_decode_kernel
     )
-    ctas = 32 if use_grouped else _decode_ctas_per_row(q.shape[0], q.device)
+    if not use_grouped:
+        ctas = _decode_ctas_per_row(q.shape[0], q.device)
+    else:
+        ctas = 256 if is_hip() else 32
     kernel(
         heads=kernel_heads,
         head_dim=head_dim,

@@ -1,9 +1,10 @@
-"""ROCm coverage for the QSA packed-varlen decode fallback.
+"""ROCm coverage for the QSA packed-varlen decode fallback and indexer scoring.
 
 On HIP there is neither flash_attn (FA2) nor flash-attn-4, so
 ``_resolve_flash_attn_varlen_func`` resolves to aiter's FA2-compatible varlen
-kernel. The first two tests are device-independent (fake modules); the last one
+kernel. The first two tests are device-independent (fake modules); the third
 runs the real aiter kernel against a torch reference and only executes on ROCm.
+The last one checks the grouped verify scoring of the indexer on gfx950.
 """
 
 import sys
@@ -119,6 +120,47 @@ def test_qsa_hip_aiter_varlen_matches_torch_reference():
         scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
         expected = torch.einsum("hk,khd->hd", scores.softmax(dim=-1), values)
         torch.testing.assert_close(out[row].float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("requests", [1, 7, 16, 32])
+@pytest.mark.parametrize("min_scored_len", [0, 512])
+def test_qsa_gfx950_grouped_verify_scoring_is_bitwise(requests, min_scored_len):
+    """The indexer scores the four verify rows of a request from one key load on
+    gfx950; every written logit must equal the per-row kernel's bit for bit."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+    )
+    from sglang.srt.utils import is_gfx95_supported
+
+    if not (HAS_TILELANG and is_gfx95_supported()):
+        pytest.skip("gfx950 TileLang-only path")
+    torch.manual_seed(requests)
+    device = torch.device("cuda")
+    rows, max_pages, page_size = 4 * requests, 256, 16
+    max_model_len = max_pages * page_size
+    # Verify rows of a request share its pages and end one token apart.
+    lens = torch.randint(1, max_model_len - 3, (requests,)).repeat_interleave(4)
+    lens = (lens + torch.arange(4).repeat(requests)).to(device, torch.int32)
+    page_table = torch.randint(0, 1024, (requests, max_pages), dtype=torch.int32)
+    page_table = page_table.repeat_interleave(4, dim=0).to(device)
+    cache = torch.randn(1024, page_size, 1, 128, device=device).to(torch.bfloat16)
+    # The indexer projects 4 heads padded to 8.
+    q = torch.zeros(rows, 8, 128, device=device, dtype=torch.bfloat16)
+    q[:, :4] = torch.randn(rows, 4, 128, device=device).to(torch.bfloat16)
+
+    args = (q, cache, page_table, lens, max_model_len)
+    ref = tilelang_qsa_mqa_decode(*args, min_scored_len=min_scored_len)
+    out = tilelang_qsa_mqa_decode(
+        *args, min_scored_len=min_scored_len, rows_per_request=4, num_query_heads=4
+    )
+    for row in range(rows):
+        length = int(lens[row])
+        if length <= min_scored_len:
+            continue
+        assert torch.equal(
+            out[row, :length].view(torch.int32), ref[row, :length].view(torch.int32)
+        )
 
 
 if __name__ == "__main__":
