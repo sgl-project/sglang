@@ -46,7 +46,9 @@ _DCP_MERGE_CAND_K = 384
 
 class DcpTopKMerge:
     """Exact global top-k merge of decode rows in one kernel; see
-    jit/csrc/dsa/dcp_topk_merge.cuh. Built by ``create``."""
+    jit/csrc/dsa/dcp_topk_merge.cuh. Built by ``create``. Calls go on one
+    stream, never concurrently, with the same rows in the same order on every
+    rank."""
 
     def __init__(self, group, max_rows: int, topk: int, buffer: torch.Tensor, handle):
         device = group.device
