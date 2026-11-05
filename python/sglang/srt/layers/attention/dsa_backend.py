@@ -72,6 +72,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    dcp_gather_request_rows,
     dcp_localize_compact,
     init_dcp_candidate_all_gather,
     init_dcp_topk_merge,
@@ -114,6 +115,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dcp.layout import (
     dsa_shards_index_k,
+    filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -327,6 +329,8 @@ class DSAMetadata:
     # The offset of topk indices in ragged kv, prefill only
     # shape: (seq_lens_sum,)
     topk_indices_offset: Optional[torch.Tensor] = None
+    # DCP prefill: this rank's KV rows of page_table_1_flattened, in order
+    dcp_local_kv_rows: Optional[torch.Tensor] = None
 
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -1173,6 +1177,20 @@ class DeepseekSparseAttnBackend(
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
 
+    def dcp_gather_kv_cache(
+        self, kv_cache: torch.Tensor, forward_batch: ForwardBatch, metadata: DSAMetadata
+    ) -> torch.Tensor:
+        # DCP prefill: the batch's KV rows from all ranks, request after request
+        # in position order, padded to whole pages (the ragged top-k layout)
+        rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
+        gathered = dcp_gather_request_rows(
+            rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
+        )
+        pad = -gathered.shape[0] % self.physical_page_size
+        if pad:
+            gathered = torch.cat([gathered, gathered.new_zeros(pad, gathered.shape[1])])
+        return gathered.view(kv_cache.dtype)
+
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_span
         if page_size == 1:
@@ -1541,6 +1559,16 @@ class DeepseekSparseAttnBackend(
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
+            dcp_local_kv_rows=(
+                filter_dcp_local_chunk_kv_indices(
+                    page_table_1_flattened,
+                    torch.zeros_like(indexer_seq_lens_cpu),
+                    indexer_seq_lens_cpu,
+                )
+                // self.attn_dcp_size
+                if self.attn_dcp_size > 1 and page_table_1_flattened is not None
+                else None
+            ),
             indexer_k_start_end=indexer_k_start_end,
             indexer_logical_page_table=indexer_logical_page_table,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
@@ -2393,7 +2421,7 @@ class DeepseekSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
         if self.attn_dcp_size > 1:
-            kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
+            kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
