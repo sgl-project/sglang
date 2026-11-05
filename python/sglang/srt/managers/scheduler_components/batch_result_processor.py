@@ -26,11 +26,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
-    mamba_lazy_spec_in_window,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -45,7 +41,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
     mamba_track_grid,
-    max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
@@ -1496,15 +1491,6 @@ class SchedulerBatchResultProcessor:
                         preserve_previous=True,
                     ),
                 )
-            elif (
-                req.finished()
-                and lazy
-                and lookahead == 1
-                and known_mamba_boundary
-                and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
-                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
-            ):
-                req.mamba_lazy_checkpoint = False
 
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
@@ -1713,10 +1699,11 @@ class SchedulerBatchResultProcessor:
 
         Running req with a confirmed crossing: the commit scattered the
         crossing state into the planned position; promote it to keep unless
-        the plan already pointed at the keep slot (in-place fallback, or
-        promoted by an earlier overlapped confirmation).
-        Finishing req: donate the keep slot only if no scatter wrote it
-        (this step) or may still write it (the in-flight next step).
+        the plan already pointed at the keep slot (promoted by an earlier
+        overlapped confirmation). A -1 plan had no slot: the keep slot and
+        mamba_last_track_seqlen stay.
+        Finishing req: donate the keep slot only if this step's scatter did
+        not write it.
         """
         positions = batch.mamba_lazy_spec_track_positions_cpu
         planned_pos = (
@@ -1726,29 +1713,15 @@ class SchedulerBatchResultProcessor:
         )
 
         if req.finished():
-            # Skip the donation if a scatter wrote or may still write the keep slot.
+            # Skip the donation if this step's scatter wrote the keep slot.
             keep_written_by_this_step = (
                 crossed and planned_pos == req.kv.mamba_next_track_idx
             )
-            other_idx = 1 - req.kv.mamba_next_track_idx
-            # Recompute the in-flight verify's plan (kv_committed_len is
-            # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_empty[
-                other_idx
-            ] and mamba_lazy_spec_in_window(
-                req,
-                mamba_track_grid(self.tree_cache.page_size),
-                max_speculative_num_draft_tokens(),
-            )
-            if (
-                planned_pos is None
-                or keep_written_by_this_step
-                or keep_may_be_written_in_flight
-            ):
+            if planned_pos is None or keep_written_by_this_step:
                 req.mamba_lazy_checkpoint = False
             return
 
-        if not crossed or planned_pos is None:
+        if not crossed or planned_pos is None or planned_pos < 0:
             return
         old_position = req.kv.mamba_next_track_idx
         kv_storage_of(
