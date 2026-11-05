@@ -74,6 +74,28 @@ if _use_aiter_gfx95:
 logger = logging.getLogger(__name__)
 
 _EXPERT_INPUT_SCALE_RE = re.compile(r"(?:^|\.)experts\.\d+\.w[123]\.input_scale$")
+# Per-tensor KV-cache scales as ModelOpt (self_attn.k_proj.k_scale) and
+# compressed-tensors (self_attn.k_scale) name them.
+_ATTN_KV_CACHE_SCALE_RE = re.compile(
+    r"\.self_attn(?:\.\d+)?\.(?:k_proj\.k_scale|v_proj\.v_scale|k_scale|v_scale)$"
+)
+
+
+def skip_mla_kv_cache_scale(name: str, loaded_weight: torch.Tensor) -> bool:
+    """Whether `name` is a checkpoint KV-cache scale that MLA must not load.
+
+    MLA writes its latent KV cache without a per-tensor scale, while some
+    decode kernels (triton, flashmla, trtllm_mla) dequantize it with the
+    attn_mqa scale. Loading a scale other than 1.0 corrupts their decode.
+    """
+    if _ATTN_KV_CACHE_SCALE_RE.search(name) is None:
+        return False
+    if not torch.all(loaded_weight == 1.0):
+        logger.warning_once(
+            "Ignoring the checkpoint's KV-cache scales (k_scale/v_scale): MLA "
+            "stores its latent KV cache unscaled, so the FP8 KV cache uses 1.0."
+        )
+    return True
 
 
 def has_expert_input_scale_checkpoint(
@@ -564,23 +586,14 @@ class DeepseekV2WeightLoaderMixin:
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
                         else:
-                            if (
-                                "k_scale" in name or "v_scale" in name
-                            ) and name not in params_dict:
-                                # modelopt attn kv scale is named differently
-                                for scale in ["k_scale", "v_scale"]:
-                                    if scale in name:
-                                        name = name.replace(
-                                            f"{scale[0]}_proj", "attn_mqa"
-                                        )
-                                        break
+                            if name not in params_dict and skip_mla_kv_cache_scale(
+                                name, loaded_weight
+                            ):
+                                continue
                             name = _resolve_quark_fp8_block_scale_name(
                                 name, params_dict
                             )
                             if name not in params_dict:
-                                # modelopt ckpt contains not needed weights for MTP module:
-                                # model.decoder.self_attn.attn_mqa.v_scale and
-                                # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
                             param = params_dict[name]
