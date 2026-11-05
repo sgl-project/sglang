@@ -29,6 +29,7 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
         )
         cap.device_cache = SimpleNamespace(buffer=buf)
         cap.topk_size = self.K
+        cap.stage_start_layer, cap.stage_end_layer = 0, self.L
         return cap, buf
 
     def _slice(self, cap, n_local):
@@ -148,6 +149,7 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
                 num_tokens=8,
                 max_running_requests=2,
                 stage_start_layer=0,
+                stage_end_layer=1,
                 device="cpu",
             )
         self.assertEqual(seen["num_fused_shared_experts"], 1)
@@ -160,8 +162,16 @@ class TestOutputRankHostCache(CustomTestCase):
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
     def _capturer(
-        self, attn_tp_rank, backend="none", pp_rank=0, pp_size=1, stage_start_layer=0
+        self,
+        attn_tp_rank,
+        backend="none",
+        pp_rank=0,
+        pp_size=1,
+        stage_start_layer=0,
+        stage_end_layer=None,
     ):
+        if stage_end_layer is None:
+            stage_end_layer = self.NUM_LAYERS
         hf_text_config = SimpleNamespace(
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
@@ -194,6 +204,7 @@ class TestOutputRankHostCache(CustomTestCase):
                 max_running_requests=4,
                 num_fused_shared_experts=0,
                 stage_start_layer=stage_start_layer,
+                stage_end_layer=stage_end_layer,
                 device="cpu",
             )
 
@@ -272,24 +283,30 @@ class TestOutputRankHostCache(CustomTestCase):
     def test_pipeline_stages_relay_rows_instead_of_writing_the_host_cache(self):
         """Under pipeline parallelism a stage holds only its own layers, so the
         output rank must not store its partial rows, and every stage rank,
-        including ranks without a host cache, must hand its rows to the relay."""
+        including ranks without a host cache, must hand its layers' rows to
+        the relay, which rebuilds the full rows stage by stage."""
         topk = torch.randint(
             1,
             64,
             (len(self.OUT_CACHE_LOC), self.NUM_LAYERS, self.K),
             dtype=torch.int32,
         )
-        first_stage = self._capturer(attn_tp_rank=0, pp_rank=0, pp_size=2)
+        first_stage = self._capturer(
+            attn_tp_rank=0, pp_rank=0, pp_size=2, stage_end_layer=1
+        )
         later_stage = self._capturer(
             attn_tp_rank=0, pp_rank=1, pp_size=2, stage_start_layer=1
         )
+        relayed = None
         for cap, layer_ids in ((first_stage, [0]), (later_stage, [1, 2])):
             with self.subTest(stage_start_layer=layer_ids[0]):
                 out = self._run_forward(cap, topk, layer_ids=layer_ids)
-                expected = torch.zeros_like(topk)
-                expected[:, layer_ids] = topk[:, layer_ids]
-                self.assertTrue(torch.equal(out.topk, expected))
+                self.assertTrue(torch.equal(out.topk, topk[:, layer_ids]))
                 self.assertTrue(torch.equal(out.out_cache_loc, self.OUT_CACHE_LOC))
+                relayed = re_mod.merge_pipeline_stage_rows(
+                    relayed=relayed, local=out.topk, stage_start_layer=layer_ids[0]
+                )
+        self.assertTrue(torch.equal(relayed, topk))
         self.assertFalse(later_stage.has_host_cache)
         self.assertEqual(int(first_stage.host_cache.buffer.count_nonzero()), 0)
 

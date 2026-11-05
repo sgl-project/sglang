@@ -172,8 +172,8 @@ class ExecFeatures(msgspec.Struct):
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses. With "
-        "pipeline parallelism, each stage's routed experts travel with its "
-        "activations, adding num_layers * top-k int32 ids per token to every hop.",
+        "pipeline parallelism each hop also carries the routed experts of the "
+        "layers run so far, up to num_layers * top-k int32 ids per token.",
     ] = False
     enable_return_indexer_topk: A[
         bool,
