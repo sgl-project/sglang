@@ -134,15 +134,17 @@ class TestRunnerGluesTheDraft(CustomTestCase):
         step_own = torch.arange(100, 106)
         view = SimpleNamespace(out_cache_loc=step_own)
         runner._draft_metadata_glue = False
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         self.assertIs(view.out_cache_loc, step_own)
         runner._draft_metadata_glue = True
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         slot = view.out_cache_loc
         self.assertEqual(slot.data_ptr(), runner.buffers.out_cache_loc.data_ptr())
         self.assertEqual(slot.shape, step_own.shape)
+        runner._glue_draft_inputs(view, 8)
+        self.assertEqual(view.out_cache_loc.shape, (8,))
         idle = SimpleNamespace(out_cache_loc=None)
-        runner._glue_draft_inputs(idle)
+        runner._glue_draft_inputs(idle, 0)
         self.assertIsNone(idle.out_cache_loc)
 
 
