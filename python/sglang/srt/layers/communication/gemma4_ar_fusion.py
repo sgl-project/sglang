@@ -8,10 +8,6 @@ FP8 quant of the dense layer stack as one NVLS kernel each; everything else
 takes the regular path. Needs SM90 with NVLink multicast (CustomAllReduceV2
 with a multicast pull plane), TP > 1 on one node, and block-FP8 weights whose
 linear takes pre-quantized ``(fp8, scales)`` input.
-
-Measured on 4xH200 at 4096 tokens: 163 us per site vs 296 us for the NCCL
-all-reduce plus the three epilogue kernels; on the LiveKit-style serving
-workload at 128 concurrent calls, TTFT p95 -18 % and ITL p50 -19 %.
 """
 
 from __future__ import annotations
