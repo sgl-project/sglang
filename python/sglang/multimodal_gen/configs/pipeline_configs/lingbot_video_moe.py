@@ -12,13 +12,11 @@ from sglang.multimodal_gen.configs.models.encoders import (
     Qwen3VLConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def _qwen3vl_postprocess_text(
