@@ -24,7 +24,7 @@ TokenSpaceProcessor.process(media, IDs)
   item feature cache, same image on another device -> loaded again
   item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
   one map, processors of another checkpoint, mm_process_config or library version -> loaded again
-  item feature cache, a sampled hit -> computed again, equal to the cache, not rewritten
+  item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten
   item feature cache, a sampled hit computes to other features -> RuntimeError
 
 get_mm_processor -> TokenSpaceSGLangProcessor
@@ -33,7 +33,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
   budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
-  --token-space-preprocess-cache-dir -> the core caches on disk
+  --token-space-preprocess-cache-dir -> the core caches on disk; the check rate reaches the core
   adjacent images -> two offsets from mm_spans, not one scanned run
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
@@ -240,7 +240,7 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         mm_process_config=None,
         item_feature_cache=None,
         keep_mm_features_on_device=False,
-        hit_check_rate=0,
+        item_feature_cache_check_rate=None,
     ):
         processor = TokenSpaceProcessor.for_strategy(strategy_class)(
             hf_config,
@@ -251,9 +251,8 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                 keep_mm_features_on_device=keep_mm_features_on_device,
             ),
             item_feature_cache=item_feature_cache,
+            item_feature_cache_check_rate=item_feature_cache_check_rate,
         )
-        # Sampled hits would make the load counts below random.
-        processor.HIT_CHECK_RATE = hit_check_rate
         self.addCleanup(processor.shutdown)
         return processor
 
@@ -444,7 +443,11 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         expected = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
         ((key, cached),) = item_feature_cache.items()
 
-        processor.HIT_CHECK_RATE = 1
+        processor = self._processor(
+            hf_config=_CHECKPOINT,
+            item_feature_cache=item_feature_cache,
+            item_feature_cache_check_rate=1,
+        )
         load = AsyncMock(wraps=processor._load_media_lists)
         with patch.object(processor, "_load_media_lists", load):
             output = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
@@ -729,6 +732,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                     token_space_preprocess_cache_trust_url=True,
                     enable_token_space_preprocess_cache=True,
                     token_space_preprocess_cache_dir=directory.name,
+                    token_space_preprocess_cache_check_rate=0.5,
                 ),
                 DiskPreprocessCache,
             ),
@@ -750,6 +754,10 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 )(None, server_args, _bare_tokenizer(), None)
                 self.addCleanup(processor.shutdown)
                 self.assertIsInstance(processor._core._item_feature_cache, cache_type)
+                self.assertEqual(
+                    processor._core._item_feature_cache_check_rate,
+                    cache_args.get("token_space_preprocess_cache_check_rate"),
+                )
 
     def test_chat_media_reach_a_partially_expanded_request(self):
         """Chat sends every turn's image; only the new turn's placeholder expands."""
