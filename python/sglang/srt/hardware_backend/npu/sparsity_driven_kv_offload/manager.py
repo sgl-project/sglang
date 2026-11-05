@@ -84,6 +84,7 @@ class SparseKVCacheManager:
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
+        self.req_to_token = req_to_token_pool.req_to_token
         self.max_context_len = req_to_token_pool.max_context_len
         self.sparse_context_len = int(sparse_context_len)
         if self.sparse_context_len <= 0:
@@ -166,16 +167,17 @@ class SparseKVCacheManager:
         except Exception as e:
             self._raise_buffer_allocation_error("device_slot_map", e)
 
-        # Host KV buffer
-        # [bs, ctx_len, head_num, head_dim] for each layer
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        # Host KV follows the native allocator's physical slots. Radix entries
+        # retain those slots after a request finishes, and new requests inherit
+        # them through req_to_token. Request IDs are only device-cache owners.
         self.host_kv_buffer: list[torch.Tensor] = []
         self.host_ptr_list: list[int] = []
         self.dev_ptr_list: list[int] = []
 
         host_kv_shape = (
-            self.size,
-            self.max_context_len,
+            paged_kv_cache.size // paged_kv_cache.page_size
+            + paged_kv_cache.kv_page_padding,
+            paged_kv_cache.page_size,
             self.head_num,
             self.head_dim,
         )
@@ -227,7 +229,7 @@ class SparseKVCacheManager:
     def init_req(self, req: Req) -> None:
         if req.is_chunked > 0:
             return
-        rid = req.req_pool_idx
+        rid = req.kv.req_pool_idx
         if rid is None:
             raise RuntimeError(
                 "Cannot initialize sparse KV state before allocating a request pool slot"
@@ -253,7 +255,7 @@ class SparseKVCacheManager:
         setattr(req_to_token_pool, "_sparse_kv_original_alloc", original_alloc)
 
         def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
-            newly_allocated = [req.req_pool_idx is None for req in reqs]
+            newly_allocated = [req.kv.req_pool_idx is None for req in reqs]
             req_pool_indices = original_alloc(reqs)
             if req_pool_indices is not None:
                 self.reset_requests(
@@ -292,11 +294,6 @@ class SparseKVCacheManager:
             # decode graph mode:
             # one token slot per request, padded requests are masked out
             req_ids = forward_batch.req_pool_indices.to(torch.long)
-            token_pos = (forward_batch.seq_lens - 1).to(torch.long)
-
-            dst_token_indices = (
-                req_ids * self.max_context_len + token_pos
-            ).contiguous()
 
             # Existing graph decode convention:
             # padded decode requests carry seq_len == 1.
@@ -332,7 +329,6 @@ class SparseKVCacheManager:
 
             req_ids = forward_batch.req_pool_indices.to(torch.long)
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.long)
-            extend_prefix_lens = forward_batch.extend_prefix_lens.to(torch.long)
 
             local_offsets = (
                 torch.arange(
@@ -345,13 +341,6 @@ class SparseKVCacheManager:
             )
 
             req_ids_2d = req_ids.unsqueeze(1).expand(batch_size, tokens_per_req)
-            dst_pos_2d = extend_prefix_lens.unsqueeze(1) + local_offsets
-
-            dst_token_indices = (
-                (req_ids_2d * self.max_context_len + dst_pos_2d)
-                .reshape(-1)
-                .contiguous()
-            )
 
             valid_mask = (
                 (local_offsets < extend_seq_lens.unsqueeze(1)).reshape(-1)
@@ -361,9 +350,10 @@ class SparseKVCacheManager:
 
         # Layout check:
         # kv_device rows:                 [token_slot]
-        # host_kv_buffer[layer] rows:     [req_id, seq_pos]
+        # host_kv_buffer[layer] rows:     [physical_page, page_offset]
         # block dims must match on [nhead, 2*dim]
         assert kv_device.shape[1:] == self.host_kv_buffer[layer_idx].shape[2:]
+        dst_token_indices = src_token_indices
         # torch.npu.synchronize()
         actual_stream = stream if stream is not None else torch.npu.current_stream()
         with torch.npu.stream(actual_stream):
@@ -393,8 +383,8 @@ class SparseKVCacheManager:
         v1 expects k/k_rope to be full native KV-cache views and therefore uses
         forward_batch.out_cache_loc as source rows. v2 expects k/k_rope to be
         compact rows produced by the current forward pass, so source rows are
-        simply [0, num_new_tokens). The native cache slot is kept only as
-        validity metadata.
+        simply [0, num_new_tokens). The destination is the native cache slot,
+        whose lifetime is managed by the token allocator and prefix cache.
 
         Keep src_tensor/dst_tensor/src_index/dst_index/valid_mask explicit so
         the final copy can be swapped to a custom kernel without changing the
@@ -428,7 +418,6 @@ class SparseKVCacheManager:
                     f"{num_src_rows}."
                 )
 
-            dst_index = (req_ids * self.max_context_len + token_pos).contiguous()
             valid_mask = (
                 (forward_batch.seq_lens != 1)
                 & (cache_loc >= 0)
@@ -504,9 +493,6 @@ class SparseKVCacheManager:
                     + torch.arange(num_src_rows, device=device, dtype=torch.long)
                     - flat_seq_starts
                 )
-                dst_index = (
-                    flat_req_ids * self.max_context_len + token_pos
-                ).contiguous()
                 valid_mask = (
                     (flat_req_ids >= 0)
                     & (token_pos >= 0)
@@ -534,11 +520,6 @@ class SparseKVCacheManager:
                 req_ids_2d = req_ids.unsqueeze(1).expand(batch_size, tokens_per_req)
                 token_pos_2d = extend_prefix_lens.unsqueeze(1) + local_offsets
 
-                dst_index = (
-                    (req_ids_2d * self.max_context_len + token_pos_2d)
-                    .reshape(-1)
-                    .contiguous()
-                )
                 valid_mask = (
                     (local_offsets < extend_seq_lens.unsqueeze(1))
                     & (req_ids_2d >= 0)
@@ -556,6 +537,7 @@ class SparseKVCacheManager:
             valid_mask = valid_mask.contiguous()
 
         assert src_tensor.shape[1:] == dst_tensor.shape[2:]
+        dst_index = forward_batch.out_cache_loc.to(torch.long).contiguous()
         assert src_index.shape == dst_index.shape == valid_mask.shape
 
         actual_stream = stream if stream is not None else torch.npu.current_stream()
@@ -567,7 +549,7 @@ class SparseKVCacheManager:
                 dst_index,
                 valid_mask,
                 1,  # src_tensor: [num_new_tokens, nhead, head_dim]
-                2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
+                2,  # dst_tensor: [physical_page, page_offset, nhead, head_dim]
                 block_dim=48,
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
@@ -664,7 +646,9 @@ class SparseKVCacheManager:
         token_pos = (
             torch.arange(total_tokens, device=device, dtype=torch.long) - src_seq_starts
         )
-        src_index = (src_req_ids * self.max_context_len + token_pos).contiguous()
+        src_index = (
+            self.req_to_token[src_req_ids, token_pos].to(torch.long).contiguous()
+        )
         dst_index = torch.arange(total_tokens, device=device, dtype=torch.long)
         valid_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
 
@@ -676,7 +660,7 @@ class SparseKVCacheManager:
                 src_index,
                 dst_index,
                 valid_mask,
-                2,  # host_kv_buffer: [num_req, max_context_len, nhead, head_dim]
+                2,  # host_kv_buffer: [physical_page, page_offset, nhead, head_dim]
                 1,  # kv_cat: [total_tokens, nhead, head_dim]
                 block_dim=48,
                 src_ptr=self.dev_ptr_list[layer_idx],
@@ -756,6 +740,15 @@ class SparseKVCacheManager:
                 topk_indices,
                 device_cache_row_indices,
                 self.max_context_len,
+            )
+            # Translate logical positions through the shared native slot table.
+            # Mask before indexing: padded top-k entries can be -1 or sentinels.
+            safe_token_pos = torch.where(host_miss_mask, topk_indices.to(torch.long), 0)
+            miss_src_index = (
+                self.req_to_token[device_cache_row_indices.unsqueeze(1), safe_token_pos]
+                .to(torch.long)
+                .reshape(-1)
+                .contiguous()
             )
 
             cache_slot_ids = self._device_cache_slot_ids[:topk_len]
