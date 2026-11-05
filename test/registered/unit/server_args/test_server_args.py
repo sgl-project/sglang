@@ -4235,6 +4235,104 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         )
         return args
 
+    def _kimi_sharding_args(self, mode):
+        enter_scope(self, envs.SGLANG_DFLASH_DRAFT_KV_RING.override(True))
+        return self._args(
+            model_config=SimpleNamespace(
+                is_encoder_decoder=False,
+                attention_chunk_size=None,
+                attention_arch=AttentionArch.MLA,
+                hf_config=SimpleNamespace(
+                    architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+                ),
+            ),
+            disaggregation_mode=mode,
+            speculative_algorithm="DFLASH",
+            device="cuda",
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            tp_size=8,
+            attn_cp_size=8,
+            attn_dp_size=1,
+            pp_size=1,
+            nnodes=2,
+            page_size=64,
+            kv_cache_dtype="fp8_e4m3",
+            chunked_prefill_size=16384,
+            attention_backend="dsa",
+            dsa_prefill_backend="trtllm",
+            dsa_decode_backend="trtllm",
+            mem_fraction_static=0.90,
+            enable_hierarchical_cache=True,
+            hicache_io_backend="kernel",
+            hicache_mem_layout="page_first",
+            hicache_host_memory_mode="cache",
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.BREAKABLE),
+                decode=PhaseConfig(backend=Backend.FULL),
+            ),
+        )
+
+    def test_kimi_colocated_pcp_can_span_two_nodes(self):
+        args = self._kimi_sharding_args("null")
+        handle_kv_cache_sharding(args, 280 * 1024)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.BREAKABLE,
+        )
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").decode.backend,
+            Backend.BREAKABLE,
+        )
+
+    def test_kimi_pd_prefill_preserves_breakable_graphs(self):
+        args = self._kimi_sharding_args("prefill")
+        handle_kv_cache_sharding(args, 280 * 1024)
+        graph = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(graph.prefill.backend, Backend.BREAKABLE)
+        self.assertEqual(graph.decode.backend, Backend.BREAKABLE)
+
+    def test_kimi_sharding_rejects_flashmla_or_mixed_backends(self):
+        for mode in ("null", "prefill"):
+            for prefill, decode in (
+                ("flashmla_kv", "flashmla_kv"),
+                ("flashmla_kv", "trtllm"),
+                ("trtllm", "flashmla_kv"),
+            ):
+                with self.subTest(mode=mode, prefill=prefill, decode=decode):
+                    args = self._kimi_sharding_args(mode)
+                    args.dsa_prefill_backend = prefill
+                    args.dsa_decode_backend = decode
+                    with self.assertRaisesRegex(ValueError, "TRTLLM"):
+                        handle_kv_cache_sharding(args, 280 * 1024)
+
+    def test_kimi_sharding_rejects_wrong_dtype_or_page_size(self):
+        for backend in ("trtllm",):
+            for field, value in (("kv_cache_dtype", "bf16"), ("page_size", 128)):
+                with self.subTest(backend=backend, field=field):
+                    args = self._kimi_sharding_args("null")
+                    args.dsa_prefill_backend = args.dsa_decode_backend = backend
+                    setattr(args, field, value)
+                    with self.assertRaisesRegex(ValueError, "fp8_e4m3.*64"):
+                        handle_kv_cache_sharding(args, 280 * 1024)
+
+    def test_kimi_pd_requires_ring_draft_kv(self):
+        args = self._kimi_sharding_args("prefill")
+        with envs.SGLANG_DFLASH_DRAFT_KV_RING.override(False):
+            with self.assertRaisesRegex(ValueError, "draft KV ring"):
+                handle_kv_cache_sharding(args, 280 * 1024)
+
+    def test_kimi_pd_decode_sharding_is_rejected(self):
+        args = self._kimi_sharding_args("decode")
+        with self.assertRaisesRegex(ValueError, "PD prefill"):
+            handle_kv_cache_sharding(args, 280 * 1024)
+
+    def test_kimi_pd_l3_is_still_rejected(self):
+        args = self._kimi_sharding_args("prefill")
+        args.hicache_storage_backend = "mooncake"
+        with self.assertRaisesRegex(ValueError, "storage|L3"):
+            handle_kv_cache_sharding(args, 280 * 1024)
+
     def _rounding_args(self, *, raw_mem_fraction, resolved_mem_fraction):
         args = self._args(
             tp_size=2,
@@ -4280,7 +4378,12 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
 
     def test_encoder_decoder_is_rejected_before_backend_setup(self):
-        args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
+        args = self._args(
+            model_config=SimpleNamespace(
+                is_encoder_decoder=True,
+                hf_config=SimpleNamespace(architectures=["T5ForConditionalGeneration"]),
+            )
+        )
 
         with self.assertRaisesRegex(ValueError, "does not support encoder-decoder"):
             handle_kv_cache_sharding(args)

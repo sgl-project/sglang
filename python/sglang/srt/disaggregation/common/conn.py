@@ -284,6 +284,7 @@ class DeferredAbortAckState(msgspec.Struct):
 
 
 class CommonKVManager(BaseKVManager):
+    supports_page_sharded_dcp: bool = False
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
@@ -1423,10 +1424,15 @@ class CommonKVManager(BaseKVManager):
                     "PD decode DCP currently requires prefill attention CP=1, "
                     f"got {info.attn_cp_size}."
                 )
-            if info.enable_kv_cache_sharding:
+            if info.enable_kv_cache_sharding and not self.supports_page_sharded_dcp:
                 raise RuntimeError(
                     "PD decode DCP does not support a prefill with "
                     "--enable-kv-cache-sharding."
+                )
+
+            if info.enable_kv_cache_sharding and info.attn_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "Page-sharded prefill to decode DCP requires matching attention TP sizes."
                 )
 
         self._resolve_rank_mapping(info)
@@ -1437,19 +1443,19 @@ class CommonKVManager(BaseKVManager):
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
-        # TP rank mapping
-        # Only MLA shards across attn-TP, so non-MLA never reads the sharding flag.
+        # CP-TP sharing publishes hybrid PCP ranks as TP ranks. Page-sharded
+        # MLA latents still need every owner at every decode rank, independently
+        # of the KDA head partition (filtered separately during state transfer).
         if (
-            self.is_mla_backend
+            (self.is_mla_backend or self.is_hybrid_mla_backend)
             and info.enable_kv_cache_sharding
             and info.attn_cp_size == 1
         ):
-            # MLA KV sharded across prefill attn-TP: every decode rank pulls
-            # from all prefill TP ranks (None marks them all as real senders).
-            assert self.attn_tp_size == info.attn_tp_size, (
-                "MLA KV cache sharding requires equal prefill/decode attn TP "
-                f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
-            )
+            if not self.is_hybrid_mla_backend:
+                assert self.attn_tp_size == info.attn_tp_size, (
+                    "MLA KV cache sharding requires equal prefill/decode attn TP "
+                    f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
+                )
             target_tp_rank = None
             target_tp_ranks = list(range(info.attn_tp_size))
             required_dst_info_num = self.attn_tp_size
@@ -2320,6 +2326,7 @@ class CommonKVSender(BaseKVSender):
         if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
             return
 
+        src_page_offset = self.curr_idx
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
@@ -2344,6 +2351,7 @@ class CommonKVSender(BaseKVSender):
             aux_index=self.aux_index if is_last_chunk else None,
             state_indices=state_indices if is_last_chunk else None,
             num_kv_tokens=num_kv_tokens,
+            src_page_offset=src_page_offset,
             wait_event=wait_event,
             indices_event=indices_event,
             trace_ctx=self.trace_ctx.copy_for_thread(),

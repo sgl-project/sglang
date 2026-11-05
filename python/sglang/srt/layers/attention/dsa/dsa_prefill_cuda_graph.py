@@ -227,3 +227,45 @@ def _dsa_indexer_prefill_capture_stub(
 bcg_dsa_indexer_prefill_split = eager_on_graph(
     on_capture=_dsa_indexer_prefill_capture_stub
 )(pcg_dsa_indexer_prefill_split)
+
+
+def _sharded_indexer_capture_stub(
+    indexer, pool, x, q_lora, positions, layer_id, return_indices, topk_result
+):
+    if topk_result is not None:
+        topk_result.fill_(-1)
+
+
+@eager_on_graph(on_capture=_sharded_indexer_capture_stub)
+def bcg_kv_shard_indexer(
+    indexer, pool, x, q_lora, positions, layer_id, return_indices, topk_result
+):
+    """Write into graph-owned storage using the replay's live page table."""
+    result = indexer._forward_cuda_impl(
+        x,
+        q_lora,
+        positions,
+        pool.forward_batch,
+        layer_id,
+        return_indices,
+        eager_graph_break=True,
+    )
+    if topk_result is not None:
+        topk_result.copy_(result)
+
+
+def _sharded_attention_capture_stub(
+    layer, pool, q, k, v, save_kv_cache, output, **kwargs
+):
+    output.zero_()
+
+
+@eager_on_graph(on_capture=_sharded_attention_capture_stub)
+def bcg_kv_shard_attention(layer, pool, q, k, v, save_kv_cache, output, **kwargs):
+    """Keep dynamic gather waits, stores and DSA attention outside decode graphs."""
+    result = get_attn_backend().forward(
+        q, k, v, layer, pool.forward_batch, save_kv_cache, **kwargs
+    )
+    # Normalize the backend's [tokens, 1, heads, latent_dim] view into the
+    # caller-owned buffer consumed at a stable address by the next segment.
+    output.copy_(result.reshape_as(output))

@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     uses_raw_fp8_dsa_kv_layout,
 )
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.interleave import (
     DSAInterleaveCPIndexerOverlap,
     is_interleave_extend,
@@ -86,6 +87,30 @@ class MlaBmmFusionPlan:
     q_nope_out_buf: torch.Tensor
     q_nope_out_view: torch.Tensor
     attn_output_buf: torch.Tensor
+    attention_prepared: bool = False
+
+
+def _dsa_indexer_attention_capture_stub(
+    self,
+    pool,
+    hidden_states,
+    q_lora,
+    positions,
+    q_nope_t,
+    q_nope_out_buf,
+    q_nope_out_view,
+    k_nope,
+    q_pe,
+    k_pe,
+    attn_output_buf,
+    topk_result,
+    *,
+    prev_topk_indices=None,
+    **kwargs,
+):
+    if self.should_run_indexer(prev_topk_indices):
+        topk_result.fill_(-1)
+    attn_output_buf.zero_()
 
 
 def _select_local_dcp_heads_for_autotune(
@@ -244,13 +269,22 @@ class DeepseekMLAForwardMixin:
             return False
         if self.dcp_size > 1:
             return False
-        # Like the DSA indexer eager region, this fusion is enabled for
-        # non-speculative CUDA BCG prefill.
-        if not is_in_prefill_graph_scope() or not is_graph_dsa_split_op_surface(
-            forward_batch
-        ):
-            return False
         if not self.use_dsa:
+            return False
+        # Prefill already has an eager indexer/attention pair. Sharded BCG
+        # decode and target verification use the same pair with a live batch.
+        prefill = is_in_prefill_graph_scope() and is_graph_dsa_split_op_surface(
+            forward_batch
+        )
+        sharded_decode = (
+            is_in_breakable_cuda_graph()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and get_kv_shard_pool(get_token_to_kv_pool()) is not None
+        )
+        if not (prefill or sharded_decode):
             return False
         if self.use_deep_gemm_bmm:
             return False
@@ -310,6 +344,8 @@ class DeepseekMLAForwardMixin:
         self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
         q_nope: torch.Tensor,
+        *,
+        attention_prepared: bool = False,
     ) -> MlaBmmFusionPlan:
         q_nope_out_buf = q.new_empty(
             (
@@ -330,6 +366,7 @@ class DeepseekMLAForwardMixin:
             q_nope_out_buf=q_nope_out_buf,
             q_nope_out_view=q_nope_out_view,
             attn_output_buf=attn_output_buf,
+            attention_prepared=attention_prepared,
         )
 
     def _q8kv8_born_fp8_q_backend(
@@ -428,6 +465,11 @@ class DeepseekMLAForwardMixin:
             and self._can_fuse_bmm_into_attention(forward_batch)
             and (cp_overlap is None or cp_overlap.can_fuse_bmm)
         )
+        eager_dsa_pool = (
+            get_kv_shard_pool(get_token_to_kv_pool())
+            if fuse_bmm_attention and is_in_breakable_cuda_graph()
+            else None
+        )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather.
         q_replicate_active = (
@@ -474,10 +516,13 @@ class DeepseekMLAForwardMixin:
                     q_lora = q
 
             # Q projection/absorb is independent of the indexer during
-            # both decode and speculative verification.
+            # both decode and speculative verification. A BCG indexer break
+            # closes this stream fork before Q is enqueued; keep Q on the main
+            # stream so it belongs to a replayed segment.
             if (
                 self.alt_stream is not None
                 and get_is_capture_mode()
+                and not is_in_breakable_cuda_graph()
                 and (
                     forward_batch.forward_mode.is_decode_or_idle()
                     or (
@@ -565,7 +610,9 @@ class DeepseekMLAForwardMixin:
                 # and the composite bmm+attention split op are adjacent in FX.
                 if fuse_bmm_attention:
                     q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
-                    fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
+                    fusion_plan = self._make_mla_bmm_fusion_plan(
+                        q, q_nope, attention_prepared=eager_dsa_pool is not None
+                    )
 
                 # Q8KV8 q-prep/indexer overlap (opt-in): the born-fp8 q-prep
                 # chain (split -> rope -> fused absorbed-bmm+cast, ~173us)
@@ -609,7 +656,33 @@ class DeepseekMLAForwardMixin:
                         self._q8kv8_qprep_overlap_pending = True
 
                 if q_lora is not None:
-                    if self.should_run_indexer(prev_topk_indices):
+                    if fusion_plan is not None and fusion_plan.attention_prepared:
+                        topk_indices = (
+                            torch.empty(
+                                (q_lora.shape[0], self.indexer.index_topk),
+                                dtype=torch.int32,
+                                device=q_lora.device,
+                            )
+                            if self.should_run_indexer(prev_topk_indices)
+                            else prev_topk_indices
+                        )
+                        self._eager_dsa_indexer_attention(
+                            eager_dsa_pool,
+                            hidden_states,
+                            q_lora,
+                            positions,
+                            fusion_plan.q_nope_t,
+                            fusion_plan.q_nope_out_buf,
+                            fusion_plan.q_nope_out_view,
+                            k_nope,
+                            q_pe,
+                            k_pe,
+                            fusion_plan.attn_output_buf,
+                            topk_indices,
+                            prev_topk_indices=prev_topk_indices,
+                            llama_4_scaling=llama_4_scaling,
+                        )
+                    elif self.should_run_indexer(prev_topk_indices):
                         if cp_overlap is not None:
                             topk_indices = cp_overlap.run_indexer(
                                 x=hidden_states,
@@ -764,6 +837,7 @@ class DeepseekMLAForwardMixin:
         if (
             self.rotary_emb is not None
             and not fuse_rope_for_trtllm_mla
+            and not (fusion_plan is not None and fusion_plan.attention_prepared)
             # Already applied at the q-prep/indexer overlap fork.
             and not self._q8kv8_qprep_overlap_pending
         ):
@@ -802,23 +876,24 @@ class DeepseekMLAForwardMixin:
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )
 
-        if cp_overlap is not None:
-            q_nope_out, q_pe, k_nope, k_pe, topk_indices = cp_overlap.prepare_qkv(
-                q_nope_out,
-                q_pe,
-                k_nope,
-                k_pe,
-                topk_indices,
-                defer_materialization=fuse_rope_for_trtllm_mla,
-            )
-        else:
-            k_nope, k_pe = prepare_kv_for_attention(
-                self,
-                forward_batch,
-                k_nope,
-                k_pe,
-                defer_materialization=fuse_rope_for_trtllm_mla,
-            )
+        if fusion_plan is None or not fusion_plan.attention_prepared:
+            if cp_overlap is not None:
+                q_nope_out, q_pe, k_nope, k_pe, topk_indices = cp_overlap.prepare_qkv(
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    topk_indices,
+                    defer_materialization=fuse_rope_for_trtllm_mla,
+                )
+            else:
+                k_nope, k_pe = prepare_kv_for_attention(
+                    self,
+                    forward_batch,
+                    k_nope,
+                    k_pe,
+                    defer_materialization=fuse_rope_for_trtllm_mla,
+                )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if self.dcp_size > 1:
@@ -890,7 +965,9 @@ class DeepseekMLAForwardMixin:
                     is_neox=self.rotary_emb.is_neox_style,
                     llama_4_scaling=llama_4_scaling,
                 )
-            if fusion_plan is not None:
+            if fusion_plan is not None and fusion_plan.attention_prepared:
+                attn_output = fusion_plan.attn_output_buf
+            elif fusion_plan is not None:
                 self._eager_bmm_attention(
                     fusion_plan.q_nope_t,
                     self.w_kc,
@@ -1189,6 +1266,71 @@ class DeepseekMLAForwardMixin:
             and get_attn_backend().data_type == torch.float8_e4m3fn
         )
 
+    @eager_on_graph(on_capture=_dsa_indexer_attention_capture_stub)
+    def _eager_dsa_indexer_attention(
+        self,
+        pool,
+        hidden_states,
+        q_lora,
+        positions,
+        q_nope_t,
+        q_nope_out_buf,
+        q_nope_out_view,
+        k_nope,
+        q_pe,
+        k_pe,
+        attn_output_buf,
+        topk_result,
+        *,
+        prev_topk_indices=None,
+        llama_4_scaling=None,
+    ):
+        """Keep the sharded indexer, KV gather and attention in one eager break.
+
+        Resolve request metadata on every replay. The capture stub skips the
+        rank-coupled work, so nested indexer wrappers execute only during
+        warmup/replay, where no BCG segment is being captured.
+        """
+        forward_batch = pool.forward_batch
+        if self.should_run_indexer(prev_topk_indices):
+            topk_indices = self.indexer(
+                x=hidden_states,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+        else:
+            topk_indices = maybe_capture_indexer_topk(self.layer_id, prev_topk_indices)
+
+        fuse_rope = self._fuse_rope_for_trtllm_mla(forward_batch)
+        if self.rotary_emb is not None and not fuse_rope:
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        k_nope, k_pe = prepare_kv_for_attention(
+            self,
+            forward_batch,
+            k_nope,
+            k_pe,
+            defer_materialization=fuse_rope,
+        )
+        self._eager_bmm_attention.run_eager(
+            q_nope_t,
+            self.w_kc,
+            q_nope_out_buf,
+            q_nope_out_view,
+            k_nope,
+            attn_output_buf,
+            True,
+            q_pe,
+            k_pe,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache if fuse_rope else None,
+            is_neox=self.rotary_emb.is_neox_style if fuse_rope else None,
+            llama_4_scaling=llama_4_scaling if fuse_rope else None,
+            topk_indices=topk_indices,
+            sharded_pool=pool,
+        )
+        topk_result.copy_(topk_indices)
+
     @eager_on_graph
     def _eager_bmm_attention(
         self,
@@ -1205,8 +1347,33 @@ class DeepseekMLAForwardMixin:
         is_neox: Optional[bool] = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sharded_pool=None,
     ) -> None:
         torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+        if sharded_pool is not None and (
+            sharded_pool.forward_batch.forward_mode.is_decode()
+            or sharded_pool.forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+                bcg_kv_shard_attention,
+            )
+
+            bcg_kv_shard_attention.run_eager(
+                self.attn_mqa,
+                sharded_pool,
+                q_nope_out_view,
+                k_nope,
+                k_nope,
+                save_kv_cache,
+                attn_output_buf,
+                q_rope=q_pe,
+                k_rope=k_pe,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
+                llama_4_scaling=llama_4_scaling,
+                topk_indices=topk_indices,
+            )
+            return
         self.attn_mqa._eager_attention.run_eager(
             q_nope_out_view,
             k_nope,

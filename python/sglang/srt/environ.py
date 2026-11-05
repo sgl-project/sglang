@@ -634,6 +634,8 @@ class Envs:
     # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
     # The engine defaults NCCL cuMem on for eligible single-node deployments.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
+    # Join every prefix gather before subsequent compute, for diagnostics.
+    SGLANG_DISABLE_KV_SHARD_PREFETCH_OVERLAP = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

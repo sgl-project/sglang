@@ -3272,6 +3272,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         *,
+        src_page_offset: Optional[int] = None,
         wait_event=None,
         indices_event=None,
         trace_ctx=None,
@@ -3305,6 +3306,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                src_page_offset=src_page_offset,
             )
         )
         return None

@@ -31,7 +31,7 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   ``ceil(prefix_pages / N)`` pages with the (never referenced) trash page —
   a *regular* in-place allgather, owner-major output, no reorder pass.
 - Symmetric gather scratch (``SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER``,
-  NCCL >= 2.31.2, single-node shard groups): both slots are carved out of one
+  NCCL >= 2.31.2, single-node or explicitly enabled MNNVL shard groups): both slots are carved out of one
   ``ncclMemAlloc`` buffer registered as a symmetric window. Every rank carves
   the same offsets, because CE addresses a peer's buffer by the local offset
   into the window.
@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -116,18 +117,21 @@ def _symmetric_scratch_supported(
 ) -> bool:
     """Collective over ``shard_group``: every rank returns the same verdict."""
     # ncclMemAlloc memory sits outside both the memory-saver region and a
-    # custom mem pool, so either one keeps the torch-allocated scratch.
+    # custom mem pool. MNNVL gather scratch can be independently owned by NCCL
+    # while persistent KV remains in the Mooncake pool for PD transfers.
     if (
         not envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
         or memory_saver_enabled
-        or custom_mem_pool is not None
+        or (custom_mem_pool is not None and os.environ.get("NCCL_MNNVL_ENABLE") != "1")
         or not is_cuda()
         or NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
     ):
         return False
-    # Across nodes NCCL would run the windowed allgather on its hierarchical
-    # path (inter-node RMA proxy puts); only the in-node CE path is verified.
-    return all(in_the_same_node_as(shard_group.cpu_group, source_rank=0))
+    # NCCL supports zero-CTA AllGather within a single NVL/MNNVL domain.
+    # Explicit MNNVL opt-in allows cross-node shard groups.
+    # Window registration below still determines whether symmetric scratch works.
+    same_node = all(in_the_same_node_as(shard_group.cpu_group, source_rank=0))
+    return same_node or os.environ.get("NCCL_MNNVL_ENABLE") == "1"
 
 
 def _symmetric_scratch_layout(
@@ -197,6 +201,9 @@ class PageInterleaveKVPoolMixin:
         assert spec.max_prefix_tokens % spec.logical_page_size == 0
         assert spec.chunk_tokens % spec.page_size == 0
 
+        self._overlap_kv_gather = (
+            not envs.SGLANG_DISABLE_KV_SHARD_PREFETCH_OVERLAP.get()
+        )
         self.shard_spec = spec
         self.shard_group = shard_group
         self.placement = page_interleave.PageInterleavePlacement(spec)
@@ -218,6 +225,15 @@ class PageInterleaveKVPoolMixin:
             group=shard_group.cpu_group,
             device=shard_group.device,
             cta_policy=NCCL_CTA_POLICY_ZERO if self._use_symmetric_scratch else None,
+        )
+        logger.info(
+            "KV gather communicator: NCCL=%d CTAPolicy=%s MNNVL=%s; "
+            "persistent custom KV pool=%s, scratch independently NCCL-owned=%s",
+            NCCLLibrary().ncclGetRawVersion(),
+            "ZERO" if self._use_symmetric_scratch else "DEFAULT",
+            os.environ.get("NCCL_MNNVL_ENABLE"),
+            self.custom_mem_pool is not None,
+            self._use_symmetric_scratch,
         )
         self.kv_gather_stream = self.device_module.Stream()
 
@@ -265,7 +281,7 @@ class PageInterleaveKVPoolMixin:
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
             "page_size=%d prefix_tokens=%d chunk_tokens=%d scratch_rows=%d x2 "
             "(%.2f MiB per rank, charged against the KV budget), "
-            "NCCL symmetric scratch=%s. "
+            "NCCL symmetric scratch=%s, prefetch overlap=%s. "
             "Batch admission is limited by this scratch capacity.",
             self.shard_rank,
             self.shard_size,
@@ -275,6 +291,7 @@ class PageInterleaveKVPoolMixin:
             scratch_rows,
             scratch_bytes / (1024 * 1024),
             self._scratch_window_registered,
+            self._overlap_kv_gather,
         )
 
     @contextmanager
@@ -331,6 +348,15 @@ class PageInterleaveKVPoolMixin:
             "(it writes pool rows directly, bypassing the ownership filter)"
         )
 
+    def register_layer_transfer_counter(
+        self, layer_transfer_counter, *, layer_ids=None
+    ):
+        # Gather bypasses the ordinary getters, so it must wait on H2D itself.
+        # Hybrid pools supply model-layer ids for the child's dense DSA layers.
+        self._shard_transfer_counter = layer_transfer_counter
+        self._shard_transfer_layer_ids = layer_ids
+        super().register_layer_transfer_counter(None)
+
     # ---- subclass hooks -------------------------------------------------------
 
     def _scratch_tensor_specs(self, rows: int) -> Dict[str, _TensorSpec]:
@@ -376,16 +402,17 @@ class PageInterleaveKVPoolMixin:
         block_pages = 0
         for i in range(len(prefix_lens_cpu)):
             prefix_len, seq_len = int(prefix_lens_cpu[i]), int(seq_lens_cpu[i])
-            assert prefix_len % ps == 0, (
-                f"sharded prefill requires physical-page-aligned prefixes "
-                f"(the radix-tree match quantum), got prefix_len="
-                f"{prefix_len}, page_size={ps}"
-            )
-            row = req_to_token[req_pool_indices[i]]
+            assert 0 <= prefix_len <= seq_len
+            # Decode/verify may append to an existing partial page. Gather that
+            # whole page before stores; only wholly new pages use chunk slots.
+            prefix_pages_end = ceil_div(prefix_len, ps) * ps
+            # Keep the request index one-dimensional. A scalar CUDA tensor
+            # used as a Python row index calls item() and waits for the stream.
+            row = req_to_token[req_pool_indices[i : i + 1], :seq_len].squeeze(0)
             if prefix_len:
                 pages_i = row[:prefix_len:ps].long() // ps
                 prefix_parts.append(pages_i)
-                block_pages += ceil_div(prefix_len // ps, shard_size)
+                block_pages += ceil_div(ceil_div(prefix_len, ps), shard_size)
                 if self._debug_plan_checks:
                     # Owner-congruence: each request's prefix owners must be
                     # exactly cyclic — the block bound above relies on it. A
@@ -404,8 +431,8 @@ class PageInterleaveKVPoolMixin:
                         f"cyclic — rotation base out of sync "
                         f"(owners[:16]={owners[:16].tolist()})"
                     )
-            if seq_len > prefix_len:
-                chunk_parts.append(row[prefix_len:seq_len:ps].long() // ps)
+            if seq_len > prefix_pages_end:
+                chunk_parts.append(row[prefix_pages_end:seq_len:ps].long() // ps)
 
         # A prefix page shared by several requests gathers into ONE scratch
         # slot (torch.unique sorts — deterministic, mirrored); chunk pages
@@ -519,10 +546,10 @@ class PageInterleaveKVPoolMixin:
         # writes that produced the prefix rows.
         self.kv_gather_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_gather_stream):
-            if self.layer_transfer_counter is not None:
-                # HiCache loads this layer's rows on its own stream, and the gather
-                # bypasses the waiting base getters.
-                self.layer_transfer_counter.wait_until(local_layer)
+            counter = getattr(self, "_shard_transfer_counter", None)
+            if counter is not None:
+                ids = self._shard_transfer_layer_ids
+                counter.wait_until(local_layer if ids is None else ids[local_layer])
             for pool_buf, name in self._gather_pairs(local_layer):
                 send_rows = self._gather_send_rows(name)
                 block = send_rows.numel()
@@ -536,6 +563,10 @@ class PageInterleaveKVPoolMixin:
                         scratch[: self.shard_size * block], send
                     )
             slot.ready.record(self.kv_gather_stream)
+        if not self._overlap_kv_gather:
+            # Also covers the initial prefetch in begin_shard_extend. The
+            # gather stream already waits for preceding compute above.
+            self.device_module.current_stream().wait_event(slot.ready)
         slot.resident_key = key
 
     def _acquire_slot_for_read(self, layer_id: int) -> _ScratchSlot:
@@ -557,6 +588,22 @@ class PageInterleaveKVPoolMixin:
             self._prefetch_layer(layer_id + 1)
         return slot
 
+    def _slot_for_write(self, layer_id: int) -> _ScratchSlot:
+        slot = self._slots[layer_id % 2]
+        if self._block_pages:
+            # Graph capture runs multiple warmup forwards against one batch
+            # plan. Later layers evict the first layers' two scratch slots;
+            # reacquire before a partial-page store on the next traversal.
+            self._prefetch_layer(layer_id)
+            self.device_module.current_stream().wait_event(slot.ready)
+        return slot
+
+    @staticmethod
+    def _loc_version(loc: torch.Tensor):
+        # Inference tensors intentionally have no mutation counter. Recompute
+        # for those; a pointer/length cache can silently survive an in-place edit.
+        return None if loc.is_inference() else loc._version
+
     def _translate_loc_cached(self, loc: torch.Tensor) -> torch.Tensor:
         """Per-batch memoized ``translate_loc_to_scratch`` for the per-layer
         callers: the same loc tensors (``out_cache_loc`` at every layer's
@@ -565,7 +612,10 @@ class PageInterleaveKVPoolMixin:
         plan is frozen per batch — so each distinct loc tensor is translated
         once per batch instead of once per layer. ``begin_shard_extend`` clears
         the cache when it installs a new plan."""
-        key = (loc.data_ptr(), loc.numel())
+        version = PageInterleaveKVPoolMixin._loc_version(loc)
+        if version is None:
+            return self.translate_loc_to_scratch(loc)
+        key = (loc.data_ptr(), loc.numel(), version)
         rows = self._translate_cache.get(key)
         if rows is None:
             rows = self.translate_loc_to_scratch(loc)
@@ -574,6 +624,16 @@ class PageInterleaveKVPoolMixin:
 
     # ---- write plan (owner filter), cached per (loc tensor, epoch) --------------
 
+    def _get_masked_write_rows(self, loc: torch.Tensor) -> torch.Tensor:
+        # Row zero is reserved. The two-part MLA store kernels skip it, so
+        # retain every source row and mask unowned destinations on device.
+        # Recompute for reused/inference tensors rather than caching by pointer.
+        return torch.where(
+            (loc > 0) & self.placement.local_mask(loc, self.shard_rank),
+            self.placement.local_index(loc),
+            0,
+        )
+
     def _get_write_plan(self, loc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """(owned positions into ``loc``, their local physical rows).
 
@@ -581,8 +641,9 @@ class PageInterleaveKVPoolMixin:
         forward, so the owner filter is computed once per batch, not per
         layer.
         """
-        key = (loc.data_ptr(), loc.numel(), self._epoch)
-        if self._write_plan_key != key:
+        version = PageInterleaveKVPoolMixin._loc_version(loc)
+        key = (loc.data_ptr(), loc.numel(), self._epoch, version)
+        if version is None or self._write_plan_key != key:
             owned_idx = torch.nonzero(
                 self.placement.local_mask(loc, self.shard_rank)
             ).squeeze(1)
@@ -662,7 +723,7 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
             # stream: ordered before this layer's attention read for free
             # and disjoint from the gather stream, which only writes the
             # prefix region. Padded locations translate to the trash page.
-            slot = self._slots[layer_id % 2]
+            slot = self._slot_for_write(layer_id)
             rows = self._translate_loc_cached(loc)
             slot.tensors["k"][rows] = cache_k
             slot.tensors["v"][rows] = cache_v
@@ -746,7 +807,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             # Stage the full chunk into this layer's slot (compute
             # stream): the absorbed / one-shot readers cover the current
             # chunk through the translated page table too.
-            slot = self._slots[layer_id % 2]
+            slot = self._slot_for_write(layer_id)
             rows = self._translate_loc_cached(loc)
             staged_k = cache_k
             if staged_k.dtype != self.dtype:
@@ -776,11 +837,23 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         if self._shard_extend_active:
-            slot = self._slots[layer_id % 2]
+            slot = self._slot_for_write(layer_id)
             rows = self._translate_loc_cached(loc)
             self._write_mla_kv_buffer(
                 slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
             )
+        if loc.is_cuda and cache_k_rope is not None and cache_k_rope.numel() > 0:
+            # Dynamic nonzero needs a D2H count before indexing the sources.
+            # The existing two-part writers already support a skipped row;
+            # keep their input shape fixed, including ranks owning no tokens.
+            super().set_mla_kv_buffer(
+                layer,
+                self._get_masked_write_rows(loc),
+                cache_k_nope,
+                cache_k_rope,
+                layer_id_override=layer_id_override,
+            )
+            return
         owned_idx, local_rows = self._get_write_plan(loc)
         if owned_idx.numel() == 0:
             return
@@ -897,20 +970,21 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
         if pool._shard_extend_active:
             targets.append(
                 (
-                    pool._slots[layer_id % 2].tensors["index_k"],
+                    pool._slot_for_write(layer_id).tensors["index_k"],
                     pool.translate_loc_to_scratch(loc),
                     None,
                 )
             )
-        # Indexer callers may reuse or mutate their location tensors. Compute
-        # fresh indices instead of memoizing only their pointer and length.
-        owned_idx = torch.nonzero(
-            pool.placement.local_mask(loc, pool.shard_rank)
-        ).squeeze(1)
-        if owned_idx.numel():
-            targets.append(
-                (local, pool.placement.local_index(loc[owned_idx]), owned_idx)
-            )
+        # Keep the write shape fixed: CUDA nonzero/boolean indexing waits for
+        # the device to report its result length at every indexer layer. Store
+        # kernels skip negative locations, including when this rank owns no
+        # rows. Recompute the mask so reused inference-tensor storage is safe.
+        local_rows = torch.where(
+            (loc >= 0) & pool.placement.local_mask(loc, pool.shard_rank),
+            pool.placement.local_index(loc),
+            -1,
+        )
+        targets.append((local, local_rows, None))
         return targets
 
     def store_quantized(

@@ -597,6 +597,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             parent = parent.parent
         return node.rotation_base + prefix_len // self.page_size
 
+    def load_back_shard_spans(self, node_ids, page_size: int, shard_size: int):
+        """Length and first owner of each host fragment, in transfer order."""
+        spans = []
+        for node_id in node_ids:
+            node = self.node_by_id(node_id)
+            if node.rotation_base is None:
+                raise ValueError(
+                    "Sharded HiCache restore requires saved rotation metadata"
+                )
+            prefix_length = 0
+            parent = node.parent
+            while parent is not None and parent.parent is not None:
+                prefix_length += len(parent.key)
+                parent = parent.parent
+            assert prefix_length % page_size == 0
+            spans.append(
+                (
+                    len(node.key),
+                    (node.rotation_base + prefix_length // page_size) % shard_size,
+                )
+            )
+        return spans
+
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
         return self.node_by_id(node_id).get_last_hash_value()

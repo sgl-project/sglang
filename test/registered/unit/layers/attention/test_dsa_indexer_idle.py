@@ -1,5 +1,5 @@
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -39,6 +39,7 @@ class TestDSAIndexerIdle(unittest.TestCase):
 
     def test_eager_idle_short_circuits_before_paged_mqa(self):
         indexer = SimpleNamespace(index_topk=4)
+        indexer._forward_cuda_impl = MethodType(Indexer._forward_cuda_impl, indexer)
         batch = SimpleNamespace(forward_mode=ForwardMode.IDLE)
 
         with (

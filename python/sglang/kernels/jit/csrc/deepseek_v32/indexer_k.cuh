@@ -331,6 +331,8 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto inv_scale = 1.0f / scale;
 
   const auto index = static_cast<const int64_t*>(params.indices)[work_id];
+  // The sharded writer keeps a fixed token count and masks non-owned rows.
+  if (index < 0) return;
   const int32_t page = static_cast<int32_t>(index >> kPageBits);
   const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
   const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * kPageBytes;

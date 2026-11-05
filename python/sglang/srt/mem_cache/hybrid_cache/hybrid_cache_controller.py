@@ -997,7 +997,7 @@ class HybridCacheController(BaseHiCacheController):
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
             if t.indices_from_pool is None and t.host_indices is not None:
-                source_len[t.name] = transferred_tokens(t.host_indices)
+                source_len[t.name] = len(t.host_indices)
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
             if entry is None:
@@ -1005,11 +1005,7 @@ class HybridCacheController(BaseHiCacheController):
             if t.indices_from_pool is not None:
                 num_slots = source_len.get(t.indices_from_pool, 0)
             else:
-                num_slots = (
-                    transferred_tokens(t.host_indices)
-                    if t.host_indices is not None
-                    else 0
-                )
+                num_slots = len(t.host_indices) if t.host_indices is not None else 0
             num_bytes += num_slots * entry.host_pool.size_per_token
         return num_bytes
 
@@ -1596,11 +1592,20 @@ class HybridCacheController(BaseHiCacheController):
             for transfer in operation.pool_transfers:
                 if transfer.host_indices is None or transfer.device_indices is None:
                     raise ValueError(f"Unresolved L2 transfer for {transfer.name}.")
-                host, device = prepare(
-                    self.mem_pool_host.entry_map[transfer.name].host_pool,
-                    transfer.host_indices,
-                    transfer.device_indices,
-                )
+                pool = self.mem_pool_host.entry_map[transfer.name].host_pool
+                if transfer.indices_from_pool == PoolName.KV:
+                    host, device = prepare(
+                        pool, transfer.host_indices, transfer.device_indices
+                    )
+                else:
+                    # KDA and other independent state pools have their own slots;
+                    # their indices are neither KV owners nor widened KV rows.
+                    host, device = self._move_pool_indices(
+                        pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        write_back_jit=write_back_jit,
+                    )
                 if host.numel() == 0:
                     continue
                 resolved_pool_transfers.append(

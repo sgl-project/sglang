@@ -186,9 +186,18 @@ class Parallel(msgspec.Struct):
         "Shard at-rest KV cache storage at page granularity across the group "
         "that currently replicates it (attention-CP ranks for GQA models "
         "under prefill CP; attention-TP ranks for MLA models), multiplying "
-        "the group's unique KV capacity. Prefill workers of PD "
-        "disaggregation only.",
+        "the group's unique KV capacity. Supported on PD prefill workers and "
+        "standalone Kimi-K3.1 with interleave PCP, TRTLLM DSA and breakable "
+        "CUDA graphs. Kimi also supports HiCache L2 and DFlash.",
     ] = False
+    kv_cache_sharding_scratch_size: A[
+        float,
+        "Per-GPU KV-sharding assembly scratch budget in GiB (1 GiB = 2^30 bytes). "
+        "Includes both prefetch slots, current-token and trash pages, and buffer "
+        "alignment. Must be positive and finite, and fit one full context. "
+        "Admission uses actual batch prefix lengths. An EAGLE MTP draft uses "
+        "one additional scratch pair. Default: 10 GiB.",
+    ] = 10.0
     # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
     # resolves to `attn_dp_size = N`, `dp_size = 1`. TODO: remove after 2026-12-31.
     enable_dp_attention: A[bool, Arg(no_cli=True, resolvable=True)] = False

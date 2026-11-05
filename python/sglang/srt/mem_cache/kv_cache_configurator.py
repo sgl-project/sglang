@@ -4,6 +4,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
@@ -95,7 +96,6 @@ from sglang.srt.mem_cache.page_interleave import (
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveDSATokenToKVPool,
-    PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
@@ -714,6 +714,7 @@ class KVCacheConfigurator:
         # virtual space (> max_total_num_tokens); the direct-indexed draft
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
+        draft_ring_pool_size: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
             if isinstance(
                 token_to_kv_pool_allocator,
@@ -801,6 +802,15 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
+            elif isinstance(token_to_kv_pool_allocator, PageInterleavePoolAllocator):
+                # Target DSA is striped; draft heads retain ordinary TP and
+                # therefore need every logical token id, including padding.
+                draft_virtual_id_space = (
+                    token_to_kv_pool_allocator.draft_virtual_id_space
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
             elif (
                 isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator)
                 and not self._uses_dflash_draft_kv_ring()
@@ -831,13 +841,13 @@ class KVCacheConfigurator:
                 block_size=int(get_spec().speculative_num_draft_tokens),
                 dcp_size=get_parallel().attn_dcp_size,
             )
+            draft_ring_pool_size = draft_kv_ring_pool_rows(
+                req_pool_rows=req_to_token_pool.req_to_token.shape[0],
+                rows_per_req=rows_per_req,
+                page_size=max(int(self.pool_page_size or 1), 1),
+            )
             sizes = msgspec.structs.replace(
-                sizes,
-                max_total_num_tokens=draft_kv_ring_pool_rows(
-                    req_pool_rows=req_to_token_pool.req_to_token.shape[0],
-                    rows_per_req=rows_per_req,
-                    page_size=max(int(self.pool_page_size or 1), 1),
-                ),
+                sizes, max_total_num_tokens=draft_ring_pool_size
             )
 
         # Initialize req_to_token_pool
@@ -883,13 +893,24 @@ class KVCacheConfigurator:
         )
 
         if self.kv_shard_rank is not None:
-            if not isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin):
+            from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
+
+            if get_kv_shard_pool(token_to_kv_pool) is None:
                 raise ValueError(
                     "--enable-kv-cache-sharding does not support this model "
                     f"family (pool {type(token_to_kv_pool).__name__})."
                 )
 
-        if draft_virtual_id_space is not None:
+        if draft_ring_pool_size is not None:
+            # DFLASH replaces target virtual ids with per-request ring locs for
+            # both extend and verify writes. Check that physical row space,
+            # not the shared target allocator's (potentially much larger) ids.
+            assert token_to_kv_pool.size >= draft_ring_pool_size, (
+                "draft KV ring pool smaller than its per-request row space: "
+                f"pool size={token_to_kv_pool.size} < "
+                f"required rows={draft_ring_pool_size}"
+            )
+        elif draft_virtual_id_space is not None:
             # The allocator's ids are widened, so compare in that same space.
             pool_logical_size = (
                 token_to_kv_pool.size
@@ -2845,6 +2866,12 @@ class KVCacheConfigurator:
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
         if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
+            if self.kv_shard_rank is not None:
+                return partial(
+                    PageInterleaveDSATokenToKVPool,
+                    shard_spec=self.kv_shard_spec,
+                    shard_group=self.kv_shard_group,
+                )
             return dsa_pool_class
         if _is_npu:
             if self.use_mla_backend:

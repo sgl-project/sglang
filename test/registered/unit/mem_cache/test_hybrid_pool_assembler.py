@@ -921,12 +921,65 @@ class TestKvHostPoolRow(CustomTestCase):
         self._build(pool, (_dsa_pool_stub(layer_num=1),))
 
 
+class TestDsaHostBudget(CustomTestCase):
+    def test_host_rows_include_owned_layers_and_packed_drafts(self):
+        # Uneven layer sharding pads KV to three layers per rank, but the
+        # indexer allocates only local non-shared layers. Drafts add one each.
+        for shard, owned_index_layers in ((None, 3), ((0, 2), 2), ((1, 2), 1)):
+            for draft_count in (0, 1, 2):
+                with self.subTest(shard=shard, drafts=draft_count):
+                    pool = _dsa_pool_stub(layer_num=5, shard=shard)
+                    pool.skip_topk_layers = [False, True, False, True, False]
+                    pool.kv_cache_dim = 656  # packed FP8 DSA row including scales
+                    pool.store_dtype = torch.float8_e4m3fn
+                    drafts = tuple(
+                        _dsa_pool_stub(layer_num=1) for _ in range(draft_count)
+                    )
+                    for draft in drafts:
+                        draft.kv_cache_dim = pool.kv_cache_dim
+                        draft.store_dtype = pool.store_dtype
+                    config = prepare_host_pool_config(
+                        decls=pool.host_pool_decls(),
+                        full_layer_mapping={i: i for i in range(5)},
+                        transfer_layer_id_max=5,
+                        transfer_page_size=64,
+                        packed_draft_device_pools=drafts,
+                    )
+                    kv_bytes = 656 * ((5 if shard is None else 3) + draft_count)
+                    index_bytes = 132 * (owned_index_layers + draft_count)
+                    budget = hybrid_pool_assembler._reserve_dsa_indexer_host_size(
+                        112, config
+                    )
+                    # Reconstruct total storage at the chosen token capacity.
+                    self.assertAlmostEqual(
+                        budget * (kv_bytes + index_bytes) / kv_bytes, 112
+                    )
+
+    def test_plain_mla_budget_is_unchanged(self):
+        pool = _kv_pool_stub(layer_num=3)
+        config = prepare_host_pool_config(
+            decls=pool.host_pool_decls(),
+            full_layer_mapping={i: i for i in range(3)},
+            transfer_layer_id_max=3,
+            transfer_page_size=64,
+        )
+        self.assertEqual(
+            hybrid_pool_assembler._reserve_dsa_indexer_host_size(112, config), 112
+        )
+
+
 class TestHybridMambaDeclaredIndexer(CustomTestCase):
     """hybrid Mamba + DSA reuses the target's indexer declaration: the KV/Mamba
     stack gains an INDEXER entry whose mirror and layer mapping cover only the
     DSA layers that own index buffers."""
 
     def test_stack_declares_indexer_and_skips_empty_layers(self):
+        self._check_stack(hicache_size=0)
+
+    def test_explicit_budget_includes_indexer_without_reducing_mamba_share(self):
+        self._check_stack(hicache_size=180)
+
+    def _check_stack(self, hicache_size):
         from sglang.srt.mem_cache.pool_host.mla import (
             MLAHostAllocation,
             MLATokenToKVPoolHost,
@@ -942,7 +995,11 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 temporal=torch.zeros(2, 9, 4), conv=(torch.zeros(2, 9, 4),)
             ),
         )
-        mamba_pool = SimpleNamespace(get_device_pool_infos=lambda: (mamba_info,))
+        kv_pool.host_capacity_bytes = 112 * 10**9
+        mamba_pool = SimpleNamespace(
+            get_device_pool_infos=lambda: (mamba_info,),
+            host_capacity_bytes=68 * 10**9,
+        )
         # transfer layers 0,2,4 are DSA (device 0,1,2), 1,3 are Mamba
         full_mapping = {0: 0, 2: 1, 4: 2}
         params = SimpleNamespace(
@@ -963,6 +1020,14 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
         def dummy_kv_host(**kwargs):
+            if hicache_size:
+                # Three BF16 KV rows, but only two uint8 index rows (128 +
+                # one FP32 scale each). Both must fit the 112 GB KV share.
+                kv_bytes = 3 * 576 * 2
+                index_bytes = 2 * (128 + 4)
+                self.assertAlmostEqual(
+                    kwargs["host_size"], 112 * kv_bytes / (kv_bytes + index_bytes)
+                )
             pool = kwargs["kv_pool"]
             drafts = kwargs["mtp_draft_device_pools"]
             width = None or (pool.kv_lora_rank + pool.qk_rope_head_dim)
@@ -1007,7 +1072,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 hybrid_pool_assembler,
                 "build_mamba_host_pool",
                 return_value=SimpleNamespace(layer_num=2, can_use_write_back_jit=False),
-            ),
+            ) as mamba_builder,
             patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
             patch.object(
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
@@ -1016,7 +1081,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 hybrid_pool_assembler,
                 "get_memory",
                 return_value=SimpleNamespace(
-                    hicache_size=0,
+                    hicache_size=hicache_size,
                     hicache_ratio=2,
                     hicache_mem_layout="page_first",
                     hicache_write_policy="write_through",
@@ -1036,6 +1101,8 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 use_mla=True,
             )
 
+        if hicache_size:
+            self.assertEqual(mamba_builder.call_args.kwargs["host_size"], 68)
         names = [e.name for e in group.entries]
         self.assertEqual(names, [PoolName.KV, PoolName.INDEXER, PoolName.MAMBA])
         indexer = group.entry_map[PoolName.INDEXER]

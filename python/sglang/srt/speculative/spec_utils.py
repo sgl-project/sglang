@@ -876,17 +876,34 @@ def draft_tp_context(layout: DraftParallelLayout):
     if layout.tp_group is None:
         return contextlib.nullcontext()
     tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
-    if layout.disable_cp:
+    if layout.disable_cp or get_parallel().enable_kv_cache_sharding:
         return _draft_without_cp(tp_context)
     return tp_context
 
 
 @contextmanager
 def _draft_without_cp(tp_context):
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+
+    graph_scope = contextlib.nullcontext()
+    graph = get_exec().graph.cuda_graph_config
+    if (
+        get_parallel().enable_kv_cache_sharding
+        and graph is not None
+        and graph.decode.backend == Backend.BREAKABLE
+    ):
+        # Only target attention has a dynamic gathered page table. The independent
+        # DFlash attention pool retains the ordinary full decode graph runner.
+        graph_scope = get_exec().graph.override(
+            cuda_graph_config=with_phase(graph, Phase.DECODE, backend=Backend.FULL)
+        )
     with (
+        graph_scope,
         tp_context,
         get_parallel().override(
-            enable_prefill_cp=False, enable_cp_tp_group_sharing=False
+            enable_prefill_cp=False,
+            enable_cp_tp_group_sharing=False,
+            enable_kv_cache_sharding=False,
         ),
         disable_cp_strategy(),
     ):

@@ -155,7 +155,11 @@ class TestPageShardScratchSizing(CustomTestCase):
             # and 128-byte index keys plus a four-byte scale for every token.
             self.assertEqual(
                 compute_page_shard_scratch_bytes(kvc, include_mtp=True),
-                2 * 2 * spec.scratch_rows * (576 + 128 + 4),
+                4
+                * (
+                    ceil_div(spec.scratch_rows * 576, 4096) * 4096
+                    + ceil_div(spec.scratch_rows * 132, 4096) * 4096
+                ),
             )
 
     @contextmanager
@@ -179,6 +183,7 @@ class TestPageShardScratchSizing(CustomTestCase):
         group = SimpleNamespace(world_size=shard_size, rank_in_group=0)
         parallel = SimpleNamespace(
             enable_kv_cache_sharding=enabled,
+            kv_cache_sharding_scratch_size=32 / 1024,
             attn_cp_group=(SimpleNamespace(world_size=1) if use_mla else group),
             attn_tp_group=group,
             attn_tp_size=tp_size,
@@ -196,7 +201,7 @@ class TestPageShardScratchSizing(CustomTestCase):
             page_size=16,
             kv_cache_dtype=torch.bfloat16,
             model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(),
+                hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
                 context_len=context_len,
                 kv_lora_rank=16,
                 qk_rope_head_dim=8,
@@ -215,15 +220,15 @@ class TestPageShardScratchSizing(CustomTestCase):
         ):
             yield kvc
 
-    def test_each_context_is_aligned_before_multiplying_by_eight(self):
+    def test_byte_budget_is_aligned_and_retains_one_context(self):
         with self._fixture(context_len=4097, chunk_tokens=33) as kvc:
             spec = make_page_shard_spec(kvc)
-        # Each request's prefix gather pads independently to 64 tokens.
-        # Aligning only 8 * context_len would reserve too few rows.
-        self.assertEqual(spec.max_prefix_tokens, 8 * 4160)
-        self.assertGreater(spec.max_prefix_tokens, 32832)
+            actual = compute_page_shard_scratch_bytes(kvc)
+        self.assertGreaterEqual(spec.max_prefix_tokens, 4160)
         self.assertEqual(spec.chunk_tokens, 48)
         self.assertEqual(spec.max_prefix_tokens % spec.logical_page_size, 0)
+        self.assertLessEqual(actual, 32 * 1024**2)
+        self.assertGreater(actual, 32 * 1024**2 - 16384)
 
     def test_target_with_mtp_budgets_one_extra_scratch_pair(self):
         with (
@@ -234,7 +239,8 @@ class TestPageShardScratchSizing(CustomTestCase):
             # Target configs can omit next-N layers; use the resolved draft count.
             kvc.model_config.num_nextn_predict_layers = None
             kvc.spec_aux_config = SimpleNamespace(eagle_draft_num_layers=1)
-            expected = 2 * (8 * 128 + 64 + 16) * (16 + 8) * 2
+            spec = make_page_shard_spec(kvc)
+            expected = 2 * ceil_div(spec.scratch_rows * 24 * 2, 4096) * 4096
             for layers in (1, 3):
                 with self.subTest(layers=layers):
                     kvc.spec_aux_config.eagle_draft_num_layers = layers
@@ -272,11 +278,10 @@ class TestPageShardScratchSizing(CustomTestCase):
                 actual = 2 * sum(
                     math.prod(shape) * dtype.itemsize for shape, dtype in specs.values()
                 )
-                self.assertEqual(estimated, actual)
-                # The zero-SM buffer adds at most one window alignment per tensor.
                 _, symmetric_bytes = _symmetric_scratch_layout(specs, num_slots=2)
-                self.assertGreaterEqual(symmetric_bytes, estimated)
-                self.assertLess(symmetric_bytes, estimated + 2 * len(specs) * 4096)
+                self.assertEqual(estimated, symmetric_bytes)
+                self.assertGreaterEqual(estimated, actual)
+                self.assertLess(estimated, actual + 2 * len(specs) * 4096)
 
 
 class TestZeroSmScratchLayout(CustomTestCase):
@@ -532,7 +537,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                 row_bytes = (8 + 4) * 2 if use_mla else 2 * (4 + 6) * 2
                 self.assertEqual(
                     compute_page_shard_scratch_bytes(kvc),
-                    2 * (128 + 64 + 16) * row_bytes,
+                    2 * ceil_div((128 + 64 + 16) * row_bytes, 4096) * 4096,
                 )
                 with self.assertRaisesRegex(ValueError, "target"):
                     compute_page_shard_scratch_bytes(kvc, include_mtp=True)
@@ -618,7 +623,6 @@ class TestMTPKVShardConfig(CustomTestCase):
             (kvc, "spec_algorithm", algorithm, "EAGLE MTP")
             for algorithm in (
                 SpeculativeAlgorithm.EAGLE3,
-                SpeculativeAlgorithm.DFLASH,
                 SpeculativeAlgorithm.FROZEN_KV_MTP,
             )
         ] + [
@@ -1609,17 +1613,17 @@ class TestBeginShardExtendPlan(CustomTestCase):
         self.assertEqual(int(stub._page_pos[pages[0]]), stub._chunk_base // PS)
         self.assertEqual(int(stub._page_pos[pages[1]]), stub._chunk_base // PS + 1)
 
-    def test_unaligned_prefix_rejected(self):
-        # The tree quantum is the PHYSICAL page: a prefix that is not a
-        # ps-multiple can never come out of match_prefix.
+    def test_partial_prefix_page_is_gathered_before_decode_append(self):
         pages = _chain_pages(base=0, n_pages=4)
-        with self.assertRaises(AssertionError):
-            _run_begin(
-                _make_pool_stub(_make_spec()),
-                [PS + 3],
-                [4 * PS],
-                [_chain_row(pages, 4 * PS)],
-            )
+        stub = _run_begin(
+            _make_pool_stub(_make_spec()),
+            [PS + 3],
+            [4 * PS],
+            [_chain_row(pages, 4 * PS)],
+        )
+        self.assertEqual(stub._block_pages, 1)
+        self.assertLess(int(stub._page_pos[pages[1]]), stub._chunk_base // PS)
+        self.assertEqual(int(stub._page_pos[pages[2]]), stub._chunk_base // PS)
 
     def test_owner_congruence_guard(self):
         """A rotation-base bug that breaks a request's prefix-owner
@@ -2224,7 +2228,9 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
                 change_state=lambda enable: nullcontext(),
                 all_gather=lambda out, inp: events.append("all_gather"),
             ),
-            layer_transfer_counter=counter,
+            _shard_transfer_counter=counter,
+            _shard_transfer_layer_ids=None,
+            _overlap_kv_gather=True,
         )
 
     def test_wait_precedes_the_gather(self):
@@ -2237,6 +2243,85 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
         events = []
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, None), 3)
         self.assertEqual(events, [("gather", 1), "all_gather"])
+
+
+class TestKimiShardL2Compatibility(CustomTestCase):
+    def test_kda_state_rows_remain_independent_of_kv_owner(self):
+        anchor = _host_pool(shard_rank=2)
+        device = _make_allocator().alloc_cyclic(start_class=0, need_size=6 * PS)
+        host = anchor.alloc(len(device), start_owner=0)
+        state_host = torch.tensor([9, 10])
+        state_device = torch.tensor([13, 14])
+        state = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=state_host,
+            device_indices=state_device,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.is_kv_sharded = True
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=SimpleNamespace(host_pool=anchor),
+            entry_map={PoolName.MAMBA: SimpleNamespace(host_pool=object())},
+        )
+        controller._move_pool_indices = lambda pool, h, d, **kw: (h, d)
+        h, d, extra = controller._move_op_indices(
+            SimpleNamespace(
+                host_indices=host,
+                device_indices=device,
+                pool_transfers=[state],
+            )
+        )
+        self.assertEqual(h.numel(), PS)
+        self.assertEqual(len(extra), 1)
+        torch.testing.assert_close(extra[0].host_indices, state_host)
+        torch.testing.assert_close(extra[0].device_indices, state_device)
+        self.assertIs(state.host_indices, state_host)
+
+    def test_native_host_backup_does_not_filter_local_rows_twice(self):
+        host = _host_pool(shard_rank=2).host_pool
+        pool = PageInterleaveMLATokenToKVPool.__new__(PageInterleaveMLATokenToKVPool)
+        pool.placement = PageInterleavePlacement(_make_spec(shard_rank=2))
+        pool.shard_rank = 2
+        # Controller has already selected this rank's stripe and translated it.
+        local_host = torch.arange(PS, 2 * PS)
+        local_device = torch.arange(PS, 2 * PS)
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_direct", create=True
+        ) as kernel:
+            host.backup_from_device_all_layer(pool, local_host, local_device, "direct")
+        kernel.assert_called_once()
+        torch.testing.assert_close(kernel.call_args.kwargs["src_indices"], local_device)
+        torch.testing.assert_close(kernel.call_args.kwargs["dst_indices"], local_host)
+
+    def test_transfer_byte_count_keeps_all_kda_state_slots(self):
+        anchor = _host_pool(shard_rank=2)
+        host = anchor.alloc(6 * PS, start_owner=0)
+        state_host = torch.tensor([9, 10])
+        state = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=state_host,
+            device_indices=torch.tensor([13, 14]),
+        )
+        index = PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.is_kv_sharded = True
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=SimpleNamespace(name=PoolName.KV, host_pool=anchor),
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(
+                    host_pool=SimpleNamespace(size_per_token=100)
+                ),
+                PoolName.INDEXER: SimpleNamespace(
+                    host_pool=SimpleNamespace(size_per_token=3)
+                ),
+            },
+        )
+        actual = controller._transfer_num_bytes(
+            SimpleNamespace(
+                host_indices=host, device_indices=host, pool_transfers=[state, index]
+            )
+        )
+        self.assertEqual(actual, PS * (anchor.size_per_token + 3) + 200)
 
 
 if __name__ == "__main__":
