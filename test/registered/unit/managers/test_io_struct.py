@@ -1232,7 +1232,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
 
 class TestGenerateReqInputBodyBinding(CustomTestCase):
-    """FastAPI binds a /generate body with pydantic; the dataclass constructor checks nothing."""
+    """TypeAdapter matches FastAPI binding; direct dataclass construction skips validation."""
 
     @classmethod
     def setUpClass(cls):
@@ -1242,8 +1242,8 @@ class TestGenerateReqInputBodyBinding(CustomTestCase):
     def _bind(self, input_embeds):
         return self.adapter.validate_python({"input_embeds": input_embeds})
 
-    def test_input_embeds_union_keeps_the_shape_and_coerces_ints(self):
-        """Normalization tells single from batch by isinstance(x[0][0], float), so ints must bind as floats."""
+    def test_input_embeds_preserves_shape_and_coerces_ints(self):
+        """Normalization distinguishes single from batch by the bound float type."""
         single = self._bind([[0, 1], [2.5, 3]])
         self.assertEqual(single.input_embeds, [[0.0, 1.0], [2.5, 3.0]])
         self.assertIsInstance(single.input_embeds[0][0], float)
@@ -1252,16 +1252,17 @@ class TestGenerateReqInputBodyBinding(CustomTestCase):
         self.assertEqual(batch.input_embeds, [[[0.0, 1.0]], [[2.0, 3.5]]])
         self.assertIsInstance(batch.input_embeds[0][0][0], float)
 
+    def test_input_embeds_rejects_malformed_shapes(self):
         for malformed in ([[0.5], [[1.5]]], [[[0.5]], [1.5]], [1.0, 2.0], "abc"):
             with self.subTest(malformed=malformed), self.assertRaises(ValidationError):
                 self._bind(malformed)
 
     def test_input_embeds_null_binds(self):
-        """A discriminator has no tag for null, so Optional must stay outside the Annotated."""
+        """Optional must wrap the discriminator so null bypasses tag selection."""
         self.assertIsNone(self._bind(None).input_embeds)
 
-    def test_input_embeds_body_is_walked_against_one_union_member(self):
-        """Walking both members costs one error per float: minutes and gigabytes for a large body with one bad value."""
+    def test_input_embeds_bad_value_collects_one_error(self):
+        """A bad value must not collect errors from both union members."""
         for body in ([[0.5, 1.5], [2.5, "x"]], [[[0.5, 1.5]], [[2.5, "x"]]]):
             with self.subTest(body=body):
                 with self.assertRaises(ValidationError) as caught:

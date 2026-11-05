@@ -203,7 +203,6 @@ class GenerateReqInput:
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    # The discriminator walks one member, so a 2D body never fails the 3D member once per float.
     input_embeds: Optional[
         Annotated[
             Union[

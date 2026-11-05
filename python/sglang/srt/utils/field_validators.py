@@ -82,7 +82,6 @@ def validate_optional_list_i64_1d_2d(
 
 
 def input_embeds_union_tag(v: Any) -> str:
-    """Discriminator of the input_embeds union: "batch" if v[0][0] is a list, else "single"."""
     is_batch = (
         isinstance(v, list)
         and v
