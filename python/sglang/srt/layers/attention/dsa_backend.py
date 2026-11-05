@@ -1533,11 +1533,11 @@ class DeepseekSparseAttnBackend(
             )
         ):
             return None
+        from sglang.kernels.ops.attention.kv_indices import (
+            create_chunked_prefix_cache_kv_indices,
+        )
         from sglang.srt.layers.dcp.planner import (
             prepare_decode_context_parallel_metadata,
-        )
-        from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-            create_chunked_prefix_cache_kv_indices,
         )
 
         dcp_meta = prepare_decode_context_parallel_metadata(
