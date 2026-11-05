@@ -137,70 +137,14 @@ _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
 _hopper_bf16_tiny_gemv = None
 _use_hopper_bf16_tiny_gemv = None
-_splitk_tactic = None
-_run_splitk_dense = None
-_warp_splitk_tactic = None
-_run_warp_splitk_dense = None
-_enable_bf16_splitk_gemm = False
 _mm_bf16 = None
 _flashinfer_autotuner = None
-_BF16_LOW_M_AUTOTUNE_MAX_M = 16
-
-# Tactics above the autotuned low-M range, measured on GB300 under CUDA graph
-# replay with PDL and cold weights. Unlisted shapes retain the TGV/cuBLAS path.
-_BF16_SPLITK_TUNED_TACTICS = {
-    # TP16.
-    (24, 256, 8192): (64, 8, 4, 11),
-    (32, 256, 8192): (64, 8, 4, 12),
-    (24, 512, 8192): (64, 8, 4, 12),
-    (32, 512, 8192): (64, 16, 4, 9),
-    (24, 2304, 8192): (64, 32, 2, 9),
-    (32, 2304, 8192): (64, 32, 2, 9),
-    (24, 2560, 8192): (64, 32, 2, 9),
-    (32, 2560, 8192): (64, 32, 2, 9),
-    # MuseSpark TP4 qkvg and pooler/unpooler slices.
-    (24, 4608, 8192): (64, 32, 2, 9),
-    (32, 4608, 8192): (64, 32, 2, 9),
-    (24, 1024, 8192): (64, 16, 4, 10),
-    (32, 1024, 8192): (64, 16, 4, 10),
-}
-
-# FlashInfer warp split-K (output_tile, token_tile, k_tile, stages, b_loader_warps),
-# MuseSpark TP4/TP8 on GB300 of the per-M best.
-# Takes precedence over _BF16_SPLITK_TUNED_TACTICS.
-_BF16_WARP_SPLITK_TUNED_TACTICS = {
-    # TP4 qkvg, o_proj and unpooler slice.
-    (24, 2048, 4096): (32, 16, 256, 9, 2),
-    (32, 2048, 4096): (32, 16, 256, 9, 2),
-    # TP8 qkvg, o_proj and unpooler slice.
-    (24, 1024, 4096): (16, 16, 256, 10, 2),
-    (32, 1024, 4096): (16, 16, 256, 10, 2),
-    # DFLASH draft of Muse Spark.
-    (24, 2048, 8192): (16, 32, 256, 9, 2),
-    (32, 2048, 8192): (32, 16, 256, 8, 2),
-    # hidden 8192 / 64q8kv heads at TP8: qkv.
-    (24, 1280, 8192): (32, 8, 256, 9, 2),
-    (32, 1280, 8192): (32, 16, 256, 9, 2),
-}
-
-
-def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
-    key = (m, n, k)
-    return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
-
-
-def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
-    """Return whether the optional Split-K path should be initialized."""
-    return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
+_BF16_LOW_M_AUTOTUNE_MAX_M = 32
 
 
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
-    global _splitk_tactic
-    global _run_splitk_dense
-    global _warp_splitk_tactic, _run_warp_splitk_dense
-    global _enable_bf16_splitk_gemm
     global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
 
@@ -259,23 +203,6 @@ def initialize_bf16_gemm_config() -> None:
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
-    _enable_bf16_splitk_gemm = False
-    if should_enable_bf16_splitk_gemm(backend):
-        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
-            SplitKTactic,
-            run_splitk_dense,
-        )
-        from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
-            WarpSplitKTactic,
-            run_warp_splitk_dense,
-        )
-
-        _splitk_tactic = SplitKTactic
-        _run_splitk_dense = run_splitk_dense
-        _warp_splitk_tactic = WarpSplitKTactic
-        _run_warp_splitk_dense = run_warp_splitk_dense
-        _enable_bf16_splitk_gemm = True
-
     _mm_bf16 = None
     if backend.is_cutedsl() and not get_exec().kernel.disable_flashinfer_autotune:
         from flashinfer.autotuner import AutoTuner
@@ -309,49 +236,15 @@ def _use_bf16_tiny_gemv(
     )
 
 
-def _bf16_splitk_gemm_out(
-    x_2d: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    out: torch.Tensor,
-) -> torch.Tensor:
-    m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    warp_tactic = _BF16_WARP_SPLITK_TUNED_TACTICS.get((m, n, k))
-    if warp_tactic is not None:
-        _run_warp_splitk_dense(
-            x_2d, weight.T, out, True, _warp_splitk_tactic(*warp_tactic), bias
-        )
-    else:
-        tactic = _splitk_tactic(*_BF16_SPLITK_TUNED_TACTICS[(m, n, k)])
-        _run_splitk_dense(
-            x_2d,
-            weight.T,
-            bias,
-            out,
-            True,
-            tactic,
-        )
-    return out
-
-
-def _bf16_splitk_gemm(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
-) -> torch.Tensor:
-    x_2d = x.view(-1, x.shape[-1])
-    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    _bf16_splitk_gemm_out(x_2d, weight, bias, out)
-    return out.view(*x.shape[:-1], weight.shape[0])
-
-
 def _bf16_low_m_autotune(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     out: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    """Run M <= 16 through FlashInfer's autotuned low-M kernels; None if not taken.
+    """Run M <= 32 through FlashInfer's autotuned low-M kernels; None if not taken.
 
-    Inside FlashInfer autotune, a larger M profiles the M <= 16 buckets instead.
+    Inside FlashInfer autotune, a larger M profiles the M <= 32 buckets instead.
     """
     if not (
         _mm_bf16 is not None
@@ -367,7 +260,7 @@ def _bf16_low_m_autotune(
     x_2d = x.view(-1, x.shape[-1])
     m = x_2d.shape[0]
     if 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M:
-        output = _mm_bf16(x_2d, weight.T, bias, pdl=True, out=out, backend="cute-dsl")
+        output = _mm_bf16(x_2d, weight.T, bias, pdl=True, out=out, backend="auto")
         return output.view(*x.shape[:-1], weight.shape[0])
     if m > _BF16_LOW_M_AUTOTUNE_MAX_M and _flashinfer_autotuner.get().is_tuning_mode:
         _mm_bf16(
@@ -375,7 +268,7 @@ def _bf16_low_m_autotune(
             weight.T,
             bias,
             pdl=True,
-            backend="cute-dsl",
+            backend="auto",
         )
     return None
 
@@ -390,11 +283,7 @@ def _bf16_gemm_dispatch_impl(
     if output is not None:
         return output if addend is None else output.add_(addend)
     m = x.numel() // x.shape[-1]
-    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
-        m, weight.shape[0], weight.shape[1]
-    ):
-        output = _bf16_splitk_gemm(x, weight, bias)
-    elif _use_bf16_tiny_gemv(x, weight, bias):
+    if _use_bf16_tiny_gemv(x, weight, bias):
         output = _hopper_bf16_tiny_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
@@ -718,22 +607,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and _bf16_low_m_autotune(x, layer.weight, bias, out=output) is not None
         ):
             return output
-        if (
-            _enable_bf16_splitk_gemm
-            and bias is None
-            and x.is_cuda
-            and x.ndim == 2
-            and x.dtype == torch.bfloat16
-            and layer.weight.dtype == torch.bfloat16
-            and output.dtype == torch.bfloat16
-            and output.is_contiguous()
-            and output.shape == (x.shape[0], layer.weight.shape[0])
-            and not layer.weight.requires_grad
-            and use_bf16_splitk_gemm(
-                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
-            )
-        ):
-            return _bf16_splitk_gemm_out(x, layer.weight, None, output)
         if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda
