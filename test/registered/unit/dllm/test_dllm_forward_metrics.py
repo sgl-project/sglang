@@ -55,8 +55,8 @@ class TestActualForwardCount(unittest.TestCase):
         batch = _batch(["fast", "slow"])
         result = LowConfidence(_config()).run(runner, batch)
         self.assertEqual(len(result), 6, "Algorithm result must expose actual work")
-        self.assertEqual(result[5], len(runner.calls))
-        self.assertEqual(result[5], 5)  # Four unmask rounds plus final KV.
+        self.assertEqual(result.forward_count, len(runner.calls))
+        self.assertEqual(result.forward_count, 5)  # Four unmask rounds plus final KV.
         self.assertFalse((runner.calls[1][1][:4] == -1).any())
         self.assertTrue((runner.calls[1][1][4:] == -1).any())
         self.assertTrue(all(rids == ["fast", "slow"] for rids, _ in runner.calls))
@@ -70,12 +70,16 @@ class TestActualForwardCount(unittest.TestCase):
         while batch.rids:
             result = algorithm.run(runner, batch, states)
             self.assertEqual(len(result), 6, "FDFO must report unresolved work")
-            self.assertEqual(result[5], 1)
+            self.assertEqual(result.forward_count, 1)
             for rid in batch.rids:
-                counts[rid] += result[5]
-            keep = [i for i, accepted in enumerate(result[2]) if not accepted]
+                counts[rid] += result.forward_count
+            keep = [
+                i
+                for i, accepted in enumerate(result.accept_length_per_req_cpu)
+                if not accepted
+            ]
             rows = batch.input_ids.view(-1, 4)[keep].flatten().tolist()
-            states = [result[3][i] for i in keep]
+            states = [result.dllm_algo_state[i] for i in keep]
             batch = _batch([batch.rids[i] for i in keep], rows)
         self.assertEqual(counts, {"fast": 2, "slow": 5})
         self.assertEqual(
@@ -86,10 +90,25 @@ class TestActualForwardCount(unittest.TestCase):
     def test_pure_prefill_counts_even_without_output(self):
         runner = _ForwardOracle()
         result = LowConfidence(_config()).run(runner, _batch(["fast"], [1] * 4))
-        self.assertEqual(result[1], [])
+        self.assertEqual(result.next_token_ids, [])
         self.assertEqual(len(result), 6, "Pure prefill must expose its forward")
-        self.assertEqual(result[5], 1)
+        self.assertEqual(result.forward_count, 1)
         self.assertEqual(len(runner.calls), 1)
+
+    def test_fdfo_counts_multiple_calls_and_resets_each_run(self):
+        class ExtraForwardAlgorithm(LowConfidence):
+            def prepare_inputs(self, model_runner, forward_batch, states):
+                # Model a round that performs extra real work before denoising.
+                self._forward(model_runner, forward_batch)
+
+        runner = _ForwardOracle()
+        algorithm = ExtraForwardAlgorithm(_config(fdfo=True))
+        for _ in range(2):
+            previous_calls = len(runner.calls)
+            result = algorithm.run(runner, _batch(["fast"]))
+            actual_calls = len(runner.calls) - previous_calls
+            self.assertGreater(actual_calls, 1)
+            self.assertEqual(result.forward_count, actual_calls)
 
     def test_retraction_retains_lifetime_count_new_request_starts_zero(self):
         req = Req("same-id", "", array("q", [1, 2]), SamplingParams())

@@ -92,6 +92,7 @@ class SchedulerOutputStreamer:
     tree_cache: BasePrefixCache
     server_args: ServerArgs
     is_generation: bool
+    is_dllm: bool = False
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     skip_tokenizer_init: InitVar[bool]
@@ -278,6 +279,7 @@ class SchedulerOutputStreamer:
         )
 
         acc = _GenerationStreamAccumulator(
+            is_dllm=self.is_dllm,
             return_logprob=return_logprob,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
@@ -449,6 +451,7 @@ class SchedulerOutputStreamer:
 
 @dataclass(slots=True, kw_only=True)
 class _GenerationStreamAccumulator:
+    is_dllm: bool = False
     return_logprob: bool
     return_hidden_states: bool
     return_routed_experts: bool
@@ -483,6 +486,10 @@ class _GenerationStreamAccumulator:
     image_tokens: Optional[list] = None
     audio_tokens: Optional[list] = None
     video_tokens: Optional[list] = None
+    dllm_forward_counts: Optional[List[int]] = None
+    dllm_prompt_forward_counts: Optional[List[int]] = None
+    dllm_generation_forward_counts: Optional[List[int]] = None
+    dllm_recompute_forward_counts: Optional[List[int]] = None
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_num_block_accept_tokens: list = field(default_factory=list)
@@ -535,6 +542,11 @@ class _GenerationStreamAccumulator:
     rust_request_stats: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.is_dllm:
+            self.dllm_forward_counts = []
+            self.dllm_prompt_forward_counts = []
+            self.dllm_generation_forward_counts = []
+            self.dllm_recompute_forward_counts = []
         if self.output_sink is OutputSink.RUST:
             self.prompt_tokens = []
             self.cached_tokens = []
@@ -710,6 +722,14 @@ class _GenerationStreamAccumulator:
             self.weight_versions.append(None)
             self.prefill_weight_versions.append(None)
 
+        if self.is_dllm:
+            self.dllm_forward_counts.append(req.dllm_forward_count)
+            self.dllm_prompt_forward_counts.append(req.dllm_prompt_forward_count)
+            self.dllm_generation_forward_counts.append(
+                req.dllm_generation_forward_count
+            )
+            self.dllm_recompute_forward_counts.append(req.dllm_recompute_forward_count)
+
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
@@ -882,10 +902,6 @@ class _GenerationStreamAccumulator:
                 customized_info, self.uocr_forced_tokens
             )
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
-        dllm_forward_counts = [
-            req.dllm_forward_count if getattr(req, "dllm_config", None) else None
-            for req in self.output_reqs
-        ]
         return BatchTokenIDOutput(
             rids=self.rids,
             # The tokenizer-side router reads the list on every TOKENIZER batch,
@@ -896,11 +912,10 @@ class _GenerationStreamAccumulator:
                 else None
             ),
             spec_verify_ct=self.spec_verify_ct,
-            dllm_forward_counts=(
-                dllm_forward_counts
-                if any(count is not None for count in dllm_forward_counts)
-                else None
-            ),
+            dllm_forward_counts=self.dllm_forward_counts,
+            dllm_prompt_forward_counts=self.dllm_prompt_forward_counts,
+            dllm_generation_forward_counts=self.dllm_generation_forward_counts,
+            dllm_recompute_forward_counts=self.dllm_recompute_forward_counts,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
             spec_num_cap_tokens=self.spec_num_cap_tokens,

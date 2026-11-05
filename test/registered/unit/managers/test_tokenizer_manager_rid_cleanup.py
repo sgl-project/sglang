@@ -1715,6 +1715,12 @@ def _dllm_output(kind, rid, count, completion_tokens, ids, finished):
     out.output_ids_offsets = [0, len(ids)]
     out.completion_tokens = [completion_tokens]
     out.dllm_forward_counts = None if count is None else [count]
+    if count is not None:
+        prompt = min(count, 2)
+        recompute = int(count > 2)
+        out.dllm_prompt_forward_counts = [prompt]
+        out.dllm_generation_forward_counts = [count - prompt - recompute]
+        out.dllm_recompute_forward_counts = [recompute]
     if kind is BatchStrOutput:
         return out
     values = {}
@@ -1755,26 +1761,60 @@ class TestForwardMetricsStreaming(unittest.TestCase):
                             )
                         )
                     metrics = [o["meta_info"]["dllm_metrics"] for o in state.out_list]
+                    expected_final = {
+                        "forward_count": 6,
+                        "prompt_forward_count": 2,
+                        "generation_forward_count": 3,
+                        "recompute_forward_count": 1,
+                        "completion_tokens": 8,
+                        "tokens_per_forward": 8 / 3,
+                    }
+                    self.assertEqual(metrics[-1], expected_final)
+                    if stream:
+                        self.assertEqual(
+                            [m["forward_count"] for m in metrics], [2, 5, 6]
+                        )
+                        self.assertEqual(
+                            [m["completion_tokens"] for m in metrics], [0, 6, 8]
+                        )
+                        self.assertEqual(
+                            [m["tokens_per_forward"] for m in metrics],
+                            [0.0, 3.0, 8 / 3],
+                        )
+                        for output in state.out_list:
+                            meta = output["meta_info"]
+                            self.assertEqual(
+                                meta["dllm_metrics"]["completion_tokens"],
+                                meta["completion_tokens"],
+                            )
                     if incremental:
-                        self.assertEqual(
-                            [m["forward_count"] for m in metrics], [2, 3, 1]
-                        )
-                        self.assertEqual(
-                            [m["completion_tokens"] for m in metrics], [0, 6, 2]
-                        )
                         merged = tm._coalesce_streaming_chunks(
                             state.out_list, "metrics"
                         )
                         self.assertEqual(
-                            merged["meta_info"]["dllm_metrics"], make_dllm_metrics(6, 8)
+                            merged["meta_info"]["dllm_metrics"], expected_final
                         )
-                    else:
-                        self.assertEqual(metrics[-1], make_dllm_metrics(6, 8))
-                        if stream:
-                            self.assertEqual(metrics[0], make_dllm_metrics(2, 0))
                     self.assertEqual(
                         state.out_list[-1]["meta_info"]["completion_tokens"], 8
                     )
+
+    def test_coalesce_uses_last_present_snapshot(self):
+        tm = _make_tokenizer_manager(self)
+        metrics = make_dllm_metrics(
+            6,
+            8,
+            prompt_forward_count=2,
+            generation_forward_count=3,
+            recompute_forward_count=1,
+        )
+        chunks = [
+            {"text": "", "meta_info": {}},
+            {"text": "hello", "meta_info": {"dllm_metrics": metrics}},
+            {"text": "!", "meta_info": {}},
+        ]
+        merged = tm._coalesce_streaming_chunks(chunks, "missing-key")
+        self.assertEqual(merged["text"], "hello!")
+        self.assertEqual(merged["meta_info"]["dllm_metrics"], metrics)
 
     def test_ar_metadata_absent_and_zero_work_defined(self):
         tm = _make_tokenizer_manager(self)
@@ -1791,7 +1831,16 @@ class TestForwardMetricsStreaming(unittest.TestCase):
             if count is None:
                 self.assertNotIn("dllm_metrics", meta)
             else:
-                self.assertEqual(meta["dllm_metrics"], make_dllm_metrics(0, 0))
+                self.assertEqual(
+                    meta["dllm_metrics"],
+                    make_dllm_metrics(
+                        0,
+                        0,
+                        prompt_forward_count=0,
+                        generation_forward_count=0,
+                        recompute_forward_count=0,
+                    ),
+                )
 
 
 if __name__ == "__main__":

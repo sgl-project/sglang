@@ -121,7 +121,10 @@ The Python `/generate` API and `Engine.generate` return request-level work in
 
 ```json
 {
-  "forward_count": 40,
+  "forward_count": 48,
+  "prompt_forward_count": 6,
+  "generation_forward_count": 40,
+  "recompute_forward_count": 2,
   "completion_tokens": 128,
   "tokens_per_forward": 3.2
 }
@@ -134,18 +137,28 @@ batches, a completed row still counts forwards while it waits for other rows.
 FDFO counts only rounds that contain the request. These are per-request counts;
 summing them across requests does not give the number of GPU batch forwards.
 
-`completion_tokens` uses the existing completion-token count after stop/length
-truncation. `tokens_per_forward` is that count divided by `forward_count`, or
-`0.0` when no forward has run. It measures output tokens per forward, not latency,
-throughput, or output quality. Token-level denoising step maps describe a
-different quantity: when individual positions become resolved.
+The total is the sum of three counters:
 
-Non-streaming and normal streaming responses contain cumulative metrics. With
-`--incremental-streaming-output`, each streaming response contains the forward
-and completion-token increments since the preceding response, and their ratio.
-Chunks can contain forwards without new tokens. To aggregate incremental
-responses, sum both counters and divide the totals; do not average the ratios.
-The outer `meta_info.completion_tokens` retains its existing cumulative meaning.
+- `prompt_forward_count`: initial prompt-only encoding.
+- `generation_forward_count`: denoising and final KV updates, including a block
+  that contains both a prompt tail and newly generated tokens. For DiffusionGemma,
+  context encoding after generated blocks also belongs to generation.
+- `recompute_forward_count`: committed-token prefill that replays previously
+  computed positions after retraction. A context call spanning both replayed and
+  new positions counts wholly as recomputation; a denoising call counts wholly
+  as generation. This is a classification of calls, not a token-weighted split.
+
+`completion_tokens` matches the outer completion-token count after stop/length
+truncation. `tokens_per_forward` divides it by `generation_forward_count`, or
+returns `0.0` before any generation forward. Prompt encoding and retraction
+prefill therefore do not enter its denominator. This ratio measures generated
+tokens per generation forward, not latency, throughput, or output quality.
+
+All scalar metrics are cumulative in non-streaming, normal streaming, and
+`--incremental-streaming-output` responses. Only token/text payloads are
+incremental. Chunks can contain forwards without new tokens. Use the last
+metrics snapshot for a request; do not sum snapshots or average their ratios.
+Clients needing increments can subtract consecutive cumulative counters.
 
 These fields describe generation outputs from the Python serving path. Abort
 notifications and the Rust frontend do not expose these metrics.

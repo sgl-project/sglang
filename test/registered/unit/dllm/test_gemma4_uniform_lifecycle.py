@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -33,6 +34,11 @@ class _Req:
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
         self.dllm_forward_count = 0
+        self.dllm_prompt_forward_count = 0
+        self.dllm_generation_forward_count = 0
+        self.dllm_recompute_forward_count = 0
+        self.dllm_computed_end = 0
+        self.dllm_recompute_until = 0
         self.dllm_phase_prefill = prefill
         self.extend_end = context_len + block_size
         self.kv = ReqKvInfo(
@@ -51,6 +57,7 @@ class _Req:
         return len(self.origin_input_ids) + len(self.output_ids)
 
     extend_len = Req.extend_len
+    get_dllm_forward_phase = Req.get_dllm_forward_phase
     finish_outside_step = Req.finish_outside_step
 
     def is_dllm_prefill(self):
@@ -67,6 +74,9 @@ class _Req:
 class _Batch:
     def __init__(self, reqs):
         self.reqs = reqs
+        self.dllm_forward_metadata = tuple(
+            (req.get_dllm_forward_phase(), req.extend_end) for req in reqs
+        )
         self.forward_mode = (
             ForwardMode.EXTEND
             if all(req.is_dllm_prefill() for req in reqs)
@@ -178,6 +188,101 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req = _Req(prefill=True)
         scheduler.process_batch_result_dllm(_Batch([req]), _result([]))
         self.assertEqual(req.dllm_forward_count, 1)
+
+    def test_phase_and_extent_are_snapshotted_before_next_schedule(self):
+        scheduler = _Scheduler(fdfo=True)
+        req = _Req(prefill=True)
+        req.prefix_len, req.extend_end = 0, 8
+        batch = _Batch([req])
+        # Overlap can prepare the next decode round before this result arrives.
+        req.dllm_phase_prefill = False
+        req.extend_end = 12
+        scheduler.process_batch_result_dllm(batch, _result(None))
+        self.assertEqual(req.dllm_forward_count, 1)
+        self.assertEqual(req.dllm_prompt_forward_count, 1)
+        self.assertEqual(req.dllm_generation_forward_count, 0)
+        self.assertEqual(req.dllm_computed_end, 8)
+
+    def test_context_forward_classification_and_zero_work(self):
+        scheduler = _Scheduler(fdfo=True)
+        req = _Req(prefill=True)
+        # Initial prompt, later block context, replay, then resumed context.
+        for prefix, end, replay_until, expected in (
+            (0, 8, 0, (1, 0, 0)),
+            (8, 12, 0, (1, 1, 0)),
+            (0, 8, 12, (1, 1, 1)),
+            (12, 16, 12, (1, 2, 1)),
+        ):
+            with self.subTest(prefix=prefix, end=end, replay_until=replay_until):
+                req.prefix_len, req.extend_end = prefix, end
+                req.dllm_recompute_until = replay_until
+                scheduler.process_batch_result_dllm(_Batch([req]), _result(None))
+                self.assertEqual(
+                    (
+                        req.dllm_prompt_forward_count,
+                        req.dllm_generation_forward_count,
+                        req.dllm_recompute_forward_count,
+                    ),
+                    expected,
+                )
+        self.assertEqual(req.dllm_forward_count, 4)
+        self.assertEqual(req.dllm_computed_end, 16)
+        req.extend_end = 20
+        no_work = _result(None)
+        no_work.dllm_forward_count = 0
+        scheduler.process_batch_result_dllm(_Batch([req]), no_work)
+        self.assertEqual(req.dllm_forward_count, 4)
+        self.assertEqual(req.dllm_computed_end, 16)
+
+    def test_repeated_retraction_retains_work_and_replay_boundary(self):
+        req = Req(
+            "replay",
+            "",
+            array("q", range(8)),
+            SamplingParams(),
+            dllm_config=_Scheduler(fdfo=True).dllm_config,
+        )
+        req.output_ids.extend([9, 10, 11, 12])
+        req.dllm_forward_count = 7
+        req.dllm_prompt_forward_count = 2
+        req.dllm_generation_forward_count = 4
+        req.dllm_recompute_forward_count = 1
+        # The computed canvas can extend beyond committed output.
+        req.dllm_computed_end = 16
+        req.reset_for_retract()
+        self.assertEqual(req.dllm_recompute_until, 12)
+        req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        req.prefix_len, req.extend_end = 0, 8
+        self.assertEqual(req.get_dllm_forward_phase(), "recompute")
+        # Retract again before replay reaches its previous high-water mark.
+        req.reset_for_retract()
+        self.assertEqual(req.dllm_recompute_until, 12)
+        self.assertEqual(
+            (
+                req.dllm_forward_count,
+                req.dllm_prompt_forward_count,
+                req.dllm_generation_forward_count,
+                req.dllm_recompute_forward_count,
+            ),
+            (7, 2, 4, 1),
+        )
+        req.prefix_len, req.extend_end = 12, 16
+        self.assertEqual(req.get_dllm_forward_phase(), "generation")
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self.assertEqual(req.get_dllm_forward_phase(), "generation")
+
+        # Embedding-input retraction discards output and restarts generation.
+        # Its old generated positions must not classify new context as replay.
+        req.input_embeds = [[0.0]] * len(req.origin_input_ids)
+        req.reset_for_retract()
+        self.assertEqual(len(req.output_ids), 0)
+        self.assertEqual(req.dllm_recompute_until, 8)
+        req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        req.prefix_len, req.extend_end = 0, 8
+        self.assertEqual(req.get_dllm_forward_phase(), "recompute")
+        req.output_ids.extend([13, 14, 15, 16])
+        req.prefix_len, req.extend_end = 8, 12
+        self.assertEqual(req.get_dllm_forward_phase(), "generation")
 
     def test_context_admission_obeys_live_swa_budget(self):
         allocator = SimpleNamespace(
