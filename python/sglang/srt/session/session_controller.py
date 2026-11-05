@@ -26,7 +26,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -334,6 +335,7 @@ class Session:
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
+            new_req.bind_multimodal_cache_namespace()
             # An offset can truncate inherited media.
             if not abort and not session_params.offset:
                 new_req.inherit_mm_token_counts(last_req)

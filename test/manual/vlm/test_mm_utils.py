@@ -6,9 +6,9 @@ import torch
 from sglang.srt.managers import mm_utils, schedule_batch
 from sglang.srt.managers.req_types import (
     MultimodalDataItem,
+    MultimodalInputs,
     MultimodalProcessorOutput,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.multimodal.modality import Modality
 
 

@@ -5,9 +5,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
-from sglang.srt.mem_cache.hybrid_cache.host_pool_config import is_mla_pool
+from sglang.srt.mem_cache.kv.layout.mha import MHAHostLayout
+from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
+from sglang.srt.mem_cache.kv.layout.state import StateHostLayout
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -51,6 +55,33 @@ def _bundle(name):
 
 
 class TestPlanNames(CustomTestCase):
+    def test_nonzero_pipeline_stage_routes_local_views_and_global_metadata(self):
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                setup_allocator_context()
+                bundle = build_unified_bundle(
+                    UnifiedGeometry(
+                        chain="mamba",
+                        mla=mla,
+                        full_layer_ids=(4, 6),
+                        state_layer_ids=(5, 7),
+                        start_layer=4,
+                        end_layer=8,
+                        **_P16,
+                    )
+                )
+                storage = bundle.storage
+                view = storage.view("full")
+                self.assertEqual(view.model_layer_ids, (4, 6))
+                self.assertEqual(view.start_layer, 0)
+                self.assertEqual(view.get_device_pool_infos()[0].layer_ids, (4, 6))
+                first = view.kv_buffer[0] if mla else view.k_buffer[0]
+                second = view.kv_buffer[1] if mla else view.k_buffer[1]
+                first.fill_(11)
+                second.fill_(29)
+                route = bundle.token_to_kv_pool.layer_router.layer(6)
+                self.assertTrue(torch.all(route.key() == 29))
+
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
             "swa": (("full", "kv", "FULL"), ("swa", "swa", "SWA")),
@@ -199,23 +230,13 @@ class _Group:
 def _host_pool_recorders():
     """Host pool builders that record what they were asked for."""
 
-    def kv_host(*, kv_pool, page_size, use_mla=None, host_size=None, **kwargs):
+    def host(layout, options, *, draft_buffer_infos=()):
         return SimpleNamespace(
-            kind="kv",
-            device_pool=kv_pool,
-            page_size=page_size,
-            use_mla=is_mla_pool(kv_pool) if use_mla is None else use_mla,
-            host_size=host_size,
-            drafts=tuple(kwargs.get("mtp_draft_device_pools", ())),
-        )
-
-    def state_host(pool, info, *, host_size, layout, mtp_draft_device_pools=()):
-        return SimpleNamespace(
-            kind="state",
-            device_pool=pool,
-            host_size=host_size,
-            layout=layout,
-            drafts=tuple(mtp_draft_device_pools),
+            host_layout=layout,
+            page_size=options.page_size,
+            host_size=options.size,
+            layout=options.layout,
+            drafts=draft_buffer_infos,
         )
 
     def envelope_pair(*, device_pools, pool_names=("full", "swa"), **kwargs):
@@ -225,7 +246,7 @@ def _host_pool_recorders():
             for p, n in zip(device_pools, pool_names)
         )
 
-    return kv_host, state_host, envelope_pair
+    return host, envelope_pair
 
 
 class TestHostStack(CustomTestCase):
@@ -259,11 +280,12 @@ class TestHostStack(CustomTestCase):
         def record(self, *args, **kwargs):
             controller.update(kwargs, args=args)
 
-        kv_host, state_host, pair = _host_pool_recorders()
+        host, pair = _host_pool_recorders()
         with (
             patch.object(hpa, "get_memory", return_value=memory),
-            patch.object(hpa, "build_kv_host_pool", side_effect=kv_host),
-            patch.object(hpa, "build_mamba_host_pool", side_effect=state_host),
+            patch.object(MHAHostLayout, "build", host),
+            patch.object(MLAHostLayout, "build", host),
+            patch.object(StateHostLayout, "build", host),
             patch.object(
                 hpa.UnifiedPageEnvelopeHostPool,
                 "build_hybrid_swa_pool_pair",
