@@ -351,6 +351,16 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             actions=self._cache_actions_from_tagged(step.actions), result=result
         )
 
+    def _match_params_binding(self, key: RadixKey):
+        token_ids = key.token_ids
+        assert_int64_array(token_ids, "tree key token ids")
+        if key.limit is not None:
+            # A view, not a slice: the binding's copy is the only one.
+            token_ids = memoryview(token_ids)[: key.limit]
+        return self._bindings.MatchParamsBinding(
+            key=token_ids, extra_key=key.extra_key, cache_salt=key.cache_salt
+        )
+
     def _match_result_from_binding(self, result) -> MatchResult:
         """Build the Python MatchResult for the binding's match result."""
         return MatchResult(
@@ -569,11 +579,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         if component_type != self.slot_id(TREE_WINDOW):
             raise NotImplementedError("The Rust tree core supports one window slot")
         return self._binding.swa_tombstone_ranges(
-            self._bindings.MatchParamsBinding(
-                key=_radix_key_buffer(key),
-                extra_key=key.extra_key,
-                cache_salt=key.cache_salt,
-            ),
+            self._match_params_binding(key),
             start,
             end,
         )
@@ -590,11 +596,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise NotImplementedError("The Rust tree core supports one window slot")
         return self._cache_actions_from_tagged(
             self._binding.attach_swa_window(
-                self._bindings.MatchParamsBinding(
-                    key=_radix_key_buffer(key),
-                    extra_key=key.extra_key,
-                    cache_salt=key.cache_salt,
-                ),
+                self._match_params_binding(key),
                 window_start,
                 window_end,
                 swa_values,
@@ -800,24 +802,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._binding.all_mamba_values_flatten()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        key = params.key
-        result = self._binding.match_prefix(
-            self._bindings.MatchParamsBinding(
-                key=_radix_key_buffer(key),
-                extra_key=key.extra_key,
-                cache_salt=key.cache_salt,
-            )
-        )
+        result = self._binding.match_prefix(self._match_params_binding(params.key))
         return self._match_result_from_binding(result)
 
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
-        return self._binding.match_full_device_prefix(
-            self._bindings.MatchParamsBinding(
-                key=_radix_key_buffer(key),
-                extra_key=key.extra_key,
-                cache_salt=key.cache_salt,
-            )
-        )
+        return self._binding.match_full_device_prefix(self._match_params_binding(key))
 
     def inc_full_pin(self, node_id: NodeId) -> None:
         self._binding.inc_full_pin(node_id)
