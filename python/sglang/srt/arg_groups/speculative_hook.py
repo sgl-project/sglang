@@ -199,6 +199,37 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 speculative_use_rejection_sampling=True,
             )
 
+    if cfg.speculative_draft_window_kv:
+        if (
+            cfg.speculative_algorithm != "DFLASH"
+            or cfg.disaggregation_mode not in ("prefill", "decode")
+            or cfg.disaggregation_transfer_backend != "nixl"
+            or cfg.speculative_draft_attention_backend != "fa3"
+            or cfg.device != "cuda"
+            or cfg.pp_size != 1
+            or cfg.dp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.enable_unified_memory
+            or cfg.enable_hierarchical_cache
+            or cfg.enable_hisparse
+            or cfg.enable_pd_role_switch
+            or cfg.enable_page_major_kv_layout
+            or cfg.disaggregation_decode_enable_offload_kvcache
+            or cfg.disaggregation_decode_host_receive_threshold < 1
+            or cfg.speculative_draft_window_size is not None
+            or envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        ):
+            raise ValueError(
+                "--speculative-draft-window-kv requires CUDA FA3 DFLASH with "
+                "NIXL PD, PP/DP/DCP=1, without offload, staging or unified memory."
+            )
+        if cfg.disaggregation_mode == "decode" and (
+            cfg.max_running_requests is None or cfg.attn_cp_size != 1
+        ):
+            raise ValueError(
+                "Draft window KV needs explicit decode max-running-requests and no decode CP"
+            )
+
     # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
     # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
     # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode

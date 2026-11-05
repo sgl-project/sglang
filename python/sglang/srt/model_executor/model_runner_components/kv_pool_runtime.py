@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_schedule,
+    get_spec,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
@@ -39,6 +40,13 @@ def is_post_capture_kv_active(
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
 ) -> bool:
     if is_draft_worker:
+        if (
+            get_spec().speculative_draft_window_kv
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            # A request-private ring is fully backed once, independent of the
+            # target's global-token capacity and post-capture shrink.
+            return False
         # A dflash-family draft pool is indexed by the target's token ids, so it
         # follows the target pool's post-capture backing.
         return (
@@ -143,9 +151,22 @@ def compute_post_capture_kv_resize(
         if owner_id not in owners:
             owners.add(owner_id)
             draft_pools.append(draft_pool)
+    from sglang.srt.mem_cache.draft_window import DraftWindowLayout
+
+    fixed_draft_bytes = sum(
+        sum(runner.token_to_kv_pool.get_kv_size_bytes())
+        for runner in draft_runners
+        if isinstance(
+            getattr(runner.token_to_kv_pool, "draft_window_layout", None),
+            DraftWindowLayout,
+        )
+    )
     budget_bytes = (
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes
+        # The solver charges this fixed allocation once, so add it back to
+        # the observed free budget; it must never be resized to target tokens.
+        + fixed_draft_bytes
         + sum(draft_pool.post_capture_backed_bytes for draft_pool in draft_pools)
         - canary_workspace_bytes
     )
