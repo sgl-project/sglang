@@ -16,7 +16,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.kernels.ops.gemm import sail_deepgemm as ops
-from sglang.srt.layers.deep_gemm_wrapper import compile_utils, entrypoint
+from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
+from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -182,9 +183,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                             ("is_allocation_symmetric", lambda: False),
                         ):
                             stack.enter_context(patch.object(module, name, value))
-                    stack.enter_context(
-                        patch.object(runner_module.deep_gemm_wrapper, gemm_name, gemm)
-                    )
+                    stack.enter_context(patch.object(sail_entrypoint, gemm_name, gemm))
                     for flag in (
                         "DEEPGEMM_SCALE_UE8M0",
                         "DEEPGEMM_NEED_TMA_ALIGNED_SCALES",
@@ -302,9 +301,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                             ("is_allocation_symmetric", lambda: False),
                         ):
                             stack.enter_context(patch.object(module, name, value))
-                    stack.enter_context(
-                        patch.object(runner_module.deep_gemm_wrapper, gemm_name, gemm)
-                    )
+                    stack.enter_context(patch.object(sail_entrypoint, gemm_name, gemm))
                     stack.enter_context(
                         patch.object(
                             runner_module.deep_gemm_wrapper,
@@ -513,12 +510,12 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
                     **{name: lambda *args, **kw: None for name in names}
                 )
                 with (
-                    patch.object(entrypoint, "_is_sail", sail),
-                    patch.object(entrypoint, "ENABLE_JIT_DEEPGEMM", jit),
-                    patch.object(entrypoint, "deep_gemm", vendor, create=True),
+                    patch.object(sail_entrypoint, "_is_sail", sail),
+                    patch.object(sail_entrypoint, "ENABLE_JIT_DEEPGEMM", jit),
+                    patch.object(sail_entrypoint, "deep_gemm", vendor, create=True),
                     self.assertRaisesRegex(error, message),
                 ):
-                    entrypoint.moe_align_block_size(a, b, ids)
+                    sail_entrypoint.moe_align_block_size(a, b, ids)
 
     def test_bf16_routes_reuse_single_alignment_result(self):
         """The GEMM write result and the inverse permutation must come from the same
@@ -557,9 +554,9 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         )
         out = torch.empty((4, 2), dtype=torch.bfloat16)
         with (
-            patch.object(entrypoint, "_is_sail", True),
-            patch.object(entrypoint, "ENABLE_JIT_DEEPGEMM", True),
-            patch.object(entrypoint, "deep_gemm", vendor, create=True),
+            patch.object(sail_entrypoint, "_is_sail", True),
+            patch.object(sail_entrypoint, "ENABLE_JIT_DEEPGEMM", True),
+            patch.object(sail_entrypoint, "deep_gemm", vendor, create=True),
             patch.object(
                 compile_utils, "deep_gemm_execution_hook", return_value=nullcontext()
             ),
@@ -607,12 +604,12 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
             )
             with (
                 self.subTest(channel=channel),
-                patch.object(entrypoint, "_is_sail", True),
-                patch.object(entrypoint, "ENABLE_JIT_DEEPGEMM", True),
-                patch.object(entrypoint, "deep_gemm", vendor, create=True),
+                patch.object(sail_entrypoint, "_is_sail", True),
+                patch.object(sail_entrypoint, "ENABLE_JIT_DEEPGEMM", True),
+                patch.object(sail_entrypoint, "deep_gemm", vendor, create=True),
                 patch.object(compile_utils, "deep_gemm_execution_hook", hook),
             ):
-                entrypoint.grouped_gemm_nt_f8f8bf16_fused(
+                sail_entrypoint.grouped_gemm_nt_f8f8bf16_fused(
                     (q, ascale),
                     (w, bscale),
                     out,
@@ -641,12 +638,12 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         ):
             with (
                 self.subTest(dtype=scale.dtype, stride=scale.stride()),
-                patch.object(entrypoint, "_is_sail", True),
-                patch.object(entrypoint, "ENABLE_JIT_DEEPGEMM", True),
-                patch.object(entrypoint, "deep_gemm", vendor, create=True),
+                patch.object(sail_entrypoint, "_is_sail", True),
+                patch.object(sail_entrypoint, "ENABLE_JIT_DEEPGEMM", True),
+                patch.object(sail_entrypoint, "deep_gemm", vendor, create=True),
                 self.assertRaisesRegex(ValueError, "K-major"),
             ):
-                entrypoint.grouped_gemm_nt_f4f4bf16_fused(
+                sail_entrypoint.grouped_gemm_nt_f4f4bf16_fused(
                     (a, scale),
                     (b, scale),
                     c,
@@ -832,9 +829,9 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
             )
             with (
                 self.subTest(variant=variant),
-                patch.object(entrypoint, "_is_sail", True),
-                patch.object(entrypoint, "ENABLE_JIT_DEEPGEMM", True),
-                patch.object(entrypoint, "deep_gemm", vendor, create=True),
+                patch.object(sail_entrypoint, "_is_sail", True),
+                patch.object(sail_entrypoint, "ENABLE_JIT_DEEPGEMM", True),
+                patch.object(sail_entrypoint, "deep_gemm", vendor, create=True),
                 patch.object(compile_utils, "deep_gemm_execution_hook", hook),
             ):
                 result = inspect.unwrap(ops.grouped_gemm_nt_bf16i4bf16_fused)(
@@ -888,7 +885,8 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
                 with self.subTest(name=name):
                     self.assertGreaterEqual(required, allocated)
                     self.assertEqual(
-                        entrypoint._get_w4a16_weight_shape(executor.rhs_q), (2, 128, 64)
+                        sail_entrypoint._get_w4a16_weight_shape(executor.rhs_q),
+                        (2, 128, 64),
                     )
                     self.assertEqual(
                         executor.rhs_s.dtype,
@@ -969,12 +967,12 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
                 patch.object(ep_module, "_is_sail", True),
                 patch.object(ep_module, "dispose_tensor"),
                 patch.object(
-                    runner_module.deep_gemm_wrapper,
+                    sail_entrypoint,
                     "grouped_gemm_nt_bf16i4bf16_nopad",
                     gemm,
                 ),
                 patch.object(
-                    runner_module.deep_gemm_wrapper,
+                    sail_entrypoint,
                     "grouped_gemm_nt_bf16i4bf16_masked",
                     gemm,
                 ),
@@ -1359,12 +1357,8 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
                 sys.modules,
                 {"deep_gemm": SimpleNamespace(preprocess_mxfp4_scales=lambda x: x)},
             ),
-            patch.object(
-                runner_module.deep_gemm_wrapper, "grouped_gemm_nt_f4f4bf16_nopad", gemm
-            ),
-            patch.object(
-                runner_module.deep_gemm_wrapper, "grouped_gemm_nt_f4f4bf16_masked", gemm
-            ),
+            patch.object(sail_entrypoint, "grouped_gemm_nt_f4f4bf16_nopad", gemm),
+            patch.object(sail_entrypoint, "grouped_gemm_nt_f4f4bf16_masked", gemm),
             patch.object(activation, "situ_and_mul_post_quant_mxfp4", produce),
             patch.object(
                 activation, "situ_and_mul_masked_post_quant_mxfp4", produce_masked

@@ -60,12 +60,17 @@ class TestSailDeepGemmFusedMoE(CustomTestCase):
             init_distributed_environment,
             initialize_model_parallel,
         )
-        from sglang.srt.layers.deep_gemm_wrapper import compile_utils, entrypoint
+        from sglang.srt.hardware_backend.sail.deep_gemm import (
+            entrypoint as sail_entrypoint,
+        )
+        from sglang.srt.layers.deep_gemm_wrapper import compile_utils
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
         from sglang.srt.layers.moe.utils import initialize_moe_config
 
-        entrypoint._require_sail_fused_api("m_grouped_gemm_bf16_bf16_bf16_nt_fused")
+        sail_entrypoint._require_sail_fused_api(
+            "m_grouped_gemm_bf16_bf16_bf16_nt_fused"
+        )
         initialize_moe_config()
         # Teardown order: model groups, default group, flags, config, env.
         cls._stack.callback(destroy_distributed_environment)
