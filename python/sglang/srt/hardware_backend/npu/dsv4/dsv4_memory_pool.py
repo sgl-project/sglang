@@ -478,6 +478,12 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # sub-pool by compression ratio.
     # ------------------------------------------------------------------
 
+    def wait_layer_transfer(self, layer_id: int) -> None:
+        super().wait_layer_transfer(layer_id)
+        if self.layer_transfer_counter is not None:
+            # The on-demand L2 loader queues the next layer after this one is consumed.
+            self.layer_transfer_counter.consume_layer(layer_id - self.start_layer)
+
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]

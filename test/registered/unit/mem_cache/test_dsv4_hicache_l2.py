@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache import memory_pool_host
 from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
     C128SidecarComponent,
 )
@@ -153,6 +154,184 @@ class TestDSV4HostViews(CustomTestCase):
                     torch.equal(view.reshape(pages, -1), expected.reshape(pages, -1))
                 )
 
+    def test_paged_ascend_copy_uses_matching_split_operator(self):
+        for layout, backup_name, load_name in (
+            (
+                "page_first_kv_split",
+                "transfer_kv_all_layer_kv_split_lf_pf",
+                "transfer_kv_per_layer_kv_split_pf_lf",
+            ),
+            (
+                "layer_first_kv_split",
+                "transfer_kv_all_layer_kv_split",
+                "transfer_kv_per_layer_kv_split",
+            ),
+        ):
+            with self.subTest(layout=layout):
+                host = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+                host.layout = layout
+                host.layer_num = 2
+                host.num_host_pages = 4
+                host.slot_page_size = 4
+                host.page_aligned_only = True
+                host.device_buffers = [
+                    torch.empty((4, 2, 1, 3), dtype=torch.uint8) for _ in range(2)
+                ]
+                raw = torch.empty((4, 2, 6), dtype=torch.uint8)
+                host.kv_buffer = self._layout_buffer(raw, layout)
+                device_indices = torch.arange(8, 12)
+                host_indices = torch.arange(4, 8)
+                with (
+                    patch.object(memory_pool_host, backup_name, create=True) as backup,
+                    patch.object(memory_pool_host, load_name, create=True) as load,
+                ):
+                    host.backup_from_device_all_layer(
+                        None, host_indices, device_indices, "kernel_ascend"
+                    )
+                    host.load_to_device_per_layer(
+                        None, host_indices, device_indices, 1, "kernel_ascend"
+                    )
+                self.assertEqual(backup.call_count, 2)
+                self.assertEqual(load.call_count, 1)
+                if layout == "page_first_kv_split":
+                    self.assertEqual(backup.call_args.kwargs["host_layer_start"], 0)
+                self.assertEqual(backup.call_args.kwargs["page_size"], 2)
+                self.assertEqual(load.call_args.kwargs["page_size"], 2)
+                self.assertEqual(load.call_args.kwargs["device_layer_id"], 0)
+                self.assertEqual(load.call_args.kwargs["host_layer_id"], 0)
+                self.assertEqual(
+                    load.call_args.kwargs["device_k"].shape, (1, 4, 2, 1, 3)
+                )
+                expected_host_shape = (
+                    (4, 1, 2, 1, 3)
+                    if layout == "page_first_kv_split"
+                    else (1, 4, 2, 1, 3)
+                )
+                self.assertEqual(
+                    load.call_args.kwargs["host_k"].shape, expected_host_shape
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["device_indices"], torch.tensor([4, 5])
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["host_indices"], torch.tensor([2, 3])
+                    )
+                )
+
+    def test_state_ascend_copy_uses_matching_split_operator(self):
+        for layout, backup_name, load_name in (
+            (
+                "page_first_kv_split",
+                "transfer_kv_all_layer_kv_split_lf_pf",
+                "transfer_kv_per_layer_kv_split_pf_lf",
+            ),
+            (
+                "layer_first_kv_split",
+                "transfer_kv_all_layer_kv_split",
+                "transfer_kv_per_layer_kv_split",
+            ),
+        ):
+            with self.subTest(layout=layout):
+                host = DeepSeekV4StateHostPool.__new__(DeepSeekV4StateHostPool)
+                host.layout = layout
+                host.layer_num = 2
+                host.num_host_pages = 4
+                host.swa_page_size = 4
+                host.ring_size = 2
+                host.state_page_bytes = 12
+                host.state_pools = [
+                    SimpleNamespace(
+                        kv_score_buffer=SimpleNamespace(
+                            kv_score=torch.empty(1, dtype=torch.float16)
+                        )
+                    )
+                    for _ in range(2)
+                ]
+                host.device_page_views = [
+                    torch.empty((4, 12), dtype=torch.uint8) for _ in range(2)
+                ]
+                raw = torch.empty((4, 2, 12), dtype=torch.uint8)
+                host.kv_buffer = self._layout_buffer(raw, layout)
+                device_indices = torch.arange(8, 12)
+                host_indices = torch.arange(4, 8)
+                with (
+                    patch.object(memory_pool_host, backup_name, create=True) as backup,
+                    patch.object(memory_pool_host, load_name, create=True) as load,
+                ):
+                    host.backup_from_device_all_layer(
+                        None, host_indices, device_indices, "kernel_ascend"
+                    )
+                    host.load_to_device_per_layer(
+                        None, host_indices, device_indices, 1, "kernel_ascend"
+                    )
+                self.assertEqual(backup.call_count, 2)
+                self.assertEqual(load.call_count, 1)
+                if layout == "page_first_kv_split":
+                    self.assertEqual(backup.call_args.kwargs["host_layer_start"], 0)
+                self.assertEqual(load.call_args.kwargs["page_size"], 2)
+                self.assertEqual(
+                    load.call_args.kwargs["device_k"].shape, (1, 4, 2, 1, 3)
+                )
+                self.assertEqual(load.call_args.kwargs["device_k"].dtype, torch.float16)
+                expected_host_shape = (
+                    (4, 1, 2, 1, 3)
+                    if layout == "page_first_kv_split"
+                    else (1, 4, 2, 1, 3)
+                )
+                self.assertEqual(
+                    load.call_args.kwargs["host_k"].shape, expected_host_shape
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["device_indices"], torch.tensor([4, 5])
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["host_indices"], torch.tensor([2, 3])
+                    )
+                )
+
+    def test_dsv4_acl_capacity_declares_paged_pool_block(self):
+        kvcache = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[object(), object()], bytes_per_page_padded=6
+            )
+        )
+        with (
+            patch.object(assembler, "is_npu", return_value=True),
+            patch.object(
+                assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first_kv_split"),
+            ),
+            patch.object(
+                assembler, "memfabric_host_memory_enabled", return_value=False
+            ),
+            patch.object(assembler, "acl_host_memory_enabled", return_value=True),
+            patch.object(assembler, "ensure_acl_capacity") as ensure_acl,
+            patch.object(assembler, "ensure_memfabric_capacity") as ensure_mf,
+            patch.object(
+                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+            ),
+        ):
+            assembler._reserve_dsv4_paged_host_memory(
+                kvcache=kvcache,
+                page_size=4,
+                num_host_pages=4,
+                swa_num_host_pages=4,
+                c128_num_host_pages=0,
+                has_paged_swa=True,
+                mtp_swa_device_buffers=[],
+                c4_layer_mapping={},
+                c4_state_global_layers=[],
+                c128_layer_mapping={},
+            )
+        ensure_acl.assert_called_once_with([48], 0)
+        ensure_mf.assert_not_called()
 
 class TestC128L2Ownership(CustomTestCase):
     def test_eviction_hooks_accept_cache_actions(self):
