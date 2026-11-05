@@ -84,51 +84,37 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
   }
 }
 
-// per-channel variant: one scale value per output column (laid out the same
-// way as `bias`), instead of a single scalar shared by the whole tile.
-template <typename scalar_t>
+template <typename scalar_t, bool has_bias>
 inline void copy_mul_stub(
-    scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ scale, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [data0, data1] = load_float_vec2(input + d);
-    auto [scale0, scale1] = load_float_vec2(scale + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0 * scale0, data1 * scale1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * scale[d]);
-  }
-}
-
-// per-channel scale + bias, fused into a single pass.
-template <typename scalar_t>
-inline void copy_mul_add_stub(
     scalar_t* __restrict__ out,
     const float* __restrict__ input,
     const float* __restrict__ scale,
     const float* __restrict__ bias,
     int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
-  int64_t d;
+  int64_t d = 0;
 #pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+  for (; d <= size - kVecSize; d += kVecSize) {
     auto [data0, data1] = load_float_vec2(input + d);
     auto [scale0, scale1] = load_float_vec2(scale + d);
-    auto [bias0, bias1] = load_float_vec2(bias + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0 * scale0 + bias0, data1 * scale1 + bias1);
+    auto out0 = data0 * scale0;
+    auto out1 = data1 * scale1;
+    if constexpr (has_bias) {
+      auto [bias0, bias1] = load_float_vec2(bias + d);
+      out0 = out0 + bias0;
+      out1 = out1 + bias1;
+    }
+    bVec out_vec = convert_from_float_ext<scalar_t>(out0, out1);
     out_vec.store(out + d);
   }
   for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * scale[d] + bias[d]);
+    float value = input[d] * scale[d];
+    if constexpr (has_bias) {
+      value += bias[d];
+    }
+    out[d] = static_cast<scalar_t>(value);
   }
 }
 
@@ -831,11 +817,7 @@ struct brgemm2<at::BFloat16, at::Float8_e4m3fn, has_bias> {
     at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, Ctmp);
 
     for (int m = 0; m < M; ++m) {
-      if constexpr (has_bias) {
-        copy_mul_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, scale, bias, N);
-      } else {
-        copy_mul_stub(C + m * ldc, Ctmp + m * BLOCK_N, scale, N);
-      }
+      copy_mul_stub<at::BFloat16, has_bias>(C + m * ldc, Ctmp + m * BLOCK_N, scale, bias, N);
     }
   }
 };
