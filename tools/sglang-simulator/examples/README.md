@@ -2,7 +2,7 @@
 
 The example assets are organized by purpose:
 
-- `sim_configs/`: standalone AIC SOL, AIC SILICON, ML, and replay simulator configs;
+- `sim_configs/`: standalone AISimulate SOL, AISimulate SILICON, ML, and replay simulator configs;
 - `assets/`: the small illustrative ML model, replay table, and test tokenizer;
 - `workloads/`: ShareGPT and timestamped simulator/Autobench workload examples;
 
@@ -24,7 +24,7 @@ Start a server with any example config:
 ```bash
 python3 -m sglang_simulator.simulation.sglang.launch_server \
   --model-path /path/to/model \
-  --sim-config-path examples/sim_configs/aic_sol.json \
+  --sim-config-path examples/sim_configs/aisimulate_sol.json \
   --port 30000
 ```
 
