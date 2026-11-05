@@ -967,7 +967,9 @@ def _candidate_sets(scores, seq_lens, k, dcp_size, dcp_rank, **kwargs):
     reason="CUDA cluster candidate top-k (sm90 / sm100)",
 )
 @pytest.mark.parametrize("cluster_size", [2, 4])
-@pytest.mark.parametrize("dist", ["randn", "ties", "dense_top"] + NARROW_DISTRIBUTIONS)
+@pytest.mark.parametrize(
+    "dist", ["randn", "ties", "dense_top", "top_bin"] + NARROW_DISTRIBUTIONS
+)
 @torch.inference_mode()
 def test_topk_v2_candidates_cluster_matches_one_block(
     dist: str, cluster_size: int
@@ -982,6 +984,10 @@ def test_topk_v2_candidates_cluster_matches_one_block(
         scores = torch.randint(0, 200, (len(lens), width), device="cuda").float() / 8
     elif dist == "dense_top":
         scores = 10 + 0.3 * torch.randn(len(lens), width, device="cuda")
+    elif dist == "top_bin":  # the threshold lands in the highest coarse bin
+        scores = torch.zeros(len(lens), width, device="cuda")
+        for row, n in enumerate(lens):
+            scores[row, max(n - k, 0) : n] = 70000
     else:
         scores = _single_bin_scores(dist, len(lens), width, "cuda")
     seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")

@@ -223,8 +223,9 @@ _CANDIDATES_CLUSTER_FLOOR = 16384
 
 
 def _candidates_cluster_size(rows: int) -> int:
+    # SM90 / SM100 only, as SUPPORT_CLUSTER in topk_impl.cuh builds the cluster path.
     arch = current_arch()
-    if rows <= 0 or arch.cuda is None or not arch.cuda.supports_cluster:
+    if rows <= 0 or not (arch.is_sm(9) or arch.is_sm(10)):
         return 0
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
