@@ -6,12 +6,9 @@ from typing import Dict, List, Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.voxtral import VoxtralForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -163,7 +160,9 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         """
         messages = self._parse_mistral_prompt(input_text)
         try:
-            input_ids = tokenizer.apply_chat_template(messages, tokenize=True)
+            input_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, return_dict=False
+            )
         except (ValueError, KeyError):
             # Fallback if prompt parsing produces malformed messages
             input_ids = tokenizer.encode(input_text)
