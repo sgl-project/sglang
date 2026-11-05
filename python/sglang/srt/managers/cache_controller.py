@@ -703,6 +703,7 @@ class HiCacheController:
                     "mori",
                     "tensorcast",
                     "seaweedfs",
+                    "fast_file",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"

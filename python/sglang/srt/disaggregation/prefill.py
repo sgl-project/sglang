@@ -1453,7 +1453,8 @@ class SchedulerDisaggregationPrefillMixin:
                 return False
             # Metadata buffer was allocated in pop_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
-            assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+            finalized = self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+            assert finalized
             self.checkpoint_disagg_prefill(req)
             return True
         else:

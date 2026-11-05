@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from array import array
+from contextlib import nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -144,6 +145,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
@@ -211,6 +213,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Unlimited-OCR v2 split-document KV reuse; None for every other model.
+    uocr_doc_reuse: Optional[DocReuse] = None
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -723,6 +728,19 @@ class UnifiedRadixCache(BasePrefixCache):
             best_match_node=node,
             mamba_branching_seqlen=None,
         )
+
+    def _linker_offload_skip_prefix(self, req: Req, token_ids):
+        # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.
+        # Convert the request's raw-token skip boundary to page-aligned radix-key units.
+        if self.linker is None:
+            return nullcontext()
+        skip_key = RadixKey(
+            token_ids[: req.linker_offload_skip_prefix_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        return self.linker.skip_offload_prefix(len(skip_key))
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -1428,7 +1446,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if reuse_existing_mamba:
             insert_params.allow_missing_mamba = True
         try:
-            result = self.insert(insert_params)
+            with self._linker_offload_skip_prefix(req, token_ids):
+                result = self.insert(insert_params)
         finally:
             if reuse_existing_mamba:
                 insert_params.allow_missing_mamba = False
@@ -4118,6 +4137,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
 
+    def enable_uocr_doc_reuse(self, doc_reuse: DocReuse) -> None:
+        """Let Unlimited-OCR v2 document windows reuse their predecessor's KV."""
+        self.uocr_doc_reuse = doc_reuse
+        self.session.uocr_doc_reuse = doc_reuse
+
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()
 
@@ -4275,6 +4299,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return node_handle
 
     def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        if self.uocr_doc_reuse is not None:
+            # A reused window's prefix was copied into fresh slots on no tree
+            # path; the match only reported its length.
+            indices = self.uocr_doc_reuse.prefix_device_indices(req)
+            if indices is not None:
+                return indices
         root = self.root_node_handle(req.extra_key)
         path = self.tree_core.collect_full_device_indices(req.last_node, root)
         if self.linker is not None:

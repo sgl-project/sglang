@@ -74,6 +74,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "qsa",
+    "unlimited_ocr_v2",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific

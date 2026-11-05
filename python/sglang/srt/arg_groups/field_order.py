@@ -556,6 +556,9 @@ POSITIONAL_FIELD_ORDER = (
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "enable_prefill_weight_versions",
+    "uocr_doc_split",
+    "uocr_doc_page_window",
+    "uocr_max_page_tokens",
     # Kimi-K3.1 additions, appended to keep existing positional slots
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",

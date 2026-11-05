@@ -80,6 +80,9 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -707,6 +710,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
+
+        if self._is_full_backend:
+            self.model_runner.attn_backend.init_prefill_cuda_graph_state(
+                max_num_tokens=self.max_num_tokens,
+                max_req_slots=self._capture_req_slots,
+            )
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
