@@ -1252,6 +1252,10 @@ class Envs:
     # by the model-specific dispatcher configuration; all other paths retain
     # their existing behavior.
     SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
+    # Let NCCL EP quantize dispatched tokens on the wire (DS_FP8E3M4: bf16 in,
+    # E4M3 + fp32 per-128-group scales out) instead of shipping bf16 and
+    # quantizing after receive. LL expert-major only; requires hidden % 512 == 0.
+    SGLANG_NCCL_EP_WIRE_FP8 = EnvBool(False)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

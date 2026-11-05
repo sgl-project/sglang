@@ -54,6 +54,44 @@ _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK = 1024
 _NCCL_EP_FP8_GROUP_SIZE = 128
 
 
+def _wire_fp8_enabled() -> bool:
+    """Whether NCCL EP should quantize dispatch tokens on the wire (DS_FP8E3M4).
+
+    LL expert-major only; guarded again in ``NcclEpBuffer.get_buffer`` against
+    unsupported layouts and hidden sizes.
+    """
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_NCCL_EP_WIRE_FP8.get()
+
+
+def _validate_wire_fp8(state) -> None:
+    """Raise unless the DS_FP8E3M4 wire recipe can be used.
+
+    Contract (nccl_ep.h, nccl-extensions 0.1.0): LL expert-major dispatch only;
+    bf16 tokens in, E4M3 + one fp32 scale per 128 token elements out; the
+    recipe hard-requires ``hidden % 512 == 0`` on its TMA-quantized blocks.
+    """
+    if state.layout.is_rank_major():
+        raise ValueError(
+            "SGLANG_NCCL_EP_WIRE_FP8=1 requires expert-major layout "
+            "(--nccl-ep-layout expert_major); the DS_FP8E3M4 recipe is not "
+            "implemented for rank-major receive."
+        )
+    if state.hidden_size % 512:
+        raise ValueError(
+            "SGLANG_NCCL_EP_WIRE_FP8=1 requires hidden %% 512 == 0 for the "
+            "DS_FP8E3M4 recipe; got hidden=%d" % state.hidden_size
+        )
+    nccl_core, nccl_ep = _load_nccl_ep()
+    recipe = getattr(nccl_ep, "DispatchQuantizationRecipe", None)
+    if recipe is None or not hasattr(recipe, "DS_FP8E3M4"):
+        raise RuntimeError(
+            "SGLANG_NCCL_EP_WIRE_FP8=1 needs nccl-extensions with "
+            "DispatchQuantizationRecipe.DS_FP8E3M4 (0.1.0 ships it)."
+        )
+
+
 class NcclEpRankMajorDispatchOutput(NamedTuple):
     """Packed local-expert compute view of a NCCL EP rank-major receive.
 
@@ -271,6 +309,11 @@ class NcclEpBuffer:
                 layout=None,
                 # Pre-allocated scratch (fixed shapes); reused per dispatch/combine step.
                 recv_tokens=None,
+                # Wire-FP8 (DS_FP8E3M4) expert-major receive scratch: NCCL writes
+                # E4M3 tokens plus fp32 per-128-group scales directly, so the
+                # bf16 recv buffer stays unallocated on that path.
+                recv_tokens_fp8=None,
+                recv_scales=None,
                 expert_counters=None,
                 expert_offsets=None,
                 recv_total=None,
@@ -320,6 +363,8 @@ class NcclEpBuffer:
             # LL auto = nRanks * max_dispatch_tokens_per_rank.
             world_size = ep_group.world_size
             state.max_recv_tokens_per_rank = world_size * max_dispatch_tokens_per_rank
+            if _wire_fp8_enabled():
+                _validate_wire_fp8(state)
             cls._create_group(state, ep_group)
         elif (
             state.hidden_size != hidden_size
@@ -386,9 +431,23 @@ class NcclEpBuffer:
         h = state.hidden_size
         max_recv = state.max_recv_tokens_per_rank
         max_send = state.max_dispatch_tokens_per_rank
-        state.recv_tokens = torch.empty(
-            (e_local, max_recv, h), dtype=torch.bfloat16, device=device
-        )
+        if _wire_fp8_enabled():
+            # DS_FP8E3M4: NCCL receives E4M3 tokens [E_local, max_recv, H] and
+            # generates fp32 scales [E_local, max_recv, H/128] (one per
+            # 128-element group, row-major — DeepEP-LL-compatible layout for
+            # the w4a8 masked GEMM). Halves dispatch wire bytes vs bf16.
+            state.recv_tokens_fp8 = torch.empty(
+                (e_local, max_recv, h), dtype=torch.float8_e4m3fn, device=device
+            )
+            state.recv_scales = torch.empty(
+                (e_local, max_recv, h // _NCCL_EP_FP8_GROUP_SIZE),
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            state.recv_tokens = torch.empty(
+                (e_local, max_recv, h), dtype=torch.bfloat16, device=device
+            )
         state.expert_counters = torch.zeros(
             (e_local,), dtype=torch.int32, device=device
         )
@@ -695,6 +754,11 @@ class NcclEpDispatcher(BaseDispatcher):
                 pass
             self.handle = None
 
+        # Rank-major CUDA graph capture follows the server-level CUDA graph
+        # flag, mirroring the expert-major contract: the warmup forward creates
+        # the handle before capture; capture records handle.update() plus the
+        # dispatch/combine kernels; replay refreshes routing through the same
+        # device-side metadata (topk_idx / src_rank_counters).
         self._ensure_buffer()
         state = self.buffer
 
@@ -726,13 +790,33 @@ class NcclEpDispatcher(BaseDispatcher):
             return
 
         # Reuse pre-allocated scratch; counters re-zeroed each dispatch.
-        recv_tokens = state.recv_tokens
         expert_counters = state.expert_counters.zero_()
         expert_offsets = state.expert_offsets.zero_()
         recv_total = state.recv_total.zero_()
 
+        wire_fp8 = state.recv_tokens_fp8 is not None
+        recv_scales = None
+        if wire_fp8:
+            # DS_FP8E3M4: NCCL quantizes on the wire — outputs are E4M3 tokens
+            # plus library-generated fp32 per-128-group scales.
+            recv_tokens = state.recv_tokens_fp8
+            recv_scales = state.recv_scales
+            outputs = nccl_ep.DispatchOutputs(
+                tokens=nccl_ep.Tensor(recv_tokens),
+                scales=nccl_ep.Tensor(recv_scales),
+            )
+            dispatch_config = nccl_ep.DispatchConfig(
+                send_only=1,
+                quantization_recipe=(
+                    nccl_ep.DispatchQuantizationRecipe.DS_FP8E3M4
+                ),
+            )
+        else:
+            recv_tokens = state.recv_tokens
+            outputs = nccl_ep.DispatchOutputs(tokens=nccl_ep.Tensor(recv_tokens))
+            dispatch_config = nccl_ep.DispatchConfig(send_only=1)
+
         inputs = nccl_ep.DispatchInputs(tokens=nccl_ep.Tensor(hidden_states))
-        outputs = nccl_ep.DispatchOutputs(tokens=nccl_ep.Tensor(recv_tokens))
         layout_info = nccl_ep.LayoutInfo(
             expert_counters=nccl_ep.Tensor(expert_counters),
             expert_offsets=nccl_ep.Tensor(expert_offsets),
@@ -742,12 +826,13 @@ class NcclEpDispatcher(BaseDispatcher):
             inputs,
             outputs,
             layout_info=layout_info,
-            config=nccl_ep.DispatchConfig(send_only=1),
+            config=dispatch_config,
             stream=stream.cuda_stream,
         )
 
         self._dispatch_intermediate_state = (
             recv_tokens,
+            recv_scales,
             expert_counters,
             topk_ids,
             topk_weights,
@@ -805,6 +890,7 @@ class NcclEpDispatcher(BaseDispatcher):
 
         (
             recv_tokens,
+            recv_scales,
             expert_counters,
             topk_ids,
             topk_weights,
@@ -816,7 +902,13 @@ class NcclEpDispatcher(BaseDispatcher):
         stream = torch.cuda.current_stream()
         self.handle.complete(config=0, stream=stream.cuda_stream)
 
-        hs_fp8, hs_scale = self._quantize_fp8(recv_tokens, expert_counters)
+        if recv_scales is not None:
+            # DS_FP8E3M4 arrive pre-quantized from the wire: E4M3 tokens with
+            # fp32 per-128-group scales in the same row-major layout the
+            # post-receive quant would produce (and the w4a8 GEMM consumes).
+            hs_fp8, hs_scale = recv_tokens, recv_scales
+        else:
+            hs_fp8, hs_scale = self._quantize_fp8(recv_tokens, expert_counters)
 
         expected_m = (
             hidden_states.shape[0] * self.world_size * topk_ids.shape[1]

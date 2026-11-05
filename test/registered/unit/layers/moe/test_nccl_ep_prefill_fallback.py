@@ -327,6 +327,10 @@ class TestForwardNormalSkipArConsistency(unittest.TestCase):
         from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
         from sglang.srt.layers.moe.moe_runner.base import MoeA2ABackend
 
+        # post_experts_output_is_complete reads dwdp_size from get_parallel()
+        # (ParallelContext) and only the flashinfer/pplx/megamoe A2A combines
+        # sum the experts' output on their own. NCCL EP does not, so the
+        # post-experts all-reduce must stay enabled.
         with patch(
             "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
             return_value=MoeA2ABackend.NCCL_EP,
@@ -336,13 +340,13 @@ class TestForwardNormalSkipArConsistency(unittest.TestCase):
                 return_value=False,
             ):
                 with patch(
-                    "sglang.srt.layers.moe.utils.should_use_dp_reduce_scatterv",
+                    "sglang.srt.layers.moe.utils.should_use_flashinfer_cutlass_moe_fp4_allgather",
                     return_value=False,
                 ):
                     with patch(
-                        "sglang.srt.layers.moe.utils.get_server_args"
-                    ) as mock_sa:
-                        mock_sa.return_value = SimpleNamespace(dwdp_size=1)
+                        "sglang.srt.layers.moe.utils.get_parallel"
+                    ) as mock_parallel:
+                        mock_parallel.return_value = SimpleNamespace(dwdp_size=1)
                         result = should_skip_post_experts_all_reduce(is_tp_path=True)
 
         self.assertFalse(result)
@@ -375,6 +379,11 @@ class TestNcclEpDispatcherEpGroupType(unittest.TestCase):
             params_dtype=torch.bfloat16,
         )
 
+        # create_moe_dispatcher derives its layer contract from the resolved
+        # quant method, so a method object is part of the signature. The
+        # nccl_ep branch never reads it, so a mock is enough here.
+        quant_method = MagicMock()
+
         tp_group_mock = MagicMock(world_size=8)
 
         with patch(
@@ -390,7 +399,7 @@ class TestNcclEpDispatcherEpGroupType(unittest.TestCase):
                 with patch(
                     "sglang.srt.layers.moe.token_dispatcher.nccl_ep_expert_major_legacy.NcclEpDispatcher"
                 ) as mock_disp_class:
-                    create_moe_dispatcher(cfg)
+                    create_moe_dispatcher(cfg, quant_method)
 
                     call_kwargs = mock_disp_class.call_args
                     self.assertIn("ep_group", call_kwargs.kwargs)
