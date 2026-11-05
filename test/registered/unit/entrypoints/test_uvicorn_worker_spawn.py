@@ -5,6 +5,7 @@ supervisor would kill and respawn it in a loop. A user's own launcher script
 still runs in every worker.
 """
 
+import importlib.machinery
 import os
 import signal
 import socket
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import types
 import unittest
 import urllib.request
 from multiprocessing import spawn
@@ -72,6 +74,25 @@ def _free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+class TestLaunchedBySglangEntrypoint(CustomTestCase):
+    def _launched(self, **main_attrs):
+        fake = types.ModuleType("__main__")
+        for name, value in main_attrs.items():
+            setattr(fake, name, value)
+        with mock.patch.dict(sys.modules, {"__main__": fake}):
+            return uvicorn_worker_spawn._launched_by_sglang_entrypoint()
+
+    def test_python_m_launch_server(self):
+        spec = importlib.machinery.ModuleSpec("sglang.launch_server", None)
+        self.assertTrue(self._launched(__spec__=spec))
+
+    def test_sglang_console_script(self):
+        self.assertTrue(self._launched(__spec__=None, __file__="/venv/bin/sglang"))
+
+    def test_user_launcher_script(self):
+        self.assertFalse(self._launched(__spec__=None, __file__="/work/my_launcher.py"))
 
 
 class TestUvicornWorkerSpawn(CustomTestCase):
