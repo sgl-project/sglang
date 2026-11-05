@@ -356,7 +356,7 @@ ENV BUILD_MOONCAKE="1"
 # gfx1250 is promoted to its own AITER pin here, ahead of the gfx942/gfx950
 # shared pin. Validated by the manual gfx1250 AITER Scout #173 A/B (no automated
 # gfx1250 Scout): gpt-oss, Flux.2, Wan2.2 and Kimi-K2 all NO_NEW_REGRESSION.
-ENV AITER_COMMIT_DEFAULT="26f4f1fb2de14d122c71f5fed7afb97a5c97cade"
+ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
@@ -379,7 +379,7 @@ ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="26f4f1fb2de14d122c71f5fed7afb97a5c97cade"
+ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
 ENV BUILD_RCCL="1"
 # rocm-systems develop. The fix for the hang in the first all-reduce on gfx1250
 # (ROCm/rocm-systems#14254) has landed on the mainline, so pin develop instead

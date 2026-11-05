@@ -67,31 +67,46 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
 
   Other quantization methods and MoE runners are rejected at startup.
 - **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
-  (use `--disable-shared-experts-fusion`), `--enable-fused-moe-sum-all-reduce` and
-  `--load-format dummy` are rejected at startup.
+  (use `--disable-shared-experts-fusion`) and `--enable-fused-moe-sum-all-reduce` are rejected
+  at startup.
 - **Speculative decoding** is rejected at startup.
+- **Load formats:** `--load-format auto` (the default), `safetensors`, `pt`, `npcache`,
+  `mistral`, `fastsafetensors`, `instanttensor` and `runai_streamer`. The others are rejected
+  at startup: `dummy` has no real weights, `gguf` holds GGUF-quantized experts, and the rest
+  load the weights without Paged Experts' loader and post-load step.
 - **CUDA graphs:** decode graphs may use the `full` backend (the default) or be disabled;
   prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
   combinations are rejected at startup.
 - **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
   the host must be able to pin that much memory. Under WSL2, pinned memory is capped at about
   half of system RAM.
-- **Startup:** on the Marlin runner, the repack runs over the host store K experts at a time at load.
+- **Startup:** with mapped safetensors (`--load-format auto`, `safetensors` or `mistral`, without
+  `--weight-loader-disable-mmap`), loading makes no second copy of the experts: each expert is
+  read from the checkpoint once, straight into the pinned host store. With other loaders, and
+  for checkpoints that store every expert in one tensor (e.g. gpt-oss), the experts are first
+  loaded into a pageable copy of every expert, as large as the host store.
 
 ## How It Works
 
 ### The K-slot table and the host store
 
 The paged method wraps the layer's own fused-MoE method. It creates the layer's expert tensors
-with K rows instead of E, so the GPU holds only the K slots, and allocates a host store holding
-all E experts of each per-expert tensor. Each tensor's weight loader is redirected to a one-row
-view of the host store, so checkpoint weights are written by SGLang's native per-expert loader
-(sharding, gate/up placement, scale layout) and the host rows have exactly the layout the GPU
-slots would have.
+with K rows instead of E, so the GPU holds only the K slots. Each tensor's weight loader is
+redirected: a load of one expert's weights does not run yet, but waits as a view of the mapped
+checkpoint file. After loading, the waiting loads run K experts at a time, each through
+SGLang's native per-expert loader (sharding, gate/up placement, scale layout) into K rows laid
+out as the GPU slots, and the wrapped method's post-load step runs on those rows as it would
+without paging (on the Marlin runner, the repack into Marlin's layout). Each chunk's result is
+copied into the host store, a page-locked table of all E experts of each per-expert tensor, and
+the chunk's checkpoint pages are given back to the kernel, so the checkpoint never occupies
+memory beside the host store. The slots then hold experts 0..K-1.
 
-After loading, the wrapped method's post-load step runs as it would without paging. On the
-Marlin runner, whose methods repack their experts into Marlin's layout, it runs over the host
-store K experts at a time, so the host store holds every expert in the repacked layout.
+A repack must treat each expert on its own to run K at a time: the step runs once more on
+experts 1..K in a chunk of their own and must give the same bytes. A step that does not repack
+must leave the loaded weights as they are, since paging copies host rows verbatim. Either is
+checked at startup. Loads that cannot wait (a checkpoint tensor holding every expert, or a
+loader whose tensors are not views of mapped files) go to a table of every expert instead,
+which the chunks are taken from.
 
 ### A step: waves, page-in, merge
 
