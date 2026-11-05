@@ -197,6 +197,10 @@ class TestNestedCgroup:
 
 class TestHostPinBudget:
     def test_local_workers_split_one_node_allowance(self, monkeypatch):
+        # A discrete host: on a shared host/device pool there is nothing to pin.
+        monkeypatch.setattr(
+            host_memory_budget, "host_copies_are_redundant", lambda: False
+        )
         monkeypatch.setattr(
             host_memory_budget,
             "host_memory_available_bytes",
