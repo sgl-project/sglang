@@ -12,8 +12,10 @@ import torch.distributed as dist
 from msgspec.structs import replace
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_replica_group,
     get_ulysses_ctx,
     model_parallel_is_initialized,
