@@ -768,6 +768,9 @@ class QSAIndexer(MultiPlatformOp):
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
+        skip_local_scores = (
+            use_fast_topk and getattr(self, "distributed_topk_group", None) is None
+        )
         with torch.profiler.record_function("qsa.local_scan"):
             logits = qsa_mqa_decode(
                 q,
@@ -775,7 +778,7 @@ class QSAIndexer(MultiPlatformOp):
                 compressed_page_table,
                 compressed_lengths,
                 max_model_len,
-                min_scored_len=self.block_topk if use_fast_topk else 0,
+                min_scored_len=self.block_topk if skip_local_scores else 0,
             )
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
