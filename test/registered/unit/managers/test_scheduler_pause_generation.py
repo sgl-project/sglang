@@ -286,7 +286,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
         scheduler.output_streamer = MagicMock()
-        scheduler.beam_coordinator = MagicMock()
         scheduler.update_running_batch(batch)
 
     def drain_with_pause_start_seen(self, scheduler, mode, now):

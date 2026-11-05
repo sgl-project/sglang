@@ -28,9 +28,9 @@ class RequestRetirer:
 
     abort ends a request no launched step reports, tells the tokenizer once,
     and releases it; release gives back what a request its caller ended holds,
-    detaching it first when aborted; the caller streams it. retract releases a
-    request a retraction requeues, and abort_retracted ends one it cannot
-    requeue."""
+    detaching it first when aborted; the caller streams it. retract releases
+    what a retracted request holds and reports whether it can resume;
+    abort_retracted ends one that will not be requeued."""
 
     def __init__(
         self,
@@ -116,7 +116,7 @@ class RequestRetirer:
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
-        """Abort a request a retraction released but cannot requeue, and tell the
+        """Abort a retracted request that will not be requeued, and tell the
         tokenizer once. It is not finished in place: a step launched before the
         retraction may still carry it, and that step's output would report it
         again."""
@@ -130,8 +130,8 @@ class RequestRetirer:
 
     def _detach(self, req: Req) -> None:
         """Drop an aborted request from the components tracking it and free its
-        media; frees no KV or rows, so it runs while the request still holds
-        them."""
+        media, but no KV or rows. `release` runs it before the KV goes: uOCR's
+        drop tells unadmitted prefix slots from row-owned ones by `holds_kv`."""
         # Counted before the media goes: the output sent after still reports it.
         req.get_mm_token_counts()
         req.release_mm_inputs_on_abort()
