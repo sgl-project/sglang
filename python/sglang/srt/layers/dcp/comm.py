@@ -232,6 +232,13 @@ def all_gather_kv_cache_for_mha_extend(
     # Host lengths avoid a device sync per slice bound, and this runs once per MLA layer.
     prefix_starts = [0, *itertools.accumulate(extend_prefix_lens_cpu)]
     extend_starts = [0, *itertools.accumulate(extend_seq_lens_cpu)]
+    assert len(prefix_starts) == len(extend_starts), (
+        f"{len(extend_prefix_lens_cpu)=} != {len(extend_seq_lens_cpu)=}"
+    )
+    # kv_a may end in attention-TP padding rows, which the slices below drop.
+    assert extend_starts[-1] <= kv_a.shape[0], (
+        f"{extend_starts[-1]=} > {kv_a.shape[0]=}"
+    )
     kv_a_parts = []
     k_pe_parts = []
     for i in range(len(extend_seq_lens_cpu)):
@@ -241,7 +248,7 @@ def all_gather_kv_cache_for_mha_extend(
         k_pe_parts += [prefix_k_pe[prefix], k_pe[extend]]
     kv_a = torch.cat(kv_a_parts, dim=0)
     k_pe = torch.cat(k_pe_parts, dim=0)
-    return kv_a.contiguous(), k_pe.contiguous()
+    return kv_a, k_pe
 
 
 def all_gather_q_for_mla_decode(
