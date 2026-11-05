@@ -430,8 +430,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 # The index-K buffer is replicated under DCP while the latent KV
-                # shards (unless K3.1 shards both by token), so this term is short
-                # by dcp_size without the scale.
+                # shards, so this term is short by dcp_size without the scale.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,

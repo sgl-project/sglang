@@ -1102,7 +1102,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
-            # under DCP the store goes through _store_index_k_cache's owner rule
             and not dsa_shards_index_k()
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -1522,8 +1521,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         if dcp_size > 1:
-            # block_tables and seqlens_32_2d are this rank's: the page ids of
-            # its index-K shard and its share of each sequence.
             topk_result = dcp_global_topk(
                 logits[:q_offset],
                 seqlens_32_2d.view(-1)[:q_offset],
@@ -1992,7 +1989,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
             if dcp_size > 1:
-                # K3.1 shards index-K by token: the kernel keeps this rank's rows
                 buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
                 fused_store_index_k_cache(
                     key,

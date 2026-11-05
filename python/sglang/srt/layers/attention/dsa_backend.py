@@ -612,7 +612,6 @@ class DeepseekSparseAttnBackend(
         self.dsa_packed_extend_topk = _is_hip or kimi_k31
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
-        # K3.1 DCP: req_to_token holds widened slots; a slot's page is slot // real_page_span.
         sharded_dcp = dsa_shards_index_k()
         self.attn_dcp_size = get_parallel().attn_dcp_size if sharded_dcp else 1
         self.attn_dcp_rank = get_parallel().attn_dcp_rank if sharded_dcp else 0
@@ -625,9 +624,6 @@ class DeepseekSparseAttnBackend(
             enable=get_exec().features.enable_memory_saver
             and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
-        # Under DCP, decode attention runs on q gathered from the DCP group
-        # (attn_mqa_for_dcp_decode) and sees attn_dcp_size x the heads; prefill
-        # attends with the local heads over the gathered KV.
         self.local_num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -1479,7 +1475,7 @@ class DeepseekSparseAttnBackend(
                     # Sharded extends index scratch rows, bounded by construction.
                     not kv_shard_extend
                     and forward_batch.seq_lens_sum > kv_cache_capacity
-                    and self.attn_dcp_size == 1  # DCP slots are widened ids
+                    and self.attn_dcp_size == 1
                 ):
                     max_idx = page_table_1_flattened.max().item()
                     assert max_idx < kv_cache_capacity, (
@@ -4484,8 +4480,6 @@ class DeepseekSparseAttnBackend(
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         elif self.attn_dcp_size > 1 and forward_mode == ForwardMode.EXTEND:
-            # DCP prefill attends over the KV gathered from all ranks, laid out
-            # request after request (see dcp_gather_kv_cache).
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED

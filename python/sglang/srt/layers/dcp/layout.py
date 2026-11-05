@@ -19,7 +19,9 @@ import torch
 
 from sglang.srt.runtime_context import get_parallel
 
-# Kimi-K3.1 shards DSA index-K by token across DCP ranks; other DSA models replicate it.
+# NOTE(yhyang201): under DCP, Kimi-K3.1 shards the DSA index-K cache by token like
+# the MLA KV (position p on rank p % N) instead of replicating it, cutting index-K
+# memory N-fold; the indexer merges per-rank top-k exactly (dsa_dcp_sharded.py).
 _dsa_shards_index_k = False
 
 

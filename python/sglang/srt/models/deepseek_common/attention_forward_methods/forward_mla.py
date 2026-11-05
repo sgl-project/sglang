@@ -93,7 +93,6 @@ def _select_local_dcp_heads_for_autotune(
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     if attention_backend == "dsa":
-        # Kimi-K3.1's sharded DSA DCP merges FlashMLA partials (natural log)
         return dsa_shards_index_k()
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
@@ -175,7 +174,6 @@ class DeepseekMLAForwardMixin:
                 # ROCm only: the draft shards its KV like the target, so its
                 # extend merges per-rank partials the same way the target does.
                 and mode.is_extend(include_draft_extend_v2=_is_hip)
-                # K3.1's sharded DSA prefill attends over the gathered KV instead
                 and not dsa_shards_index_k()
             )
         )
@@ -764,7 +762,7 @@ class DeepseekMLAForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv (K3.1's DSA backend gathers its own cache)
+                # for extend, gather kv
                 if not self.use_dsa:
                     bcg_dcp_extend_kv_gather(
                         get_token_to_kv_pool(),

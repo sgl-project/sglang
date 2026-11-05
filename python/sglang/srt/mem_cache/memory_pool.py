@@ -5295,7 +5295,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_size = get_parallel().attn_dcp_size
             index_buf_size = (
                 size
-                # K3.1 shards index-K by token like the MLA KV
                 if dcp_replicated or dsa_shards_index_k()
                 else (size + self.page_size) * dcp_size - self.page_size
             )
