@@ -37,7 +37,7 @@ class TestK3NormGemm(CustomTestCase):
                     gate = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)[
                         :, K:
                     ]
-                    norm_weight = torch.rand(D, device="cuda") + 0.5
+                    norm_weight = (torch.rand(D, device="cuda") + 0.5).bfloat16()
                     w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / 32
 
                     out = kda_onorm_oproj_hip(x, gate, norm_weight, EPS, w)

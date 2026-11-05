@@ -32,6 +32,7 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -41,7 +42,12 @@ namespace sglang {
 namespace k3_norm_gemm {
 
 constexpr int kGatedHead = 0;
-constexpr int kD = 128;
+constexpr int kD = 128;         // head dim normalized by o_norm
+constexpr int kMaxRows = 16;    // M limit: one MFMA row tile
+constexpr int kTile = 16;       // MFMA 16x16x16 tile edge
+constexpr int kKBlock = 32;     // K columns per block per wave (4 lanes x 8)
+constexpr int kGroupElems = 8;  // bf16 elements per 16 B lane load
+constexpr int kTileElems = kTile * kTile;
 template <int kMode>
 constexpr bool kGated = kMode == kGatedHead;
 
@@ -49,11 +55,11 @@ typedef short s4_t __attribute__((ext_vector_type(4)));
 typedef float f4_t __attribute__((ext_vector_type(4)));
 
 struct Params {
-  const uint16_t* __restrict__ x;  // [M, K] bf16, row stride sx
-  const uint16_t* __restrict__ g;  // [M, K] bf16 gate (kGatedHead), row stride sg
-  const float* __restrict__ nwf;   // kGatedHead: [kD] fp32 o_norm weight
-  const uint16_t* __restrict__ w;  // [N, K] bf16 contiguous
-  uint16_t* __restrict__ y;        // [M, N] bf16, row stride sy
+  const uint16_t* __restrict__ x;   // [M, K] bf16, row stride sx
+  const uint16_t* __restrict__ g;   // [M, K] bf16 gate (kGatedHead), row stride sg
+  const uint16_t* __restrict__ nw;  // kGatedHead: [kD] bf16 o_norm weight
+  const uint16_t* __restrict__ w;   // [N, K] bf16 contiguous
+  uint16_t* __restrict__ y;         // [M, N] bf16, row stride sy
   int64_t sx, sg, sy;
   int32_t M, K;
   float eps;
@@ -109,15 +115,17 @@ __device__ __forceinline__ s4_t hi4(const uint4& v) {
 
 template <int kMode, int kWaves, int kNT, int kKB>
 __global__ void __launch_bounds__(kWaves * 64) norm_gemm_kernel(const Params __grid_constant__ p) {
-  __shared__ float red[kWaves * kNT * 256];
+  static_assert(kGated<kMode>, "only the gated-head prologue is implemented");
+  static_assert(kKB * kKBlock == kD, "one wave per head");
+  __shared__ float red[kWaves * kNT * kTileElems];
 
   const int lane = threadIdx.x & 63;
   const int wv = threadIdx.x >> 6;
-  const int r = lane & 15;
-  const int q = lane >> 4;
+  const int r = lane % kTile;
+  const int q = lane / kTile;
   const int K = p.K;
-  const int kw0 = wv * (kKB * 32);
-  const int nblk = blockIdx.x * kNT * 16;
+  const int kw0 = wv * (kKB * kKBlock);
+  const int nblk = blockIdx.x * kNT * kTile;
 
   // 1) this lane's A fragment (row r, columns kw0 + 32 b + 8 q + [0, 8)) and
   // its norm weights first: s_waitcnt retires loads in issue order, so the
@@ -126,23 +134,19 @@ __global__ void __launch_bounds__(kWaves * 64) norm_gemm_kernel(const Params __g
   const int rr = live ? r : 0;  // branch-free loads: dead rows read row 0, zeroed below
   uint4 xr[kKB];
   uint4 gr[kGated<kMode> ? kKB : 1];
-  float nwb[kGated<kMode> ? kKB * 8 : 1];
+  float nwb[kGated<kMode> ? kKB * kGroupElems : 1];
 #pragma unroll
   for (int b = 0; b < kKB; ++b) {
-    xr[b] = *reinterpret_cast<const uint4*>(p.x + rr * p.sx + kw0 + 32 * b + 8 * q);
+    const int col = kKBlock * b + kGroupElems * q;  // column within the head
+    xr[b] = *reinterpret_cast<const uint4*>(p.x + rr * p.sx + kw0 + col);
     if constexpr (kGated<kMode>) {
-      gr[b] = *reinterpret_cast<const uint4*>(p.g + rr * p.sg + kw0 + 32 * b + 8 * q);
-      // fp32 o_norm weight; kKB * 32 == kD so column % kD = 32 b + 8 q
-      const float4 u0 = *reinterpret_cast<const float4*>(p.nwf + 32 * b + 8 * q);
-      const float4 u1 = *reinterpret_cast<const float4*>(p.nwf + 32 * b + 8 * q + 4);
-      nwb[b * 8 + 0] = u0.x;
-      nwb[b * 8 + 1] = u0.y;
-      nwb[b * 8 + 2] = u0.z;
-      nwb[b * 8 + 3] = u0.w;
-      nwb[b * 8 + 4] = u1.x;
-      nwb[b * 8 + 5] = u1.y;
-      nwb[b * 8 + 6] = u1.z;
-      nwb[b * 8 + 7] = u1.w;
+      gr[b] = *reinterpret_cast<const uint4*>(p.g + rr * p.sg + kw0 + col);
+      // read the live bf16 parameter: weight updates need no cache refresh
+      float u[kGroupElems];
+      unpack8(*reinterpret_cast<const uint4*>(p.nw + col), u);
+#pragma unroll
+      for (int i = 0; i < kGroupElems; ++i)
+        nwb[b * kGroupElems + i] = u[i];
     }
   }
 
@@ -150,10 +154,10 @@ __global__ void __launch_bounds__(kWaves * 64) norm_gemm_kernel(const Params __g
   uint4 wreg[kNT][kKB];
 #pragma unroll
   for (int t = 0; t < kNT; ++t) {
-    const uint16_t* wrow = p.w + (int64_t)(nblk + t * 16 + r) * K + kw0 + 8 * q;
+    const uint16_t* wrow = p.w + (int64_t)(nblk + t * kTile + r) * K + kw0 + kGroupElems * q;
 #pragma unroll
     for (int b = 0; b < kKB; ++b)
-      wreg[t][b] = *reinterpret_cast<const uint4*>(wrow + 32 * b);
+      wreg[t][b] = *reinterpret_cast<const uint4*>(wrow + kKBlock * b);
   }
 
   if (!live) {
@@ -164,31 +168,28 @@ __global__ void __launch_bounds__(kWaves * 64) norm_gemm_kernel(const Params __g
   float ss = 0.f;
 #pragma unroll
   for (int b = 0; b < kKB; ++b) {
-    float xf[8];
+    float xf[kGroupElems];
     unpack8(xr[b], xf);
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < kGroupElems; ++i)
       ss = fmaf(xf[i], xf[i], ss);
   }
   ss += __shfl_xor(ss, 16);
   ss += __shfl_xor(ss, 32);
 
-  static_assert(kGated<kMode>, "only the gated-head prologue is implemented");
-  static_assert(kKB * 32 == kD, "one wave per head");
   const float rstd = 1.0f / sqrtf(ss / (float)kD + p.eps);
 
   uint4 ar[kKB];
 #pragma unroll
   for (int b = 0; b < kKB; ++b) {
-    float xf[8];
+    float xf[kGroupElems];
     unpack8(xr[b], xf);
-    const int c0 = kw0 + 32 * b + 8 * q;
     if constexpr (kGated<kMode>) {
-      float gf[8];
+      float gf[kGroupElems];
       unpack8(gr[b], gf);
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const float nwv = nwb[b * 8 + i];
+      for (int i = 0; i < kGroupElems; ++i) {
+        const float nwv = nwb[b * kGroupElems + i];
         float v = xf[i] * rstd;
         v = v * nwv;
         v = v / (1.0f + __expf(-gf[i]));
@@ -216,18 +217,18 @@ __global__ void __launch_bounds__(kWaves * 64) norm_gemm_kernel(const Params __g
   for (int t = 0; t < kNT; ++t)
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      red[(wv * kNT + t) * 256 + (4 * q + i) * 16 + r] = acc[t][i];
+      red[(wv * kNT + t) * kTileElems + (4 * q + i) * kTile + r] = acc[t][i];
   __syncthreads();
-  for (int e = threadIdx.x; e < kNT * 256; e += kWaves * 64) {
-    const int t = e >> 8;
-    const int row = (e >> 4) & 15;
-    const int col = e & 15;
+  for (int e = threadIdx.x; e < kNT * kTileElems; e += kWaves * 64) {
+    const int t = e / kTileElems;
+    const int row = (e / kTile) % kTile;
+    const int col = e % kTile;
     if (row < p.M) {
       float s = 0.f;
 #pragma unroll
       for (int i = 0; i < kWaves; ++i)
-        s += red[(i * kNT + t) * 256 + (e & 255)];
-      p.y[row * p.sy + nblk + t * 16 + col] = (uint16_t)(pack2(s, 0.f) & 0xFFFFu);
+        s += red[(i * kNT + t) * kTileElems + e % kTileElems];
+      p.y[row * p.sy + nblk + t * kTile + col] = __bfloat16_as_ushort(__float2bfloat16(s));
     }
   }
 }
@@ -240,15 +241,15 @@ struct NormGemm {
       const tvm::ffi::TensorView nw,
       const tvm::ffi::TensorView w,
       const tvm::ffi::TensorView y,
-      int64_t flags,  // bit0: g valid, bit2: nw valid (fp32)
+      int64_t flags,  // bit0: g valid, bit2: nw valid (bf16)
       double eps) {
     using namespace host;
     const int64_t M = x.size(0);
     const int64_t K = x.size(1);
     const int64_t N = w.size(0);
-    RuntimeCheck(M >= 1 && M <= 16, "norm_gemm: 1 <= M <= 16");
-    RuntimeCheck(w.size(1) == K && K == (int64_t)kWaves * kKB * 32, "norm_gemm: K mismatch");
-    RuntimeCheck(N % (16 * kNT) == 0, "norm_gemm: N tile");
+    RuntimeCheck(M >= 1 && M <= kMaxRows, "norm_gemm: 1 <= M <= 16");
+    RuntimeCheck(w.size(1) == K && K == (int64_t)kWaves * kKB * kKBlock, "norm_gemm: K mismatch");
+    RuntimeCheck(N % (kTile * kNT) == 0, "norm_gemm: N tile");
     RuntimeCheck(x.stride(1) == 1 && w.stride(1) == 1 && w.stride(0) == K && y.stride(1) == 1, "norm_gemm: layout");
     RuntimeCheck(x.stride(0) % 8 == 0, "norm_gemm: x row alignment");
     Params p{};
@@ -259,14 +260,14 @@ struct NormGemm {
       p.g = static_cast<const uint16_t*>(g.data_ptr());
       p.sg = g.stride(0);
     }
-    if (flags & 4) p.nwf = static_cast<const float*>(nw.data_ptr());
+    if (flags & 4) p.nw = static_cast<const uint16_t*>(nw.data_ptr());
     p.w = static_cast<const uint16_t*>(w.data_ptr());
     p.y = static_cast<uint16_t*>(y.data_ptr());
     p.sy = y.stride(0);
     p.M = static_cast<int32_t>(M);
     p.K = static_cast<int32_t>(K);
     p.eps = static_cast<float>(eps);
-    LaunchKernel(static_cast<uint32_t>(N / (16 * kNT)), kWaves * 64, x.device())(
+    LaunchKernel(static_cast<uint32_t>(N / (kTile * kNT)), kWaves * 64, x.device())(
         norm_gemm_kernel<kMode, kWaves, kNT, kKB>, p);
   }
 };

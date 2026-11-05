@@ -40,7 +40,7 @@ def hip_onorm_supported(M: int, K: int, N: int, D: int) -> bool:
 def kda_onorm_oproj_hip(
     x: torch.Tensor,  # [M, HV*D] contiguous rows
     gate: torch.Tensor,  # [M, HV*D] unit inner stride, row stride % 8 == 0
-    norm_weight: torch.Tensor,  # [D] bf16 or fp32
+    norm_weight: torch.Tensor,  # [D] bf16, contiguous
     eps: float,
     w: torch.Tensor,  # [N, HV*D] bf16 contiguous
 ) -> torch.Tensor:
@@ -50,10 +50,8 @@ def kda_onorm_oproj_hip(
     waves, nt = HIP_ONORM_CFG
     assert hip_onorm_supported(M, K, N, norm_weight.shape[0])
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    if norm_weight.dtype != torch.float32:  # callers on the hot path pass fp32
-        norm_weight = norm_weight.float()
+    assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
     flags = 1 | 4
-    assert norm_weight.is_contiguous()
     _hip_module(_MODE_GATED_HEAD, waves, nt, 4).run(
         x, gate, norm_weight, w, out, flags, float(eps)
     )

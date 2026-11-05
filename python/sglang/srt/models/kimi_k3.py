@@ -2184,6 +2184,8 @@ class KimiK3DeltaAttention(nn.Module):
             or self.o_norm.activation != "sigmoid"
             or self.o_norm.weight is None
             or self.o_norm.weight.shape != (core_attn_out.shape[-1],)
+            or self.o_norm.weight.dtype != torch.bfloat16
+            or not self.o_norm.weight.is_contiguous()
             or not core_attn_out.is_contiguous()
             or core_attn_out.dtype != torch.bfloat16
             or core_attn_out.numel() != m * w.shape[1]
@@ -2198,14 +2200,10 @@ class KimiK3DeltaAttention(nn.Module):
             m, w.shape[1], w.shape[0], self.o_norm.weight.shape[0]
         ):
             return None
-        nw = self.__dict__.get("_k3_onorm_w32")
-        if nw is None:  # first (eager warm-up) call, before graph capture
-            nw = self.o_norm.weight.detach().float().contiguous()
-            self.__dict__["_k3_onorm_w32"] = nw
         return k3_norm_gemm.kda_onorm_oproj_hip(
             core_attn_out.view(m, -1),
             g_proj_states,
-            nw,
+            self.o_norm.weight,
             float(self.o_norm.eps),
             w,
         )
