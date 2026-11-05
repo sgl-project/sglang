@@ -526,10 +526,8 @@ class PrefillBootstrapQueue:
         bootstrapped_reqs = []
         indices_to_remove = set()
 
-        # Snapshot so leave() can drop by request identity while we iterate.
         # The polls are reduced across ranks in this order.
         queue = list(self.queue)
-
         if self.pp_size > 1:
             if len(queue) == 0:
                 return []
@@ -562,8 +560,6 @@ class PrefillBootstrapQueue:
             else:
                 # Align rids across attn TP/CP ranks before polling so
                 # poll_and_all_reduce_attn_cp_tp_group never sees unequal lengths.
-                # Do not early-return on a locally empty queue: idle ranks must
-                # still join the has_req / rid collectives with peers.
                 has_req = torch.tensor(
                     [1 if queue else 0], dtype=torch.uint8, device="cpu"
                 )

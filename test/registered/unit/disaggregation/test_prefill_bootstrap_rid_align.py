@@ -21,8 +21,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _FakeReqList(list):
-    """Minimal stand-in for IndexedReqList: supports leave() used by pop_bootstrapped."""
-
     def leave(self, reqs):
         leaving = set(reqs)
         self[:] = [req for req in self if req not in leaving]
