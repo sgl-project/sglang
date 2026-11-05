@@ -83,7 +83,6 @@ def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
     # indexer reconfigure that process-wide, so reserving on top would compound.
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     reserved_num_sms = max(
-        0,
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(),
         _MEGA_MOE_SM107_DECODE_RESERVED_SMS if decode_like and _device_sm == 107 else 0,
     )
