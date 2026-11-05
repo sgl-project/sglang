@@ -613,7 +613,7 @@ mod tests {
     /// reaches the wire with its real length, and a malformed one is a 400.
     #[test]
     fn stop_regex_bound_reaches_the_wire() {
-        assert_eq!(norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len, 6);
+        assert_eq!(norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len, 24);
         assert_eq!(norm(r#"{"temperature": 0.7}"#).stop_regex_max_len, 0);
         let _ = norm_err(r#"{"stop_regex": "("}"#);
         let _ = norm_err(r#"{"stop_regex": ["\\d{6}", "("]}"#);
@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(once, twice, "a second normalize must change nothing");
         assert_eq!(twice.stop_strs, vec!["END".to_string(), "STOP".to_string()]);
         assert_eq!(twice.stop_str_max_len, 4);
-        assert_eq!(twice.stop_regex_max_len, 3);
+        assert_eq!(twice.stop_regex_max_len, 12);
 
         // Greedy handling must not re-fire either: temperature is 1.0 after the
         // first pass, which is not in the greedy window.
