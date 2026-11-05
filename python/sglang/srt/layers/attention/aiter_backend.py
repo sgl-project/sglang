@@ -629,6 +629,13 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and envs.SGLANG_AITER_UNIFIED_VERIFY.get()
         )
+        # A DSpark draft runner captures only target_verify, which on unified verify
+        # reads the page table instead of the flat CUDA-graph KV indices.
+        self._graph_reads_flat_kv_indices = not (
+            self._use_unified_verify
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+        )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -2944,7 +2951,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_cprr_empty_rows = torch.zeros(
                     (n_verify_rows,), dtype=torch.bool, device=self.device
                 )
-        if kv_indices_buf is None:
+        if kv_indices_buf is None and self._graph_reads_flat_kv_indices:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
@@ -2988,7 +2995,9 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        if not self.skip_prefill:
+        # Only the non-unified target_verify reads the custom mask.
+        self.cuda_graph_custom_mask = None
+        if not self.skip_prefill and not self._use_unified_verify:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
