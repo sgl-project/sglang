@@ -104,7 +104,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1890,6 +1890,9 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
+        kimi_k3_tool_grammar = (
+            self.chat_encoding_spec == "kimi_k3" and self.tool_call_parser == "kimi_k3"
+        )
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
@@ -1938,10 +1941,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 tool_call_constraint is None
                 and not required_parsed_natively
-                and not (
-                    self.chat_encoding_spec == "kimi_k3"
-                    and self.tool_call_parser == "kimi_k3"
-                )
+                and not kimi_k3_tool_grammar
                 and (
                     request.tool_choice == "required"
                     or isinstance(request.tool_choice, ToolChoice)
@@ -1953,14 +1953,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
-        elif (
-            effective_tools
-            and self.chat_encoding_spec == "kimi_k3"
-            and self.tool_call_parser == "kimi_k3"
-        ):
+        elif effective_tools and kimi_k3_tool_grammar:
             tool_call_constraint = (
                 "structural_tag",
-                get_kimik3_structural_tag(
+                KimiK3Detector().get_structural_tag(
                     effective_tools,
                     tool_choice="none",
                     thinking_mode=xgrammar_reasoning,
