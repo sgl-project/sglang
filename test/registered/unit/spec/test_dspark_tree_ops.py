@@ -427,5 +427,57 @@ class TreeAttentionContractTest(CustomTestCase):
         self.assertIsNotNone(out["tree_prefix"])
 
 
+class NodeCommitLaunchTest(CustomTestCase):
+    def _plan(self):
+        return tree_ops.NodePlan(
+            n=2,
+            max_q=2,
+            start=torch.zeros(2, dtype=torch.int32),
+            depths=torch.tensor([0, 1], dtype=torch.int64),
+            ancestors=torch.zeros((2, 2), dtype=torch.int64),
+            req_ids=torch.zeros(2, dtype=torch.int64),
+            query_cu=torch.arange(3, dtype=torch.int32),
+            hidden_ids=torch.arange(2, dtype=torch.int64),
+            token_index=torch.arange(2, dtype=torch.int64),
+        )
+
+    def test_prepare_commit_use_one_program_per_job(self):
+        calls = {}
+
+        class FakeLauncher:
+            def __init__(self, name):
+                self.name = name
+
+            def __getitem__(self, grid):
+                def launch(*args):
+                    calls[self.name] = (grid, args[-1])
+
+                return launch
+
+        fake_freeze = FakeLauncher("freeze")
+        fake_commit = FakeLauncher("commit")
+        descriptors = [(0, 1, 2, 4, 5, 6, 7, 8, 0, 1)] * 2
+        with mock.patch.object(
+            tree_ops,
+            "build_node_descriptors",
+            return_value=(descriptors, 16, 4),
+        ), mock.patch.object(
+            tree_ops,
+            "_node_commit_kernels",
+            return_value=(fake_freeze, fake_commit),
+        ):
+            prepared = tree_ops.prepare_nodes(
+                self._plan(),
+                [object()],
+                torch.zeros(2, dtype=torch.int64),
+                torch.ones(2, dtype=torch.bool),
+                torch.device("cpu"),
+            )
+            tree_ops.commit_nodes(prepared)
+
+        self.assertEqual(calls["freeze"], ((2,), 512))
+        self.assertEqual(calls["commit"], ((2,), 512))
+
+
 if __name__ == "__main__":
     unittest.main()

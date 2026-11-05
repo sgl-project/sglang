@@ -64,6 +64,7 @@ _TREE_BACKEND_ALIASES = {
     "sgl": "sgl_kernel_npu",
 }
 _TREE_OPS_LOADED = False
+_BYTE_BLOCK = 512
 
 __all__ = [
     "NodePlan",
@@ -1037,10 +1038,9 @@ def _node_commit_kernels():
         N: tl.constexpr,
         MAX_Q: tl.constexpr,
         BN: tl.constexpr,
-        BLOCK: tl.constexpr,
+        CBLOCK: tl.constexpr,
     ):
         job = tl.program_id(0)
-        row = tl.program_id(1)
         d = Desc + job * 10
         original = tl.load(d).to(tl.pointer_type(tl.uint8))
         row_stride = tl.load(d + 1)
@@ -1065,49 +1065,66 @@ def _node_commit_kernels():
         # ratio=1 denotes state; compressed KV is emitted at the window boundary.
         selected = selected & ((pos + 1) % ratio == 0)
         position = (pos + 1) // ratio - 1
-        col = position // rows
-        page = tl.load(table + req * width + col, (node < N) & (col < width), other=0)
+        row_of = position % rows
+        col_of = position // rows
+        page = tl.load(
+            table + req * width + col_of,
+            (node < N) & (col_of < width),
+            other=0,
+        )
         on_page = selected & (page == page_id)
         enabled = tl.sum(on_page.to(tl.int32), 0) > 0
-        if row == 0:
-            tl.store(PageActive + job, enabled)
-        if row < rows and enabled:
-            matches = (on_page & (position % rows == row)) != 0
+        tl.store(PageActive + job, enabled)
+        if enabled:
             # Ascending request priority, latest accepted depth within a request.
-            priority = tl.where(matches, (N - req) * (MAX_Q + 1) + depth, -1)
-            best = tl.max(priority, 0)
-            chosen = tl.max(tl.where(matches & (priority == best), node, -1), 0)
-            lanes = tl.arange(0, BLOCK)
-            for begin in tl.range(0, row_bytes, BLOCK):
-                offset = begin + lanes
-                old = tl.load(
-                    original + row * row_stride + offset, offset < row_bytes, other=0
-                )
-                value = tl.load(
-                    node_data + tl.maximum(chosen, 0) * row_bytes + offset,
-                    (offset < row_bytes) & (chosen >= 0),
-                    other=0,
-                )
-                tl.store(
-                    Staging + stage_offset + row * row_bytes + offset,
-                    tl.where(chosen >= 0, value, old),
-                    offset < row_bytes,
-                )
+            priority = (N - req) * (MAX_Q + 1) + depth
+            lanes = tl.arange(0, CBLOCK)
+            for r in tl.range(0, rows):
+                match = on_page & (row_of == r)
+                best = tl.max(tl.where(match, priority, -1), 0)
+                chosen = tl.max(tl.where(match & (priority == best), node, -1), 0)
+                for begin in tl.range(0, row_bytes, CBLOCK):
+                    offset = begin + lanes
+                    old = tl.load(
+                        original + r * row_stride + offset,
+                        offset < row_bytes,
+                        other=0,
+                    )
+                    value = tl.load(
+                        node_data + tl.maximum(chosen, 0) * row_bytes + offset,
+                        (offset < row_bytes) & (chosen >= 0),
+                        other=0,
+                    )
+                    tl.store(
+                        Staging + stage_offset + r * row_bytes + offset,
+                        tl.where(chosen >= 0, value, old),
+                        offset < row_bytes,
+                    )
 
     @triton.jit
-    def commit_node_pages(Desc, Staging, Active, BLOCK: tl.constexpr):
+    def commit_node_pages(Desc, Staging, Active, CBLOCK: tl.constexpr):
         job = tl.program_id(0)
-        row = tl.program_id(1)
         d = Desc + job * 10
-        if tl.load(Active + job) and row < tl.load(d + 3):
+        if tl.load(Active + job):
+            rows = tl.load(d + 3)
             target = tl.load(d).to(tl.pointer_type(tl.uint8))
             stride = tl.load(d + 1)
             size = tl.load(d + 2)
-            source = Staging + tl.load(d + 8) + row * size
-            lanes = tl.arange(0, BLOCK)
-            for begin in tl.range(0, size, BLOCK):
-                value = tl.load(source + begin + lanes, begin + lanes < size, other=0)
-                tl.store(target + row * stride + begin + lanes, value, begin + lanes < size)
+            stage = tl.load(d + 8)
+            lanes = tl.arange(0, CBLOCK)
+            for r in tl.range(0, rows):
+                for begin in tl.range(0, size, CBLOCK):
+                    offset = begin + lanes
+                    value = tl.load(
+                        Staging + stage + r * size + offset,
+                        offset < size,
+                        other=0,
+                    )
+                    tl.store(
+                        target + r * stride + offset,
+                        value,
+                        offset < size,
+                    )
 
     _NODE_COMMIT_KERNELS = (freeze_node_pages, commit_node_pages)
     return _NODE_COMMIT_KERNELS
@@ -1129,7 +1146,7 @@ def prepare_nodes(plan: NodePlan, records: list[NodeRecord], winners, active, de
     staging = torch.empty(total, dtype=torch.uint8, device=device)
     enabled = torch.empty(len(descriptors), dtype=torch.bool, device=device)
     bn = 1 << max(int(plan.n) - 1, 0).bit_length()
-    freeze_node_pages[(len(descriptors), max_rows)](
+    freeze_node_pages[(len(descriptors),)](
         desc,
         plan.ancestors,
         plan.depths,
@@ -1145,7 +1162,7 @@ def prepare_nodes(plan: NodePlan, records: list[NodeRecord], winners, active, de
         # can be larger when budget > depth).
         int(plan.ancestors.shape[1]),
         bn,
-        256,
+        _BYTE_BLOCK,
     )
     return desc, staging, enabled, max_rows
 
@@ -1155,7 +1172,7 @@ def commit_nodes(prepared) -> None:
     _, commit_node_pages = _node_commit_kernels()
     desc, staging, enabled, max_rows = prepared
     if desc.shape[0]:
-        commit_node_pages[(len(desc), max_rows)](desc, staging, enabled, 256)
+        commit_node_pages[(len(desc),)](desc, staging, enabled, _BYTE_BLOCK)
 
 
 # ---------------------------------------------------------------------------
