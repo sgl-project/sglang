@@ -220,9 +220,7 @@ class DSANPUIndexerMixin:
         )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
-            if is_prefill
-            and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
-            and not uses_prefill_cp
+            if is_prefill and not uses_prefill_cp
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
