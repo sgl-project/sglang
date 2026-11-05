@@ -11,9 +11,8 @@ from unittest.mock import patch
 
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 NV_MEGA_RUNTIME_CHILDREN = (
@@ -56,6 +55,13 @@ RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC": "SGLANG_Q35MF_EDGE_SHM_SYNC",
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST": "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP": "SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
+}
+
+RENAMED_ENVS = {
+    **RENAMED_NV_MEGA_RUNTIME_CHILDREN,
+    # The Kimi-K3 cookbook still sets these old ROCm names.
+    "SGLANG_OPT_HIP_K3_AITER": "SGLANG_AITER_K3_OPT",
+    "SGLANG_OPT_HIP_K3_RADIX4_TOPK": "SGLANG_K3_RADIX4_TOPK",
 }
 
 
@@ -209,7 +215,7 @@ class TestRenamedEnvAliases(unittest.TestCase):
         return field, value, deprecations
 
     def test_former_name_applies_with_a_deprecation_warning(self):
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
+        for new, old in RENAMED_ENVS.items():
             with self.subTest(new=new):
                 field, value, deprecations = self._read(new, {old: "1"})
                 self.assertEqual(field.deprecated_name, old)
@@ -218,7 +224,7 @@ class TestRenamedEnvAliases(unittest.TestCase):
                 self.assertIn(new, str(deprecations[0].message))
 
     def test_new_name_wins_over_former_name(self):
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
+        for new, old in RENAMED_ENVS.items():
             with self.subTest(new=new):
                 _, value, deprecations = self._read(new, {old: "1", new: "0"})
                 self.assertIs(value, False)
@@ -262,56 +268,6 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
         self.assertEqual(os.environ[new_name], "ABC")
-
-
-class TestKimiK3HipEnvAliases(CustomTestCase):
-    """Launch scripts and the Kimi-K3 cookbook still set the pre-rename Kimi-K3
-    ROCm names, so each must keep reaching its new descriptor."""
-
-    # (new name, deprecated name, old raw, old parsed, new raw, new parsed);
-    # the old value is non-default so a read that ignores the alias shows up.
-    ALIASES = [
-        ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True, "0", False),
-        (
-            "SGLANG_OPT_HIP_K3_RADIX4_TOPK",
-            "SGLANG_K3_RADIX4_TOPK",
-            "1",
-            True,
-            "0",
-            False,
-        ),
-    ]
-
-    def _get(self, name):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            value = getattr(envs, name).get()
-        return value, [w for w in caught if w.category is DeprecationWarning]
-
-    def test_deprecated_name_is_read_with_warning(self):
-        for new_name, old_name, old_raw, old_value, _, _ in self.ALIASES:
-            # The old name has no descriptor, and patch.dict also drops the copy
-            # the alias fallback writes to the new name.
-            with self.subTest(new_name), patch.dict(os.environ):
-                getattr(envs, new_name).clear()
-                os.environ[old_name] = old_raw
-                value, deprecations = self._get(new_name)
-                self.assertEqual(value, old_value)
-                self.assertEqual(len(deprecations), 1)
-                self.assertIn(old_name, str(deprecations[0].message))
-                self.assertIn(new_name, str(deprecations[0].message))
-
-    def test_new_name_wins_over_deprecated_name(self):
-        for new_name, old_name, old_raw, _, new_raw, new_value in self.ALIASES:
-            with (
-                self.subTest(new_name),
-                patch.dict(os.environ),
-                getattr(envs, new_name).override(new_raw),
-            ):
-                os.environ[old_name] = old_raw
-                value, deprecations = self._get(new_name)
-                self.assertEqual(value, new_value)
-                self.assertEqual(deprecations, [])
 
 
 if __name__ == "__main__":
