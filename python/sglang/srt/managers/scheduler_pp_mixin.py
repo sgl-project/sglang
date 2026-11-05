@@ -513,19 +513,9 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(send_release_work)
 
-                # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
-                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        d2h_event.synchronize()
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                    else:
-                        # No result to process, but its launch was counted.
-                        self._on_step_processed(self.mbs[next_mb_id])
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-
+                # Send the current activation before waiting for the next
+                # microbatch's CPU results. Keep control-message order and the
+                # proxy-send fence that protects CUDA Graph output reuse.
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -541,6 +531,19 @@ class SchedulerPPMixin:
                     )
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self._pp_send_proxy_to_next_stage(result)
+
+                # post-process the coming microbatch
+                if self.mbs[next_mb_id] is not None:
+                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
+                        d2h_event.synchronize()
+                        self._pp_process_batch_result(
+                            self.mbs[next_mb_id],
+                            next_batch_result,
+                        )
+                    else:
+                        # No result to process, but its launch was counted.
+                        self._on_step_processed(self.mbs[next_mb_id])
+                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -1522,7 +1525,14 @@ class SchedulerPPMixin:
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
+                # Read back ready decode IDs before later PP sends add work
+                # to the scheduler stream. Keep the relay/future-map IDs on
+                # device; the result processor waits on copy_done before use.
                 if (
+                    target.forward_mode.is_decode()
+                    and target.spec_algorithm.is_none()
+                    and batch_result.next_token_ids.is_cuda
+                ) or (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
                 ):
