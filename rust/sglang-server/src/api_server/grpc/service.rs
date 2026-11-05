@@ -319,6 +319,7 @@ mod tests {
                     startup_ready,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(&ServerArgs {
                         served_model_name: "test-model".into(),
@@ -661,6 +662,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,

@@ -415,8 +415,8 @@ The registry contains `nv-extra`, selecting `pr-test-extra.yml` with
 `run-ci-nv-extra`, and `amd-extra`, selecting `pr-test-amd-extra.yml` with
 `run-ci-amd-extra`. NVIDIA/shared Extra includes its existing Xeon CPU coverage.
 The `nv` and `amd` entries select Base workflows; `mlu` selects `pr-test-mlu.yml`
-with `run-ci-mlu`. PPU is not registered; its workflow uses `run-ci` and
-`run-ci-ppu` labels plus PPU path filters.
+with `run-ci-mlu`, and `ppu` selects `pr-test-ppu.yml` with `run-ci-ppu`.
+PPU retains its existing path filters.
 
 `/run-extra-ci <hardware>` and `/run-full-ci <hardware>` require exactly one
 `nv` or `amd` argument. Full combines the matching Base and Extra tiers. Missing,

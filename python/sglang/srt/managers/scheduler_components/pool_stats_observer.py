@@ -10,6 +10,8 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import ceil_align
@@ -237,6 +239,8 @@ class SchedulerPoolStatsObserver:
 
     def _get_token_info(self, full: SubPoolUsage) -> PoolStats:
         available_size = full.available
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.tree_cache.evictable_size()
         num_used = full.capacity - (available_size + evictable_size)
         token_usage = num_used / full.capacity
@@ -308,6 +312,11 @@ class SchedulerPoolStatsObserver:
     def _get_swa_token_info(self, full: SubPoolUsage, swa: SubPoolUsage) -> PoolStats:
         full_capacity, full_available_size = full.capacity, full.available
         swa_capacity, swa_available_size = swa.capacity, swa.available
+        if is_cp_sharded_padded():
+            full_capacity = from_cp_sharded(full_capacity)
+            full_available_size = from_cp_sharded(full_available_size)
+            swa_capacity = from_cp_sharded(swa_capacity)
+            swa_available_size = from_cp_sharded(swa_available_size)
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         # Per-request SWA ring: released with the req slot, yet cached radix

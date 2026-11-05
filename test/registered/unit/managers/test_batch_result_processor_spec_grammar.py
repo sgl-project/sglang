@@ -353,6 +353,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             tree.supports_mamba.return_value = True
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
+            tree.logical_page_size = 1
             processor = replace(
                 _make_processor(),
                 tree_cache=tree,

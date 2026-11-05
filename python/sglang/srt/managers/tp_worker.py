@@ -25,6 +25,8 @@ from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -553,6 +555,8 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.effective_logical_max_total_num_tokens
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
+        if is_cp_sharded_padded():
+            kv_capacity = from_cp_sharded(kv_capacity)
         # Not an error: a deployment that never sends max-length requests may
         # want a small pool. Checked here because this is the final served value.
         if kv_capacity < self.model_config.context_len:

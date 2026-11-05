@@ -557,6 +557,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_layer_partition",
     "engram_config",
     "moe_ascend_ops_config",
+    "cp_kv_layout",
     # Kimi-K3.1 additions, appended to keep existing positional slots
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",
