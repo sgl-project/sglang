@@ -202,6 +202,8 @@ def launch(
         sin_cache,
         True,  # is_neox
         True,  # is_nope_first
-        compute_all_q_rope=False,
+        # Write Q for slot < 0 tokens too, as the split chain and the Triton kernel do;
+        # only their KV cache write is skipped.
+        compute_all_q_rope=True,
     )
     return out

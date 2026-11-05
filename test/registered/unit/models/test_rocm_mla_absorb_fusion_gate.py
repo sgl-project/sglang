@@ -194,8 +194,9 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
     """forward_absorb_rocm_core consults the writer only for non-DCP decode
     and target-verify; every other step keeps the split chain."""
 
-    def _call(self, *, mode, dcp_enabled=False):
+    def _call(self, *, mode, dcp_enabled=False, owner=True):
         writer = mock.Mock()
+        kv_layer = SimpleNamespace(owner=owner, key=lambda: None)
         attn = SimpleNamespace(
             rocm_mla_q_cache_writer=writer,
             attn_mqa=SimpleNamespace(layer_id=0, k_scale_float=1.0),
@@ -214,7 +215,11 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
             ),
-            mock.patch.object(forward_mla_rocm, "get_kv_layers"),
+            mock.patch.object(
+                forward_mla_rocm,
+                "get_kv_layers",
+                return_value=SimpleNamespace(read=lambda _: kv_layer),
+            ),
         ):
             result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
                 attn,
@@ -243,6 +248,13 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
                 result, write = self._call(mode=mode, dcp_enabled=dcp_enabled)
                 self.assertIsNone(result)
                 write.assert_not_called()
+
+    def test_non_owner_sub_pool_keeps_the_split_chain(self):
+        """The writer scatters at out_cache_loc, but a non-owner sub-pool's layer
+        is written at the batch's swa_loc; fusing it would write the wrong rows."""
+        result, write = self._call(mode="decode", owner=False)
+        self.assertIsNone(result)
+        write.assert_not_called()
 
 
 if __name__ == "__main__":

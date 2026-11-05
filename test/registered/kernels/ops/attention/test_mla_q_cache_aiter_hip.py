@@ -89,12 +89,15 @@ def test_fused_mla_q_cache_identity_rope(tokens, cache_dtype, output_dtype):
 
 
 def test_fused_mla_q_cache_skips_negative_slots():
+    """A slot < 0 token skips only its KV cache write; its Q row must still be
+    written, as the split chain and the Triton kernel write it."""
     values = _inputs(4)
     values["slot_mapping"][-2:] = -1
+    values["out"].fill_(float("nan"))
     expected_q, expected_k = _reference(values)
     mla_q_cache_aiter_hip.run(**values)
     torch.cuda.synchronize()
-    torch.testing.assert_close(values["out"][:2], expected_q[:2])
+    torch.testing.assert_close(values["out"], expected_q)
     torch.testing.assert_close(values["kv_cache"][:2], expected_k[:2])
     assert torch.count_nonzero(values["kv_cache"][2:]).item() == 0
 
