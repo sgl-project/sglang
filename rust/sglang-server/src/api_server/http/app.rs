@@ -291,6 +291,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 peer_endpoints: Vec::new(),
+                generate_validator: None,
             },
         );
         let (failure_tx, failure_rx) = flume::bounded(1);
@@ -343,6 +344,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     peer_endpoints: Vec::new(),
+                    generate_validator: None,
                 },
             );
             let (failure_tx, failure_rx) = flume::bounded(1);

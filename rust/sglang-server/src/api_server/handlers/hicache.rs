@@ -210,6 +210,7 @@ mod tests {
                 metadata: CoreMetadata::default(),
                 metrics: None,
                 request_log: None,
+                generate_validator: None,
             },
         );
         let mut args = ServerArgs::default();

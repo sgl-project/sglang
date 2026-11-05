@@ -367,6 +367,7 @@ mod tests {
                     }),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             );
             Self {
@@ -747,6 +748,7 @@ mod tests {
                 metadata: CoreMetadata::default(),
                 metrics: None,
                 request_log: None,
+                generate_validator: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
@@ -785,6 +787,48 @@ mod tests {
             .expect("empty input_ids must be rejected");
         assert_eq!(error.code(), Code::InvalidArgument);
         assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    /// The launch's generate validator refuses a batch whole, as on HTTP: no
+    /// item reaches the scheduler, the valid one included.
+    #[tokio::test]
+    async fn generate_validator_refuses_the_whole_batch_before_submission() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 2,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                metrics: None,
+                request_log: None,
+                generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+            },
+        );
+        let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
+        let request = api::GenerateRequest {
+            text: Some(many_strings(&["a", "b"])),
+            top_logprobs_num: Some(api::Int64OrList {
+                value: Some(api::int64_or_list::Value::Many(api::Int64List {
+                    items: vec![1, 2],
+                })),
+            }),
+            ..Default::default()
+        };
+        let error = service
+            .generate(Request::new(request))
+            .await
+            .err()
+            .expect("the validator must refuse the batch");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.message(), "top_logprobs_num 2");
+        assert!(intake_rx.is_empty());
     }
 
     /// A list-form request fans out like the HTTP batch: every item is tagged

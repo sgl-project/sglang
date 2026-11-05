@@ -162,6 +162,12 @@ async fn submit_generation(
             "service unavailable",
             stream,
         )),
+        // Admission refused the request (the launch's `GenerateValidator`, or
+        // a media client error) before any frame: Python answers the
+        // tokenizer manager's `ValueError` with a unary 400, for a stream too.
+        Err(CoreError::InvalidArgument(message)) => {
+            Err(openai_error(StatusCode::BAD_REQUEST, message, false))
+        }
         Err(error) => Err(openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             error.to_string(),

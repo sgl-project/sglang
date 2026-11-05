@@ -1137,6 +1137,7 @@ mod tests {
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1185,6 +1186,7 @@ mod tests {
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1232,6 +1234,7 @@ mod tests {
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -1277,6 +1280,7 @@ mod tests {
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
                 request_log: None,
+                generate_validator: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1367,6 +1371,7 @@ mod tests {
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
                 request_log: None,
+                generate_validator: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1620,6 +1625,139 @@ mod tests {
         }
     }
 
+    /// The launch's generate validator refuses at every ingress before
+    /// anything is submitted, a batch's valid items included: native
+    /// `/generate` with its 400 (a stream's error frame), and the OpenAI
+    /// routes with their 400, unary even for a stream, as Python answers the
+    /// tokenizer manager's `ValueError` before the stream starts.
+    #[tokio::test]
+    async fn generate_validator_refuses_every_ingress_before_submission() {
+        let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
+        let openai = serde_json::json!({
+            "object": "error",
+            "message": "top_logprobs_num 2",
+            "type": "BadRequestError",
+            "param": null,
+            "code": 400,
+        });
+        let generate = |text: serde_json::Value, top_logprobs_num, stream| {
+            serde_json::json!({
+                "text": text,
+                "stream": stream,
+                "return_logprob": true,
+                "top_logprobs_num": top_logprobs_num,
+            })
+        };
+        let completion = |stream| {
+            serde_json::json!({
+                "model": "m",
+                "prompt": [1, 2],
+                "logprobs": 2,
+                "max_tokens": 1,
+                "stream": stream,
+            })
+        };
+        for (uri, body, status, error) in [
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    false,
+                ),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    true,
+                ),
+                StatusCode::OK,
+                &native,
+            ),
+            (
+                "/generate",
+                generate(serde_json::json!("x"), serde_json::json!(2), false),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/v1/completions",
+                completion(false),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
+            (
+                "/v1/completions",
+                completion(true),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
+        ] {
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = crate::api_server::handlers::CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    peer_endpoints: Vec::new(),
+                    generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                },
+            );
+            let state = Arc::new(AppState {
+                core,
+                server_args: Arc::new(crate::message::config::ServerArgs {
+                    served_model_name: "m".into(),
+                    ..Default::default()
+                }),
+                generation_policy: GenerationPolicy::default(),
+                chat_formatter: None,
+                generate_hook: None,
+                openai_chat: None,
+            });
+            let case = format!("{uri} {body}");
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = routes()
+                .merge(super::super::openai::routes())
+                .with_state(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            let first = body
+                .strip_prefix("data: ")
+                .unwrap_or(body)
+                .lines()
+                .next()
+                .unwrap();
+            assert_eq!(&parse(first)["error"], error, "{case}");
+            assert!(
+                intake_rx.is_empty(),
+                "{case}: an item reached the scheduler"
+            );
+        }
+    }
+
     /// A hook's keys reach every native frame of every request — unary,
     /// cumulative and incremental streams, single and batch — each request's
     /// hook started from its own sampling params, with the scheduler's decode
@@ -1683,6 +1821,7 @@ mod tests {
                     metadata: crate::api_server::handlers::CoreMetadata::from(&server_args),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             );
             let top_p_hook = TopPHook::default();

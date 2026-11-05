@@ -1690,6 +1690,7 @@ mod tests {
                     metadata: CoreMetadata::from(args.as_ref()),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             );
             let state = Arc::new(super::super::AppState {

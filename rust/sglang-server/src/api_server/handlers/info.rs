@@ -142,6 +142,7 @@ mod tests {
                     ..Default::default()
                 },
                 request_log: None,
+                generate_validator: None,
             },
         );
 
@@ -193,6 +194,7 @@ mod tests {
                 },
                 peer_endpoints: vec![DummyTarget::replying(&[0], move |_| Ok(envelope(2.5)))],
                 request_log: None,
+                generate_validator: None,
             },
         );
 
