@@ -2,6 +2,7 @@ import json
 import sys
 import threading
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
@@ -40,6 +41,7 @@ from sglang.test.scheduler_test_utils import (
     FakeReq,
     decode_queue,
     empty_request_lists,
+    release_only_retirer,
 )
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -85,6 +87,10 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = MagicMock()
         req.kv.holds_kv = req.kv.holds_mamba = False
         req.kv.retraction_backup = None
+        req.finished_reason = None
+        req.finish_outside_step.side_effect = lambda reason: setattr(
+            req, "finished_reason", reason
+        )
         req.priority = priority
         req.rid = "req"
         req.output_ids = []
@@ -367,11 +373,16 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.pending_bootstrap = True
         req.metadata_buffer_index = -1
         req.cache_request_handle = object()
+        req.session = None
+        req.get_mm_token_counts = MagicMock()
+        req.release_mm_inputs_on_abort = MagicMock()
         req.kv.holds_kv = True
         req.kv.holds_mamba = False
+        req.kv.retraction_backup = None
         cache.finish = MagicMock()
         scheduler = SimpleNamespace(
             tree_cache=cache,
+            request_retirer=release_only_retirer(cache),
             clear_pending_chunk_send=MagicMock(),
             ps=SimpleNamespace(tp_rank=0),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
@@ -379,13 +390,21 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             enable_hicache_storage=False,
         )
+        scheduler.release_prefill_sender = partial(
+            SchedulerDisaggregationPrefillMixin.release_prefill_sender, scheduler
+        )
 
         with (
             envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True),
             patch(
-                "sglang.srt.disaggregation.prefill.release_kv_cache"
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
             ) as release_kv_cache,
-            patch("sglang.srt.disaggregation.prefill.prepare_abort"),
+            patch(
+                "sglang.srt.disaggregation.prefill.prepare_abort",
+                side_effect=lambda req, *a, **kw: setattr(
+                    req, "finished_reason", FINISH_ABORT()
+                ),
+            ),
             patch(
                 "sglang.srt.disaggregation.prefill.get_parallel",
                 return_value=SimpleNamespace(tp_rank=0),
@@ -441,47 +460,24 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         scheduler.checkpoint_disagg_prefill.assert_called_once_with(req)
 
-    def test_waiting_abort_releases_without_insert(self):
-        scheduler = SimpleNamespace(
-            tree_cache=MagicMock(),
-            req_to_metadata_buffer_idx_allocator=MagicMock(),
-            clear_pending_chunk_send=MagicMock(),
-        )
-        sender = MagicMock()
-        req = SimpleNamespace(
-            disagg_kv_sender=sender,
-            metadata_buffer_index=3,
-            kv=SimpleNamespace(
-                holds_kv=True, holds_mamba=False, retraction_backup=None
-            ),
-            pending_bootstrap=True,
-        )
-
-        with patch(
-            "sglang.srt.disaggregation.prefill.release_kv_cache"
-        ) as release_kv_cache:
-            SchedulerDisaggregationPrefillMixin.release_aborted_prefill_waiting_req(
-                scheduler, req
-            )
-
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, checkpoint=False
-        )
-        sender.abort.assert_called_once()
-        self.assertFalse(req.pending_bootstrap)
-
-    def test_scheduler_waiting_abort_delegates_release_once(self):
+    def test_scheduler_waiting_abort_releases_once_without_insert(self):
         scheduler = Scheduler.__new__(Scheduler)
         empty_request_lists(scheduler)
         scheduler.mm_receiver = None
-        scheduler.waiting_queue.join([MagicMock(rid="req")])
+        req = MagicMock(rid="req", metadata_buffer_index=3, pending_bootstrap=True)
+        req.finished_reason = None
+        req.finish_outside_step.side_effect = lambda reason: setattr(
+            req, "finished_reason", reason
+        )
+        scheduler.waiting_queue.join([req])
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
         scheduler.output_streamer = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        scheduler.release_aborted_prefill_waiting_req = MagicMock()
+        scheduler.disagg_prefill_pending_chunk_rids = {"req"}
+        scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
         scheduler.hisparse_coordinator = None
@@ -496,9 +492,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             get_serving.return_value.weight_version = None
             scheduler.abort_request(AbortReq(rid="req"))
 
-        scheduler.release_aborted_prefill_waiting_req.assert_called_once()
+        req.disagg_kv_sender.abort.assert_called_once()
+        self.assertFalse(req.pending_bootstrap)
         scheduler.tree_cache.finish.assert_called_once()
-        release.assert_not_called()
+        release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
 
 
 class TestDecodePreallocQueuePriority(CustomTestCase):

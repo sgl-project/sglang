@@ -18,7 +18,13 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
+from sglang.srt.managers.scheduler_components import (  # noqa: E402
+    request_retirer as retirer_mod,
+)
+from sglang.test.scheduler_test_utils import (  # noqa: E402
+    empty_request_lists,
+    release_only_retirer,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -32,8 +38,10 @@ class _FakeReq:
 
     def __init__(self, rid: str):
         self.rid = rid
-        # Mirrors Req.kv; the abort paths read only these two predicates.
-        self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
+        # Mirrors Req.kv; the abort paths read only these fields.
+        self.kv = SimpleNamespace(
+            holds_kv=True, holds_mamba=False, retraction_backup=None
+        )
         self.to_finish = None
         self._finished = False
         self.discard_output_reason = None
@@ -42,6 +50,7 @@ class _FakeReq:
         self.weight_version_events = []
         self.prefill_weight_versions = None
         self.time_stats = Mock()
+        self.cache_request_handle = None
 
     def finished(self):
         return self._finished
@@ -83,12 +92,10 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         req = _FakeReq("failed_load")
         req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.release_aborted_request = Mock()
-        sched.tree_cache = None
+        sched.request_retirer = Mock()
         sched.ipc_channels = Mock()
 
-        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
-            sched.process_pending_chunked_abort()
+        sched.process_pending_chunked_abort()
 
         self.assertEqual(req.finished_reason.status_code, 503)
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
@@ -97,11 +104,15 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def test_aborted_chunked_beam_leader_retires_its_group(self):
         req = _FakeReq("beam_leader")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.release_aborted_request = Mock()
-        sched.tree_cache = None
+        sched.request_retirer = release_only_retirer(
+            Mock(), beam_coordinator=sched.beam_coordinator
+        )
         sched.ipc_channels = Mock()
 
-        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache"),
+        ):
             sched.process_pending_chunked_abort()
 
         sched.beam_coordinator.retire_group.assert_called_once_with(req)
@@ -110,19 +121,21 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         # Each chunk's extend allocates HiSparse spec scratch for the row.
         req = _FakeReq("hisparse_chunked")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.release_aborted_request = Mock()
-        sched.tree_cache = None
         sched.ipc_channels = Mock()
-        sched.enable_hisparse = True
         calls = []
-        sched.hisparse_coordinator = Mock()
-        sched.hisparse_coordinator.request_finished.side_effect = lambda req: (
-            calls.append(("hisparse", req))
+        hisparse_coordinator = Mock()
+        hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
+            ("hisparse", req)
         )
+        sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
 
-        with patch(
-            "sglang.srt.managers.scheduler.release_kv_cache",
-            side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(
+                retirer_mod,
+                "release_kv_cache",
+                side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
+            ),
         ):
             sched.process_pending_chunked_abort()
 
