@@ -47,6 +47,45 @@ def pd_first_draft_proposal(topk_index: torch.Tensor, vocab_size: int) -> torch.
     return probs
 
 
+def snapshot_retracted_eagle_input(req, batch_index, batch, future_map) -> None:
+    """Keep the current draft relay when PD decode releases a request row."""
+    if batch.enable_overlap:
+        row = req.kv.req_pool_idx
+        topk_p = future_map.topk_p_buf[row]
+        topk_index = future_map.topk_index_buf[row]
+        hidden_states = (
+            future_map.hidden_states_buf[row]
+            if future_map.hidden_states_buf is not None
+            else None
+        )
+        draft_probs = (
+            future_map.draft_probs_buf[row]
+            if future_map.draft_probs_buf is not None
+            else None
+        )
+    else:
+        info = batch.spec_info
+        topk_p = info.topk_p[batch_index]
+        topk_index = info.topk_index[batch_index]
+        hidden_states = (
+            info.hidden_states[batch_index] if info.hidden_states is not None else None
+        )
+        draft_probs = (
+            info.draft_probs[batch_index] if info.draft_probs is not None else None
+        )
+
+    # Rows can be reused as soon as release_req returns; copy to owned storage.
+    req.output_topk_p = topk_p.detach().cpu().clone()
+    req.output_topk_index = topk_index.detach().cpu().clone()
+    # Multi-layer EAGLE does not relay hidden states. Retain the existing
+    # prefill placeholder when this algorithm does not use that component.
+    if hidden_states is not None:
+        req.hidden_states_tensor = hidden_states.detach().cpu().clone()
+    req.retraction_draft_probs = (
+        draft_probs.detach().cpu().clone() if draft_probs is not None else None
+    )
+
+
 def build_eagle_disagg_draft_input(
     batch: ScheduleBatch,
     last_tokens_tensor: torch.Tensor,
@@ -135,6 +174,11 @@ def build_eagle_disagg_draft_input(
         draft_probs = pd_first_draft_proposal(topk_index, batch.model_config.vocab_size)
         if not spec.enable_multi_layer_eagle:
             draft_probs = draft_probs[:, 0]
+        for i, req in enumerate(batch.reqs):
+            saved = getattr(req, "retraction_draft_probs", None)
+            if saved is not None:
+                draft_probs[i].copy_(saved.to(device=draft_probs.device))
+                req.retraction_draft_probs = None
 
     spec_info = EagleDraftInput(
         topk_p=topk_p,

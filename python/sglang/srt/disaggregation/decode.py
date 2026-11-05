@@ -3689,8 +3689,14 @@ class SchedulerDisaggregationDecodeMixin:
         if running_batch.is_empty():
             ret = None
         else:
-            running_batch = self.update_running_batch(running_batch)
-            ret = running_batch if not running_batch.is_empty() else None
+            updated = self.update_running_batch(running_batch)
+            if updated is None:
+                # The overlap loop needs an idle scheduling turn to commit a
+                # queued result before the current batch can be retracted.
+                ret = None
+            else:
+                running_batch = updated
+                ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
