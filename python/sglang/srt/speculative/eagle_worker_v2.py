@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_postprocess,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
@@ -1374,7 +1375,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
+        self._adaptive_sync_group: Optional[GroupCoordinator] = None
         if get_spec().speculative_adaptive and self._hosts_draft:
+            # The target TP group, read before any draft context narrows it: the
+            # memory-budget decision must be identical on every rank that captures.
+            self._adaptive_sync_group = get_parallel().tp_group
             self.adaptive_controller = AdaptiveController(
                 self,
                 AdaptiveSpeculativeParams(
@@ -1468,6 +1473,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
+                    memory_budget_gb=get_spec().speculative_adaptive_memory_budget_gb,
                 )
 
     def forward_batch_generation(
@@ -1910,14 +1916,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        state.gpu_memory_gb = self._max_across_tp(max(before_mem - after_mem, 0.0))
         log_info_on_rank0(
             logger,
             f"Built adaptive runtime state steps={speculative_num_steps}: "
             f"elapsed={time.perf_counter() - tic:.2f}s, "
-            f"mem={(before_mem - after_mem):.2f}GB",
+            f"mem={state.gpu_memory_gb:.2f}GB",
         )
 
         return state
+
+    def _max_across_tp(self, value: float) -> float:
+        group = self._adaptive_sync_group
+        if group is None or group.world_size == 1:
+            return value
+        tensor = torch.tensor([value], dtype=torch.float64)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+        )
+        return tensor.item()
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         """Apply a pre-built runtime state to this worker."""

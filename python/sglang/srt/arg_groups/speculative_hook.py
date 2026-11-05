@@ -268,6 +268,18 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         if cfg.speculative_adaptive:
             _init_adaptive_speculative_params(server_args)
 
+    budget_gb = cfg.speculative_adaptive_memory_budget_gb
+    if budget_gb is not None:
+        if budget_gb < 0:
+            raise ValueError(
+                f"--speculative-adaptive-memory-budget-gb must be >= 0, got {budget_gb}"
+            )
+        if not cfg.speculative_adaptive:
+            logger.warning(
+                "--speculative-adaptive-memory-budget-gb has no effect without "
+                "adaptive speculative decoding"
+            )
+
     if algo is not None:
         # Imported here and not above: the name is only bound inside the
         # `speculative_algorithm is not None` branch, and this runs either way.
