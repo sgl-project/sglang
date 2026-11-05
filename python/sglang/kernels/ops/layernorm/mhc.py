@@ -2138,9 +2138,9 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    from sgl_kernel_npu.operators.norm import mhc_pre
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
 
-    y, post, comb = mhc_pre(
+    y, post, comb = mhc_pre_dpskv4(
         x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
     )
     return y, post, comb, False
