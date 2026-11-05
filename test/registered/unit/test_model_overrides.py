@@ -63,6 +63,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     moe_dp_size=1,
                     cp_strategy=None,
                     cp_kv_layout=None,
+                    enable_unified_memory=False,
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
@@ -991,6 +992,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     *qwen4, config_extra=compressed, qsa_indexer_dtype=name
                 )
                 self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), name)
+
+    def test_nemotron3_embedding_rejects_rocm(self):
+        """The ROCm default attention backend ignores ENCODER_ONLY layers, so
+        Nemotron-3-Embed must fail at startup there, not return causal embeddings."""
+        # The checkpoint is a bare Ministral3Model; ModelConfig renames it.
+        nemotron3 = ("Ministral3Model", "ministral3")
+        embedding_fields = {"is_causal": False, "pooling": "avg"}
+        with override_platform(is_cuda=True):
+            self._construct(*nemotron3, config_extra=embedding_fields)
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                self._construct(*nemotron3, config_extra=embedding_fields)
+            # Generative Ministral3 checkpoints are unaffected.
+            self._construct(*nemotron3)
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")

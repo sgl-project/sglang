@@ -3,6 +3,7 @@ import re
 import unittest
 from unittest.mock import patch
 
+import sgl_kernel  # noqa: F401
 import torch
 
 kernel = torch.ops.sgl_kernel

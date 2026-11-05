@@ -33,7 +33,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
@@ -2517,6 +2516,8 @@ class MMReceiverBase(ABC):
             on_dispatch_error(dispatch_error)
 
     def create_req(self, recv_req: TokenizedGenerateReqInput):
+        from sglang.srt.managers.schedule_batch import Req
+
         req = Req(
             recv_req.rid,
             recv_req.input_text,
