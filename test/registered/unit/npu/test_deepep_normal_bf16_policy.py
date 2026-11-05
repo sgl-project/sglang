@@ -82,17 +82,21 @@ class TestNormalBf16Policy(CustomTestCase):
                 "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
                 return_value=False,
             ),
-            patch.object(deepep, "get_deepep_output_dtype", return_value=Dtype.INT8),
             patch.dict(os.environ, {"DEEP_NORMAL_MODE_USE_INT8_QUANT": "1"}),
         ):
-            with self.assertRaisesRegex(
-                ValueError, "DEEP_NORMAL_MODE_USE_INT8_QUANT=0"
-            ):
-                self.dispatcher("normal", Dtype.INT8)
-            self.assertEqual(
-                self.dispatcher("low_latency", Dtype.INT8).deepep_output_dtype,
-                Dtype.INT8,
-            )
+            for dtype in (Dtype.BF16, Dtype.INT8, Dtype.FP8):
+                with (
+                    self.subTest(dtype=dtype),
+                    patch.object(deepep, "get_deepep_output_dtype", return_value=dtype),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "DEEP_NORMAL_MODE_USE_INT8_QUANT=0"
+                    ):
+                        self.dispatcher("normal", dtype)
+                    self.assertEqual(
+                        self.dispatcher("low_latency", dtype).deepep_output_dtype,
+                        dtype,
+                    )
 
     def test_selected_cli_dtype_and_quant_config_refresh(self):
         with (
