@@ -2718,20 +2718,10 @@ def test_swa_backup_resolves_relocated_full_virtual_ids(backend, unified, entryp
         )
     assert swa.nodes_to_load == [nodes[0], nodes[2]]
     assert swa.device_indices.dtype == torch.int64
-    assert swa.device_indices.tolist() == (
-        [511, 407, 613] if unified else [111, 107, 113]
-    )
-    if unified:
-        allocator.translate_swa_indices_for_transfer.assert_called_once()
-        assert allocator.translate_swa_indices_for_transfer.call_args.args[
-            0
-        ].tolist() == [
-            11,
-            7,
-            13,
-        ]
-    else:
-        allocator.translate_swa_indices_for_transfer.assert_not_called()
+    # A unified pool's window copy names its rows by the owner's ids and
+    # translates them when submitted, so a relocation before then is seen.
+    assert swa.device_indices.tolist() == ([11, 7, 13] if unified else [111, 107, 113])
+    allocator.translate_swa_indices_for_transfer.assert_not_called()
     assert core.get_component_device_value(nodes[0], ComponentType.SWA).tolist() == [
         111,
         107,
@@ -5023,7 +5013,7 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
         total_bytes=4096,
         enable_memory_saver=False,
         need_sort=False,
-        lazy_compaction=False,
+        lazy_compaction=True,
     )
     allocator = bundle.token_to_kv_pool_allocator
     padding = allocator.alloc(4)
@@ -5065,11 +5055,11 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
     assert full_indices.numel() == 0
     (swa_transfer,) = transfers[ComponentType.SWA]
     assert swa_transfer.nodes_to_load == [source_id for source_id, _ in sources]
+    # The unified pool's window copy names its rows by the owner's ids; it
+    # translates them when submitted.
     assert torch.equal(
         swa_transfer.device_indices,
-        allocator.translate_swa_indices_for_transfer(
-            torch.cat([source_values for _, source_values in sources])
-        ),
+        torch.cat([source_values for _, source_values in sources]).to(torch.int64),
     )
 
 

@@ -47,15 +47,18 @@ STATE_CHAINS = ("mamba", "mamba_mla", "tri")
 
 
 class TraceConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """One traced allocator: its chain and page size. A unified chain
+    compacts lazily (its ends compact only when asked), so every trace runs
+    lazy compaction."""
+
     chain: str
     page_size: int
-    lazy: bool
     # Paged extend and decode run device kernels; on "cpu" the stream uses
     # plain token allocation instead.
     device: str = "cuda"
 
     def key(self) -> str:
-        return f"{self.chain}/ps{self.page_size}/lazy{int(self.lazy)}/{self.device}"
+        return f"{self.chain}/ps{self.page_size}/{self.device}"
 
 
 def trace_geometry(config: TraceConfig) -> UnifiedGeometry:
@@ -73,7 +76,7 @@ def trace_geometry(config: TraceConfig) -> UnifiedGeometry:
         swa_tokens=64 * ps,
         context_len=256 * ps,
         window=32,
-        lazy=config.lazy,
+        lazy=True,
         device=config.device,
     )
 
@@ -134,8 +137,7 @@ class BuilderAdapter:
         self.steps = forward_steps_of(self.allocator)
         self.launches: List[ForwardLaunch] = []
         self.tree = self._build_tree() if config.chain == "swa" else None
-        if config.lazy:
-            pin_every_band(self.allocator, lambda: not self.gate_open)
+        pin_every_band(self.allocator, lambda: not self.gate_open)
 
     def _build_tree(self) -> UnifiedRadixCache:
         return UnifiedRadixCache(
@@ -299,7 +301,7 @@ class BuilderAdapter:
                 out[f"{p}.edges"] = [m.watermark_physical]
             out[f"{p}.allocated_pages"] = m._allocated_pages()
             out[f"{p}.holes"] = sorted(m._free_phys_pages.tolist())
-            out[f"{p}.pending"] = sorted(m._pending_reuse_pages_cpu)
+            out[f"{p}.pending"] = sorted(m.usage.pending_pages)
             out[f"{p}.free_vids"] = (
                 None if m.free_virtual_ids is None else m.free_virtual_ids.tolist()
             )
@@ -505,9 +507,9 @@ def draw_op(rng: random.Random, model: HostModel, config: TraceConfig) -> dict:
         return {"op": "cache", "req": rng.choice(unretired)}
     if roll < 0.86 and config.chain == "swa" and model.cached:
         return {"op": "evict", "n": rng.randint(1, 8) * ps}
-    if roll < 0.90 and config.lazy:
+    if roll < 0.90:
         return {"op": "gate", "open": rng.random() < 0.7}
-    if roll < 0.94 and config.lazy:
+    if roll < 0.94:
         if rng.random() < 0.5:
             return {"op": "forward", "req": rng.choice(live)}
         return {"op": "fire"}
@@ -617,17 +619,16 @@ def corner_states(config: TraceConfig) -> Dict[str, List[dict]]:
     fill = [{"op": "extend", "req": i, "n": 4 * ps} for i in range(12)]
     holes = fill + [{"op": "free", "req": i} for i in range(0, 12, 2)]
     corners = {"holes": holes}
-    if config.lazy:
-        corners["closed_gate_over_holes"] = holes + [{"op": "gate", "open": False}]
-        corners["pending_reuse_behind_forward"] = (
-            fill
-            + [{"op": "forward", "req": 1}]
-            + [{"op": "free", "req": i} for i in range(0, 12, 2)]
-            + [{"op": "flush"}]
-        )
-        corners["hicache_reservation"] = holes + [
-            {"op": "reserve", "member": "full", "n": 2 * ps}
-        ]
+    corners["closed_gate_over_holes"] = holes + [{"op": "gate", "open": False}]
+    corners["pending_reuse_behind_forward"] = (
+        fill
+        + [{"op": "forward", "req": 1}]
+        + [{"op": "free", "req": i} for i in range(0, 12, 2)]
+        + [{"op": "flush"}]
+    )
+    corners["hicache_reservation"] = holes + [
+        {"op": "reserve", "member": "full", "n": 2 * ps}
+    ]
     if config.chain == "tri":
         corners["float_interior_holes"] = holes + [
             {"op": "retire", "req": i, "upto": 4 * ps} for i in range(1, 12, 4)

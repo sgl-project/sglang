@@ -96,9 +96,9 @@ class PPBatchMetadata:
     fpm_timing: Optional[FpmTiming] = None
     # The step's launch record, which its processed result carries.
     forward_launch: Optional[ForwardLaunch] = None
-    # Rank-local: the event recorded behind this microbatch's forward, when the
-    # unified pool keeps freed pages pending on it.
-    forward_done: Optional[torch.cuda.Event] = None
+    # Rank-local: the unified pool's record of this forward, retired when its
+    # result is processed.
+    unified_forward_done: Optional[torch.cuda.Event] = None
 
 
 class SchedulerPPMixin:
@@ -106,7 +106,7 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
-    # Records a skipped output's completion behind the local forward
+    # Records a skipped output's completion behind the unified pool's forward
     # (`_pp_make_skip_output_result`); made on first use.
     _pp_skip_output_stream = None
 
@@ -1022,17 +1022,19 @@ class SchedulerPPMixin:
             skipped_output_comm=True,
             fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
             forward_launch=mb_metadata.forward_launch if mb_metadata else None,
+            unified_forward_done=(
+                mb_metadata.unified_forward_done if mb_metadata else None
+            ),
         )
         d2h_event = self.device_module.Event()
-        forward_done = mb_metadata.forward_done if mb_metadata else None
+        forward_done = batch_result.unified_forward_done
         if forward_done is None:
             d2h_event.record(self.device_module.current_stream())
         else:
-            # Processing this result releases the pages pending on the
-            # microbatch's forward, so the host must see that forward end
-            # first: record the event on a side stream that waits it, which
-            # the caller's synchronize then implies. The current stream gains
-            # no dependency on the forward.
+            # Processing this result retires the microbatch's forward, so the
+            # host must see that forward end first: record the event on a side
+            # stream that waits it, which the caller's synchronize then implies.
+            # The current stream gains no dependency on the forward.
             stream = self._pp_skip_output_stream
             if stream is None:
                 stream = self._pp_skip_output_stream = self.device_module.Stream()
@@ -1125,6 +1127,7 @@ class SchedulerPPMixin:
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
                 fpm_timing=mb_metadata.fpm_timing,
                 forward_launch=mb_metadata.forward_launch,
+                unified_forward_done=mb_metadata.unified_forward_done,
             )
             return output_result
 
@@ -1214,6 +1217,7 @@ class SchedulerPPMixin:
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
             fpm_timing=mb_metadata.fpm_timing,
             forward_launch=mb_metadata.forward_launch,
+            unified_forward_done=mb_metadata.unified_forward_done,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1749,20 +1753,16 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
-                event = self.device_module.Event()
-                event.record(self.device_module.current_stream())
-                tracked = (
-                    not cur_batch.forward_mode.is_prebuilt()
-                    and self._on_step_forward_recorded(event)
-                )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,
                     forward_launch=result.forward_launch,
-                    forward_done=event if tracked else None,
+                    unified_forward_done=result.unified_forward_done,
                 )
+                event = self.device_module.Event()
+                event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

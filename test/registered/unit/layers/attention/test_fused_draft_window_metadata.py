@@ -123,7 +123,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 need_sort=False,
                 max_num_reqs=2,
                 model_context_len=1024,
-                lazy_compaction=False,
+                lazy_compaction=True,
             ),
         )
         allocator = storage.allocator

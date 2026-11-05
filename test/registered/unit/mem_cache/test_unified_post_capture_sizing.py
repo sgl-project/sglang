@@ -207,7 +207,7 @@ def _mla_draft_bundle(
         max_num_reqs=2,
         model_context_len=512,
         fused_draft=placement,
-        lazy_compaction=False,
+        lazy_compaction=True,
         post_capture_active=post_capture_active,
     )
 
@@ -558,6 +558,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                         write_and_read()
                     before = runner.ids_in("full", live)[rank].item()
                     alloc.free(first)
+                    alloc.full_attn_allocator.flush_for_allocation()
                     k.add_(7)
                     graph.replay()
                     torch.cuda.synchronize()
@@ -911,6 +912,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                         )
                     before = reader.translate_dcp_read_ids(table[1, :1]).clone()
                     alloc.free(gap)
+                    alloc.full_attn_allocator.flush_for_allocation()
                     self.assertFalse(
                         torch.equal(before, reader.translate_dcp_read_ids(table[1, :1]))
                     )
@@ -1424,6 +1426,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 pointer = space.read_v2p.data_ptr()
                 before = coords.write(live).clone()
                 alloc.free(first)
+                alloc.full_attn_allocator.flush_for_allocation()
                 k.add_(7)
                 v.add_(11)
                 graph.replay()
