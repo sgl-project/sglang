@@ -143,9 +143,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
 
 
 class VocabShard(msgspec.Struct, frozen=True):
-    """Where a rank's vocab slice starts, and the gather over its group."""
+    """A rank's vocab slice [start, start + width), and the gather over its group."""
 
     start: int
+    width: int
     gather: VocabGather
 
 
@@ -233,7 +234,7 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         )
         if group.rank_in_group == 0:
             logger.info(f"DSpark markov_w2 vocab gather: {type(gather).__name__}")
-        self.vocab_shard = VocabShard(start=start, gather=gather)
+        self.vocab_shard = VocabShard(start=start, width=end - start, gather=gather)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -740,6 +741,12 @@ class DSparkDraftMixin:
             hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
         ):
             return None
+        # The fused kernel shares one location vector across every layer.
+        if any(
+            not pool.layer_router.layer(layer.self_attn.attn.layer_id).owner
+            for layer in layers
+        ):
+            return None
         k_norm_weights = self._fused_k_norm_weights()
         attn0 = layers[0].self_attn
         head_dim = attn0.head_dim
@@ -850,6 +857,7 @@ class DSparkDraftMixin:
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -902,6 +910,7 @@ class DSparkDraftMixin:
                     positions=positions,
                     hidden_states=ctx_hidden,
                     cache_loc=cache_loc,
+                    swa_cache_loc=swa_loc,
                     cache_loc_2d=cache_loc_2d,
                     commit_lens=commit_lens,
                 )
@@ -916,9 +925,15 @@ class DSparkDraftMixin:
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             if cache_loc_2d is not None and commit_lens is not None:
-                pool.set_kv_buffer_prefix_valid(
+                pool.layer_router.layer(attn.attn.layer_id).store_prefix(
                     attn.attn,
-                    cache_loc_2d,
+                    KVWriteLoc(
+                        cache_loc_2d,
+                        swa_loc=(
+                            None if swa_loc is None else swa_loc.view_as(cache_loc_2d)
+                        ),
+                        physical=True,
+                    ),
                     commit_lens,
                     k,
                     v,
@@ -930,7 +945,7 @@ class DSparkDraftMixin:
                 # already in the ids the draft pool indexes.
                 pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
-                    KVWriteLoc(cache_loc, physical=True),
+                    KVWriteLoc(cache_loc, swa_loc=swa_loc, physical=True),
                     k,
                     v,
                     attn.attn.k_scale,

@@ -174,15 +174,15 @@ class DFlashPrepGraph:
         )
         from sglang.kernels.ops.speculative.k3_dflash_post import compact_draft_lens
         from sglang.srt.lora.layers import unwrap_lora_layer
-        from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
-            ForwardBatch,
-            ForwardMode,
-        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
             has_forward_context,
+        )
+        from sglang.srt.model_executor.forward_mode import (
+            CaptureHiddenMode,
+            ForwardMode,
         )
         from sglang.srt.speculative.dflash_worker_v2 import (
             _resolve_dflash_embedding_module,

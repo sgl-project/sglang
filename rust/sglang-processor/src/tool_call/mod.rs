@@ -27,6 +27,6 @@ pub(crate) trait ToolDetector: Send + Sync {
 }
 
 /// Python's `call_` id: 24 hex digits of a UUID4.
-pub(crate) fn tool_call_id() -> String {
+pub fn tool_call_id() -> String {
     format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..24])
 }

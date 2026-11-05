@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.runtime_context import get_lora, get_serving
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
@@ -55,6 +55,21 @@ class _GrpcRequest:
         if self._is_disconnected_fn is None:
             return False
         return bool(self._is_disconnected_fn())
+
+
+def _media_input_features(mm_processor) -> List[str]:
+    if mm_processor is None or mm_processor.mm_tokens is None:
+        return []
+    tokens = mm_processor.mm_tokens
+    return [
+        feature
+        for feature, token in (
+            ("image_inputs", tokens.image_token),
+            ("video_inputs", tokens.video_token),
+            ("audio_inputs", tokens.audio_token),
+        )
+        if token
+    ]
 
 
 class RuntimeHandle:
@@ -429,11 +444,18 @@ class RuntimeHandle:
     def get_server_info(self) -> str:
         return json.dumps(
             msgspec_to_builtins(
-                redact_watermark_secrets(
-                    build_server_info(
-                        self.tokenizer_manager.server_args, self.scheduler_info
-                    )
-                )
+                {
+                    **redact_watermark_secrets(
+                        build_server_info(
+                            self.tokenizer_manager.server_args, self.scheduler_info
+                        )
+                    ),
+                    # Older servers and processors without a modality's placeholder
+                    # drop that media silently, so clients check this list first.
+                    "grpc_features": _media_input_features(
+                        self.tokenizer_manager.mm_processor
+                    ),
+                }
             ),
             default=str,
         )

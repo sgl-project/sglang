@@ -46,9 +46,9 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -59,10 +59,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    get_moe_runner_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import (
     TopK,
@@ -92,11 +89,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -104,6 +97,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -384,15 +378,8 @@ class MoEGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
         if config.topk_method == "noaux_tc":
-            correction_bias_dtype = (
-                torch.bfloat16
-                if quant_config is not None
-                and quant_config.get_name() == "modelopt_fp4"
-                and get_moe_runner_backend().is_flashinfer_trtllm()
-                else torch.float32
-            )
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
+                torch.empty((config.n_routed_experts), dtype=torch.float32)
             )
         else:
             self.e_score_correction_bias = None
@@ -708,6 +695,9 @@ class MiMoV2Attention(nn.Module):
         self.v_size = self.num_kv_heads * self.v_head_dim
 
         self.v_scale = v_scale
+        # Set once attention_value_scale has been folded into o_proj weights,
+        # disabling the runtime V multiply (see _fold_attention_value_scale_into_o_proj).
+        self.v_scale_folded = False
 
         self.scaling = self.head_dim**-0.5
 
@@ -785,7 +775,7 @@ class MiMoV2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
-        if self.v_scale is not None:
+        if self.v_scale is not None and not self.v_scale_folded:
             v = v * self.v_scale
 
         inner_state = q, k, v, forward_batch
@@ -809,7 +799,9 @@ class MiMoV2Attention(nn.Module):
             qkv,
             positions,
             get_attn_backend().get_fused_kv_write_buffers(self.attn, forward_batch),
-            value_scale=1.0 if self.v_scale is None else self.v_scale,
+            value_scale=(
+                1.0 if self.v_scale is None or self.v_scale_folded else self.v_scale
+            ),
         )
         if query is None:
             return None
@@ -844,7 +836,7 @@ class MiMoV2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         # [t, h, d]
 
-        if self.v_scale is not None:
+        if self.v_scale is not None and not self.v_scale_folded:
             v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
@@ -1760,6 +1752,44 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 expected_fused_tp_size,
                 config=self.config,
                 model=self,
+            )
+
+        self._fold_attention_value_scale_into_o_proj()
+
+    def _fold_attention_value_scale_into_o_proj(self) -> None:
+        """Fold ``attention_value_scale`` into the o_proj weights.
+
+        Attention is linear in V: ``softmax(qk) @ (s*V) == s * (softmax(qk) @ V)``,
+        so scaling every o_proj weight by s reproduces the runtime
+        ``v = v * v_scale`` exactly while removing one Muls kernel per layer on
+        the NPU decode path. Only applies to floating-point (unquantized)
+        o_proj weights; quantized ones keep the runtime multiply. KV caches
+        then hold unscaled V, which stays self-consistent because every
+        consumer of V goes through this layer's (folded) o_proj.
+        """
+        v_scale = getattr(self.config, "attention_value_scale", None)
+        if v_scale is None:
+            return
+        folded = skipped = 0
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            weight = attn.o_proj.weight
+            if weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                weight.data.mul_(v_scale)
+                attn.v_scale_folded = True
+                folded += 1
+            else:
+                skipped += 1
+        if folded:
+            logger.info(
+                f"Folded attention_value_scale={v_scale} into {folded} o_proj "
+                "weight(s); runtime V scaling disabled for them."
+            )
+        if skipped:
+            logger.warning(
+                f"attention_value_scale={v_scale} kept as runtime multiply for "
+                f"{skipped} layer(s) with non-fp16/bf16/fp32 o_proj (cannot "
+                "fold into quantized weights)."
             )
 
     def get_embed_and_head(self):
