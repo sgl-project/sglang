@@ -23,10 +23,11 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 # One bf16 ulp: the fused and unfused kernels reduce K in different orders.
 _OUTPUT_TOL = dict(rtol=2**-7, atol=1e-7)
@@ -68,7 +69,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 k_dim=heads * head_dim,
                 v_dim=v_heads * head_dim,
                 conv_weights=randn(dim, 4, dtype=conv_dtype),
-                bias=randn(dim),
+                bias=randn(dim, dtype=conv_dtype),
                 A_log=randn(v_heads, dtype=torch.float32),
                 dt_bias=randn(v_heads * head_dim, dtype=torch.float32),
                 lower_bound=lower_bound,
@@ -188,6 +189,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             for layer, (mixed, a, b) in zip(layers, inputs)
         ]
 
+    @unittest.skipIf(is_hip(), "CUDA sm90/sm100 dispatch; HIP has its own test")
     def test_verify_commit_verify(self):
         # B=1 exercises the enabled path. Platform override makes the dispatch
         # testable on any CUDA CI runner; it does not replace a GPU kernel.
@@ -414,6 +416,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                         getattr(state, name), getattr(ref_state, name), rtol=0, atol=0
                     )
 
+    @unittest.skipIf(is_hip(), "CUDA sm90/sm100 dispatch; HIP has its own test")
     def test_snapshot_dispatch_is_unchanged(self):
         for platform in (
             {"is_sm90": True, "is_sm100": False},
