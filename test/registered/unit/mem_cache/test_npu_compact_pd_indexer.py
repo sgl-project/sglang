@@ -192,7 +192,8 @@ class TestNPUCompactPDIndexer(CustomTestCase):
                         )
                     self.assertEqual(pool.num_indexer_layers, indexer_layers)
                     self.assertEqual(
-                        indexer_bytes, 128 * dtype.itemsize * indexer_layers
+                        indexer_bytes,
+                        128 * pool.index_k_buffer.element_size() * indexer_layers,
                     )
                     self.assertEqual(
                         pool.index_k_buffer.nbytes,
