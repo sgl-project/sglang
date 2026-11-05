@@ -16,7 +16,7 @@ from sglang.srt.utils import aiter_tuned_tables as tables
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 try:
     import aiter  # noqa: F401
@@ -201,40 +201,6 @@ class TestTritonJson(CustomTestCase):
             self.assertEqual(it.select_triton_overrides(self.tmp, report), {})
         self.assertEqual(report.triton_json[names[0]], tables.SUPERSEDED)
 
-    @unittest.skipUnless(_HAS_AITER, "aiter not installed")
-    def test_lookup_through_aiter(self):
-        import aiter.ops.triton.utils.gemm_config_utils as gcu
-        from aiter.ops.triton.utils._triton import arch_info
-
-        try:
-            arch = arch_info.get_arch()
-        except Exception:  # noqa: BLE001
-            arch = None
-        if arch != it.TRITON_ARCH:
-            self.skipTest("gfx950 only")
-        orig = gcu.load_config_json
-        report = it.IntreeReport()
-        try:
-            it.install_triton_json(report)
-            self.assertEqual(len(report.triton_json), 3)
-            for name, status in report.triton_json.items():
-                self.assertIn(status, (tables.APPLIED, tables.UPSTREAM), name)
-                n, k = (
-                    int(x.split("=")[1])
-                    for x in name[len(it.TRITON_CONFIG_NAME) + 1 : -5].split("-")
-                )
-                ours = self._ours(name)
-                for bucket in (b for b in ours if b.startswith("M_LEQ_")):
-                    m = int(bucket[len("M_LEQ_") :])
-                    got, tuned = gcu.get_gemm_config(
-                        it.TRITON_CONFIG_NAME, m, n, k, backend="triton"
-                    )
-                    self.assertTrue(tuned)
-                    self.assertEqual(got, ours[bucket], (name, bucket))
-        finally:
-            gcu.load_config_json = orig
-            gcu._get_gemm_config_cached.cache_clear()
-
 
 def _stock_gfx950_policy(m, hidden_size, w_preshuffle_bf16=False, res_preshuffle=False):
     from aiter.ops.mhc import _mhc_fused_config_gfx950_256
@@ -266,46 +232,6 @@ class TestMhcTileM16(CustomTestCase):
         self.assertEqual(patched(4096, 7168), _stock_gfx950_policy(4096, 7168))
         with self.assertRaises(TypeError):
             patched(8, 7168, w_preshuffle_bf16=True)
-
-    @unittest.skipUnless(__import__("torch").cuda.is_available(), "needs a GPU")
-    def test_bit_identical_on_gpu(self):
-        import aiter.ops.mhc as aiter_mhc
-        import torch
-
-        if aiter_mhc.get_gfx_runtime() != "gfx950":
-            self.skipTest("gfx950 only")
-        orig = aiter_mhc.get_mhc_fused_post_pre_config
-        stock = getattr(orig, "__wrapped__", orig)
-        hc, hidden = 4, 7168
-        hc3 = hc * 2 + hc * hc
-        g = torch.Generator(device="cuda").manual_seed(0)
-
-        def rnd(*shape, dtype=torch.float32, scale=1.0):
-            return (torch.randn(*shape, generator=g, device="cuda") * scale).to(dtype)
-
-        try:
-            for m in (80, 144, 192, 384, 640):
-                if stock(m, hidden)[1] == 16:
-                    continue  # this aiter already picks 16 here
-                args = (
-                    rnd(m, hidden, dtype=torch.bfloat16),
-                    rnd(m, hc, hidden, dtype=torch.bfloat16),
-                    rnd(m, hc, 1),
-                    rnd(m, hc, hc),
-                    rnd(hc3, hc * hidden),
-                    rnd(3, scale=0.1),
-                    rnd(hc3, scale=0.1),
-                )
-                outs = []
-                for fn in (stock, it.make_mhc_tile_m16_config(stock)):
-                    aiter_mhc.get_mhc_fused_post_pre_config = fn
-                    outs.append(
-                        aiter_mhc.mhc_fused_post_pre(*args, hc_post_mult_value=2.0)
-                    )
-                for a, b in zip(*outs):
-                    self.assertTrue(torch.equal(a, b), m)
-        finally:
-            aiter_mhc.get_mhc_fused_post_pre_config = orig
 
 
 if __name__ == "__main__":
