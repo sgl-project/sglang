@@ -444,6 +444,10 @@ class KVCacheConfigurator:
         return legacy_draft_attn_tp_size(self.spec_algorithm)
 
     def __post_init__(self) -> None:
+        from sglang.srt.mem_cache.draft_window import uses_draft_window_kv
+
+        if not self.is_draft_worker and self.is_hybrid_swa and uses_draft_window_kv():
+            raise ValueError("Draft window KV requires a target without SWA pools")
         aux = self.spec_aux_config
         if (
             not self.is_draft_worker
@@ -648,7 +652,11 @@ class KVCacheConfigurator:
         return get_schedule().page_size * self.loc_space_scale
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
-        max_total_num_tokens = config.max_total_num_tokens
+        max_total_num_tokens = (
+            config.draft_window_tokens
+            if self.is_draft_worker and config.draft_window_tokens is not None
+            else config.max_total_num_tokens
+        )
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None

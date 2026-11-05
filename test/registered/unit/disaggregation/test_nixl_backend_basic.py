@@ -251,6 +251,50 @@ class TestNixlBackendInitialization(CustomTestCase):
 
 
 class TestNixlEmptyStateTransfer(CustomTestCase):
+    def test_draft_window_uses_full_token_suffix_and_rejects_partial_history(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr._state_layout_rejections = {}
+        mgr._prepared_state_plans = {}
+        mgr.state_tp_size = 4
+        mgr.kv_args = SimpleNamespace(
+            state_types=[StateType.DRAFT_WINDOW],
+            state_data_ptrs=[[0x10000, 0x11000]],
+            state_item_lens=[[256, 256]],
+            state_layer_ids=[[]],
+        )
+        mgr._send_kvcache_generic = MagicMock(return_value="window-handle")
+        src, dst = [98, 99, 100], [502, 503, 256]
+        handles = list(
+            mgr.maybe_send_extra(
+                "decode",
+                [src],
+                [[0x20000, 0x21000]],
+                [dst],
+                0,
+                4,
+                dst_state_item_lens=[[256, 256]],
+            )
+        )
+        self.assertEqual(handles, ["window-handle"])
+        kwargs = mgr._send_kvcache_generic.call_args.kwargs
+        self.assertTrue(kwargs["force_flat"])
+        np.testing.assert_array_equal(kwargs["prefill_data_indices"], src)
+        np.testing.assert_array_equal(kwargs["dst_data_indices"], dst)
+        mgr._send_kvcache_generic.reset_mock()
+        with self.assertRaisesRegex(ValueError, "complete aligned suffix"):
+            list(
+                mgr.maybe_send_extra(
+                    "decode",
+                    [src],
+                    [[0x20000, 0x21000]],
+                    [dst[:1]],
+                    0,
+                    4,
+                    dst_state_item_lens=[[256, 256]],
+                )
+            )
+        mgr._send_kvcache_generic.assert_not_called()
+
     def test_prepared_mamba_rejects_stride_mismatch_before_fallback(self):
         """Different SSM dtypes must not write into the wrong decode request slot."""
         for src_stride, dst_stride in ((32, 16), (16, 32)):

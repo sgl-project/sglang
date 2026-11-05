@@ -1818,6 +1818,25 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
+
+    if getattr(draft_token_to_kv_pool, "draft_window_size", None) is not None:
+        ptrs, sizes, page_strides = draft_token_to_kv_pool.get_contiguous_buf_infos()
+        page = draft_token_to_kv_pool.page_size
+        if any(stride % page for stride in page_strides):
+            raise ValueError("Draft window transfer needs whole-token strides")
+        kv_args.draft_window_kv_layout = {
+            "window": draft_token_to_kv_pool.draft_window_size,
+            "dtype": str(draft_token_to_kv_pool.dtype),
+            "strides": [stride // page for stride in page_strides],
+        }
+        append_state_component(
+            kv_args,
+            StateType.DRAFT_WINDOW,
+            ptrs,
+            sizes,
+            [stride // page for stride in page_strides],
+        )
+
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)

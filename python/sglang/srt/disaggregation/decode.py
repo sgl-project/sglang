@@ -167,6 +167,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
@@ -467,6 +468,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
 
     _defer_publish: bool = False
+    draft_window_kv: bool = False
 
     def __init__(
         self,
@@ -485,6 +487,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         transfer_backend: TransferBackend,
     ):
         parallel = get_parallel()
+        self.draft_window_kv = get_spec().speculative_draft_window_kv
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
@@ -858,7 +861,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
-        if self.draft_token_to_kv_pool is not None:
+        if (
+            self.draft_token_to_kv_pool is not None
+            and getattr(self.draft_token_to_kv_pool, "draft_window_size", None) is None
+        ):
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -1109,7 +1115,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
+        if self.draft_window_kv and (
+            req.session is not None or req.multimodal_inputs is not None
+        ):
+            prepare_abort(
+                req,
+                "Draft window KV does not support session-held KV or multimodal requests",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            return
+
+        from sglang.srt.mem_cache.draft_window import uses_draft_window_kv
+
+        if is_retracted and (
+            dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator)
+            or uses_draft_window_kv()
+        ):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
@@ -2189,6 +2211,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # req_pool_idx values need not be equal.
             return get_qsa_pending_state_indices(decode_req.req)
 
+        def _draft_window_payload():
+            from sglang.srt.mem_cache.draft_window import draft_window_transfer_rows
+
+            return draft_window_transfer_rows(
+                self.draft_token_to_kv_pool,
+                self.req_to_token_pool.req_to_token,
+                decode_req.req.kv.req_pool_idx,
+                seq_len,
+            )
+
         def _swa_ring_payload():
             # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
             # Same window positions and order -> positional match with prefill.
@@ -2224,6 +2256,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.MINIMAX_INDEX_K: _minimax_payload,
             StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
             StateType.SWA_RING: _swa_ring_payload,
+            StateType.DRAFT_WINDOW: _draft_window_payload,
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
@@ -2352,6 +2385,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Send ``decode_req``'s destination, or hold it until the forward in
         flight is done; a held send's rows (``receive_rows``) are held, not
         recorded as the peer's, and re-read at the send (``refresh``)."""
+        if self.draft_window_kv:
+            # Retire previous writes before publishing a recycled draft ring.
+            self.scheduler.forward_stream.synchronize()
         if not metadata_buffer_preassigned:
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -3263,6 +3299,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
 
     enable_host_receive: bool = False
+    draft_window_kv: bool = False
 
     def __init__(
         self,
@@ -3290,8 +3327,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._skipped_checksum_signatures: set = set()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.draft_window_kv = get_spec().speculative_draft_window_kv
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            or self.draft_window_kv
         )
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
@@ -3966,7 +4005,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ready = []
         releases = list(self._deferred_releases.items())
         for decode_req, _, deadline, _, required_acks in releases:
-            if self._is_host_destination(decode_req):
+            if self.draft_window_kv:
+                is_drained = decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                    decode_req.req.bootstrap_room, required_acks
+                )
+                is_ready = is_drained
+            elif self._is_host_destination(decode_req):
                 # A timeout cannot prove that a remote write has stopped.
                 is_drained = decode_req.kv_receiver.is_abort_release_safe()
                 is_ready = is_drained

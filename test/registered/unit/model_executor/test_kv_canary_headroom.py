@@ -166,6 +166,18 @@ class TestCanaryHeadroom(CustomTestCase):
                     self._resize(None) - large.per_forward_workspace_bytes(),
                 )
 
+    def test_private_draft_window_is_charged_once_and_never_resized(self):
+        from sglang.srt.mem_cache.draft_window import DraftWindowLayout
+
+        draft = Mock(
+            post_capture_active=False,
+            draft_window_layout=DraftWindowLayout(2048, 256, 5, 8),
+        )
+        draft.get_kv_size_bytes.return_value = (4096, 4096)
+        budget = self._resize(None, (None,), draft_pools=(draft,))
+        self.assertEqual(budget, self._resize(None) + 8192)
+        draft.finalize_backing.assert_not_called()
+
     def test_reserved_draft_pools_are_backed_to_the_target_config(self):
         """A draft pool that reserved post-capture backing is finalized to the
         target's config and its backed bytes rejoin the budget; an eagerly

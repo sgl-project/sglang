@@ -68,6 +68,59 @@ class TestRegisterToBootstrap(CustomTestCase):
         # An empty layout never goes on the wire as a new field.
         self.assertIsNone(payload["spec_kv_layout"])
 
+        # Window layout must coexist with the common speculative/state schema.
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        layout = {"window": 2048, "dtype": "torch.bfloat16", "strides": [256, 256]}
+        mgr.draft_window_kv_layout = layout
+        mgr.spec_kv_layout = {"algorithm": "DFLASH", "num_draft_entries": 10}
+        mgr.kv_args.state_types = [StateType.DRAFT_WINDOW]
+        mgr.kv_args.state_wire_keys = [None]
+        mgr.kv_args.state_window_tails = [None]
+        mgr.register_to_bootstrap()
+        payload = mock_put.call_args.kwargs["json"]
+        self.assertEqual(payload["draft_window_kv_layout"], layout)
+        self.assertEqual(payload["spec_kv_layout"], mgr.spec_kv_layout)
+        self.assertEqual(payload["state_wire"], [[StateType.DRAFT_WINDOW.value, None]])
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.get")
+    def test_decode_rejects_missing_or_mismatched_draft_window_layout(self, mock_get):
+        from types import SimpleNamespace
+
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+        layout = {"window": 2048, "dtype": "torch.bfloat16", "strides": [256, 256]}
+        manager = object.__new__(CommonKVManager)
+        manager.prefill_info_table = {}
+        manager.kv_args = SimpleNamespace(page_size=256)
+        manager.kv_cache_dtype_str = "fp8_e4m3"
+        manager.draft_window_kv_layout = layout
+        payload = dict(
+            attn_tp_size=4,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=256,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+        )
+        response = mock_get.return_value
+        response.status_code = 200
+        for peer_layout in (
+            None,
+            layout | {"window": 4096},
+            layout | {"dtype": "torch.float8_e4m3fn"},
+        ):
+            with self.subTest(peer_layout=peer_layout):
+                response.json.return_value = payload | {
+                    "draft_window_kv_layout": peer_layout
+                }
+                with self.assertRaisesRegex(
+                    RuntimeError, "Draft window KV layout mismatch"
+                ):
+                    manager.try_ensure_parallel_info("prefill:8998")
+                self.assertEqual(manager.prefill_info_table, {})
+
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
         self, mock_put
