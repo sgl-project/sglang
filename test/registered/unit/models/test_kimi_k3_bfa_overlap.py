@@ -302,7 +302,9 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             _k3_fused_decode_args=None,
         )
         owner = SimpleNamespace(
-            attn=layer, o_norm=SimpleNamespace(weight=ones(128), eps=1e-6)
+            attn=layer,
+            local_num_heads=12,
+            o_norm=SimpleNamespace(weight=ones(128), eps=1e-6),
         )
 
         def update():
