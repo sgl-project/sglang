@@ -288,19 +288,25 @@ def _init_cpu_threads_env(
             )
 
         elif mem_bind_env:
-            nodes = [n.strip() for n in mem_bind_env.split(",") if n.strip()]
-            if len(nodes) == 1:
-                # Single node given (e.g. "8"): all ranks bind to node 8
-                node_mem_bind = int(nodes[0])
-            elif gpu_id < len(nodes):
-                # Multiple nodes given (e.g. "8,9"): rank 0 gets 8, rank 1 gets 9
-                node_mem_bind = int(nodes[gpu_id])
-            else:
-                logger.warning(
-                    "SGLANG_CPU_MEM_BIND has %d nodes, but gpu_id is %d. Using fallback.",
-                    len(nodes),
-                    gpu_id,
+            node_strings = [n.strip() for n in mem_bind_env.split(",")]
+            if any(not n.isdecimal() for n in node_strings):
+                raise ValueError(
+                    "SGLANG_CPU_MEM_BIND must be a comma-separated list of "
+                    "non-negative memory-node IDs; ranges are not supported."
                 )
+            nodes = [int(n) for n in node_strings]
+            if len(nodes) != parallel.tp_size or len(set(nodes)) != len(nodes):
+                raise ValueError(
+                    f"SGLANG_CPU_MEM_BIND requires exactly {parallel.tp_size} "
+                    f"distinct memory-node IDs (one per TP worker); got {nodes}."
+                )
+            if gpu_id != parallel.tp_rank:
+                raise ValueError(
+                    "SGLANG_CPU_MEM_BIND requires gpu_id == tp_rank; "
+                    f"got gpu_id={gpu_id}, tp_rank={parallel.tp_rank}. "
+                    "Offset or strided worker IDs are not supported."
+                )
+            node_mem_bind = nodes[gpu_id]
 
         # Bind OpenMP threads to CPU cores and bind memory to the target NUMA node
         if node_mem_bind < 0:
