@@ -168,6 +168,9 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+# The default window of a window payload: the scheduler's sliding window.
+_SCHEDULER_WINDOW = object()
+
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
@@ -631,11 +634,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
 
-    def _swa_tail_len(self, seq_len: int) -> int:
+    def _swa_tail_len(self, seq_len: int, window_size: Optional[int] = None) -> int:
+        """The tokens of a window's tail a decode preallocation keeps: the
+        target window's, or a window of ``window_size`` tokens."""
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
 
-        window_size = self.scheduler.sliding_window_size
+        if window_size is None:
+            window_size = self.scheduler.sliding_window_size
         if window_size is None or window_size <= 0:
             return seq_len
 
@@ -1881,19 +1887,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 .numpy()
             ]
 
-        def _swa_payload():
-            window_size = self.scheduler.sliding_window_size
-            window_start = max(total_prefix_len, seq_len - window_size)
-            window_start = page_align_floor(window_start, page_size)
-            window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                decode_req.req.kv.req_pool_idx, window_start:seq_len
-            ]
-            window_kv_indices_swa = (
-                self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                    window_kv_indices_full
-                )
+        def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
+            if window is _SCHEDULER_WINDOW:
+                # Read only when a window entry is sent.
+                window = self.scheduler.sliding_window_size
+            storage = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
-            return kv_to_page_indices(window_kv_indices_swa, page_size)
+            resume = storage.resume_units(
+                sub_pool,
+                decode_req.req,
+                token_start=total_prefix_len,
+                token_boundary=seq_len,
+                window=window,
+            )
+            return resume.unit_ids.cpu().numpy()
 
         def _full_kv_pages_payload():
             kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1967,6 +1975,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.QSA_PENDING: _qsa_pending_payload,
             StateType.QSA_COMPRESSED: _full_kv_pages_payload,
             StateType.SWA: _swa_payload,
+            StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
             StateType.DSA: _dsa_pages_payload,
             StateType.DSA_TAIL: _dsa_tail_payload,
             StateType.MINIMAX_INDEX_K: _minimax_payload,
@@ -2485,7 +2494,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         storage = kv_storage_of(
             self.req_to_token_pool, allocator, tree_cache=self.tree_cache
         )
-        return alloc_for_decode_prealloc(storage, allocator, **kwargs)
+        # Every window other than the target's (whose tail the scheduler's
+        # window gives) keeps its own tail, by the same rule: a fused draft's
+        # band retains its own length.
+        stated_window_tails = {
+            name: (self._swa_tail_len(kwargs["fill_len"], window), component)
+            for name, (window, component) in storage.stated_window_lengths().items()
+            if component != ComponentType.SWA.name
+        }
+        return alloc_for_decode_prealloc(
+            storage, allocator, stated_window_tails=stated_window_tails, **kwargs
+        )
 
     def _transfer_page_indices(
         self, decode_req: DecodeRequest, kv_indices: torch.Tensor, page_size: int
@@ -2713,7 +2732,11 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     swa_tail_len: int,
     req_to_token_pool: Optional[ReqToTokenPool] = None,
+    stated_window_tails: Optional[Dict[str, Tuple[int, str]]] = None,
 ) -> torch.Tensor:
+    """``stated_window_tails`` names, for each window with its own retention,
+    (tail tokens, tree component)."""
+    stated_window_tails = stated_window_tails or {}
     req.kv.allocate_prealloc(fill_len)
     if allocator.page_size == 1:
         return storage.take_tokens(delta_len, make_room=_evicted_by_caller)
@@ -2748,11 +2771,20 @@ def alloc_for_decode_prealloc(
         # Full-attention layers reuse prefix KV; SWA layers allocate only the
         # live window tail.
         window_tail=swa_tail_len if uses_swa_tail else None,
+        stated_window_tails=(
+            {name: tail for name, (tail, _) in stated_window_tails.items()}
+            if uses_swa_tail
+            else None
+        ),
     )
     if uses_swa_tail:
-        swa_evicted_seqlen = fill_len - swa_tail_len
-        assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
-        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+        tails = {ComponentType.SWA: swa_tail_len}
+        for tail, component in stated_window_tails.values():
+            tails[ComponentType[component]] = tail
+        for component, tail in tails.items():
+            evicted_seqlen = fill_len - tail
+            assert evicted_seqlen >= 0 and evicted_seqlen % allocator.page_size == 0
+            req.kv.set_evicted_seqlen(component, evicted_seqlen)
     return kv_loc
 
 
