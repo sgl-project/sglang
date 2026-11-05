@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 from sglang.srt.layers.moe.utils import (
@@ -1129,6 +1130,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 reaches[name] = max(reaches.get(name, 0), reach)
         return reaches
 
+    @dumper.grouped_step
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,

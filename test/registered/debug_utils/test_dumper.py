@@ -1203,6 +1203,93 @@ class TestDumpModelStepOverride:
         assert filenames and all("step=3" in f for f in filenames)
 
 
+class TestSpeculativeDumpStep:
+    def test_capture_suppresses_synthetic_dumps_and_steps(self, tmp_path):
+        """Graph warmup must not consume or pollute a real request's first step."""
+        d = _make_test_dumper(tmp_path, enable_output_console=False)
+        with d.suspend():
+            d.dump("warmup", torch.tensor([0]))
+            d.step()
+            with d.suspend():
+                d.step()
+        assert d.get_state()["step"] == 0
+        assert not _get_filenames(tmp_path)
+        d.dump("request", torch.tensor([1]))
+        d.step()
+        assert d.get_state()["step"] == 1
+        assert "step=0" in _find_dump_file(tmp_path, name="request").name
+
+    def test_grouped_forwards_keep_one_step_and_distinct_metadata(self, tmp_path):
+        """Draft forwards must not advance the step before target verification."""
+        d = _make_test_dumper(tmp_path, enable_output_console=False)
+
+        @d.grouped_step
+        def run_round(forwards):
+            for is_draft, phase in forwards:
+                with d.speculative_forward(is_draft=is_draft, phase=phase):
+                    d.dump("hidden", torch.tensor([17, 42]))
+                    d.step()
+
+        run_round(
+            [
+                (True, "DECODE"),
+                (True, "DECODE"),
+                (False, "TARGET_VERIFY"),
+                (True, "DRAFT_EXTEND_V2"),
+            ]
+        )
+        run_round([(False, "TARGET_VERIFY")])  # graph replay skips draft forwards
+
+        dumps = [_load_dump(p) for p in Path(tmp_path).glob("*/*.pt")]
+        assert all(torch.equal(dump["value"], torch.tensor([17, 42])) for dump in dumps)
+        records = [dump["meta"] for dump in dumps]
+        assert len(records) == 5
+        first = sorted(
+            (r for r in records if r["step"] == 0), key=lambda r: r["dump_index"]
+        )
+        assert [
+            (r["spec_role"], r["spec_phase"], r["spec_forward_index"]) for r in first
+        ] == [
+            ("draft", "DECODE", 0),
+            ("draft", "DECODE", 1),
+            ("target", "TARGET_VERIFY", 0),
+            ("draft", "DRAFT_EXTEND_V2", 0),
+        ]
+        second = next(r for r in records if r["step"] == 1)
+        assert (
+            second["spec_role"],
+            second["spec_phase"],
+            second["spec_forward_index"],
+        ) == ("target", "TARGET_VERIFY", 0)
+        assert d.get_state()["step"] == 2
+        d.step()  # ordinary forwards retain their original behavior
+        assert d.get_state()["step"] == 3
+
+    def test_failed_and_nested_rounds_restore_scope(self, tmp_path):
+        """Partial rounds advance once and do not leave later dumps grouped."""
+        d = _make_test_dumper(tmp_path, enable_output_console=False)
+
+        @d.grouped_step
+        def inner():
+            d.step()
+
+        @d.grouped_step
+        def outer():
+            inner()
+            with d.speculative_forward(is_draft=True, phase="DECODE"):
+                d.dump("partial", torch.tensor([1]))
+                raise ValueError("interrupted")
+
+        with pytest.raises(ValueError, match="interrupted"):
+            outer()
+        assert d.get_state()["step"] == 1
+        assert not d.in_grouped_step
+        d.dump("ordinary", torch.tensor([2]))
+        ordinary = _load_dump(_find_dump_file(tmp_path, name="ordinary"))["meta"]
+        assert ordinary["step"] == 1
+        assert "spec_role" not in ordinary
+
+
 class TestParallelRankInFilename:
     def test_config_default_false(self):
         """include_parallel_rank_in_filename defaults to False."""
