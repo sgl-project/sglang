@@ -34,7 +34,6 @@ def load_source(name):
     return module
 
 
-lru_module = load_source("lru")
 mtp_module = load_source("mtp")
 
 
@@ -125,7 +124,6 @@ class TestSparseKVManager(unittest.TestCase):
             List=List,
             Union=Union,
             logger=logging.getLogger(__name__),
-            plan_sparse_lru=lru_module.plan_sparse_lru,
             slot_map_lookup=self.lookup,
             unidex_copy_inplace=self.copy,
             is_sparse_mtp_batch=mtp_module.is_sparse_mtp_batch,
@@ -196,23 +194,20 @@ class TestSparseKVManager(unittest.TestCase):
             source_indices[valid].long()
         ].clone()
 
-    def manager(self, capacity=4):
+    def manager(self):
         m = self.Manager.__new__(self.Manager)
         m.lim_adapter = None
         m.copy_sfa_enabled = False
         m.size, m.max_context_len, m.sparse_context_len = 4, 64, 2
-        m.device_cache_size, m.use_lru = capacity, capacity > 2
+        m.device_cache_size = 2
         m.device, m.start_layer, m.layer_num = "cpu", 0, 1
         m._slot_map_width = 72
-        m.device_kv_buffer = [torch.full((4, capacity, 1, 3), -999.0)]
+        m.device_kv_buffer = [torch.full((4, 2, 1, 3), -999.0)]
         m.selected_kv_buffer = torch.empty((4, 2, 1, 3))
         m.device_slot_map = [torch.full((5, 72), -1, dtype=torch.int32)]
         m.host_kv_buffer = [torch.arange(4 * 64 * 3).float().view(4, 64, 1, 3)]
         m.dev_ptr_list = [123]
         m._device_cache_slot_ids = torch.arange(2)
-        m._lru_init = torch.arange(capacity)
-        m.cache_tokens = [torch.full((5, capacity), -1, dtype=torch.int32)]
-        m.lru_order = [m._lru_init.expand(5, -1).clone()]
         m._materialize_h2d_miss_stream = self.side
         m.copy_ready, m.hit_done, m.miss_done, m.refill_done = (
             object(),
@@ -316,24 +311,12 @@ class TestSparseKVManager(unittest.TestCase):
                     self.assertEqual(float(selected[i, j].abs().sum()), 0.0)
         return selected
 
-    def test_lru_reuses_across_disjoint_topk_rounds(self):
+    def test_inactive_request_mappings_survive(self):
         manager = self.manager()
         self.step(manager, [1], [[1, 2]])
-        self.step(manager, [1], [[3, 4]])
-        self.step(manager, [1], [[1, 2]])
-        self.assertEqual(self.host_copy_rows, 4)
-        self.step(manager, [1], [[1, 5]])
-        self.assertGreaterEqual(int(manager.device_slot_map[0][1, 1]), 0)
-        self.assertEqual(int(manager.device_slot_map[0][1, 3]), -1)
-
-    def test_inactive_request_mappings_survive(self):
-        for capacity in (2, 4):
-            with self.subTest(capacity=capacity):
-                manager = self.manager(capacity)
-                self.step(manager, [1], [[1, 2]])
-                saved = manager.device_slot_map[0][1].clone()
-                self.step(manager, [2], [[3, 4]])
-                self.assertTrue(torch.equal(saved, manager.device_slot_map[0][1]))
+        saved = manager.device_slot_map[0][1].clone()
+        self.step(manager, [2], [[3, 4]])
+        self.assertTrue(torch.equal(saved, manager.device_slot_map[0][1]))
 
     def test_hit_miss_reordering_and_stream_publication(self):
         manager = self.manager()
@@ -352,31 +335,18 @@ class TestSparseKVManager(unittest.TestCase):
         self.assertTrue(torch.all(manager.device_slot_map[0][0] == -1))
         manager.reset_requests([1])
         self.assertTrue(torch.all(manager.device_slot_map[0][1] == -1))
-        self.assertTrue(torch.all(manager.cache_tokens[0][1] == -1))
         self.step(manager, [1], [[1, 2]])
         self.assertEqual(self.host_copy_rows, 4)
 
     def test_randomized_gather_and_mapping_consistency(self):
         random_generator = random.Random(17392)
-        for capacity in (2, 3, 4, 8):
-            manager = self.manager(capacity)
-            for _ in range(80):
-                requests = random_generator.sample(
-                    [1, 2, 3], random_generator.randint(1, 3)
-                )
-                selections = [random_generator.sample(range(16), 2) for _ in requests]
-                self.step(manager, requests, selections)
-                if manager.use_lru:
-                    for rid in requests:
-                        for slot, token in enumerate(
-                            manager.cache_tokens[0][rid].tolist()
-                        ):
-                            if token >= 0:
-                                self.assertEqual(
-                                    int(manager.device_slot_map[0][rid, token]), slot
-                                )
-                        order = manager.lru_order[0][rid].tolist()
-                        self.assertEqual(sorted(order), list(range(capacity)))
+        manager = self.manager()
+        for _ in range(80):
+            requests = random_generator.sample(
+                [1, 2, 3], random_generator.randint(1, 3)
+            )
+            selections = [random_generator.sample(range(16), 2) for _ in requests]
+            self.step(manager, requests, selections)
 
     def test_attention_pads_short_topk_before_gather(self):
         manager = self.manager()

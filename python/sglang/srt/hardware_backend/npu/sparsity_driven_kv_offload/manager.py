@@ -25,9 +25,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers
     copy_sfa_host_row_stride,
     view_copy_sfa_output,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lru import (
-    plan_sparse_lru,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     is_sparse_mtp_batch,
     prepare_mtp_rows,
@@ -148,20 +145,15 @@ class SparseKVCacheManager:
         self.layer_num = self.paged_kv_cache.layer_num
         self.device_cache_size = self.sparse_context_len
         self.indexer_impl = "legacy"
-        self.use_lru = (
-            self.device_cache_size > self.sparse_context_len
-            and self.indexer_impl != "lim"
-        )
         self._slot_map_width = (
             (self.max_context_len + 127) // 128 * 128
             if self.indexer_impl == "lim"
             else (self.max_context_len // 8 + 1) * 8
         )
         logger.info(
-            "Sparse KV per rank: K=%d C=%d, LRU=%s",
+            "Sparse KV per rank: K=%d C=%d",
             self.sparse_context_len,
             self.device_cache_size,
-            self.use_lru,
         )
         self.cache_capacity = self.device_cache_size
         if self.copy_sfa_enabled and (
@@ -248,23 +240,6 @@ class SparseKVCacheManager:
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                if self.use_lru:
-                    self._lru_init = torch.arange(
-                        self.device_cache_size, dtype=torch.int64, device=self.device
-                    )
-                    self.cache_tokens = [
-                        torch.full(
-                            (self.size + 1, self.device_cache_size),
-                            -1,
-                            dtype=torch.int32,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                    self.lru_order = [
-                        self._lru_init.expand(self.size + 1, -1).clone()
-                        for _ in range(self.layer_num)
-                    ]
                 if self.copy_sfa_enabled:
                     self.device_slot_owner: list[torch.Tensor] = [
                         torch.full(
@@ -440,9 +415,6 @@ class SparseKVCacheManager:
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
             if self.copy_sfa_enabled:
                 self.device_slot_owner[layer_idx].index_fill_(0, req_ids_tensor, -1)
-            if self.use_lru:
-                self.cache_tokens[layer_idx].index_fill_(0, req_ids_tensor, -1)
-                self.lru_order[layer_idx][req_ids_tensor] = self._lru_init
         if self.lim_adapter is not None:
             self.lim_adapter.reset_requests(req_ids_tensor)
 
@@ -1242,21 +1214,9 @@ class SparseKVCacheManager:
             )
 
             cache_slot_ids = self._device_cache_slot_ids[:topk_len]
-            plan = None
-            if self.use_lru:
-                plan = plan_sparse_lru(
-                    hit_mask=token_on_device,
-                    hit_slots=device_token_pos,
-                    miss_mask=host_miss_mask,
-                    cached_tokens=self.cache_tokens[layer_idx][slot_map_row_indices],
-                    lru_order=self.lru_order[layer_idx][slot_map_row_indices],
-                )
-                refill_slots = plan.miss_slots
-                refill_valid_mask = host_miss_mask.reshape(-1).contiguous()
-            else:
-                # Preserve the K-slot path without adding an LRU sort.
-                refill_slots = cache_slot_ids.expand(batch_size, -1)
-                refill_valid_mask = valid_topk_mask.reshape(-1).contiguous()
+            # Refill the K-entry cache in the current TopK order.
+            refill_slots = cache_slot_ids.expand(batch_size, -1)
+            refill_valid_mask = valid_topk_mask.reshape(-1).contiguous()
             request_cache_offsets = (
                 device_cache_row_indices.unsqueeze(1) * self.device_cache_size
             )
@@ -1282,8 +1242,6 @@ class SparseKVCacheManager:
                 refill_slots,
                 refill_valid_mask,
             ]
-            if plan is not None:
-                side_inputs.extend(plan)
             for tensor in side_inputs:
                 tensor.record_stream(self._materialize_h2d_miss_stream)
             _record_stream_event(stream, self.copy_ready)
@@ -1332,43 +1290,7 @@ class SparseKVCacheManager:
                 block_dim=24,
             )
             # No full-pool reset: inactive requests keep their resident mappings.
-            # In LRU mode invalidate only victims, after their hit copies finish.
-            if plan is None:
-                self.device_slot_map[layer_idx].index_fill_(0, slot_map_row_indices, -1)
-            else:
-                evicted = plan.evicted_tokens
-                evict_mask = host_miss_mask & (evicted >= 0)
-                evict_indices = (
-                    (
-                        slot_map_row_indices.unsqueeze(1) * self._slot_map_width
-                        + evicted.long().clamp(min=0)
-                    )
-                    .reshape(-1)
-                    .contiguous()
-                )
-                unidex_copy_inplace(
-                    torch.full_like(evict_indices.view(-1, 1), -1, dtype=torch.int32),
-                    self.device_slot_map[layer_idx].view(-1, 1),
-                    refill_src_index,
-                    evict_indices,
-                    evict_mask.reshape(-1).contiguous(),
-                    1,
-                    1,
-                    block_dim=48,
-                )
-                unidex_copy_inplace(
-                    topk_indices.to(torch.int32).reshape(-1, 1).contiguous(),
-                    self.cache_tokens[layer_idx].view(-1, 1),
-                    refill_src_index,
-                    refill_dst_index,
-                    refill_valid_mask,
-                    1,
-                    1,
-                    block_dim=48,
-                )
-                self.lru_order[layer_idx].index_copy_(
-                    0, slot_map_row_indices, plan.next_order
-                )
+            self.device_slot_map[layer_idx].index_fill_(0, slot_map_row_indices, -1)
 
             slot_map_token_indices = torch.where(
                 refill_valid_mask.view(batch_size, topk_len),

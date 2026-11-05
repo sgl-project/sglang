@@ -33,7 +33,6 @@ def install_sparse_reset(pool: ReqToTokenPool, copy_sfa_enabled: bool):
     manager = SparseKVCacheManager.__new__(SparseKVCacheManager)
     manager.device = "cpu"
     manager.layer_num = 2
-    manager.use_lru = False
     manager.lim_adapter = None
     manager.copy_sfa_enabled = copy_sfa_enabled
     manager.device_slot_map = [torch.full((pool._alloc_size, 2), 7) for _ in range(2)]

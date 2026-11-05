@@ -152,13 +152,11 @@ class BudgetPlan:
             if n not in ("device_kv_buffer", "device_slot_map")
         )
         self.adapter_bytes = sum(s.nbytes for s in self.adapter_buffers.values())
-        self.host_kv_bytes = (
-            request_rows
-            * num_layers
-            * context_len
-            * self.kv_cache_dim
-            * kv_dtype.itemsize
-        )
+        self.host_kv_bytes = BufferSpec(
+            (request_rows, context_len, 1, self.kv_cache_dim),
+            kv_dtype,
+            num_layers,
+        ).nbytes
         self.host_token_capacity = None
         self.host_kv_spec = None
         self.key_scale_spec = None
@@ -217,12 +215,7 @@ class BudgetPlan:
             self.kv_dtype,
             self.num_layers,
         )
-        self.host_kv_bytes = (
-            self.host_token_capacity
-            * self.num_layers
-            * self.kv_cache_dim
-            * self.kv_dtype.itemsize
-        )
+        self.host_kv_bytes = self.host_kv_spec.nbytes
         return self
 
     def validate_buffers(self, owner, specs: dict[str, BufferSpec]) -> None:
