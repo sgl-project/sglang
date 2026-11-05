@@ -12,6 +12,9 @@ from typing import List, Literal, Union
 import numpy as np
 import torch
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2_asr import MiMoV2ASRForCausalLM
 from sglang.srt.multimodal.modality import Modality
@@ -245,16 +248,17 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
                 if text_part:
                     contents.append(_Content(type="text", content=text_part))
 
-        loop = asyncio.get_running_loop()
         try:
+            future = self.io_executor.submit(self._process_contents, contents)
+            track_mm_preprocessing_future(future)
             (
                 input_ids,
                 audio_inputs,
                 position_ids,
                 rope_deltas,
-            ) = await loop.run_in_executor(
-                self.io_executor,
-                lambda: self._process_contents(contents),
+            ) = await asyncio.wrap_future(
+                future,
+                loop=asyncio.get_running_loop(),
             )
         except RuntimeError as e:
             logger.error(f"MiMo ASR processor failed in process_mm_data_async: {e}")

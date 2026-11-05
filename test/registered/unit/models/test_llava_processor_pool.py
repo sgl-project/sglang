@@ -7,6 +7,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    MultimodalPreprocessingAdmission,
+)
 from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -72,6 +75,96 @@ def test_llava_times_out_blocked_pool_submission_without_freezing_loop(monkeypat
     processor._replace_broken_cpu_executor.assert_called_once_with(
         processor.cpu_executor
     )
+
+
+def test_llava_timeout_reports_while_permit_tracks_running_process(monkeypatch):
+    monkeypatch.setenv("REQUEST_TIMEOUT", "1")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_preprocess(*_args):
+        started.set()
+        release.wait(timeout=5)
+        return "processed"
+
+    monkeypatch.setattr(
+        LlavaImageProcessor,
+        "_preprocess_image_task",
+        staticmethod(blocking_preprocess),
+    )
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    processor = object.__new__(LlavaImageProcessor)
+    processor.cpu_executor = executor
+    processor._processor = Mock()
+    processor._replace_broken_cpu_executor = Mock()
+    admission = MultimodalPreprocessingAdmission(1)
+    lease = admission.try_acquire(1)
+
+    async def run_test():
+        with lease.activate():
+            with pytest.raises(asyncio.TimeoutError):
+                await processor._process_single_image(b"image", "pad", None)
+        assert started.is_set()
+        lease.release()
+        assert admission.inflight_items == 1
+        release.set()
+        for _ in range(100):
+            if admission.inflight_items == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert admission.inflight_items == 0
+
+    try:
+        asyncio.run(run_test())
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+
+
+def test_llava_remote_fetch_keeps_permit_after_request_cancellation(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_fetch(_url):
+        started.set()
+        release.wait(timeout=5)
+        return b"image"
+
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.processors.llava.get_image_bytes",
+        blocking_fetch,
+    )
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    processor = object.__new__(LlavaImageProcessor)
+    processor.io_executor = executor
+    admission = MultimodalPreprocessingAdmission(1)
+    lease = admission.try_acquire(1)
+
+    async def run_test():
+        with lease.activate():
+            task = asyncio.create_task(
+                processor._fetch_remote_image_bytes("https://example.com/image.png")
+            )
+            while not started.is_set():
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        lease.release()
+        assert admission.inflight_items == 1
+        release.set()
+        for _ in range(100):
+            if admission.inflight_items == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert admission.inflight_items == 0
+
+    try:
+        asyncio.run(run_test())
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
 
 
 def test_broken_pool_is_replaced_once_for_concurrent_failures():
