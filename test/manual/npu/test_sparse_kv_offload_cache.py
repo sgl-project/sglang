@@ -370,9 +370,6 @@ class TestSparseKVManager(unittest.TestCase):
             torch=torch,
             torch_npu=SimpleNamespace(npu_sparse_flash_attention=sparse_attention),
             _get_sparse_kv_manager=lambda backend: backend.sparse_kv_manager,
-            # Isolate compact fallback payloads; the real fused eligibility and
-            # graph transitions are covered by check_lim_copy_sfa.py on NPU.
-            _copy_sfa_decode_eligible=lambda *_args: False,
             is_sparse_mtp_batch=mtp_module.is_sparse_mtp_batch,
             normalize_batch_topk_indices=self.manager_scope[
                 "normalize_batch_topk_indices"

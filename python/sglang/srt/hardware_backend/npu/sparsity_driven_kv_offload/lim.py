@@ -59,9 +59,6 @@ class LIMDecodeAdapter:
         self.batch_capacity = manager.batch_capacity
         self.top_k = manager.sparse_context_len
         self.full_visible = manager.copy_sfa_enabled
-        self.fused_copy_metadata = (
-            self.full_visible and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-        )
         self.fused_pre_metadata = (
             self.full_visible
             and self.top_k == 2048
@@ -115,20 +112,6 @@ class LIMDecodeAdapter:
             self._pre_states = torch.empty_like(self._pre_safe_slots)
             self._pre_next_prefix = torch.empty_like(self._pre_safe_slots)
             self._pre_cache_sizes = torch.empty_like(self._pre_safe_slots)
-        if self.fused_copy_metadata:
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
-                fused_lim_copy_sfa_metadata,
-            )
-
-            self._fused_copy_sfa_metadata = fused_lim_copy_sfa_metadata
-            # The fused kernel writes prefix state. Keep that write private: select
-            # has already published the real state, even for short/fallback rows.
-            self._metadata_prefix_scratch = torch.full(
-                (self.rows + 1,), -1, dtype=torch.int32, device=device
-            )
-            self._metadata_next_scratch = torch.full(
-                (self.batch_capacity,), -1, dtype=torch.int32, device=device
-            )
         self.mtp_full_visible = envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
         if self.mtp_full_visible:
             # The diagnostic integration supports the target-verify Q4 shape.
@@ -391,73 +374,6 @@ class LIMDecodeAdapter:
             valid,
             slots,
             lengths,
-        )
-
-    def copy_sfa_metadata(self, manager, plan):
-        """Pass graph-stable native LIM buffers directly, without replanning."""
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
-            fill_request_block_table,
-        )
-
-        batch = plan.source_ids.shape[0]
-        if self.fused_copy_metadata:
-            # Rebuild shared manager buffers on every consumer. IndexShare or
-            # another path may have reused them since the preceding call.
-            self._fused_copy_sfa_metadata(
-                source_ids=plan.source_ids,
-                topk_misses=plan.topk_misses,
-                miss_counts=plan.miss_counts,
-                valid_rows=plan.valid_rows,
-                sparse_rows=plan.sparse_rows,
-                request_slots=plan.request_slots,
-                next_prefix=self._metadata_next_scratch[:batch],
-                last_prefix=self._metadata_prefix_scratch,
-                actual_seq_lengths_kv=manager.planner_actual_seq_lengths_kv[:batch],
-                num_cache_tokens=manager.planner_num_cache_tokens[:batch],
-                hbm_block_table=manager.planner_hbm_block_table[:batch],
-                dram_block_table=manager.planner_dram_block_table[:batch],
-                capacity=self.capacity,
-                host_context_len=manager.max_context_len,
-                request_rows=self.rows,
-            )
-        else:
-            valid = plan.valid_rows & plan.sparse_rows
-            # Invalid native queries may leave old output contents. Zero counts
-            # prevent either copy phase from reading their unused source/slot rows.
-            plan.topk_misses.masked_fill_(~valid, 0)
-            plan.miss_counts.masked_fill_(~valid, 0)
-            # Preserve the full contiguous [B,32768] rows. A [:,:K] slice would
-            # retain the native row stride and fail the Copy-SFA layout contract.
-            lengths = valid.to(torch.int32) * self.capacity
-            manager.planner_actual_seq_lengths_kv[:batch].copy_(lengths)
-            manager.planner_num_cache_tokens[:batch].copy_(lengths)
-            for pages, offsets, output in (
-                (
-                    self.capacity // 128,
-                    manager.hbm_page_offsets,
-                    manager.planner_hbm_block_table,
-                ),
-                (
-                    manager.max_context_len // 128,
-                    manager.dram_page_offsets,
-                    manager.planner_dram_block_table,
-                ),
-            ):
-                fill_request_block_table(
-                    plan.request_slots, valid, offsets, pages, output[:batch]
-                )
-        return (
-            plan.source_ids.unsqueeze(1),
-            plan.device_slots.unsqueeze(1),
-            plan.topk_misses,
-            plan.miss_sources,
-            plan.miss_slots,
-            plan.miss_counts,
-            manager.planner_actual_seq_lengths_query[:batch],
-            manager.planner_actual_seq_lengths_kv[:batch],
-            manager.planner_num_cache_tokens[:batch],
-            manager.planner_hbm_block_table[:batch],
-            manager.planner_dram_block_table[:batch],
         )
 
     def gather_full_visible(self, manager, plan, layer_index, selected, *, copy):
