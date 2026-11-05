@@ -133,7 +133,7 @@ def build_rust_frame_metadata_fixture() -> dict:
     collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
     f, indent=2)`` after changing either side."""
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -669,6 +669,11 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
         ) as build_args,
+        patch.object(
+            server_module,
+            "build_processor_fingerprint",
+            return_value="sha256:" + "12" * 32,
+        ),
     ):
         yield build_args
 
@@ -695,7 +700,10 @@ class TestRustServerExtension(CustomTestCase):
                 self.server.start_mm_workers(sentinel.spec, 8)
 
         scheduler = SimpleNamespace(
-            model_config=SimpleNamespace(is_multimodal=True),
+            processor=sentinel.processor,
+            model_config=SimpleNamespace(
+                is_multimodal=True, hf_config=sentinel.config, model_path="test/model"
+            ),
         )
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
@@ -942,6 +950,49 @@ class TestRustServerExtension(CustomTestCase):
                     ]
                     self.assertEqual(tables, [expected, expected])
 
+    def test_gather_frontend_cpu_share_counts_only_listeners_on_this_mask(self):
+        """Every serving rank joins the collective, a non-listener contributes
+        no key, this rank's position is taken at its own index of the gathered
+        list, and an elastic-EP joiner stays out of it."""
+        gathered = []
+        other_mask = ("node", tuple(range(64, 128)))
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [obj, None, other_mask, obj]
+
+        world_group = SimpleNamespace(
+            all_gather_object=all_gather_object, rank_in_group=3
+        )
+
+        def moe(is_ep_joiner):
+            return SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=is_ep_joiner))
+
+        with (
+            patch.object(
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(world_group=world_group),
+            ),
+            patch.object(server_module, "get_exec", return_value=moe(False)),
+            patch.object(
+                server_module,
+                "_frontend_cpu_key",
+                return_value=("node", tuple(range(64))),
+            ),
+        ):
+            share = RustServer.gather_frontend_cpu_share(hosts_listener=True)
+            RustServer.gather_frontend_cpu_share(hosts_listener=False)
+            with patch.object(server_module, "get_exec", return_value=moe(True)):
+                joiner_share = RustServer.gather_frontend_cpu_share(hosts_listener=True)
+
+        self.assertEqual(share, (1, 2))
+        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+        # An elastic-EP joiner never enters the collective the serving ranks
+        # left behind at startup (the same rule as gather_server_endpoints).
+        self.assertEqual(joiner_share, (0, 1))
+        self.assertEqual(len(gathered), 2, "a joiner entered the gather")
+
     def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
         """A multi-node launch whose listener is loopback warns, naming the
         host and rendezvous address, unless the nodes rendezvous on loopback
@@ -1154,6 +1205,7 @@ class TestRustServerExtension(CustomTestCase):
             model_config=SimpleNamespace(
                 is_multimodal=True,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
+                model_path="test/model",
             ),
         )
         with (
@@ -1170,14 +1222,16 @@ class TestRustServerExtension(CustomTestCase):
                 BuiltinServer.launch(scheduler)
             extension.Server.assert_not_called()
 
-            mm_processor.return_value.resolve_spec.return_value = sentinel.spec
+            spec = Mock()
+            spec.rust_json.return_value = "{}"
+            mm_processor.return_value.resolve_spec.return_value = spec
             instance = BuiltinServer.launch(scheduler)
 
         extension.Server.assert_called_once()
         instance.server.start_mm_workers.assert_called_once_with(
             sentinel.worker_spec, 8
         )
-        self.assertIs(instance.mm_spec, sentinel.spec)
+        self.assertIs(instance.mm_spec, spec)
         self.assertTrue(instance._multimodal_enabled)
 
     @unittest.skipUnless(
@@ -1210,7 +1264,12 @@ class TestRustServerExtension(CustomTestCase):
             # Affinity is per thread: launch on a thread of its own, as the
             # scheduler's launch thread, so the test runner keeps its mask.
             scheduler = SimpleNamespace(
-                model_config=SimpleNamespace(is_multimodal=True)
+                processor=sentinel.processor,
+                model_config=SimpleNamespace(
+                    is_multimodal=True,
+                    hf_config=sentinel.config,
+                    model_path="test/model",
+                ),
             )
             with launch_context(ModelServer, cores=([launch_core], server_cores)):
                 ModelServer.launch(scheduler)

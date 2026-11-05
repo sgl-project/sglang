@@ -24,7 +24,7 @@ from sglang.test.vlm_utils import (
 KIMI_VL_MODEL = "moonshotai/Kimi-VL-A3B-Instruct"
 
 
-register_cuda_ci(est_time=242, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=242, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
