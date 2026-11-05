@@ -98,10 +98,15 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
-        with mock.patch.object(
-            forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False
+        for module_flag, broken in (
+            ("_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False),
+            ("_SGLANG_EXPERIMENTAL_LORA_OPTI", True),
         ):
-            self.assertFalse(_CAN_FUSE(_attn()))
+            with (
+                self.subTest(term=module_flag),
+                mock.patch.object(forward_mla_rocm, module_flag, broken),
+            ):
+                self.assertFalse(_CAN_FUSE(_attn()))
 
 
 class TestAbsorbBmmConfig(CustomTestCase):
@@ -181,10 +186,12 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
         )
 
     def test_each_term_alone_turns_it_off(self):
-        """Prefill keeps the split path, as do layouts the kernel lacks:
-        DSA caches, DCP's all-gathered q_nope_out, non-MXFP4 w_kc, NoPE layers."""
+        """Prefill keeps the split path, as do layouts the kernel lacks: DSA caches,
+        DCP's all-gathered q_nope_out, LoRA or deep-gemm absorbs, NoPE layers.
+        Every term shared with the FP8 branch is broken on an MXFP4 attn too."""
         forward_batch = self._make_decode_batch()
         with self._aiter_gfx95_env():
+            self.assertTrue(self._can_fuse(self._make_attn(), forward_batch))
             self.assertFalse(
                 self._can_fuse(
                     self._make_attn(),
@@ -192,23 +199,35 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
                 )
             )
             for name, broken in (
-                ("use_dsa", True),
+                # Shared with the FP8 branch.
+                ("dcp_size", 2),
+                ("rotary_emb", None),
+                ("use_deep_gemm_bmm", True),
                 ("kv_b_proj", SimpleNamespace(set_lora=True)),
+                # MXFP4 only.
+                ("use_dsa", True),
+                ("w_scale_k", None),
+                # Not MXFP4: dispatch leaves this branch.
                 ("w_kc", torch.empty(1, dtype=torch.float8_e4m3fn)),
                 ("w_kc", torch.empty(1, dtype=torch.bfloat16)),
-                ("w_scale_k", None),
-                ("rotary_emb", None),
             ):
-                with self.subTest(term=name):
+                with self.subTest(term=name, broken=broken):
                     attn = self._make_attn()
                     setattr(attn, name, broken)
                     self.assertFalse(self._can_fuse(attn, forward_batch))
-            with get_parallel().override(dcp_enabled=True):
-                self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
-            with mock.patch.object(
-                forward_mla_rocm,
-                "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE",
-                False,
+            for module_flag, broken in (
+                ("_use_aiter_gfx95", False),
+                ("_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False),
+                ("_SGLANG_EXPERIMENTAL_LORA_OPTI", True),
+            ):
+                with (
+                    self.subTest(term=module_flag),
+                    mock.patch.object(forward_mla_rocm, module_flag, broken),
+                ):
+                    self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
+            with (
+                self.subTest(term="dcp_enabled"),
+                get_parallel().override(dcp_enabled=True),
             ):
                 self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
 
