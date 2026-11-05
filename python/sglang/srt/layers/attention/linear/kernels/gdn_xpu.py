@@ -111,6 +111,7 @@ class XpuGDNKernel(TritonGDNKernel):
             or b is None
             or not kwargs.get("inplace_update", True)
             or kwargs.get("track_state") is not None
+            or kwargs.get("needs_track_state", False)
         ):
             return super().extend(
                 q,
