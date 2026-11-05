@@ -64,7 +64,12 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    broadcast_pyobj,
+    derive_attn_dp_random_seed,
+    set_random_seed,
+)
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -355,6 +360,7 @@ class TpModelWorker(BaseTpWorker):
         # Elastic joiners and last-stage-only draft workers cannot enter the WORLD
         # broadcast, so they reuse the target's already-broadcast seed.
         if random_seed is not None:
+            # A draft worker gets the target's seed, already derived below.
             self.random_seed = random_seed
         elif get_exec().moe.is_ep_joiner:
             self.random_seed = get_device().random_seed
@@ -384,6 +390,15 @@ class TpModelWorker(BaseTpWorker):
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
+        if random_seed is None:
+            # The broadcast seed is the server's. Each attention-DP group samples
+            # its own requests and needs its own random stream, while the
+            # attention-TP ranks of one group must keep a common seed.
+            self.random_seed = derive_attn_dp_random_seed(
+                self.random_seed,
+                attn_dp_rank=get_parallel().attn_dp_rank,
+                attn_dp_size=get_parallel().attn_dp_size,
+            )
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not get_schedule().disable_overlap_schedule
