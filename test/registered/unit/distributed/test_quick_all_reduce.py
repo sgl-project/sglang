@@ -25,13 +25,17 @@ _QR_MODULE = "sglang.srt.distributed.device_communicators.quick_all_reduce"
 
 
 class _FakeFlyDSLInt4:
-    def __init__(self):
+    def __init__(self, **kwargs):
         self.calls = 0
         self.closed = False
+        self.compiled = []
 
     def allreduce(self, inp, out):
         self.calls += 1
         out.copy_(inp)
+
+    def compile(self, inp, out):
+        self.compiled.append((inp, out))
 
     def close(self):
         self.closed = True
@@ -84,6 +88,21 @@ class TestQuickAllReduceFlyDSLInt4(CustomTestCase):
         for name, tensor in rejected.items():
             with self.subTest(name):
                 self.assertFalse(quick_reduce.should_quick_allreduce(tensor))
+
+    def test_init_compiles_on_an_admitted_payload(self):
+        """The FlyDSL kernels are built at init, on a payload this communicator admits."""
+        fake_module = types.ModuleType("aiter.ops.flydsl")
+        fake_module.QuickAllReduceInt4 = _FakeFlyDSLInt4
+        quick_reduce = _make_uninitialized_quick_reduce()
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl": fake_module}),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            self.assertTrue(quick_reduce._init_flydsl_int4(2048 * MB))
+
+        ((compile_inp, _),) = quick_reduce._flydsl_int4.compiled
+        self.assertTrue(quick_reduce.should_quick_allreduce(compile_inp))
+        self.assertIn("compiled at init", "\n".join(logs.output))
 
     def test_missing_flydsl_class_falls_back_to_hip_visibly(self):
         """Without QuickAllReduceInt4, QuickReduce stays on the HIP kernel, warns once and says so."""

@@ -240,13 +240,22 @@ class QuickAllReduce:
             rank=self.rank,
             world_size=self.world_size,
         )
+        # The FlyDSL binaries take the payload size at run time, so the smallest
+        # payload this communicator admits builds every one of them.
+        compile_inp = torch.zeros(
+            self._min_size(torch.bfloat16) // 2,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._flydsl_int4.compile(compile_inp, torch.empty_like(compile_inp))
         # QuickAllReduceInt4 rejects payloads above its 4 GiB window.
         self.qr_max_size = min(
             qr_max_size if qr_max_size > 0 else ops.qr_max_size(), 0xFFFFFFFF
         )
         self.disabled = False
         logger.info(
-            "QuickReduce INT4 uses aiter FlyDSL QuickAllReduceInt4 (max %d MiB)",
+            "QuickReduce INT4 uses aiter FlyDSL QuickAllReduceInt4 "
+            "(max %d MiB, compiled at init)",
             self.qr_max_size // MB,
         )
         return True
@@ -284,14 +293,12 @@ class QuickAllReduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        dtype = inp.dtype
+        return self._min_size(inp.dtype) <= inp_size <= self.qr_max_size
+
+    def _min_size(self, dtype: torch.dtype) -> int:
         if self.use_fp16_kernels:
             dtype = torch.float16
-        return (
-            inp_size <= self.qr_max_size
-            and inp_size
-            >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
-        )
+        return self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
