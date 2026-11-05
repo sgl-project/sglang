@@ -311,7 +311,7 @@ struct NormGateKernel {
     auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
     D.set_value(kHeadDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, D}).with_strides({D, 1}).with_dtype<T>().with_device(device).verify(x).verify(y);
     if (weight.has_value()) {

@@ -82,6 +82,222 @@ import { agentx } from "/src/snippets/agentx/Qwen/qwen3.8-flash-next.jsx";
 
 <AgentX data={agentx} />
 
+### MI355X deployment measured with SemiAnalysis InferenceX
+
+AMD's Quark MXFP4 checkpoint with NEXTN MTP on one MI355X (TP1), with GPU-resident KV up to concurrency 16 and HiCache offload above it, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4680](https://github.com/SemiAnalysisAI/InferenceX/pull/4680), [#4542](https://github.com/SemiAnalysisAI/InferenceX/pull/4542), [#4779](https://github.com/SemiAnalysisAI/InferenceX/pull/4779)) at concurrency 1–80. Concurrency 12 and 16 run the default path; concurrency 1–8 run the FlyDSL monokernel; concurrency 24, 48 and 80 add an FP8 KV cache and HiCache host-memory offload.
+
+- **Container image.** `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261031` (`sha256:3867dc07ba2530f914e1f210ed829f7a572a75286c8c362dbc22cbecf9b5a7e6`, the image tested in InferenceX, run without patches). This dated nightly is built from SGLang `main` at [`e9c18259c7`](https://github.com/sgl-project/sglang/commit/e9c18259c77dad912a13b0df3148a472d19630f4) with AITER [`285579b6`](https://github.com/ROCm/aiter/commit/285579b6211b0da30f35b91a890c29c823597cd1) and the monokernel package [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) at [`b10f3b71`](https://github.com/sgl-project/sgl-amd-mono/commit/b10f3b71c45a70f504c5cad2d622c3e423196e90), the pin SGLang carries since [#47483](https://github.com/sgl-project/sglang/pull/47483).
+- **Checkpoint.** [`amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8) has MXFP4 MoE experts (the MTP head's included), FP8 attention and an FP8 N-gram table, 116 GiB in all.
+- **PLE offload.** At concurrency 12 to 80, `--ple-offload-embedding` keeps the 47.7 GiB FP8 N-gram table in pinned host memory, which leaves about 82 GB of weights on the GPU. On ROCm the server leaves it off unless you pass the flag. Offloading this checkpoint also needs the `--json-model-override-args` value, which declares the table's FP8 storage up front; without it the server stops at load with `fp8 PLE auto-switch is unsupported with ple_offload_embedding`. The monokernel reads the table on the GPU, so the concurrency 1–8 command leaves the offload off; it keeps the override value, as in InferenceX.
+- **Memory fraction.** For models with a context above 8,192 tokens, the aiter attention backend multiplies `--mem-fraction-static` by 0.85. `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` keeps the value as given: 0.9 up to concurrency 16 and 0.88 at concurrency 24–80.
+- **Monokernel (concurrency 1–8).** `--enable-amd-monokernel` runs MTP target verify (13 persistent launches per step) and every MTP draft step (one launch) through the FlyDSL kernels of `sgl-amd-mono`, for up to 8 running requests on one MI355X (TP1). Other steps use the standard forward. It needs NEXTN with 3 steps, eagle-topk 1 and 4 draft tokens, and the Quark checkpoint above. Its verify writes the per-draft SSM states itself, so leave out `--enable-linear-replayssm-spec`. The flag is marked experimental, and SGLang stops at startup with the list of reasons if the setup is outside what the kernel supports.
+- **Batch limits.** At concurrency 12, 16 and 24, set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency, so request bursts above it still decode in a captured graph: 24, 32 and 48. At concurrency 48 and 80 set both to 128. With the monokernel, set both to the concurrency: 1, 2, 4 and 8. The commands below use concurrency 16, 8, 24, 48 and 80.
+- **FP8 KV and HiCache (concurrency 24–80).** `--kv-cache-dtype fp8_e4m3` and `--speculative-draft-kv-cache-dtype fp8_e4m3` store the target and draft KV caches in FP8 E4M3, and `SGLANG_USE_AITER_UNIFIED_ATTN=1` switches the aiter backend to its unified-attention kernel. The Mamba state pool uses `--mamba-radix-cache-strategy extra_buffer_lazy` with `--mamba-track-interval 256`, and `--max-mamba-cache-size` is 960, 720 and 640 at concurrency 24, 48 and 80. HiCache (`--enable-hierarchical-cache` with `--hicache-io-backend kernel`, `--hicache-mem-layout page_first` and `--hicache-write-policy write_back`) offloads KV to host memory; `--hicache-size` is in gigabytes and is 200 at concurrency 24 and 298 at concurrency 48 and 80, inside the 299 GB host-memory share InferenceX gives each point. At concurrency 80, `--strip-thinking-cache` caches only the prompt when a request finishes, and `--mamba-max-states-per-path 2` keeps at most two Mamba states per conversation path. These points keep ReplaySSM and the PLE offload of concurrency 12 and 16.
+- **Thinking.** The commands for concurrency 1–16 pass `--default-chat-template-kwargs '{"enable_thinking": false}'`, which makes non-thinking the default: the chat template opens each reply with an empty `<think></think>` block. The commands for concurrency 24–80 follow the InferenceX recipe, which leaves the flag out, so the model's thinking-on default applies; add the flag for non-thinking replies. A request switches either default with `"chat_template_kwargs": {"enable_thinking": true}` or `false`.
+
+```bash Concurrency 12–16
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+AITER_GDR_FLYDSL=1 \
+sglang serve \
+  --model-path amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 \
+  --trust-remote-code \
+  --tp-size 1 \
+  --quantization quark \
+  --attention-backend aiter \
+  --page-size 64 \
+  --kv-cache-dtype auto \
+  --mamba-ssm-dtype bfloat16 \
+  --ple-offload-embedding \
+  --json-model-override-args '{"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-linear-replayssm-spec \
+  --mem-fraction-static 0.9 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 32 \
+  --cuda-graph-max-bs-decode 32 \
+  --scheduler-recv-interval 10 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash Concurrency 1–8 (monokernel)
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+AITER_GDR_FLYDSL=1 \
+sglang serve \
+  --model-path amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 \
+  --trust-remote-code \
+  --tp-size 1 \
+  --quantization quark \
+  --attention-backend aiter \
+  --page-size 64 \
+  --kv-cache-dtype auto \
+  --mamba-ssm-dtype bfloat16 \
+  --json-model-override-args '{"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-amd-monokernel \
+  --mem-fraction-static 0.9 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs-decode 8 \
+  --scheduler-recv-interval 10 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash Concurrency 24
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+AITER_GDR_FLYDSL=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+sglang serve \
+  --model-path amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 \
+  --trust-remote-code \
+  --tp-size 1 \
+  --quantization quark \
+  --attention-backend aiter \
+  --page-size 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --ple-offload-embedding \
+  --json-model-override-args '{"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-draft-kv-cache-dtype fp8_e4m3 \
+  --enable-linear-replayssm-spec \
+  --mem-fraction-static 0.88 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 48 \
+  --cuda-graph-max-bs-decode 48 \
+  --max-mamba-cache-size 960 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --mamba-track-interval 256 \
+  --enable-hierarchical-cache \
+  --hicache-size 200 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_back \
+  --scheduler-recv-interval 10 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash Concurrency 48
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+AITER_GDR_FLYDSL=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+sglang serve \
+  --model-path amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 \
+  --trust-remote-code \
+  --tp-size 1 \
+  --quantization quark \
+  --attention-backend aiter \
+  --page-size 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --ple-offload-embedding \
+  --json-model-override-args '{"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-draft-kv-cache-dtype fp8_e4m3 \
+  --enable-linear-replayssm-spec \
+  --mem-fraction-static 0.88 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --max-mamba-cache-size 720 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --mamba-track-interval 256 \
+  --enable-hierarchical-cache \
+  --hicache-size 298 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_back \
+  --scheduler-recv-interval 10 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash Concurrency 80
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+AITER_GDR_FLYDSL=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+sglang serve \
+  --model-path amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 \
+  --trust-remote-code \
+  --tp-size 1 \
+  --quantization quark \
+  --attention-backend aiter \
+  --page-size 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --ple-offload-embedding \
+  --json-model-override-args '{"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}}' \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-draft-kv-cache-dtype fp8_e4m3 \
+  --enable-linear-replayssm-spec \
+  --mem-fraction-static 0.88 \
+  --chunked-prefill-size 16384 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --max-mamba-cache-size 640 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --mamba-track-interval 256 \
+  --enable-hierarchical-cache \
+  --hicache-size 298 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_back \
+  --strip-thinking-cache \
+  --mamba-max-states-per-path 2 \
+  --scheduler-recv-interval 10 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --watchdog-timeout 1200 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 ## 1. Model Introduction
 
 **Qwen3.8-Flash-Next** is a multimodal Mixture-of-Experts model released as an early preview of the architecture Qwen4 is being built on — the same role Qwen3-Next played for Qwen3.5, whose hybrid Gated DeltaNet + Gated Attention design then carried through the Qwen3.5, Qwen3.6, Qwen3.7 and Qwen3.8 series. Qwen is publishing the architectural changes ahead of the full Qwen4 family so the community can evaluate them independently.

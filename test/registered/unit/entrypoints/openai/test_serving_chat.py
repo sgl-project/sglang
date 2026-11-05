@@ -35,6 +35,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
     MessageProcessingResult,
+    StreamOptions,
     Tool,
     ToolChoice,
     ToolChoiceFuncName,
@@ -46,6 +47,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
@@ -471,6 +473,17 @@ class ServingChatTestCase(CustomTestCase):
         user = {"role": "user", "content": "Hi?"}
         cases = {
             "thinking unknown": {"messages": [user], "thinking": {"type": "off"}},
+            "effort none": {"messages": [user], "reasoning_effort": "none"},
+            "effort minimal": {"messages": [user], "reasoning_effort": "minimal"},
+            "effort numeric": {"messages": [user], "reasoning_effort": 0.5},
+            "effort none via reasoning": {
+                "messages": [user],
+                "reasoning": {"effort": "none"},
+            },
+            "effort none via template kwargs": {
+                "messages": [user],
+                "chat_template_kwargs": {"reasoning_effort": "none"},
+            },
             "root not first": {
                 "messages": [user, {"role": "root", "content": "You are A."}]
             },
@@ -499,8 +512,8 @@ class ServingChatTestCase(CustomTestCase):
                     self.assertEqual(error is not None, is_m3)
 
     def test_m3_request_contract_accepts_valid_requests(self):
-        """Disabled thinking, a trailing tool call, a leading root and answered calls
-        in any order are valid M3 requests."""
+        """Disabled thinking, every listed effort, a trailing tool call, a leading root
+        and answered calls in any order are valid M3 requests."""
         self.chat.is_minimax_m3 = True
         weather = {"name": "get_weather", "arguments": "{}"}
         calls = [
@@ -510,6 +523,10 @@ class ServingChatTestCase(CustomTestCase):
         user = {"role": "user", "content": "Hi?"}
         for fields in (
             {"messages": [user], "thinking": {"type": "disabled"}},
+            *(
+                {"messages": [user], "reasoning_effort": effort}
+                for effort in ("low", "medium", "high", "xhigh", "max")
+            ),
             {
                 "messages": [
                     user,
@@ -532,8 +549,8 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertIsNone(self.chat._validate_request(request))
 
     def test_m3_thinking_mode_follows_request_intent(self):
-        """thinking outranks reasoning_effort, an effort only ever turns thinking off,
-        and values the template cannot use are dropped."""
+        """thinking outranks reasoning_effort, an effort never changes the thinking
+        mode, and the effort is dropped once thinking is off."""
         from sglang.srt.entrypoints.openai.serving_chat import (
             _normalize_minimax_m3_request,
         )
@@ -541,9 +558,6 @@ class ServingChatTestCase(CustomTestCase):
         user = [{"role": "user", "content": "Hi?"}]
         for fields, mode, effort in (
             ({"reasoning_effort": "high"}, None, "high"),
-            ({"reasoning_effort": "minimal"}, "disabled", None),
-            ({"reasoning_effort": "none"}, "disabled", None),
-            ({"reasoning_effort": 0.5}, None, None),
             (
                 {"reasoning_effort": "high", "thinking": {"type": "adaptive"}},
                 "adaptive",
@@ -573,8 +587,9 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_m3_effort_from_template_kwargs_is_normalized(self):
         """An effort sent in chat_template_kwargs or set by the server is normalized
-        like the top-level one, and a server default never overrides thinking the
-        request turned off."""
+        like the top-level one, a server default outside the enum is dropped rather
+        than rejected, and a server default never overrides thinking the request
+        turned off."""
         self.chat.is_minimax_m3 = True
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
@@ -584,16 +599,9 @@ class ServingChatTestCase(CustomTestCase):
         # (request fields, server defaults, rendered effort, rendered thinking_mode):
         # the request's own settings outrank the server defaults, which fill gaps.
         cases = (
-            (
-                {"chat_template_kwargs": {"reasoning_effort": "none"}},
-                {},
-                None,
-                "disabled",
-            ),
-            ({}, {"reasoning_effort": "none"}, None, "disabled"),
+            ({}, {"reasoning_effort": "none"}, None, None),
             ({"chat_template_kwargs": {"reasoning_effort": "high"}}, {}, "high", None),
             ({"thinking": {"type": "disabled"}}, enabled, None, "disabled"),
-            ({"reasoning_effort": "none"}, enabled, None, "disabled"),
             ({}, {**enabled, "reasoning_effort": "high"}, "high", "enabled"),
         )
         for fields, server_defaults, effort, mode in cases:
@@ -1320,9 +1328,9 @@ class ServingChatTestCase(CustomTestCase):
                     }
                 yield {
                     **output,
-                    "text": output["text"][len(text) :]
-                    if incremental
-                    else output["text"],
+                    "text": (
+                        output["text"][len(text) :] if incremental else output["text"]
+                    ),
                 }
 
             self.tm.generate_request = Mock(return_value=generate())
@@ -2767,6 +2775,41 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_kimi_k3_tool_choice_none_forbids_tools_section(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="none",
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=False)
+
+        constraint_type, tag = result.tool_call_constraint
+        self.assertEqual(constraint_type, "structural_tag")
+        self.assertIn(
+            tag.model_dump_json(),
+            {
+                get_kimik3_structural_tag(
+                    [], tool_choice="none", thinking_mode=m
+                ).model_dump_json()
+                for m in (False, True)
+            },
+        )
+
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
@@ -2931,6 +2974,79 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertNotIn("image_prompts", kwargs)
 
+    def test_kimi_k3_keeps_tool_call_arguments_bytes(self):
+        """The K3 encoder keeps a nested argument value's original JSON text;
+        parsing the arguments to a dict first would re-serialize it."""
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        arguments = '{"options": { "unit" : "c" , "days" : 3 }}'
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "Sunny"},
+            ],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            messages[1]["tool_calls"][0]["function"]["arguments"], arguments
+        )
+
+    def test_kimi_k3_explicit_tool_choice_none_reaches_encoder_without_tools(self):
+        """An explicit tool_choice=none is rendered even without tools; the
+        default "none" of a request without tools is not."""
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        messages = [{"role": "user", "content": "Hi"}]
+        for kwargs, expected in (({"tool_choice": "none"}, "none"), ({}, None)):
+            with self.subTest(kwargs=kwargs):
+                request = ChatCompletionRequest(model="x", messages=messages, **kwargs)
+                self.assertEqual(request.tool_choice, "none")
+
+                self.chat._process_messages(request, is_multimodal=False)
+
+                call_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(call_kwargs.get("tool_choice"), expected)
+
+    def test_validate_request_accepts_draft07_schema_identifiers(self):
+        """A plain-name ``$id`` fragment is valid draft-07 but fails the 2020-12
+        metaschema; it constrains nothing, so the tool is accepted."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "$id": "#lookup",
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+
+        self.assertIsNone(self.chat._validate_request(request))
+
     def test_message_tools_participate_in_validation_across_encodings(self):
         tool = {
             "type": "function",
@@ -2966,6 +3082,88 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(
                     self.chat._validate_request(duplicate),
                     "Tool names must be unique across request and message tools.",
+                )
+
+    def test_kimi_k3_rejects_message_tools_the_encoding_cannot_render(self):
+        def tool(name="lookup", **fields):
+            return {"type": "function", "function": {"name": name}, **fields}
+
+        def declare(role, tools, content=""):
+            return [
+                {"role": role, "content": content, "tools": tools},
+                {"role": "user", "content": "Hi?"},
+            ]
+
+        untyped = {"function": {"name": "lookup"}}
+        cases = {
+            "user message": (declare("user", [tool()], "Hi"), True),
+            "assistant message": (declare("assistant", [tool()]), True),
+            "root message": (declare("root", [tool()], "You are A."), True),
+            "system message with content": (declare("system", [tool()], "A"), True),
+            "missing type": (declare("system", [untyped]), True),
+            "non-function type": (declare("system", [tool(type="bogus")]), True),
+            "name starts with a digit": (declare("system", [tool("1x")]), True),
+            "name with a symbol": (declare("system", [tool("a@b")]), True),
+            "empty name": (declare("system", [tool("")]), True),
+            "name over 256 chars": (declare("system", [tool("a" * 257)]), True),
+            "system message": (declare("system", [tool("_a-1" + "b" * 252)]), False),
+            "developer message": (declare("developer", [tool()], None), False),
+        }
+        for chat_encoding_spec in (None, "kimi_k3"):
+            self.chat.chat_encoding_spec = chat_encoding_spec
+            for name, (messages, rejected_by_k3) in cases.items():
+                with self.subTest(chat_encoding_spec=chat_encoding_spec, case=name):
+                    error = self.chat._validate_request(
+                        ChatCompletionRequest(model="x", messages=messages)
+                    )
+                    self.assertEqual(
+                        error is not None,
+                        rejected_by_k3 and chat_encoding_spec == "kimi_k3",
+                        error,
+                    )
+
+    def test_kimi_k3_forced_tool_call_overrides_json_response_format(self):
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {"type": "function", "function": {"name": "get_weather"}}
+        json_object = {"type": "json_object"}
+        json_schema = {
+            "type": "json_schema",
+            "json_schema": {"name": "a", "schema": {"type": "object"}},
+        }
+        named = {"type": "function", "function": {"name": "get_weather"}}
+        cases = (
+            ("kimi_k3", "required", json_object, None, True),
+            ("kimi_k3", named, json_schema, None, True),
+            ("kimi_k3", "required", json_object, "a+", False),
+            (None, "required", json_object, None, False),
+        )
+        for spec, tool_choice, response_format, regex, accepted in cases:
+            self.chat.chat_encoding_spec = spec
+            self.chat.tool_call_parser = "kimi_k3" if spec else "hermes"
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Weather in Paris?"}],
+                tools=[tool],
+                tool_choice=tool_choice,
+                response_format=response_format,
+                regex=regex,
+            )
+            with self.subTest(spec=spec, tool_choice=tool_choice, regex=regex):
+                if not accepted:
+                    with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                        self.chat._convert_to_internal_request(
+                            request, self.fastapi_request
+                        )
+                    continue
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request, self.fastapi_request
+                )
+                self.assertNotIn("json_schema", adapted.sampling_params)
+                self.assertIn("structural_tag", adapted.sampling_params)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(
+                    kwargs["response_format"]["type"], response_format["type"]
                 )
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
@@ -3468,6 +3666,20 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
+
+    def test_kimi_k3_tool_call_id_unique_when_history_count_repeats(self):
+        # Regression: history-count K3 ids repeated when a client sent a shorter
+        # history (context compaction); dedup-by-id clients dropped the call.
+        self.chat.tool_call_parser = "kimi_k3"
+        call_item = Mock()
+        call_item.name = "Bash"
+        call_item.tool_index = 0
+
+        first = self.chat._process_tool_call_id(call_item, history_tool_calls_cnt=3)
+        second = self.chat._process_tool_call_id(call_item, history_tool_calls_cnt=3)
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("call_"))
 
     def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
         """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
@@ -6147,6 +6359,25 @@ class TestUsageReasoningTokens(CustomTestCase):
             prompt_tokens=5, completion_tokens=7
         )
         self.assertIsNone(no_reasoning.completion_tokens_details)
+
+
+class TestShouldIncludeUsage(CustomTestCase):
+    def test_explicit_include_usage_overrides_server_default(self):
+        from sglang.srt.entrypoints.openai.utils import should_include_usage
+
+        for include_usage, server_default, expected in (
+            (False, True, False),
+            (True, False, True),
+            (None, True, True),
+            (None, False, False),
+        ):
+            with self.subTest(
+                include_usage=include_usage, server_default=server_default
+            ):
+                stream_options = StreamOptions(include_usage=include_usage)
+                self.assertEqual(
+                    should_include_usage(stream_options, server_default)[0], expected
+                )
 
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):
