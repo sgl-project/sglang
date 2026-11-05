@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget imp
 )
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_disagg,
     get_exec,
     get_parallel,
     get_schedule,
@@ -168,6 +169,14 @@ def get_sparse_kv_budget(
         if query_heads <= 0:
             raise ValueError("CopySFA requires a positive per-rank query head count.")
         copy_sfa_query_heads = 1 << (query_heads - 1).bit_length()
+    disagg = get_disagg()
+    prefill_rows = request_rows - 1
+    if disagg.disaggregation_mode == "decode" and not disagg.enable_pd_role_switch:
+        prefill_rows = 0
+    elif get_schedule().prefill_max_requests is not None:
+        prefill_rows = min(prefill_rows, get_schedule().prefill_max_requests)
+    page_size = get_schedule().page_size
+    aligned_context = (context_len + page_size - 1) // page_size * page_size
     if graph_batch_capacity is None:
         # Reserve before admission determines the final request-pool size.
         # Capture buckets may round that size up for attention parallelism.
@@ -181,7 +190,7 @@ def get_sparse_kv_budget(
                 graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
     return resolve_sparse_kv_budget(
         model_config=model_config,
-        page_size=get_schedule().page_size,
+        page_size=page_size,
         request_rows=request_rows,
         context_len=context_len,
         num_layers=num_layers,
@@ -190,6 +199,7 @@ def get_sparse_kv_budget(
         cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
         hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
         kv_dtype=kv_dtype,
+        prefill_workspace_tokens=prefill_rows * aligned_context,
         max_query_width=get_sparse_kv_max_query_width(),
         copy_sfa_query_heads=copy_sfa_query_heads,
         graph_batch_capacity=max(

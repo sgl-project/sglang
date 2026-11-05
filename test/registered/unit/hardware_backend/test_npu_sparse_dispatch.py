@@ -82,7 +82,18 @@ def test_legacy_budget_requires_fused_mode(monkeypatch):
 
 def test_fused_budget_keeps_its_constraints(monkeypatch):
     monkeypatch.setattr(config, "get_parallel", lambda: SimpleNamespace(attn_tp_size=1))
-    monkeypatch.setattr(config, "get_schedule", lambda: SimpleNamespace(page_size=128))
+    monkeypatch.setattr(
+        config,
+        "get_schedule",
+        lambda: SimpleNamespace(page_size=128, prefill_max_requests=None),
+    )
+    monkeypatch.setattr(
+        config,
+        "get_disagg",
+        lambda: SimpleNamespace(
+            disaggregation_mode="null", enable_pd_role_switch=False
+        ),
+    )
     monkeypatch.setattr(config, "get_eager_max_batch_size", lambda _: 4)
     monkeypatch.setattr(config, "get_sparse_kv_max_query_width", lambda: 4)
     with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True):

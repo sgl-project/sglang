@@ -1193,7 +1193,7 @@ class TestEagleConfigurator(CustomTestCase):
             self.assertEqual(cfg._fixed_overhead_bytes, fixed)
             available = fixed + 10_000_000
             sizes = cfg.calculate_pool_sizes(available, 128)
-            used = sizes.max_total_num_tokens * cell_size + fixed
+            used = sizes.max_total_num_tokens * cell_size + cfg._fixed_overhead_bytes
             self.assertLessEqual(used, available)
 
             # The HBM limit caps actual allocations; it must not reserve the
@@ -1290,8 +1290,11 @@ class TestEagleConfigurator(CustomTestCase):
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
-                return_value=SimpleNamespace(
-                    managed_hbm_bytes=123, scale_element_size=torch.float32.itemsize
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    managed_hbm_bytes=123,
+                    scale_element_size=torch.float32.itemsize,
+                    context_len=kwargs["context_len"],
+                    request_rows=kwargs["request_rows"],
                 ),
             ) as mock_sparse_budget,
             mock_cpu_env(tp_size=16),

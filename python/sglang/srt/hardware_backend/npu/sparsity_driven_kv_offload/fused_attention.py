@@ -8,6 +8,7 @@ import torch
 import torch_npu
 
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 def forward_sparsity_driven_kv_offload(
@@ -76,7 +77,15 @@ def forward_sparsity_driven_kv_offload(
         return backend.do_cp_balance_attn(
             q, k_nope, q_rope, k_pe, topk_indices, layer, actual_q, actual_kv
         )
-    k_nope, k_pe = manager.get_forward_kv(layer, forward_batch, stream)
+    gather_plan = None
+    if not backend.graph_mode and forward_batch.forward_mode == ForwardMode.EXTEND:
+        gather_plan = backend.forward_metadata.sparse_kv_fused_prefill_plan
+        if gather_plan is None:
+            gather_plan = manager.prepare_forward_kv_plan(forward_batch, stream)
+            backend.forward_metadata.sparse_kv_fused_prefill_plan = gather_plan
+    k_nope, k_pe = manager.get_forward_kv(
+        layer, forward_batch, stream, plan=gather_plan, current=current_inputs
+    )
     if topk_indices.ndim == 2:
         topk_indices = topk_indices.unsqueeze(-2)
     result, _, _ = torch_npu.npu_sparse_flash_attention(

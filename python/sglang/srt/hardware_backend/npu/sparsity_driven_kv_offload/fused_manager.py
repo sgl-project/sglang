@@ -17,6 +17,8 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
+    fused_prefill_current_mapping,
+    make_fused_prefill_plan,
     prepare_prefill_gather_rows,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
@@ -107,6 +109,7 @@ class SparseKVCacheManager:
         self.max_query_width = self.budget.max_query_width
         self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
+        self._prefill_workspace_stream = None
         self._slot_map_width = self.budget.context_len
         logger.info(
             "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, host_layout=paged",
@@ -114,6 +117,12 @@ class SparseKVCacheManager:
             self.device_cache_size,
             self.budget.managed_hbm_bytes / 1024**2,
             self.budget.host_kv_bytes / 1024**2,
+        )
+        logger.info(
+            "Sparse KV prefill workspace: enabled=%s capacity_tokens=%d persistent_bytes=%d",
+            bool(self.budget.prefill_workspace_tokens),
+            self.budget.prefill_workspace_tokens,
+            self.budget.prefill_workspace_bytes,
         )
         self.cache_capacity = self.device_cache_size
         self._copy_sfa_operator = load_copy_sfa_operator()
@@ -506,15 +515,39 @@ class SparseKVCacheManager:
                 requests = forward_batch.req_pool_indices.to(torch.long)
                 self.resident_begin[layer_idx].index_fill_(0, requests, -1)
                 self.resident_end[layer_idx].index_fill_(0, requests, -1)
-                return None
 
             return src_tensor, token_positions, valid_mask
+
+    def prepare_forward_kv_plan(self, forward_batch, stream):
+        """Use a fixed budgeted workspace on one compute stream only."""
+        current_stream = torch.npu.current_stream()
+        actual_stream = current_stream if stream is None else stream
+        if actual_stream != current_stream:
+            return None
+        capacity = getattr(self.budget, "prefill_workspace_tokens", 0)
+        if not capacity:
+            return None
+        _, total = prepare_prefill_gather_rows(
+            forward_batch.req_pool_indices_cpu,
+            forward_batch.seq_lens_cpu,
+            self.size,
+            self.max_context_len,
+        )
+        if not total or total > capacity:
+            return None
+        if self._prefill_workspace_stream is None:
+            self._prefill_workspace_stream = actual_stream
+        if self._prefill_workspace_stream != actual_stream:
+            return None
+        return make_fused_prefill_plan(forward_batch, self, actual_stream)
 
     def get_forward_kv(
         self,
         layer: Union[RadixAttention, int],
         forward_batch: ForwardBatch,
         stream: Optional[torch.npu.Stream] = None,
+        plan=None,
+        current=None,
     ):
         """Gather full request KV from sparse storage as compact TND tensors.
 
@@ -548,6 +581,46 @@ class SparseKVCacheManager:
             if forward_batch.req_pool_indices.device.type == "npu"
             else self.device
         )
+        actual_stream = stream if stream is not None else torch.npu.current_stream()
+        if (
+            plan is not None
+            and plan.stream == actual_stream
+            and actual_stream == torch.npu.current_stream()
+        ):
+            total = plan.total_tokens
+            packed = self.prefill_packed[:total]
+            nope = self.prefill_nope[:total]
+            rope = self.prefill_rope[:total]
+            mapping = None
+            if current is not None:
+                current_payload, _, current_valid = current
+                if plan.current_mapping is None:
+                    plan.current_mapping = fused_prefill_current_mapping(
+                        plan, forward_batch, current_valid, self.host_token_capacity
+                    )
+                mapping = plan.current_mapping
+            host_mask = plan.valid if mapping is None else mapping[3]
+            with torch.npu.stream(actual_stream):
+                unidex_copy_inplace(
+                    self.host_kv_buffer[layer_idx],
+                    packed,
+                    plan.source,
+                    plan.destination,
+                    host_mask,
+                    2,
+                    1,
+                    block_dim=48,
+                    src_ptr=self.dev_ptr_list[layer_idx],
+                )
+                if mapping is not None:
+                    src, dst, valid, _ = mapping
+                    unidex_copy_inplace(
+                        current_payload, packed, src, dst, valid, 1, 1, block_dim=48
+                    )
+                nope.copy_(packed[..., : self.kv_lora_rank])
+                rope.copy_(packed[..., self.kv_lora_rank :])
+            return nope, rope
+
         req_ids = forward_batch.req_pool_indices.to(device=device, dtype=torch.long)
         seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.long)
 

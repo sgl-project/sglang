@@ -112,6 +112,53 @@ class TestLIMState(CustomTestCase):
             budget = resolve_sparse_kv_budget(**self.options(max_query_width=width))
             self.assertEqual(budget.cache_tokens, width * 2048)
 
+    def test_optional_prefill_workspace_budget_and_fallback(self):
+        base = resolve_sparse_kv_budget(**self.options())
+        plan = resolve_sparse_kv_budget(**self.options(prefill_workspace_tokens=129))
+        self.assertEqual(base.prefill_workspace_tokens, 0)
+        self.assertEqual(plan.prefill_workspace_tokens, 129)
+        for name, width in (
+            ("prefill_packed", 576),
+            ("prefill_nope", 512),
+            ("prefill_rope", 64),
+        ):
+            spec = plan.manager_buffers[name]
+            self.assertEqual(spec.shape, (129, 1, width))
+            self.assertEqual(spec.dtype, torch.bfloat16)
+        self.assertEqual(
+            plan.managed_hbm_bytes - base.managed_hbm_bytes, 129 * 1152 * 2
+        )
+        self.assertEqual(plan.prefill_workspace_bytes, 129 * 1152 * 2)
+        self.assertEqual(plan.copy_sfa_bytes, base.copy_sfa_bytes)
+        fitting = resolve_sparse_kv_budget(
+            **self.options(
+                prefill_workspace_tokens=129, hbm_budget_bytes=plan.managed_hbm_bytes
+            )
+        )
+        self.assertEqual(fitting.prefill_workspace_tokens, 129)
+        with self.assertLogs(
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget",
+            level="WARNING",
+        ) as logs:
+            fallback = resolve_sparse_kv_budget(
+                **self.options(
+                    prefill_workspace_tokens=129,
+                    hbm_budget_bytes=base.managed_hbm_bytes,
+                )
+            )
+        self.assertIn("129 tokens", logs.output[0])
+        self.assertEqual(fallback.prefill_workspace_tokens, 0)
+        self.assertEqual(fallback.managed_hbm_bytes, base.managed_hbm_bytes)
+        with self.assertRaisesRegex(ValueError, "exceeding"):
+            resolve_sparse_kv_budget(
+                **self.options(
+                    prefill_workspace_tokens=129,
+                    hbm_budget_bytes=base.managed_hbm_bytes - 1,
+                )
+            )
+        with self.assertRaises(ValueError):
+            resolve_sparse_kv_budget(**self.options(prefill_workspace_tokens=-1))
+
     def test_budget_rejects_insufficient_union_capacity_and_width(self):
         for width in (2, 3, 5, 14):
             with self.assertRaisesRegex(ValueError, "query"):
@@ -121,6 +168,27 @@ class TestLIMState(CustomTestCase):
         for width in (0, 15):
             with self.assertRaisesRegex(ValueError, "query"):
                 resolve_sparse_kv_budget(**self.options(max_query_width=width))
+
+    def test_pool_sizing_reserves_native_capacity_before_workspace(self):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        for fits in (True, False):
+            plan = resolve_sparse_kv_budget(
+                **self.options(prefill_workspace_tokens=129)
+            )
+            configurator = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
+            configurator._sparse_budget = plan
+            configurator._sparse_min_tokens = 129
+            configurator._cell_size = 8
+            configurator._fixed_overhead_bytes = plan.managed_hbm_bytes
+            required = plan.managed_hbm_bytes + 256 * 8
+            result = configurator.calculate_pool_sizes(required - int(not fits), 128)
+            self.assertEqual(plan.prefill_workspace_tokens, 129 if fits else 0)
+            self.assertGreaterEqual(result.max_total_num_tokens, 256)
+            # Later recalculation cannot alter an already selected plan.
+            with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                configurator.calculate_pool_sizes(0, 128)
+            self.assertEqual(plan.prefill_workspace_tokens, 129 if fits else 0)
 
     def test_graph_padding_grows_scratch_not_request_residency(self):
         small = resolve_sparse_kv_budget(

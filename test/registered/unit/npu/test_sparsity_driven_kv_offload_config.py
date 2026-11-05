@@ -45,7 +45,16 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             patch(
                 prefix + "get_parallel", return_value=SimpleNamespace(attn_tp_size=8)
             ),
-            patch(prefix + "get_schedule", return_value=SimpleNamespace(page_size=128)),
+            patch(
+                prefix + "get_schedule",
+                return_value=SimpleNamespace(page_size=128, prefill_max_requests=None),
+            ),
+            patch(
+                prefix + "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_mode="null", enable_pd_role_switch=False
+                ),
+            ),
             patch(prefix + "get_eager_max_batch_size", return_value=4),
             patch(prefix + "get_sparse_kv_max_query_width", return_value=1),
         ):
@@ -83,7 +92,16 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             patch(
                 prefix + "get_parallel", return_value=SimpleNamespace(attn_tp_size=1)
             ),
-            patch(prefix + "get_schedule", return_value=SimpleNamespace(page_size=128)),
+            patch(
+                prefix + "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_mode="null", enable_pd_role_switch=False
+                ),
+            ),
+            patch(
+                prefix + "get_schedule",
+                return_value=SimpleNamespace(page_size=128, prefill_max_requests=None),
+            ),
             patch(
                 prefix + "get_spec",
                 return_value=SimpleNamespace(speculative_num_draft_tokens=1),
@@ -109,6 +127,54 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 kv_bytes_per_token=1152,
             )
         self.assertEqual(plan.batch_capacity, 32)
+        self.assertEqual(plan.prefill_workspace_tokens, 17 * 4224)
+
+    def test_prefill_workspace_role_and_request_cap(self):
+        from sglang.srt.environ import envs
+
+        prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
+        for mode, switch, cap, rows in (
+            ("null", False, None, 4),
+            ("prefill", False, 2, 2),
+            ("decode", False, None, 0),
+            ("decode", True, 8, 4),
+        ):
+            with (
+                self.subTest(mode=mode, switch=switch, cap=cap),
+                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+                envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+                envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
+                patch(
+                    prefix + "get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_mode=mode, enable_pd_role_switch=switch
+                    ),
+                ),
+                patch(
+                    prefix + "get_schedule",
+                    return_value=SimpleNamespace(
+                        page_size=128, prefill_max_requests=cap
+                    ),
+                ),
+                patch(prefix + "get_sparse_kv_max_query_width", return_value=1),
+                patch(prefix + "get_eager_max_batch_size", return_value=4),
+            ):
+                plan = get_sparse_kv_budget(
+                    model_config=SimpleNamespace(
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
+                        index_head_dim=128,
+                        hf_config=SimpleNamespace(index_n_heads=64, index_topk=2048),
+                    ),
+                    copy_sfa_query_heads=8,
+                    request_rows=5,
+                    context_len=129,
+                    num_layers=1,
+                    top_k=2048,
+                    kv_bytes_per_token=1152,
+                    graph_batch_capacity=4,
+                )
+                self.assertEqual(plan.prefill_workspace_tokens, rows * 256)
 
     def test_glm_dsa_model_enables_sparse_kv_offload(self):
         with (

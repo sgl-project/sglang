@@ -90,6 +90,8 @@ def _reshape_kv_for_fia_nz(
 
 @dataclass
 class ForwardMetadata:
+    # Eager fused prefill plan is owned by this forward.
+    sparse_kv_fused_prefill_plan: Optional[object] = None
     # Current anchor plan, also consumed by following IndexShare layers. The
     # tensors are owned by the sparse manager and updated inside graph replay.
     sparse_kv_lim_plan: Optional[LIMSelection] = None
