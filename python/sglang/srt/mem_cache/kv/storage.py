@@ -360,6 +360,10 @@ class KVStorage:
         )
         self.requests.set_mamba_ping_pong_slot(req, position, -1)
 
+    def release_tracking_slots(self, req) -> None:
+        """Give back request-owned tracking slots, keeping its live state."""
+        self._allocator.state.release_tracking(self.requests, req)
+
     def release_state_slot(self, req) -> None:
         """Give back the state slot ``req`` took before its KV (a request that
         does not run after all)."""

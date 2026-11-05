@@ -119,7 +119,13 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_memory,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -478,6 +484,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         enable_mamba_track = (
             get_exec().mamba.enable_mamba_extra_buffer
+            and not get_memory().radix_cache_skip_decode_insert
             and self.model_runner.spec_algorithm.is_none()
         )
 

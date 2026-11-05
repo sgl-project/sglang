@@ -525,5 +525,245 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
 
 
+class TestPrefillOnlyRadixCaching(unittest.TestCase):
+    def _request(self, enabled=True):
+        from unittest.mock import Mock, patch
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache import common
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.mem_cache.unified_cache.components import mamba
+
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.state = StateStorage.empty("mamba")
+        pool.mamba_allocator, pool.free_rows = _BoundedMambaAllocator(10), Mock()
+        live, track = pool.mamba_allocator.alloc(1)[0], pool.mamba_allocator.alloc(1)
+        pool.enable_mamba_extra_buffer = pool.enable_mamba_extra_buffer_lazy = True
+        pool.mamba_ping_pong_track_buffer_size = 1
+        pool.req_index_to_mamba_ping_pong_track_buffer_mapping = track.reshape(1, 1)
+        kv = ReqKvInfo(req_pool_idx=0, kv_committed_len=4, kv_allocated_len=4)
+        kv.mamba_pool_idx, kv.mamba_ping_pong_track_buffer = live, track
+        kv.mamba_ping_pong_empty = [False]
+        kv.mamba_next_track_idx = kv.mamba_last_track_idx = 0
+        kv.mamba_last_track_seqlen = 4
+        req = SimpleNamespace(kv=kv, origin_input_ids=[1, 2, 3, 4], output_ids=[5, 6])
+        req.skip_radix_cache_insert, req.owned_kv_len, req.rid = False, lambda: 4, "r"
+        req.inflight_middle_chunks, req.extend_end, req.prefix_len = 0, 4, 0
+        req.refresh_fill_ids, req.finished, req.lock = Mock(), lambda: False, None
+        tree = SimpleNamespace(enable_mamba_extra_buffer=True, req_to_token_pool=pool)
+        tree.supports_mamba, tree.claim_kv_row = lambda: True, lambda r: False
+        tree.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            state=pool.state,
+            state_slots=pool.mamba_allocator,
+            storage=None,
+        )
+        tree.kv_storage = lambda: kv_storage_of(pool, tree.token_to_kv_pool_allocator)
+        tree.free_kv_row, tree.unlock, tree.prefixes = Mock(), Mock(), {}
+        component = object.__new__(MambaComponent)
+        component.cache = tree
+        component._alloc_mamba_slot = lambda req=None: pool.mamba_allocator.alloc(1)
+
+        def publish(r, *, up_to):  # minimal stand-in for the tree insert path
+            params = InsertParams()
+            length = component.prepare_for_caching_req(r, params, up_to, r.finished())
+            if length:
+                tree.prefixes[length] = params.mamba_value.item()
+                r.kv.cache_protected_len = length
+            result = SimpleNamespace(mamba_exist=False) if length else None
+            component.cleanup_after_caching_req(r, r.finished(), result, params)
+
+        tree.checkpoint = Mock(side_effect=publish)
+        tree.on_release = lambda r, checkpointed: (
+            None if checkpointed else component.cleanup_after_caching_req(r, True)
+        )
+        memory = SimpleNamespace(radix_cache_skip_decode_insert=enabled)
+        for module in (common, mamba):
+            self.enterContext(patch.object(module, "get_memory", return_value=memory))
+        spec = SimpleNamespace(speculative_algorithm="EAGLE3")
+        self.enterContext(patch.object(common, "get_spec", return_value=spec))
+        return req, tree, pool
+
+    def test_prefill_only_ownership(self):
+        from sglang.srt.mem_cache import common
+
+        for case in ("disabled", "prefill", "chunked", "retracted"):
+            with self.subTest(case=case):
+                req, tree, pool = self._request(enabled=case != "disabled")
+                if case != "disabled":
+                    req.inflight_middle_chunks = int(case == "chunked")
+                    req.kv.mamba_last_track_seqlen = 6 if case == "retracted" else 4
+                    common.checkpoint_kv_cache(req, tree)
+                    # Prefill releases the snapshot slot; the live state (9) stays owned.
+                    kept = req.kv.mamba_ping_pong_track_buffer is not None
+                    self.assertEqual(kept, case == "chunked")
+                    self.assertNotIn(9, pool.mamba_allocator.free_ids)
+                req.finished = lambda: True
+                prefixes = {} if case == "retracted" else {4: 8}
+                free = list(range(10)) if case == "retracted" else [*range(8), 9]
+                for _ in range(2):  # release is idempotent
+                    common.release_kv_cache(req, tree, checkpoint=True)
+                    self.assertEqual(tree.prefixes, prefixes)
+                    self.assertEqual(sorted(pool.mamba_allocator.free_ids), free)
+                self.assertEqual(tree.checkpoint.call_count, 1)
+
+    def test_capacity_and_admission(self):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        cfg = object.__new__(KVCacheConfigurator)
+        cfg.model_config, cfg.attn_dp_size = SimpleNamespace(context_len=262144), 1
+        cfg.mambaish_config = object()
+        pool = SimpleNamespace(mamba_ping_pong_track_buffer_size=2)
+        pool.enable_mamba_extra_buffer = True
+        pool.mamba_allocator = SimpleNamespace(schedulable_available_size=lambda: 3)
+        adder = object.__new__(PrefillAdder)
+        adder.is_hybrid_ssm_cache, adder.can_run_list = True, []
+        adder.tree_cache = SimpleNamespace(
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state_slots=pool.mamba_allocator
+            ),
+        )
+        # Flag off keeps the ratio-3 cap; flag on keeps 2 slots per request + 4 reserved.
+        cases = [(False, 384, 144, 96), (True, 384, 144, 144), (True, 960, 1000, 478)]
+        for enabled, slots, requested, expected in cases:
+            override = rc.get_context().override_server_args(
+                radix_cache_skip_decode_insert=enabled,
+                disable_radix_cache=False,
+                disable_overlap_schedule=False,
+                mamba_radix_cache_strategy="extra_buffer_lazy",
+                max_mamba_cache_size=slots,
+                max_running_requests=requested,
+            )
+            with override, envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(False):
+                self.assertEqual(cfg.resolve_max_num_reqs(10_000_000), expected)
+                for evictable, admits in ((0, not enabled), (1, True)):
+                    adder.tree_cache.mamba_evictable_size = lambda: evictable
+                    self.assertEqual(adder._has_mamba_prefill_headroom(), admits)
+
+
+class TestPrefillOnlyStoragePort(unittest.TestCase):
+    def test_unified_table_checkpoint_and_idempotent_release(self):
+        from unittest.mock import Mock, patch
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache import common
+        from sglang.srt.mem_cache.kv.requests import RequestTable, StateTracking
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+        from sglang.srt.mem_cache.kv.storage import KVStorage
+
+        state = StateStorage.empty("mamba")
+        state.slots = _BoundedMambaAllocator(10)
+        table = RequestTable(
+            size=1,
+            pre_alloc_size=0,
+            max_context_len=8,
+            state_sub_pool="mamba",
+            tracking=StateTracking(
+                extra_buffer=True, lazy=True, track_slots=1, initial_slots=1
+            ),
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        kv = ReqKvInfo(req_pool_idx=1, kv_committed_len=4, kv_allocated_len=4)
+        kv.mamba_pool_idx = state.slots.alloc(1)[0]
+        kv.mamba_ping_pong_track_buffer = state.slots.alloc(1)
+        kv.mamba_ping_pong_empty = [False]
+        kv.mamba_next_track_idx = kv.mamba_last_track_idx = 0
+        table.req_index_to_mamba_ping_pong_track_buffer_mapping[1] = (
+            kv.mamba_ping_pong_track_buffer
+        )
+        table.free_slots = []
+        storage = object.__new__(KVStorage)
+        storage.requests = table
+        storage._allocator = SimpleNamespace(
+            state=state, state_slots=state.slots, storage=storage, page_size=1
+        )
+        req = SimpleNamespace(
+            kv=kv,
+            rid="unified",
+            finished=lambda: False,
+            skip_radix_cache_insert=False,
+            inflight_middle_chunks=0,
+            extend_end=4,
+            prefix_len=0,
+            output_ids=[5, 6],
+            owned_kv_len=lambda: 4,
+            refresh_fill_ids=Mock(),
+            lock=None,
+        )
+        tree = SimpleNamespace(
+            req_to_token_pool=table,
+            token_to_kv_pool_allocator=storage._allocator,
+            checkpoint=Mock(),
+            supports_mamba=lambda: True,
+            claim_kv_row=lambda r: False,
+            free_kv_row=Mock(),
+            unlock=Mock(),
+            on_release=lambda r, checkpointed: storage.release_state("mamba", r),
+        )
+        with (
+            patch.object(
+                common,
+                "get_memory",
+                return_value=SimpleNamespace(radix_cache_skip_decode_insert=True),
+            ),
+            patch.object(
+                common,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="EAGLE3"),
+            ),
+        ):
+            common.checkpoint_kv_cache(req, tree)
+            tree.checkpoint.assert_called_once_with(req, up_to=4)
+            self.assertEqual(req.prefix_len, 4)
+            self.assertEqual(state.slots.free_ids, list(range(9)))
+            self.assertIsNone(kv.mamba_ping_pong_track_buffer)
+            self.assertIsNone(kv.mamba_ping_pong_empty)
+            self.assertEqual(
+                table.req_index_to_mamba_ping_pong_track_buffer_mapping[1].tolist(),
+                [-1],
+            )
+            req.finished = lambda: True
+            for _ in range(2):
+                common.release_kv_cache(req, tree, checkpoint=True)
+                self.assertEqual(sorted(state.slots.free_ids), list(range(10)))
+            self.assertEqual(table.free_slots, [1])
+            self.assertIsNone(kv.mamba_pool_idx)
+
+    def test_tracking_release_keeps_live_donated_and_empty_slots(self):
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        state = StateStorage.empty("mamba")
+        state.slots = _BoundedMambaAllocator(10)
+        live, donated, tracked = state.slots.alloc(3)
+        kv = ReqKvInfo(req_pool_idx=0, mamba_pool_idx=live)
+        kv.mamba_ping_pong_track_buffer = torch.tensor([int(tracked), -1])
+        kv.mamba_ping_pong_empty = [False, True]
+        table = SimpleNamespace(
+            req_index_to_mamba_ping_pong_track_buffer_mapping=kv.mamba_ping_pong_track_buffer.reshape(
+                1, 2
+            ).clone()
+        )
+        req = SimpleNamespace(kv=kv)
+        for _ in range(2):
+            state.release_tracking(table, req)
+            self.assertEqual(sorted(state.slots.free_ids), list(range(8)))
+            self.assertIsNone(kv.mamba_ping_pong_empty)
+            self.assertEqual(
+                table.req_index_to_mamba_ping_pong_track_buffer_mapping.tolist(),
+                [[-1, -1]],
+            )
+        self.assertEqual(int(kv.mamba_pool_idx), int(live))
+        self.assertNotIn(int(donated), state.slots.free_ids)
+
+
 if __name__ == "__main__":
     unittest.main()

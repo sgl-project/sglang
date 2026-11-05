@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -631,6 +631,13 @@ class MambaComponent(TreeComponent):
                 storage, sub_pool = self._state()
                 cache_len -= storage.settle_replay(sub_pool, req.kv.mamba_pool_idx)
 
+        if (
+            get_memory().radix_cache_skip_decode_insert
+            and cache_len is not None
+            and cache_len > len(req.origin_input_ids)
+        ):
+            # A retracted request may prefill generated tokens; don't publish them.
+            return 0
         if is_finished:
             if cache_len is None:
                 cache_len = 0

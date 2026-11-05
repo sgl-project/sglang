@@ -217,6 +217,23 @@ class StateStorage:
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_prev_track_seqlen = None
 
+    def release_tracking(self, table, req: Req) -> None:
+        """Release prefill snapshots without releasing live or donated state."""
+        buf = req.kv.mamba_ping_pong_track_buffer
+        if buf is None:
+            return
+        for position, empty in enumerate(req.kv.mamba_ping_pong_empty):
+            if not empty:
+                self.slots.free(buf[position : position + 1])
+        table.req_index_to_mamba_ping_pong_track_buffer_mapping[
+            req.kv.req_pool_idx
+        ].fill_(-1)
+        req.kv.mamba_ping_pong_track_buffer = None
+        req.kv.mamba_ping_pong_empty = None
+        req.kv.mamba_next_track_idx = req.kv.mamba_last_track_idx = None
+        req.kv.mamba_last_track_seqlen = None
+        req.kv.mamba_prev_track_seqlen = None
+
     def release(
         self,
         table,
@@ -230,7 +247,10 @@ class StateStorage:
         self.slots.free(mamba_index.unsqueeze(0))
         req.kv.mamba_pool_idx = None
 
-        if table.enable_mamba_extra_buffer:
+        if (
+            table.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is not None
+        ):
             size = table.mamba_ping_pong_track_buffer_size
             keep = mamba_ping_pong_track_buffer_to_keep
             assert keep in (None, 0, 1) and (keep != 1 or size == 2), (
@@ -252,6 +272,7 @@ class StateStorage:
             req.kv.mamba_next_track_idx = None
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
+        if table.enable_mamba_extra_buffer:
             req.kv.mamba_prev_track_seqlen = None
             req.kv.mamba_cow_src_index = None
             req.kv.mamba_needs_clear = False

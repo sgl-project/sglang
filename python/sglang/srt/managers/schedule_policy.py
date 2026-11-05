@@ -1436,6 +1436,24 @@ class PrefillAdder:
         if self.tree_cache.buffer_pipeline is not None:
             self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
 
+    def _has_mamba_prefill_headroom(self):
+        if not (
+            get_memory().radix_cache_skip_decode_insert and self.is_hybrid_ssm_cache
+        ):
+            return True
+        pool = self.tree_cache.req_to_token_pool
+        available = (
+            self.tree_cache.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
+        )
+        available += self.tree_cache.mamba_evictable_size()
+        # Batch admissions also need live/track slots and a donation replacement.
+        per_req = 2 + (
+            pool.mamba_ping_pong_track_buffer_size
+            if pool.enable_mamba_extra_buffer
+            else 0
+        )
+        return available >= (len(self.can_run_list) + 1) * per_req
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -1473,6 +1491,8 @@ class PrefillAdder:
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
         with self._lock_node(req.last_node):
+            if not self._has_mamba_prefill_headroom():
+                return AddReqResult.NO_TOKEN
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,

@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.runtime_context import get_memory, get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -277,6 +277,15 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
+        if (
+            get_memory().radix_cache_skip_decode_insert
+            and req.inflight_middle_chunks <= 0
+        ):
+            pool = tree_cache.req_to_token_pool
+            if pool.holds_state_slots:
+                kv_storage_of(
+                    pool, tree_cache.token_to_kv_pool_allocator
+                ).release_tracking_slots(req)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
 
@@ -438,6 +447,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
 
     owned_kv_len = req.owned_kv_len()
     checkpoint = checkpoint and not req.skip_radix_cache_insert
+    if get_memory().radix_cache_skip_decode_insert and len(req.output_ids) > 1:
+        # A request finishing in prefill still publishes its prompt checkpoint.
+        checkpoint = False
     if checkpoint:
         # A tree that takes over component state (mamba) must see the request
         # finished, or the insert forks the state and the slot leaks.
