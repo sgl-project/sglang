@@ -11,7 +11,7 @@ import torch
 from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 

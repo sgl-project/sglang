@@ -86,6 +86,7 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-unit-test-1-gpu-large",
         "base-b-kernel-unit-test-4-gpu-b200",
         "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-small",
         "base-b-kernel-benchmark-test-1-gpu-large",
         # Diffusion keeps case-level pytest partitioning behind registered
         # bridge files while sharing this discovery and dispatch entry point.
@@ -100,8 +101,6 @@ PER_COMMIT_SUITES = {
         "base-c-test-4-gpu-b200",
         "base-c-test-2-gpu-gb300",
         "base-c-test-4-gpu-gb300",
-        "base-c-test-8-gpu-h20",
-        "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
         "base-c-test-8-gpu-b300",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
@@ -114,6 +113,8 @@ PER_COMMIT_SUITES = {
         "extra-b-test-8-gpu-h200",
         "extra-b-test-8-gpu-h20",
         "extra-b-test-8-gpu-b300",
+        "extra-b-test-2-gpu-gb300",
+        "extra-b-test-4-gpu-gb300",
     ],
     HWBackend.NPU: [
         "base-a-test-npu",
@@ -151,6 +152,7 @@ NIGHTLY_SUITES = {
         # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
         # shape as the per-commit suites. No `nightly=True`: the stage name
         # carries the cadence; only the legacy suites below still need the flag.
+        "nightly-test-1-gpu-small",
         "nightly-test-1-gpu-large",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
@@ -158,6 +160,7 @@ NIGHTLY_SUITES = {
         "nightly-test-4-gpu-gb300",
         "nightly-test-8-gpu-h200",
         "nightly-test-8-gpu-b200",
+        "nightly-test-8-gpu-b300",
     ],
     HWBackend.AMD: [
         "nightly-amd",
@@ -165,6 +168,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-2-gpu",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
         "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
