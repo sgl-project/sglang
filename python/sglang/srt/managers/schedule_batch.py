@@ -2949,7 +2949,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
-            # release memory and don't insert into the tree because we need the space instantly
+            # Release the row now; the tree keeps its KV only with --preempt-keep-kv.
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
