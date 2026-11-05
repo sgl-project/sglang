@@ -23,30 +23,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
-inline void copy_mul_add_stub(
-    scalar_t* __restrict__ out,
-    const float* __restrict__ input,
-    const float* __restrict__ bias,
-    int64_t size,
-    float scale) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec vscale = fVec(scale);
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [data0, data1] = load_float_vec2(input + d);
-    auto [bias0, bias1] = load_float_vec2(bias + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0 * vscale + bias0, data1 * vscale + bias1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * scale + bias[d]);
-  }
-}
-template <typename scalar_t>
 inline void copy_add_stub(
     scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -65,22 +41,38 @@ inline void copy_add_stub(
     out[d] = static_cast<scalar_t>(input[d] + bias[d]);
   }
 }
-template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int size, float scale) {
+template <typename scalar_t, bool has_bias>
+inline void copy_mul_stub(
+    scalar_t* __restrict__ out,
+    const float* __restrict__ input,
+    float scale,
+    const float* __restrict__ bias,
+    int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec vscale = fVec(scale);
 
-  int d;
+  int64_t d = 0;
 #pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+  for (; d <= size - kVecSize; d += kVecSize) {
     auto [data0, data1] = load_float_vec2(input + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0 * vscale, data1 * vscale);
+    auto out0 = data0 * vscale;
+    auto out1 = data1 * vscale;
+    if constexpr (has_bias) {
+      auto [bias0, bias1] = load_float_vec2(bias + d);
+      out0 = out0 + bias0;
+      out1 = out1 + bias1;
+    }
+    bVec out_vec = convert_from_float_ext<scalar_t>(out0, out1);
     out_vec.store(out + d);
   }
   for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * scale);
+    float value = input[d] * scale;
+    if constexpr (has_bias) {
+      value += bias[d];
+    }
+    out[d] = static_cast<scalar_t>(value);
   }
 }
 
@@ -784,11 +776,7 @@ struct brgemm2<at::BFloat16, at::Float8_e4m3fn, has_bias> {
 
     // copy from Ctmp to C and mul scale
     for (int m = 0; m < M; ++m) {
-      if constexpr (has_bias) {
-        copy_mul_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N, scale);
-      } else {
-        copy_mul_stub(C + m * ldc, Ctmp + m * BLOCK_N, N, scale);
-      }
+      copy_mul_stub<at::BFloat16, has_bias>(C + m * ldc, Ctmp + m * BLOCK_N, scale, bias, N);
     }
   }
 
