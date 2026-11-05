@@ -655,6 +655,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
                 table_dir=getattr(config, "ple_offload_dir", None),
+                weight_scale=ngram_embedding.weight_scale,
             )
         self.ngram_embedding = ngram_embedding
 
@@ -936,6 +937,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         backend: str = "pinned",
         table_dir: Optional[str] = None,
         host_table: Optional[torch.Tensor] = None,
+        weight_scale: Optional[torch.Tensor] = None,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -989,10 +991,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
         # The scale is tiny; keep it with the model instead of offloading it
-        # with the table. The token embedding has none.
-        self.register_buffer(
-            "weight_scale", getattr(embedding, "weight_scale", None), persistent=True
-        )
+        # with the table. Only the n-gram table has one.
+        self.register_buffer("weight_scale", weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
@@ -2041,7 +2041,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     def _build_embed_tokens(self, config: Qwen4ExpTextConfig) -> nn.Module:
         if not self.pp_group.is_first_rank:
             return PPMissingLayer()
-        offload = getattr(config, "ple_offload_token_embedding", False)
+        offload = config.ple_offload_token_embedding
         if offload and config.tie_word_embeddings:
             raise ValueError(
                 "--ple-offload-token-embedding needs untied word embeddings: "
