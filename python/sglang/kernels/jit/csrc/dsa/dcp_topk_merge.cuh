@@ -1,30 +1,14 @@
-// Exact global top-k merge for DSA decode context parallelism (DCP).
+// Exact global top-k merge for DSA decode context parallelism (DCP), one CTA per
+// row. Ranks exchange their best kCandK local candidates over NVLink multicast
+// and select the k-th key t* among them. A rank whose candidates all reach t*
+// and that has more keys may hold more of the top-k; its full local top-k then
+// replaces its candidates (exact: a rank holds at most k top-k keys). Every rank
+// sees the same candidates, so all agree on t* without more traffic.
 //
-// Every rank holds the local top-k candidates of its token shard (the v2
-// candidate epilogue: fp32 score bits, global position; position -1 is empty).
-// One CTA per row:
-//   1. pushes the rank's best kCandK candidates to every rank through NVLink
-//      multicast, and keeps its full local top-k for peers' fallback reads;
-//   2. polls the kNumRanks x kCandK candidates of the row;
-//   3. selects the k-th key t* among them (score descending, then position
-//      ascending: a strict total order over 64-bit keys);
-//   4. checks the certificate: a rank may hold more of the global top-k only if
-//      it sent kCandK candidates, has more keys, and all of them reach t*. Then
-//      its full local top-k replaces its candidates and t* is selected again,
-//      which is exact because a rank holds at most k global top-k keys;
-//   5. writes this rank's keys >= t* as widened KV slots, -1 after them.
-//
-// Exchange: every 64-bit entry carries an 8-bit epoch tag next to its payload
-// (score bits << 32 | position << 8 | tag), written with one 64-bit multimem
-// store and read with one 64-bit relaxed load, so a reader that sees the tag of
-// the current call also sees its payload; no flag or release is needed. Each
-// row slot keeps a call counter; the tag is counter % 255 + 1 and two buffers
-// alternate by its parity. A rank overwrites a parity buffer only after it has
-// read every peer's entries of the call in between, which each peer wrote after
-// it had finished reading that buffer.
-//
-// All ranks see the same candidates, so t* and the certificate agree on every
-// rank and the fallback needs no extra communication.
+// Each 64-bit entry carries an 8-bit call tag beside its payload and is written
+// and read in one access, so seeing the tag means seeing the payload. Two buffers
+// alternate by call parity; a rank reuses one only after reading every peer's
+// entries of the call in between.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -43,7 +27,7 @@ namespace sglang {
 
 namespace dcp_topk_merge {
 
-// One warp per rank (warp q polls rank q's candidates), up to 16 ranks.
+// one warp per rank
 constexpr int kMaxWarps = 16;
 constexpr uint32_t kEmptyPos = 0xFFFFFFu;  // 24-bit position field of an empty entry
 
@@ -55,8 +39,7 @@ struct Smem {
   int sent[kMaxWarps], kept[kMaxWarps];
 };
 
-// Order-preserving fp32 -> uint32 with -0 equal to +0, as top-k mode 2 orders
-// the local candidates, so ties between them go by position here too.
+// ordered fp32 -> uint32 with -0 equal to +0, as top-k mode 2 orders the local candidates
 SGL_DEVICE uint32_t extract_tie_key(float x) {
   const uint32_t bits = __float_as_uint(x == 0.0f ? 0.0f : x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
@@ -78,7 +61,6 @@ SGL_DEVICE uint64_t entry_key(uint64_t e) {
   return p == kEmptyPos ? 0 : make_topk_key(static_cast<int32_t>(e >> 32), static_cast<int32_t>(p));
 }
 
-// A visitor over a per-thread key array, in the form select_kth takes.
 template <int kN>
 SGL_DEVICE auto visit_keys(const uint64_t (&keys)[kN]) {
   return [&keys](auto f) {
@@ -88,7 +70,6 @@ SGL_DEVICE auto visit_keys(const uint64_t (&keys)[kN]) {
   };
 }
 
-// Exclusive prefix sum over the CTA (one value per thread); `total` is the CTA sum.
 template <int kWarps>
 SGL_DEVICE int block_exclusive_sum(int v, int& total, Smem& s) {
   const uint32_t lane = device::get_lane_id();
@@ -107,8 +88,7 @@ SGL_DEVICE int block_exclusive_sum(int v, int& total, Smem& s) {
   return before + incl - v;
 }
 
-// Writes the CTA's selected entries in thread order to slots [0, n) through
-// emit(slot, i), i the entry within its thread, and pad(slot) to [n, kWidth).
+// selected entries to slots [0, n) in thread order via emit(slot, i); pad(slot) fills [n, kWidth)
 template <int kWidth, int kThreads, int kN, class Emit, class Pad>
 SGL_DEVICE void compact(const bool (&sel)[kN], Emit emit, Pad pad, Smem& s) {
   int mine = 0;
@@ -124,11 +104,8 @@ SGL_DEVICE void compact(const bool (&sel)[kN], Emit emit, Pad pad, Smem& s) {
     pad(e);
 }
 
-// The rem-th largest key (rem >= 1) among the keys visited by `visit(f)`; every
-// thread visits its own share and calls f the same number of times (k = 0 for
-// an empty slot). 8-bit radix rounds from the top byte with double-buffered
-// histograms and a one-warp scan; stops once the chosen bucket is exactly the
-// remaining quota and returns that bucket's smallest key. 0 when rem < 1.
+// The rem-th largest nonzero key that `visit` yields across the CTA (0 when rem < 1),
+// by 8-bit radix rounds from the top byte.
 template <class Visit>
 SGL_DEVICE uint64_t select_kth(Visit visit, int rem, Smem& s) {
   if (rem < 1) return 0;
@@ -147,7 +124,7 @@ SGL_DEVICE uint64_t select_kth(Visit visit, int rem, Smem& s) {
       if (k && (shift == 56 || (k >> (shift + 8)) == prefix)) atomicAdd(&h[(k >> shift) & 255], 1);
     });
     for (int i = tid; i < 256; i += blockDim.x)
-      s.hist[b ^ 1][i] = 0;  // its last reader finished before the previous round's last barrier
+      s.hist[b ^ 1][i] = 0;  // last read before the previous round's final barrier
     __syncthreads();
     if (warp == 0) {
       int c[8], tot = 0;
@@ -187,7 +164,6 @@ SGL_DEVICE uint64_t select_kth(Visit visit, int rem, Smem& s) {
   return prefix;
 }
 
-// sel[i] = keys[i] is at least t; nothing is selected when t is 0
 template <int kN>
 SGL_DEVICE void select_at_least(const uint64_t (&keys)[kN], uint64_t t, bool (&sel)[kN]) {
 #pragma unroll
@@ -195,8 +171,6 @@ SGL_DEVICE void select_at_least(const uint64_t (&keys)[kN], uint64_t t, bool (&s
     sel[i] = t != 0 && keys[i] >= t;
 }
 
-// Poll kPer entries (stride `step` from `src`) until all carry `tag`; every
-// load of a round is in flight together.
 template <int kPer>
 SGL_DEVICE void poll_tagged(const uint64_t* src, int step, uint64_t tag, uint64_t (&v)[kPer]) {
   unsigned pending = (1u << kPer) - 1;
@@ -211,9 +185,9 @@ SGL_DEVICE void poll_tagged(const uint64_t* src, int step, uint64_t tag, uint64_
 }
 
 struct Params {
-  const int2* __restrict__ candidates;    // [rows, kTopK] (score bits, global position)
-  uint64_t* __restrict__ buffer;          // this rank's symmetric buffer
-  uint64_t* multicast_ptr;                // its multicast address
+  const int2* __restrict__ candidates;  // [rows, kTopK] (score bits, global position)
+  uint64_t* __restrict__ buffer;        // this rank's symmetric buffer
+  uint64_t* multicast_ptr;
   const int64_t* __restrict__ peer_ptrs;  // [kNumRanks] symmetric buffer of each rank
   int64_t* __restrict__ counters;         // [max_rows] calls per row slot
   const int32_t* __restrict__ global_lens;
@@ -221,15 +195,13 @@ struct Params {
   int64_t page_table_stride;
   int32_t* __restrict__ out_slots;       // [rows, kTopK] widened slots, -1 after
   int32_t* __restrict__ fallback;        // [rows] 1 when the certificate failed
-  uint64_t* __restrict__ union_scratch;  // [max_rows, kNumRanks * kTopK] fallback union; global, so smem stays small
+  uint64_t* __restrict__ union_scratch;  // [max_rows, kNumRanks * kTopK] fallback union
   int32_t dcp_rank;
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
 };
 
-// Fallback of a row whose certificate failed for the ranks in `fail`: the
-// k-th key of the union in union_scratch, where segment q holds rank q's full
-// local top-k if it failed (polled over NVLink), else its candidates.
+// k-th key of the union of each failed rank's full local top-k and the others' candidates
 template <int kNumRanks, int kTopK, int kCandK>
 SGL_DEVICE uint64_t fallback_kth(
     const Params& p,
@@ -287,8 +259,8 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   static_assert(kNumRanks == 8 || kNumRanks == 16, "one warp per rank: 8 or 16 ranks");
   constexpr int kThreads = 32 * kNumRanks;
   static_assert(kCandK % 32 == 0 && kTopK % kThreads == 0 && kCandK <= kTopK);
-  constexpr int kPerThread = kTopK / kThreads;  // local top-k entries per thread
-  constexpr int kPerLane = kCandK / 32;         // candidates per lane
+  constexpr int kPerThread = kTopK / kThreads;
+  constexpr int kPerLane = kCandK / 32;
   constexpr int64_t kSlot = static_cast<int64_t>(kNumRanks) * kCandK + kTopK;
   __shared__ Smem s;
 
@@ -321,7 +293,7 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
       [&](int e) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(0, -1, tag)); },
       s);
 
-  // widened slots of the own keys while the pushes travel
+  // widened slots of the own keys, while the pushes travel
   int slot[kPerThread];
 #pragma unroll
   for (int i = 0; i < kPerThread; ++i) {
@@ -379,11 +351,7 @@ template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK>
 struct DcpTopKMergeKernel {
   static constexpr auto kernel = dcp_topk_merge::merge_kernel<kNumRanks, kTopK, kCandK>;
 
-  /**
-   * \brief Merges one batch of decode rows; every rank of the group calls it
-   * with the same rows in the same order. See dcp_topk_merge.py for the
-   * tensor contract.
-   */
+  /// \brief Merges one batch of decode rows; dcp_topk_merge.py holds the contract.
   static void
   run(tvm::ffi::TensorView candidates,
       tvm::ffi::TensorView buffer,
@@ -421,7 +389,6 @@ struct DcpTopKMergeKernel {
         page_table.size(0) >= rows, "dcp_topk_merge: page_table has ", page_table.size(0), " rows < rows ", rows);
     const int64_t need = 2LL * max_rows * (kNumRanks * kCandK + kTopK);
     RuntimeCheck(buffer.size(0) >= need, "dcp_topk_merge: buffer numel ", buffer.size(0), " < ", need);
-    // an entry carries the position in 24 bits, all ones meaning empty
     const int64_t max_pos = page_table.size(1) * span;
     RuntimeCheck(max_pos <= dcp_topk_merge::kEmptyPos, "dcp_topk_merge: positions up to ", max_pos, " exceed 24 bits");
     if (rows == 0) return;

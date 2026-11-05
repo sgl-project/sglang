@@ -1,12 +1,4 @@
-"""Multi-GPU test of the DSA DCP top-k merge (``DcpTopKMerge``).
-
-Every rank holds the token-interleaved shard of the same global score rows,
-runs the v2 candidate epilogue on it and merges through NVLink multicast. Each
-rank's result must be exactly its share of the global top-k (score descending,
-then position ascending) as widened slots, -1 after them, also when a graph
-replays the merge on three alternating inputs until the 8-bit epoch tag wraps,
-so a read of a stale call's entries would return another input's keys. Unlike
-the one-GPU DSA DCP tests it needs 8 real ranks with NVLink multicast.
+"""Needs 8 GPUs with NVLink multicast.
 
 Usage::
 
@@ -64,8 +56,7 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
     if kind == "random":
         return [torch.randn(131072, generator=g)]
     if kind == "dense_top":
-        # many distinct scores near the global threshold: overflows the v2
-        # merge's 10-bit threshold bin, not the local 12-bit ones
+        # many distinct scores near the global threshold
         return [
             10 + 0.3 * torch.randn(131072, generator=g),
             10 + 0.3 * torch.randn(65536, generator=g),
@@ -81,8 +72,7 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
         for n in (65536, 20000):
             base = torch.randn(8, generator=g)
             base[3] += 10
-            # distinct scores spread over many of v2's coarse bins, so the local
-            # top-k stays exact and the merge alone is under test
+            # distinct scores keep the local top-k exact, so only the merge is tested
             rows.append(
                 base.repeat(n // 8 + 1)[:n] + 4.0 * torch.randperm(n, generator=g) / n
             )
@@ -115,8 +105,6 @@ def _keys(scores: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
 
 
 class _Case:
-    """One input set: this rank's shard of the rows and its expected results."""
-
     def __init__(self, kind: str, seed: int, rank: int, world: int, span: int):
         device = torch.device("cuda", torch.cuda.current_device())
         glob = _rows(kind, seed)

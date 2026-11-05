@@ -78,7 +78,6 @@ class DcpTopKMerge:
         assert group.rank_in_group == dcp_rank, (group.rank_in_group, dcp_rank)
 
         world = group.world_size
-        # 16 ranks only on megakernel paths
         worlds = (8, 16) if megakernel_enabled() else (8,)
         if world not in worlds or topk != 2048:
             print_info_once(
