@@ -18,11 +18,13 @@ The public nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash export uses this layou
 LiLiCorr and packed draft weights use different runtimes and are not accepted.
 Target layer indices include the embedding output in GGUF, so they are shifted
 by one for SGLang's decoder-layer captures.
+Only small config values are cached; readers retain large tokenizer views.
 """
 
-from transformers import Qwen3Config
+from copy import deepcopy
+from functools import lru_cache
 
-from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
+from transformers import Qwen3Config
 
 _LAYER_NAMES = {
     "attn_norm": "input_layernorm",
@@ -51,10 +53,11 @@ def dflash_gguf_name_map(num_layers):
     return names
 
 
+@lru_cache(maxsize=4)
 def is_plain_dflash_gguf(path):
-    from gguf import GGMLQuantizationType
+    from gguf import GGMLQuantizationType, GGUFReader
 
-    reader = get_gguf_reader(path)
+    reader = GGUFReader(path, mode="r")
     arch = reader.fields.get("general.architecture")
     return (
         arch is not None
@@ -75,9 +78,9 @@ def is_plain_dflash_gguf(path):
 
 
 def _read_plain_dflash_gguf(path):
-    from gguf import GGMLQuantizationType
+    from gguf import GGMLQuantizationType, GGUFReader
 
-    reader = get_gguf_reader(path)
+    reader = GGUFReader(path, mode="r")
     meta = {
         key: field.contents()
         for key, field in reader.fields.items()
@@ -108,7 +111,19 @@ def _read_plain_dflash_gguf(path):
 
 
 def build_plain_dflash_gguf_config(path):
+    return Qwen3Config(**deepcopy(_read_plain_dflash_gguf_config(path)))
+
+
+@lru_cache(maxsize=4)
+def _read_plain_dflash_gguf_config(path) -> dict:
+    from gguf import GGUFValueType
+
     reader, meta, _ = _read_plain_dflash_gguf(path)
+    tokens = reader.fields["tokenizer.ggml.tokens"]
+    if tokens.types != [GGUFValueType.ARRAY, GGUFValueType.STRING]:
+        raise ValueError(
+            "DFlash GGUF tokenizer.ggml.tokens must be an array of strings"
+        )
 
     def field(name):
         key = "dflash." + name
@@ -131,7 +146,7 @@ def build_plain_dflash_gguf_config(path):
     fc = next(t for t in reader.tensors if t.name == "fc.weight")
     if tuple(fc.shape) != (hidden * len(targets), hidden):
         raise ValueError("DFlash GGUF fc shape does not match its target layers")
-    return Qwen3Config(
+    return dict(
         architectures=["DFlashDraftModel"],
         hidden_size=hidden,
         intermediate_size=int(field("feed_forward_length")),
@@ -142,7 +157,8 @@ def build_plain_dflash_gguf_config(path):
         rms_norm_eps=float(field("attention.layer_norm_rms_epsilon")),
         max_position_embeddings=int(field("context_length")),
         rope_theta=float(field("rope.freq_base")),
-        vocab_size=len(reader.fields["tokenizer.ggml.tokens"].contents()),
+        vocab_size=len(tokens.data),
+        is_causal=bool(field("attention.causal")),
         use_sliding_window=any(pattern),
         sliding_window=int(field("attention.sliding_window")),
         layer_types=["sliding_attention" if p else "full_attention" for p in pattern],
@@ -151,7 +167,6 @@ def build_plain_dflash_gguf_config(path):
         dflash_config={
             "target_layer_ids": targets,
             "mask_token_id": int(meta["tokenizer.ggml.mask_token_id"]),
-            "causal": bool(field("attention.causal")),
         },
     )
 

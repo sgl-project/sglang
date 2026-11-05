@@ -4,8 +4,11 @@ Checkpoint: nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash.
 Fixtures cover indexing, loader dispatch, and exact BF16 decoding.
 """
 
+import gc
 import tempfile
 import unittest
+import weakref
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,12 +17,17 @@ import gguf
 import numpy as np
 import torch
 
+from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.models import dflash
 from sglang.srt.utils.hf_transformers.config import get_config
 from sglang.srt.utils.hf_transformers.dflash_gguf import (
     build_plain_dflash_gguf_config,
     plain_dflash_gguf_weights,
 )
-from sglang.srt.utils.hf_transformers.gguf_native import has_native_gguf_support
+from sglang.srt.utils.hf_transformers.gguf_native import (
+    has_native_gguf_support,
+    read_gguf_architecture,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,7 +35,15 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def write_draft(
-    path, *, missing=None, extra=None, targets=(2, 6), lilicorr=False, packed=False
+    path,
+    *,
+    missing=None,
+    extra=None,
+    targets=(2, 6),
+    lilicorr=False,
+    packed=False,
+    causal=False,
+    tokens=("a", "b", "c", "mask"),
 ):
     writer = gguf.GGUFWriter(path, "dflash")
     for key, value in {
@@ -47,9 +63,12 @@ def write_draft(
     writer.add_float32("dflash.attention.layer_norm_rms_epsilon", 1e-6)
     writer.add_array("dflash.target_layers", list(targets))
     writer.add_array("dflash.attention.sliding_window_pattern", [True])
-    writer.add_bool("dflash.attention.causal", False)
+    writer.add_bool("dflash.attention.causal", causal)
     writer.add_uint32("tokenizer.ggml.mask_token_id", 3)
-    writer.add_array("tokenizer.ggml.tokens", ["a", "b", "c", "mask"])
+    if isinstance(tokens, str):
+        writer.add_string("tokenizer.ggml.tokens", tokens)
+    else:
+        writer.add_array("tokenizer.ggml.tokens", list(tokens))
     if lilicorr:
         writer.add_uint32("lilicorr.num_layers", 1)
     tensors = {
@@ -92,28 +111,94 @@ def write_draft(
     writer.close()
 
 
-class TestDFlashGGUF(CustomTestCase):
-    def test_config_and_weights_parse_the_gguf_once(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "draft.gguf"
-            write_draft(path)
-            with patch("gguf.GGUFReader", wraps=gguf.GGUFReader) as reader:
-                self.assertTrue(has_native_gguf_support(str(path)))
-                get_config(str(path), trust_remote_code=False)
-                list(plain_dflash_gguf_weights(str(path)))
-            self.assertEqual(reader.call_count, 1)
+@contextmanager
+def track_readers():
+    reader_type = gguf.GGUFReader
+    readers = []
+    token_parts = []
 
-    def test_dense_config_preserves_capture_indices_and_window(self):
+    def create(*args, **kwargs):
+        reader = reader_type(*args, **kwargs)
+        readers.append(weakref.ref(reader))
+        token_parts.extend(
+            weakref.ref(part) for part in reader.fields["tokenizer.ggml.tokens"].parts
+        )
+        return reader
+
+    with patch("gguf.GGUFReader", side_effect=create):
+        yield readers, token_parts
+
+
+class TestDFlashGGUF(CustomTestCase):
+    def test_config_cache_releases_readers_and_keeps_configs_independent(self):
+        """Cached config data must not retain tokenizer views or caller mutations."""
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "draft.gguf"
             write_draft(path)
-            self.assertTrue(has_native_gguf_support(str(path)))
-            config = build_plain_dflash_gguf_config(str(path))
-            self.assertEqual(config.dflash_config["target_layer_ids"], [1, 5])
-            self.assertEqual(config.sliding_window, 32)
-            self.assertEqual(config.layer_types, ["sliding_attention"])
-            self.assertEqual(config.architectures, ["DFlashDraftModel"])
-            self.assertFalse(hasattr(config, "quantization_config"))
+            with track_readers() as (readers, token_parts):
+                config = build_plain_dflash_gguf_config(str(path))
+                config.dflash_config["target_layer_ids"].clear()
+                again = build_plain_dflash_gguf_config(str(path))
+                self.assertEqual(again.dflash_config["target_layer_ids"], [1, 5])
+                self.assertEqual(len(readers), 1)
+                self.assertTrue(token_parts)
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in readers + token_parts))
+                list(plain_dflash_gguf_weights(str(path)))
+                self.assertEqual(len(readers), 2)
+            gc.collect()
+            self.assertTrue(all(ref() is None for ref in readers + token_parts))
+
+    def test_architecture_probe_does_not_retain_non_dflash_readers(self):
+        """Probing an ordinary target must not retain its full tokenizer metadata."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.gguf"
+            writer = gguf.GGUFWriter(path, "llama")
+            writer.add_array("tokenizer.ggml.tokens", ["a", "b"])
+            writer.add_tensor("token_embd.weight", np.ones((2, 32), dtype=np.float32))
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            with track_readers() as (readers, token_parts):
+                self.assertEqual(read_gguf_architecture(str(path)), "llama")
+            gc.collect()
+            self.assertEqual(len(readers), 1)
+            self.assertTrue(token_parts)
+            self.assertTrue(all(ref() is None for ref in readers + token_parts))
+
+    def test_config_preserves_vocabulary_capture_indices_and_attention(self):
+        tokens = ("", "é", "long token", "mask", "z")
+        with tempfile.TemporaryDirectory() as temp:
+            for causal, expected in [
+                (False, AttentionType.ENCODER_ONLY),
+                (True, AttentionType.DECODER),
+            ]:
+                with self.subTest(causal=causal):
+                    path = Path(temp) / f"draft-{causal}.gguf"
+                    write_draft(path, causal=causal, tokens=tokens)
+                    self.assertTrue(has_native_gguf_support(str(path)))
+                    config = build_plain_dflash_gguf_config(str(path))
+                    self.assertEqual(config.dflash_config["target_layer_ids"], [1, 5])
+                    self.assertEqual(config.vocab_size, len(tokens))
+                    self.assertEqual(config.sliding_window, 32)
+                    self.assertEqual(config.layer_types, ["sliding_attention"])
+                    self.assertEqual(config.architectures, ["DFlashDraftModel"])
+                    self.assertEqual(
+                        dflash._get_dflash_layer_attention_params(config, 0)[1],
+                        expected,
+                    )
+
+    def test_invalid_token_metadata_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for index, tokens in enumerate(((0, 1, 2, 3), "mask")):
+                with self.subTest(tokens=tokens):
+                    path = Path(temp) / f"draft-{index}.gguf"
+                    write_draft(path, tokens=tokens)
+                    with self.assertRaisesRegex(
+                        ValueError, "tokenizer.ggml.tokens must be an array of strings"
+                    ):
+                        build_plain_dflash_gguf_config(str(path))
 
     def test_bf16_bytes_load_as_dense_linear_weights(self):
         with tempfile.TemporaryDirectory() as temp:

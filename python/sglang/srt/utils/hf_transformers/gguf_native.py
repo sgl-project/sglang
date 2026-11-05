@@ -41,7 +41,6 @@ from sglang.srt.utils.hf_transformers.dflash_gguf import (
     build_plain_dflash_gguf_config,
     is_plain_dflash_gguf,
 )
-from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
     "muse-glimmer": MuseGlimmerConfig.from_gguf,
@@ -51,7 +50,9 @@ GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
 def read_gguf_architecture(gguf_path: str) -> Optional[str]:
     """The ``general.architecture`` string, or None if it cannot be read."""
     try:
-        reader = get_gguf_reader(gguf_path)
+        from gguf import GGUFReader
+
+        reader = GGUFReader(gguf_path)
         field = reader.fields.get("general.architecture")
         if field is None:
             return None
