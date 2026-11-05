@@ -131,17 +131,7 @@ def dcp_gathered_prefill_crossover(
     q_all_gather: bool,
 ) -> float:
     """Prefix tokens per extend token and gathered head at which the two DCP
-    prefill routes put the same number of bytes on the wire.
-
-    Owned sends every extend token's partial for every head through the a2a,
-    with the LSE packed next to it, and all-gathers its query first unless
-    --dcp-replicate-q-proj built it locally. Gathered all-gathers each cached
-    prefix token's latent once. Both collectives move the same (W-1)/W of their
-    volume over the same fabric, so the group width and the bandwidth cancel:
-    what is left is the layer geometry and the two dtypes. A bf16 cache with a
-    kv_lora_rank-wide a2a and a bf16 query gather lands near 3.8; the fp8 cache
-    with a v_head_dim-wide a2a and a locally built query lands near 0.9.
-    """
+    prefill routes put the same bytes on the wire; width and bandwidth cancel."""
     latent = kv_lora_rank + qk_rope_head_dim
     partial_width = v_head_dim if project_before_merge else kv_lora_rank
     owned = (partial_width + _lse_pack_dim(partial_dtype)) * partial_dtype.itemsize
@@ -158,14 +148,8 @@ def dcp_use_gathered_prefill(
     gathered_heads: int,
     crossover: float,
 ) -> bool:
-    """Whether a DCP prefill all-gathers the cached prefix KV and attends with
-    this rank's heads, instead of all-gathering Q and LSE-merging owned slots.
-
-    The gathered path moves one latent per prefix token; the owned path moves
-    every extend token's Q for all heads plus the head partials back. The
-    prefix all-gather reads position p from rank p % W, so every prefix must
-    be a whole number of widened pages.
-    """
+    """Whether this DCP prefill gathers the cached prefix instead of the query.
+    The gather reads position p from rank p % W, so prefixes must be page-whole."""
     w = get_parallel().dcp_group.world_size
     if any(p % w for p in extend_prefix_lens_cpu):
         return False

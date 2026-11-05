@@ -169,9 +169,8 @@ class DeepseekMLAForwardMixin:
             or mode.is_target_verify()
             or (
                 self.use_dsa
-                # ROCm only: the draft shards its KV like the target, and the
-                # DSA backend may plan a gathered prefix, in which case the MLA
-                # path attends this rank's heads instead of merging partials.
+                # ROCm only: the draft shards its KV like the target, and a
+                # gathered prefix attends this rank's heads, not merged partials.
                 and mode.is_extend(include_draft_extend_v2=_is_hip)
                 and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
             )
