@@ -11,6 +11,7 @@ from typing import Any, Optional, Sequence
 import msgspec
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import (
     KVLayerDecl,
     StateLifetime,
@@ -194,7 +195,7 @@ def build_kv_storage(
         "building one of its own"
     )
     owner = plan.owner()
-    window = plan.of_lifetime(WindowLifetime)
+    window = plan.primary_window()
     state = plan.of_lifetime(StateLifetime)
     for s in plan.sub_pools:
         expected = None if plan.fused_draft is None else plan.fused_draft.region(s.name)
@@ -257,6 +258,9 @@ def build_kv_storage(
         head_num=owner_spec.head_num if owner_is_mha else ctx.head_num,
         head_dim=owner_spec.head_dim if owner_is_mha else ctx.head_dim,
         bs1_floor_terms=sized.bs1_floor_terms,
+        # Backends ask for the sliding-window layers by their role: the
+        # target's window.
+        roles={} if window is None else {IdSpaceKind.SLIDING_WINDOW: window.name},
     )
     req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None
