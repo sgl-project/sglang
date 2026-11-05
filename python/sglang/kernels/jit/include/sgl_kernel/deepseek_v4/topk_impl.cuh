@@ -71,6 +71,8 @@ enum class Exactness : uint32_t { FAST = 0, EXACT = 1, DETERMINISTIC = 2 };
 inline constexpr Exactness kExactness = static_cast<Exactness>(SGL_TOPK_MODE);
 inline constexpr bool kExact = kExactness != Exactness::FAST;
 inline constexpr bool kDeterministic = kExactness == Exactness::DETERMINISTIC;
+/// Mode 2's cluster tie keys order equal values by a 20-bit row index; longer rows are rejected.
+inline constexpr uint32_t kDeterministicIdxBits = 20;
 
 /// Hints that `value` is warp-uniform so it can live in a uniform register. The
 /// caller must already guarantee that: on ROCm this is the identity, since the
@@ -1265,6 +1267,11 @@ SGL_DEVICE void mbar_skip_phase(uint32_t addr) {
       "mbarrier.test_wait.parity.shared::cta.b64 p, [%0], 1;\n}\n" ::"r"(addr)
       : "memory");
 }
+/// Release of this thread's prior shared::cta accesses at cluster scope (MEMBAR.ALL.CTA, not the
+/// GPU-scope membar of a release arrive); with a relaxed barrier arrive it forms a release arrive.
+SGL_DEVICE void fence_release_shared_cta() {
+  asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
+}
 SGL_DEVICE void barrier_cluster_arrive_relaxed() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 }
@@ -1605,13 +1612,12 @@ struct TopKCluster : TopKRadixBase<11> {
       smem->tie_ctr_gt = 0;
       smem->tie_ctr_eq = 0;
     }
-    // bar-0: no rank pushes into another before every rank has reset the state above and read
-    // the previous problem's receive buffers. Relaxed arrive (the release form is a MEMBAR.ALL.GPU
-    // that also waits for the previous output stores); its latency hides behind the PDL wait.
-    // NOTE: UB by the PTX memory model, which orders none of the accesses above for a relaxed
-    // arrive; safe in time, since every dependent access (this CTA's scan, a peer's first push)
-    // follows the whole cluster's arrival. The mbarrier init itself is ordered (init).
+    // bar-0: no rank pushes into another, and no warp of this CTA counts, before every rank has
+    // reset the state above and read the previous problem's receive buffers. A shared::cta release
+    // fence + relaxed arrive publishes exactly that (the release arrive is a MEMBAR.ALL.GPU that
+    // also waits for the previous output stores); its latency hides behind the PDL wait.
     // The wait comes before the scan: its acquire invalidates L1, which the collect pass re-reads.
+    ptx::fence_release_shared_cta();
     ptx::barrier_cluster_arrive_relaxed();
     PDLWaitPrimary<kUsePDL>();
     ptx::barrier_cluster_wait();
@@ -1756,7 +1762,7 @@ struct TopKCluster : TopKRadixBase<11> {
       const uint32_t num_bits) {
     if (remain == 0) return;  // only with NaN-polluted counts
     using Key = std::conditional_t<kDeterministic, uint64_t, uint32_t>;
-    constexpr uint32_t kIdxBits = kDeterministic ? 20 : 0;
+    constexpr uint32_t kIdxBits = kDeterministic ? kDeterministicIdxBits : 0;
     const auto tx = threadIdx.x;
     const auto lane_id = get_lane_id();
     const auto warp_id = broadcast(tx / kWarpSize);
@@ -2039,6 +2045,11 @@ struct TopKCluster : TopKRadixBase<11> {
     }
 
     if (eq_digit > kMaxNumTie) [[unlikely]] {
+      // refine_cluster re-emits every selected slot at new positions: drop the slots pass 1 wrote,
+      // or a rank's own staging (PAGE_TABLE / DUAL_OUTPUT) keeps stale entries that it transforms.
+      for (uint32_t t = tx; t < topk; t += kBlockSize) {
+        problem.out[t] = -1;
+      }
       if (this_rank == 0 && tx == 0) ptx::mbar_arrive_expect_tx(ptx::to_shared(&smem->mbar_ties), 0);
       const auto smem_0 = ptx::map_rank(smem, 0);
       if (this_rank == 0) {
@@ -2214,7 +2225,7 @@ struct TopKCluster : TopKRadixBase<11> {
     // Mode 2 radixes (key, smallest index first) so the final bucket is one element
     // and the selected set is deterministic (idx < 2^20: scores are at most 1M long).
     using Key = std::conditional_t<kDeterministic, uint64_t, uint32_t>;
-    constexpr uint32_t kIdxBits = kDeterministic ? 20 : 0;
+    constexpr uint32_t kIdxBits = kDeterministic ? kDeterministicIdxBits : 0;
     const auto comp = [=](float val, uint32_t idx) -> Key {
       const Key rel = extract_tie_key(val) - key_lo;
       if constexpr (kDeterministic) {

@@ -1300,6 +1300,11 @@ struct TopKKernel {
         .with_dtype<float>()
         .with_device(device_)
         .verify(scores);
+    // Mode 2: the cluster paths' tie keys hold a 20-bit row index.
+    if constexpr (impl::kDeterministic) {
+      RuntimeCheck(
+          L.unwrap() <= (1u << impl::kDeterministicIdxBits), "deterministic top-k: rows of at most 2^20 scores");
+    }
     TensorMatcher({B})  // seq_lens
         .with_dtype<int32_t>()
         .with_device(device_)
@@ -1430,6 +1435,11 @@ struct TopKKernel {
         .with_device(device_)
         .ensure_alignment(16)
         .verify(scores);
+    // Mode 2: the cluster paths' tie keys hold a 20-bit row index.
+    if constexpr (impl::kDeterministic) {
+      RuntimeCheck(
+          L.unwrap() <= (1u << impl::kDeterministicIdxBits), "deterministic top-k: rows of at most 2^20 scores");
+    }
     TensorMatcher({B})  // pool_lens
         .with_dtype<int32_t>()
         .with_device(device_)

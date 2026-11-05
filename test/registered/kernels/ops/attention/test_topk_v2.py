@@ -321,6 +321,26 @@ def test_topk_v2_dual_output(batch: int, seq: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, direct_raw, batch, seq_lens.cpu(), k)
 
 
+@pytest.mark.parametrize("batch", [1, 16])
+@torch.inference_mode()
+def test_topk_v2_cluster_refine_page_outputs(batch: int) -> None:
+    """A cluster row whose threshold bin overflows twice (all zeros but a few ones) keeps a
+    duplicate-free page-table and dual selection that holds every one."""
+    k, seq, ones = 2048, 65536, 1024
+    device = "cuda"
+    scores = torch.zeros(batch, seq, dtype=torch.float32, device=device)
+    scores[:, seq - ones :] = 1.0
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    page_table, inv_cpu = _make_page_table(batch, seq // PAGE_SIZE, "perm", device)
+
+    paged_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+    transformed_raw, direct_raw = _run_dual(scores, seq_lens, page_table, inv_cpu, k)
+    for row in range(batch):
+        for selected in (paged_raw[row], transformed_raw[row], direct_raw[row]):
+            assert len(selected) == k and len(set(selected)) == k
+            assert set(range(seq - ones, seq)) <= set(selected)
+
+
 # --- exactness when the coarse histogram cannot discriminate -----------------
 # The tests above draw from ``torch.randn``, which spreads scores over many
 # coarse bins and leaves the threshold bin far below the tie-staging capacity.
