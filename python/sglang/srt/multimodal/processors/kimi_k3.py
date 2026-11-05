@@ -55,6 +55,7 @@ from sglang.srt.multimodal.processors.kimi_common import (
     unwrap_kimi_images,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    _MAX_GPU_RESIZE_PIXELS,
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _gpu_preprocess_images,
@@ -336,6 +337,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         pixel_values = None
         if images and torch.cuda.is_available():
             image_scale, image_bias = self._get_gpu_norm_tensors()
+            gpu_oom = False
             try:
                 pixel_values, grid_thws = _gpu_preprocess_images(
                     images,
@@ -347,10 +349,15 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     post_resize=lambda x: _fill_transparent_bg(
                         x, self._transparent_bg_config
                     ),
+                    max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
                 )
             except torch.OutOfMemoryError:
-                # The tokenizer shares GPU 0 with the scheduler's static pools;
-                # serve the request on the CPU path instead of failing it.
+                gpu_oom = True
+            if gpu_oom:
+                # Outside the except block, so the failed attempt's tensors
+                # are no longer held by the traceback. The tokenizer shares
+                # GPU 0 with the scheduler's static pools; serve the request on
+                # the CPU path once instead of failing it.
                 logger.warning(
                     "Kimi-K3 GPU image preprocessing ran out of memory for "
                     "%d images; falling back to CPU preprocessing.",

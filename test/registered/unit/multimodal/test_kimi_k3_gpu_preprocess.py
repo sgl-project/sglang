@@ -60,23 +60,40 @@ def test_resize_matches_pil_bicubic_golden():
         assert (diff == 0).mean() > 0.7, f"bitwise ratio={(diff == 0).mean():.3f}"
 
 
+def _spy_cpu_moves(monkeypatch):
+    moved = []
+    real_cpu = torch.Tensor.cpu
+    monkeypatch.setattr(
+        torch.Tensor, "cpu", lambda t: moved.append(t.shape) or real_cpu(t)
+    )
+    return moved
+
+
 def test_large_resize_runs_on_cpu_and_matches(monkeypatch):
     """Sources above the GPU pixel cap resize on the CPU with the same kernel
     and come back on the caller's device."""
     x = torch.from_numpy(_natural_image(600, 800)).permute(2, 0, 1).unsqueeze(0)
     expected = _resize_bicubic_if_needed(x, 300, 400)
 
-    monkeypatch.setattr(kimi_k25, "_MAX_GPU_RESIZE_PIXELS", 0)
-    moved = []
-    real_cpu = torch.Tensor.cpu
-    monkeypatch.setattr(
-        torch.Tensor, "cpu", lambda t: moved.append(t.shape) or real_cpu(t)
-    )
-    ours = _resize_bicubic_if_needed(x, 300, 400)
+    moved = _spy_cpu_moves(monkeypatch)
+    ours = _resize_bicubic_if_needed(x, 300, 400, max_gpu_pixels=0)
 
     assert moved == [x.shape]
     assert ours.device == x.device
     torch.testing.assert_close(ours, expected)
+
+
+def test_resize_cap_is_per_image_and_opt_in(monkeypatch):
+    """The cap compares one source image, not the batch, and callers that do
+    not pass it (model-side deferred preprocessing) never move to the CPU."""
+    x = torch.from_numpy(_natural_image(600, 800)).permute(2, 0, 1).unsqueeze(0)
+    batch = torch.cat([x, x])
+    moved = _spy_cpu_moves(monkeypatch)
+
+    _resize_bicubic_if_needed(batch, 300, 400, max_gpu_pixels=600 * 800)
+    _resize_bicubic_if_needed(batch, 300, 400)
+
+    assert moved == []
 
 
 def test_fill_transparent_bg_matches_checkpoint_composite():

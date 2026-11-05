@@ -4,8 +4,6 @@ import copy
 import threading
 from typing import Any, Callable, TypeVar
 
-import torch
-
 T = TypeVar("T")
 
 
@@ -51,17 +49,7 @@ class MultimodalProcessorExecutor:
             with self._clone_lock:
                 processor = copy.deepcopy(self._resolve_processor())
             self._worker_state.processor = processor
-        try:
-            return function(*args, processor=processor, **kwargs)
-        except torch.OutOfMemoryError:
-            # Cached blocks from earlier requests may be all that is in the way.
-            torch.cuda.empty_cache()
-            return function(*args, processor=processor, **kwargs)
-        finally:
-            # GPU preprocessing shares a device with model weights and KV; keep
-            # each worker's cached peak image buffers from crowding them out.
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        return function(*args, processor=processor, **kwargs)
 
     def shutdown(self) -> None:
         self._executor.shutdown()

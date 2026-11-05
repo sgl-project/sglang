@@ -152,7 +152,10 @@ _MAX_GPU_RESIZE_PIXELS = 4096 * 4096
 
 
 def _resize_bicubic_if_needed(
-    image: torch.Tensor, target_height: int, target_width: int
+    image: torch.Tensor,
+    target_height: int,
+    target_width: int,
+    max_gpu_pixels: Optional[int] = None,
 ) -> torch.Tensor:
     """Track the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
 
@@ -167,10 +170,14 @@ def _resize_bicubic_if_needed(
     """
     if image.shape[-2:] == (target_height, target_width):
         return image.float()
-    # The fp32 copy of a very large source can exhaust a GPU that also holds
-    # the weights and KV cache, so resize those on the CPU.
+    # ``max_gpu_pixels`` (per source image): the fp32 copy of a very large
+    # source can exhaust a GPU that also holds the weights and KV cache, so
+    # callers sharing that GPU resize those on the CPU.
     device = image.device
-    if image.shape[0] * image.shape[-2] * image.shape[-1] > _MAX_GPU_RESIZE_PIXELS:
+    if (
+        max_gpu_pixels is not None
+        and image.shape[-2] * image.shape[-1] > max_gpu_pixels
+    ):
         image = image.cpu()
     return (
         F.interpolate(
@@ -206,6 +213,7 @@ def _process_single_image(
     patch_size: int,
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    max_gpu_resize_pixels: Optional[int] = None,
 ) -> torch.Tensor:
     """Process a single image on GPU: resize -> pad -> normalize -> patchify.
 
@@ -219,7 +227,9 @@ def _process_single_image(
     padded_h = new_h + config["pad_height"]
     padded_w = new_w + config["pad_width"]
 
-    x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
+    x = _resize_bicubic_if_needed(
+        image.unsqueeze(0), new_h, new_w, max_gpu_resize_pixels
+    )
     if post_resize is not None:
         x = post_resize(x)
 
@@ -232,6 +242,7 @@ def _resize_images_by_source_shape(
     indexed_images: list[tuple[int, torch.Tensor]],
     target_height: int,
     target_width: int,
+    max_gpu_resize_pixels: Optional[int] = None,
 ) -> list[torch.Tensor]:
     """Resize images while batching only inputs with an identical source layout.
 
@@ -249,13 +260,13 @@ def _resize_images_by_source_shape(
         if len(images) == 1:
             index, image = images[0]
             resized_by_index[index] = _resize_bicubic_if_needed(
-                image.unsqueeze(0), target_height, target_width
+                image.unsqueeze(0), target_height, target_width, max_gpu_resize_pixels
             )
             continue
 
         source_batch = torch.cat([image.unsqueeze(0) for _, image in images], dim=0)
         resized_batch = _resize_bicubic_if_needed(
-            source_batch, target_height, target_width
+            source_batch, target_height, target_width, max_gpu_resize_pixels
         )
         for local_index, (index, _) in enumerate(images):
             resized_by_index[index] = resized_batch[local_index : local_index + 1]
@@ -302,10 +313,12 @@ def _gpu_preprocess_images(
     patch_size: int,
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    max_gpu_resize_pixels: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
     Groups images with the same target padded size for batch processing.
+    Sources larger than ``max_gpu_resize_pixels`` are resized on the CPU.
     """
     n = len(images)
     if n == 0:
@@ -337,6 +350,7 @@ def _gpu_preprocess_images(
                 patch_size,
                 to_chw=to_chw,
                 post_resize=post_resize,
+                max_gpu_resize_pixels=max_gpu_resize_pixels,
             )
             all_patches[idx] = patches
             all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
@@ -351,7 +365,7 @@ def _gpu_preprocess_images(
                 # bicubic launches for common multi-image requests without padding
                 # random-size inputs to a larger source resolution.
                 resized = _resize_images_by_source_shape(
-                    indexed_images, target_h, target_w
+                    indexed_images, target_h, target_w, max_gpu_resize_pixels
                 )
                 if post_resize is not None:
                     # Before the concat: a hook may change the channel count (K3
@@ -499,7 +513,12 @@ class KimiGPUProcessorWrapper:
         # 3. GPU image preprocessing
         image_scale, image_bias = self._get_gpu_norm_tensors()
         pixel_values, grid_thws = _gpu_preprocess_images(
-            images, resize_configs, image_scale, image_bias, self._patch_size
+            images,
+            resize_configs,
+            image_scale,
+            image_bias,
+            self._patch_size,
+            max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
         )
 
         return {
