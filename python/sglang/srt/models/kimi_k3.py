@@ -82,7 +82,7 @@ from sglang.srt.layers.moe.topk import (
     TopK,
     TopKOutputFormat,
     build_precomputed_topk_output,
-    precomputed_topk_postprocess_is_noop,
+    can_postprocess_precomputed_topk,
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -103,11 +103,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -136,6 +132,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -458,6 +455,13 @@ class KimiK3MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        # K3 allocates one weight slot per logical expert. Online relocation
+        # and extra replicas require a separate weight-layout implementation.
+        if get_exec().moe.enable_eplb or get_exec().moe.ep_num_redundant_experts:
+            raise ValueError(
+                "Kimi-K3 supports initial expert placement without online EPLB "
+                "or redundant experts."
+            )
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         moe_renormalize = config.moe_renormalize
@@ -908,11 +912,12 @@ class KimiK3MoE(nn.Module):
             return False
         if self.gate.e_score_correction_bias is None:
             return False
-        # K3 calls self.topk() without a padding mask or EPLB dispatch info, so
-        # select_experts' post-processing collapses to the capture hook and the
-        # recorder -- both of which build_precomputed_topk_output runs. Bail out
-        # if that ever stops holding rather than silently dropping the remap.
-        if not precomputed_topk_postprocess_is_noop(cfg):
+        # Physical placement and batch padding are applied after the fused
+        # router, through the same post-processing as TopK. Fake dispatch
+        # rewrites logits before routing and must retain the ordinary path.
+        if get_exec().moe.ep_dispatch_algorithm == "fake":
+            return False
+        if not can_postprocess_precomputed_topk(cfg):
             return False
         if get_exec().deterministic.enable_deterministic_inference:
             return False
@@ -975,7 +980,18 @@ class KimiK3MoE(nn.Module):
                 self.layer_idx,
                 hidden_states.shape[0],
             )
-        return build_precomputed_topk_output(w, i, cfg, self.layer_idx), routed
+        num_token_non_padded, dispatch_info = self.topk.routing_inputs()
+        return (
+            build_precomputed_topk_output(
+                w,
+                i,
+                cfg,
+                self.layer_idx,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            ),
+            routed,
+        )
 
     def _ep_front_overlap(self, hidden_states: torch.Tensor):
         """Overlap the exact fp32 gate+top-k with the latent down projection.
@@ -1911,7 +1927,9 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+        if not self.use_full_rank_gate:
+            return False
+        if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
@@ -1995,21 +2013,27 @@ class KimiK3DeltaAttention(nn.Module):
         w = layer.conv_weights
         if _is_npu:
             return
-        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        from sglang.kernels.ops.attention import kda_fused_decode
+
+        heads = self.local_num_heads
+        seg = heads * 128
         if (
-            w is None
+            heads not in kda_fused_decode.SUPPORTED_HEADS
+            or w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
             or layer.dt_bias.dtype != torch.float32
         ):
             rank0_log(
-                "K3 fused KDA decode disabled: unexpected conv/A_log/dt_bias "
+                f"K3 fused KDA decode disabled: {heads} local heads "
+                f"(kernel supports {sorted(kda_fused_decode.SUPPORTED_HEADS)}) or "
+                "unexpected conv/A_log/dt_bias "
                 f"layout (conv {None if w is None else tuple(w.shape)}, "
                 f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
                 f"dt_bias {None if layer.dt_bias is None else tuple(layer.dt_bias.shape)})"
@@ -2029,7 +2053,7 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [heads]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
@@ -2110,8 +2134,9 @@ class KimiK3DeltaAttention(nn.Module):
             )
         return qkv, beta, forget_gate, g_proj_states
 
-    def forward(
+    def forward_pre_o_proj(
         self,
+        *,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -2164,7 +2189,21 @@ class KimiK3DeltaAttention(nn.Module):
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+        return core_attn_out.squeeze(0).flatten(-2)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
+        core_attn_out = self.forward_pre_o_proj(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
         if self.all_reduce_fusion:
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
@@ -2311,6 +2350,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
+            self._pre_o_proj_out: Optional[torch.Tensor] = None
+            self._return_pre_o_proj = False
             _orig_o_proj_forward = self.o_proj.forward
 
             def _gated_o_proj_forward(x, *args, **kwargs):
@@ -2330,6 +2371,26 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # Even a skipped gate must close its capture branch.
                     torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
                     self._gate_pending_stream = None
+                if self._return_pre_o_proj:
+                    # forward_pre_o_proj() sets _return_pre_o_proj. Skipping
+                    # o_proj hands its GEMM and its attention-TP reduction to
+                    # the caller. The MLA cores only unpack a 2-tuple from it.
+                    if isinstance(x, tuple):
+                        # A quantized o_proj makes the core quantize its input,
+                        # and the gate above is skipped along with it.
+                        raise RuntimeError(
+                            f"forward_pre_o_proj: layer {self.layer_id} has a "
+                            "quantized o_proj input, so there is no gated bf16 "
+                            "output to hand back"
+                        )
+                    if self._pre_o_proj_out is not None:
+                        raise RuntimeError(
+                            f"forward_pre_o_proj: layer {self.layer_id} reached "
+                            "o_proj twice in one attention forward; the second "
+                            "output would overwrite the first"
+                        )
+                    self._pre_o_proj_out = x
+                    return x, None
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2393,6 +2454,25 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
 
+    def forward_pre_o_proj(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert self.use_output_gate, "forward_pre_o_proj needs the gated o_proj wrapper"
+        assert not self._return_pre_o_proj, "forward_pre_o_proj is not re-entrant"
+        self._return_pre_o_proj, self._pre_o_proj_out = True, None
+        self.forward(positions, hidden_states, forward_batch, zero_allocator, **kwargs)
+        out = self._pre_o_proj_out
+        self._return_pre_o_proj, self._pre_o_proj_out = False, None
+        if out is None:
+            raise RuntimeError("MLA forward returned without reaching o_proj")
+        return out
+
 
 def _is_moe_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
     """Whether a layer runs a MoE rather than the dense MLP: past the dense
@@ -2423,7 +2503,7 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
+def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
@@ -2431,12 +2511,12 @@ def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     neither a later pipeline rank nor a draft model's capture of the target's
     hidden states can take them; it is decided at construction. Nor can a
     dense layer after an SP-MoE one, whose FFN reads every row of the bank:
-    every layer from the first MoE layer on must be one. ``sp_collective``:
-    whether K3's SP collective is enabled on this rank."""
+    every layer from the first MoE layer on must be one. This layout also
+    works with NCCL: custom collective kernels only fuse the local bank
+    read with the gather, and are not required to keep the bank sharded."""
     if not (
         _shards_moe_rows()
         and config.attn_res_block_size is not None
-        and sp_collective
         and envs.SGLANG_K3_SP_ATTN_RES.get()
         and get_parallel().pp_size == 1
     ):
@@ -2481,9 +2561,7 @@ def _stage_facts(
     ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
     if config.attn_res_block_size is not None:
         if bank is None:
-            bank = AttnBankState.facts(
-                reads_slices=_carries_bank_slices(config, sp_collective)
-            )
+            bank = AttnBankState.facts(reads_slices=_carries_bank_slices(config))
         attn_ops = dict(
             read=bank.attn_readout,
             update=bank.attn_update,
@@ -2648,7 +2726,7 @@ class KimiK3DecoderLayer(nn.Module):
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
-                reads_slices=_carries_bank_slices(config, sp_collective),
+                reads_slices=_carries_bank_slices(config),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -2702,6 +2780,8 @@ class KimiK3DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        if isinstance(result, tuple):
+            result = result[0]
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
@@ -2751,7 +2831,7 @@ class KimiK3LinearModel(nn.Module):
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
         sp_collective = k3_sp_collective.enabled()
-        self.carries_bank_slices = _carries_bank_slices(config, sp_collective)
+        self.carries_bank_slices = _carries_bank_slices(config)
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3003,6 +3083,16 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    @staticmethod
+    def get_model_config_for_expert_location(config):
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=config.num_expert_group,
+        )
+
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
     # q_proj scheme while the weight loader packs q/k/v/g into its shards.
@@ -3129,6 +3219,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        if _is_npu:
+            return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -3337,8 +3429,21 @@ class KimiK3LinearForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self._check_dsa_indexer_loaded(loaded_params)
         self.post_load_weights()
         return loaded_params
+
+    def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
+        if self.config.dsa_config is None:
+            return
+        expected = {
+            name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
+        }
+        missing = sorted(expected - loaded_params)
+        assert not missing, (
+            f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
+            f"e.g. {missing[:4]}"
+        )
 
     def post_load_weights(self):
         # Also invoked by loader post-load hooks (DummyModelLoader,
@@ -3460,6 +3565,12 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    @staticmethod
+    def get_model_config_for_expert_location(config):
+        return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
 
     supports_cuda_vmm_feature_transport = True
 
@@ -3891,4 +4002,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-EntryClass = [KimiK3ForConditionalGeneration, KimiK3LinearForCausalLM]
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    pass
+
+
+EntryClass = [
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+    KimiK3LinearForCausalLM,
+]
