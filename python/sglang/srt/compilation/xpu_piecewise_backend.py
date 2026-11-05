@@ -9,8 +9,8 @@ from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
     is_in_torch_compile_warmup,
 )
-from sglang.srt.compilation.cuda_piecewise_backend import (
-    CUDAPiecewiseBackend,
+from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
+from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
     weak_ref_tensors,
 )
 from sglang.srt.utils.common import print_warning_once
