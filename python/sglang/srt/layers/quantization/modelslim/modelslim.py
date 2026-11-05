@@ -244,7 +244,7 @@ class ModelSlimConfig(QuantizationConfig):
         return scheme_class
 
     def get_modelslim_kv_scheme(self, prefix):
-        if self.requested_kv_cache_dtype in ("auto", "bf16", "bfloat16"):
+        if self.requested_kv_cache_dtype in ("auto", "bf16", "bfloat16", "int8"):
             return None
         # Map the model's layer prefix to checkpoint-name candidates, e.g.
         # with or without "language_model."; try the original name first.

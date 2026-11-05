@@ -701,6 +701,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         backend.device = torch.device("cpu")
         backend.use_mla = True
+        backend.use_int8_quant_indexer = False
         backend.use_dsa = False
         backend.dcp_size, backend.dcp_rank = size, rank
         backend.dense_mla_dcp_target = size > 1
@@ -899,6 +900,7 @@ class TestMlaPrefixFia(unittest.TestCase):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         backend.dcp_size = 1
         backend.use_mla = True
+        backend.use_int8_quant_indexer = False
         backend.use_fia = use_fia
         backend.is_dllm_model = False
         backend.qk_nope_head_dim = 128

@@ -1,0 +1,741 @@
+"""CPU-only tests for the Ascend DSA KV cache capability and its consumers.
+
+Covers the capability accept/reject matrix, the MLA KV cache dim selector, the
+NPU MLA pool's indexer dtypes and the indexer sizer. NPU extension modules are
+stubbed; no operator runs.
+"""
+
+import argparse
+import sys
+import types
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+sys.modules.setdefault("sgl_kernel_npu", types.ModuleType("sgl_kernel_npu"))
+sys.modules.setdefault("torch_npu", MagicMock(name="torch_npu"))
+import sglang.srt.utils as _utils
+from sglang.srt.utils import common as _common_utils
+
+_real_is_npu = _common_utils.is_npu
+_real_utils_is_npu = _utils.is_npu
+_common_utils.is_npu = lambda: False
+_utils.is_npu = _common_utils.is_npu
+try:
+    from sglang.srt.arg_groups.arg_utils import add_cli_args_from_dataclass
+    from sglang.srt.arg_groups.fields.model import Model
+    from sglang.srt.hardware_backend.npu import kv_capability, memory_pool_npu
+    from sglang.srt.hardware_backend.npu.kv_capability import resolve_kv_capability
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.layers.attention.dsa import dsa_npu_indexer
+    from sglang.srt.mem_cache import kv_cache_configurator, kv_cache_dtype
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        calculate_mla_kv_cache_dim,
+        is_packed_mla_kv_cache,
+    )
+    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+    from sglang.srt.model_executor import pool_configurator
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend,
+        Phase,
+        default_cuda_graph_config,
+        with_phase,
+    )
+    from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+    from sglang.srt.runtime_context import get_context
+finally:
+    _common_utils.is_npu = _real_is_npu
+    _utils.is_npu = _real_utils_is_npu
+
+A2_SOC = "Ascend910B3"
+FP8 = torch.float8_e4m3fn
+
+
+def _patch_npu(*, arch35: bool):
+    """Patch the SoC probes behind resolve_npu_kv_capability."""
+    return (
+        patch(
+            "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+            return_value=arch35,
+        ),
+        patch.object(kv_capability, "_get_npu_soc_name", return_value=A2_SOC),
+    )
+
+
+class _NpuPatchedTestCase(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # resolve_npu_kv_capability reads the indexer switch off the model bag,
+        # so every consumer of it needs a published config.
+        self._publish_indexer_kv_dtype()
+
+    def _publish_indexer_kv_dtype(self, requested="auto", **fields):
+        override = get_context().override_server_args(
+            dsa_indexer_kv_dtype=requested, **fields
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _use_npu(self, *, arch35: bool):
+        for p in _patch_npu(arch35=arch35):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _stub_int8_signals(self, *, op=True, index_n_heads=32, prefill_cp=False):
+        # Stubs the vendor-op probe and the two hf_config reads, which need the
+        # custom_ops wheel and a real checkpoint.
+        for name, value in (
+            ("_int8_indexer_op_available", op),
+            ("_dsa_index_n_heads", index_n_heads),
+            ("_dsa_prefill_cp_enabled", prefill_cp),
+        ):
+            p = patch.object(kv_capability, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+
+
+class TestResolveKvCapability(CustomTestCase):
+    def test_fp8_on_arch35_is_packed_with_quantized_indexer(self):
+        cap = resolve_kv_capability(kv_cache_dtype=FP8, is_arch35=True, soc_name="x")
+        self.assertTrue(cap.supported)
+        self.assertTrue(cap.main_kv_packed)
+        self.assertEqual(cap.main_kv_scale_dtype, torch.float32)
+        self.assertTrue(cap.indexer_quant)
+        self.assertEqual(cap.indexer_kv_dtype, FP8)
+        self.assertEqual(cap.indexer_scale_dtype, torch.float32)
+
+    def test_fp8_on_non_arch35_is_rejected_with_soc_and_alternatives(self):
+        cap = resolve_kv_capability(
+            kv_cache_dtype=FP8, is_arch35=False, soc_name=A2_SOC
+        )
+        self.assertFalse(cap.supported)
+        self.assertFalse(cap.main_kv_packed)
+        self.assertIn(A2_SOC, cap.unsupported_reason)
+        self.assertIn("--kv-cache-dtype fp8_e4m3", cap.unsupported_reason)
+        self.assertIn("arch35", cap.unsupported_reason)
+        self.assertIn("bf16", cap.unsupported_reason)
+
+    def test_rejection_names_the_requested_value(self):
+        cap = resolve_kv_capability(
+            kv_cache_dtype=FP8, is_arch35=False, soc_name=A2_SOC, requested="mxfp8"
+        )
+        self.assertIn("--kv-cache-dtype mxfp8", cap.unsupported_reason)
+
+    def test_int8_on_a2_is_packed_with_an_unquantized_bf16_indexer(self):
+        cap = resolve_kv_capability(
+            kv_cache_dtype=torch.int8, is_arch35=False, soc_name=A2_SOC
+        )
+        self.assertTrue(cap.supported)
+        self.assertTrue(cap.main_kv_packed)
+        self.assertEqual(cap.main_kv_scale_dtype, torch.float32)
+        # The indexer is a separate axis: it does not follow the main KV dtype.
+        self.assertFalse(cap.indexer_quant)
+        self.assertEqual(cap.indexer_kv_dtype, torch.bfloat16)
+        self.assertIsNone(cap.indexer_scale_dtype)
+
+    def test_int8_on_arch35_is_rejected_pointing_at_fp8(self):
+        cap = resolve_kv_capability(
+            kv_cache_dtype=torch.int8, is_arch35=True, soc_name="x"
+        )
+        self.assertFalse(cap.supported)
+        self.assertFalse(cap.main_kv_packed)
+        self.assertIn("--kv-cache-dtype int8", cap.unsupported_reason)
+        self.assertIn("arch35", cap.unsupported_reason)
+        self.assertIn("fp8_e4m3", cap.unsupported_reason)
+
+    def test_unquantized_and_e5m2_are_unpacked_on_every_soc(self):
+        for dtype in (torch.bfloat16, torch.float16, torch.float8_e5m2):
+            for is_arch35 in (True, False):
+                with self.subTest(dtype=dtype, is_arch35=is_arch35):
+                    cap = resolve_kv_capability(
+                        kv_cache_dtype=dtype, is_arch35=is_arch35, soc_name="x"
+                    )
+                    self.assertTrue(cap.supported)
+                    self.assertFalse(cap.main_kv_packed)
+                    self.assertIsNone(cap.main_kv_scale_dtype)
+                    self.assertFalse(cap.indexer_quant)
+                    self.assertEqual(cap.indexer_kv_dtype, dtype)
+                    self.assertIsNone(cap.indexer_scale_dtype)
+
+    def test_capability_is_frozen(self):
+        cap = resolve_kv_capability(kv_cache_dtype=FP8, is_arch35=True, soc_name="x")
+        with self.assertRaises(Exception):
+            cap.main_kv_packed = False
+
+
+class TestResolveIndexerKvDtype(CustomTestCase):
+    """--dsa-indexer-kv-dtype is an axis of its own, not a main-KV follower."""
+
+    def _resolve(
+        self, *, main=torch.bfloat16, arch35=False, indexer, op=True, **signals
+    ):
+        return resolve_kv_capability(
+            kv_cache_dtype=main,
+            is_arch35=arch35,
+            soc_name=A2_SOC if not arch35 else "Ascend950",
+            requested_indexer_kv_dtype=indexer,
+            int8_indexer_op_available=op,
+            **signals,
+        )
+
+    INT8_CONFLICTS = (
+        ({"index_n_heads": 65}, "index_n_heads=65"),
+        ({"prefill_cp_enabled": True}, "CP and DCP"),
+    )
+
+    def test_int8_indexer_on_a2_quantizes_with_an_fp16_scale(self):
+        cap = self._resolve(indexer="int8")
+        self.assertTrue(cap.supported)
+        # The indexer moves while the main KV stays unpacked BF16.
+        self.assertFalse(cap.main_kv_packed)
+        self.assertTrue(cap.indexer_quant)
+        self.assertEqual(cap.indexer_kv_dtype, torch.int8)
+        # The vendor op signature fixes an FP16 scale, not FP32.
+        self.assertEqual(cap.indexer_scale_dtype, torch.float16)
+
+    def test_int8_indexer_rides_on_a_packed_int8_main_kv(self):
+        cap = self._resolve(main=torch.int8, indexer="int8")
+        self.assertTrue(cap.supported)
+        self.assertTrue(cap.main_kv_packed)
+        self.assertEqual(cap.main_kv_scale_dtype, torch.float32)
+        self.assertEqual(cap.indexer_kv_dtype, torch.int8)
+        self.assertEqual(cap.indexer_scale_dtype, torch.float16)
+
+    def test_int8_indexer_needs_the_vendor_operator(self):
+        cap = self._resolve(indexer="int8", op=False)
+        self.assertFalse(cap.supported)
+        self.assertIn("--dsa-indexer-kv-dtype int8", cap.unsupported_reason)
+        self.assertIn("npu_quant_lightning_indexer", cap.unsupported_reason)
+        self.assertIn("--dsa-indexer-kv-dtype bf16", cap.unsupported_reason)
+
+    def test_bf16_indexer_overrides_the_arch35_fp8_default(self):
+        cap = self._resolve(main=FP8, arch35=True, indexer="bf16")
+        self.assertTrue(cap.supported)
+        self.assertTrue(cap.main_kv_packed)
+        self.assertFalse(cap.indexer_quant)
+        self.assertEqual(cap.indexer_kv_dtype, torch.bfloat16)
+        self.assertIsNone(cap.indexer_scale_dtype)
+
+    def test_auto_leaves_the_indexer_to_the_main_kv_dtype(self):
+        for indexer in (None, "auto"):
+            with self.subTest(indexer=indexer):
+                cap = self._resolve(main=FP8, arch35=True, indexer=indexer)
+                self.assertTrue(cap.indexer_quant)
+                self.assertEqual(cap.indexer_kv_dtype, FP8)
+                cap = self._resolve(indexer=indexer)
+                self.assertFalse(cap.indexer_quant)
+
+    def test_fp8_indexer_is_rejected_off_arch35(self):
+        cap = self._resolve(indexer="fp8_e4m3")
+        self.assertFalse(cap.supported)
+        self.assertIn("--dsa-indexer-kv-dtype fp8_e4m3", cap.unsupported_reason)
+        self.assertIn(A2_SOC, cap.unsupported_reason)
+        self.assertIn("int8", cap.unsupported_reason)
+
+    def test_int8_indexer_is_rejected_on_arch35(self):
+        cap = self._resolve(arch35=True, indexer="int8")
+        self.assertFalse(cap.supported)
+        self.assertIn("--dsa-indexer-kv-dtype int8", cap.unsupported_reason)
+        self.assertIn("fp8_e4m3", cap.unsupported_reason)
+
+    def test_an_unsupported_main_kv_dtype_wins_over_the_indexer_axis(self):
+        cap = self._resolve(main=FP8, indexer="int8")
+        self.assertFalse(cap.supported)
+        self.assertIn("--kv-cache-dtype", cap.unsupported_reason)
+
+    def test_int8_indexer_startup_conflicts_are_rejected(self):
+        # A bf16 main KV is unpacked: the conflicts must not sit behind the
+        # packed-only write-path checks.
+        for main in (torch.bfloat16, torch.int8):
+            for signals, flag in self.INT8_CONFLICTS:
+                with self.subTest(main=main, signals=signals):
+                    cap = self._resolve(main=main, indexer="int8", **signals)
+                    self.assertFalse(cap.supported)
+                    self.assertIn("--dsa-indexer-kv-dtype int8", cap.unsupported_reason)
+                    self.assertIn(flag, cap.unsupported_reason)
+                    self.assertIn("--dsa-indexer-kv-dtype bf16", cap.unsupported_reason)
+
+    def test_startup_conflicts_bind_only_an_int8_indexer(self):
+        self.assertTrue(self._resolve(indexer="int8", index_n_heads=64).supported)
+        for signals, _ in self.INT8_CONFLICTS:
+            with self.subTest(signals=signals):
+                self.assertTrue(self._resolve(indexer="bf16", **signals).supported)
+                cap = self._resolve(main=FP8, arch35=True, indexer="auto", **signals)
+                self.assertTrue(cap.supported)
+
+    def test_int8_head_limit_is_the_vendor_padding_target(self):
+        """The startup head limit must track the head count the indexer pads to."""
+        self.assertEqual(
+            kv_capability._INT8_INDEXER_MAX_HEADS,
+            dsa_npu_indexer.VENDOR_QUANT_INDEXER_NUM_HEADS,
+        )
+
+    def test_every_cli_choice_reaches_a_resolver_branch(self):
+        """Each --dsa-indexer-kv-dtype choice must be known to the resolver.
+
+        A choice added to the CLI but not to the capability layer would fall
+        through to the unknown-dtype rejection on every NPU.
+        """
+        parser = argparse.ArgumentParser()
+        add_cli_args_from_dataclass(parser, Model, fields=["dsa_indexer_kv_dtype"])
+        (action,) = [a for a in parser._actions if a.dest == "dsa_indexer_kv_dtype"]
+        self.assertTrue(action.choices)
+        for choice in action.choices:
+            for arch35 in (False, True):
+                with self.subTest(choice=choice, arch35=arch35):
+                    cap = self._resolve(arch35=arch35, indexer=choice)
+                    if not cap.supported:
+                        self.assertNotIn("not a known", cap.unsupported_reason)
+
+
+class TestIndexerAdditionalContracts(CustomTestCase):
+    def test_bf16_override_on_fp16_main_kv_is_honored(self):
+        cap = resolve_kv_capability(
+            kv_cache_dtype=torch.float16,
+            is_arch35=False,
+            soc_name="Ascend910B4",
+            requested_indexer_kv_dtype="bf16",
+        )
+        self.assertEqual(cap.indexer_kv_dtype, torch.bfloat16)
+
+    def test_dcp_int8_indexer_is_rejected(self):
+        cap = resolve_kv_capability(
+            kv_cache_dtype=torch.bfloat16,
+            is_arch35=False,
+            soc_name="Ascend910B4",
+            requested_indexer_kv_dtype="int8",
+            int8_indexer_op_available=True,
+            dcp_size=2,
+        )
+        self.assertFalse(cap.supported)
+        self.assertIn("CP and DCP", cap.unsupported_reason)
+
+    def test_vendor_probe_requires_both_entry_points(self):
+        with patch.dict(sys.modules, {"custom_ops": types.ModuleType("custom_ops")}):
+            for metadata_present in (True, False):
+                custom = SimpleNamespace(npu_quant_lightning_indexer=lambda: None)
+                if metadata_present:
+                    custom.npu_quant_lightning_indexer_metadata = lambda: None
+                with (
+                    self.subTest(metadata_present=metadata_present),
+                    patch.object(torch.ops, "custom", custom),
+                ):
+                    self.assertEqual(
+                        kv_capability._int8_indexer_op_available(), metadata_present
+                    )
+
+
+class TestPackedKvWritePathRejections(CustomTestCase):
+    """Both set_kv_buffer and MLAProlog write packed records in PA_BSND."""
+
+    PACKED = ((torch.int8, False), (FP8, True))
+
+    def _cap(self, dtype, is_arch35, **flags):
+        return resolve_kv_capability(
+            kv_cache_dtype=dtype, is_arch35=is_arch35, soc_name=A2_SOC, **flags
+        )
+
+    def test_fia_nz_is_rejected_on_every_packed_path(self):
+        for dtype, is_arch35 in self.PACKED:
+            with self.subTest(dtype=dtype):
+                cap = self._cap(dtype, is_arch35, fia_nz_enabled=True)
+                self.assertFalse(cap.supported)
+                self.assertFalse(cap.main_kv_packed)
+                self.assertIn("SGLANG_USE_FIA_NZ", cap.unsupported_reason)
+
+    def test_mlaprolog_allows_int8_on_a2_and_fp8_on_arch35(self):
+        for dtype, is_arch35 in self.PACKED:
+            with self.subTest(dtype=dtype):
+                cap = self._cap(dtype, is_arch35, mla_preprocess_enabled=True)
+                self.assertTrue(cap.supported)
+                self.assertTrue(cap.main_kv_packed)
+
+    def test_unpacked_paths_ignore_the_write_path_flags(self):
+        cap = self._cap(
+            torch.bfloat16, False, mla_preprocess_enabled=True, fia_nz_enabled=True
+        )
+        self.assertTrue(cap.supported)
+        self.assertFalse(cap.main_kv_packed)
+
+
+class TestConfigureKvCacheDtypeOnNpu(_NpuPatchedTestCase):
+    def _configure(
+        self,
+        server_args_kv_cache_dtype,
+        *,
+        model=None,
+        is_npu=True,
+        is_draft_worker=False,
+    ):
+        platform = SimpleNamespace(is_npu=lambda: is_npu, is_cpu=lambda: False)
+        with patch.object(kv_cache_dtype, "current_platform", platform):
+            return configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=server_args_kv_cache_dtype,
+                model=model,
+                model_dtype=torch.bfloat16,
+                is_draft_worker=is_draft_worker,
+                is_dflash=False,
+                speculative_draft_attention_backend="fa3",
+            )
+
+    def test_fp8_on_a2_is_a_startup_error(self):
+        self._use_npu(arch35=False)
+        for requested in ("fp8_e4m3", "mxfp8"):
+            with self.subTest(requested=requested):
+                with self.assertRaises(ValueError) as ctx:
+                    self._configure(requested)
+                message = str(ctx.exception)
+                self.assertIn(f"--kv-cache-dtype {requested}", message)
+                self.assertIn(A2_SOC, message)
+                self.assertIn("bf16", message)
+
+    def test_auto_with_fp8_checkpoint_on_a2_is_a_startup_error(self):
+        self._use_npu(arch35=False)
+        model = SimpleNamespace(quant_config=SimpleNamespace(kv_cache_quant_algo="FP8"))
+        with self.assertRaisesRegex(ValueError, "--kv-cache-dtype auto"):
+            self._configure("auto", model=model)
+
+    def test_bf16_and_auto_are_accepted_on_a2(self):
+        self._use_npu(arch35=False)
+        self.assertEqual(self._configure("bf16"), (None, torch.bfloat16))
+        self.assertEqual(self._configure("auto"), (None, torch.bfloat16))
+
+    def test_fp8_is_accepted_on_arch35(self):
+        self._use_npu(arch35=True)
+        self.assertEqual(self._configure("fp8_e4m3"), (None, FP8))
+
+    def test_int8_is_accepted_on_a2(self):
+        self._use_npu(arch35=False)
+        self.assertEqual(self._configure("int8"), (None, torch.int8))
+
+    def test_int8_on_arch35_is_a_startup_error(self):
+        self._use_npu(arch35=True)
+        with self.assertRaisesRegex(ValueError, "--kv-cache-dtype int8"):
+            self._configure("int8")
+
+    def test_int8_off_npu_is_a_startup_error(self):
+        with self.assertRaisesRegex(ValueError, "Ascend DSA"):
+            self._configure("int8", is_npu=False)
+
+    def test_a_draft_pool_does_not_inherit_int8(self):
+        self._use_npu(arch35=False)
+        self.assertEqual(
+            self._configure("int8", is_draft_worker=True), ("auto", torch.bfloat16)
+        )
+
+    def test_non_npu_platforms_are_not_checked(self):
+        self._use_npu(arch35=False)
+        self.assertEqual(self._configure("fp8_e4m3", is_npu=False), (None, FP8))
+
+    def _publish_int8_indexer(self, *, decode_graph):
+        cuda_graph_config = default_cuda_graph_config()
+        if not decode_graph:
+            cuda_graph_config = with_phase(
+                cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            )
+        self._publish_indexer_kv_dtype("int8", cuda_graph_config=cuda_graph_config)
+
+    def test_int8_indexer_is_accepted_on_a2(self):
+        self._use_npu(arch35=False)
+        self._stub_int8_signals()
+        for decode_graph in (True, False):
+            with self.subTest(decode_graph=decode_graph):
+                self._publish_int8_indexer(decode_graph=decode_graph)
+                self.assertEqual(self._configure("bf16"), (None, torch.bfloat16))
+                cap = kv_capability.resolve_npu_kv_capability(torch.bfloat16)
+                self.assertTrue(cap.supported)
+                self.assertEqual(cap.indexer_kv_dtype, torch.int8)
+
+    def test_a_draft_does_not_inherit_the_int8_indexer(self):
+        """Only the target quantizes the indexer; a draft must resolve it unquantized."""
+        self._use_npu(arch35=False)
+        self._publish_int8_indexer(decode_graph=False)
+        self._stub_int8_signals()
+        target = kv_capability.resolve_npu_kv_capability(torch.bfloat16)
+        self.assertTrue(target.indexer_quant)
+        self.assertEqual(target.indexer_kv_dtype, torch.int8)
+        self.assertEqual(target.indexer_scale_dtype, torch.float16)
+        draft = kv_capability.resolve_npu_kv_capability(
+            torch.bfloat16, is_draft_worker=True
+        )
+        self.assertTrue(draft.supported)
+        self.assertFalse(draft.indexer_quant)
+        self.assertEqual(draft.indexer_kv_dtype, torch.bfloat16)
+        self.assertIsNone(draft.indexer_scale_dtype)
+
+    def test_int8_indexer_startup_conflicts_are_startup_errors(self):
+        self._use_npu(arch35=False)
+        cases = (
+            ({"op": False}, "npu_quant_lightning_indexer"),
+            ({"index_n_heads": 128}, "index_n_heads=128"),
+            ({"prefill_cp": True}, "CP and DCP"),
+        )
+        for stubs, flag in cases:
+            with self.subTest(stubs=stubs):
+                self._publish_int8_indexer(decode_graph=True)
+                self._stub_int8_signals(**stubs)
+                with self.assertRaisesRegex(ValueError, flag):
+                    self._configure("bf16")
+
+    def test_only_an_int8_indexer_probes_its_startup_signals(self):
+        """Other indexer dtypes must not import custom_ops or build the model config."""
+        for name in (
+            "_int8_indexer_op_available",
+            "_dsa_index_n_heads",
+            "_dsa_prefill_cp_enabled",
+        ):
+            p = patch.object(kv_capability, name, side_effect=AssertionError(name))
+            p.start()
+            self.addCleanup(p.stop)
+        for arch35, indexer, main in (
+            (False, "auto", "bf16"),
+            (False, "bf16", "int8"),
+            (True, "fp8_e4m3", "bf16"),
+        ):
+            with self.subTest(arch35=arch35, indexer=indexer):
+                self._use_npu(arch35=arch35)
+                self._publish_indexer_kv_dtype(indexer)
+                self._configure(main)
+
+    def test_a_quantized_indexer_off_npu_is_a_startup_error(self):
+        for requested in ("int8", "fp8_e4m3"):
+            with self.subTest(requested=requested):
+                self._publish_indexer_kv_dtype(requested)
+                with self.assertRaisesRegex(
+                    ValueError, f"--dsa-indexer-kv-dtype {requested}"
+                ):
+                    self._configure("bf16", is_npu=False)
+
+    def test_an_unquantized_indexer_off_npu_is_accepted(self):
+        self._publish_indexer_kv_dtype("bf16")
+        self.assertEqual(self._configure("bf16", is_npu=False), (None, torch.bfloat16))
+
+
+class TestMlaKvCacheDim(_NpuPatchedTestCase):
+    def setUp(self):
+        super().setUp()
+        kernel = SimpleNamespace(
+            dsa_prefill_backend="flashmla_kv", dsa_decode_backend="flashmla_kv"
+        )
+        for p in (
+            patch.object(kv_cache_configurator, "is_deepseek_dsa", return_value=True),
+            patch.object(
+                kv_cache_configurator,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="null"),
+            ),
+            patch.object(
+                kv_cache_configurator,
+                "get_exec",
+                return_value=SimpleNamespace(kernel=kernel),
+            ),
+            patch.object(kv_cache_configurator, "_is_hip", False),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        self.model_config = SimpleNamespace(
+            hf_config=None, kv_lora_rank=512, qk_rope_head_dim=64
+        )
+
+    def _dim(self, dtype, packed):
+        return calculate_mla_kv_cache_dim(
+            model_config=self.model_config, kv_cache_dtype=dtype, packed=packed
+        )
+
+    def test_packed_selector_is_caller_owned(self):
+        self.assertEqual(self._dim(FP8, packed=True), 512 + 512 // 128 * 4 + 64 * 2)
+        self.assertEqual(self._dim(FP8, packed=False), 576)
+        self.assertEqual(self._dim(torch.bfloat16, packed=False), 576)
+
+    def test_packed_requires_a_one_byte_dtype(self):
+        with self.assertRaises(AssertionError):
+            self._dim(torch.bfloat16, packed=True)
+
+    def test_is_packed_off_npu_keeps_the_dtype_rule(self):
+        with patch.object(kv_cache_configurator, "_is_npu", False):
+            self.assertTrue(is_packed_mla_kv_cache(FP8))
+            self.assertFalse(is_packed_mla_kv_cache(torch.float8_e5m2))
+            self.assertFalse(is_packed_mla_kv_cache(torch.bfloat16))
+
+    def test_is_packed_on_npu_follows_the_capability(self):
+        with patch.object(kv_cache_configurator, "_is_npu", True):
+            self._use_npu(arch35=True)
+            self.assertTrue(is_packed_mla_kv_cache(FP8))
+            self.assertFalse(is_packed_mla_kv_cache(torch.float8_e5m2))
+            self.assertFalse(is_packed_mla_kv_cache(torch.bfloat16))
+            self.assertFalse(is_packed_mla_kv_cache(torch.int8))
+
+    def test_is_packed_on_a2_is_false_for_fp8(self):
+        with patch.object(kv_cache_configurator, "_is_npu", True):
+            self._use_npu(arch35=False)
+            self.assertFalse(is_packed_mla_kv_cache(FP8))
+
+    def test_int8_is_packed_on_a2_only(self):
+        with patch.object(kv_cache_configurator, "_is_npu", True):
+            self._use_npu(arch35=False)
+            self.assertTrue(is_packed_mla_kv_cache(torch.int8))
+            self.assertEqual(self._dim(torch.int8, packed=True), 656)
+            # Rejected at startup on arch35, so the sizer must not pack it
+            # either: an undercounted cell would surface as an OOM instead.
+            self._use_npu(arch35=True)
+            self.assertFalse(is_packed_mla_kv_cache(torch.int8))
+
+
+def _build_pool(
+    dtype,
+    *,
+    arch35=True,
+    start_layer=0,
+    layer_num=2,
+    indexer_layer_ids=None,
+    dcp_size=1,
+    indexer_kv_dtype=None,
+):
+    capability = resolve_kv_capability(
+        kv_cache_dtype=dtype,
+        is_arch35=arch35,
+        soc_name="x",
+        requested_indexer_kv_dtype=indexer_kv_dtype,
+        int8_indexer_op_available=True,
+    )
+    parallel = SimpleNamespace(attn_dcp_size=dcp_size, attn_dcp_rank=0)
+    with patch.object(memory_pool_npu, "get_parallel", return_value=parallel):
+        return NPUMLATokenToKVPool(
+            16,
+            page_size=4,
+            dtype=dtype,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=layer_num,
+            device="cpu",
+            enable_memory_saver=False,
+            index_head_dim=128,
+            index_size=16 * dcp_size,
+            start_layer=start_layer,
+            end_layer=start_layer + layer_num,
+            indexer_layer_ids=indexer_layer_ids,
+            kv_cache_dim=656 if capability.main_kv_packed else None,
+            kv_capability=capability,
+        )
+
+
+class TestNpuMlaPoolLayout(CustomTestCase):
+    def test_int8_packed_pool_keeps_a_bf16_indexer_buffer(self):
+        pool = _build_pool(torch.int8, arch35=False)
+        self.assertTrue(pool.dsa_kv_cache_store_fp8)
+        self.assertEqual(pool.k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.k_buffer.shape[-1], 656)
+        self.assertEqual(pool.v_buffer.shape[-1], 0)
+        self.assertEqual(pool.indexer_store_dtype, torch.bfloat16)
+        self.assertEqual(pool.index_k_buffer.dtype, torch.bfloat16)
+        self.assertIsNone(pool.index_k_scale_buffer)
+
+    def test_indexer_dtypes_live_on_the_pool(self):
+        packed = _build_pool(FP8)
+        self.assertEqual(packed.indexer_kv_dtype, FP8)
+        self.assertEqual(packed.indexer_store_dtype, FP8)
+        self.assertEqual(packed.indexer_scale_dtype, torch.float32)
+        self.assertEqual(packed.index_k_buffer.dtype, FP8)
+        self.assertEqual(packed.index_k_scale_buffer.dtype, torch.float32)
+        unpacked = _build_pool(torch.bfloat16)
+        self.assertEqual(unpacked.indexer_kv_dtype, torch.bfloat16)
+        self.assertEqual(unpacked.indexer_store_dtype, torch.bfloat16)
+        self.assertIsNone(unpacked.indexer_scale_dtype)
+        self.assertEqual(unpacked.index_k_buffer.dtype, torch.bfloat16)
+
+    def test_an_int8_indexer_allocates_an_fp16_scale_buffer(self):
+        """The scale buffer is what switches the indexer to its quantized path.
+
+        dsa_npu_indexer gates quantized reads on index_k_scale_buffer being
+        allocated, so a BF16 main KV plus an INT8 indexer must still produce
+        one, in the capability's FP16 scale dtype.
+        """
+        pool = _build_pool(torch.bfloat16, arch35=False, indexer_kv_dtype="int8")
+        self.assertFalse(pool.dsa_kv_cache_store_fp8)
+        self.assertTrue(pool.indexer_quant)
+        self.assertEqual(pool.indexer_store_dtype, torch.int8)
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
+
+    def test_pool_rejects_fp8_on_a2(self):
+        with self.assertRaisesRegex(ValueError, "arch35"):
+            _build_pool(FP8, arch35=False)
+
+
+class TestNpuIndexerSizing(_NpuPatchedTestCase):
+    NUM_LAYERS = 3
+
+    def _indexer_bytes(self, dtype, indexer_kv_dtype="auto"):
+        configurator = object.__new__(DefaultPoolConfigurator)
+        kvc = SimpleNamespace(
+            kv_cache_dtype=dtype,
+            model_config=SimpleNamespace(hf_config=None),
+            server_args=SimpleNamespace(enable_hisparse=False),
+            is_draft_worker=False,
+        )
+        with (
+            get_context().override_server_args(
+                enable_hisparse=False, dsa_indexer_kv_dtype=indexer_kv_dtype
+            ),
+            patch.object(pool_configurator, "_is_npu", True),
+            patch.object(pool_configurator, "get_dsa_index_head_dim", return_value=128),
+        ):
+            return configurator._compute_dsa_indexer_cell_size(
+                kvc=kvc,
+                num_layers=self.NUM_LAYERS,
+                is_draft_worker=kvc.is_draft_worker,
+                allocate_all_layers=True,
+            )
+
+    @staticmethod
+    def _pool_indexer_bytes_per_token(pool):
+        per_token = pool.index_k_buffer[0][0].nbytes // pool.index_page_size
+        if pool.index_k_scale_buffer is not None:
+            per_token += pool.index_k_scale_buffer[0][0].nbytes // pool.index_page_size
+        return per_token
+
+    def test_fp8_on_arch35_counts_scale_bytes(self):
+        self._use_npu(arch35=True)
+        self.assertEqual(self._indexer_bytes(FP8), 132 * self.NUM_LAYERS)
+        self.assertEqual(self._pool_indexer_bytes_per_token(_build_pool(FP8)), 132)
+
+    def test_int8_main_kv_keeps_bf16_indexer_bytes(self):
+        self._use_npu(arch35=False)
+        self.assertEqual(self._indexer_bytes(torch.int8), 256 * self.NUM_LAYERS)
+        self.assertEqual(
+            self._pool_indexer_bytes_per_token(_build_pool(torch.int8, arch35=False)),
+            256,
+        )
+
+    def test_bf16_has_no_scale_bytes(self):
+        self._use_npu(arch35=False)
+        self.assertEqual(self._indexer_bytes(torch.bfloat16), 256 * self.NUM_LAYERS)
+        self.assertEqual(
+            self._pool_indexer_bytes_per_token(_build_pool(torch.bfloat16)), 256
+        )
+
+    def test_an_int8_indexer_is_sized_as_the_pool_allocates_it(self):
+        """The sizer and the pool must agree on the INT8 indexer cell size.
+
+        The reservation reads the capability's indexer dtypes while the pool
+        allocates from them; a divergence overcommits or underfills the KV
+        pool at startup.
+        """
+        self._use_npu(arch35=False)
+        self._stub_int8_signals()
+        self.assertEqual(
+            self._indexer_bytes(torch.bfloat16, "int8"), 130 * self.NUM_LAYERS
+        )
+        pool = _build_pool(torch.bfloat16, arch35=False, indexer_kv_dtype="int8")
+        self.assertEqual(self._pool_indexer_bytes_per_token(pool), 130)
+
+
+if __name__ == "__main__":
+    unittest.main()
