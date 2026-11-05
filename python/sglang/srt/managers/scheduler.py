@@ -5017,11 +5017,14 @@ class Scheduler(
                         if self.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
+                            # it, and writers of reused pages follow this stream. Only
+                            # the unified pool's allocator exposes these hooks.
                             allocator = self.token_to_kv_pool_allocator
                             forward_done = self.device_module.Event()
                             forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(forward_done)
+                            allocator.set_latest_forward_done_event(
+                                forward_done, self.forward_stream
+                            )
                             # Write-set classification: hand the allocator this
                             # forward's virtual out_cache_loc as a tensor ref (no GPU work).
                             allocator.set_inflight_forward(
