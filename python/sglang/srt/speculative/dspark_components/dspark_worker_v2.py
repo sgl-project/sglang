@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
+from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -241,6 +242,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
+        if isinstance(self.draft_model, DFlashDraftModel):
+            self.draft_model.enable_split_fc()
         self._draft_sampler = None
 
         # The mask token is input-only (it is embedded, never sampled), so its

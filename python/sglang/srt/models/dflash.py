@@ -866,14 +866,8 @@ class DFlashDraftModel(nn.Module):
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
         self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
-        # gemm_ag needs the same fc input on every rank of the TP group; attention DP
-        # and prefill CP give ranks different tokens.
-        self.split_fc = (
-            not self.quantizable
-            and envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
-            and get_parallel().attn_dp_size == 1
-            and get_parallel().attn_cp_size == 1
-        )
+        # Set by the spec worker from the target topology; see enable_split_fc.
+        self.split_fc = False
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -1025,6 +1019,20 @@ class DFlashDraftModel(nn.Module):
         if not gemm_ag_supported(comm, x, self.fc.weight):
             return self.fc(x)
         return gemm_ag(comm, x, self.fc.weight)
+
+    def enable_split_fc(self) -> None:
+        """Turn on the split fc if the flag is set and the target topology allows it.
+
+        Call outside the draft scope: gemm_ag needs the same fc input on every rank of
+        the TP group, attention DP and prefill CP give ranks different tokens, and the
+        draft scope reads both widths as 1.
+        """
+        self.split_fc = (
+            not self.quantizable
+            and envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
+            and get_parallel().attn_dp_size == 1
+            and get_parallel().attn_cp_size == 1
+        )
 
     @torch.no_grad()
     def forward(
