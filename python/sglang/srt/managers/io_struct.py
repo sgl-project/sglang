@@ -2091,7 +2091,8 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
 class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     """Internal IPC request for updating model weights from serialized tensors."""
 
-    # Serialized named tensors, normalized to raw MultiprocessingSerializer
+    # Serialized named tensors, one per engine rank in world-rank order
+    # (tp_size * pp_rank + tp_rank), normalized to raw MultiprocessingSerializer
     # bytes before scheduler IPC. Python Engine callers construct this field
     # with bytes directly. FastAPI HTTP callers send base64 strings because JSON
     # has no bytes type; the Annotated Base64Bytes marker is used only by the
@@ -2626,9 +2627,9 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     # The PEFT adapter_config.json, already JSON — a tighter type would only add
     # decode strictness with no benefit.
     config_dict: Dict[str, Any]
-    # One serialized copy of the adapter tensors per TP rank; each rank
-    # deserializes only its own copy. Same normalization conventions as
-    # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
+    # One serialized copy of the adapter tensors per engine rank; each rank
+    # deserializes only its own copy. Same order and normalization conventions
+    # as UpdateWeightsFromTensorReqInput.serialized_named_tensors.
     serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, int]] = None

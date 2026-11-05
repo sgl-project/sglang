@@ -191,12 +191,15 @@ class BaseTpWorker(ABC):
         return success, message
 
     def deserialize_own_rank(self, serialized_named_tensors):
-        """Each rank deserializes only its own payload (index tp_rank);
-        deserializing another rank's copy would break producer-side CUDA-IPC
-        refcounting."""
+        """Each rank deserializes only its own payload, at its engine world rank
+        (tp_size * pp_rank + tp_rank); deserializing another rank's copy would
+        break producer-side CUDA-IPC refcounting."""
+        parallel = get_parallel()
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[get_parallel().tp_rank]
+            serialized_named_tensors[
+                parallel.tp_size * parallel.pp_rank + parallel.tp_rank
+            ]
         )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
