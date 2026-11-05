@@ -516,8 +516,8 @@ class AiterAttnBackend(AttentionBackend):
             (self.fp8_prefill_num_head or self.num_head) - self.num_head
         )
         # forward_mha reads the prefix latent in bf16 whenever this hook exists;
-        # without the asm fp8 prefill, keep the model's dtype and its own K concat.
-        if not self.use_fp8_prefill_attn:
+        # keep it only where the asm fp8 prefill runs a bf16 model.
+        if not (self.use_fp8_prefill_attn and self.input_dtype == torch.bfloat16):
             self.pack_prefix_chunk_kv = None
         if self.use_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
             logger.info(
