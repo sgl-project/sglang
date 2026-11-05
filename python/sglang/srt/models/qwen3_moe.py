@@ -945,9 +945,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         tbo_subbatch_index: Optional[int] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ):
         state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
         state.update(
             dict(
