@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -46,6 +47,7 @@ from typing import (
     Type,
     Union,
 )
+from uuid import uuid4
 
 import fastapi
 import numpy as np
@@ -79,6 +81,7 @@ from sglang.srt.layers.joint_schema_head import (
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.cancellation_retirement import CancellationRetirementRegistry
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -91,6 +94,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    CancellationRetirementOutput,
+    CancellationRetirementReq,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
@@ -290,6 +295,8 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # Distinct from the caller's reusable rid, and never inferred from output.
+    request_instance_id: Optional[str] = None
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -926,6 +933,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
+                (CancellationRetirementOutput, self._handle_cancel_retirement_output),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1829,6 +1837,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        if envs.SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS.get() and isinstance(
+            tokenized_obj, TokenizedGenerateReqInput
+        ):
+            # Capture before the first await: a caller may later reuse the rid.
+            state = self.rid_to_state.get(tokenized_obj.rid)
+            tokenized_obj.request_instance_id = (
+                state.request_instance_id if state is not None else None
+            )
         prepared_mm_items = []
         prepared_embeds = []
         dispatched = False
@@ -2379,6 +2395,132 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(gen.aclose() for gen in generators),
                 return_exceptions=True,
             )
+
+    def _cancel_retirement_support_reason(self, state: ReqState) -> str:
+        parallel = get_parallel()
+        if any(
+            getattr(parallel, key) != 1
+            for key in (
+                "nnodes",
+                "tp_size",
+                "dp_size",
+                "pp_size",
+                "attn_cp_size",
+                "attn_dp_size",
+                "dcp_size",
+            )
+        ):
+            return "Retirement receipts currently require a single scheduler rank"
+        if (
+            get_serving().tokenizer_worker_num != 1
+            or envs.SGLANG_RUST_SERVER.get()
+            or self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            return (
+                "Retirement receipts require one Python tokenizer and unified serving"
+            )
+        obj = state.obj
+        if (
+            not isinstance(obj, GenerateReqInput)
+            or not state.request_instance_id
+            or not getattr(obj, "is_single", False)
+            or getattr(obj, "parallel_sample_num", 1) != 1
+            or obj.contains_mm_input()
+            or obj.input_embeds is not None
+            or obj.positional_embed_overrides is not None
+            or obj.session_id is not None
+            or obj.session_params is not None
+            or obj.lora_path is not None
+            or obj.lora_id is not None
+            or obj._sampling_params_beam_width() > 1
+        ):
+            return "Only single text generation without sessions, LoRA or beam search is supported"
+        return ""
+
+    async def abort_request_and_wait(
+        self, rid: str, cancellation_id: str, timeout_seconds: float = 1.0
+    ) -> dict:
+        """Cancel one request instance and optionally wait for its retirement.
+
+        The five-minute retry window is independent of ordinary output cleanup.
+        A timed-out/disconnected HTTP waiter cannot cancel the shared receipt.
+        """
+        if not isinstance(rid, str) or not rid:
+            raise ValueError("An exact, nonempty rid is required")
+        if not isinstance(cancellation_id, str) or not 1 <= len(cancellation_id) <= 128:
+            raise ValueError("cancellation_id must contain 1 to 128 characters")
+        if not math.isfinite(timeout_seconds) or not 0 <= timeout_seconds <= 30:
+            raise ValueError("timeout_seconds must be finite and between 0 and 30")
+
+        def response(status, reason=""):
+            return {
+                "rid": rid,
+                "cancellation_id": cancellation_id,
+                "status": status,
+                "reason": reason,
+                "completion_scope": "scheduler_owned_request",
+            }
+
+        if not envs.SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS.get():
+            return response(
+                "unsupported", "Cancellation retirement receipts are disabled"
+            )
+        registry = getattr(self, "_cancel_retirement_registry", None)
+        if registry is None:
+            registry = self._cancel_retirement_registry = (
+                CancellationRetirementRegistry()
+            )
+        receipt = registry.lookup(cancellation_id, rid)
+        if receipt is None:
+            state = self.rid_to_state.get(rid)
+            status = reason = ""
+            if state is None or not state.dispatched:
+                status = "unknown"
+                reason = "No dispatched request instance is available"
+            elif reason := self._cancel_retirement_support_reason(state):
+                status = "unsupported"
+            instance_id = state.request_instance_id if state is not None else ""
+            receipt = registry.create(cancellation_id, rid, instance_id or "")
+            if status:
+                # Negative results also bind the operation. Retrying an unknown
+                # rid must not later cancel a new request reusing that rid.
+                registry.resolve(
+                    CancellationRetirementOutput(
+                        rid=rid,
+                        cancellation_id=cancellation_id,
+                        request_instance_id=instance_id or "",
+                        status=status,
+                        reason=reason,
+                    )
+                )
+            else:
+                try:
+                    self._dispatch_to_scheduler(
+                        CancellationRetirementReq(
+                            rid=rid,
+                            cancellation_id=cancellation_id,
+                            request_instance_id=instance_id,
+                        )
+                    )
+                except Exception:
+                    registry.resolve(
+                        CancellationRetirementOutput(
+                            rid=rid,
+                            cancellation_id=cancellation_id,
+                            request_instance_id=instance_id,
+                            status="unknown",
+                            reason="Cancellation dispatch failed; retirement is unknown",
+                        )
+                    )
+        output = await registry.wait(receipt, timeout_seconds)
+        if output is None:
+            return response("pending", "Retirement has not been confirmed")
+        return response(output.status, output.reason)
+
+    def _handle_cancel_retirement_output(self, recv_obj: CancellationRetirementOutput):
+        registry = getattr(self, "_cancel_retirement_registry", None)
+        if registry is not None:
+            registry.resolve(recv_obj)
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
@@ -3985,6 +4127,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if (
+                envs.SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS.get()
+                and isinstance(obj, GenerateReqInput)
+                and getattr(obj, "is_single", False)
+                and obj.parallel_sample_num == 1
+            ):
+                state.request_instance_id = uuid4().hex
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
