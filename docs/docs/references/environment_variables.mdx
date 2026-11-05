@@ -2031,6 +2031,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bootstrap URL for the ZBAL path (NPU only).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_COMPACT_DSA_INDEXER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt in to producer-only DSA indexer buffers on non-arch35 NPU PD or HiCache workers. Requires PP, attention CP and DCP sizes of one. Enable on both PD roles at the same revision. HiSparse, external linkers and draft pools use dense indexers. Validate native transfers and model accuracy for your KV dtype before production use.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

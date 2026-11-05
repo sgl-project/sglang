@@ -970,8 +970,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_kv_layer_ids(self):
+        # Packed DSA registers K (including RoPE/scales) without the empty V.
+        main_groups = 1 if self.dsa_kv_cache_store_fp8 else 2
         return (
-            list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
+            list(range(self.start_layer, self.start_layer + self.layer_num))
+            * main_groups
             + self.get_state_layer_ids()
         )
 

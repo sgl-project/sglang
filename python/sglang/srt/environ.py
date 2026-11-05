@@ -872,6 +872,9 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Compact shared-topk indexer rows on non-arch35 NPU PD/HiCache pools.
+    # Both PD roles must use the same value. PP, CP and DCP must all be one.
+    SGLANG_NPU_COMPACT_DSA_INDEXER = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

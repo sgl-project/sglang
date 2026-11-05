@@ -678,6 +678,7 @@ class _StaticStateEntries(msgspec.Struct, frozen=True, kw_only=True):
 
 def _static_owner_region(token_to_kv_pool) -> Region:
     """The KV entries a static pool registers."""
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
@@ -692,7 +693,7 @@ def _static_owner_region(token_to_kv_pool) -> Region:
     layer_ids = (
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        or isinstance(token_to_kv_pool, (MiniMaxM3Nvfp4KVPool, NPUMLATokenToKVPool))
         else ()
     )
     return Region(
