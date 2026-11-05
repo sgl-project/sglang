@@ -46,6 +46,20 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
             out = self._slice(cap, n_local=5)
         self.assertTrue(torch.equal(out, buf[0:5, :, : self.K]))
 
+    def test_a2a_backends_read_buffer_head(self):
+        """Each DP rank captures only its own rows, like DeepEP."""
+        cap, buf = self._capturer()
+        for backend in ("nixl", "mooncake", "mori", "pplx"):
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+                mock.patch.object(
+                    re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(backend)
+                ),
+            ):
+                out = self._slice(cap, n_local=5)
+                self.assertTrue(torch.equal(out, buf[0:5, :, : self.K]))
+
     def test_deepep_v2_matches_deepep(self):
         cap, _ = self._capturer()
         outs = []
