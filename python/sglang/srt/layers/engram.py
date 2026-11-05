@@ -7,6 +7,7 @@ sglang.kernels.ops.embeddings.engram_hash to produce identical hash ids.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import errno
 import functools
 import glob
@@ -74,7 +75,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -957,6 +964,53 @@ class _PeerShards:
         return out.view(*indices.shape, self.dim)
 
 
+def resolve_engram_config(columns: int) -> EngramConfig:
+    """The engram_config the layers run. The one place `auto` becomes a lookup: once
+    per process, at model construction, when the parallel layout and the GPUs are
+    known; the result is recorded in the config so later layers read it."""
+    config = get_exec().offload.engram_config or EngramConfig()
+    if config.lookup != EngramLookup.AUTO:
+        return config
+    parallel = get_parallel()
+    tp = parallel.tp_size
+    lookup = EngramLookup.ALL_REDUCE
+    # Measured on GB300, B300 and H200 at TP 2-8 and DP 8-32, reading the owner's
+    # shard in place was faster than every collective, for prefill and decode.
+    if (
+        config.placement == EngramPlacement.GPU
+        and is_cuda()
+        and tp > 1
+        and _tp_in_one_nvlink_domain()
+    ):
+        lookup = EngramLookup.PEER_READ
+    # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
+    # per rank and for decode from DP 4; elsewhere within tens of microseconds.
+    elif (
+        is_cuda()
+        and tp > 1
+        and parallel.attn_dp_size == tp
+        and parallel.attn_cp_size == 1
+        and cols_per_rank(columns, tp) is not None
+    ):
+        lookup = EngramLookup.ALL_TO_ALL
+    config = dataclasses.replace(config, lookup=lookup)
+    get_context().override("resolve_engram_config", engram_config=config)
+    logger.info("Engram lookup auto -> %s", lookup)
+    return config
+
+
+def _tp_in_one_nvlink_domain() -> bool:
+    """Collective over the TP group."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
+    )
+
+    return in_one_nvlink_domain(
+        get_parallel().tp_group.cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+
+
 def shard_range(
     num_embeddings: int,
     column_bounds: tuple[int, ...],
@@ -1008,8 +1062,7 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
-        # Resolved by server args (_resolve_engram_config); None before that.
-        config = get_exec().offload.engram_config or EngramConfig()
+        config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
         if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
@@ -1218,68 +1271,91 @@ class EngramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
-        sizes = self._eager_dp_sizes(indices, forward_batch)
-        exchange = self._dp_exchange(sizes)
-        if exchange is None:
+        exchanges = (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL)
+        sizes = (
+            self._dp_sizes(indices, forward_batch) if self.lookup in exchanges else None
+        )
+        if sizes is None:
             return self._dp_global_buffer_lookup(indices, forward_batch)
         if sum(sizes) == 0:
             return self.new_rows(indices)
-        group = get_parallel().tp_group
         ids = indices.new_empty((sum(sizes), *indices.shape[1:]))
-        group.all_gatherv(indices.contiguous(), sizes=sizes, output=ids)
-        if exchange == EngramLookup.REDUCE_SCATTER:
-            values = self._owned_rows(ids).view(ids.shape[0], -1)
-            local = group.reduce_scatterv(values, sizes=sizes)
-            return local.view(*indices.shape, self.dim)
-        # all_to_all: look up this rank's own hash columns for every token, then send
-        # each rank its part, 1/tp of the bytes a reduce-scatter moves. Hash ids are
-        # [token, n-gram size, head], so the columns are in that order.
-        k, n = self._cols_per_rank, indices.shape[0]
-        start = get_parallel().tp_rank * k
+        get_parallel().tp_group.all_gatherv(
+            indices.contiguous(), sizes=sizes, output=ids
+        )
+        if self.lookup == EngramLookup.REDUCE_SCATTER:
+            out = self._dp_reduce_scatter_lookup(ids, sizes)
+        else:
+            out = self._dp_all_to_all_lookup(ids, sizes)
+        return out.view(*indices.shape, self.dim)
+
+    def _dp_reduce_scatter_lookup(
+        self, ids: torch.Tensor, sizes: list[int]
+    ) -> torch.Tensor:
+        """Look up the owned rows of every rank's `ids`; a reduce-scatter hands each
+        rank its own tokens' rows."""
+        group = get_parallel().tp_group
+        values = self._owned_rows(ids).view(ids.shape[0], -1)
+        if len(set(sizes)) > 1:
+            return group.reduce_scatterv(values, sizes=sizes)
+        # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collective.
+        local = values.new_empty((sizes[0], values.shape[1]))
+        group.reduce_scatter_tensor(local, values)
+        return local
+
+    def _dp_all_to_all_lookup(
+        self, ids: torch.Tensor, sizes: list[int]
+    ) -> torch.Tensor:
+        """Look up this rank's own hash columns for every token, then send each rank
+        its part, 1/tp of the bytes a reduce-scatter moves. Hash ids are [token,
+        n-gram size, head], so the columns are in that order."""
+        parallel = get_parallel()
+        group = parallel.tp_group
+        k, n = self._cols_per_rank, sizes[parallel.attn_dp_rank]
+        start = parallel.tp_rank * k
         own = ids.flatten(1)[:, start : start + k].contiguous()
         values = self._owned_rows(own).view(own.shape[0], -1)
         recv = values.new_empty((self.tp_size * n, values.shape[1]))
-        torch.distributed.all_to_all_single(
-            recv,
-            values,
-            output_split_sizes=[n] * self.tp_size,
-            input_split_sizes=sizes,
-            group=group.device_group,
-        )
+        if len(set(sizes)) > 1:
+            torch.distributed.all_to_all_single(
+                recv,
+                values,
+                output_split_sizes=[n] * self.tp_size,
+                input_split_sizes=sizes,
+                group=group.device_group,
+            )
+        else:
+            # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collective.
+            group.all_to_all_single(recv.view(-1), values.view(-1))
         # [source rank, token, its columns] -> [token, columns in rank order]
-        out = engram_rows_to_token_major(recv, self.tp_size)
-        return out.view(*indices.shape, self.dim)
+        return engram_rows_to_token_major(recv, self.tp_size)
 
-    def _dp_exchange(self, sizes: Optional[list[int]]) -> Optional[str]:
-        """The exchange for an eager lookup, or None for the global-buffer path."""
-        if sizes is None or self.lookup == EngramLookup.ALL_REDUCE:
-            return None
-        if self.lookup == EngramLookup.REDUCE_SCATTER:
-            return EngramLookup.REDUCE_SCATTER
-        # Measured fastest at DP 2-8 on GB300, B300 and H200 from 8K tokens per rank up.
-        return EngramLookup.ALL_TO_ALL if self._cols_per_rank is not None else None
-
-    def _eager_dp_sizes(
+    def _dp_sizes(
         self, indices: torch.Tensor, forward_batch: ForwardBatch
     ) -> Optional[list[int]]:
-        """Per-rank token counts if the lookup may exchange only the real rows, else None."""
+        """Per-rank row counts for an exchange, or None for the global-buffer path."""
         parallel = get_parallel()
         padding = forward_batch.dp_padding_mode
         if (
             _is_hip
             or padding is None
-            or padding.is_max_len()
             or parallel.attn_cp_size > 1
             or self.tp_size != parallel.attn_dp_size
             or world_dp_gather_enabled()
-            or torch.cuda.is_current_stream_capturing()
         ):
+            return None
+        n = indices.shape[0]
+        if padding.is_max_len():
+            # Every rank holds n padded rows, so the counts survive a graph capture.
+            full = get_global_dp_buffer_len() == self.tp_size * n
+            return [n] * self.tp_size if full else None
+        if torch.cuda.is_current_stream_capturing():
             return None
         sizes = get_dp_global_num_tokens()
         if (
             sizes is None
             or len(sizes) != self.tp_size
-            or sizes[parallel.attn_dp_rank] != indices.shape[0]
+            or sizes[parallel.attn_dp_rank] != n
         ):
             return None
         return list(sizes)

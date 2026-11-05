@@ -203,7 +203,7 @@ struct TinyNGemmKernel {
 
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({M, K})
         .with_strides({-1, 1})
         .with_dtype<bf16_t>()
@@ -251,7 +251,7 @@ struct TinyKGemmKernel {
 
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({M, K}).with_strides({-1, 1}).with_dtype<bf16_t>().with_device(device).verify(x);
     TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(w);
     TensorMatcher({M, N}).with_dtype<OutT>().with_device(device).verify(out);
