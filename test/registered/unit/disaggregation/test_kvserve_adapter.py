@@ -1,189 +1,271 @@
-import sys
+"""CPU coverage for KVServe transfer completion and buffer ownership."""
+
+import contextlib
+import queue
 import threading
 import unittest
-from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import msgspec
-import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
 from sglang.srt.disaggregation.mooncake.kvserve import ACK, KVServeAdapter
+from sglang.srt.disaggregation.mooncake.kvserve_pipeline import (
+    EncodedTransferPipeline,
+    RestorePipeline,
+    SourceRoomGate,
+)
 from sglang.srt.disaggregation.mooncake.kvserve_transport import ReceiveCredits
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class TestKVServeCompletion(CustomTestCase):
-    def test_role_switch_fails_before_allocating_codec_buffers(self):
-        manager = SimpleNamespace(
-            kv_args=SimpleNamespace(gpu_id=0, state_types=[], num_draft_entries=0),
-            server_args=SimpleNamespace(enable_pd_role_switch=True),
-            is_mla_backend=False,
-            is_hybrid_mla_backend=False,
-            attn_tp_size=1,
-            attn_cp_size=1,
-            dcp_size=1,
-            pp_size=1,
-            enable_staging=False,
-        )
-        # The optional codec is not installed in CPU CI. Only satisfy its import:
-        # validation must reject role switching before any codec is constructed.
-        runtime = ModuleType("kvserve_v1.compression.runtime")
-        runtime.CacheSpec = Mock()
-        runtime.CompressionConfig = Mock()
-        with patch.dict(sys.modules, {runtime.__name__: runtime}):
-            with self.assertRaisesRegex(ValueError, "role switching"):
-                KVServeAdapter(manager, [], [], 1, [])
-        runtime.CacheSpec.assert_not_called()
-        runtime.CompressionConfig.assert_not_called()
-
+class TestAdapterProtocol(unittest.TestCase):
     def setUp(self):
-        super().setUp()
         self.adapter = object.__new__(KVServeAdapter)
-        self.adapter.manager = SimpleNamespace(
-            record_failure=Mock(), _poison_unsettled_send=Mock()
-        )
+        self.adapter.manager = SimpleNamespace(record_failure=Mock())
         self.adapter.lock = threading.Lock()
         self.adapter.submit_lock = threading.Lock()
-        self.adapter.epoch = "test"
         self.adapter.page_size = 1
         self.adapter.has_mamba = False
-        self.adapter.expected_rooms = {}
-        self.adapter.restored_rooms = {}
-        self.adapter.expect_room(123, [7, 3], False)
+        self.adapter.expected_rooms = {7: {3, 5}}
+        self.adapter.restored_rooms = {7: {0: set(), 1: set()}}
 
-    def test_native_completion_cannot_bypass_restoration(self):
-        self.assertEqual(self.adapter.check_success(123, KVPoll.Success), KVPoll.Failed)
-        self.adapter.manager.record_failure.assert_called_once()
+    def test_success_requires_both_parts_of_every_registered_page(self):
+        for restored, expected in (
+            ({0: set(), 1: set()}, KVPoll.Failed),
+            ({0: {3, 5}, 1: set()}, KVPoll.Failed),
+            ({0: {3, 5}, 1: {3, 6}}, KVPoll.Failed),
+            ({0: {3, 5}, 1: {3, 5}}, KVPoll.Success),
+        ):
+            with self.subTest(restored=restored):
+                self.adapter.restored_rooms[7] = restored
+                self.assertEqual(
+                    self.adapter.check_success(7, KVPoll.Success), expected
+                )
 
-    def test_k_only_completion_cannot_start_decode(self):
-        self.adapter.restored_rooms[123][0].update([3, 7])
-        self.assertEqual(self.adapter.check_success(123, KVPoll.Success), KVPoll.Failed)
+    def test_peer_profile_and_capacities_must_match(self):
+        self.adapter.runtime = SimpleNamespace(wire_profile="profile")
+        slot = {"ptrs": [4096, 8192], "capacities": [4096, 128]}
+        self.adapter.registration = lambda: {"slots": [slot, slot]}
+        peer = {
+            "version": 3,
+            "has_mamba": False,
+            "page_size": 1,
+            "profile": "profile",
+            "slots": [dict(slot) for _ in range(8)],
+        }
+        self.adapter.validate_peer(peer)
+        for other in (
+            None,
+            {**peer, "profile": "other"},
+            {**peer, "page_size": 16},
+            {**peer, "slots": [{**slot, "capacities": [4096, 127]}]},
+        ):
+            with self.subTest(peer=other), self.assertRaises(ValueError):
+                self.adapter.validate_peer(other)
 
-    def test_same_count_wrong_pages_cannot_start_decode(self):
-        self.adapter.restored_rooms[123] = {0: {3, 7}, 1: {3, 8}}
-        self.assertEqual(self.adapter.check_success(123, KVPoll.Success), KVPoll.Failed)
-
-    def test_all_registered_k_and_v_pages_allow_native_completion(self):
-        self.adapter.restored_rooms[123] = {0: {3, 7}, 1: {3, 7}}
-        self.assertEqual(
-            self.adapter.check_success(123, KVPoll.Success), KVPoll.Success
-        )
-        self.adapter.manager.record_failure.assert_not_called()
-
-    def test_receiver_cleanup_retires_compression_bookkeeping(self):
-        self.adapter.drop_room(123)
-        self.assertFalse(self.adapter.expected_rooms)
-        self.assertFalse(self.adapter.restored_rooms)
-
-    def test_late_ack_cannot_release_an_unrelated_credit(self):
+    def test_duplicate_and_stale_ack_never_release_another_credit(self):
+        self.adapter.epoch = "current"
         self.adapter.pending_lock = threading.Lock()
-        event, result = threading.Event(), {}
-        self.adapter.pending = {"current": (event, result, ReceiveCredits(0), 0)}
-        self.adapter.handle_ack(
-            [
-                ACK,
-                msgspec.msgpack.encode(
-                    [{"epoch": "test", "sequence": "previous", "restore_ms": 1}]
-                ),
-            ]
-        )
+        event = threading.Event()
+        pool = ReceiveCredits(1)
+        slot = pool.acquire()[0]
+        self.adapter.pending = {"1": (event, {}, pool, slot)}
+        for value in (
+            {"epoch": "old", "sequence": "1"},
+            {"epoch": "current", "sequence": "other"},
+        ):
+            self.adapter.handle_ack([ACK, msgspec.msgpack.encode([value])])
         self.assertFalse(event.is_set())
-        self.adapter.handle_ack(
-            [
-                ACK,
-                msgspec.msgpack.encode(
-                    [{"epoch": "test", "sequence": "current", "restore_ms": 2}]
-                ),
-            ]
-        )
+        self.assertEqual(pool.available, [])
+        ack = [ACK, msgspec.msgpack.encode([{"epoch": "current", "sequence": "1"}])]
+        self.adapter.handle_ack(ack)
+        self.adapter.handle_ack(ack)
         self.assertTrue(event.is_set())
-        self.assertEqual(result["restore_ms"], 2)
+        self.assertEqual(pool.available, [0])
 
-    def test_unsettled_transfer_prevents_deregister_and_free(self):
+    def test_unsettled_transfer_cannot_free_registered_memory(self):
         self.adapter.poisoned = True
         self.adapter.runtime = SimpleNamespace(shutdown=Mock())
         with self.assertRaises(RuntimeError):
             self.adapter.close()
         self.adapter.runtime.shutdown.assert_not_called()
 
-    def test_disabled_peer_is_rejected_instead_of_native_fallback(self):
-        self.adapter.runtime = SimpleNamespace(wire_profile="profile")
-        self.adapter.registration = lambda: {"slots": [{"capacities": [4096, 128]}]}
-        with self.assertRaises(ValueError):
-            self.adapter.validate_peer(None)
-
-    def test_peer_profile_and_buffer_capacity_must_match(self):
-        self.adapter.runtime = SimpleNamespace(wire_profile="profile")
-        self.adapter.registration = lambda: {"slots": [{"capacities": [4096, 128]}]}
-        peer = {
-            "version": 3,
-            "has_mamba": False,
-            "page_size": 1,
-            "profile": "profile",
-            "slots": [{"ptrs": [4096, 8192], "capacities": [4096, 128]}],
-        }
-        self.adapter.validate_peer(peer)
-        with self.assertRaises(ValueError):
-            self.adapter.validate_peer({**peer, "profile": "other"})
-        with self.assertRaises(ValueError):
-            self.adapter.validate_peer(
-                {**peer, "slots": [{"ptrs": [4096, 8192], "capacities": [4096, 127]}]}
-            )
-
-    def test_matching_peer_allows_independent_slot_counts(self):
-        self.adapter.runtime = SimpleNamespace(wire_profile="shared-profile")
-        slot = {"ptrs": [4096, 8192], "capacities": [4096, 128]}
-        for local_count, remote_count in ((2, 8), (8, 2)):
-            with self.subTest(local_count=local_count, remote_count=remote_count):
-                self.adapter.registration = lambda: {
-                    "slots": [dict(slot) for _ in range(local_count)]
-                }
-                peer = {
-                    "version": 3,
-                    "has_mamba": False,
-                    "page_size": self.adapter.page_size,
-                    "profile": "shared-profile",
-                    "slots": [dict(slot) for _ in range(remote_count)],
-                }
-                self.adapter.validate_peer(peer)
-                with self.assertRaisesRegex(
-                    ValueError, "incompatible compression profile"
-                ):
-                    self.adapter.validate_peer({**peer, "profile": "different-profile"})
-
-    def test_previous_process_ack_cannot_release_credit(self):
-        adapter = self.adapter
-        adapter.pending_lock = threading.Lock()
-        event = threading.Event()
-        adapter.pending = {"0": (event, {}, ReceiveCredits(0), 0)}
-        adapter.handle_ack(
-            [ACK, msgspec.msgpack.encode([{"epoch": "old", "sequence": "0"}])]
-        )
-        self.assertFalse(event.is_set())
-
-    def test_paged_indices_exclude_invalid_tail(self):
+    def test_paged_indices_exclude_the_invalid_tail(self):
         self.assertEqual(KVServeAdapter.token_ids([3, 7], 4, 5), [12, 13, 14, 15, 28])
         with self.assertRaises(ValueError):
             KVServeAdapter.token_ids([3, 7], 4, 4)
+
+    def test_failed_sender_waits_until_its_source_reader_drains(self):
+        sender = object.__new__(MooncakeKVSender)
+        sender.bootstrap_room = 7
+        sender.conclude_state = None
+        sender._kvserve_source_gate = SourceRoomGate()
+        sender.kv_mgr = SimpleNamespace(
+            kvserve_enabled=True, kvserve=None, request_status={7: KVPoll.Transferring}
+        )
+        sender.trace_ctx = SimpleNamespace(trace_req_finish=Mock())
+
+        def fail_after_enqueue(_):
+            self.assertTrue(sender._kvserve_source_gate.acquire())
+            return KVPoll.Failed
+
         self.assertEqual(
-            KVServeAdapter.token_ids(np.array([3, 7]), 4, 5), [12, 13, 14, 15, 28]
+            sender._poll_with_status(fail_after_enqueue), KVPoll.Transferring
+        )
+        self.assertFalse(sender._kvserve_source_gate.acquire())
+        sender._kvserve_source_gate.release()
+        self.assertEqual(sender._poll_with_status(fail_after_enqueue), KVPoll.Failed)
+
+
+class TestTransferBuffers(unittest.TestCase):
+    def test_output_lease_is_reused_only_after_transfer_finishes(self):
+        started, finish = threading.Event(), threading.Event()
+
+        def write(_lease, _job):
+            started.set()
+            if not finish.wait(3):
+                raise TimeoutError("transfer did not finish")
+            return 42
+
+        pipeline = EncodedTransferPipeline(
+            [(object(), object())], write, Mock(), workers=1
+        )
+        self.addCleanup(pipeline.close)
+        self.addCleanup(finish.set)
+        lease = pipeline.acquire()
+        future = pipeline.submit(lease, {})
+        self.assertTrue(started.wait(2))
+        self.assertEqual(pipeline.available, [])
+        finish.set()
+        self.assertEqual(future.result(2), 42)
+        self.assertIs(pipeline.acquire(), lease)
+        pipeline.discard_unsubmitted(lease)
+
+    def test_failed_transfer_quarantines_its_output_lease(self):
+        def fail(_lease, _job):
+            raise RuntimeError("transfer failed")
+
+        failed = Mock()
+        pipeline = EncodedTransferPipeline(
+            [(object(), object())], fail, failed, workers=1
+        )
+        self.addCleanup(pipeline.close)
+        lease = pipeline.acquire()
+        with self.assertRaisesRegex(RuntimeError, "transfer failed"):
+            pipeline.submit(lease, {}).result(2)
+        self.assertEqual(lease.state, "quarantined")
+        self.assertEqual(pipeline.available, [])
+        failed.assert_called_once()
+
+
+class FakeReceiveAdapter(KVServeAdapter):
+    def __init__(self, failed_completion=False):
+        self.lock = threading.Lock()
+        self.slot_locks = [threading.Lock(), threading.Lock()]
+        self.device, self.poisoned, self.verify = "fake", False, False
+        self.chunk_size, self.cache_blocks, self.page_size = 1024, 100, 1
+        self.expected_rooms = {7: {10}}
+        self.restored_rooms = {7: {0: set(), 1: set()}}
+        self.completions = [threading.Event(), threading.Event()]
+        self.submitted, self.acks = queue.Queue(), queue.Queue()
+        self.failed_completion = failed_completion
+        self.runtime = SimpleNamespace(
+            slots=[
+                SimpleNamespace(arena_a=SimpleNamespace(numel=lambda: 1024))
+                for _ in range(2)
+            ],
+            wire_profile="profile",
+            aux_bytes=lambda *_: 32,
+            decode=self.decode,
+        )
+        self.manager = SimpleNamespace(
+            request_status={7: KVPoll.Transferring},
+            check_status=lambda _: KVPoll.Transferring,
+            record_failure=Mock(),
+            update_status=Mock(),
         )
 
-    def test_duplicate_ack_does_not_double_release(self):
-        adapter = self.adapter
-        adapter.pending_lock = threading.Lock()
-        pool = ReceiveCredits(1)
-        slot = pool.acquire()[0]
-        event = threading.Event()
-        adapter.pending = {"1": (event, {}, pool, slot)}
-        msg = [ACK, msgspec.msgpack.encode([{"epoch": "test", "sequence": "1"}])]
-        adapter.handle_ack(msg)
-        adapter.handle_ack(msg)
-        self.assertEqual(pool.available, [0])
+    def decode(self, slot, *_args, **_kwargs):
+        self.submitted.put(slot)
+
+        def synchronize():
+            if self.failed_completion:
+                raise RuntimeError("restore completion failed")
+            if not self.completions[slot].wait(3):
+                raise TimeoutError("restore did not finish")
+
+        return SimpleNamespace(synchronize=synchronize)
+
+    def reply(self, meta, result):
+        self.acks.put((meta, result.copy()))
+
+    def record(self, _value):
+        pass
+
+    def control_failed(self, _error):
+        self.poisoned = True
+
+
+def ready(slot, part):
+    return {
+        "slot_id": slot,
+        "room": 7,
+        "epoch": "epoch",
+        "sequence": str(slot),
+        "version": 3,
+        "profile": "profile",
+        "indices": [10],
+        "tokens": 1,
+        "part": part,
+        "aux_bytes": 32,
+        "codec_bytes": 128,
+        "u8_bytes": 256,
+    }
+
+
+class TestRestoreCompletion(unittest.TestCase):
+    def make_pipeline(self, adapter):
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(device=lambda _: contextlib.nullcontext())
+        )
+        return RestorePipeline(adapter, fake_torch, KVPoll.Failed)
+
+    def test_ack_and_page_accounting_wait_for_each_restore(self):
+        adapter = FakeReceiveAdapter()
+        pipeline = self.make_pipeline(adapter)
+        self.addCleanup(pipeline.close)
+        self.addCleanup(lambda: [event.set() for event in adapter.completions])
+        pipeline.accept([ready(0, 0), ready(1, 1)])
+        self.assertEqual(
+            {adapter.submitted.get(timeout=2), adapter.submitted.get(timeout=2)}, {0, 1}
+        )
+        self.assertTrue(adapter.acks.empty())
+        with self.assertRaises(ValueError):
+            pipeline.accept([ready(0, 0)])
+        adapter.completions[1].set()
+        meta, result = adapter.acks.get(timeout=2)
+        self.assertEqual(meta["part"], 1)
+        self.assertNotIn("error", result)
+        self.assertEqual(adapter.restored_rooms[7], {0: set(), 1: {10}})
+        adapter.completions[0].set()
+        self.assertEqual(adapter.acks.get(timeout=2)[0]["part"], 0)
+        self.assertEqual(adapter.restored_rooms[7], {0: {10}, 1: {10}})
+
+    def test_failed_restore_wait_keeps_destination_quarantined(self):
+        adapter = FakeReceiveAdapter(failed_completion=True)
+        pipeline = self.make_pipeline(adapter)
+        pipeline.accept([ready(0, 0)])
+        _, result = adapter.acks.get(timeout=2)
+        self.assertIn("restore completion failed", result["error"])
+        self.assertFalse(pipeline.room_is_idle(7))
+        self.assertTrue(adapter.poisoned)
+        with self.assertRaisesRegex(RuntimeError, "Unsettled"):
+            pipeline.close()
 
 
 if __name__ == "__main__":

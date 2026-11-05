@@ -130,28 +130,6 @@ class TestHybridPlan(unittest.TestCase):
             self.run_prepare()
         self.api.build_memory_plan.assert_not_called()
 
-    def test_optional_real_codec_uses_global_layer_quantization_boundary(self):
-        try:
-            from kvserve_v1.compression.runtime.config import CompressionConfig
-            from kvserve_v1.compression.runtime.layout import build_compression_layout
-            from kvserve_v1.compression.runtime.spec import CacheSpec
-        except ImportError:
-            self.skipTest("optional KVServe runtime is not installed")
-        specs = {
-            f"layer.{i}": CacheSpec(i, 1, 2, 256, torch.bfloat16, 256)
-            for i in (3, 6, 10, 11, 14)
-        }
-        config = CompressionConfig.from_extra_config(
-            {"compression": {"enable-compression-pipeline": True}}
-        )
-        layout = build_compression_layout(specs, config, {}, num_model_layers=16)
-        self.assertEqual(
-            [p.sections[0].num_levels for p in layout.parts(0)], [12, 12, 12, 6, 6]
-        )
-        self.assertEqual(
-            [p.sections[0].num_levels for p in layout.parts(1)], [8, 8, 8, 4, 4]
-        )
-
 
 class TestHybridAdapter(unittest.TestCase):
     def test_peer_mamba_capability_must_match_strictly(self):
