@@ -1060,9 +1060,9 @@ class Pi05PolicyModel(nn.Module):
             self.config.action_horizon,
             self.config.action_dim,
             generator=generator,
-            device=self.device,
+            device=generator.device if generator is not None else self.device,
             dtype=torch.float32,
-        )
+        ).to(self.device)
 
     def denoise_step(
         self,

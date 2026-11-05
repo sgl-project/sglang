@@ -11,6 +11,9 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -362,6 +365,22 @@ class VLAActionDenoisingStage(PipelineStage):
         super().__init__()
         self.policy_model = policy_model
 
+    def _initial_noise(self, batch: Req, observation: Any) -> torch.Tensor:
+        if observation.noise is not None:
+            return observation.noise
+        model = self.policy_model
+        generator = batch.generator
+        if isinstance(generator, list):
+            if len(generator) != 1:
+                raise ValueError("Pi05 expects one generator per observation")
+            generator = generator[0]
+        if generator is None:
+            seed = normalize_output_seeds(batch.seed, num_outputs_per_prompt=1)[0]
+            device = batch.generator_device or model.device
+            generator = torch.Generator(device=device).manual_seed(seed)
+        # Keep generators local: storing one on Req disables grouped prefix encoding.
+        return model.sample_noise(observation.batch_size, generator=generator)
+
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
@@ -400,10 +419,21 @@ class VLAActionDenoisingStage(PipelineStage):
             start = time.perf_counter()
             options = vla_options(group_batches[0])
             observation = vla_state(group_batches[0])["observation_group"]
+            noise = observation.noise
+            if noise is None:
+                noise = torch.cat(
+                    [
+                        self._initial_noise(
+                            batch, vla_state(batch)["observation_batch"]
+                        )
+                        for batch in group_batches
+                    ],
+                    dim=0,
+                )
             actions = self.policy_model.sample_actions(
                 observation,
                 prefix_context,
-                noise=observation.noise,
+                noise=noise,
                 num_steps=group_batches[0].num_inference_steps,
                 use_cuda_graph=_cuda_graph_enabled(group_batches[0]),
                 generator=None,
@@ -457,13 +487,9 @@ class VLAActionDenoisingStage(PipelineStage):
             flow = state.get("pi05_flow")
             if flow is None:
                 observation = state["observation_batch"]
-                noise = observation.noise
-                if noise is None:
-                    noise = model.sample_noise(
-                        observation.batch_size, generator=batch.generator
-                    )
-                else:
-                    noise = noise.to(device=model.device, dtype=torch.float32)
+                noise = self._initial_noise(batch, observation).to(
+                    device=model.device, dtype=torch.float32
+                )
                 flow = Pi05FlowState.create(noise, prefix, batch.num_inference_steps)
                 state["pi05_flow"] = flow
             if flow.num_steps != batch.num_inference_steps:
@@ -527,7 +553,7 @@ class VLAActionDenoisingStage(PipelineStage):
             )
         elif should_run_action:
             # broadcast PrefixContext from action root rank to action ranks
-            noise = observation.noise if observation is not None else None
+            noise = self._initial_noise(batch, observation)
             actions = self.policy_model.sample_actions(
                 observation,
                 prefix_context,
