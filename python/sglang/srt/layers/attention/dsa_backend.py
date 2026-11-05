@@ -4002,6 +4002,20 @@ class DeepseekSparseAttnBackend(
                     rope_positions = get_cp_strategy().shard_position_ids(
                         rope_positions, forward_batch
                     )
+                    if (
+                        getattr(
+                            forward_batch.attn_cp_metadata, "graph_num_tokens", None
+                        )
+                        is not None
+                    ):
+                        # In CP BCG the eager attention bridge trims Q to the
+                        # live local rows, but K uses the global cache extent.
+                        # RoPE takes rank-local Q, K and positions; the gather
+                        # below reconstructs the global live KV extent.
+                        local_rows = q.shape[0]
+                        k = k[:local_rows]
+                        k_rope = k_rope[:local_rows]
+                        rope_positions = rope_positions[:local_rows]
 
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,

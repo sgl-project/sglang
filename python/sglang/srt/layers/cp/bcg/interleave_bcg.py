@@ -1,4 +1,4 @@
-"""Interleave BCG adapter for GLM-5.3 Flash text prefills.
+"""Interleave BCG adapter for supported GLM text prefills.
 
 Keep full-sequence KPool positions separate from the local DSA positions.
 Graph row capacity is fixed while live token counts and prefix state can change.
@@ -80,12 +80,27 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
     @staticmethod
     def supports(server_args):
         cfg = resolving_view(server_args)
+        resolved = resolved_view(server_args)
+        if not (cfg.dp_size == cfg.ep_size == 1 and resolved.attn_cp_size > 1):
+            return False
+
+        hf_config = model_config_of(server_args).hf_config
+        architectures = hf_config.architectures or ()
+        if "Glm5NextForConditionalGeneration" in architectures:
+            return True
+
+        # GLM-5.2 uses the standard DSA indexer and sparse TRT-LLM MLA.
+        # Reuse this adapter only for that tested topology and KV format.
         return (
-            cfg.dp_size == 1
-            and cfg.ep_size == 1
-            and resolved_view(server_args).attn_cp_size > 1
-            and "Glm5NextForConditionalGeneration"
-            in model_config_of(server_args).hf_config.architectures
+            getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+            and "GlmMoeDsaForCausalLM" in architectures
+            and cfg.device == "cuda"
+            and resolved.dsa_prefill_backend == "trtllm"
+            and resolved.kv_cache_dtype == "fp8_e4m3"
+            and resolved.dcp_size == 1
+            and not cfg.enable_two_batch_overlap
+            and not cfg.enable_lora
+            and not cfg.lora_paths
         )
 
     def _max_local_tokens(self, extend_seq_lens):

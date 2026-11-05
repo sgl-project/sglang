@@ -1896,6 +1896,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+            cp_metadata = forward_batch.attn_cp_metadata
+            if getattr(cp_metadata, "graph_num_tokens", None) is not None:
+                # Interleave gathered only the live keys. Graph capture
+                # addresses can still span the whole token bucket.
+                live_rows = sum(forward_batch.extend_seq_lens_cpu)
+                assert key.shape[0] == live_rows <= out_cache_loc.shape[0]
+                out_cache_loc = out_cache_loc[:live_rows]
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
