@@ -5608,7 +5608,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def _index_k_rows(self, indices):
-        """Logical slots -> this rank's index-K rows (identity unless index-K is token-sharded)."""
         if not dsa_shards_index_k():
             return indices
         return maybe_dcp_kernel_indices(

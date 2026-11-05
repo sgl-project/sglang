@@ -446,8 +446,6 @@ def _validate_dcp_backend(
     prefill_impl: str,
     decode_impl: str,
 ) -> None:
-    # The DCP indexer emits global KV slots that only the flashmla_kv path
-    # localizes, and its decode merge runs the v2 top-k with the per-forward plan.
     if not kimi_k31:
         raise ValueError("DSA with --dcp-size > 1 is implemented for Kimi-K3.1 only.")
     if not use_fused_topk:
@@ -1073,7 +1071,6 @@ class DeepseekSparseAttnBackend(
         )
 
     def _dcp_local_ctx_lens(self, ctx_lens: torch.Tensor) -> torch.Tensor:
-        # The indexer scores only this rank's share of the index-K cache.
         if self.attn_dcp_size == 1:
             return ctx_lens
         return get_dcp_lens(ctx_lens, self.attn_dcp_size, self.attn_dcp_rank).to(
@@ -2428,7 +2425,6 @@ class DeepseekSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
         if self.attn_dcp_size > 1:
-            # Prefill attends over the KV gathered from all ranks.
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
@@ -3533,7 +3529,6 @@ class DeepseekSparseAttnBackend(
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         num_q_heads = q_all.shape[2]
         target_q_heads = _flashmla_kv_padded_heads(num_q_heads)
-        # The schedule metadata was built for this head count
         assert target_q_heads == (
             self.flashmla_kv_num_q_heads_prefill
             if self.attn_dcp_size > 1 and not dcp_partial
@@ -3559,7 +3554,6 @@ class DeepseekSparseAttnBackend(
         tile_scheduler_metadata = metadata.flashmla_metadata.flashmla_metadata
         num_splits = metadata.flashmla_metadata.num_splits
         if dcp_partial:
-            # Move this rank's slots to the front; topk_length bounds the kernel's walk.
             page_table_1, topk_length = dcp_localize_compact(page_table_1)
             if get_platform().is_sm90:
                 # SM90 needs static top-k; -1 padding masks nonlocal keys.

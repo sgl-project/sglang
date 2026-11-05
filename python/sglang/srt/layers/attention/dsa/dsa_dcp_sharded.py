@@ -66,13 +66,6 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 class DcpCandidateAllGather:
-    """All-gather of the top-k candidates over the DCP group through torch
-    symmetric memory (NVLS multimem, as TorchSymmMemCommunicator does for
-    all-reduce): every rank writes its candidates into one symmetric output
-    buffer, rendezvoused once at init. Falls back to the group all-gather when
-    multicast is unavailable or the payload does not fit.
-    """
-
     def __init__(self, group, max_rows: int, topk: int):
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -108,6 +101,7 @@ class DcpCandidateAllGather:
 
     def merge_scores(self, rows: int, width: int) -> torch.Tensor:
         # Reserved outside capture and reused by every graph; never rebound once captured.
+        # TODO(kpham-sgl): reserve at init inside the KV budget; it is max_rows x context fp32.
         if (
             self.merge_buffer is None
             and 0 < rows <= self.max_rows
@@ -132,7 +126,7 @@ def init_dcp_candidate_all_gather(max_rows: int, topk: int) -> None:
     """Collective over the DCP group; call on every rank before CUDA graph
     capture."""
     global _CANDIDATE_ALL_GATHER
-    if _CANDIDATE_ALL_GATHER is not None:  # one buffer per process
+    if _CANDIDATE_ALL_GATHER is not None:
         return
     _CANDIDATE_ALL_GATHER = DcpCandidateAllGather(
         get_parallel().dcp_group, max_rows, topk
@@ -267,8 +261,6 @@ def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
 
 @triton.jit
 def _fill_visible_kernel(dense, dense_stride, lens, BLOCK: tl.constexpr):
-    # -inf over [0, lens[row]), the only columns the top-k reads; a fixed
-    # number of programs per row strides over it
     row = tl.program_id(0)
     n = tl.load(lens + row)
     base = dense + row.to(tl.int64) * dense_stride
@@ -288,7 +280,6 @@ def _scatter_candidates_kernel(
     TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # one program per (rank, row) block of candidates
     src_row = tl.program_id(0)
     row = src_row % num_rows
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -316,8 +307,6 @@ def _localize_compact_kernel(
     dcp_rank,
     TOPK: tl.constexpr,
 ):
-    # owned slots (slot % N == rank) -> local rows slot // N at the front, in
-    # order, -1 after them; lengths[row] = number of owned slots
     row = tl.program_id(0)
     offs = tl.arange(0, TOPK)
     x = tl.load(slots + row.to(tl.int64) * slots_stride + offs)

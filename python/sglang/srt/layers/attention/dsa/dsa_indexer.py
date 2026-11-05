@@ -261,8 +261,6 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
 
 
 def _index_k_dcp() -> Tuple[int, int]:
-    """(size, rank) of the DCP group Kimi-K3.1 shards index-K over by token, or
-    (1, 0): other models keep index-K replicated under DCP."""
     if not dsa_shards_index_k():
         return 1, 0
     parallel = get_parallel()
@@ -1833,12 +1831,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         block_tables: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Prefill under DCP: every request's index-K from all ranks, in DCP1's
-        # get_index_k_scale_buffer layout, so the ragged indexer runs unchanged.
         parallel = get_parallel()
         dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
         local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
-        # block_tables holds this rank's page ids of each request
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
@@ -1937,7 +1932,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
         if dsa_shards_index_k() and forward_batch.forward_mode.is_decode_or_idle():
-            # Widened slots of every visible position
             raw_topk_result = dcp_all_visible(
                 seq_lens_expanded,
                 metadata.get_page_table_64(),
@@ -2020,9 +2014,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
             return
 
-        # K3.1 shards index-K like the MLA KV under DCP; only the fused store
-        # maps the widened write loc to this rank's row (slot // N) and skips
-        # the tokens of other ranks.
         assert dcp_size == 1, "DSA index-K writes under DCP need the CUDA fused store"
 
         # Fast path: AITER fused quant + cache store

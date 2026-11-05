@@ -2237,7 +2237,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if getattr(config, "index_topk", None) is not None and (
             get_parallel().attn_dcp_size > 1
         ):
-            # K3.1 DSA layers: index-K sharded by token, global top-k merge
             set_dsa_shards_index_k()
         super().__init__(
             layer_id=layer_idx,
