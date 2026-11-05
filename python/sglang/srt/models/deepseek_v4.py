@@ -4603,10 +4603,12 @@ class DeepseekV4Model(nn.Module):
                 tail=tail, rows=pre_hc_head, num_tokens=num_tokens
             )
         if hip_cp_tail and capture_dspark:
-            dspark_aux_hidden_states = [
-                _scatter_tail_rows(tail=tail, rows=aux, num_tokens=input_ids.shape[0])
-                for aux in dspark_aux_hidden_states
-            ]
+            aux = _scatter_tail_rows(
+                tail=tail,
+                rows=dspark_aux_hidden_states.finalize(),
+                num_tokens=input_ids.shape[0],
+            )
+            return (hidden_states, pre_hc_head), aux
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()

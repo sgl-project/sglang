@@ -36,6 +36,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -52,12 +53,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-# gfx950 aiter's small-M group32 MXFP8 GEMM tile returns NaN for DeepSeek-V4.1's
-# wqkv_a (N=1792, K=5120, M=5..8); shards that small run unsharded instead.
-_HIP_MIN_TOKENS_PER_RANK = 16
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -178,9 +173,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
-        # TODO(At1a8): noqa, temporary work-around for the gfx950 aiter MXFP8 GEMM NaN
-        # it can be safely removed later, once the aiter kernel is fixed
-        if _is_hip and seq_len < cp_size * _HIP_MIN_TOKENS_PER_RANK:
+        # tokens are dealt by global index, so the smallest shard holds seq_len // cp_size
+        if seq_len // cp_size < envs.SGLANG_CP_MIN_TOKENS_PER_RANK.get():
             return False
         return seq_len > 0 and seq_len >= cp_size and cp_size > 1
 
