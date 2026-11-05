@@ -10,8 +10,8 @@ import numpy as np
 import pybase64
 import torch
 
-from sglang.srt.configs.nemotron_h import NemotronHPuzzleConfig
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.srt.state_capturer import base as base_mod
@@ -126,8 +126,23 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
             self._capture(self._capturer(), ids, "none")
 
 
+def _report_num_experts(num_experts):
+    """Make the model report num_experts routed experts (None: no report)."""
+    return mock.patch.object(
+        re_mod.ModelConfigForExpertLocation,
+        "from_model_config",
+        return_value=(
+            None
+            if num_experts is None
+            else ModelConfigForExpertLocation(
+                num_layers=1, num_logical_experts=num_experts
+            )
+        ),
+    )
+
+
 def _create_kwargs(
-    *, routed_experts_dtype="int32", hf_text_config=None, num_fused_shared_experts=0
+    *, routed_experts_dtype="int32", num_experts=None, num_fused_shared_experts=0
 ):
     seen = {}
 
@@ -140,6 +155,7 @@ def _create_kwargs(
             routed_experts_dtype=routed_experts_dtype,
         ),
         mock.patch.object(re_mod.RoutedExpertsCapturer, "__init__", record),
+        _report_num_experts(num_experts),
     ):
         re_mod.RoutedExpertsCapturer.create(
             model=SimpleNamespace(
@@ -147,9 +163,7 @@ def _create_kwargs(
                     num_fused_shared_experts=num_fused_shared_experts
                 )
             ),
-            model_config=SimpleNamespace(
-                hf_text_config=hf_text_config or SimpleNamespace()
-            ),
+            model_config=SimpleNamespace(),
             num_tokens=8,
             max_running_requests=2,
             device="cpu",
@@ -162,7 +176,7 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
         """Capture sizing must use the supplied wrapper model's shared-expert layout."""
         seen = _create_kwargs(num_fused_shared_experts=1)
         self.assertEqual(seen["num_fused_shared_experts"], 1)
-        # int32 never needs the expert count, which this config does not name.
+        # int32 never needs the expert count, which this model does not report.
         self.assertEqual(seen["dtype"], torch.int32)
 
 
@@ -257,35 +271,21 @@ class TestIdsDtype(CustomTestCase):
         self.assertEqual(decoded.tolist(), [0, 70000, -1])
 
     def test_create_uses_the_configured_dtype(self):
-        seen = _create_kwargs(
-            routed_experts_dtype="int16",
-            hf_text_config=SimpleNamespace(n_routed_experts=896),
-        )
+        seen = _create_kwargs(routed_experts_dtype="int16", num_experts=896)
         self.assertEqual(seen["dtype"], torch.int16)
 
     def test_int16_must_hold_the_largest_expert_id(self):
         """Ids run from -1 to num_experts - 1, so int16 holds 32768 experts."""
-        self.assertEqual(
-            re_mod._ids_dtype("int16", SimpleNamespace(num_experts=32768)),
-            torch.int16,
-        )
-        # A puzzle checkpoint's per-layer count is what the model builds.
-        puzzle = NemotronHPuzzleConfig(
-            hybrid_override_pattern="ME",
-            n_routed_experts=8,
-            block_configs=[
-                {"block_type": "mamba"},
-                {"block_type": "moe", "n_routed_experts": 32769},
-            ],
-        )
-        rejected = {
-            "too many experts": SimpleNamespace(num_local_experts=32769),
-            "too many in a puzzle layer": puzzle,
-            "unknown expert count": SimpleNamespace(),
-        }
-        for case, config in rejected.items():
-            with self.subTest(case), self.assertRaises(ValueError):
-                re_mod._ids_dtype("int16", config)
+        with _report_num_experts(32768):
+            self.assertEqual(re_mod._ids_dtype("int16", SimpleNamespace()), torch.int16)
+        rejected = {"too many experts": 32769, "unknown expert count": None}
+        for case, num_experts in rejected.items():
+            with (
+                self.subTest(case),
+                _report_num_experts(num_experts),
+                self.assertRaises(ValueError),
+            ):
+                re_mod._ids_dtype("int16", SimpleNamespace())
 
 
 if __name__ == "__main__":

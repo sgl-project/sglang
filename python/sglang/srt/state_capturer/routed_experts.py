@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_dp_local_slice_cpu,
@@ -32,29 +32,20 @@ def _is_scattered_a2a_backend() -> bool:
 _DTYPES = {"int32": torch.int32, "int16": torch.int16}
 
 
-def _num_routed_experts(hf_text_config) -> Optional[int]:
-    if isinstance(hf_text_config, NemotronHConfig):
-        # Puzzle checkpoints set the count per layer; the model builds the max.
-        return hf_text_config.max_n_routed_experts
-    # Other configs name the routed expert count differently.
-    counts = (
-        getattr(hf_text_config, name, None)
-        for name in ("n_routed_experts", "num_experts", "num_local_experts")
-    )
-    return next((n for n in counts if isinstance(n, int)), None)
-
-
-def _ids_dtype(routed_experts_dtype: str, hf_text_config) -> torch.dtype:
+def _ids_dtype(routed_experts_dtype: str, model_config: ModelConfig) -> torch.dtype:
     dtype = _DTYPES[routed_experts_dtype]
     if dtype == torch.int32:
         return dtype
-    num_experts = _num_routed_experts(hf_text_config)
-    if num_experts is None:
+    expert_location_config = ModelConfigForExpertLocation.from_model_config(
+        model_config
+    )
+    if expert_location_config is None:
         raise ValueError(
             f"--routed-experts-dtype {routed_experts_dtype} needs the routed "
-            "expert count, but the model config sets none of n_routed_experts, "
-            "num_experts or num_local_experts. Use int32."
+            "expert count, but the model does not report it through "
+            "get_model_config_for_expert_location. Use int32."
         )
+    num_experts = expert_location_config.num_logical_experts
     # Captured ids are logical routed ids in [-1, num_experts), taken before
     # EPLB remapping. Fused shared-expert columns may wrap in the device cache;
     # _get_local_slice drops them before anything reads the ids.
@@ -97,10 +88,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
-            dtype=_ids_dtype(
-                get_exec().features.routed_experts_dtype,
-                model_config.hf_text_config,
-            ),
+            dtype=_ids_dtype(get_exec().features.routed_experts_dtype, model_config),
         )
 
     def __init__(

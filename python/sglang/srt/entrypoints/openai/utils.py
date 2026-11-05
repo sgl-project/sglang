@@ -11,7 +11,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     SpecTokensDetails,
     StreamOptions,
 )
-from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -268,18 +267,12 @@ def should_include_usage(
 def process_routed_experts_from_ret(
     ret_item: dict[str, Any],
     request: ChatCompletionRequest | CompletionRequest,
-) -> str | None:
-    """Process routed experts from a ret item in non-streaming response."""
+) -> tuple[str | None, str | None]:
+    """Process routed experts and their dtype from a non-streaming ret item."""
     if not getattr(request, "return_routed_experts", False):
-        return None
-    return ret_item["meta_info"].get("routed_experts", None)
-
-
-def routed_experts_dtype_for(routed_experts: str | None) -> str | None:
-    """The dtype clients decode ``routed_experts`` with; None without them."""
-    if routed_experts is None:
-        return None
-    return get_exec().features.routed_experts_dtype
+        return None, None
+    meta_info = ret_item["meta_info"]
+    return meta_info.get("routed_experts"), meta_info.get("routed_experts_dtype")
 
 
 def cached_tokens_details_from_dict(
