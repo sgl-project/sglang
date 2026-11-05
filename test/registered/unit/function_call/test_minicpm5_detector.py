@@ -64,6 +64,23 @@ def make_tools_config():
     ]
 
 
+def make_tools_nullable_note():
+    return [
+        Tool(
+            function=Function(
+                name="strict_flag",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "note": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    },
+                    "required": ["note"],
+                },
+            )
+        )
+    ]
+
+
 def make_tools_no_required():
     return [
         Tool(
@@ -73,6 +90,21 @@ def make_tools_no_required():
                     "type": "object",
                     "properties": {"note": {"type": "string"}},
                     "required": [],
+                },
+            )
+        )
+    ]
+
+
+def make_tools_echo(param_schema: dict):
+    return [
+        Tool(
+            function=Function(
+                name="echo",
+                parameters={
+                    "type": "object",
+                    "properties": {"value": param_schema},
+                    "required": ["value"],
                 },
             )
         )
@@ -138,6 +170,43 @@ def test_non_string_types_v3():
     args = json.loads(res.calls[0].parameters)
     assert args["nums"] == [1, 2, 3]
     assert args["exact"] is True
+
+
+def test_nullable_string_param_preserved_v3():
+    detector = MiniCPM5Detector()
+    tools = make_tools_nullable_note()
+    text = '<function name="strict_flag"><param name="note">true</param></function>\n'
+    res = detector.detect_and_parse(text, tools)
+    assert len(res.calls) == 1
+    args = json.loads(res.calls[0].parameters)
+    assert args["note"] == "true"
+    assert isinstance(args["note"], str)
+
+
+def test_enum_string_schema_parsed_as_string_v3():
+    # A schema without a top-level ``type`` used to fall through to JSON
+    # decoding (``42`` -> int); the enum's value type now drives coercion.
+    detector = MiniCPM5Detector()
+    tools = make_tools_echo({"enum": ["42", "43"]})
+    text = '<function name="echo"><param name="value">42</param></function>\n'
+    res = detector.detect_and_parse(text, tools)
+    assert len(res.calls) == 1
+    args = json.loads(res.calls[0].parameters)
+    assert args["value"] == "42"
+    assert isinstance(args["value"], str)
+
+
+def test_allof_string_schema_parsed_as_string_v3():
+    # ``allOf: [{"type": "string"}]`` is a string schema, so the literal must
+    # not be JSON-decoded into a bool.
+    detector = MiniCPM5Detector()
+    tools = make_tools_echo({"allOf": [{"type": "string"}]})
+    text = '<function name="echo"><param name="value">true</param></function>\n'
+    res = detector.detect_and_parse(text, tools)
+    assert len(res.calls) == 1
+    args = json.loads(res.calls[0].parameters)
+    assert args["value"] == "true"
+    assert isinstance(args["value"], str)
 
 
 def test_multiple_calls_interleaved_text_v3():
