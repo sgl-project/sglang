@@ -107,6 +107,10 @@ class TopkCaptureOutput:
     out_cache_loc: torch.Tensor
     topk: torch.Tensor
     host_cache: BaseHostCache
+    # Position among the capturer's outputs and its finalize hooks; see
+    # BaseTopkCapturer.add_finalize_hook.
+    seq: int = 0
+    finalize_hooks: Tuple[Callable[[int], None], ...] = ()
 
     def map_device_tensors(self, fn):
         # Device-tensor fields only; caller injects the copy+safety primitive
@@ -115,12 +119,21 @@ class TopkCaptureOutput:
         self.topk = fn(self.topk)
 
     def finalize(self):
+        # Results are finalized in launch order: every older output has landed
+        # or was dropped.
+        for hook in self.finalize_hooks:
+            hook(self.seq - 1)
         self.host_cache.buffer[self.out_cache_loc] = self.topk
+        for hook in self.finalize_hooks:
+            hook(self.seq)
 
 
 class BaseTopkCapturer:
     # Class defaults also cover capturers built without __init__ (test doubles).
     _pre_read_hooks: Tuple[Callable[[], None], ...] = ()
+    _finalize_hooks: Tuple[Callable[[int], None], ...] = ()
+    # Outputs handed out for overlap scheduling, whose rows land at finalize().
+    num_outputs: int = 0
     # Rows of host-tier KV slots (hierarchical cache); see alloc_host_tier_cache.
     host_tier_cache: Optional[BaseHostCache] = None
 
@@ -158,6 +171,11 @@ class BaseTopkCapturer:
     def add_pre_read_hook(self, hook: Callable[[], None]) -> None:
         """Run hook before every get_topk, to land pending row copies."""
         self._pre_read_hooks = (*self._pre_read_hooks, hook)
+
+    def add_finalize_hook(self, hook: Callable[[int], None]) -> None:
+        """Run hook(n) once the rows of outputs 1..n have landed in host_cache
+        (or will never land)."""
+        self._finalize_hooks = (*self._finalize_hooks, hook)
 
     def alloc_host_tier_cache(self, num_tokens: int, device: str) -> BaseHostCache:
         """Allocate rows for num_tokens host-tier KV slots, freed with the capturer."""
@@ -234,11 +252,14 @@ class BaseTopkCapturer:
             # Kernel batches may be padded; only real request tokens are stored.
             slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
         if no_copy_to_cpu:
+            self.num_outputs += 1
             # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
                 out_cache_loc=out_cache_loc.clone(),
                 topk=slice_gpu.clone(),
                 host_cache=self.host_cache,
+                seq=self.num_outputs,
+                finalize_hooks=self._finalize_hooks,
             )
         out_cache_loc_cpu = out_cache_loc.cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
