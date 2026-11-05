@@ -20,10 +20,10 @@ import triton
 from sglang.kernels.ops.attention.cutedsl_kda import (
     cutedsl_fused_sigmoid_gating_kda_update,
 )
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.fla.kda import chunk_kda
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
 def make_inputs(

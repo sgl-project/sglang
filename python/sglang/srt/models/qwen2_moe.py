@@ -38,7 +38,6 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -93,6 +92,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    silu_and_mul_fp4_quant,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -109,7 +112,7 @@ from sglang.srt.utils import (
     make_pp_layers,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -213,39 +216,13 @@ class Qwen2MoeMLP(nn.Module):
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
 
-    def _silu_fp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
-        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
-
-        if self._down_input_scale_inv_1d is None:
-            self._down_input_scale_inv_1d = self.down_proj.input_scale_inv.reshape(1)
-        num_tokens = gate_up.shape[0]
-        masked_m = self._masked_m_cache.get(num_tokens)
-        if masked_m is None:
-            masked_m = torch.tensor(
-                [num_tokens], dtype=torch.int32, device=gate_up.device
-            )
-            self._masked_m_cache[num_tokens] = masked_m
-        y_fp4, y_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
-            gate_up.unsqueeze(0),
-            masked_m,
-            self._down_input_scale_inv_1d,
-        )
-        # [M, K/2, 1] -> [M, K/2]; scale: expert-grouped 6-D swizzle
-        # (32, 4, m_blocks, 4, K/64, 1) -> the dense swizzled layout
-        # fp4_gemm expects (verified bit-exact vs fp4_quantize up to FP4
-        # rounding ties for M in 64..8192).
-        y_fp4 = y_fp4.squeeze(-1).view(torch.uint8)
-        m_padded = y_sf.shape[2] * y_sf.shape[0] * y_sf.shape[3]  # m_blocks*32*4
-        y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
-        return y_fp4, y_sf
-
     def forward(
         self,
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
-            x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+        if can_run_silu_fp4_quant_fusion(self, gate_up):
+            x, _ = self.down_proj(silu_and_mul_fp4_quant(self, gate_up))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -341,6 +318,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -372,6 +353,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
+                        or get_moe_a2a_backend().is_ascend_fuseep()
                     )
                     else {}
                 ),
@@ -393,6 +375,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
@@ -525,7 +508,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 elif _is_hip:
-                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                    from sglang.kernels.ops.elementwise.elementwise import (
                         sigmoid_gate_mul_broadcast,
                     )
 
@@ -605,14 +588,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -661,16 +636,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=(
-                    forward_batch.moe_num_token_non_padded()
-                    if forward_batch is not None
-                    else None
-                ),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if not self.is_nextn
-                    else None
-                ),
             )
             if self.enable_shared_expert_fusion:
                 topk_output = self._append_shared_to_topk_output(
@@ -827,6 +792,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self._forward_deepep(hidden_states, forward_batch)
 
@@ -847,6 +813,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.alt_stream is not None
             and get_is_capture_mode()
             and not torch.compiler.is_compiling()
+            # Paged experts run as an eager break, which must end the segment on the
+            # capture stream.
+            and not (
+                get_exec().moe.enable_paged_experts and is_in_breakable_cuda_graph()
+            )
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states,
@@ -868,7 +839,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             if shared_output is None:
                 raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
                 MoeDeferredFinalize,
             )
 
@@ -1278,47 +1249,6 @@ class Qwen2MoeForCausalLM(nn.Module):
             )
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-        # decoder layer
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states = layer(
-                    positions, forward_batch.hidden_states, forward_batch
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            forward_batch.hidden_states = hidden_states
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):

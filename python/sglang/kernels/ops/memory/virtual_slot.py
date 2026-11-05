@@ -28,7 +28,7 @@ import triton.language as tl
 # `.item()`, no tensor branching); runs on the scheduler thread.
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["v_pages_ptr"])
 def alloc_bind_inplace_kernel(
     v_pages_ptr,  # in: [N] int64 — virtual page ids
     v2p_ptr,  # in/out: int64 — virtual_to_physical table
@@ -126,7 +126,7 @@ def free_unbind_inplace_kernel(
     tl.store(p2v_ptr + p, -1, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["v_pages_ptr", "p_pages_ptr"])
 def bind_inplace_kernel(
     v_pages_ptr,  # in: [N] int64 — virtual page ids
     p_pages_ptr,  # in: [N] int64 — physical page ids to bind them to
@@ -373,3 +373,32 @@ def translate_token_ids(
         BLOCK=TRANSLATE_TOKEN_IDS_BLOCK,
     )
     return out
+
+
+@triton.jit
+def expand_page_mapping_kernel(
+    source, target, N: tl.constexpr, FACTOR: tl.constexpr, BLOCK: tl.constexpr
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    page = tl.load(source + offsets // FACTOR, mask=offsets < N - 1, other=0)
+    expanded = tl.where(page > 0, page * FACTOR + offsets % FACTOR, 0)
+    tl.store(
+        target + offsets, tl.where(offsets == N - 1, -1, expanded), mask=offsets < N
+    )
+
+
+def expand_page_mapping(source, target, factor):
+    """Refresh a stable replicated P-page map from the live owner-page map."""
+    if not target.is_cuda:
+        offsets = torch.arange(target.numel() - 1, device=target.device)
+        pages = source[offsets // factor]
+        target[:-1].copy_(torch.where(pages > 0, pages * factor + offsets % factor, 0))
+        target[-1] = -1
+        return
+    expand_page_mapping_kernel[(triton.cdiv(target.numel(), 256),)](
+        source,
+        target,
+        target.numel(),
+        factor,
+        256,
+    )
