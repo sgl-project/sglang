@@ -1,21 +1,8 @@
 """In-tree rows for aiter's tuned-config tables, for shapes the aiter pin lacks.
 
-``aiter_tuned_configs/<table>/<model>.csv`` holds a model's rows for one aiter table, in
-that table's columns. ``install_aiter_tuned_tables()`` runs before the model loads: it
-merges every CSV into aiter's own resolution of the table and hands the result back to
-aiter as one file through the table's ``AITER_CONFIG_*`` variable (a single path skips
-aiter's merge, which refuses duplicate keys). Rows are keyed by exact shape, so like
-aiter's ``model_configs/`` they apply to whichever model runs that shape:
-
-* a row with ``base_*`` columns replaces aiter's row for the same key only while aiter
-  still picks that base kernel, so an aiter that merged or re-tuned the shape wins;
-* a row without them adds a shape aiter has no row for, and yields to any row aiter has;
-* a hipBLASLt row names its kernel by an index into one hipBLASLt build, so it carries
-  the ROCm that numbered it (``rocm`` column) and applies only there; a FlyDSL row
-  applies only on an aiter that can import FlyDSL.
-
-A table whose variable the user set is left alone. ``SGLANG_AITER_INTREE_GEMM_TUNE=0``
-turns this off; ``AITER_LOG_TUNED_CONFIG=1`` makes aiter log the row it picks.
+``aiter_tuned_configs/<table>/<model>.csv`` holds rows in one table's columns, keyed by exact
+shape like aiter's ``model_configs/``, so they apply to whichever model runs that shape. A
+table whose ``AITER_CONFIG_*`` the user set is left alone.
 """
 
 from __future__ import annotations
@@ -46,9 +33,8 @@ APPLIED, UPSTREAM, SUPERSEDED, MISSING, ADDED = (
 
 
 class AiterTable(msgspec.Struct, frozen=True):
-    """One of aiter's tuned-config tables: the ``aiter_tuned_configs`` folder of its rows,
-    its ``AITER_CONFIG_*`` variable, and the columns that key a shape and name the kernel
-    aiter picks for it."""
+    """One aiter tuned-config table: its in-tree folder, ``AITER_CONFIG_*`` variable, and
+    the columns that key a shape and name its kernel."""
 
     name: str
     env: str
@@ -139,8 +125,9 @@ def row_keys(df, key_cols: Sequence[str]) -> list:
 def apply_intree_rows(table, intree, key_cols, kernel_cols):
     """Apply the in-tree rows to ``table`` (aiter's resolved table).
 
-    Returns ``(new_table, {status: count})``; a key never appears twice, which aiter
-    refuses to load.
+    A row with ``base_*`` columns replaces aiter's row only while aiter still picks that
+    base kernel; one without adds a shape aiter has no row for. Returns
+    ``(new_table, {status: count})``; no key appears twice, which aiter refuses to load.
     """
     stats = {APPLIED: 0, UPSTREAM: 0, SUPERSEDED: 0, MISSING: 0, ADDED: 0}
     if any(c not in table.columns for c in [*key_cols, *kernel_cols]):
@@ -210,7 +197,8 @@ def uses_flydsl(rows, kernel_cols):
 
 
 def read_intree_rows(table: AiterTable, csvs: Sequence[str]):
-    """The rows of ``csvs`` this runtime can use."""
+    """The rows of ``csvs`` this runtime can use: a hipBLASLt row's solution index belongs
+    to the ROCm in its ``rocm`` column, and a FlyDSL row needs an aiter that imports FlyDSL."""
     import pandas as pd
 
     from sglang.srt.utils.common import get_hip_version
@@ -278,6 +266,7 @@ def install_intree_table(
         return stats, base
     path = _write_atomic(merged, out_dir, table.name)
     prev = os.environ.get(table.env)
+    # one path: aiter skips its own merge, which refuses duplicate keys
     os.environ[table.env] = path
     # get_config_file is lru-cached; drop a resolution made before the env change
     cache_clear = getattr(type(AITER_CONFIGS).get_config_file, "cache_clear", None)
