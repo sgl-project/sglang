@@ -80,25 +80,16 @@ Key characteristics as served by SGLang:
 
 ## 2. Configuration Tips
 
-### 2.1 Sparse attention on Blackwell: use the built-in Triton path (MSA not recommended)
+### 2.1 MSA sparse-attention fast path
 
 The Blackwell recipes serve M3's sparse-attention step on SGLang's built-in Triton kernel. This is what the release image does out of the box, and it is what the benchmark card measures. SGLang auto-forces `page_size` to 128 for the `fa4` backend (#28976), so `--page-size 128` is omitted from the Blackwell cells.
 
-[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`) is an optional Blackwell kernel for the same step, and SGLang uses it automatically when it is installed. **We do not recommend installing it with current SGLang releases (v0.5.22, v0.5.23):**
-
-- **It fails to start.** MSA's `main` branch calls `quack.activation.sub_packed_f32x2`, which quack-kernels removed in 0.6.3. SGLang v0.5.22 and v0.5.23 pin quack-kernels 0.6.5, so the server dies at warm-up with an `AttributeError` even though the install succeeds. This is tracked in [MiniMax-AI/MSA#24](https://github.com/MiniMax-AI/MSA/issues/24), with a fix open in [MiniMax-AI/MSA#27](https://github.com/MiniMax-AI/MSA/pull/27).
-- **With that fix, it is slower than Triton.** On `v0.5.23-cu130` GB300 (TP4, the GB300 recipe), MSA raised mean TPOT from 31.5 to 54.3 ms at random 2048/256 (concurrency 64) and from 20.0 to 23.4 ms at 8192/256 (concurrency 24), and raised TTFT by 41–84%. On `v0.5.22-cu130` at 2048/256, it raised mean TPOT from 26.8 to 38.6 ms on B200 (TP8) and from 32.7 to 46.9 ms on B300 (TP4).
+[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`) is an optional Blackwell kernel for the same step, and SGLang uses it automatically when it is installed.
 
 If `fmha_sm100` is already installed in your environment, set `SGLANG_DISABLE_MSA=1` to keep the Triton path. MSA is a Blackwell (SM100) kernel and does not apply to Hopper or AMD ROCm.
 
 <Note>
-**GB300: per-phase attention split.** The GB300 cell adds `--decode-attention-backend trtllm_mha`. Decode on M3's full-attention layers then runs on FlashInfer's trtllm-gen paged decode, which is ~2x faster than fa4 at the kernel level for this TP4 geometry. Prefill stays on `--attention-backend fa4`, which also keeps page size 128. The sparse layers are unaffected. `trtllm_mha` accepts page 128 through trtllm-gen's dynamic tokens-per-page kernels (FlashInfer ≥ 0.6.12, SGLang ≥ 0.5.22), which the recipe image satisfies.
-
-End-to-end on `v0.5.23-cu130`, the split performs **on par with fa4-only on the benchmark card's workloads**. Mean TPOT is 31.5 vs 31.5 ms at 2048/256 (concurrency 64) and 20.0 vs 19.8 ms at 8192/256 (concurrency 24). GSM8K stays within run-to-run noise: 95.3% vs 97.0% on v0.5.23, and 95.3% vs 94.5% on v0.5.22. The gain shows up in long-context agentic serving: +11–15% median per-user interactivity in 900 s agentic-replay runs at concurrency 1–60 (measured on the earlier M3 dev image). B200 (TP8, different shard geometry) and GB200 are not benchmarked with the split and keep fa4-only.
-</Note>
-
-<Note>
-For multimodal (image) serving, keep the same text recipe above and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; the sparse-attention path only touches the language model, not image handling.
+For multimodal (image) serving, keep the same text recipe above and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
 </Note>
 
 ### 2.2 Memory and workload tuning
