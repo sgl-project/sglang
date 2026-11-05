@@ -16,13 +16,18 @@ from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SituAndMul
 from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank
+from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import row_shard
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import cdiv, get_bool_env_var, print_info_once
@@ -88,10 +93,18 @@ class KimiK3MoEHipMixin:
     # Set by link_column_tails_hip when the next layer's attention read can ride
     # the column-parallel tail's all-gather.
     next_attn_read: Optional[NextAttnRead] = None
+    # The full shared-expert [gate; up] and down weights for shard_front (gathered
+    # post-load), and what shard_front gathered for the forward after it.
+    _row_front_shared: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    _row_front_out: Optional[tuple] = None
+    # Set by link_row_sharded_stream_hip when every later layer reads a stream
+    # left on row shards (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM, PP1).
+    _row_stream = False
 
     def _prepare_hip_paths(self) -> None:
         """Post-load, after _merge_front_weights: the ROCm paths this layer takes."""
         self._select_prefill_up_proj_columns()
+        self._build_row_sharded_front()
         # fp32 front with a SiTU shared expert: the routed input's bf16 cast can
         # ride the shared activation's launch instead of its own.
         shared = self.shared_experts
@@ -296,8 +309,6 @@ class KimiK3MoEHipMixin:
         the rows, and all-gather the stream. latent_rows / shared_rows hold
         num_tokens rows padded to a multiple of TP; prefix_sum is the residual
         on every row or already on this rank's padded rows."""
-        from sglang.srt.models.kimi_k3 import _add3
-
         tp_group = get_parallel().tp_group
         padded_rows, hidden_size = shared_rows.shape
         rows = padded_rows // self.tp_size
@@ -308,7 +319,24 @@ class KimiK3MoEHipMixin:
         shared = shared_rows.new_empty(rows, hidden_size)
         tp_group.reduce_scatter_tensor(latent, latent_rows)
         tp_group.reduce_scatter_tensor(shared, shared_rows)
-        start = get_parallel().tp_rank * rows
+        return self._row_tail(latent, shared, num_tokens, prefix_sum)
+
+    def _row_tail(
+        self,
+        latent: torch.Tensor,
+        shared: torch.Tensor,
+        num_tokens: int,
+        prefix_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        """The latent norm, up-projection and shared + residual add on this
+        rank's rows of the complete latent and shared sums, then the all-gather
+        of the stream, or the stream left on this rank's rows."""
+        from sglang.srt.models.kimi_k3 import _add3
+
+        rows, hidden_size = shared.shape
+        padded_rows = rows * self.tp_size
+        tp_rank = get_parallel().tp_rank
+        start = tp_rank * rows
         if prefix_sum.shape[0] == num_tokens:
             prefix = prefix_sum[start : min(start + rows, num_tokens)]
         else:
@@ -320,9 +348,137 @@ class KimiK3MoEHipMixin:
             )
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
         stream_rows = _add3(out, shared, prefix)
+        if self._row_stream:
+            # the next read takes this rank's rows (attn_bank._bank_rows)
+            return stream_rows[: row_shard(num_tokens, self.tp_size, tp_rank)[1]]
         stream = stream_rows.new_empty(padded_rows, hidden_size)
-        tp_group.all_gather_into_tensor(stream, stream_rows)
+        get_parallel().tp_group.all_gather_into_tensor(stream, stream_rows)
         return stream[:num_tokens]
+
+    def _build_row_sharded_front(self) -> None:
+        """Post-load on gfx950: every rank gathers the full shared-expert
+        weights from the TP shards, for shard_front."""
+        if not (
+            envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
+            and _is_gfx95
+            and self.tp_size > 1
+            and self._eligible_for_fused_front
+            # the merged front is [gate_up | router | latent] (not the EP pair)
+            and len(self._front_sizes) == 3
+        ):
+            return
+        group = get_parallel().tp_group.device_group
+        gate_up = self.shared_experts.gate_up_proj.weight  # this rank's [gate; up]
+        down = self.shared_experts.down_proj.weight  # [H, this rank's columns]
+        inter, hidden_size = gate_up.shape[0] // 2, gate_up.shape[1]
+        full_gate_up = gate_up.new_empty(2 * self.tp_size * inter, hidden_size)
+        for i, half in enumerate(gate_up.split(inter)):
+            torch.distributed.all_gather_into_tensor(
+                full_gate_up[i * self.tp_size * inter : (i + 1) * self.tp_size * inter],
+                half.contiguous(),
+                group=group,
+            )
+        full_down_t = down.new_empty(self.tp_size * down.shape[1], down.shape[0])
+        torch.distributed.all_gather_into_tensor(
+            full_down_t, down.t().contiguous(), group=group
+        )
+        self._row_front_shared = (full_gate_up, full_down_t.t().contiguous())
+        del full_down_t
+        torch.cuda.empty_cache()
+
+    def shard_front(self, normed: torch.Tensor, num_tokens: int) -> bool:
+        """The row-sharded batch's front on this rank's padded rows of the
+        normed FFN input: router top-k and latent from the merged front weight.
+        Gathers only the routed experts' MXFP8 input (rows quantize the same as
+        after a gather) and the top-k; forward() then runs them, the shared
+        experts on these rows and the tail. False leaves the batch to the
+        regular path."""
+        from sglang.kernels.ops.moe.k3_a8w4_gfx950 import quant_mxfp8
+        from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
+
+        min_tokens = self._a8w4_moe_min_tokens
+        if (
+            self._row_front_shared is None
+            # the A8W4 kernels and the latent reduce write bf16
+            or normed.dtype != torch.bfloat16
+            or min_tokens is None
+            or not min_tokens <= num_tokens <= self._a8w4_moe_max_tokens
+        ):
+            return False
+        fused = _k3_bf16_gemm(
+            normed, self._front_w[self._front_sizes[0] :], out_dtype=torch.float32
+        )
+        router_logits, routed_input = torch.split(fused, self._front_sizes[1:], dim=-1)
+        topk_output = self.topk(normed, router_logits)
+        top_k = topk_output.topk_ids.shape[1]
+        # ids ride bit-cast beside the weights (and the scales, below)
+        topk = torch.cat(
+            [
+                topk_output.topk_ids.to(torch.int32).view(torch.float32),
+                topk_output.topk_weights.to(torch.float32),
+            ],
+            dim=-1,
+        )
+        a, a_scale = quant_mxfp8(routed_input.to(normed.dtype))
+        # one gather for the scale bytes and the top-k; bytes travel as bf16 pairs
+        side = torch.cat([a_scale, topk.view(torch.uint8)], dim=-1)
+        group = get_parallel().tp_group
+        rows = a.shape[0]
+        a_all = a.new_empty(self.tp_size * rows, a.shape[1])
+        group.all_gather_into_tensor(a_all.view(torch.bfloat16), a.view(torch.bfloat16))
+        side_all = side.new_empty(self.tp_size * rows, side.shape[1])
+        group.all_gather_into_tensor(
+            side_all.view(torch.bfloat16), side.view(torch.bfloat16)
+        )
+        side_all = side_all[:num_tokens]
+        scale_width = a_scale.shape[1]
+        topk_all = side_all[:, scale_width:].contiguous().view(torch.float32)
+        self._row_front_out = (
+            (a_all[:num_tokens], side_all[:, :scale_width].contiguous()),
+            topk_all[:, :top_k].contiguous().view(torch.int32),
+            topk_all[:, top_k:].contiguous(),
+            normed,
+        )
+        return True
+
+    def _forward_row_front(self, prefix_sum: torch.Tensor) -> torch.Tensor:
+        """The routed experts on what shard_front gathered, then the latent
+        reduce-scatter (on the side stream in eager batches) under the shared
+        experts, complete from their full weights on this rank's rows, and the
+        row-sharded tail."""
+        from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
+
+        a_mx, topk_ids, topk_weights, normed = self._row_front_out
+        self._row_front_out = None
+        num_tokens = a_mx[0].shape[0]
+        rows = normed.shape[0]
+        latent_rows = normed.new_empty(rows * self.tp_size, self.moe_hidden_size)
+        # bf16 rows of the latent's shape; the experts read a_mx instead
+        latent_shape = normed.new_empty(1, 1).expand(num_tokens, self.moe_hidden_size)
+        self._run_a8w4(
+            latent_shape, topk_ids, topk_weights, latent_rows[:num_tokens], a_mx=a_mx
+        )
+        latent_rows[num_tokens:].zero_()
+        latent = latent_rows.new_empty(rows, self.moe_hidden_size)
+        tp_group = get_parallel().tp_group
+        overlap = not (
+            torch.cuda.is_current_stream_capturing() or is_in_breakable_cuda_graph()
+        )
+        if overlap:
+            current_stream = torch.cuda.current_stream()
+            side_stream = _hip_moe_side_stream(current_stream.device)
+            side_stream.wait_stream(current_stream)
+            with torch.cuda.stream(side_stream):
+                tp_group.reduce_scatter_tensor(latent, latent_rows)
+        else:
+            tp_group.reduce_scatter_tensor(latent, latent_rows)
+        gate_up_w, down_w = self._row_front_shared
+        # fp32 gate_up into the SiTU, as the fused front feeds it
+        gate_up = _k3_bf16_gemm(normed, gate_up_w, out_dtype=torch.float32)
+        shared = _k3_bf16_gemm(self.shared_experts.act_fn(gate_up), down_w)
+        if overlap:
+            current_stream.wait_stream(side_stream)
+        return self._row_tail(latent, shared, num_tokens, prefix_sum)
 
     def _column_tail_and_next_read(
         self,
@@ -432,15 +588,33 @@ class KimiK3MoEHipMixin:
             and routed_input.is_contiguous()
         ):
             return False
-        from sglang.kernels.ops.moe.k3_a8w4_gfx950 import k3_a8w4_moe
-
         topk_output = self.topk(hidden_states, router_logits)
         assert TopKOutputChecker.format_is_standard(topk_output), topk_output.format
-        experts = self.experts
-        k3_a8w4_moe(
+        self._run_a8w4(
             routed_input,
             topk_output.topk_ids.to(torch.int32),
             topk_output.topk_weights.to(torch.float32),
+            latent,
+        )
+        return True
+
+    def _run_a8w4(
+        self,
+        routed_input: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        latent: torch.Tensor,
+        a_mx: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> None:
+        """The gfx950 A8W4 grouped GEMMs into latent; a_mx is routed_input
+        already through quant_mxfp8."""
+        from sglang.kernels.ops.moe.k3_a8w4_gfx950 import k3_a8w4_moe
+
+        experts = self.experts
+        k3_a8w4_moe(
+            routed_input,
+            topk_ids,
+            topk_weights,
             experts.w13_weight,
             experts.w13_weight_scale,
             experts.w2_weight,
@@ -448,8 +622,8 @@ class KimiK3MoEHipMixin:
             beta=experts.moe_runner_config.gemm1_alpha,
             linear_beta=experts.moe_runner_config.gemm1_clamp_limit,
             out=latent,
+            a_mx=a_mx,
         )
-        return True
 
 
 def ffn_row_shards_hip(layer) -> Optional[Callable[[int], bool]]:
@@ -467,6 +641,23 @@ def ffn_row_shards_hip(layer) -> Optional[Callable[[int], bool]]:
     if get_parallel().attn_tp_size != get_parallel().tp_size:
         return None
     return layer.mlp.takes_row_sharded_tail
+
+
+def link_row_sharded_stream_hip(model) -> None:
+    """Let a layer's row-sharded tail leave the stream on this rank's rows only
+    when every later layer reads it there (its FFN takes the row-sharded read)
+    and no pipeline stage boundary follows: a dense layer or a PP send would
+    read every row of the stream and of the bank, which the shard left stale."""
+    if not envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+        return
+    if get_parallel().pp_size > 1:
+        return
+    later_on_shards = True
+    for i in reversed(range(model.start_layer, model.end_layer)):
+        layer = model.layers[i]
+        if isinstance(layer.mlp, KimiK3MoEHipMixin):
+            layer.mlp._row_stream = later_on_shards
+        later_on_shards = later_on_shards and layer._row_shards is not None
 
 
 def link_column_tails_hip(model) -> None:

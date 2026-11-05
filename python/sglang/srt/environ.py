@@ -997,6 +997,17 @@ class Envs:
     # H <= 16) on that HIP kernel's split-K form: each row's top-k over
     # sparse_mla_decode_splits(rows) CTAs and an fp32 log-sum-exp combine.
     SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
+    # Kimi-K3 prefill on gfx950, on top of the row-sharded MoE tail: run the MoE front
+    # (router top-k, latent down-proj) and the shared experts on this rank's rows, from full
+    # shared-expert weights each rank gathers at load (+264 MB a layer).
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT = EnvBool(False)
+    # With the row-sharded attention read, exchange o_proj's input to row shards (all-to-all,
+    # 1/4.7 of the output's bytes) and run o_proj there with its full weight, gathered at load
+    # (+176 MB a layer), instead of reduce-scattering the TP-partial output. Eager batches only.
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ = EnvBool(False)
+    # With the row-sharded MoE tail, leave the stream on each rank's rows: the next layer's
+    # attention read aggregates the bank there and gathers its normed input.
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
     # Use the gfx950 MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode.
     SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
     # GiB of ROCm device memory kept out of torch's allocator (0 = no cap): HSA
