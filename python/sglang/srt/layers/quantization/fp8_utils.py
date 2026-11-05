@@ -6,6 +6,8 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -43,6 +45,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_musa,
     is_sm90_supported,
@@ -77,6 +80,14 @@ _use_aiter_ck_blockscale_gfx942 = _use_aiter and get_bool_env_var(
 _use_aiter_ck_blockscale_bpreshuffle_gfx942 = _use_aiter and get_bool_env_var(
     "SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE"
 )
+# Replace the CK bpreshuffle GEMM by PyHIP's FlyDSL 256x256 kernel for large M on gfx942.
+_use_pyhip_fp8_blockscale_gemm = (
+    _use_aiter_ck_blockscale_bpreshuffle_gfx942
+    and envs.SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM.get()
+    and is_gfx942_supported()
+)
+# Decode and small extends stay on CK.
+_PYHIP_FP8_GEMM_MIN_M = 2048
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -115,6 +126,7 @@ if _use_aiter:
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -240,6 +252,7 @@ if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
+
     from sglang.srt.utils.custom_op import register_custom_op
 
     @register_custom_op(
@@ -804,6 +817,16 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
+@lru_cache(maxsize=1)
+def _load_pyhip_fp8_blockscale_gemm():
+    from sglang.srt.layers.quantization.pyhip_fp8_blockscale_gemm import (
+        gemm_a8w8_blockscale_942,
+    )
+
+    logger.info("Using the PyHIP FlyDSL kernel for gfx942 FP8 block-scale linears")
+    return gemm_a8w8_blockscale_942
+
+
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -856,7 +879,29 @@ def aiter_w8a8_block_fp8_linear(
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
 
+    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    m = q_input.shape[0]
     if (
+        use_bpreshuffle
+        and _use_pyhip_fp8_blockscale_gemm
+        and m >= _PYHIP_FP8_GEMM_MIN_M
+        and n % 32 == 0
+        and k % 128 == 0
+        and out_dtype == torch.bfloat16
+        # Row-strided activations (packed FP8 all-gather) are consumed in place.
+        and q_input.stride(-1) == 1
+        and q_input.stride(0) % 16 == 0
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # Both bpreshuffle x_scale presentations hold column-major [K / 128, M] bytes.
+        output = _load_pyhip_fp8_blockscale_gemm()(
+            q_input,
+            weight,
+            torch.as_strided(x_scale, (k // 128, m), (m, 1)),
+            weight_scale,
+            w_preshuffled=True,
+        )
+    elif (
         _use_aiter_ck_blockscale_bpreshuffle_gfx942
         and use_bpreshuffle
         and not q_input.is_contiguous()
@@ -892,7 +937,7 @@ def aiter_w8a8_block_fp8_linear(
             weight,
             x_scale,
             weight_scale,
-            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+            dtype=out_dtype,
         )
 
     if bias is not None:

@@ -19,6 +19,7 @@ from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
@@ -127,6 +128,7 @@ if _use_aiter:
         mimo_rmsnorm_fp8_group_quant as _aiter_mimo_rmsnorm_fp8_group_quant,
     )
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
+
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_fused_rms_qkv_quant_supported:
@@ -420,6 +422,8 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
     is_next_layer_sparse: Optional[bool]
+    # Attention computes all heads on the local token shard.
+    sp_attn: bool = False
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -446,7 +450,9 @@ class LayerScatterModes:
         context = _LayerModeComputationContext(**kwargs)
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
-            attn_mode=ScatterMode.TP_ATTN_FULL,
+            attn_mode=(
+                ScatterMode.SCATTERED if context.sp_attn else ScatterMode.TP_ATTN_FULL
+            ),
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
@@ -586,7 +592,15 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            gathered_last_layer_output = self._communicate_simple_fn(
+            capture_fn = self._communicate_simple_fn
+            if (
+                self.layer_scatter_modes.attn_mode == ScatterMode.SCATTERED
+                and self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and self._context.attn_tp_size > 1
+            ):
+                # Captures stay attention-TP gathered, as with TP attention.
+                capture_fn = CommunicateSimpleFn._scattered_to_tp_attn_full
+            gathered_last_layer_output = capture_fn(
                 hidden_states=residual,
                 forward_batch=forward_batch,
                 context=self._context,
@@ -1087,6 +1101,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
+            return CommunicateWithAllReduceAndLayerNormFn._simple
+
+        if all(
+            mode == ScatterMode.SCATTERED
+            for mode in (
+                hidden_states_input_mode,
+                residual_input_mode,
+                hidden_states_output_mode,
+                residual_output_mode,
+            )
+        ):
+            # Attention on the token shard already produced reduced rows.
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (

@@ -26,6 +26,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.models.mimo_v2_utils import (
+    mimo_effective_prefix_lengths as _mimo_effective_prefix_lengths,
+)
+
 from .flydsl_pa import PagedAttention as flypa
 
 try:
@@ -627,24 +631,6 @@ def _allocate_mimo_asm_output(
     if output_tokens > logical_tokens:
         output[logical_tokens:].zero_()
     return output, output[:logical_tokens]
-
-
-def _mimo_effective_prefix_lengths(forward_batch: ForwardBatch) -> list[int] | None:
-    """Recover logical prefix lengths when chunk-cache accounting reports zero."""
-    reported = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-    if reported is None:
-        return None
-    reported = [int(length) for length in reported]
-
-    extend = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
-    if extend is None or seq_lens is None or len(extend) != len(seq_lens):
-        return reported
-
-    derived = [
-        int(seq_len) - int(extend_len) for seq_len, extend_len in zip(seq_lens, extend)
-    ]
-    return derived if all(length >= 0 for length in derived) else reported
 
 
 def can_use_mimo_fresh_bf16_asm(

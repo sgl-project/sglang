@@ -52,3 +52,21 @@ def supports_native_mimo_vectorized_v_cache(
             or (swa_num_kv_heads == 2 and mimo_flydsl_target_verify_enabled())
         )
     )
+
+
+def mimo_effective_prefix_lengths(forward_batch) -> list[int] | None:
+    """Recover logical prefix lengths when chunk-cache accounting reports zero."""
+    reported = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if reported is None:
+        return None
+    reported = [int(length) for length in reported]
+
+    extend = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
+    if extend is None or seq_lens is None or len(extend) != len(seq_lens):
+        return reported
+
+    derived = [
+        int(seq_len) - int(extend_len) for seq_len, extend_len in zip(seq_lens, extend)
+    ]
+    return derived if all(length >= 0 for length in derived) else reported

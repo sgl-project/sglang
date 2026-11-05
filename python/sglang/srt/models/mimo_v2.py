@@ -48,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_dp_global_num_tokens,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -65,6 +66,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -142,6 +144,34 @@ def _mimo_moe_inputs(hidden_states):
         normalized, quantized, scale = hidden_states
         return normalized, (quantized, scale)
     return hidden_states, hidden_states
+
+
+def _mimo_ep_sp_supported() -> bool:
+    args = get_global_server_args()
+    return (
+        is_gfx942_supported()
+        and is_dp_attention_enabled()
+        and get_attention_tp_size() == 4
+        and get_moe_a2a_backend().is_mori()
+        and args.attention_backend == "aiter"
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        and args.page_size == 64
+        and args.kv_cache_dtype == "bf16"
+        and args.attn_cp_size == 1
+    )
+
+
+def _mimo_ep_sp_active(forward_batch: ForwardBatch) -> bool:
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        or forward_batch.can_run_tbo
+        or forward_batch.extend_seq_lens_cpu is None
+        or forward_batch.positions.ndim != 1
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    sizes = get_dp_global_num_tokens()
+    return sizes is not None and sum(sizes) >= 2048
 
 
 def _mimo_needs_v_padding(
@@ -675,6 +705,33 @@ class MiMoV2Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        # SGLANG_MIMO_SWA_SP: all-head QKV of SWA layers in [Q | K | V] order, filled from
+        # the TP shards before weight post-processing.
+        self.qkv_proj_full = None
+        if (
+            envs.SGLANG_MIMO_SWA_SP.get()
+            and _mimo_ep_sp_supported()
+            and sliding_window_size > 0
+            and self.total_num_heads == 64
+            and self.total_num_kv_heads == 8
+            and self.head_dim == 192
+            and self.original_v_head_dim == 128
+            and not self.needs_v_pad
+        ):
+            self.qkv_proj_full = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                v_head_size=self.original_v_head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=0,
+                tp_size=1,
+                prefix=add_prefix("qkv_proj_full", prefix),
+                skip_block_quant_check=True,
+            )
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -708,6 +765,51 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
+
+        # Complete o_proj weight [hidden, heads * v_head_dim] for SWA SP.
+        self.o_proj_full: Optional[torch.Tensor] = None
+        self.attention_sink_full: Optional[torch.Tensor] = None
+
+    def build_sp_weights(self):
+        """Assemble full-head weights before quantization post-processing."""
+        if self.qkv_proj_full is None:
+            return
+        from sglang.srt.layers.attention.mimo_sp import _mimo_attn_tp_gather
+
+        if isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
+            shard = self.o_proj.weight.data
+            self.o_proj_full = (
+                _mimo_attn_tp_gather(shard.t().contiguous()).t().contiguous()
+            )
+        if self.attention_sink_bias is not None:
+            self.attention_sink_full = _mimo_attn_tp_gather(
+                self.attention_sink_bias.data
+            )
+        sizes = (self.q_size, self.k_size, self.v_size)
+        full_params = dict(self.qkv_proj_full.named_parameters())
+        for name, shard in self.qkv_proj.named_parameters():
+            full = full_params[name]
+            if full.shape == shard.shape:
+                full.data.copy_(shard.data)
+                continue
+            rows = shard.shape[0]
+            attn_tp = get_attention_tp_size()
+            parts = [rows * size // sum(sizes) for size in sizes]
+            assert (
+                full.shape == (attn_tp * rows, *shard.shape[1:]) and sum(parts) == rows
+            ), name
+            gathered = _mimo_attn_tp_gather(shard.data).view(
+                attn_tp, rows, *shard.shape[1:]
+            )
+            # Per-rank [q_r | k_r | v_r] blocks -> [Q | K | V].
+            full.data.copy_(
+                torch.cat(
+                    [
+                        block.reshape(attn_tp * part, *shard.shape[1:])
+                        for block, part in zip(gathered.split(parts, dim=1), parts)
+                    ]
+                )
+            )
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -764,7 +866,12 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        sp_swa: bool = False,
     ) -> torch.Tensor:
+        if sp_swa:
+            from sglang.srt.layers.attention.mimo_sp import run_mimo_sp_swa
+
+            return run_mimo_sp_swa(self, positions, hidden_states, forward_batch)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
@@ -917,6 +1024,24 @@ class MiMoV2DecoderLayer(nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
+        # SWA attention on the token shard in extend batches.
+        self.layer_communicator_sp_attn = None
+        if self.self_attn.qkv_proj_full is not None:
+            self.layer_communicator_sp_attn = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes.init_new(
+                    layer_id=layer_id,
+                    num_layers=config.num_hidden_layers,
+                    is_layer_sparse=self.is_layer_sparse,
+                    is_previous_layer_sparse=is_previous_layer_sparse,
+                    is_next_layer_sparse=is_next_layer_sparse,
+                    sp_attn=True,
+                ),
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            )
+
     def _detect_fused_rms_qkv_quant_format(self) -> str:
         """Select the fused RMSNorm + group-quant contract for MiMo QKV."""
         if not envs.SGLANG_MIMO_FUSED_RMS_QKV_QUANT.get() or not (
@@ -977,9 +1102,17 @@ class MiMoV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        communicator = self.layer_communicator
+        sp_swa = (
+            self.layer_communicator_sp_attn is not None
+            and self.self_attn.o_proj_full is not None
+            and _mimo_ep_sp_active(forward_batch)
+        )
+        if sp_swa:
+            communicator = self.layer_communicator_sp_attn
         # Self Attention
         hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+            communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
                 residual,
                 forward_batch,
@@ -993,9 +1126,10 @@ class MiMoV2DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                sp_swa=sp_swa,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = communicator.prepare_mlp(
             hidden_states,
             residual,
             forward_batch,
@@ -1003,15 +1137,11 @@ class MiMoV2DecoderLayer(nn.Module):
         )
 
         should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
+            communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        use_reduce_scatter = communicator.should_use_reduce_scatter(forward_batch)
 
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
@@ -1020,7 +1150,7 @@ class MiMoV2DecoderLayer(nn.Module):
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual = communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
 
@@ -1899,6 +2029,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        for layer in getattr(self.model, "layers", ()):
+            attn = getattr(layer, "self_attn", None)
+            if isinstance(attn, MiMoV2Attention):
+                attn.build_sp_weights()
 
     def get_embed_and_head(self):
         assert (

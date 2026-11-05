@@ -46,6 +46,9 @@ export SGLANG_SPEC_NAN_DETECTION=1
 export SGLANG_SPEC_OOB_DETECTION=1
 export SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY="${SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY:-1}"
 export SGLANG_USE_AITER_CK_BLOCKSCALE_BPRESHUFFLE=1
+# Enable PyHIP FP8 linears and SWA SP by default; allow explicit opt-out.
+export SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM="${SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM:-1}"
+export SGLANG_MIMO_SWA_SP="${SGLANG_MIMO_SWA_SP:-1}"
 # Baseline contract: never inherit the lossy Quick Reduce path or mixed-router
 # optimization from the caller. Ablations must use a separate launcher.
 unset ROCM_QUICK_REDUCE_QUANTIZATION
@@ -222,6 +225,7 @@ echo "Optimizations: FlyPA prefill=${SGLANG_FLYPA_MIMO_PREFILL}; fused bounds ch
 
 echo "Configuration: global-tp=8, attention-tp=4, dp=2, ep=8, moe-a2a=mori, max-running=${MAX_RUNNING_REQUESTS}, requested-max-running-per-dp=${requested_max_running_per_dp}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, effective-prefill-per-dp=${effective_prefill_chunk}, partitions=${SGLANG_FLYDSL_PA_NUM_PARTITIONS}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}, quick-ar=${ROCM_QUICK_REDUCE_QUANTIZATION:-unset}, nccl-min-channels=${NCCL_MIN_NCHANNELS}, mixed-router=${SGLANG_MIMO_MIXED_ROUTER}, fused-rms-moe=${SGLANG_MIMO_FUSED_RMS_MOE_QUANT}, fused-rms-qkv=${SGLANG_MIMO_FUSED_RMS_QKV_QUANT}, speculative=${speculative_status}, aiter-ar-fusion=0, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}, reasoning-parser=${REASONING_PARSER}, tbo=0, overlap=enabled"
 echo "MORI: launch-config=${MORI_EP_LAUNCH_CONFIG_MODE}, dispatch=${SGLANG_MORI_DISPATCH_DTYPE}, combine=${SGLANG_MORI_COMBINE_DTYPE}, capacity-per-rank=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}, shmem=${MORI_SHMEM_MODE}, sdma=${MORI_ENABLE_SDMA}"
+echo "EP8 prefill: pyhip-fp8-gemm=${SGLANG_USE_PYHIP_FP8_BLOCKSCALE_GEMM}, swa-sp=${SGLANG_MIMO_SWA_SP}"
 if [[ "${MORI_EP_LAUNCH_CONFIG_MODE}" == "AUTO" ]]; then
   echo "MORI tuning config: ${MORI_EP_TUNING_CONFIG}"
 fi
