@@ -25,6 +25,11 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 
+from .expert_layout import (
+    LAYOUT_REFUSED,
+    get_expert_layout_session,
+    mark_expert_weights_shared,
+)
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
@@ -121,6 +126,7 @@ class IpcModelLoader(BaseModelLoader):
                 "[IpcModelLoader] Weight cache not available or config mismatch, "
                 "falling back to disk load"
             )
+            mark_expert_weights_shared(False)
             return self._fallback_load(model_config, device_config)
 
         entries = cache_data["entries"]
@@ -178,6 +184,7 @@ class IpcModelLoader(BaseModelLoader):
             f"total={time.perf_counter() - tic:.2f}s"
         )
 
+        mark_expert_weights_shared(True)
         return model.eval()
 
     def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
@@ -553,9 +560,21 @@ class IpcModelLoader(BaseModelLoader):
                 f"dtype={engine_config.dtype}"
             )
 
-            send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
+            request = {"type": "fetch_state", "config": engine_config.to_dict()}
+            expert_layout_session = get_expert_layout_session()
+            if expert_layout_session is not None:
+                # Lets the daemon check that this engine routes with the expert
+                # layout its weights are in.
+                request.update(expert_layout_session.fetch_fields())
+            send_msg(sock, request)
             result = recv_msg(sock)
 
+            if result.get("status") == LAYOUT_REFUSED:
+                raise RuntimeError(
+                    f"[IpcModelLoader] The weight cache daemon at "
+                    f"{self.socket_path} refused to serve its weights: "
+                    f"{result.get('message')}"
+                )
             if result.get("status") != "ok":
                 daemon_config = result.get("daemon_config", {})
                 raise RuntimeError(

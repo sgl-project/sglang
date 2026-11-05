@@ -19,6 +19,7 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.weight_cache.expert_layout import get_expert_layout_session
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -67,6 +68,13 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
+        # With the weight cache on, the expert weights are normally the
+        # daemon's copy, shared with every engine that maps it. A rebalance
+        # moves experts in place, so it has to keep the daemon's record of the
+        # expert layout in step (see weight_cache/expert_layout.py).
+        self._weight_cache_mode = _weight_cache_mode()
+        self._weight_cache_off_reason = None
+
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_end(self):
@@ -112,6 +120,32 @@ class EPLBManager:
         ):
             return
 
+        # The daemon's expert layout record to move experts through, or None
+        # when the weights are this engine's own.
+        expert_layout = None
+        if self._weight_cache_mode != "off":
+            session = get_expert_layout_session()
+            mode, reason = (
+                ("off", "this engine has no expert layout session")
+                if session is None
+                else session.rebalance_mode()
+            )
+            if mode == "coordinated" and get_exec().moe.elastic_ep_backend is not None:
+                mode, reason = (
+                    "off",
+                    "elastic EP also moves experts outside rebalance()",
+                )
+            if mode == "off":
+                if reason != self._weight_cache_off_reason:
+                    self._weight_cache_off_reason = reason
+                    logger.warning(
+                        "[EPLBManager] rebalancing is off with the weight cache: "
+                        f"{reason}. The expert layout stays as it is."
+                    )
+                return
+            if mode == "coordinated":
+                expert_layout = session
+
         logger.info("[EPLBManager] rebalance start")
 
         enable_timing = self._rebalance_layers_per_chunk is None
@@ -152,6 +186,14 @@ class EPLBManager:
         for chunk_layer_ids in update_layer_ids_chunks:
             if len(update_layer_ids_chunks) > 1:
                 yield
+            if expert_layout is not None:
+                reason = expert_layout.begin(chunk_layer_ids)
+                if reason is not None:
+                    logger.info(
+                        f"[EPLBManager] rebalance stopped before layers "
+                        f"{chunk_layer_ids}: {reason}"
+                    )
+                    return
             update_expert_location_with_recovery(
                 expert_location_updater=self._get_expert_location_updater(),
                 model=self._get_model(),
@@ -174,6 +216,22 @@ class EPLBManager:
                 # P2P waits only synchronize participating peers. Ranks without
                 # moves must also install this chunk before NIXL resumes.
                 dist.barrier()
+            if expert_layout is not None:
+                # Once committed, the daemon may serve these weights to the
+                # next engine, so the moves must have landed.
+                torch.get_device_module().synchronize()
+                reason = expert_layout.commit(
+                    chunk_layer_ids,
+                    get_global_expert_location_metadata().physical_to_logical_map_cpu,
+                )
+                if reason is not None:
+                    logger.error(
+                        f"[EPLBManager] the weight cache daemons did not record the "
+                        f"move of layers {chunk_layer_ids}: {reason}. Rebalancing "
+                        f"is off; restart the daemons before another engine uses "
+                        f"them."
+                    )
+                    return
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 
@@ -351,3 +409,9 @@ def update_expert_location_with_recovery(
 def _chunk_list(items: List, chunk_size):
     for start_index in range(0, len(items), chunk_size):
         yield items[start_index : start_index + chunk_size]
+
+
+def _weight_cache_mode() -> str:
+    # The model config's field. Inside EPLBManager.__init__, ``get_model`` names
+    # the model getter argument instead, and the model is not loaded yet there.
+    return get_model().weight_cache_mode
