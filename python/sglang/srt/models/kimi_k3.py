@@ -1346,7 +1346,6 @@ class KimiK3MoE(nn.Module):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
-            aiter_presort.clear_registration()
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
@@ -1527,10 +1526,15 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
-        else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+        try:
+            if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+                out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            else:
+                out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+        finally:
+            # Every self.topk call may register a radix-4 presort; one that no
+            # fused_moe consumed must not outlive this layer (AITER's contract).
+            aiter_presort.clear_registration()
         return out.view(num_tokens, hidden_size)
 
 
