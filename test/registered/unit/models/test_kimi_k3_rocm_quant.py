@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -39,11 +40,9 @@ def _per_channel_fp8(out_features: int, in_features: int):
 
 
 class TestChannelFp8ToBf16(CustomTestCase):
-    """aiter's batched absorb GEMM takes ``w_scale`` as a scalar, so a
-    per-channel vector cannot reach it. The scale axis is the GEMM's
-    contraction axis, so requantizing to one per-tensor scale is lossy --
-    ~2.3% relative error on real K3 weights. Dequantizing to bf16 costs ~0.12%
-    and lets the absorb use its bf16 path with w_scale at the 1.0 default."""
+    """The BF16 kv_b of the MLA absorb (off gfx950 + AITER, or with
+    SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8=0) and the merged in-proj's f_b: each channel
+    dequantized with its own scale, ~0.12% error on real K3 weights."""
 
     def test_dequantizes_every_channel_with_its_own_scale(self):
         weight, scale, dense = _per_channel_fp8(out_features=8, in_features=16)
@@ -113,10 +112,10 @@ class TestKvBForAbsorb(CustomTestCase):
     requantized to per-tensor FP8; the kill switch keeps the BF16 dequant."""
 
     def test_default_requantizes_to_one_tensor_scale(self):
-        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
-        module = SimpleNamespace(weight_scale=scale.squeeze(1))
+        module = _quark_fp8_linear(8)
+        weight, scale = module.weight, module.weight_scale.view(-1, 1)
 
-        q, tensor_scale = k3_kv_b_for_absorb(module=module, weight=weight)
+        q, tensor_scale = k3_kv_b_for_absorb(module=module)
 
         self.assertEqual((q.dtype, q.shape), (weight.dtype, weight.shape))
         self.assertEqual(tensor_scale.numel(), 1)
@@ -128,28 +127,82 @@ class TestKvBForAbsorb(CustomTestCase):
         self.assertLess(err.item(), 0.07 * exact.abs().max().item())
 
     def test_kill_switch_keeps_the_bf16_dequant(self):
-        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
-        module = SimpleNamespace(weight_scale=scale.squeeze(1))
+        module = _quark_fp8_linear(8)
 
         with envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.override(False):
-            out, tensor_scale = k3_kv_b_for_absorb(module=module, weight=weight)
+            out, tensor_scale = k3_kv_b_for_absorb(module=module)
 
         self.assertIsNone(tensor_scale)
-        torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, weight))
+        torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, module.weight))
 
     def test_no_requant_where_the_absorb_has_no_fp8_kernel(self):
         """Off gfx950 + AITER the absorb dequantizes an FP8 w_kc/w_vc to BF16,
         so a requant would add its error for no speedup."""
-        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
-        module = SimpleNamespace(weight_scale=scale.squeeze(1))
+        module = _quark_fp8_linear(8)
 
         with mock.patch(
             "sglang.srt.models.deepseek_common.utils._use_aiter_gfx95", False
         ):
-            out, tensor_scale = k3_kv_b_for_absorb(module=module, weight=weight)
+            out, tensor_scale = k3_kv_b_for_absorb(module=module)
 
         self.assertIsNone(tensor_scale)
-        torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, weight))
+        torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, module.weight))
+
+    def test_restored_processed_state_matches_the_checkpoint(self):
+        """Loaders that restore a saved, already-processed state run post_load_weights
+        on kv_b's transposed, maybe AITER-preshuffled view; the absorb weights must
+        match the ones built from the checkpoint layout."""
+        for preshuffle in (False, True):
+            module = _quark_fp8_linear(32, in_features=64)
+            want_q, want_scale = k3_kv_b_for_absorb(module=module)
+            with (
+                self.subTest(preshuffle=preshuffle),
+                _quark_processing(fnuz=False, preshuffle=preshuffle),
+            ):
+                module.scheme.process_weights_after_loading(module)
+                got_q, got_scale = k3_kv_b_for_absorb(module=module)
+
+                self.assertEqual(got_q.shape, want_q.shape)
+                self.assertTrue(
+                    torch.equal(got_q.view(torch.uint8), want_q.view(torch.uint8))
+                )
+                torch.testing.assert_close(got_scale, want_scale, rtol=0, atol=0)
+
+
+_QUARK_FP8 = "sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8"
+
+
+def _aiter_shuffle_16x16(weight: torch.Tensor) -> torch.Tensor:
+    """AITER's shuffle_weight(layout=(16, 16)) for a one-byte [N, K] weight."""
+    n, k = weight.shape
+    return (
+        weight.view(n // 16, 16, k // 32, 2, 16)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+        .view(n, k)
+    )
+
+
+@contextlib.contextmanager
+def _quark_processing(*, fnuz: bool, preshuffle: bool = False):
+    """QuarkW8A8Fp8.process_weights_after_loading as an fnuz or OCP GPU runs it;
+    narrow partitions stay FP8, as K3's 128-row f_a does."""
+    with (
+        mock.patch(f"{_QUARK_FP8}._is_hip", False),
+        mock.patch(f"{_QUARK_FP8}._is_fp8_fnuz", fnuz),
+        # Both copies of the predicate, so the unshuffle sees what was shuffled.
+        mock.patch(f"{_QUARK_FP8}.use_aiter_bpreshuffle_gemm", return_value=preshuffle),
+        mock.patch(
+            "sglang.srt.layers.quantization.fp8_utils.use_aiter_bpreshuffle_gemm",
+            return_value=preshuffle,
+        ),
+        mock.patch(
+            f"{_QUARK_FP8}.shuffle_weight",
+            lambda weight, layout: _aiter_shuffle_16x16(weight),
+            create=True,
+        ),
+    ):
+        yield
 
 
 def _quark_fp8_linear(out_features: int, in_features: int = 16):
@@ -171,13 +224,14 @@ def _dequant(linear) -> torch.Tensor:
 
 
 class _QuarkFp8Config:
-    """Resolves every linear to Quark per-channel FP8 unless its prefix is excluded."""
+    """Resolves every linear to Quark per-channel FP8 unless its prefix or class
+    name is excluded; Quark's layer_type_quant_config matches the class name."""
 
     def __init__(self, excluded=()):
         self.excluded = excluded
 
     def get_quant_method(self, layer, prefix):
-        if prefix in self.excluded:
+        if prefix in self.excluded or type(layer).__name__ in self.excluded:
             return UnquantizedLinearMethod()
         layer.scheme = _quark_fp8_linear(1).scheme
         return QuarkLinearMethod(None)
@@ -270,6 +324,13 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         mods = _kda_inproj_linears(quant_config=quant_config)
         self.assertEqual(mods["qkvg_proj"].weight.shape[0], 32)
 
+    def test_tail_follows_the_quant_config_of_the_real_qkvg_class(self):
+        """A config that resolves [q,k,v,g] by class name must size the tail for
+        fused_qkvg_proj's own class, or the merge fails on a tail it cannot fill."""
+        quant_config = _QuarkFp8Config(excluded=("MergedColumnParallelLinear",))
+        mods = _kda_inproj_linears(quant_config=quant_config)
+        self.assertEqual(mods["qkvg_proj"].weight.shape[0], 32)
+
     def test_env_disables_the_tail(self):
         with envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.override(False):
             mods = _kda_inproj_linears()
@@ -301,6 +362,20 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         self.assertIsNone(f_b)
         self.assertIs(mods["qkvg_proj"].weight, weight)
         torch.testing.assert_close(weight.float(), before, rtol=0, atol=0)
+
+    def test_processed_state_from_an_fnuz_gpu_keeps_the_restored_tail(self):
+        """On e4m3fnuz GPUs (MI300) processing doubles every channel scale, the
+        merged pad rows' included; a correctly saved state must still restore."""
+        mods = _kda_inproj_linears()
+        k3_merge_kda_inproj_fp8(**mods)
+        with _quark_processing(fnuz=True):
+            for name in ("qkvg_proj", "f_a_proj", "b_proj", "f_b_proj"):
+                mods[name].scheme.process_weights_after_loading(mods[name])
+
+        sizes, f_b = k3_merge_kda_inproj_fp8(**mods)
+
+        self.assertEqual(sizes, [24, 8, 8, 3, 21])
+        self.assertIsNone(f_b)
 
     def test_processed_tail_that_was_never_merged_raises(self):
         """A state saved without the tail loads into a narrowed view and leaves the

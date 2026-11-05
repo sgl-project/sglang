@@ -24,7 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.linear import LinearBase, MergedColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
@@ -49,9 +49,9 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
 
 
 def k3_kv_b_for_absorb(
-    *, module: nn.Module, weight: torch.Tensor
+    *, module: nn.Module
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """kv_b for the MLA absorb BMMs from a per-channel FP8 weight.
+    """kv_b for the MLA absorb BMMs, [out, in], from a per-channel FP8 kv_b_proj.
 
     On gfx950 with AITER, requantize to per-tensor FP8 and return its scalar
     scale, so the absorb runs AITER's a8w8 BMM. Otherwise (or with
@@ -60,21 +60,41 @@ def k3_kv_b_for_absorb(
     """
     from sglang.srt.models.deepseek_common import utils as deepseek_utils
 
+    weight = _k3_channel_fp8_checkpoint_weight(module)
     # rocm_absorb_{q,v}_bmm only take the a8w8 BMM on gfx950 + AITER; elsewhere
     # an FP8 w_kc/w_vc would be dequantized back to BF16 after a lossy requant.
     if not (
         deepseek_utils._use_aiter_gfx95 and envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.get()
     ):
-        return _k3_channel_fp8_to_bf16(module, weight), None
+        return _k3_channel_fp8_to_bf16(module=module, weight=weight), None
 
     from sglang.srt.layers.quantization.fp8_utils import (
         channel_quant_to_tensor_quant,
     )
 
-    weight_scale = module.weight_scale
-    if weight_scale.dim() == 1:
-        weight_scale = weight_scale.view(-1, 1)
-    return channel_quant_to_tensor_quant(weight, weight_scale)
+    return channel_quant_to_tensor_quant(x_q_channel=weight, x_s=module.weight_scale)
+
+
+def _k3_channel_fp8_checkpoint_weight(module: nn.Module) -> torch.Tensor:
+    """module.weight as [out, in], undoing QuarkW8A8Fp8's post-processing if it ran.
+
+    Loaders that restore an already-processed state (ShardedStateLoader,
+    RemoteModelLoader) run post_load_weights on its transposed, maybe
+    AITER-preshuffled, [in, out] view.
+    """
+    weight = module.weight.data
+    if not _is_processed_quark_channel_fp8(module):
+        return weight
+    from sglang.srt.layers.quantization.fp8_utils import (
+        unshuffle_aiter_fp8_weight,
+        use_aiter_bpreshuffle_gemm,
+    )
+
+    weight = weight.t()
+    # QuarkW8A8Fp8 preshuffles on this same predicate of the [out, in] row count.
+    if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+        weight = unshuffle_aiter_fp8_weight(weight)
+    return weight
 
 
 def _is_quark_channel_fp8_scheme(module: nn.Module) -> bool:
@@ -125,9 +145,13 @@ def k3_kda_inproj_fp8_tail_rows(
         return 0
     # fused_qkvg_proj does not exist yet (its size is this answer), so resolve
     # its quant method on a weightless probe; [q,k,v,g] may be excluded alone.
-    qkvg_probe = LinearBase(
-        f_a_proj.weight.shape[1],
-        wide_rows,
+    # The probe keeps fused_qkvg_proj's class, which Quark's
+    # layer_type_quant_config matches by name; only LinearBase.__init__ runs.
+    qkvg_probe = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
+    LinearBase.__init__(
+        qkvg_probe,
+        input_size=f_a_proj.weight.shape[1],
+        output_size=wide_rows,
         quant_config=quant_config,
         prefix=qkvg_prefix,
     )
@@ -232,9 +256,13 @@ def _kda_inproj_fp8_processed_sizes(
     # A state saved without the tail loads into a narrowed view and leaves the
     # tail uninitialized. The weight may be preshuffled; the scales never are.
     scale = qkvg_proj.weight_scale.reshape(-1)
+    # The merge writes pad scales of 1.0, which processing may rescale like every
+    # channel (2x for e4m3fnuz), so ask only for one positive value.
+    pad_scale = scale[wide + n_fa + n_b :]
     if not (
         torch.equal(scale[wide : wide + n_fa], f_a_proj.weight_scale.reshape(-1))
-        and bool((scale[wide + n_fa + n_b :] == 1.0).all())
+        and bool((pad_scale > 0).all())
+        and bool((pad_scale == pad_scale[:1]).all())
     ):
         raise RuntimeError(
             "The restored fused_qkvg_proj tail does not hold the merged [f_a | b] "
