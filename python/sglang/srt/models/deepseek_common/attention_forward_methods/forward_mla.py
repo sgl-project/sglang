@@ -857,7 +857,6 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     k_nope,
                     forward_batch,
-                    save_kv_cache=save_kv_cache,
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
