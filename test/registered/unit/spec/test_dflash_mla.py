@@ -16,8 +16,8 @@ from transformers import Qwen3Config
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.loader import post_load_weights
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.models.dspark import DSparkDraftModel
@@ -373,12 +373,24 @@ class TestDFlashMLA(CustomTestCase):
         model = DSparkDraftModel(
             Qwen3Config(**_export_fields(), markov_rank=4, markov_head_type="vanilla")
         )
+        # The layers allocate uninitialized weights, which may hold NaN.
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.copy_(torch.randn_like(param) * 0.2)
         attn = model.layers[0].self_attn
+        with torch.no_grad():
+            for parameter in attn.parameters():
+                parameter.fill_(0.1)
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
             module.forward = module.forward_native
         # A real MLA pool also exposes the K/V buffer getters the GQA bundle probes.
+        from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+
         pool = Mock(spec=MLATokenToKVPool)
+        pool.start_layer = 0
+        pool.layer_router = PlainPoolRouter(pool, "full")
         ctx_hidden, positions = torch.randn(4, HIDDEN), torch.tensor([0, 1, 5, 6])
         loc_2d = torch.tensor([[3, 4], [8, 9]])
         commit_lens = torch.tensor([1, 2], dtype=torch.int32)

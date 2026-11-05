@@ -5,11 +5,8 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import (
-    get_ci_test_range,
-    get_jit_cuda_arch,
-    is_hip_runtime,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -42,7 +39,7 @@ TINY_GEMM_CASES = get_ci_test_range(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("n,k,num_tokens,out_dtype", TINY_GEMM_CASES)
 def test_tiny_gemm(n, k, num_tokens, out_dtype):
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         pytest.skip("SM90+ required")
 
     x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
@@ -58,7 +55,7 @@ def test_tiny_gemm(n, k, num_tokens, out_dtype):
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 16])
 def test_tiny_gemm_fp32_weights(num_tokens):
     """FP32 router weights are read in FP32: a BF16 read misses FP64 by ~1e-3."""
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         pytest.skip("SM90+ required")
 
     torch.manual_seed(42)

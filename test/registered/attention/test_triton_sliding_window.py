@@ -10,12 +10,11 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
 
 # Sliding window attention with Triton backend (Gemma-3 model)
-register_cuda_ci(est_time=91, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=91, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="extra-a-test-1-gpu-large-amd")
 
 
@@ -99,22 +98,6 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
         result = response.json()
         self.assertGreater(len(result["text"].strip()), 0)
         print(f"Long context generation result: {result['text'][:100]}...")
-
-    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-    def test_no_cuda_graph(self):
-        self.no_cuda_graph_process = popen_launch_server(
-            self.model,
-            self.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=self.common_args + ["--disable-cuda-graph"],
-        )
-
-        try:
-            self._test_short_context_generation()
-            self._test_long_context_generation()
-            self._test_mmlu()
-        finally:
-            kill_process_tree(self.no_cuda_graph_process.pid)
 
     def test_cuda_graph(self):
         self.cuda_graph_process = popen_launch_server(

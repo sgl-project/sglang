@@ -7,6 +7,14 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
     _attention_backend_fa3_fp8_fallback,
@@ -17,17 +25,15 @@ from sglang.srt.arg_groups.overrides import (
     _deterministic_rocm_rccl_check,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
+    _hybrid_swa_memory_backend_disable,
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
-    attention_backends_of,
     declare_resolution,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
+)
+from sglang.srt.arg_groups.platform_hook import (
+    handle_sail_attention_backend_compatibility,
 )
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
@@ -118,6 +124,8 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
+
+    handle_sail_attention_backend_compatibility(server_args)
 
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
@@ -270,6 +278,9 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
+
+    # Needs the final prefill and decode backends.
+    run_post_process_pass(server_args, _hybrid_swa_memory_backend_disable)
 
     # XPU platforms backends
     if cfg.dcp_size > 1 and get_platform().is_xpu:
@@ -578,7 +589,7 @@ def handle_multi_item_scoring(server_args: Any):
 
 
 def handle_deterministic_inference(server_args: Any):
-    from sglang.srt.server_args import (
+    from sglang.srt.arg_groups.choices import (
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
 

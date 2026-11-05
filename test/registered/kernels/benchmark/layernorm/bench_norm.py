@@ -4,11 +4,17 @@ import torch
 import triton
 import triton.testing
 from flashinfer.norm import fused_add_rmsnorm as fi_fused_add_rmsnorm
+from flashinfer.norm import fused_add_rmsnorm_quant as fi_fused_add_rmsnorm_quant
 from flashinfer.norm import rmsnorm as fi_rmsnorm
+from flashinfer.norm import rmsnorm_quant as fi_rmsnorm_quant
 
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.kernels.ops.layernorm.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+from sglang.kernels.ops.layernorm.norm import (
+    fused_add_rmsnorm_quant as jit_fused_add_rmsnorm_quant,
+)
 from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
+from sglang.kernels.ops.layernorm.norm import rmsnorm_quant as jit_rmsnorm_quant
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -94,9 +100,86 @@ def benchmark_fused_add_rmsnorm(hidden_size: int, batch_size: int, provider: str
     return run_benchmark(f, scale=NUM_LAYERS)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["hidden_size", "batch_size"],
+        x_vals=configs_1,
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name="rmsnorm-quant-performance",
+        args={},
+    )
+)
+def benchmark_rmsnorm_quant(hidden_size: int, batch_size: int, provider: str):
+    input = torch.randn(
+        (NUM_LAYERS, batch_size, hidden_size), dtype=DTYPE, device=DEVICE
+    )
+    weight = torch.randn((NUM_LAYERS, hidden_size), dtype=DTYPE, device=DEVICE)
+    out = torch.empty(
+        (NUM_LAYERS, batch_size, hidden_size), dtype=torch.float8_e4m3fn, device=DEVICE
+    )
+    scale = torch.full((1,), 0.05, dtype=torch.float32, device=DEVICE)
+
+    def f():
+        for i in range(NUM_LAYERS):
+            if provider == "jit":
+                jit_rmsnorm_quant(input[i], weight[i], scale, out[i])
+            else:
+                fi_rmsnorm_quant(out[i], input[i], weight[i], scale)
+
+    return run_benchmark(f, scale=NUM_LAYERS)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["hidden_size", "batch_size"],
+        x_vals=configs_1,
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name="fused-add-rmsnorm-quant-performance",
+        args={},
+    )
+)
+def benchmark_fused_add_rmsnorm_quant(hidden_size: int, batch_size: int, provider: str):
+    input = torch.randn(
+        (NUM_LAYERS, batch_size, hidden_size), dtype=DTYPE, device=DEVICE
+    )
+    residual = torch.randn_like(input)
+    weight = torch.randn((NUM_LAYERS, hidden_size), dtype=DTYPE, device=DEVICE)
+    out = torch.empty(
+        (NUM_LAYERS, batch_size, hidden_size), dtype=torch.float8_e4m3fn, device=DEVICE
+    )
+    scale = torch.full((1,), 0.05, dtype=torch.float32, device=DEVICE)
+
+    def f():
+        for i in range(NUM_LAYERS):
+            if provider == "jit":
+                jit_fused_add_rmsnorm_quant(
+                    input[i], residual[i], weight[i], scale, out[i]
+                )
+            else:
+                fi_fused_add_rmsnorm_quant(
+                    out[i], input[i], residual[i], weight[i], scale
+                )
+
+    return run_benchmark(f, scale=NUM_LAYERS)
+
+
 if __name__ == "__main__":
     print("Benchmarking rmsnorm...")
     benchmark_rmsnorm.run(print_data=True)
 
     print("Benchmarking fused_add_rmsnorm...")
     benchmark_fused_add_rmsnorm.run(print_data=True)
+
+    print("Benchmarking rmsnorm_quant...")
+    benchmark_rmsnorm_quant.run(print_data=True)
+
+    print("Benchmarking fused_add_rmsnorm_quant...")
+    benchmark_fused_add_rmsnorm_quant.run(print_data=True)

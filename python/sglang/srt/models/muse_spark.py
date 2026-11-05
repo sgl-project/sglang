@@ -393,8 +393,8 @@ class MuseSpark1xAttention(nn.Module):
         ):
             return None
         cache_loc = backend._get_layer_cache_loc(self.attn, forward_batch)
-        k_cache = pool.get_key_buffer(self.layer_idx)
-        v_cache = pool.get_value_buffer(self.layer_idx)
+        k_cache = pool.layer_router.read(self.layer_idx).key()
+        v_cache = pool.layer_router.read(self.layer_idx).value()
         return (
             k_cache.view(k_cache.shape[0], -1),
             v_cache.view(v_cache.shape[0], -1),

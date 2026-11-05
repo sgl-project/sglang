@@ -37,6 +37,17 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.utils.common import human_readable_int
 
 
+def _paged_experts_num_resident(value: str) -> Optional[int]:
+    """``auto`` (None: as many as fit, sized after loading) or a positive count."""
+    if value == "auto":
+        return None
+    if value.isdigit() and int(value) > 0:
+        return int(value)
+    raise argparse.ArgumentTypeError(
+        f"must be 'auto' or a positive count, got {value!r}"
+    )
+
+
 class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
@@ -182,6 +193,10 @@ class ExecFeatures(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -229,7 +244,7 @@ class ExecKernel(msgspec.Struct):
     ] = None
     enable_nvidia_megakernel: A[
         bool,
-        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package, or for MiniMax-M3.1 from the SGLang plugin of the MSA package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
     enable_amd_monokernel: A[
         bool,
@@ -276,7 +291,7 @@ class ExecKernel(msgspec.Struct):
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'halops' (MXFP8 w8a8 dense GEMM from the optional HALOps wheel; SM100 only). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -326,9 +341,17 @@ class ExecKernel(msgspec.Struct):
             help=(
                 "DeepSeek-V4 sparse prefill backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path; "
+                "'cutedsl_h16' enables experimental DeepSeek-V4 BF16 sparse "
+                "prefill for 16 TP-local query heads on SM90. Only ordinary "
+                "eager prefill uses H16; graph, speculative, TBO, CP and "
+                "bounded-replay paths retain the existing backend. "
+                "DeepSeek-V4.1 is not supported. Padded combined TOPK is limited "
+                "to 16384 (including the SWA window); the default 1M context "
+                "fits this limit. Sparse-prefill threshold and environment "
+                "selection remain unchanged."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8", "cutedsl_h16"],
         ),
     ] = "auto"
     dsa_triton_union: A[
@@ -799,7 +822,7 @@ class ExecComm(msgspec.Struct):
         Arg(
             help=(
                 "Disable Aiter AllReduce Fusion for prefill batches "
-                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "(EXTEND / MIXED) while keeping it for decode. "
                 "Only meaningful with --enable-aiter-allreduce-fusion."
             ),
             resolvable=True,
@@ -1009,16 +1032,22 @@ class ExecMoe(msgspec.Struct):
     # -------------------------------------------------------------------------
     enable_paged_experts: A[
         bool,
-        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
-        "the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
+        "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
         "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
         "graphs must be breakable or disabled.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],
-        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
-        "--enable-paged-experts; at least the router's top-k.",
+        Arg(
+            help="Number of routed experts per MoE layer kept resident on the GPU, at least the "
+            "router's top-k; or 'auto' (the default): as many as fit in --mem-fraction-static "
+            "next to a KV cache of --max-total-tokens, else of up to --max-running-requests, if "
+            "you set it (else 1), requests of --context-length (default: the model's), at "
+            "least one.",
+            type_parser=_paged_experts_num_resident,
+        ),
     ] = None
 
     # -------------------------------------------------------------------------

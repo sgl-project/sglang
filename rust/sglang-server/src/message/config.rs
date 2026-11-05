@@ -14,7 +14,7 @@
 //! constructor argument, so a drifted caller fails at boot rather than running
 //! on a silently-defaulted knob. The `#[pyo3::pymethods]` constructors below
 //! each struct — plus the hand-written extractions,
-//! [`PreferredSamplingParams`] and [`LaunchServerInfo`] — are the only
+//! [`PreferredSamplingParams`] and [`JsonObject`] — are the only
 //! Python-facing code in this file;
 //! the rest is pure Rust.
 
@@ -36,13 +36,17 @@ pub struct RustServerServerArgs {
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
     pub stage_channel_cap: usize,
-    /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
-    /// the scheduler's reserved launch cores). `None` → run unpinned.
+    /// CPU core ids every frontend thread is pinned to, as one shared set (e.g.
+    /// this rank's NUMA-local cores minus the scheduler's reserved launch
+    /// cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
     /// This listener serves the node's `/metrics` (when metrics are on). Only
     /// the base port does: every listener would render the same node-wide
     /// files, so a scraper of each DP rank's port would count them N times.
     pub metrics_listener: bool,
+    /// How long a drain's listeners keep open connections once its requests
+    /// finished (see `CoreHandle::drain_close_deadline`).
+    pub graceful_close_timeout: std::time::Duration,
 }
 
 impl Default for RustServerServerArgs {
@@ -56,6 +60,7 @@ impl Default for RustServerServerArgs {
             stage_channel_cap: 8192,
             cores: None,
             metrics_listener: true,
+            graceful_close_timeout: crate::api_server::handlers::GRACEFUL_CLOSE_TIMEOUT,
         }
     }
 }
@@ -211,7 +216,11 @@ pub struct ServerArgs {
     pub deployment_info: DeploymentInfo,
     /// Python's `/server_info` fields that are fixed at launch, which
     /// `/server_info` reports beneath its runtime fields.
-    pub launch_server_info: LaunchServerInfo,
+    pub launch_server_info: JsonObject,
+    /// Python's `/model_info` fields that are fixed at launch (the model's
+    /// modalities, `model_type`, `architectures`, its embedding plan), which
+    /// `/model_info` reports after its typed fields.
+    pub launch_model_info: JsonObject,
     /// The scheduler's shared-memory load snapshot file, its DP rank count and
     /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
     /// go over ZMQ instead), plus the accelerator name and per-rank count that
@@ -273,6 +282,7 @@ impl ServerArgs {
         max_total_num_tokens,
         deployment_info,
         launch_server_info,
+        launch_model_info,
         load_snapshot_path,
         load_snapshot_dp_size,
         load_snapshot_dp_rank,
@@ -326,7 +336,8 @@ impl ServerArgs {
         version: String,
         max_total_num_tokens: u64,
         deployment_info: DeploymentInfo,
-        launch_server_info: LaunchServerInfo,
+        launch_server_info: JsonObject,
+        launch_model_info: JsonObject,
         load_snapshot_path: Option<String>,
         load_snapshot_dp_size: usize,
         load_snapshot_dp_rank: usize,
@@ -380,6 +391,7 @@ impl ServerArgs {
             max_total_num_tokens,
             deployment_info,
             launch_server_info,
+            launch_model_info,
             load_snapshot_path,
             load_snapshot_dp_size,
             load_snapshot_dp_rank,
@@ -439,7 +451,8 @@ impl Default for ServerArgs {
             version: String::new(),
             max_total_num_tokens: 0,
             deployment_info: DeploymentInfo::default(),
-            launch_server_info: LaunchServerInfo::default(),
+            launch_server_info: JsonObject::default(),
+            launch_model_info: JsonObject::default(),
             load_snapshot_path: None,
             load_snapshot_dp_size: 0,
             load_snapshot_dp_rank: 0,
@@ -472,6 +485,14 @@ pub struct DeploymentInfo {
     pub hicache_write_policy: Option<String>,
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
+    pub rust_server_endpoints: Vec<RustServerEndpoint>,
+}
+
+/// One DP rank's listener, as a base URL (`http://host:port`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RustServerEndpoint {
+    pub dp_rank: u32,
+    pub endpoint: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -591,14 +612,15 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
     }
 }
 
-/// Python's launch-time `/server_info` fields (`rust_server/config.py`'s
-/// `_launch_server_info`: the resolved `server_args`, `launch_command`, the
-/// scheduler's init info, `kv_events`), carried verbatim as one JSON object.
-/// `Arc` because every `/server_info` response starts from a copy.
+/// A launch-time JSON object Python computes and the Rust server reports
+/// verbatim: `rust_server/config.py`'s `_launch_server_info` (the resolved
+/// `server_args`, `launch_command`, the scheduler's init info, `kv_events`)
+/// and its `/model_info` fields. `Arc` because every response starts from a
+/// copy.
 #[derive(Clone, Debug, Default)]
-pub struct LaunchServerInfo(pub Arc<serde_json::Map<String, serde_json::Value>>);
+pub struct JsonObject(pub Arc<serde_json::Map<String, serde_json::Value>>);
 
-impl<'py> pyo3::FromPyObject<'_, 'py> for LaunchServerInfo {
+impl<'py> pyo3::FromPyObject<'_, 'py> for JsonObject {
     type Error = pyo3::PyErr;
 
     fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
@@ -606,10 +628,10 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for LaunchServerInfo {
         match serde_json::from_str(&text) {
             Ok(serde_json::Value::Object(fields)) => Ok(Self(Arc::new(fields))),
             Ok(_) => Err(pyo3::exceptions::PyValueError::new_err(
-                "launch_server_info must be a JSON object",
+                "expected a JSON object",
             )),
             Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "launch_server_info is not valid JSON: {e}"
+                "expected a JSON object, got invalid JSON: {e}"
             ))),
         }
     }

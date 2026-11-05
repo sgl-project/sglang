@@ -8,11 +8,11 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=25, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
 
 HIDDEN = 2048
 HEAD_DIM = 512
@@ -319,7 +319,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
             with self.subTest(ratio=ratio):
                 self._check_step(_build(64, ratio, seed=164 + ratio), ratio)
 
-    @unittest.skipUnless(is_hip(), "HIP fused pair-state writer")
     def test_pair_state_survives_the_next_decode_step(self):
         t = _build(8, 2, seed=3000)
         t.req.copy_(t.req.roll(1))
@@ -343,7 +342,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
         self._check_step(t, 2)
         self.assertTrue(torch.equal(state, expected_state))
 
-    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_padded_rows_publish_nothing(self):
         """A padded graph suffix carries raw_out_loc == 0 and out_loc == 0, which
         both kernels must read off the arrays (the caller passes no mask)."""
@@ -371,7 +369,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 else:
                     self.assertFalse(t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any())
 
-    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_open_group_rows_publish_nothing(self):
         """A live ratio-2 token at an even position completes no group, so the metadata
         gives it c2_out_loc == -1; an index-K writer taking that -1 straight from

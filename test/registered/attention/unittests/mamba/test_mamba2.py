@@ -8,7 +8,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention import (
     DEFAULT_CONV_KERNEL,
@@ -206,6 +206,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         fb = SimpleNamespace(
             batch_size=bs,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
@@ -289,6 +290,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         return SimpleNamespace(
             batch_size=3,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             req_pool_indices=object(),
             seq_lens=object(),
             seq_lens_cpu=object(),

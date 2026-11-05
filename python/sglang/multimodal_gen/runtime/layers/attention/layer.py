@@ -1629,9 +1629,9 @@ class USPAttention(nn.Module):
         v_prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, rows, heads = q.shape[:3]
-        ulysses = get_ulysses_parallel_world_size()
         skip_sp = self.skip_sequence_parallel or skip_sequence_parallel_override
-        if qkv_pre_all_to_all and not skip_sp and ulysses > 1:
+        if qkv_pre_all_to_all and not skip_sp:
+            ulysses = get_ulysses_parallel_world_size()
             # q arrives head-sharded; the output all-to-all shards it by rows.
             rows, heads = rows // ulysses, heads * ulysses
         if q_prefix is not None and attn_mask is not None:
@@ -2450,21 +2450,12 @@ def _make_breakable_attention_forward(forward_method):
     pass-through to the original method.
     """
 
-    @eager_on_graph
-    def bcg_forward(self, *args, out, **kwargs):
-        result = forward_method(self, *args, **kwargs)
-        outs, results = (out, result) if isinstance(out, tuple) else ((out,), (result,))
-        for dst, src in zip(outs, results, strict=True):
-            if dst is None and src is None:
-                continue
-            # copy_ would broadcast a mispredicted shape or cast a dtype silently.
-            assert (
-                dst is not None
-                and src is not None
-                and dst.shape == src.shape
-                and dst.dtype == src.dtype
-            ), "BCG attention output mispredicted"
-            dst.copy_(src)
+    bcg_forward = eager_on_graph(
+        forward_method,
+        output_factory=lambda self, *args, **kwargs: self._new_bcg_output(
+            *args, **kwargs
+        ),
+    )
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
@@ -2483,9 +2474,7 @@ def _make_breakable_attention_forward(forward_method):
                 )
             )
             if not capture_dense:
-                out = self._new_bcg_output(*args, **kwargs)
-                bcg_forward(self, *args, **kwargs, out=out)
-                return out
+                return bcg_forward(self, *args, **kwargs)
         return forward_method(self, *args, **kwargs)
 
     return forward

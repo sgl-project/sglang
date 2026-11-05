@@ -33,12 +33,7 @@ from sglang.srt.arg_groups.arg_utils import (
     resolvable_fields,
     with_fallback,
 )
-
-# Compatibility re-exports; model providers import model_override_base directly.
-from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
-    _MODEL_OVERRIDE_FNS,
-    _PREDICATE_OVERRIDE_FNS,
-    MODEL_OVERRIDES,
+from sglang.srt.arg_groups.model_override_base import (
     ResolvedView,
     ResolvingConfig,
     _declaration_overlay,
@@ -47,10 +42,8 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
-    mamba_extra_buffer_of,
     model_config_of,
     record_of,
-    register_model_override,
     register_model_override_predicate,
     resolved_view,
     resolving_view,
@@ -370,6 +363,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -427,6 +421,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
@@ -440,8 +435,6 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
-        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
@@ -490,10 +483,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     """Default DSA KV-cache dtype before resolving split attention backends."""
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -506,6 +500,9 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             )
             return {"kv_cache_dtype": "bfloat16"}
         return {}
+
+    if kimi_k31:
+        return _kimi_k31_kv_cache_dtype(view)
 
     import torch
 
@@ -566,6 +563,15 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
+    if hip and dcp_size > 1:
+        no_dcp_path = chosen - {"triton", None}
+        if no_dcp_path:
+            raise ValueError(
+                f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
+                "on ROCm; use --dsa-prefill-backend triton --dsa-decode-backend "
+                "triton with --dcp-size > 1."
+            )
+
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
     if prefill_backend != "tilelang" or decode_backend != "tilelang":
@@ -603,10 +609,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     HiSparse settings take precedence when enabled.
     """
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -629,6 +636,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     import torch
 
     major, _ = torch.cuda.get_device_capability()
+    if kimi_k31:
+        return _kimi_k31_dsa_backends(view)
+
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
@@ -643,18 +653,14 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     if getattr(hf_config, "learnable_sink", False):
         backend = "flashmla_sparse"
-        for field in ("dsa_prefill_backend", "dsa_decode_backend"):
-            value = getattr(view, field)
-            if value is not None and value != backend:
-                option = "--" + field.replace("_", "-")
-                raise ValueError(
-                    f"{model_arch} uses learnable attention sinks and requires "
-                    f"{option} {backend!r}; got {value!r}"
-                )
-        if not user_set_prefill:
-            declared["dsa_prefill_backend"] = backend
-        if not user_set_decode:
-            declared["dsa_decode_backend"] = backend
+        declared = _pin_dsa_backends(
+            view,
+            backend,
+            lambda option, value: (
+                f"{model_arch} uses learnable attention sinks and requires "
+                f"{option} {backend!r}; got {value!r}"
+            ),
+        )
         logger.warning(
             "Set DSA backends for learnable attention sinks: "
             f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
@@ -741,6 +747,58 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     return declared
 
 
+def _pin_dsa_backends(
+    view: Any, backend: str, mismatch_error: Callable[[str, str], str]
+) -> Dict[str, Any]:
+    declared: Dict[str, Any] = {}
+    for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+        value = getattr(view, field)
+        if value is None:
+            declared[field] = backend
+        elif value != backend:
+            option = "--" + field.replace("_", "-")
+            raise ValueError(mismatch_error(option, value))
+    return declared
+
+
+# Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
+_KIMI_K31_DSA_BACKEND = "flashmla_kv"
+# ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
+_KIMI_K31_DSA_BACKEND_HIP = "triton"
+
+
+def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
+    if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+        raise ValueError(
+            "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
+            f"fp8_ds_mla format); got {view.kv_cache_dtype!r}."
+        )
+    if view.kv_cache_dtype != "fp8_e4m3":
+        logger.warning("Setting KV cache dtype to fp8_e4m3 for Kimi-K3.1.")
+        return {"kv_cache_dtype": "fp8_e4m3"}
+    return {}
+
+
+def _kimi_k31_dsa_backends(view: Any) -> dict:
+    if view.enable_hisparse:
+        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
+    backend = (
+        _KIMI_K31_DSA_BACKEND_HIP if get_platform().is_hip else _KIMI_K31_DSA_BACKEND
+    )
+    declared = _pin_dsa_backends(
+        view,
+        backend,
+        lambda option, value: (
+            f"Kimi-K3.1 requires {option} {backend!r} to match "
+            f"the reference fp8_ds_mla numerics; got {value!r}."
+        ),
+    )
+    logger.warning(
+        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
+    )
+    return declared
+
+
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
@@ -756,6 +814,8 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
+        "Xing4_0ForCausalLM",
+        "KimiK31ForConditionalGeneration",
     }
 )
 
@@ -941,12 +1001,14 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         "NemotronH_Omni_Reasoning_V3",
+        "Xing4_0ForCausalLM",
     }
 )
 
@@ -972,7 +1034,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
             and view.tp_size in SUPPORTED_TP_SIZES
             and view.attn_cp_size == 1
             and not view.encoder_only
-            and not view.enable_pdmux
         ):
             return {}
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
@@ -1053,6 +1114,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm4MoeLiteForCausalLM",
+            "Xing4_0ForCausalLM",
         ]
     except Exception:
         return False
@@ -1093,11 +1155,58 @@ def _deterministic_rocm_rccl_check(view: Any) -> dict:
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
-    from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+    from sglang.srt.arg_groups.choices import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+
+    # Views without the per-phase fields (e.g. partial views in tests) mean unset.
+    prefill_backend = getattr(view, "prefill_attention_backend", None)
+    decode_backend = getattr(view, "decode_attention_backend", None)
+
+    decode_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
+    decode_note = ""
+    if decode_backend == "aiter":
+        # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
+        # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch
+        # size, and speculative decoding would run AITER's unverified verify kernels.
+        if (
+            is_gfx95_supported()
+            and not use_mla_backend(view)
+            and view.speculative_algorithm is None
+        ):
+            decode_choices.append("aiter")
+        else:
+            decode_note = (
+                " (aiter decode is accepted only on gfx950, for non-MLA models and "
+                "without speculative decoding)"
+            )
+
+    # A per-phase backend overrides --attention-backend for its phase. Unset (None)
+    # means the phase uses --attention-backend, which is checked below.
+    for flag, backend, choices, note in (
+        (
+            "--prefill-attention-backend",
+            prefill_backend,
+            DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
+            "",
+        ),
+        (
+            "--decode-attention-backend",
+            decode_backend,
+            decode_choices,
+            decode_note,
+        ),
+    ):
+        if backend is not None and backend not in choices:
+            raise ValueError(
+                f"Currently only {choices} attention backends are supported for deterministic inference, "
+                f"but {flag} is '{backend}'{note}."
+            )
 
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
-        if get_platform().is_sm100 or get_platform().is_sm120:
+        if get_platform().is_xpu:
+            # fa3 and flashinfer have no XPU kernels.
+            backend = "intel_xpu"
+        elif get_platform().is_sm100 or get_platform().is_sm120:
             # Blackwell and newer architectures
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer
@@ -1321,14 +1430,45 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 
 @register_post_process
+def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
+    if view.disable_hybrid_swa_memory:
+        return {}
+    from sglang.srt.configs.model_config import is_layer_types_hybrid_swa_model
+
+    model_config = model_config_of(view)
+    architectures = model_config.hf_config.architectures
+    if not is_layer_types_hybrid_swa_model(architectures, model_config.hf_text_config):
+        return {}
+    # aiter: with the SWA pool it serves these models through unified_attention,
+    # which loses a passkey 32K tokens back on Gemma 3 that triton retrieves;
+    # drop it here once unified_attention retrieves it too.
+    # wave, flex_attention: they never translate full-pool slots into SWA ones.
+    backends = [
+        backend
+        for backend in attention_backends_of(view)
+        if backend in ("aiter", "wave", "flex_attention")
+    ]
+    if not backends:
+        return {}
+    logger.warning(
+        f"Disable hybrid SWA memory for {architectures[0]} on the {backends[0]} attention backend."
+    )
+    return {"disable_hybrid_swa_memory": True}
+
+
+@register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
     prefill_backend, decode_backend = attention_backends_of(view)
     if "intel_xpu" in (prefill_backend, decode_backend):
-        supported_page_sizes = [64, 128]
-        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes.extend([16, 32])
-            msg = msg + " for MLA"
+            # sgl_kernel's mla_decode accepts only these; it has no page_size 1 path.
+            supported_page_sizes = [16, 32, 64, 128]
+            msg = "Intel XPU attention backend for MLA"
+        else:
+            # MHA page_size 1 goes through sgl_kernel's workaround (KV gather +
+            # non-paged varlen attention); the paged kernel accepts only 64/128.
+            supported_page_sizes = [1, 64, 128]
+            msg = "Intel XPU attention backend"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
@@ -1482,7 +1622,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     # load with gate and up exchanged. Leave the backend at "auto" and let
     # create_moe_runner resolve it to ASCEND.
     if view.quantization == "mxfp8" and not get_platform().is_npu:
-        from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
+        from sglang.srt.arg_groups.choices import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
@@ -1659,7 +1799,7 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 @register_post_process
 def _gguf_quantization(view: Any) -> dict:
-    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+    from sglang.srt.utils.hf_transformers import check_gguf_file
 
     if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
         view.model_path
@@ -1805,9 +1945,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if cfg.device != "cuda":
         return False
-    if cfg.dcp_size != 1:
+    if cfg.dcp_size != 1 and not cfg.enable_unified_memory:
         return False
-    if mla_enabled:
+    if mla_enabled and not cfg.enable_unified_memory:
         return False
     if cfg.prefill_only_disable_kv_cache:
         return False
@@ -1823,18 +1963,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
-    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
-    if cfg.enable_unified_memory:
-        from sglang.srt.configs.hybrid_arch import mambaish_config
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
-            return False
-        # The solver budgets these independent draft pools again after capture.
-        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
-        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
-            return False
 
     if (
         cfg.disaggregation_mode != "prefill"
@@ -1903,7 +2032,7 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
     # model never loads an HF config) is honored as-is; otherwise the memo
     # is only kept once the record is resolved, because `page_size` below
     # is resolution-written.
-    from sglang.srt.arg_groups.overrides import model_config_of
+    from sglang.srt.arg_groups.model_override_base import model_config_of
 
     if not hasattr(server_args, "_mamba_cache_chunk_size"):
         try:

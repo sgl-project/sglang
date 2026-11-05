@@ -358,8 +358,8 @@ jobs:
           cargo build --locked --release --workspace
 
       # Install SGLang from the local checkout in editable mode (no PyPI
-      # version pin) — mirrors `pr-test-rust.yml` so the router e2e runs
-      # against whatever SGLang version is on the branch. Replaces the
+      # version pin) so the router e2e runs against whatever SGLang version
+      # is on the branch. Replaces the
       # previous `pip install sglang[srt]==X.Y.Z` pin, which forced the
       # e2e to test against a stale wheel and would silently miss any
       # new ServerArgs field (e.g. `disaggregation_mode` /

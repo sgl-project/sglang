@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -107,8 +107,8 @@ def _extend_runner(raw_bs):
         extend_seq_lens_cpu=[width] * raw_bs,
         seq_lens_sum=None,
         out_cache_loc_virtual=None,
-        kv_loc_plan=None,
-        kv_loc_cols=None,
+        iteration_ids=None,
+        iteration_cols=None,
         spec_info=SimpleNamespace(
             num_correct_drafts=torch.zeros(raw_bs, dtype=torch.int32),
             num_accept_tokens=torch.ones(raw_bs, dtype=torch.int32),

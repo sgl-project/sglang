@@ -18,12 +18,16 @@ from sglang.srt.models.qwen4_exp import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import set_weight_attrs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_xpu_ci(est_time=45, suite="stage-b-test-1-gpu-xpu")
+
+_accelerator = torch.accelerator.current_accelerator()
+DEVICE = _accelerator.type if _accelerator is not None else None
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required for this test."
+    DEVICE not in ("cuda", "xpu"), reason="a CUDA or XPU device is required."
 )
 
 
@@ -39,7 +43,7 @@ def _make_source_embedding(
 ):
     local_rows = vocab_end - vocab_start
     weight = nn.Parameter(
-        torch.empty((local_rows, embedding_dim), dtype=dtype, device="cuda"),
+        torch.empty((local_rows, embedding_dim), dtype=dtype, device=DEVICE),
         requires_grad=False,
     )
     set_weight_attrs(
@@ -97,12 +101,12 @@ def _load_rows(offloaded, rows, *, pinned=True):
 def test_qwen4_ple_pinned_gather_tp1(input_dtype, embedding_dim):
     source = _make_source_embedding(embedding_dim=embedding_dim)
     offloaded = Qwen4ExpPinnedHostEmbedding(source)
-    rows = torch.arange(8 * embedding_dim, dtype=torch.bfloat16, device="cuda").reshape(
+    rows = torch.arange(8 * embedding_dim, dtype=torch.bfloat16, device=DEVICE).reshape(
         8, embedding_dim
     )
     _load_rows(offloaded, rows)
 
-    ids = torch.tensor([[0, 7, 3], [4, 1, 6]], dtype=input_dtype, device="cuda")
+    ids = torch.tensor([[0, 7, 3], [4, 1, 6]], dtype=input_dtype, device=DEVICE)
     expected = rows.index_select(0, ids.long().flatten()).reshape(
         *ids.shape, embedding_dim
     )
@@ -123,17 +127,17 @@ def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
         tp_size=2,
     )
     offloaded = Qwen4ExpPinnedHostEmbedding(source)
-    rows = torch.arange(8 * embedding_dim, dtype=torch.bfloat16, device="cuda").reshape(
+    rows = torch.arange(8 * embedding_dim, dtype=torch.bfloat16, device=DEVICE).reshape(
         8, embedding_dim
     )
     _load_rows(offloaded, rows)
 
-    ids = torch.tensor([[-1, 3, 4], [7, 8, 100]], device="cuda")
+    ids = torch.tensor([[-1, 3, 4], [7, 8, 100]], device=DEVICE)
     output = torch.full(
         (*ids.shape, embedding_dim),
         torch.nan,
         dtype=torch.bfloat16,
-        device="cuda",
+        device=DEVICE,
     )
     actual = offloaded.gather(ids, out=output)
     expected = torch.zeros_like(output)
@@ -146,8 +150,8 @@ def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
 
 def test_qwen4_ple_pinned_gather_empty_input():
     offloaded = Qwen4ExpPinnedHostEmbedding(_make_source_embedding())
-    _load_rows(offloaded, torch.zeros((8, 7), dtype=torch.bfloat16, device="cuda"))
-    ids = torch.empty((0, 3), dtype=torch.int64, device="cuda")
+    _load_rows(offloaded, torch.zeros((8, 7), dtype=torch.bfloat16, device=DEVICE))
+    ids = torch.empty((0, 3), dtype=torch.int64, device=DEVICE)
     actual = offloaded.gather(ids)
     assert actual.shape == (0, 3, 7)
     assert actual.numel() == 0
@@ -171,7 +175,7 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     )
     layer._graph_prefetch_buffers = {}
     layer._eager_prefetch_buffer = None
-    lookup_ids = torch.empty((0,), dtype=torch.int64, device="cuda")
+    lookup_ids = torch.empty((0,), dtype=torch.int64, device=DEVICE)
 
     monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: False)
     eager_large = layer._get_prefetch_buffer(8, lookup_ids)
@@ -224,18 +228,18 @@ def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
         eos_token_id=1,
         ple_offload_embedding=True,
     )
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    base = torch.cuda.memory_allocated()
-    with torch.device("cuda"):  # the model loader builds every layer this way
+    torch.accelerator.synchronize()
+    torch.accelerator.reset_peak_memory_stats()
+    base = torch.accelerator.memory_allocated()
+    with torch.device(DEVICE):  # the model loader builds every layer this way
         layer = Qwen4ExpPLELayer(config, prefix="ple", layer_id=0, ple_layer_index=0)
-    peak = torch.cuda.max_memory_allocated() - base
+    peak = torch.accelerator.max_memory_allocated() - base
 
     emb = layer.ple_embedding.ngram_embedding
     table_bytes = emb.weight.numel() * emb.weight.element_size()
     assert peak < table_bytes // 2, (peak, table_bytes)
     assert emb.weight.device.type == "cpu" and emb.weight.is_pinned()
-    assert emb.weight_scale.is_cuda
+    assert emb.weight_scale.device.type == DEVICE
     assert not any(t.is_meta for t in (*layer.parameters(), *layer.buffers()))
 
 

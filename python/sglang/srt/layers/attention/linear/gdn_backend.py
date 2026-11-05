@@ -30,6 +30,10 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     build_track_rows,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    stage_pool_states,
+    unstage_pool_states,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
@@ -37,9 +41,12 @@ from sglang.srt.layers.attention.linear.utils import (
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -242,7 +249,9 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         or not 1 <= chunk_size <= max_chunk
         or getattr(config, "linear_key_head_dim", None) != 128
         or getattr(config, "linear_value_head_dim", None) != 128
-        or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+        or model_runner.token_to_kv_pool.layer_router.part_view(
+            STATE_PART
+        ).mamba_cache.temporal.dtype
         != expected_state_dtype
     ):
         return None
@@ -545,14 +554,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
+    def _create_kernel_dispatcher(self, backends):
+        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
         if not is_cpu() and not is_npu():
             assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -561,9 +571,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
-        self.kernel_dispatcher = GDNKernelDispatcher(
-            backends.decode, backends.prefill, backends.verify
-        )
+        self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -591,7 +599,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             get_prefill_num_tokens_to_capture,
         )
 
-        mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        mamba_cache = self.state_pool.mamba_cache
         capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
         supported = (
             is_cuda()
@@ -677,7 +685,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
         )
+        if track_rows is None and forward_batch.mamba_track_indices is not None:
+            meta.track_dst[: forward_batch.batch_size].copy_(
+                forward_batch.mamba_track_indices
+            )
         self.prefill_graph_metadata = meta
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=meta.cu_seqlens,
+            mamba_cache_indices=meta.cache_indices,
+            mamba_track_indices=None
+            if forward_batch.mamba_track_indices is None
+            else meta.track_dst[: forward_batch.batch_size],
+        )
 
     def _prefill_graph_track_rows(
         self, forward_batch: ForwardBatch
@@ -785,17 +804,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return
 
         metadata = self.forward_metadata
-        mamba_pool = self.req_to_token_pool.mamba_pool
+        mamba_pool = self.state_pool
         mamba_cache = mamba_pool.mamba_cache
-        is_gdn_replayssm = not getattr(mamba_pool, "replayssm_is_kda", False)
+        is_gdn_replayssm = not mamba_pool.replayssm_is_kda
         use_replayssm_fold = (
             mamba_cache.replayssm_rawv is not None
-            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and mamba_pool.replayssm_spec_fold
             and is_gdn_replayssm
         )
         use_replayssm_spec = (
             mamba_cache.replayssm_d is not None
-            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and mamba_pool.replayssm_cache_base is not None
             and is_gdn_replayssm
         )
         self._use_strided_target_verify_qkv = self._target_verify_supports_strided_qkv(
@@ -850,7 +869,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -1140,7 +1159,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         tables, so every launch grid depends only on the bucket. Rows past the
         batch belong to no sequence; chunk_fwd_o leaves them zero."""
         meta = self.prefill_graph_metadata
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         if meta.track:
@@ -1218,7 +1237,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if self.mis_metadata is not None:
@@ -1245,23 +1264,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
-            mamba_pool = self.req_to_token_pool.mamba_pool
+            mamba_pool = self.state_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
-                and getattr(mamba_pool, "replayssm_spec_fold", False)
-                and not getattr(mamba_pool, "replayssm_is_kda", False)
+                and mamba_pool.replayssm_spec_fold
+                and not mamba_pool.replayssm_is_kda
             )
             use_replayssm_spec = (
                 mamba_cache_params.replayssm_d is not None
-                and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-                and not getattr(mamba_pool, "replayssm_is_kda", False)
+                and mamba_pool.replayssm_cache_base is not None
+                and not mamba_pool.replayssm_is_kda
             )
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
+        # pool. Run them on contiguous per-sequence copies and scatter the result
+        # back. No-op for the default contiguous pool.
         # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
         # proper indexed writes and handle non-contiguous pools directly via
         # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
@@ -1275,13 +1294,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
+            # Row 0 of the copies is the padding sink, as in the pool: the
+            # prefill kernels treat state index 0 as padding.
+            (
+                (conv_states_contig, ssm_states_contig),
+                state_cache_indices,
+                staged_pool_rows,
+            ) = stage_pool_states((conv_states, ssm_states), cache_indices)
         else:
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
@@ -1462,8 +1481,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if needs_state_gather:
                 # Scatter the in-place-updated contiguous copies back to the
                 # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+                unstage_pool_states(
+                    (conv_states, ssm_states),
+                    (conv_states_contig, ssm_states_contig),
+                    staged_pool_rows,
+                )
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
