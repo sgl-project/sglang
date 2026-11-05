@@ -1,4 +1,4 @@
-"""ROCm steps of the parallel runtime's bring-up (distributed/bootstrap.py)."""
+"""Reserve ROCm runtime memory outside torch's allocator."""
 
 import torch
 

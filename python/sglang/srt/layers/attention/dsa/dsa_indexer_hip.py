@@ -1,8 +1,4 @@
-"""Kimi-K3.1's DSA indexer on ROCm (AITER): index-K sharded by token under DCP, and
-target-verify logits that read each request's index-K once for all its draft rows.
-
-The tensors built here are the same for every DSA layer of a forward, so the first
-layer builds them (_PerForwardMemo)."""
+"""ROCm DSA index-K sharding and shared-request target-verify logits."""
 
 from __future__ import annotations
 
@@ -16,10 +12,8 @@ from sglang.srt.utils import print_info_once
 
 
 class _PerForwardMemo:
-    """One per-forward tensor, computed once and shared by the forward's DSA layers.
-
-    Layers run in increasing layer_id order, so a repeated or lower layer_id, or another
-    key, starts a new forward; graph capture records the first layer's compute."""
+    """Layers run in increasing layer_id order; a repeated or lower ID, or a new
+    key, starts a new forward. Graph capture records the first layer's compute."""
 
     def __init__(self) -> None:
         self._key: Optional[Tuple[Any, ...]] = None
@@ -149,9 +143,8 @@ def verify_paged_mqa_logits(
 
 
 def hist_topk_workspace(indexer, config):
-    """The gfx950 fused indexer's workspace for an indexer whose shapes its
-    logits+histogram and one-launch top-k serve, taken now (before the pools are
-    sized), or None."""
+    """Preallocate the gfx950 logits/top-k workspace before pools are sized,
+    or return None for unsupported shapes."""
     from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (

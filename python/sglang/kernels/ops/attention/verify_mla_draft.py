@@ -1,19 +1,8 @@
-"""
-The DFLASH MLA draft's grouped-head split-KV *verify* (topk==1) under
---enable-amd-monokernel on gfx950: a copy of ``verify_mla.py`` tuned for the
-MLA5 draft (absorbed MLA, a 1K-key sliding window, 12 heads a rank), so that
-kernel and its other callers stay as they are.
+"""Grouped-head split-KV verify for the gfx950 monokernel's DFLASH MLA draft.
 
-Grid is ``(bs, n_head_blocks, split)``; each program handles ``BLOCK_H`` query
-heads x ALL ``L_EXT`` draft queries. Over ``verify_mla.py``: a sliding window on
-the prefix (stage 1 starts the rail at length - window and masks each row),
-two heads a tile at head_dim 576, more splits for absorbed MLA and narrow V
-heads, and the prefix dots optionally in bf16 over an FP8 cache.
-
-Correctness matches ``extend_attention_fwd`` for the topk==1 causal verify case.
-
-score(h,i,t) = q_nope[i,h] · c_KV[t]  +  q_pe[i,h] · k_pe[t]      # 512 dot + 64 dot
-out(h,i)     = Σ_t softmax_t · c_KV[t]                            # V = c_KV
+Specializes ``verify_mla.py`` for sliding windows and optional BF16 prefix dots
+over FP8 KV. Each program handles a group of query heads and the whole draft
+block; the caller must enforce topk == 1.
 """
 
 import torch
@@ -59,10 +48,7 @@ _BLOCK_CONFIG = {
 
 
 def block_config(head_dim):
-    """
-    Return (BLOCK_H, BLOCK_N, num_warps) for a head_dim; default for untuned
-    dims. BLOCK_H must be a power of 2 (heads beyond H_Q are masked).
-    """
+    """Return (BLOCK_H, BLOCK_N, num_warps), with a power-of-two head tile."""
     return _BLOCK_CONFIG.get(
         head_dim, (DEFAULT_BLOCK_H, DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS)
     )
@@ -70,10 +56,7 @@ def block_config(head_dim):
 
 @triton.jit
 def _active_splits(seqlen, num_splits, BLOCK_N: tl.constexpr):
-    """
-    The launched split count, capped by ``seqlen // BLOCK_N``.
-    Floor partitioning keeps every active split non-empty.
-    """
+    """Floor partitioning keeps every active split non-empty."""
     return tl.maximum(1, tl.minimum(num_splits, seqlen // BLOCK_N))
 
 
@@ -800,19 +783,11 @@ def can_handle(
     logit_cap=0.0,
     xai_temperature_len=-1,
 ):
-    """Return True iff the grouped-head split-KV verify path can serve this
-    exact problem with the same result as extend_attention_fwd. Conservative:
-    anything not explicitly handled -> False -> caller falls back to the
-    baseline.
+    """Check static eligibility; unsupported inputs fall back to extend_attention_fwd.
 
-    IMPORTANT: ``custom_mask`` is intentionally NOT inspected (its values can't
-    be read inside a captured HIP graph without a host sync). Every draft query
-    sees the whole committed prefix and, when ``is_causal``, only its own
-    predecessors among the draft tokens -- that is the tree mask ONLY at
-    speculative topk == 1. The caller therefore MUST gate enablement on topk == 1
-    (TritonAttnBackend does: ``use_verify_shared_kv = ... and self.topk == 1``).
-    At topk > 1 the tree is not causal and this path must stay disabled."""
-    # No exotic features.
+    The caller must enforce topk == 1: only then does a causal mask match the
+    draft tree. Reading custom_mask values would synchronize during graph capture.
+    """
     if sinks is not None:
         return False
     # A sliding window is masked on the prefix (WINDOW in stage 1); inside the
@@ -902,15 +877,10 @@ def verify_shared_kv_fwd(
     max_bs=None,
     bf16_dot=False,
 ):
-    """
-    Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
-    shape. Returns True if it ran (o_extend written), False if unsupported
-    (caller falls back). A single TP-local KV head needs no offset at all;
-    several are served when the group size is a power of two.
+    """Write topk == 1 verify output; return False when the caller must fall back.
 
-    bf16_dot: with an FP8 cache, upcast the cached K/V and run the prefix dots in
-    q's dtype (BF16) instead of casting q and the probabilities to FP8. The
-    draft-draft part already runs in fp32. No effect on a BF16 cache.
+    ``bf16_dot`` upcasts FP8 cached K/V for prefix dots in q's dtype. Draft-draft
+    attention remains FP32; a BF16 cache needs no upcast.
     """
     if not can_handle(
         q_extend,

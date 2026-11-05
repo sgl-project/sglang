@@ -1,3 +1,25 @@
+// Portions adapted from https://github.com/moonmath-ai/amd-kernels (MIT License).
+//
+// Copyright (c) 2026 The MoonMath.ai
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 /// Kimi-K3 routed-expert grouped GEMMs for gfx950: MXFP8 activations x MXFP4 weights (A8W4) on the
 /// scaled MFMA (v_mfma_scale_f32_16x16x128_f8f6f4), reading AITER's preshuffled K3 weights in place.
 ///
@@ -61,22 +83,38 @@ K3A8W4_DEV __amdgpu_buffer_rsrc_t make_rsrc(const void* p, uint64_t bytes) {
 
 K3A8W4_DEV u32x4 ld_b128(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
   u32x4 v;
-  asm volatile("buffer_load_dwordx4 %0, %1, %2, %3 offen" : "=v"(v) : "v"(voff), "s"(r), "s"(soff) : "memory");
+  asm volatile("buffer_load_dwordx4 %0, %1, %2, %3 offen"  // codespell:ignore offen
+
+               : "=v"(v)
+               : "v"(voff), "s"(r), "s"(soff)
+               : "memory");
   return v;
 }
 
 K3A8W4_DEV u32 ld_b32(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
   u32 v;
-  asm volatile("buffer_load_dword %0, %1, %2, %3 offen" : "=v"(v) : "v"(voff), "s"(r), "s"(soff) : "memory");
+  asm volatile("buffer_load_dword %0, %1, %2, %3 offen"  // codespell:ignore offen
+
+               : "=v"(v)
+               : "v"(voff), "s"(r), "s"(soff)
+               : "memory");
   return v;
 }
 
 K3A8W4_DEV void st_b32(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
-  asm volatile("buffer_store_dword %0, %1, %2, 0 offen" ::"v"(v), "v"(voff), "s"(r) : "memory");
+  asm volatile("buffer_store_dword %0, %1, %2, 0 offen"  // codespell:ignore offen
+               ::"v"(v),
+               "v"(voff),
+               "s"(r)
+               : "memory");
 }
 
 K3A8W4_DEV void st_b8(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
-  asm volatile("buffer_store_byte %0, %1, %2, 0 offen" ::"v"(v), "v"(voff), "s"(r) : "memory");
+  asm volatile("buffer_store_byte %0, %1, %2, 0 offen"  // codespell:ignore offen
+               ::"v"(v),
+               "v"(voff),
+               "s"(r)
+               : "memory");
 }
 
 template <int N>
@@ -594,7 +632,10 @@ __global__ __launch_bounds__(NW * 64, 4) void down_ws_kernel(const DownParams p)
       const int row = rg * 8 + (lane >> 3), cc = (lane & 7) ^ (row & 7);
       const u32 off = (u32)(blk * BM + row) * (u32)p.I + (u32)(s * kKStep + cc * 16);
       const u32 dst = to_sgpr(lds_base + (u32)(slot * C::SLOT_BYTES + s * BM * kKStep + rg * 1024));
-      asm volatile("s_mov_b32 m0, %1\n\tbuffer_load_dwordx4 %0, %2, 0 offen lds" ::"v"(off), "s"(dst), "s"(a_rsrc)
+      asm volatile("s_mov_b32 m0, %1\n\tbuffer_load_dwordx4 %0, %2, 0 offen lds"  // codespell:ignore offen
+                   ::"v"(off),
+                   "s"(dst),
+                   "s"(a_rsrc)
                    : "memory", "m0");
     }
     if (tid < BM) {

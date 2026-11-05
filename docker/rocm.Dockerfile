@@ -810,11 +810,8 @@ RUN cd sglang \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install $CONS -e "python[${all_extras}]"; \
        fi
 
-# Rust radix TreeCore, built in place against this image's ROCm torch (pyproject_other.toml builds
-# only the multimodal extension, and an isolated build would pull CUDA torch). As in the CUDA
-# image, SGLANG_RUST_BUILD_MODE=never then loads it on every rank with no Cargo probe at startup:
-# without it each rank probes Cargo, the ranks can mix Rust and Python TreeCores, and HiCache
-# write-back asserts once the host pool fills.
+# Build against the installed ROCm torch; isolation would pull CUDA torch.
+# Bundle TreeCore so ranks cannot mix Rust/Python implementations and diverge on HiCache reclaim.
 RUN cd sglang/python \
     && python -m pip --no-cache-dir install "setuptools-rust>=1.11" \
     && sed -i -E 's/^rust-extensions = \["multimodal"\]$/rust-extensions = ["multimodal", "rust_tree_core"]/' pyproject.toml \

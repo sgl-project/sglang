@@ -1,4 +1,4 @@
-"""The gfx950 Kimi-K3 latent-MoE tail kernels against the unfused norm, GEMM and add chain."""
+"""The gfx950 latent-MoE tail must match the projection with RMS scaling factored out."""
 
 import unittest
 
@@ -47,9 +47,8 @@ class TestKimiK3LatentTailHip(CustomTestCase):
 
     @torch.inference_mode()
     def test_tail_matches_norm_projection_and_add(self):
-        """One launch equals bf16(rmsnorm(latent) @ up.T) + shared [+ prefix] with
-        an fp32 add, within one bf16 rounding (but where the GEMM's summation order
-        flips the projection's rounding ahead of a cancelling add)."""
+        """Match the factored projection and fp32 add, allowing bf16 rounding
+        differences where the GEMM's summation order changes a cancelling add."""
         for rows in (1, 4, 32):
             latent, shared, prefix, proj = self._inputs(rows)
             for with_prefix in (False, True):

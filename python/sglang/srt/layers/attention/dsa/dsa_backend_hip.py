@@ -1,5 +1,4 @@
-"""Kimi-K3.1 DSA under decode context parallelism on ROCm: the Triton backends
-attend over this rank's fp8_ds_mla shard and return the partials for the merge."""
+"""Kimi-K3.1 ROCm DSA partials over this rank's fp8_ds_mla shard."""
 
 from __future__ import annotations
 

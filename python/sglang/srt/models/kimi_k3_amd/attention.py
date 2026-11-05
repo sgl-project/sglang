@@ -1,8 +1,7 @@
-"""forward_pre_o_proj on Kimi-K3's gated MLA attention (port of sgl-project/sglang#45202):
-the TP-local core output o_proj takes, so the AMD decode monokernel can run o_proj and
-its attention-TP reduction. KDA's counterpart splits KimiK3DeltaAttention.forward at
-o_proj; MLA calls o_proj deep inside the DeepseekV2AttentionMLA cores, so its gated
-o_proj wrapper hands the input back instead."""
+"""MLA pre-o_proj handoff for the AMD monokernel (port of sgl-project/sglang#45202).
+
+The gated o_proj wrapper returns its TP-local input; the monokernel owns the
+projection and attention-TP reduction."""
 
 from __future__ import annotations
 
@@ -16,8 +15,7 @@ if TYPE_CHECKING:
 
 
 class KimiK3MLAPreOProjMixin:
-    """forward_pre_o_proj for KimiK3MLAAttention, whose gated o_proj wrapper returns
-    _take_pre_o_proj(x) while _return_pre_o_proj is set."""
+    """Intercept gated o_proj to return its input to the monokernel."""
 
     _return_pre_o_proj = False
     _pre_o_proj_out: Optional[torch.Tensor] = None

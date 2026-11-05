@@ -1,4 +1,4 @@
-"""The gfx950 NoPE indexer prologue must reproduce the generic ROCm path bit for bit."""
+"""NoPE quantization and cache writes match ROCm with fixed GEMM results."""
 
 import contextlib
 import sys

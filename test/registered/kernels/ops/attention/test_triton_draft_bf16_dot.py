@@ -1,5 +1,4 @@
-"""bf16_dot holds ROCm DFLASH draft attention over an FP8 KV to BF16 accuracy and
-leaves the default FP8 path and a BF16 cache unchanged."""
+"""Draft BF16 dots must preserve accuracy over FP8 KV and leave BF16 KV unchanged."""
 
 import sys
 from types import SimpleNamespace

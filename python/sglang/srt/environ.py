@@ -843,9 +843,8 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
-    # Host-to-device ratio of the hierarchical Mamba state pool alone, in place of
-    # --hicache-ratio (ratio mode only). Agentic replay can fill the host state slots long
-    # before the host KV pool, and a host KV prefix without its state cannot be reused.
+    # Override --hicache-ratio for Mamba states in ratio mode: a cached KV prefix
+    # cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
@@ -998,8 +997,7 @@ class Envs:
     # H <= 16) on that HIP kernel's split-K form: each row's top-k over
     # sparse_mla_decode_splits(rows) CTAs and an fp32 log-sum-exp combine.
     SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
-    # gfx950 DSA sparse MLA decode / verify over fp8_ds_mla KV with the MXFP8 kernel ported
-    # from aiter's opus decode (Q quantized to MXFP8) instead of the Triton split-K kernel.
+    # Use the gfx950 MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode.
     SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
     # GiB of ROCm device memory kept out of torch's allocator (0 = no cap): HSA
     # allocates per-queue scratch outside it, e.g. for RCCL's spilling generic kernel.

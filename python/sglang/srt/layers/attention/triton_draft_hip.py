@@ -1,10 +1,4 @@
-"""ROCm draft workers on the Triton attention backend.
-
-A DFLASH draft worker runs target-verify forwards only. On ROCm its backend keeps q
-and the attention math in BF16 over an FP8 cache, allocates no split-KV decode
-partials, and an MLA draft under DCP serves its sliding-window layers from this
-rank's owner rows (MlaDcpWindowVerify) instead of global prefix and window rails.
-"""
+"""ROCm draft attention with BF16 dots and rank-local DCP sliding windows."""
 
 from __future__ import annotations
 
@@ -83,13 +77,9 @@ def check_dcp_mla_draft(draft_hf_config, draft_window_size: Optional[int]) -> No
 
 
 class MlaDcpWindowVerify:
-    """The sliding-window MLA verify layers of a draft under DCP.
+    """Attend to this rank's keys in [p - window, p] and return partials for DCP.
 
-    Each query row at position p attends the keys of [p - sliding_window_size, p]
-    this rank owns through Triton sparse MLA, like trtllm_mla's
-    _forward_sliding_window, and returns the rank-local (out, lse) the absorbed
-    MLA forward merges. The rows come from req_to_token (or the draft KV ring),
-    so target-verify metadata builds no global prefix rail either.
+    Read window rows from req_to_token or the draft ring, without a global prefix rail.
     """
 
     def __init__(self, backend: TritonAttnBackend, model_runner: ModelRunner):
@@ -103,9 +93,7 @@ class MlaDcpWindowVerify:
     def window_sparse_indices(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """This rank's window indices / counts for every query row; built once
-        per forward and reused by the following sliding layers of the same
-        window."""
+        """Reuse rank-local window indices across consecutive matching draft layers."""
         cache = self._index_cache
         if (
             cache is not None

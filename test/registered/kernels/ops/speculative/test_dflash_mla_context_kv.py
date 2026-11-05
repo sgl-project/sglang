@@ -11,10 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DFLASH's fused MLA context KV must match the per-layer path it replaces.
-
-python -m pytest test/registered/kernels/ops/speculative/test_dflash_mla_context_kv.py -v
-"""
+"""DFLASH's fused MLA context KV must match the per-layer path it replaces."""
 
 import unittest
 from types import SimpleNamespace

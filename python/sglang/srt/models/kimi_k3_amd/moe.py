@@ -1,22 +1,7 @@
 """Kimi-K3's latent MoE on ROCm.
 
-``KimiK3MoE`` takes ``KimiK3MoEHipMixin`` as a base and enters it behind ``_is_hip``:
-the fused-front pipeline (``_forward_fused_hip``), the gfx950 A8W4 routed experts and
-the post-load choices they read. ROCm has no multicast, so K3's all-reduce fusion
-(``k3_ar_fusion``) never runs there; the [latent | shared] pair ends in one of:
-
-- the column split (prefill): each rank adds its 1/TP of the routed up_proj columns
-  into the shared experts' partial sum, which run on a side stream under the routed
-  experts, and one all-reduce carries both;
-- the row-sharded tail (gfx950 prefill): reduce-scatter by rows, the tail on this
-  rank's rows, all-gather of the stream;
-- the column-parallel tail whose all-gather also stages the next layer's attention
-  read (gfx950 TP8 decode);
-- the one-kernel fused latent tail (gfx950 decode);
-- otherwise KimiK3MoE's single collective and tail.
-
-The helpers this module shares with ``kimi_k3`` are imported where used: ``kimi_k3``
-imports this module for KimiK3MoE's base class.
+Shared helpers are imported inside methods to avoid a cycle with ``kimi_k3``,
+which imports this mixin. ROCm keeps the multicast all-reduce fusion disabled.
 """
 
 from __future__ import annotations
@@ -92,7 +77,7 @@ def _vector_aligned(t: torch.Tensor) -> bool:
 
 
 class KimiK3MoEHipMixin:
-    """KimiK3MoE's ROCm paths; see the module docstring."""
+    """KimiK3MoE's ROCm paths."""
 
     # Set post-load by _prepare_hip_paths; the defaults keep every path off.
     # This rank's columns of the replicated routed up_proj, used for batches of at
@@ -235,8 +220,6 @@ class KimiK3MoEHipMixin:
             )
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
 
-        # prefetch_bc: b and c complete before the norm / up_proj chain
-        # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
     def _forward_shared_casting_routed(

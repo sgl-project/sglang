@@ -1,8 +1,4 @@
-"""Decode / target-verify prologue of Kimi-K3.1's NoPE DSA indexer on gfx950 (AITER).
-
-The ROCm counterpart of the CUDA fused prologue (Indexer._fused_q_prepare_and_store):
-the K / head-gate GEMMs, k_norm and the DCP-aware index-K store, then one kernel
-(indexer_q_quant_head_gate) quantizes Q and folds the BF16 head gate."""
+"""Kimi-K3.1 NoPE indexer prologue for gfx950 decode and target verify."""
 
 from __future__ import annotations
 

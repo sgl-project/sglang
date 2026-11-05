@@ -31,10 +31,10 @@ def kda_chain_verify_gfx950(
     retrieve_parent_token: Optional[torch.Tensor],
     ring_kwargs: dict,
 ) -> Optional[torch.Tensor]:
-    """The chain verify output, or None for a verify the kernel cannot serve: a
-    tree (any retrieve_* tensor), a conv bias, or an unsupported shape, dtype or
-    ring layout. ``ring_kwargs`` holds the ReplaySSM ring; without it the kernel
-    writes the per-step state snapshots."""
+    """Return chain verify output, or None for an unsupported shape, dtype or layout.
+
+    ``ring_kwargs`` selects ReplaySSM; without it, write per-step snapshots.
+    """
     replayssm_rawv = ring_kwargs.get("replayssm_rawv")
     if (
         retrieve_next_token is not None

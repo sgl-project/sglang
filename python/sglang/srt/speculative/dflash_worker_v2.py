@@ -1126,9 +1126,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
-        # ROCm rehearses with borrowing off (graph_pool_borrow_enabled is
-        # CUDA-only): the pass still builds the Triton sampler and surfaces an
-        # OOM at startup, but ROCm sizes KV before capture, so it reserves nothing.
+        # ROCm prewarms the sampler without graph-pool borrowing; KV is sized before capture.
         if (
             not self._hosts_draft
             or not (is_cuda() or is_hip())
@@ -2251,8 +2249,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return plan.write_ids(self.draft_model_runner.kv_index_translator)
 
     def _mla_context_kv(self) -> Optional["MlaContextKV"]:
-        """The monokernel's stacked writer of every draft layer's context KV (ROCm),
-        or None for the per-layer path."""
+        """Return the ROCm monokernel's stacked context-KV writer, or None."""
         if self._mla_ctx_resolved:
             return self._mla_ctx
         self._mla_ctx_resolved = True

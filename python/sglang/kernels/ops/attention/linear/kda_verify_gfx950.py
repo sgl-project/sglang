@@ -1,10 +1,7 @@
-"""KDA chain spec-verify on gfx950 in one HIP kernel.
+"""Fused KDA chain verify with ReplaySSM or per-step snapshots on gfx950.
 
-Conv1d, recurrence, conv-window writes and either the ReplaySSM ring or the per-step
-state snapshots run in csrc/attention/kda_verify_gfx950.cuh. Takes the arguments of
-``fused_kda_conv_gating_verify`` bar ``num_warps``, ``conv_bias`` (Kimi-K3's conv has none)
-and ``conv_state_indices``: the conv state and the SSM state share ``cache_indices``, as the
-KDA backend passes them.
+The bias-free conv and SSM state share ``cache_indices``; intermediate windows
+and snapshots use ``intermediate_state_indices``.
 """
 
 from __future__ import annotations

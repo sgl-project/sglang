@@ -1,8 +1,4 @@
-"""HIP KDA chain verify (gfx950) must match the Triton chain verify, with the ReplaySSM
-ring or with per-step state snapshots.
-
-Conv windows, v ring rows and beta are bit-identical; k ring rows and gate decays sit
-within an ulp (the HIP gate's fast exp / log); outputs and snapshots are close."""
+"""gfx950 KDA verify must preserve outputs, ring writes and snapshots within tolerance."""
 
 import sys
 from types import SimpleNamespace

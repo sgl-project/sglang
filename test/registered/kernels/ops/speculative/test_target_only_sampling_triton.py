@@ -1,5 +1,4 @@
-"""ROCm's Triton tree_speculative_sampling_target_only must reproduce the CUDA kernel,
-sample the target distribution, and replay under a CUDA graph."""
+"""Triton sampled verify must match CUDA semantics and preserve graph replay."""
 
 import sys
 

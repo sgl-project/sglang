@@ -1,10 +1,4 @@
-"""Kimi-K3 A8W4 MoE grouped GEMMs on gfx950 (sglang.kernels.ops.moe.k3_a8w4_gfx950).
-
-The kernels read AITER's preshuffled MXFP4 weights and scales in place and pair them with MXFP8
-activations on the scaled MFMA, so both checks guard layout contracts no other test covers: against
-a dense fp32 reference built from the unshuffled weights, and against AITER's own A8W4 fused_moe on
-the same tensors (the integration in kimi_k3.py swaps one for the other).
-"""
+"""Kimi-K3's gfx950 A8W4 MoE must match dense and AITER references."""
 
 import math
 import unittest
