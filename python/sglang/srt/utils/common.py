@@ -2368,29 +2368,34 @@ def suppress_noisy_warnings():
 
     # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
     # which bypasses filterwarnings; override showwarning to drop them too.
-    cutlass_dsl_noisy = {
+    # The module renames come from flashinfer importing pre-4.8 cutlass paths.
+    cutlass_dsl_noisy = [
         (
             DeprecationWarning,
-            "Using `struct.scalar` as pointer is deprecated.",
+            re.escape("Using `struct.scalar` as pointer is deprecated."),
         ),
         (
             UserWarning,
-            "NamedBarrier wait also arrives on the barrier. "
-            "Routing call to NamedBarrier.arrive_and_wait().",
+            re.escape(
+                "NamedBarrier wait also arrives on the barrier. "
+                "Routing call to NamedBarrier.arrive_and_wait()."
+            ),
         ),
-        (
-            DeprecationWarning,
-            "builtin type swigvarlink has no __module__ attribute",
-        ),
-    }
-    for cat, msg in cutlass_dsl_noisy:
-        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+        (DeprecationWarning, r"builtin type \w+ has no __module__ attribute"),
+        (DeprecationWarning, r"cutlass\.\S+ is deprecated; use cutlass\."),
+        (DeprecationWarning, re.escape("Arch from arch.py is deprecated.")),
+    ]
+    for cat, pattern in cutlass_dsl_noisy:
+        warnings.filterwarnings("ignore", message=pattern, category=cat)
 
     if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
         prev_showwarning = warnings.showwarning
 
         def _filtered_showwarning(message, category, *args, **kwargs):
-            if (category, str(message)) in cutlass_dsl_noisy:
+            if any(
+                issubclass(category, cat) and re.match(pattern, str(message))
+                for cat, pattern in cutlass_dsl_noisy
+            ):
                 return
             prev_showwarning(message, category, *args, **kwargs)
 

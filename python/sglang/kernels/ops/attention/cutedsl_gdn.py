@@ -218,7 +218,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -237,7 +237,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -450,7 +450,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -469,7 +469,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -673,7 +673,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -689,7 +689,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -890,7 +890,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -906,7 +906,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g

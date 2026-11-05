@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.common import suppress_noisy_warnings
 from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
 from sglang.srt.utils.network import is_port_available
 from sglang.test.sgl_eval_utils import run_sgl_eval
@@ -54,6 +55,8 @@ from sglang.utils import normalize_base_url
 
 # Tests load HF configs, tokenizers, and models straight from transformers.
 apply_all_hf_patches()
+# unittest.main turns DeprecationWarning back on in every test process.
+suppress_noisy_warnings()
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
