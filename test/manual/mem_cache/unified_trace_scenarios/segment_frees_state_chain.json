@@ -1,0 +1,19 @@
+{"name": "segment_frees_state_chain", "chain": "mamba", "page_size": 16, "lazy": false, "ops": [
+  {"op": "extend", "req": 0, "n": 83},
+  {"op": "extend", "req": 1, "n": 83},
+  {"op": "extend", "req": 2, "n": 83},
+  {"op": "extend", "req": 3, "n": 83},
+  {"op": "extend", "req": 4, "n": 83},
+  {"op": "extend", "req": 5, "n": 83},
+  {"op": "state_alloc", "n": 1},
+  {"op": "state_alloc", "n": 1},
+  {"op": "state_alloc", "n": 1},
+  {"op": "segment", "req": 0, "start": 32},
+  {"op": "group", "begin": true},
+  {"op": "segment", "req": 1, "start": 16},
+  {"op": "free", "req": 2},
+  {"op": "group", "begin": false},
+  {"op": "state_free", "index": 1},
+  {"op": "extend", "req": 0, "n": 21},
+  {"op": "decode", "reqs": [0, 1]}
+]}

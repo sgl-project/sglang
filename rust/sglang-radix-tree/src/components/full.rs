@@ -7,13 +7,13 @@ use std::collections::{BinaryHeap, HashMap};
 use tch::{Kind, Tensor};
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL};
+use crate::components::{ComponentType, FULL, Family};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_lru_list::PriorityKey;
 use crate::unified_tree_core::{
-    CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
+    CacheActions, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
     MatchPrefixParams, MatchResult, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
 
@@ -30,6 +30,10 @@ impl FullComponent {
 impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     fn component_type(&self) -> ComponentType {
         FULL
+    }
+
+    fn family(&self) -> Family {
+        Family::Token
     }
 
     fn create_match_validator(
@@ -104,7 +108,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         let node = tree_core.arena.node(node_id);
@@ -156,7 +160,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let ct = FULL;
         assert!(
@@ -167,7 +171,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         // D-leaf; the parent id was captured at return time because the leaf
         // itself may have been freed by the eviction in between.
         if let Some(last_node_parent) = tree_core.component_state(FULL).evict_device_cursor
-            && tree_core.evictable_device_leaves.contains(last_node_parent)
+            && tree_core.is_device_walk_candidate_(last_node_parent)
         {
             let key = tree_core
                 .eviction_strategy
@@ -183,7 +187,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             return None;
         }
         while let Some(Reverse((_, x))) = tree_core.full_evict_device_heap.pop() {
-            if !tree_core.evictable_device_leaves.contains(x) {
+            if !tree_core.is_device_walk_candidate_(x) {
                 continue;
             }
             let last_node_parent = tree_core.arena.node(x).try_parent();
@@ -205,7 +209,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         for spare_imminent_demotes in [true, false] {
             if tracker[&FULL] >= num_tokens {
@@ -217,11 +221,15 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     break;
                 }
                 let node = tree_core.arena.node(node_id);
-                if !node.has_device_value(FULL) || !node.has_host_value(FULL) {
+                // Queued victims count as demoted.
+                if !node.has_device_value(FULL)
+                    || !node.has_host_value(FULL)
+                    || node.write_back_queued
+                {
                     tree_core.full_coexisting_host_nodes.discard(node_id);
                     continue;
                 }
-                if spare_imminent_demotes && tree_core.evictable_device_leaves.contains(node_id) {
+                if spare_imminent_demotes && tree_core.is_device_walk_candidate_(node_id) {
                     continue;
                 }
                 if !tree_core.can_reclaim_coexisting_host_value_(node_id, FULL) {
@@ -248,7 +256,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
         let arena = &tree_core.arena;
@@ -491,7 +499,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -509,12 +517,29 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 if let Some(transfer) = transfers.first()
                     && let Some(device_indices) = &transfer.device_indices
                 {
+                    let loaded_nodes: Vec<NodeIdx_> = transfer
+                        .nodes_to_load
+                        .iter()
+                        .flatten()
+                        .map(|&loaded_id| {
+                            tree_core
+                                .arena
+                                .resolve(loaded_id)
+                                .expect("load-back transfers must reference live nodes")
+                        })
+                        .collect();
+                    let loaded_len = device_indices.size1().expect("1-D load-back indices");
+                    let chain_len: i64 = loaded_nodes
+                        .iter()
+                        .map(|&loaded_idx| tree_core.arena.host_value_len(loaded_idx, FULL) as i64)
+                        .sum();
+                    assert_eq!(
+                        loaded_len, chain_len,
+                        "load-back filled {loaded_len} device slots for a chain of \
+                         {chain_len} host tokens"
+                    );
                     let mut offset = 0i64;
-                    for &loaded_id in transfer.nodes_to_load.iter().flatten() {
-                        let loaded_idx = tree_core
-                            .arena
-                            .resolve(loaded_id)
-                            .expect("load-back transfers must reference live nodes");
+                    for loaded_idx in loaded_nodes {
                         let loaded = tree_core.arena.node_mut(loaded_idx);
                         let n_len = loaded.host_value_len(FULL) as i64;
                         loaded

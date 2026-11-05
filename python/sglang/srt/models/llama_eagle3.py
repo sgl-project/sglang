@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import add_prefix
 
@@ -269,6 +270,8 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+
     def __init__(
         self,
         config: LlamaConfig,

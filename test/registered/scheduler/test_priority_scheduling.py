@@ -17,8 +17,8 @@ from sglang.test.test_utils import (
     send_concurrent_generate_requests_with_custom_params,
 )
 
-register_cuda_ci(est_time=166, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=155, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=195, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestPriorityScheduling(CustomTestCase):

@@ -366,7 +366,7 @@ export const config = {
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
         // The monokernel refuses SGLANG_HIP_DSV41_INDEX_K_PAGE8.
-        "--monokernel-backend amd",
+        "--enable-amd-monokernel",
         "--enforce-shared-experts-fusion",
         // The one backend worth naming on gfx950: aiter's fp8 GEMM beats what the
         // automatic selection resolves to for this model's 32-wide ue8m0 blocks.

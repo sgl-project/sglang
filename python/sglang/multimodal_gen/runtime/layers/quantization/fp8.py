@@ -4,9 +4,15 @@ import logging
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm.fp8_gfx1250 import (
+    gfx1250_fp8_scaled_mm,
+    gfx1250_fp8_scaled_mm_supported,
+    per_token_quant_fp8_gfx1250,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
@@ -38,6 +44,7 @@ from sglang.multimodal_gen.runtime.utils.common import (
     use_intel_amx_backend,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -58,6 +65,7 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     requantize_with_max_scale,
 )
+from sglang.srt.utils.common import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (
@@ -80,12 +88,91 @@ if USE_AITER or _use_hip_int4:
 logger = logging.getLogger(__name__)
 
 
+def _apply_gfx1250_triton_fp8(
+    *,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Per-token FP8 linear through the gfx1250 Triton tile.
+
+    ``weight`` is ``[K, N]`` float8_e4m3fn and ``weight_scale`` holds one scale
+    per output channel. Returns ``None`` when the tile does not cover the shape,
+    leaving the caller on its existing path.
+    """
+    x_2d = x.view(-1, x.shape[-1])
+    K, N = weight.shape
+    if not gfx1250_fp8_scaled_mm_supported(M=x_2d.shape[0], N=N, K=K):
+        return None
+    qx, x_scale = per_token_quant_fp8_gfx1250(x_2d)
+    output = gfx1250_fp8_scaled_mm(
+        qx, weight, x_scale, weight_scale, out_dtype=x.dtype, bias=bias
+    )
+    return output.view(*x.shape[:-1], weight.shape[1])
+
+
+def validate_fp8_block_device(device):
+    """Serialized e4m3fn block GEMM requires NVIDIA SM89+ tensor cores."""
+    device = torch.device(device)
+    if (
+        device.type != "cuda"
+        or torch.version.hip is not None
+        or not torch.cuda.is_available()
+        or torch.cuda.get_device_capability(device) < (8, 9)
+    ):
+        raise RuntimeError("Block FP8 requires an NVIDIA CUDA GPU with SM89 or newer")
+
+
+def _quantize_block_fp8_activation(x, block_size=(128, 128), scale_min=1e-4):
+    """Share an activation scale over token/channel blocks, padding final tokens."""
+    m, k = x.shape
+    block_m, block_k = block_size
+    if k % block_k:
+        raise ValueError("FP8 activation channels must align to the block size")
+    blocks = (
+        F.pad(x, (0, 0, 0, (-m) % block_m))
+        .float()
+        .reshape(-1, block_m, k // block_k, block_k)
+    )
+    scales = blocks.abs().amax(dim=(1, 3)).clamp_min(scale_min) / 448.0
+    quantized = (blocks / scales[:, None, :, None]).to(torch.float8_e4m3fn)
+    return (
+        quantized.reshape(-1, k)[:m].contiguous(),
+        scales.repeat_interleave(block_m, dim=0)[:m].contiguous(),
+    )
+
+
 class Fp8Config(SRTFp8Config, QuantizationConfig):
     """Config class for FP8.
 
     No-arg ``Fp8Config()`` selects online (post-load) weight quantization:
     ``is_checkpoint_fp8_serialized=False`` with ``activation_scheme="dynamic"``.
+    ``activation_block_size`` opts serialized block weights into shared scales
+    over multiple tokens/channels, using the Triton block GEMM without repacking.
     """
+
+    def __init__(
+        self,
+        *args,
+        activation_block_size: tuple[int, int] | None = None,
+        activation_scale_min: float = 1e-4,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if activation_block_size is not None:
+            if (
+                len(activation_block_size) != 2
+                or any(size <= 0 for size in activation_block_size)
+                or self.weight_block_size is None
+                or activation_block_size[1] != self.weight_block_size[1]
+                or activation_scale_min <= 0
+            ):
+                raise ValueError(
+                    "FP8 activation blocks must match the weight channel blocks"
+                )
+        self.activation_block_size = activation_block_size
+        self.activation_scale_min = activation_scale_min
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -101,6 +188,8 @@ class Fp8Config(SRTFp8Config, QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            if self.activation_block_size is not None:
+                return BlockActivationFp8LinearMethod(self)
             return Fp8LinearMethod(self)
         return None
 
@@ -141,6 +230,16 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_marlin = False
 
         self.block_quant = self.quant_config.weight_block_size is not None
+
+        # gfx1250 has no tuned hipBLASLt FP8 kernel, so the library GEMM this
+        # method would otherwise dispatch to is slower than the BF16 path it
+        # replaces; route to the Triton tile instead.
+        self.use_gfx1250_triton_fp8 = (
+            not self.block_quant
+            and not self.quant_config.is_checkpoint_fp8_serialized
+            and is_gfx1250_supported()
+            and not envs.SGLANG_DISABLE_GFX1250_FP8_GEMM.get()
+        )
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -335,7 +434,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if self.use_gfx1250_triton_fp8:
+                    # The gfx1250 tile dequantizes with one scale per output
+                    # channel; a per-tensor scale would lose the per-channel
+                    # range that keeps a BF16 checkpoint usable at FP8.
+                    qweight, weight_scale = per_token_group_quant_fp8(
+                        layer.weight, layer.weight.shape[-1]
+                    )
+                    weight_scale = weight_scale.t().contiguous()
+                elif self.cutlass_fp8_supported or self.use_marlin:
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
@@ -346,8 +453,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
 
-                # Update the layer with the new values.
-                layer.weight = Parameter(qweight.t(), requires_grad=False)
+                # Update the layer with the new values. The gfx1250 tile wants
+                # [K, N] contiguous along N rather than the usual transposed
+                # view of a [N, K] weight; at these shapes that is worth
+                # 1.05-1.33x, paid once here as a transpose at load.
+                qweight_kn = qweight.t()
+                if self.use_gfx1250_triton_fp8:
+                    qweight_kn = qweight_kn.contiguous()
+                layer.weight = Parameter(qweight_kn, requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 layer.input_scale = None
 
@@ -432,6 +545,13 @@ class Fp8LinearMethod(LinearMethodBase):
         if not x.is_contiguous():
             x = x.contiguous()
 
+        if self.use_gfx1250_triton_fp8:
+            output = _apply_gfx1250_triton_fp8(
+                x=x, weight=layer.weight, weight_scale=layer.weight_scale, bias=bias
+            )
+            if output is not None:
+                return output
+
         if self.per_channel_serialized:
             input_scale = layer.input_scale
             if input_scale is not None:
@@ -497,3 +617,79 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
+
+
+class BlockActivationFp8LinearMethod(Fp8LinearMethod):
+    """Serialized block weights with activation scales shared across tokens."""
+
+    def __init__(self, quant_config: Fp8Config):
+        self.quant_config = quant_config
+        self.activation_block_size = quant_config.activation_block_size
+        self.block_quant = True
+        self.per_channel_serialized = False
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        block_n, block_k = self.quant_config.weight_block_size
+        if input_size_per_partition % block_k or sum(output_partition_sizes) % block_n:
+            raise ValueError(
+                "Serialized FP8 dimensions must align to the weight block size"
+            )
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        scales = layer.weight_scale_inv
+        if not torch.isfinite(scales).all() or not (scales > 0).all():
+            raise ValueError("FP8 scales must be finite and positive")
+
+    def apply(self, layer, x, bias=None):
+        from sglang.kernels import KernelBackend, get_kernel
+
+        if layer.training or torch.is_grad_enabled():
+            raise RuntimeError("Block FP8 requires eval and no_grad inference")
+        if x.shape[-1] != layer.input_size_per_partition:
+            raise ValueError("Block FP8 input dimension does not match the weight")
+        validate_fp8_block_device(x.device)
+        if x.dtype != layer.orig_dtype:
+            if (
+                not torch.is_autocast_enabled("cuda")
+                or torch.get_autocast_dtype("cuda") != layer.orig_dtype
+            ):
+                raise TypeError(
+                    f"Block FP8 requires {layer.orig_dtype} input or matching CUDA autocast"
+                )
+            x = x.to(layer.orig_dtype)
+        if x.numel() == 0:
+            return x.new_empty((*x.shape[:-1], layer.output_size_per_partition))
+        quantized, scales = _quantize_block_fp8_activation(
+            x.reshape(-1, layer.input_size_per_partition),
+            self.activation_block_size,
+            self.quant_config.activation_scale_min,
+        )
+        output = get_kernel("gemm.w8a8_block_fp8_matmul_triton", KernelBackend.TRITON)(
+            quantized,
+            layer.weight,
+            scales,
+            layer.weight_scale_inv,
+            self.quant_config.weight_block_size,
+            output_dtype=layer.orig_dtype,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.reshape(*x.shape[:-1], layer.output_size_per_partition)
