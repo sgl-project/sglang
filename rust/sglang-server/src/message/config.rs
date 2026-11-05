@@ -182,6 +182,9 @@ pub struct ServerArgs {
     /// Apply the router's `x-override-*` headers to `/generate` bodies
     /// (`SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES`).
     pub enable_request_header_overrides: bool,
+    /// Decompress request bodies tagged with `x-body-compressed`
+    /// (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
+    pub enable_request_decompression: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -291,6 +294,7 @@ impl ServerArgs {
         health_generate_headers,
         default_priority_value,
         enable_request_header_overrides,
+        enable_request_decompression,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
@@ -353,6 +357,7 @@ impl ServerArgs {
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         enable_request_header_overrides: bool,
+        enable_request_decompression: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
@@ -413,6 +418,7 @@ impl ServerArgs {
             health_generate_headers,
             default_priority_value,
             enable_request_header_overrides,
+            enable_request_decompression,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
@@ -480,6 +486,7 @@ impl Default for ServerArgs {
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             enable_request_header_overrides: false,
+            enable_request_decompression: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),

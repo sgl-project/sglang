@@ -68,6 +68,7 @@ def _server_args(ext, port: int):
         gc_threshold=None,
         default_priority_value=None,
         enable_request_header_overrides=False,
+        enable_request_decompression=False,
         health_generate_headers={},
         incremental_streaming_output=False,
         disaggregation_mode=ext.DisaggregationMode.Null,

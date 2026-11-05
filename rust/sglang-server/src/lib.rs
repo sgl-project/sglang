@@ -163,7 +163,8 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
 
 /// Wraps the HTTP app before it serves: an embedding package's own middleware
 /// or routes ([`Server::start_with_extensions`]). It wraps every route but the
-/// PD bootstrap registry's, inside the access log.
+/// PD bootstrap registry's, inside the access log and the request-body
+/// decompression, so it reads decompressed bodies.
 pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
 
 /// When a `/generate` request's timing starts, as a request extension: an

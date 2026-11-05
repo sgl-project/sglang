@@ -72,6 +72,9 @@ sha2 = "0.10"
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
+# Request bodies tagged `x-body-compressed: zstd`
+# (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
+zstd = { version = "0.13", default-features = false }
 sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
 
 [dev-dependencies]
