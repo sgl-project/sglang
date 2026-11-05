@@ -19,6 +19,71 @@ _HAS_SUPPORTED_RUNTIME = (
 )
 
 
+def _packed_prefill_inputs(spec, prefix_lengths, extension_lengths, *, pool_slots):
+    num_tokens = sum(extension_lengths)
+    table_stride = max(prefix_lengths) + 1
+    shape = (spec.num_q_heads, spec.head_dim)
+    kv_shape = (spec.num_kv_heads, spec.head_dim)
+    q = torch.randn(num_tokens, *shape, device="mps", dtype=torch.bfloat16)
+    current_k = torch.randn(num_tokens, *kv_shape, device="mps", dtype=torch.bfloat16)
+    current_v = torch.randn_like(current_k)
+    k_pool = torch.randn(pool_slots, *kv_shape, device="mps", dtype=torch.bfloat16)
+    v_pool = torch.randn_like(k_pool)
+    slots = torch.randperm(pool_slots, device="mps").to(torch.int32)
+    table = torch.zeros(
+        len(prefix_lengths), table_stride, device="mps", dtype=torch.int32
+    )
+    start = 0
+    for row, prefix_length in enumerate(prefix_lengths):
+        table[row, :prefix_length] = slots[start : start + prefix_length]
+        start += prefix_length
+    request_rows = torch.arange(len(prefix_lengths), device="mps", dtype=torch.int64)
+    return [
+        q,
+        current_k,
+        current_v,
+        k_pool,
+        v_pool,
+        table,
+        request_rows,
+        torch.tensor(prefix_lengths, device="mps", dtype=torch.int32),
+        torch.tensor(extension_lengths, device="mps", dtype=torch.int32),
+    ]
+
+
+def _packed_prefill_reference(inputs, spec):
+    """Per-token torch attention; invalid slots are skipped, invalid rows are 0."""
+    q, current_k, current_v, k_pool, v_pool, table, request_rows = inputs[:7]
+    prefix_lengths, extension_lengths = (t.tolist() for t in inputs[7:])
+    q_per_kv = spec.num_q_heads // spec.num_kv_heads
+    references = []
+    request_start = 0
+    for batch, extension_length in enumerate(extension_lengths):
+        request = int(request_rows[batch])
+        if request < 0:
+            references.extend(torch.zeros_like(q[0]) for _ in range(extension_length))
+            request_start += extension_length
+            continue
+        slots = table[request, : prefix_lengths[batch]].long()
+        slots = slots[(slots >= 0) & (slots < k_pool.shape[0])]
+        for offset in range(extension_length):
+            token = request_start + offset
+            new_rows = slice(request_start, token + 1)
+            keys = torch.cat((k_pool[slots], current_k[new_rows]))
+            values = torch.cat((v_pool[slots], current_v[new_rows]))
+            keys = keys.repeat_interleave(q_per_kv, dim=1)
+            values = values.repeat_interleave(q_per_kv, dim=1)
+            scores = torch.einsum("hd,thd->ht", q[token].float(), keys.float())
+            probabilities = torch.softmax(scores * spec.attention_scale, dim=-1)
+            references.append(
+                torch.einsum("ht,thd->hd", probabilities, values.float()).to(
+                    torch.bfloat16
+                )
+            )
+        request_start += extension_length
+    return torch.stack(references)
+
+
 @unittest.skipUnless(_HAS_SUPPORTED_RUNTIME, "requires Torch 2.13 and MLX on MPS")
 class TestMlxDeferredDecodeSmallMemory(unittest.TestCase):
     def test_two_long_sequences_match_torch(self):
@@ -258,6 +323,90 @@ class TestMlxDeferredDecodeSmallMemory(unittest.TestCase):
         torch.mps.synchronize()
         torch.testing.assert_close(
             output.cpu(), torch.stack(references).cpu(), atol=0.008, rtol=0.03
+        )
+
+    def test_packed_prefill_kernel_paths_match_torch(self):
+        """Each case pins one launch geometry the tiled kernel derives from shapes."""
+        import mlx.core as mx
+
+        from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
+            DeferredAttentionSpec,
+            radix_prefill_deferred,
+        )
+        from sglang.srt.utils.tensor_bridge import mlx_call
+
+        qwen = DeferredAttentionSpec(num_q_heads=16, num_kv_heads=8, head_dim=128)
+        cases = {
+            # Ragged requests: a row-tile crossing (33), an exact two-tile
+            # request (64), a short one, no prefix, and a multi-key-tile prefix.
+            "ragged_tiles": (qwen, (300, 0, 37), (33, 64, 5)),
+            # One row tile, five KV splits over three key tiles: split 2 holds
+            # keys rows 0..23 cannot see yet, and splits 3-4 hold no keys.
+            "masked_and_empty_splits": (
+                DeferredAttentionSpec(num_q_heads=6, num_kv_heads=2, head_dim=64),
+                (40,),
+                (30,),
+            ),
+            # head_dim 256 uses the smaller key tile to fit threadgroup memory.
+            "head_dim_256": (
+                DeferredAttentionSpec(num_q_heads=8, num_kv_heads=2, head_dim=256),
+                (40, 5),
+                (20, 13),
+            ),
+            # Two or fewer new tokens per request stay on the per-token kernel.
+            "per_token_fallback": (qwen, (10, 20), (1, 1)),
+        }
+        for name, (spec, prefix_lengths, extension_lengths) in cases.items():
+            with self.subTest(name):
+                torch.manual_seed(20261104)
+                inputs = _packed_prefill_inputs(
+                    spec, prefix_lengths, extension_lengths, pool_slots=512
+                )
+                compiled_prefill = mx.compile(
+                    lambda *arrays, spec=spec: radix_prefill_deferred(
+                        *arrays, spec=spec
+                    )
+                )
+                output = mlx_call(compiled_prefill, *inputs, device="mps")
+                reference = _packed_prefill_reference(inputs, spec)
+                torch.mps.synchronize()
+                torch.testing.assert_close(
+                    output.cpu(), reference.cpu(), atol=0.008, rtol=0.03
+                )
+
+    def test_packed_prefill_skips_invalid_slots_and_zeroes_invalid_requests(self):
+        """Out-of-pool Radix slots drop out of the softmax; rows of a request
+        with an invalid pool index come out as zeros, not uninitialized memory."""
+        import mlx.core as mx
+
+        from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
+            DeferredAttentionSpec,
+            radix_prefill_deferred,
+        )
+        from sglang.srt.utils.tensor_bridge import mlx_call
+
+        torch.manual_seed(20261105)
+        spec = DeferredAttentionSpec(num_q_heads=16, num_kv_heads=8, head_dim=128)
+        inputs = _packed_prefill_inputs(spec, (3, 40, 10), (20, 30, 12), pool_slots=128)
+        table, request_rows = inputs[5], inputs[6]
+        # Request 0's whole prefix is out of the pool, so its early rows would
+        # be dominated by zero keys if invalid slots leaked into the softmax.
+        table[0, :3] = torch.tensor([-5, 128 + 7, -1], dtype=torch.int32)
+        request_rows[1] = -1
+        # Recycle a NaN-filled buffer of the output's size so rows the kernel
+        # never writes would read back as NaN instead of a lucky zero.
+        mx.eval(mx.full(tuple(inputs[0].shape), mx.nan, dtype=mx.bfloat16))
+
+        output = mlx_call(
+            lambda *arrays: radix_prefill_deferred(*arrays, spec=spec),
+            *inputs,
+            device="mps",
+        )
+        reference = _packed_prefill_reference(inputs, spec)
+        torch.mps.synchronize()
+        torch.testing.assert_close(output.cpu(), reference.cpu(), atol=0.008, rtol=0.03)
+        torch.testing.assert_close(
+            output[20:50].cpu(), torch.zeros_like(output[20:50]).cpu(), atol=0, rtol=0
         )
 
     def test_current_token_bypasses_uncommitted_pool_entry(self):
