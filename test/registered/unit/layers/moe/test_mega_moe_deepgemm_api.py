@@ -144,18 +144,13 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIsNot(buffers[0], buffers[2])
         self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
 
-    def test_decode_reserved_sms_applies_to_decode_only(self):
+    def test_decode_reserved_sms_applies_to_sm107_decode_only(self):
         max_num_sms = _UNCACHED_MEGA_MOE_MAX_NUM_SMS
         props = SimpleNamespace(multi_processor_count=212)
-        with (
-            patch.object(mega_moe, "_device_sm", 107),
-            patch.object(torch.cuda, "get_device_properties", return_value=props),
-        ):
-            for decode_reserved, decode in ((0, 210), (1, 210), (18, 194)):
-                with self.subTest(decode_reserved=decode_reserved):
-                    with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_RESERVED_SMS.override(
-                        decode_reserved
-                    ):
+        with patch.object(torch.cuda, "get_device_properties", return_value=props):
+            for device_sm, decode in ((107, 194), (100, 210)):
+                with self.subTest(device_sm=device_sm):
+                    with patch.object(mega_moe, "_device_sm", device_sm):
                         self.assertEqual(max_num_sms(False), 210)
                         self.assertEqual(max_num_sms(True), decode)
 

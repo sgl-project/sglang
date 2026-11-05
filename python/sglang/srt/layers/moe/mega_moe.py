@@ -68,6 +68,10 @@ def _mega_moe_mma_type(experts) -> str:
     return "fp8xfp8" if experts.w13_weight.dtype == torch.float8_e4m3fn else "fp8xfp4"
 
 
+# Decode/target-verify on sm107: SMs left for the mHC stats stream beside MegaMoE.
+_MEGA_MOE_SM107_DECODE_RESERVED_SMS = 18
+
+
 @functools.cache
 def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
     if _device_sm < 100:
@@ -81,9 +85,7 @@ def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
     reserved_num_sms = max(
         0,
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(),
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_RESERVED_SMS.get()
-        if decode_like
-        else 0,
+        _MEGA_MOE_SM107_DECODE_RESERVED_SMS if decode_like and _device_sm == 107 else 0,
     )
     return max(2, num_sms - reserved_num_sms)
 
