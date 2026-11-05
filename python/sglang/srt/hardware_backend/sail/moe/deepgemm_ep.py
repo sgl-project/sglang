@@ -109,6 +109,15 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             hidden_states = gemm(runner_input, quant_info, running_state)
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
+    def _grouped_gemm_nt_f8f8bf16_masked(self, *args, **kwargs):
+        """Route the shared blockwise masked FP8 GEMM to the SAIL wrapper.
+
+        Blockwise FP8 keeps the upstream ``_run_masked_gemm``; only the entry
+        point differs, because the SAIL build names the per-channel kernel type
+        and the SBO switch differently from the CUDA build.
+        """
+        return sail_entrypoint.grouped_gemm_nt_f8f8bf16_masked(*args, **kwargs)
+
     def _run_contiguous_gemm(
         self,
         runner_input: DeepGemmRunnerInput,
@@ -947,7 +956,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        sail_entrypoint.grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
@@ -1046,7 +1055,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        deep_gemm_return_value = sail_entrypoint.grouped_gemm_nt_f8f8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,
@@ -1432,7 +1441,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
+        sail_entrypoint.grouped_gemm_nt_bf16_masked(
             hidden_states,
             w13_weight,
             gateup_output,
@@ -1494,7 +1503,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
+        deep_gemm_return_value = sail_entrypoint.grouped_gemm_nt_bf16_masked(
             down_input,
             w2_weight,
             down_output,
