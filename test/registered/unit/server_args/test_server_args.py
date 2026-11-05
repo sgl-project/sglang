@@ -22,6 +22,7 @@ from sglang.srt.arg_groups import (
     validation_hook,
 )
 from sglang.srt.arg_groups.attention_hook import (
+    _aiter_decode_workspace_mb,
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
@@ -5470,6 +5471,43 @@ class TestPagedExpertsNumResident(unittest.TestCase):
         for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 _paged_experts_num_resident(bad)
+
+
+class TestAiterDecodeWorkspaceReserve(CustomTestCase):
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        # Llama-3.1-8B
+        args._model_config = SimpleNamespace(
+            attention_arch=AttentionArch.MHA,
+            is_hybrid_swa=False,
+            num_attention_heads=32,
+            head_dim=128,
+            context_len=131072,
+        )
+        return args
+
+    def test_auto_request_pool_uses_the_4096_cap(self):
+        args = self._args()
+        # 4096 requests x 32 heads x 512 partitions x (128 + 2) fp32
+        self.assertAlmostEqual(
+            _aiter_decode_workspace_mb(args, args._model_config), 33280
+        )
+
+    def test_scales_with_heads_per_rank_and_explicit_request_cap(self):
+        args = self._args(tp_size=2, max_running_requests=256)
+        self.assertAlmostEqual(
+            _aiter_decode_workspace_mb(args, args._model_config), 1040
+        )
+
+    def test_no_workspace_for_mla_or_sliding_window(self):
+        args = self._args()
+        args._model_config.attention_arch = AttentionArch.MLA
+        self.assertEqual(_aiter_decode_workspace_mb(args, args._model_config), 0)
+        args._model_config.attention_arch = AttentionArch.MHA
+        args._model_config.is_hybrid_swa = True
+        self.assertEqual(_aiter_decode_workspace_mb(args, args._model_config), 0)
 
 
 if __name__ == "__main__":

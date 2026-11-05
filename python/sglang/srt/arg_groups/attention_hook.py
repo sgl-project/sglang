@@ -41,16 +41,51 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attn_tp_size, get_platform
 from sglang.srt.utils.common import (
+    get_bool_env_var,
     parse_connector_type,
 )
+from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
 
 # Largest GQA group DISPATCH_DECODE instantiates in sgl-kernel-xpu flash_attention.cpp.
 XPU_DECODE_MAX_Q_GROUP_SIZE = 16
+
+# Mirrors _AITER_PARTITION_SIZE_ROCM in layers/attention/aiter_backend.py.
+_AITER_PARTITION_SIZE = 256
+# Upper bound of the automatic request-pool size (KVCacheConfigurator.resolve_max_num_reqs).
+_AUTO_MAX_RUNNING_REQUESTS = 4096
+
+
+def _aiter_decode_workspace_mb(server_args: Any, model_config: Any) -> float:
+    """Upper bound of AiterAttnBackend.workspace_buffer in MiB.
+
+    The buffer holds fp32 partial outputs plus two fp32 stats for every
+    (request slot, head, partition), and is allocated after the KV pool.
+    """
+    if (
+        use_mla_backend(server_args)
+        or model_config.is_hybrid_swa
+        or get_bool_env_var("SGLANG_USE_AITER_UNIFIED_ATTN")
+    ):
+        return 0.0
+    cfg = resolving_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    num_heads = model_config.num_attention_heads // attn_tp_size
+    num_partitions = -(-model_config.context_len // _AITER_PARTITION_SIZE)
+    if cfg.max_running_requests is not None:
+        max_reqs = max(1, cfg.max_running_requests // cfg.attn_dp_size)
+    else:
+        max_reqs = _AUTO_MAX_RUNNING_REQUESTS
+    per_req_bytes = num_heads * num_partitions * (model_config.head_dim + 2) * 4
+    return max_reqs * per_req_bytes / (1 << 20)
 
 
 def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
@@ -271,10 +306,26 @@ def handle_attention_backend_compatibility(server_args: Any):
                     cfg.mem_fraction_static,
                 )
             else:
+                mem_fraction_static = cfg.mem_fraction_static * 0.85
+                gpu_mem = (
+                    None
+                    if explicit_mem_fraction
+                    else get_device_memory_capacity(cfg.device)
+                )
+                if gpu_mem:
+                    # The decode workspace is allocated after the KV pool, so the
+                    # automatic fraction must leave room for it on top of the
+                    # graph/activation reserve; 0.85 alone is short for long-context
+                    # models with many heads per rank (Llama-3.1-8B at TP1: ~33 GB).
+                    workspace_mb = _aiter_decode_workspace_mb(server_args, model_config)
+                    mem_fraction_static = min(
+                        mem_fraction_static,
+                        round(cfg.mem_fraction_static - workspace_mb / gpu_mem, 3),
+                    )
                 declare_resolution(
                     server_args,
                     "_handle_attention_backend_compatibility",
-                    mem_fraction_static=cfg.mem_fraction_static * 0.85,
+                    mem_fraction_static=mem_fraction_static,
                 )
 
     # Other platforms backends
