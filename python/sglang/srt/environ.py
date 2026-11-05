@@ -2263,8 +2263,8 @@ class Envs:
     # the pack + all-to-all + combine (W_UV-before-reduce path, 128-wide heads).
     # Rows per call up to SGLANG_DCP_PUSH_COMBINE_MAX_ROWS. See
     # kernels/ops/attention/dcp_push_combine.py.
-    SGLANG_DCP_PUSH_COMBINE = EnvBool(True)
-    SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(_k31_gb_best(1536, 1024))
+    SGLANG_ENABLE_DCP_PUSH_COMBINE = EnvBool(True)
+    SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(1024)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention

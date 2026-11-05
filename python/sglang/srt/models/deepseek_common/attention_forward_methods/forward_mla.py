@@ -172,10 +172,13 @@ class DeepseekMLAForwardMixin:
     # materialized: disables deferred BMM fusion and born-FP8 query packing.
     # Applies only to this mixin's absorbed path, not MLA_ROCM.
     needs_unfused_mla_qkv = False
+    # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
+    dcp_v_preproject = False
+    _dcp_v_weights: Optional[torch.Tensor] = None
 
     def _prepare_dcp_v_weights(self, group):
         weights = group.all_gather(self.w_vc.contiguous(), dim=0)
-        cached = getattr(self, "_dcp_v_weights", None)
+        cached = self._dcp_v_weights
         if cached is None:
             self._dcp_v_weights = weights
         else:
@@ -945,7 +948,7 @@ class DeepseekMLAForwardMixin:
                     # A head's linear V projection commutes with its LSE-weighted
                     # reduction. Exchange the narrower projected partials.
                     if (
-                        getattr(self, "dcp_v_preproject", False)
+                        self.dcp_v_preproject
                         and self.use_dsa
                         and (
                             attn_output.shape[0] >= 512
@@ -961,7 +964,7 @@ class DeepseekMLAForwardMixin:
                         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
                         and not is_kv_b_lora_active(self)
                     ):
-                        weights = getattr(self, "_dcp_v_weights", None)
+                        weights = self._dcp_v_weights
                         if (
                             weights is None
                             and not torch.cuda.is_current_stream_capturing()
@@ -1046,20 +1049,9 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = deepseek_mla_correction.apply_v_correction(
                 self, attn_output, attn_bmm_output
             )
-        if attention_output_gate is not None:
-            attn_bmm_output = _apply_attention_output_gate(
-                self, attn_bmm_output, attention_output_gate
-            )
-        output, _ = self.o_proj(attn_bmm_output)
-
-        if self.next_skip_topk is None:
-            return output
-
-        # Return topk_indices for the next layer when enabling index cache
-        if not self.next_skip_topk:
-            return output, None
-        else:
-            return output, topk_indices
+        return _finish_absorb_output(
+            self, attn_bmm_output, attention_output_gate, topk_indices
+        )
 
     def project_mla_values(
         self: DeepseekV2AttentionMLA,

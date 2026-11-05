@@ -67,14 +67,6 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 class DcpCandidateAllGather:
-    """All-gather of the top-k candidates over the DCP group through torch
-    symmetric memory (NVLS multimem, as TorchSymmMemCommunicator does for
-    all-reduce): every rank writes its candidates into one symmetric output
-    buffer, rendezvoused once at init. Falls back to the group all-gather when
-    multicast is unavailable or the payload does not fit. Only the first
-    min(local_lens[row], topk) pairs in each row are valid.
-    """
-
     def __init__(self, group, max_rows: int, topk: int):
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -449,19 +441,18 @@ def dcp_global_topk(
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
         return out
-    workspace = _CANDIDATE_ALL_GATHER if all_gather is None else None
+    workspace = _CANDIDATE_ALL_GATHER
     compact_prefix = (
         workspace is not None
         and workspace.prefix_handle is not None
         and rows <= workspace.max_rows
         and topk == workspace.topk
     )
-    if all_gather is None and workspace is not None:
-        all_gather = partial(
-            workspace, local_lens=local_lens, compact_prefix=compact_prefix
-        )
-    if all_gather is None:
-        all_gather = partial(parallel.dcp_group.all_gather, dim=0)
+    all_gather = (
+        partial(workspace, local_lens=local_lens, compact_prefix=compact_prefix)
+        if workspace is not None
+        else partial(parallel.dcp_group.all_gather, dim=0)
+    )
 
     # Row i of `dense` holds the candidate scores at their global positions.
     # Its -inf fill depends on the lengths only, so it overlaps the local top-k
