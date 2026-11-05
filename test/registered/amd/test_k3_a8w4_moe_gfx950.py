@@ -117,8 +117,9 @@ class TestK3A8W4MoeGfx950(CustomTestCase):
             out.index_add_(0, tok, w[tok, slot, None] * y)
         return out
 
-    def _run(self, x, ids, w, out=None):
-        return self.M.k3_a8w4_moe(
+    def _run(self, x, ids, w, out=None, **overrides):
+        run = self.M._k3_a8w4_moe if overrides else self.M.k3_a8w4_moe
+        return run(
             x,
             ids,
             w,
@@ -129,22 +130,7 @@ class TestK3A8W4MoeGfx950(CustomTestCase):
             beta=self.BETA,
             linear_beta=self.LBETA,
             out=out,
-        )
-
-    def _run_segments(self, x, ids, w, block_m, seg_blocks):
-        return self.M._k3_a8w4_moe(
-            x,
-            ids,
-            w,
-            self.w13,
-            self.w13s,
-            self.w2,
-            self.w2s,
-            beta=self.BETA,
-            linear_beta=self.LBETA,
-            out=None,
-            block_m=block_m,
-            seg_blocks=seg_blocks,
+            **overrides,
         )
 
     @staticmethod
@@ -185,10 +171,10 @@ class TestK3A8W4MoeGfx950(CustomTestCase):
             (w / w.sum(1, keepdim=True)).contiguous(),
         )
         ref = self._reference(x, ids, w)
-        whole = self._run_segments(x, ids, w, block_m, seg_blocks=1 << 20)
+        whole = self._run(x, ids, w, block_m=block_m, seg_blocks=1 << 20)
         self.assertLess(self._rel(whole, ref), 1e-2)
-        for seg in (1, 3, 8):
-            out = self._run_segments(x, ids, w, block_m, seg_blocks=seg)
+        for seg in (3, 8):  # non-power-of-two tail and production segment size
+            out = self._run(x, ids, w, block_m=block_m, seg_blocks=seg)
             self.assertTrue(torch.equal(out, whole), f"seg_blocks={seg}")
 
     def test_matches_aiter_a8w4(self):

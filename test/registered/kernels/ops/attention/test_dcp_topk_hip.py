@@ -29,18 +29,23 @@ _GARBAGE = 1e30
 _REGISTER_SCORES = 16 * 1024
 
 
-def _row_lengths(group: str, world: int) -> list[int]:
-    if group == "short":
-        # empty, most ranks empty, and both sides of the global top-k bound
-        return [0, 1, world - 1, 1000, TOPK, TOPK + 1]
-    if group == "local_fast":  # every rank's share <= 2048: no local select
-        return [world * TOPK - 1, world * TOPK]
-    if group == "local_radix":
-        return [world * TOPK + 1, world * 5000]
-    if group == "register_tail":
-        n = world * _REGISTER_SCORES
-        return [n, n + 1, world * 17500]
-    raise ValueError(group)
+def _row_lengths(world: int) -> list[int]:
+    # Each CTA follows its row's length, so one batch covers all local paths.
+    return [
+        0,
+        1,
+        world - 1,
+        1000,
+        TOPK,
+        TOPK + 1,
+        world * TOPK - 1,
+        world * TOPK,  # local copy/select boundary
+        world * TOPK + 1,
+        world * 5000,
+        world * _REGISTER_SCORES,
+        world * _REGISTER_SCORES + 1,
+        world * 17500,
+    ]
 
 
 def _scores(kind: str, n: int, gen: torch.Generator) -> torch.Tensor:
@@ -115,15 +120,12 @@ def _case(world, lengths, make_scores, seed):
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
 @pytest.mark.parametrize("world", [2, 8])
 @pytest.mark.parametrize("kind", ["spread", "one_exponent"])
-@pytest.mark.parametrize(
-    "group", ["short", "local_fast", "local_radix", "register_tail"]
-)
-def test_selects_the_global_topk_slots(world, kind, group):
+def test_selects_the_global_topk_slots(world, kind):
     """The slots of exactly the top-min(len, 2048) global positions, -1 after them,
     whichever local path (copy, radix, register tail) each rank's share takes."""
-    lengths = _row_lengths(group, world)
+    lengths = _row_lengths(world)
     scores, table, span = _case(
-        world, lengths, lambda n, g: _scores(kind, n, g), seed=world * 7 + len(group)
+        world, lengths, lambda n, g: _scores(kind, n, g), seed=world * 7
     )
     out, num_owners = _dcp_topk(scores, world, table, span)
     out, num_owners, table = out.cpu(), num_owners.cpu(), table.cpu()

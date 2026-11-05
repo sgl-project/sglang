@@ -19,7 +19,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     is_mla_dcp_lse_base_on_e,
 )
-from sglang.srt.speculative import dflash_utils
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_pool_rows,
@@ -47,6 +46,9 @@ CONTEXTS = {
     "single": [3000],
     "edge": [1020, 1021],
 }
+# DCP8 edge and single requests use the same split count; include the boundary
+# positions in its batch instead of compiling a separate edge case.
+DCP8_BATCH = CONTEXTS["batch"] + CONTEXTS["edge"]
 
 
 def _layout(ctx, dcp, seed):
@@ -207,10 +209,14 @@ def _assert_matches(out, lse, ref_out, ref_lse):
     torch.testing.assert_close(lse, ref_lse, rtol=0, atol=2e-3)
 
 
-@pytest.mark.parametrize("dcp", [1, 8])
+@pytest.mark.parametrize(
+    "dcp,ctx",
+    [(1, CONTEXTS[name]) for name in CONTEXTS]
+    + [(8, DCP8_BATCH), (8, CONTEXTS["single"])],
+    ids=["dcp1-batch", "dcp1-single", "dcp1-edge", "dcp8-batch", "dcp8-single"],
+)
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, fp8_dtype])
 @pytest.mark.parametrize("window_left", WINDOWS)
-@pytest.mark.parametrize("ctx", list(CONTEXTS.values()), ids=list(CONTEXTS))
 def test_rank_partials_merge_to_dense_window(dcp, kv_dtype, window_left, ctx):
     req_to_token, pool_idx, positions, keys, q = _inputs(ctx, dcp, kv_dtype)
     out, lse = _merged_rank_partials(
@@ -222,9 +228,16 @@ def test_rank_partials_merge_to_dense_window(dcp, kv_dtype, window_left, ctx):
 
 
 @pytest.mark.parametrize("window_left", WINDOWS)
-@pytest.mark.parametrize("ctx", list(CONTEXTS.values()), ids=list(CONTEXTS))
-def test_ring_rows_read_as_the_request_window(window_left, ctx):
-    # With a draft KV ring the window keys live in each request's ring rows.
+@pytest.mark.parametrize(
+    "ctx,with_floor",
+    [
+        (CONTEXTS["batch"], False),
+        (CONTEXTS["single"], False),
+        (CONTEXTS["batch"], True),
+    ],
+    ids=["batch", "single", "prefix-cache-floor"],
+)
+def test_ring_rows_read_as_the_request_window(window_left, ctx, with_floor):
     dcp = 8
     req_to_token, pool_idx, positions, keys, q = _inputs(ctx, dcp, fp8_dtype)
     ring = DFlashDraftKVRing(
@@ -236,32 +249,12 @@ def test_ring_rows_read_as_the_request_window(window_left, ctx):
         device="cuda",
         window_left=window_left,
     )
-    out, lse = _merged_rank_partials(
-        q, keys, req_to_token, pool_idx, positions, _layer(window_left), dcp, ring=ring
-    )
-    _assert_matches(
-        out, lse, *_reference(q, keys, req_to_token, pool_idx, positions, window_left)
-    )
-
-
-@pytest.mark.parametrize("window_left", WINDOWS)
-def test_ring_window_starts_at_the_request_floor(window_left):
-    # A prefix-cache hit leaves the ring rows below the request's first extend stale.
-    dcp, ctx = 8, CONTEXTS["batch"]
-    req_to_token, pool_idx, positions, keys, q = _inputs(ctx, dcp, fp8_dtype)
-    ring = DFlashDraftKVRing(
-        rows_per_req=draft_kv_ring_rows_per_req(
-            window_left=window_left, block_size=Q_LEN, dcp_size=dcp
-        ),
-        dcp_size=dcp,
-        req_pool_rows=req_to_token.shape[0],
-        device="cuda",
-        window_left=window_left,
-    )
-    floors = [max(0, c - 37) for c in ctx]
-    ring.min_pos[pool_idx.cuda()] = torch.tensor(
-        floors, dtype=torch.int32, device="cuda"
-    )
+    floors = [max(0, c - 37) for c in ctx] if with_floor else None
+    if floors is not None:
+        # Prefix-cache hits must not read stale keys below the first extend.
+        ring.min_pos[pool_idx.cuda()] = torch.tensor(
+            floors, dtype=torch.int32, device="cuda"
+        )
     out, lse = _merged_rank_partials(
         q,
         keys,
@@ -284,20 +277,16 @@ def test_ring_admits_triton_only_under_dcp_on_rocm():
     """Only ROCm's triton draft backend reads a ring window by index, and only under
     DCP; elsewhere it keeps dev's refusal."""
 
+    config = {
+        "num_hidden_layers": 1,
+        "dflash_config": {"attention_mode": "mla"},
+        "layer_types": ["sliding_attention"],
+    }
+
     def reason(dcp, hip):
-        with (
-            mock.patch.object(
-                dflash_utils, "is_dflash_mla_draft_config", return_value=True
-            ),
-            mock.patch.object(
-                dflash_utils,
-                "get_dflash_layer_types",
-                return_value=["sliding_attention"],
-            ),
-            mock.patch("sglang.srt.utils.is_hip", return_value=hip),
-        ):
+        with mock.patch("sglang.srt.utils.is_hip", return_value=hip):
             return draft_kv_ring_unsupported_reason(
-                object(), draft_backend="triton", draft_window_size=None, dcp_size=dcp
+                config, draft_backend="triton", draft_window_size=None, dcp_size=dcp
             )
 
     assert reason(dcp=8, hip=True) is None

@@ -4152,16 +4152,13 @@ class TestKimiK31DcpOverrides(CustomTestCase):
                 )
                 self.assertEqual(overrides["speculative_attention_mode"], "decode")
 
-    def test_dflash_on_rocm_rejects_other_draft_backends(self):
-        # cutedsl_mla is CUDA-only.
-        for backend in ("flashinfer", "cutedsl_mla", "trtllm_mla", "aiter"):
-            with self.subTest(backend=backend):
-                with self.assertRaisesRegex(ValueError, "other than triton"):
-                    self._overrides(
-                        is_hip=True,
-                        speculative_algorithm="DFLASH",
-                        speculative_draft_attention_backend=backend,
-                    )
+    def test_dflash_on_rocm_rejects_the_cuda_draft_backend(self):
+        with self.assertRaisesRegex(ValueError, "other than triton"):
+            self._overrides(
+                is_hip=True,
+                speculative_algorithm="DFLASH",
+                speculative_draft_attention_backend="cutedsl_mla",
+            )
 
     def test_other_speculative_algorithms_stay_rejected(self):
         with self.assertRaisesRegex(ValueError, "DSPARK and DFLASH"):

@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,14 +10,20 @@ from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import 
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
+    kda_verify_gfx950,
+    supports_kda_verify_gfx950,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.linear.kda_backend_hip import kda_chain_verify_gfx950
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: the gfx950 product-rounding boundary must stay bit-exact.
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=155, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
 
@@ -54,10 +61,9 @@ _RING_CASES += [
 _RING_LEN = 16
 
 
-def _make_ring_buffers(H, HV, K, V):
+def _make_ring_buffers(H, HV, K, V, slots=8):
     # Garbage-filled so a full-tensor bitwise compare proves both that written
     # positions match and that neither kernel scribbles outside them.
-    slots = 8
     return {
         "rawv": torch.randn(
             slots, HV, _RING_LEN, V, device=_DEVICE, dtype=torch.bfloat16
@@ -180,13 +186,13 @@ def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
     return o, conv, win, ic
 
 
-def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
+def _fused_args(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
     conv = inp["conv_pool"].clone()
     ssm = inp["ssm"].clone()
     win = inp["win_pool"].clone()
     ic = inp["inter_ssm"].clone() if rings is None else None
 
-    o = fused_kda_conv_gating_verify(
+    return dict(
         mixed_qkv=inp["mixed"],
         conv_weight=inp["w"],
         conv_bias=inp["bias"],
@@ -215,7 +221,17 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
         replayssm_g=rings["g"] if rings is not None else None,
         replayssm_beta=rings["beta"] if rings is not None else None,
     )
-    return o, conv, win, ic
+
+
+def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
+    args = _fused_args(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings)
+    o = fused_kda_conv_gating_verify(**args)
+    return (
+        o,
+        args["conv_state"].transpose(-1, -2),
+        args["intermediate_conv_window"].transpose(-1, -2),
+        args["intermediate_states_buffer"],
+    )
 
 
 def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloat16):
@@ -308,6 +324,235 @@ def test_output_does_not_depend_on_cta_scheduling():
 @pytest.mark.parametrize("case", _RING_CASES)
 def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)
+
+
+def _gfx950_case(B, H, seed, T=8, lower_bound=-5.0, snapshot=False):
+    inp = _make_inputs(B, T, H, H, 128, 128, 4, False, False, seed, torch.float32)
+    inp["cache_indices"] = torch.tensor(
+        [-1] + list(range(1, B)) if B > 1 else [1], device=_DEVICE, dtype=torch.int32
+    )
+    inp["inter_indices"] = inp["cache_indices"]
+    inp["win_pool"].normal_()  # untouched window rows must keep their sentinel values
+    inp["inter_ssm"].fill_(7.0)
+    rings = (
+        None if snapshot else _make_ring_buffers(H, H, 128, 128, inp["ssm"].shape[0])
+    )
+    args = _fused_args(inp, B, T, H, H, 128, 128, lower_bound, None, rings)
+    del args["conv_bias"], args["conv_state_indices"]
+    return args
+
+
+def _gfx950_supported(args):
+    return supports_kda_verify_gfx950(
+        **{
+            key: args[key]
+            for key in (
+                "num_q_heads",
+                "num_v_heads",
+                "head_k_dim",
+                "head_v_dim",
+                "T",
+                "mixed_qkv",
+                "conv_weight",
+                "conv_state",
+                "a",
+                "b",
+                "ssm_states",
+                "replayssm_rawv",
+                "intermediate_states_buffer",
+                "intermediate_conv_window",
+            )
+        }
+    )
+
+
+def _gfx950_reference(args):
+    return fused_kda_conv_gating_verify(
+        conv_bias=None, conv_state_indices=args["cache_indices"], **args
+    )
+
+
+def _assert_gfx950_result(ref, new, o_ref, o_new, snapshot_atol=1e-4):
+    ring = ref["cache_ring"]
+    for name in ("conv_state", "intermediate_conv_window", "ssm_states") + (
+        ("replayssm_rawv", "replayssm_beta") if ring else ()
+    ):
+        assert torch.equal(ref[name], new[name]), name
+    if ring:
+        torch.testing.assert_close(
+            new["replayssm_rawk"], ref["replayssm_rawk"], rtol=8e-3, atol=1e-5
+        )
+        torch.testing.assert_close(
+            new["replayssm_g"], ref["replayssm_g"], rtol=1e-5, atol=1e-6
+        )
+    else:
+        torch.testing.assert_close(
+            new["intermediate_states_buffer"],
+            ref["intermediate_states_buffer"],
+            rtol=1e-3,
+            atol=snapshot_atol,
+        )
+    rows = (ref["cache_indices"] >= 0).repeat_interleave(ref["T"])
+    torch.testing.assert_close(
+        o_new[0][rows].float(), o_ref[0][rows].float(), rtol=2e-2, atol=2e-3
+    )
+
+
+def _gfx950_srt(args, *, conv_bias=None, **overrides):
+    layer = SimpleNamespace(
+        bias=conv_bias,
+        conv_weights=args["conv_weight"],
+        **{
+            key: args[key]
+            for key in (
+                "A_log",
+                "dt_bias",
+                "num_q_heads",
+                "num_v_heads",
+                "head_k_dim",
+                "head_v_dim",
+                "lower_bound",
+            )
+        },
+    )
+    kwargs = dict(
+        mixed_qkv=args["mixed_qkv"],
+        a=args["a"],
+        b=args["b"],
+        draft_token_num=args["T"],
+        conv_states=args["conv_state"].transpose(-1, -2),
+        conv_state_indices=args["cache_indices"],
+        ssm_states=args["ssm_states"],
+        intermediate_state_cache=args["intermediate_states_buffer"],
+        intermediate_conv_window_cache=args["intermediate_conv_window"].transpose(
+            -1, -2
+        ),
+        intermediate_state_indices=args["intermediate_state_indices"],
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_parent_token=None,
+        ring_kwargs={
+            key: args[key]
+            for key in (
+                "cache_ring",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_g",
+                "replayssm_beta",
+            )
+        }
+        if args["cache_ring"]
+        else {},
+    )
+    kwargs.update(overrides)
+    return kda_chain_verify_gfx950(layer, **kwargs)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+class TestGfx950Verify:
+    @pytest.mark.parametrize("B", [1, 24])
+    @pytest.mark.parametrize("lower_bound", [-5.0, None])
+    @pytest.mark.parametrize(
+        "T,snapshot", [(8, False), (6, False), (3, False), (8, True), (6, True)]
+    )
+    def test_matches_triton_chain_verify(self, B, lower_bound, T, snapshot):
+        """Keep every (BV, T, bounded gate, snapshot) specialization and padded state."""
+        H = 12 if snapshot or T == 8 else 16
+        seed = B * 17 + 5 if snapshot else B * 31 + H
+        ref, new = (
+            _gfx950_case(B, H, seed, T, lower_bound, snapshot) for _ in range(2)
+        )
+        assert _gfx950_supported(new)
+        _assert_gfx950_result(
+            ref, new, _gfx950_reference(ref), kda_verify_gfx950(**new)
+        )
+
+    @pytest.mark.parametrize(
+        "field", ["conv_state", "intermediate_conv_window", "conv_weight"]
+    )
+    def test_conv_inputs_the_kernel_cannot_read_fall_back(self, field):
+        args = _gfx950_case(1, 16, seed=0)
+        assert _gfx950_supported(args)
+        args[field] = (
+            args[field][:, :3] if field == "conv_weight" else args[field].float()
+        )
+        assert not _gfx950_supported(args)
+
+    @pytest.mark.parametrize("ring", [True, False], ids=["ring", "snapshots"])
+    def test_srt_verify_indexes_state_by_slot_and_window_by_batch_row(self, ring):
+        # No physical slot equals its scratch row; -1 must not write any state.
+        ref, new = (_gfx950_case(6, 12, seed=11, snapshot=not ring) for _ in range(2))
+        for args in (ref, new):
+            args["cache_indices"] = torch.tensor(
+                [7, -1, 4, 0, 6, 1], device=_DEVICE, dtype=torch.int32
+            )
+            args["intermediate_state_indices"] = torch.arange(
+                6, device=_DEVICE, dtype=torch.int32
+            )
+        o_new = _gfx950_srt(new)
+        assert o_new is not None
+        _assert_gfx950_result(
+            ref, new, _gfx950_reference(ref), o_new, snapshot_atol=1e-3
+        )
+
+    def test_reads_mixed_qkv_and_b_as_views_of_the_fused_projection(self):
+        B, H, T = 3, 12, 8
+        dense, views = (_gfx950_case(B, H, seed=23) for _ in range(2))
+        sizes = [3 * H * 128, H * 128, 128, H]
+        sizes.append(-sum(sizes) % 8)  # TP8 in-projection rows pad to 6288 columns
+        front = torch.randn(B * T, sum(sizes), device=_DEVICE, dtype=torch.bfloat16)
+        views["mixed_qkv"], _, _, views["b"], _ = torch.split(front, sizes, dim=-1)
+        views["mixed_qkv"].copy_(dense["mixed_qkv"])
+        views["b"].copy_(dense["b"])
+        assert _gfx950_supported(views)
+        o_dense, o_views = kda_verify_gfx950(**dense), kda_verify_gfx950(**views)
+        for name in (
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_g",
+            "replayssm_beta",
+            "intermediate_conv_window",
+            "conv_state",
+            "ssm_states",
+        ):
+            assert torch.equal(dense[name], views[name]), name
+        rows = (dense["cache_indices"] >= 0).repeat_interleave(T)
+        assert torch.equal(o_dense[0][rows], o_views[0][rows])
+
+    @pytest.mark.parametrize(
+        "unsupported", ["tree", "conv_bias", "bf16_A_log", "ring_shorter_than_T"]
+    )
+    def test_srt_verify_declines_what_the_kernel_cannot_serve(self, unsupported):
+        args = _gfx950_case(6, 12, seed=0)
+        args["cache_indices"] = torch.tensor(
+            [7, -1, 4, 0, 6, 1], device=_DEVICE, dtype=torch.int32
+        )
+        args["intermediate_state_indices"] = torch.arange(
+            6, device=_DEVICE, dtype=torch.int32
+        )
+        overrides = {}
+        if unsupported == "tree":
+            tree = torch.full((6, 8), -1, device=_DEVICE, dtype=torch.int64)
+            overrides = dict(
+                retrieve_next_token=tree,
+                retrieve_next_sibling=tree,
+                retrieve_parent_token=tree,
+            )
+        elif unsupported == "conv_bias":
+            overrides["conv_bias"] = torch.zeros(
+                args["conv_weight"].shape[0], device=_DEVICE
+            )
+        elif unsupported == "bf16_A_log":
+            args["A_log"] = args["A_log"].bfloat16()
+        else:
+            for name in (
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_g",
+                "replayssm_beta",
+            ):
+                args[name] = torch.zeros_like(args[name][:, :, :7]).contiguous()
+        assert _gfx950_srt(args, **overrides) is None
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
-"""ROCm tests for Triton sparse MLA launch tuning."""
+"""ROCm sparse MLA over packed FP8 KV: numerical references and launch tuning."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 import triton
 
+import sglang.kernels.ops.attention.dsa.sparse_mla_decode_gfx950 as mla_gfx950
 from sglang.kernels.ops.attention.dsa import sparse_mla_prefill_gfx950
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _cu_count,
@@ -18,15 +21,24 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _get_splitk_bufs,
     _splitk_bufs,
 )
-from sglang.srt.utils import is_hip
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=155, suite="stage-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm only")
 
 _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
     torch.float8_e4m3fn, 16, 512, 64, 576
 )
+
+
+_DEVICE = "cuda"
+_DV, _DR, _TOPK, _N = 512, 64, 2048, 16384
+_RAGGED = [256, 0, 1, 63, 65, 2048, 300, 200]
+_PREFILL_POOL = 8192
 
 
 def test_cu_count_uses_tensor_device(monkeypatch):
@@ -112,6 +124,29 @@ def _scaled_fp8_ds_mla_kv(pool, seed):
     return kv, keys
 
 
+def _sparse_mla_reference(q, keys, idx, sm_scale, lengths=None):
+    if lengths is not None:
+        rows, heads, _ = q.shape
+        out = torch.zeros(rows, heads, 512, device=_DEVICE)
+        lse = torch.full((rows, heads), -float("inf"), device=_DEVICE)
+        for row in range(rows):
+            n = int(lengths[row])
+            if n:
+                k = keys[idx[row, :n].long()]
+                scores = q[row] @ k.T * sm_scale
+                lse[row] = torch.logsumexp(scores, -1)
+                out[row] = torch.softmax(scores, -1) @ k[:, :512]
+        return out, lse
+    gathered = keys[idx.clamp(min=0).long()]
+    scores = torch.einsum("thd,tkd->thk", q, gathered) * sm_scale
+    scores = scores.masked_fill((idx < 0)[:, None, :], float("-inf"))
+    lse = torch.logsumexp(scores, -1)
+    out = torch.einsum(
+        "thk,tkd->thd", torch.softmax(scores, -1).nan_to_num(0.0), gathered[..., :512]
+    )
+    return out, lse
+
+
 @pytest.mark.skipif(not _IS_GFX950, reason="gfx950 long-prefill path")
 def test_long_prefill_scaled_kv_matches_reference(monkeypatch):
     """The Triton single-pass prefill dequantizes the fp8_ds_mla rows to bf16 before the
@@ -134,10 +169,7 @@ def test_long_prefill_scaled_kv_matches_reference(monkeypatch):
     out = triton_sparse_mla_fwd(q_nope, q_rope, kv, idx.unsqueeze(1), sm_scale)
 
     q = torch.cat([q_nope.float(), q_rope.float()], -1)
-    rows = keys[idx.clamp(min=0).long()]
-    s = torch.einsum("thd,tkd->thk", q, rows) * sm_scale
-    s = s.masked_fill((idx < 0)[:, None, :], float("-inf"))
-    ref = torch.einsum("thk,tkd->thd", torch.softmax(s, -1), rows[..., :512])
+    ref, _ = _sparse_mla_reference(q, keys, idx, sm_scale)
     err = ((out[0].float() - ref).norm() / ref.norm()).item()
     assert err < 4e-3, err
 
@@ -248,6 +280,155 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
     torch.testing.assert_close(
         run(_reduce_d_chunk(active_splits, batch * heads)), run(64), rtol=0, atol=0
     )
+
+
+def _pow2_scaled_kv():
+    torch.manual_seed(0)
+    k = (torch.randn(_N, 1, _DV + _DR, device=_DEVICE) * 2).bfloat16()
+    kv = quantize_k_cache(k.unsqueeze(1), pow2_scale=True).view(_N, 1, -1)
+    raw = kv.view(torch.uint8).view(_N, 656)
+    nope = raw[:, :512].view(torch.float8_e4m3fn).float().view(_N, 4, 128)
+    scale = raw[:, 512:528].contiguous().view(torch.float32).view(_N, 4, 1)
+    rope = raw[:, 528:].contiguous().view(torch.bfloat16).float()
+    return kv, torch.cat([(nope * scale).view(_N, 512), rope], -1)
+
+
+def _decode_reference(qn, qr, idx, lens, kd, sm, mxfp8_q=True):
+    """FP32 attention using the production MXFP8 Q quantizer and dequantized KV."""
+    R, H, _ = qn.shape
+    if not mxfp8_q:
+        return _sparse_mla_reference(
+            torch.cat([qn.float(), qr.float()], -1), kd, idx, sm, lens
+        )
+    q8 = torch.empty(R, H, 512, device=_DEVICE, dtype=torch.float8_e4m3fn)
+    qs = torch.empty(R, H, 16, device=_DEVICE, dtype=torch.uint8)
+    qrc = torch.empty(R, H, 64, device=_DEVICE, dtype=torch.bfloat16)
+    mla_gfx950._mxfp8_quant_kernel[(R, H // 16)](
+        qn,
+        q8,
+        qs,
+        qr,
+        qrc,
+        qn.stride(0),
+        qn.stride(1),
+        qr.stride(0),
+        qr.stride(1),
+        H,
+        HB=16,
+    )
+    scale = torch.exp2(qs.float() - 127).view(R, H, 16, 1)
+    qd = torch.cat(
+        [(q8.float().view(R, H, 16, 32) * scale).view(R, H, 512), qr.float()], -1
+    )
+    return _sparse_mla_reference(qd, kd, idx, sm, lens)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+@pytest.mark.parametrize(
+    "H,lens,splits",
+    [
+        pytest.param(16, _RAGGED, 1, id="h16-unsplit"),
+        pytest.param(16, _RAGGED, 2, id="h16-two-splits"),
+        pytest.param(16, _RAGGED, 8, id="h16-eight-splits"),
+        pytest.param(96, _RAGGED, 1, id="h96-unsplit"),
+        pytest.param(96, _RAGGED, 2, id="h96-two-splits"),
+        pytest.param(96, _RAGGED, 8, id="h96-eight-splits"),
+        pytest.param(128, _RAGGED, 1, id="h128-unsplit"),
+        pytest.param(128, _RAGGED, 2, id="h128-two-splits"),
+        pytest.param(128, _RAGGED, 8, id="h128-eight-splits"),
+        pytest.param(16, [256] * 8, None, id="auto-eight-splits"),
+        pytest.param(96, [100] * 10, None, id="auto-four-splits"),
+        pytest.param(128, [40] * 33, None, id="auto-unsplit"),
+    ],
+)
+def test_decode_matches_reference(H, lens, splits):
+    kv, kd = _pow2_scaled_kv()
+    R = len(lens)
+    qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
+    qn, qr = qkv[..., :_DV], qkv[..., _DV:]
+    lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
+    idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
+    for r, n in enumerate(lens):
+        idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
+    sm = (_DV + _DR) ** -0.5
+    o, lse = mla_gfx950.sparse_mla_decode_gfx950(
+        qn, qr, kv, idx.unsqueeze(1), sm, topk_length=lengths, num_splits=splits
+    )
+    o_ref, lse_ref = _decode_reference(qn, qr, idx, lengths, kd, sm)
+    finite = torch.isfinite(lse_ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], rtol=0, atol=1e-3)
+    torch.testing.assert_close(o[0].float(), o_ref, rtol=0, atol=3e-2)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+def test_decode_without_row_lengths_skips_the_padding():
+    """Decode without DCP hands the backend -1-padded top-k rows and no lengths."""
+    kv, kd = _pow2_scaled_kv()
+    lens = [_TOPK, 300, 1, 1024]
+    R, H = len(lens), 96
+    qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
+    qn, qr = qkv[..., :_DV], qkv[..., _DV:]
+    idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
+    for r, n in enumerate(lens):
+        idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
+    sm = (_DV + _DR) ** -0.5
+    backend = SimpleNamespace(_triton_sparse_mla_workspaces={}, attn_dcp_size=1)
+    o = DeepseekSparseAttnBackend._forward_triton_decode(
+        backend, qn, qr, kv, _DV, idx, sm
+    )
+    lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
+    # the Triton split-K kernel keeps q in BF16
+    o_ref, _ = _decode_reference(qn, qr, idx, lengths, kd, sm, mxfp8_q=False)
+    torch.testing.assert_close(o.float(), o_ref, rtol=0, atol=3e-2)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 only")
+@pytest.mark.parametrize(
+    "H,topk,q_mul,head_major",
+    [
+        (8, 2048, 30.0, False),
+        (8, 1000, 1.0, True),
+        (12, 2048, 1.0, False),
+        (12, 1000, 30.0, True),
+        (16, 2048, 1.0, True),
+        (16, 1000, 30.0, False),
+    ],
+)
+def test_sparse_mla_prefill_gfx950(H, topk, q_mul, head_major):
+    T = 96
+    kv, k = _scaled_fp8_ds_mla_kv(_PREFILL_POOL, seed=H + topk)
+    torch.manual_seed(topk + H)
+    q_nope = torch.randn(T, H, _DV, device=_DEVICE, dtype=torch.bfloat16) * (
+        0.1 * q_mul
+    )
+    q_rope = torch.randn(T, H, _DR, device=_DEVICE, dtype=torch.bfloat16) * (
+        0.1 * q_mul
+    )
+    if head_major:
+        q_nope = q_nope.transpose(0, 1).contiguous().transpose(0, 1)
+        q_rope = q_rope.transpose(0, 1).contiguous().transpose(0, 1)
+    idx = torch.randint(0, _PREFILL_POOL, (T, topk), device=_DEVICE, dtype=torch.int32)
+    idx[:8, -300:] = -1
+    idx[8] = -1
+    sm_scale = (_DV + _DR) ** -0.5
+    assert sparse_mla_prefill_gfx950.supports_sparse_mla_prefill_gfx950(
+        q_nope, q_rope, kv, _DV
+    )
+
+    out, lse = sparse_mla_prefill_gfx950.sparse_mla_prefill_gfx950(
+        q_nope, q_rope, kv, idx.unsqueeze(1), sm_scale, _DV, return_lse=True
+    )
+    ref_out, ref_lse = _sparse_mla_reference(
+        torch.cat([q_nope.float(), q_rope.float()], -1), k, idx, sm_scale
+    )
+
+    assert out.shape == (1, T, H, _DV) and lse.shape == (T, H)
+    assert torch.all(out[0, 8] == 0) and torch.all(torch.isneginf(lse[8]))
+    keep = torch.arange(T, device=_DEVICE) != 8
+    o, r = out[0, keep].float(), ref_out[keep]
+    assert ((o - r).norm() / r.norm()).item() < 4e-3
+    torch.testing.assert_close(lse[keep], ref_lse[keep], rtol=0, atol=1e-4)
 
 
 if __name__ == "__main__":

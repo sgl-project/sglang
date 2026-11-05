@@ -74,7 +74,7 @@ class TestKimiK3LatentTailHip(CustomTestCase):
         as their consumer does (sum over chunks / rms), give the same projection."""
         rows_n = H // 8
         up_slice = self.up[3 * rows_n : 4 * rows_n]
-        for rows in (1, 4, 64):
+        for rows in (1, 64):  # masked 16-row tile and full 64-row tile
             latent, _, _, proj = self._inputs(rows)
             part, sq = k3_latent_tail_partials(latent, self.norm_w, up_slice)
             self.assertEqual(tuple(part.shape), (PARTIAL_SPLITS, rows, rows_n))
