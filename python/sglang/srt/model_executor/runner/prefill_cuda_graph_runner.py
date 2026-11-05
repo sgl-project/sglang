@@ -332,6 +332,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     _use_draft_input_embeds = False
+    _layer_model_text_only = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
@@ -731,6 +732,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     if name in params
                 ),
                 None,
+            )
+            from sglang.srt.models.deepseek_nextn import DeepseekModelNextN
+
+            # NextN embeds its input_ids itself, so its graph holds the text-only
+            # embedding path.
+            self._layer_model_text_only = isinstance(
+                self.layer_model, DeepseekModelNextN
             )
 
         # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata;
@@ -1457,7 +1465,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_hc_sidechannel
+            or self._qwen_bcg_mtp_draft
+            or self._layer_model_text_only
         ):
             return False
         # Full replay bypasses forward_extend's Python image-mask guard.

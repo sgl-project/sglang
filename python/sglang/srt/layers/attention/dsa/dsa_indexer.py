@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
     _is_in_piecewise_or_breakable_cuda_graph,
     bcg_dsa_indexer_prefill_split,
+    bcg_dsa_indexer_prefill_topk_split,
     pcg_dsa_indexer_prefill_split,
 )
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
@@ -891,6 +892,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             page_table_64=page_table_64,
             rows=rows,
         )
+
+    def _prefill_prep_in_graph(
+        self, forward_batch: ForwardBatch, num_rows: int
+    ) -> bool:
+        # Same gate as the captured prefill attention, whose padded-row
+        # conventions (zero-padded out_cache_loc, dummy slot 0) this relies on.
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        if not (
+            self.use_dsa_indexer_fusion
+            and envs.SGLANG_ENABLE_DSA_PREFILL_INDEXER_PREP_IN_CUDA_GRAPH.get()
+            and not self._aiter_fused_fp8_active(forward_batch)
+            and not self.dsa_enable_prefill_cp
+        ):
+            return False
+        backend = get_attn_backend()
+        return isinstance(
+            backend, DeepseekSparseAttnBackend
+        ) and backend.can_run_prefill_attention_in_graph(forward_batch, num_rows)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # topk_transform selects every valid page slot when kv_len <= index_topk;
@@ -1859,22 +1879,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not return_indices:
             return None
 
-        # MLA: use dummy logits with topk kernel's fast path to generate indices
-        # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
+        return self._fill_all_selected_topk(metadata, x_meta.device, topk_result)
+
+    def _fill_all_selected_topk(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+        topk_result: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Top-k indices when every key is selected (kv_len <= top-k).
+
+        Zero logits take the top-k kernel's fast path, which gives
+        [0, 1, ..., length - 1, -1, ...]. With a static ``topk_result`` (PCG/BCG)
+        fill its valid prefix, leave padded rows at the -1 sentinel and return
+        None; otherwise return the indices.
+        """
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
             self.index_topk,
             dtype=torch.float32,
-            device=x_meta.device,
+            device=device,
         )
         raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
-        if topk_result is not None:
-            # PCG/BCG: fill the valid prefix of the padded static buffer and
-            # leave padded rows at the -1 sentinel.
-            topk_result[: raw_topk_result.shape[0]] = raw_topk_result
-            return None
-        return raw_topk_result
+        if topk_result is None:
+            return raw_topk_result
+        topk_result[: raw_topk_result.shape[0]] = raw_topk_result
+        return None
 
     def _store_index_k_cache(
         self,
@@ -2121,22 +2152,47 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result = torch.empty(
                     (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
-            graph_dispatch_fn = (
-                bcg_dsa_indexer_prefill_split
-                if is_in_breakable_cuda_graph()
-                else pcg_dsa_indexer_prefill_split
-            )
-            # ROCm aiter fused RMSNorm+quant hands over (x, x_s[, x_bf16]).
-            x_parts = x if isinstance(x, tuple) else (x,)
-            graph_dispatch_fn(
-                layer_id=layer_id,
-                x=x_parts[0],
-                q_lora=q_lora,
-                positions=positions,
-                topk_result=topk_result,
-                x_s=x_parts[1] if len(x_parts) > 1 else None,
-                x_bf16=x_parts[2] if len(x_parts) > 2 else None,
-            )
+            if (
+                return_indices
+                and not isinstance(x, tuple)
+                and self._prefill_prep_in_graph(forward_batch, num_rows=x.shape[0])
+            ):
+                # Row-wise Q/K prep and index-K store over every bucket row
+                # (padded rows store to the dummy slot); only logits + top-k break.
+                # CUDA hands over plain bf16 x; the ROCm (x, x_s[, x_bf16]) tuple
+                # takes the whole-indexer split below.
+                q_fp8, weights = self._fused_q_prepare_and_store(
+                    x,
+                    q_lora,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    enable_dual_stream=False,
+                )
+                bcg_dsa_indexer_prefill_topk_split(
+                    layer_id=layer_id,
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    topk_result=topk_result,
+                )
+            else:
+                graph_dispatch_fn = (
+                    bcg_dsa_indexer_prefill_split
+                    if is_in_breakable_cuda_graph()
+                    else pcg_dsa_indexer_prefill_split
+                )
+                # ROCm aiter fused RMSNorm+quant hands over (x, x_s[, x_bf16]).
+                x_parts = x if isinstance(x, tuple) else (x,)
+                graph_dispatch_fn(
+                    layer_id=layer_id,
+                    x=x_parts[0],
+                    q_lora=q_lora,
+                    positions=positions,
+                    topk_result=topk_result,
+                    x_s=x_parts[1] if len(x_parts) > 1 else None,
+                    x_bf16=x_parts[2] if len(x_parts) > 2 else None,
+                )
             result = _broadcast_indexer_topk_from_rank0(
                 topk_result if return_indices else None
             )
