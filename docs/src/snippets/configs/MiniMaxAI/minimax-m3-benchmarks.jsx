@@ -3,7 +3,7 @@
 //
 // NVIDIA rows (B200 / B300 / GB300 / H200) re-measured 2026-11-04 on
 // lmsysorg/sglang:v0.5.23-cu130 with each cell's exact launch flags. The sparse step
-// runs on the built-in Triton path (the image ships without MSA; see §2.1).
+// runs on the built-in Triton path (the image does not bundle the MSA kernel).
 //
 // SPEED: sglang.benchmark.serving --dataset-name random --flush-cache (default
 // --random-range-ratio), 1 warm-up run discarded, mean of 3 measured runs.

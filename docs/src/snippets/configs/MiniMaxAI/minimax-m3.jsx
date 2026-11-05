@@ -94,7 +94,7 @@ sgl-eval run mmmu_pro \\
   dockerImages: {
     // NVIDIA: the CUDA-13 release image (amd64+arm64, Hopper + Blackwell).
     // Every NVIDIA cell was re-validated on it. It does not bundle MSA, so the
-    // sparse step runs on the built-in Triton path (recommended; see §2.1).
+    // sparse step runs on the built-in Triton path.
     b200: "lmsysorg/sglang:v0.5.23-cu130",
     b300: "lmsysorg/sglang:v0.5.23-cu130",
     gb200: "lmsysorg/sglang:v0.5.23-cu130",
@@ -198,8 +198,8 @@ sgl-eval run mmmu_pro \\
   // NVIDIA Blackwell: one validated single-node recipe per family — tp4 across
   // B300 / GB200 / GB300, tp8 on B200. fa4 + page 128 + deep_gemm are the M3
   // SM100 auto-defaults, so this is also the bare-launch behavior. The sparse
-  // step runs on the built-in Triton path; MSA (fmha_sm100) is not recommended
-  // on v0.5.22/v0.5.23 because it measured slower (see §2.1 on the page).
+  // step runs on the built-in Triton path, or on MiniMax's MSA kernel
+  // (fmha_sm100) when it is installed.
   // AMD: tp8. MI350X/MI355X (gfx950) serve MXFP8 natively (backends auto). MI300X/
   // MI325X (gfx942) need --attention-backend aiter + --moe-runner-backend triton,
   // and the MXFP8 weights are auto-converted to block-fp8 at load; the cold-start
@@ -262,7 +262,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       // GB300: decode on FlashInfer trtllm-gen (trtllm_mha), prefill on fa4. On par with
-      // fa4-only on the card workloads; gains in long-context agentic serving (§2.1 Note).
+      // fa4-only on the card workloads.
       // Needs sglang >= 0.5.22 and flashinfer >= 0.6.12. B200/GB200 keep fa4-only.
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
       verified: true,
