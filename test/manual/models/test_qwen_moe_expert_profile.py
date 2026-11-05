@@ -230,12 +230,16 @@ def run_engine(args, name, original):
         max_running_requests=2,
         chunked_prefill_size=256,
         mem_fraction_static=0.15,
-        disable_cuda_graph=True,
+        cuda_graph_backend_decode="full" if args.decode_graph else "disabled",
+        cuda_graph_backend_prefill="disabled",
+        cuda_graph_max_bs_decode=2,
         disable_overlap_schedule=True,
         disable_radix_cache=True,
         random_seed=417,
     )
     try:
+        if args.decode_graph:
+            assert engine.get_server_info()["cuda_graph_backend_decode"] == "full"
         outputs = [
             engine.generate(
                 input_ids=prompt,
@@ -304,6 +308,7 @@ def main():
     parser.add_argument("--port", type=int, default=31060)
     parser.add_argument("--attention-backend", default="fa3")
     parser.add_argument("--logprob-tolerance", type=float, default=0.05)
+    parser.add_argument("--decode-graph", action="store_true")
     args = parser.parse_args()
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(parents=True, exist_ok=False)
@@ -313,6 +318,7 @@ def main():
     result = {
         "tp_size": args.tp_size,
         "token_top_k": top_k,
+        "decode_graph": args.decode_graph,
         "status": "running",
         "comparisons": {},
     }
