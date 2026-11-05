@@ -6,6 +6,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
+    _post_process_topk_ids,
     _zero_topk_weights_padded_region,
     capture_routed_experts_if_allowed,
     select_experts,
@@ -24,10 +25,32 @@ def fused_topk_npu(
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
     defer_expert_recording: bool = False,
+    moe_load_balancer=None,
 ) -> "TopKOutput":
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
+    if (
+        use_grouped_topk
+        and correction_bias is None
+        and topk_config.scoring_func not in ("sigmoid", "sqrtsoftplus")
+        and num_token_non_padded is None
+    ):
+        topk_config.torch_native = True
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=layer_id,
+            router_logits=router_logits,
+            topk_config=topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            defer_expert_recording=defer_expert_recording,
+            moe_load_balancer=moe_load_balancer,
+        )
+    if moe_load_balancer is not None:
+        router_logits, correction_bias = moe_load_balancer.transform_topk_inputs(
+            router_logits, correction_bias
+        )
 
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
@@ -99,20 +122,6 @@ def fused_topk_npu(
         )
         topk_weights = topk_weights.to(torch.float32)
 
-    # torch native is not yet supported num_token_non_padded
-    # Fallback to torch native implementation
-    else:
-        topk_config.torch_native = True
-        return select_experts(
-            hidden_states=hidden_states,
-            layer_id=layer_id,
-            router_logits=router_logits,
-            topk_config=topk_config,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-            defer_expert_recording=defer_expert_recording,
-        )
-
     return _finalize_topk_npu(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
@@ -122,6 +131,7 @@ def fused_topk_npu(
         expert_location_dispatch_info=expert_location_dispatch_info,
         layer_id=layer_id,
         defer_expert_recording=defer_expert_recording,
+        moe_load_balancer=moe_load_balancer,
     )
 
 
@@ -135,7 +145,19 @@ def _finalize_topk_npu(
     expert_location_dispatch_info,
     layer_id,
     defer_expert_recording=False,
+    moe_load_balancer=None,
 ):
+    if moe_load_balancer is not None:
+        topk_ids, topk_weights, _ = _post_process_topk_ids(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            topk_config=topk_config,
+            router_logits=router_logits,
+            layer_id=layer_id,
+            num_token_non_padded=num_token_non_padded,
+            moe_load_balancer=moe_load_balancer,
+        )
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
     num_shared = topk_config.num_shared_topk_slots
     routed_ids = topk_ids[:, :-num_shared] if num_shared else topk_ids
     if not defer_expert_recording:

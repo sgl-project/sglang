@@ -74,11 +74,6 @@ def handle_moe_load_balancer(server_args: Any):
             )
         if pipeline.placement_policy is not None:
             _check_coupled_placement(cfg)
-        if (
-            pipeline.capabilities.requires_post_topk_routing
-            and not pipeline.capabilities.routes_shared_expert
-        ):
-            resolutions["disable_shared_experts_fusion"] = True
         declare_resolution(server_args, "_handle_moe_load_balancer", **resolutions)
 
 

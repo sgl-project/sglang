@@ -2467,6 +2467,37 @@ class TestMoELoadBalancerAlgorithm(unittest.TestCase):
                     )
                 )
 
+    def test_replica_routing_preserves_shared_fusion_configuration(self):
+        from types import SimpleNamespace
+
+        pipeline = SimpleNamespace(
+            name="custom",
+            placement_policy=None,
+            capabilities=SimpleNamespace(
+                supports_concurrent_microbatches=True,
+                graph_stability="stable",
+                requires_post_topk_routing=True,
+                routes_shared_expert=False,
+            ),
+        )
+        for disabled in (False, True):
+            with (
+                self.subTest(disabled=disabled),
+                patch(
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                    return_value=pipeline,
+                ),
+            ):
+                args = ServerArgs(
+                    model_path="dummy",
+                    moe_load_balancer_algorithm="custom",
+                    disable_shared_experts_fusion=disabled,
+                )
+                handle_moe_load_balancer(args)
+                self.assertEqual(
+                    resolution_result(args, "disable_shared_experts_fusion"), disabled
+                )
+
     def test_native_eplb_path_does_not_import_evenmoe(self):
         server_args = ServerArgs(model_path="dummy", enable_eplb=True, ep_size=2)
         with patch.dict(sys.modules, {"evenmoe": None}):
