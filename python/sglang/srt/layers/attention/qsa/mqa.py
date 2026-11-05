@@ -537,10 +537,9 @@ def tilelang_qsa_mqa_prefill_relative(
 
 
 # CTAs per decode row: few enough levels to bound the TileLang specializations.
-# A row's CTAs stride over its 64-key groups, so each CTA scores about
-# groups / ctas of them back to back. Up to four waves' worth of rows take 256
-# CTAs per row (one CTA per row from four waves of rows on); in between, 64 CTAs
-# per row keep that serial walk short at long contexts.
+# 256 below four_waves / 16 rows (where 16 CTAs per row filled four waves),
+# 64 up to four_waves rows, then 1. A row's CTAs stride over its 64-key groups,
+# so more CTAs per row keep each CTA's serial walk short at long contexts.
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 64, 256)
 
 
