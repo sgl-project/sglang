@@ -7,9 +7,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -128,6 +131,18 @@ class DSATopKBackend(Enum):
             == logits.shape[0]
             == attn_metadata.real_page_table.shape[0]
         ):
+            if _use_triton_topk(logits, topk):
+                from sglang.kernels.ops.attention.dsa.triton_topk_transform import (
+                    topk_transform_paged_triton,
+                )
+
+                return topk_transform_paged_triton(
+                    logits,
+                    lengths,
+                    attn_metadata.real_page_table,
+                    attn_metadata.page_size,
+                    topk,
+                )
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
 
         # Extend-shaped RAGGED top-k for the SGL backend routes to the same v2
@@ -306,6 +321,23 @@ def _topk_unfused(
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices
+
+
+def _use_triton_topk(logits: torch.Tensor, topk: int) -> bool:
+    """SGLANG_DSA_TOPK_TRITON (ROCm): the single-pass selector for decode-shaped
+    PAGED rows; see kernels/ops/attention/dsa/triton_topk_transform.py."""
+    if not _is_hip or not envs.SGLANG_DSA_TOPK_TRITON.get():
+        return False
+
+    from sglang.kernels.ops.attention.dsa.triton_topk_transform import MAX_ROWS
+
+    return (
+        0 < logits.shape[0] <= MAX_ROWS
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.shape[0] * logits.stride(0) * 4 < 2**31
+        and 0 < topk <= 2048
+    )
 
 
 def _topk_transform_v2_paged(
