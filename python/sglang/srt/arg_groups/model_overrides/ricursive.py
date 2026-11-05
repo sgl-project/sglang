@@ -28,8 +28,12 @@ def _ricursive_overrides(server_args: Any, hf_config: Any) -> dict:
     if not get_platform().is_cuda:
         return overrides
     if get_platform().is_sm100:
-        # trtllm_mha doesn't support deterministic inference.
-        default_backend = "fa4" if cfg.enable_deterministic_inference else "trtllm_mha"
+        # trtllm_mha doesn't support deterministic inference, which an on-policy
+        # target turns on after this runs.
+        deterministic = (
+            cfg.enable_deterministic_inference or cfg.rl_on_policy_target is not None
+        )
+        default_backend = "fa4" if deterministic else "trtllm_mha"
     elif get_platform().is_sm90:
         default_backend = "fa3"
     else:
