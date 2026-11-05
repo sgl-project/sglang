@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
 from sglang.srt.mem_cache.kv.plan import (
@@ -572,18 +573,23 @@ class StaticKVStorage:
                 ),
             ]
         else:
+            # Admission also checks the hot pool; occupancy counts logical KV.
+            is_hisparse = isinstance(allocator, HiSparseTokenToKVPoolAllocator)
+            token_allocator = (
+                allocator.logical_attn_allocator if is_hisparse else allocator
+            )
             # A state model's token capacity is what its requests can schedule.
             capacity = (
-                self.requests.schedulable_token_capacity(allocator.size)
+                self.requests.schedulable_token_capacity(token_allocator.size)
                 if shape.has_state
-                else shape.token_capacity
+                else (token_allocator.size if is_hisparse else shape.token_capacity)
             )
             usage = [
                 SubPoolUsage(
                     name="full",
                     metrics="full",
                     capacity=capacity,
-                    available=allocator.available_size(),
+                    available=token_allocator.available_size(),
                 )
             ]
         if shape.has_state:

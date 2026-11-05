@@ -28,6 +28,8 @@ def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     manager.attn_cp_size = 1
     manager.attn_cp_rank = 0
     manager.enable_staging = False
+    if manager_type is NixlKVManager:
+        manager.local_shm_enabled = False
     manager._staging_outstanding = {}
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()

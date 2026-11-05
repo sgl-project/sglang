@@ -330,6 +330,7 @@ class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.local_shm_enabled = False
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {
@@ -832,6 +833,7 @@ class TestNixlEarlySendWaitEvent(CustomTestCase):
         mgr = object.__new__(NixlKVManager)
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.enable_staging = False
+        mgr.local_shm_enabled = False
         mgr.transfer_infos = {room: {"agent": SimpleNamespace(dst_port=5555)}}
         queue = SimpleNamespace(put=MagicMock())
         mgr.transfer_queues = [queue]
@@ -1252,6 +1254,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
     def _make_manager(self, peers):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.local_shm_enabled = False
         mgr.agent = ReloadFakeAgent()
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.is_mla_backend = False

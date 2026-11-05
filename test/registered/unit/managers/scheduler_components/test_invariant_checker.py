@@ -39,6 +39,55 @@ from sglang.test.tree_slots import tree_slots_of
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestHiSparseLogicalOccupancy(CustomTestCase):
+    def test_logical_free_count_is_not_capped_by_hot_pool(self):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+
+        allocator = MagicMock(spec=HiSparseTokenToKVPoolAllocator)
+        allocator.size = 2048
+        allocator.available_size.return_value = 768
+        allocator.logical_attn_allocator = SimpleNamespace(
+            size=2048, available_size=lambda: 1792
+        )
+        pool = SimpleNamespace(
+            schedulable_token_capacity=lambda size: size,
+            mamba_allocator=SimpleNamespace(available_size=lambda: 7),
+            mamba_pool=SimpleNamespace(size=8),
+        )
+        tree = MagicMock()
+        tree.supports_mamba.return_value = False
+        tree.evictable_size.return_value = 0
+        allocator.state.ckpt_pool = None
+        allocator.state.pool.size = 8
+        allocator.state_slots.available_size.return_value = 7
+        for has_state in (False, True):
+            storage = StaticKVStorage(
+                pool,
+                allocator,
+                shape=StaticPoolShape(
+                    has_window=False,
+                    has_state=has_state,
+                    token_capacity=1024,
+                ),
+            )
+            observer = SchedulerPoolStatsObserver(
+                tree_cache=tree,
+                storage=storage,
+                token_to_kv_pool_allocator=allocator,
+                session_controller=None,
+                hisparse_coordinator=None,
+                enable_hisparse=True,
+            )
+            stats = observer.get_pool_stats()
+            self.assertEqual(stats.full_capacity, 2048)
+            self.assertEqual(stats.full_available_size, 1792)
+            self.assertEqual(stats.full_num_used, 256)
+            self.assertEqual(stats.full_token_usage, 0.125)
+        allocator.available_size.assert_not_called()
+
+
 class TestCheckTreeCacheGate(CustomTestCase):
     @contextmanager
     def _without_explicit_sanity_check_setting(self):
