@@ -20,8 +20,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.managers.req_types import MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, flatten_nested_list
@@ -198,8 +198,7 @@ class CLIPAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=parallel.attn_tp_rank,
-            tp_size=parallel.attn_tp_size,
+            parallel_group="attn_tp",
         )
         # TODO: this layer shards over attention TP but reduces over the full TP
         # group; reduce over the attention-TP group so attention DP and attention
@@ -216,8 +215,7 @@ class CLIPAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
-            tp_rank=parallel.attn_tp_rank,
-            tp_size=parallel.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
     def forward(

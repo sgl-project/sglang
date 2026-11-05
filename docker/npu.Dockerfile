@@ -20,14 +20,14 @@ ARG TORCH_NPU_VERSION="2.10.0.post6"
 ARG TORCH_NPU_INDEX_URL="https://ascend.devcloud.huaweicloud.com/pypi/simple/"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
-ARG SGLANG_KERNEL_NPU_TAG=2026.9.0.post6
+ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post1
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
 ARG MODELSCOPE_VERSION=""
 ARG EVALSCOPE_VERSION=""
 
 # memfabric-hybrid / memcache-hybrid version, installed from the pip index (no OBS bucket download)
-ARG MF_VERSION="1.2.1"
+ARG MF_VERSION="1.3.0"
 
 # memfabric-zbal: 950 与 a3 使用不同版本
 ARG ZBAL_VERSION_950="1.2.21004.post1"
@@ -115,7 +115,7 @@ RUN . /etc/environment_new && \
 RUN . /etc/environment_new && \
     ${PIP_INSTALL} pybind11 && \
     if [ "$TARGETARCH" = "arm64" ]; then \
-        ${PIP_INSTALL} https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com:443/Triton-ascend/3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl?AccessKeyId=HPUAAPJN7IAXFCS2GDSQ&Expires=1806290330&Signature=eRq3VKjwgP/tTkObtsho%2BzIsmJM%3D; \
+        ${PIP_INSTALL} "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com:443/Triton-ascend/3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl?AccessKeyId=HPUAAPJN7IAXFCS2GDSQ&Expires=1806290330&Signature=eRq3VKjwgP/tTkObtsho%2BzIsmJM%3D"; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
         ${PIP_INSTALL} https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl; \
     else \

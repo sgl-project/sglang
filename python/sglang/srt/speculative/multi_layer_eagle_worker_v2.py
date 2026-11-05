@@ -17,32 +17,29 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
-    MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
-)
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -50,6 +47,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -62,6 +60,8 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     prepare_for_draft,
     prepare_for_draft_extend,
@@ -107,6 +107,7 @@ _is_cpu = is_cpu()
 
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
@@ -159,8 +160,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
+        # Retain the target's attention topology when swapping TP groups.
+        self.parallel_layout = resolve_draft_parallel_layout(
+            DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+        )
+
         # Load draft model weights only.
         with (
+            draft_tp_context(self.parallel_layout),
             draft_pp_context(),
             speculative_moe_backend_context(),
             draft_model_build_scope(),
@@ -188,8 +195,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "InklingForConditionalGenerationMTP",
             "GigaChat35ForCausalLMNextN",
         ]
-        # Retain the target's attention topology when swapping TP groups.
-        self.draft_owns_attention = False
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -218,7 +223,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
@@ -226,7 +231,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
         ):
             super().init_cuda_graphs()
@@ -247,7 +252,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             and self.speculative_num_steps > 1
             # The fix stashes the mamba/sconv boundary state, so it only applies
             # to hybrid models; non-hybrid MTP drafts (e.g. MiMoV2) must skip it.
-            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and self.req_to_token_pool.holds_state_slots
         ):
             return
         draft_model_runner = self.draft_runner_list[0]
@@ -261,8 +266,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 target_hidden_size,
             )
             return
-        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
-            conv_state = self.req_to_token_pool.mamba_pool.mamba_cache.conv
+        if self.req_to_token_pool.holds_state_slots:
+            target_pool = self.target_worker.model_runner.token_to_kv_pool
+            conv_state = target_pool.layer_router.part_view(STATE_PART).mamba_cache.conv
             self.draft_extend_num_warmup_tokens = min(conv_state[0].shape[2:])
         self.draft_extend_num_front_tokens = (
             self.speculative_num_steps - 1 + self.draft_extend_num_warmup_tokens
@@ -398,6 +404,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner_list[
                     step
                 ].attn_backend = self.draft_extend_attn_backend_list[-1]
+            # Boot guard: every backend a draft forward reaches must carry
+            # its runner's `RunnerIds` or the index builders emit virtual ids.
+            runner_ids = self.draft_runner_list[step].runner_ids
+            if runner_ids.is_translating:
+                runner_ids.bind_and_verify_backends(
+                    [self.draft_extend_attn_backend_list[-1]]
+                )
 
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
@@ -436,8 +449,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
                 )
         else:
+            # NPU length updates live in the backend. Keep one graph per step;
+            # combined multi-step NPU capture is not enabled here.
             self.cuda_graph_runner_for_draft_extend = (
-                MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
+                MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
             )
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self._specialized_graph_memory_usage["draft_extend"] = (
@@ -453,7 +468,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -461,12 +476,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0],
             self.topk,
             self.speculative_num_steps,
+            target_translator=self.target_worker.model_runner.runner_ids,
+            num_draft_tokens=self.speculative_num_draft_tokens,
         )
 
         # Run draft
         parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -480,6 +497,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if iteration_ids is not None:
+            # Verify and draft extend write the window the draft planned.
+            verify_input.iteration_ids = iteration_ids
+            verify_input.prepared_out_cache_loc = iteration_ids.write_virtual
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -572,14 +594,18 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             return
         seen = set()
         for runner in self.draft_runner_list:
-            pool = runner.req_to_token_pool.mamba_pool
+            req_pool = runner.req_to_token_pool
+            pool = runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
             if id(pool) in seen:
                 continue
             seen.add(id(pool))
+            # The pool is a PHYSICAL store; the unified allocator hands out
+            # virtual slot ids (identity on a static pool).
+            state_ids = runner.runner_ids.state_ids(req_pool.state_sub_pool)
             if clear is not None and len(clear) > 0:
-                pool.clear_slots(clear)
+                pool.clear_slots(state_ids.ids(clear))
             if cow_src is not None and len(cow_src) > 0:
-                pool.copy_from(cow_src, cow_dst)
+                pool.copy_from(state_ids.ids(cow_src), state_ids.ids(cow_dst))
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
@@ -589,6 +615,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        iteration_ids: Optional[IterationIds] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -597,6 +624,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            iteration_ids: The target prefill's plan; the draft writes the same
+                slots.
         """
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
@@ -634,6 +663,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0],
             capture_hidden_mode=draft_capture_hidden_mode,
             return_hidden_states_before_norm=True,
+            iteration_ids=iteration_ids,
         )
 
         self._apply_deferred_mamba_init_to_draft_pools(forward_batch)
@@ -679,6 +709,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 probs, topk_p, topk_index = sample_draft_proposal(
                     output.logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
+                    sampling_seed=forward_batch.sampling_info.sampling_seed,
+                    positions=forward_batch.seq_lens,
+                    draft_step=step,
                 )
                 draft_probs_list.append(probs)
             else:
@@ -759,11 +792,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_token_num=self.speculative_num_draft_tokens,
                 device=batch.device,
             )
+        seq_lens = batch.seq_lens + self.speculative_num_draft_tokens
         runner.stage_shared_reads(
-            seq_lens=batch.seq_lens + self.speculative_num_draft_tokens,
+            seq_lens=seq_lens,
             req_pool_indices=batch.req_pool_indices,
             out_cache_loc=locs,
             positions=positions,
+            # Both loc sources read req_to_token untranslated: `locs` is virtual.
+            out_cache_loc_virtual=locs,
+            iteration_ids=self.draft_runner_list[0].runner_ids.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=None,
+                write_virtual=locs,
+            ),
         )
         return True
 
@@ -773,6 +815,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch_result: GenerationBatchResult,
         *,
         staged: bool = False,
+        iteration_ids: Optional[IterationIds] = None,
     ):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
@@ -816,6 +859,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 return_hidden_states_before_norm=True,
                 widened_out_cache_loc=boundary_kv_locs,
                 widened_positions=boundary_kv_positions,
+                iteration_ids=iteration_ids,
             )
 
         if self.plan_stream:
@@ -875,6 +919,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                             step_logits,
                             forward_batch.sampling_info.temperatures,
+                            sampling_seed=forward_batch.sampling_info.sampling_seed,
+                            positions=forward_batch.seq_lens,
+                            draft_step=step,
                         )
                         ret_draft_probs_list.append(probs)
                     if rotates_in_graph:
@@ -948,7 +995,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     ]
                 if self.use_rejection_sampling and self.topk == 1:
                     probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                        logits_sel, forward_batch.sampling_info.temperatures
+                        logits_sel,
+                        forward_batch.sampling_info.temperatures,
+                        sampling_seed=forward_batch.sampling_info.sampling_seed,
+                        positions=forward_batch.seq_lens,
+                        draft_step=step,
                     )
                     ret_draft_probs_list.append(probs)
                 else:
@@ -999,6 +1050,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+
     def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
         return [
             (f"draft_step_{i}", r)
@@ -1034,6 +1087,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             target_worker,
         )
 
+        self.draft_parallel_layout = self._draft_worker.parallel_layout
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -1041,6 +1096,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=self.topk == 1
+        )
 
     @property
     def last_shared_read_runner(self):
@@ -1062,6 +1123,22 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             ),
         )
 
+    @property
+    def draft_window_reaches(self) -> dict[str, int]:
+        # Widened extend reads front rows before the committed length. The
+        # attention role "swa" may route to a different storage band per runner.
+        draft = self._draft_worker
+        reaches = {}
+        for runner in draft.draft_runner_list:
+            if not runner.runner_ids.is_fused_draft:
+                continue
+            router = runner.token_to_kv_pool.layer_router
+            if router.routes_to(IdSpaceKind.SLIDING_WINDOW):
+                name = router.storage_name(IdSpaceKind.SLIDING_WINDOW)
+                reach = runner.sliding_window_size + draft.draft_extend_num_front_tokens
+                reaches[name] = max(reaches.get(name, 0), reach)
+        return reaches
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1081,7 +1158,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=target_capture_mode,
+                return_iteration_ids=True,
             )
+            iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1096,6 +1175,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch,
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
+                iteration_ids=iteration_ids,
             )
             return batch_output
         else:
@@ -1124,13 +1204,17 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(
-                batch, batch_output, staged=staged
+                batch,
+                batch_output,
+                staged=staged,
+                iteration_ids=verify_input.iteration_ids,
             )
             return batch_output
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
         return run_eagle_verify(
             batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

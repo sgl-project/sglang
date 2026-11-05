@@ -15,7 +15,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # A real config.json, so resolution runs past the dummy-model early return.
 _MINI_CONFIG = {
@@ -139,7 +139,7 @@ class TestAttnDpSize(CustomTestCase):
         """`attn_dp_enabled` is also true for an elastic scale joiner at width
         one. The readback reports the configured width instead, so a joiner's
         replicas are not folded into attention-DP groups when it is read back."""
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.runtime_context import attn_dp_enabled_of
 
         joiner = ServerArgs(

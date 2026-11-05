@@ -93,6 +93,9 @@ Choose a model and GPU configuration from the [cookbook](/cookbook/diffusion/int
 
 Docker is also recommended for AMD GPUs. Use a ROCm image matched to your GPU and host driver, not the NVIDIA `latest` image. Follow [AMD GPUs](/docs/hardware-platforms/amd_gpu) for the current image tags, device passthrough flags, and source installation options.
 
+For **Strix Halo / gfx1151**, use `rocm/sgl-dev:*-gfx1151*` (image sets `SGLANG_USE_AITER=0`) and pass `--attention-backend torch_sdpa --num-gpus 1`. Do not use AITER on wave32 gfx115x. See the Strix Halo section in [AMD GPUs](../hardware-platforms/amd_gpu).
+
+## Platform-Specific: MUSA (Moore Threads GPUs)
 ## Moore Threads GPUs (MUSA)
 
 For Moore Threads GPUs (MTGPU) with the MUSA software stack, follow the platform guide first. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:

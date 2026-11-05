@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
 import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
+    get_activation_cuda_cflags,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -32,10 +33,27 @@ def _jit_module(
     fuse_silu_and_mul: bool,
     masked_layout: bool,
     use_pdl: bool,
+    sorted_layout: bool = False,
+    silu_and_mul_mode: str = "legacy",
 ) -> Module:
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
     assert group_size in _SUPPORTED_GROUP_SIZES
+    if silu_and_mul_mode not in ("legacy", "dense"):
+        raise ValueError(f"Unknown silu_and_mul_mode: {silu_and_mul_mode}")
+    dense = silu_and_mul_mode == "dense"
+    if dense and not (
+        fuse_silu_and_mul
+        and in_dtype in (torch.bfloat16, torch.float16)
+        and out_dtype == torch.float8_e4m3fn
+        and group_size == 128
+        and not masked_layout
+        and not sorted_layout
+    ):
+        raise ValueError(
+            "dense mode requires flat BF16/FP16 SiLU+mul, FP8 output and group_size=128"
+        )
+    # Only the flat dense variant adds a flag; legacy launcher arguments stay intact.
     trait_args = make_cpp_args(
         in_dtype,
         out_dtype,
@@ -45,19 +63,20 @@ def _jit_module(
         aligned,
         fuse_silu_and_mul,
         use_pdl,
+        *([True] if dense else []),
     )
-    launcher = (
-        "PerTokenGroupQuantMaskedKernel"
-        if masked_layout
-        else "PerTokenGroupQuantFlatKernel"
-    )
+    assert not (masked_layout and sorted_layout)
+    layout = "masked" if masked_layout else ("sorted" if sorted_layout else "flat")
+    launcher = f"PerTokenGroupQuant{layout.capitalize()}Kernel"
     return load_jit(
         "per_token_group_quant",
         *trait_args,
-        "masked" if masked_layout else "flat",
+        layout,
         cuda_files=["gemm/per_token_group_quant.cuh"],
         cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
-        extra_cuda_cflags=["--use_fast_math"],
+        extra_cuda_cflags=get_activation_cuda_cflags()
+        if dense
+        else ["--use_fast_math"],
     )
 
 
@@ -95,6 +114,10 @@ def _per_token_group_quant_custom_op(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
+    silu_and_mul_mode: str = "legacy",
 ) -> None:
     num_groups = output_q.shape[-1] // group_size
     row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)
@@ -108,10 +131,21 @@ def _per_token_group_quant_custom_op(
         bool(fuse_silu_and_mul),
         masked_m is not None,
         is_arch_support_pdl(),
+        sorted_token_ids is not None,
+        silu_and_mul_mode,
     )
     if masked_m is not None:
         module.per_token_group_quant(
             input, output_q, output_s, masked_m, int(expected_m or -1)
+        )
+    elif sorted_token_ids is not None:
+        module.per_token_group_quant(
+            input,
+            output_q,
+            output_s,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            num_valid_tokens,
         )
     else:
         module.per_token_group_quant(input, output_q, output_s)
@@ -171,6 +205,10 @@ def per_token_group_quant(
     *,
     out_dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
+    silu_and_mul_mode: Literal["legacy", "dense"] = "legacy",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quantization. Returns ``(output_q, output_s)``.
 
@@ -192,7 +230,17 @@ def per_token_group_quant(
       int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
     The packed layouts require ``scale_ue8m0=True``.
 
+    With ``fuse_silu_and_mul=True``, ``silu_and_mul_mode="dense"`` matches the
+    dense CUDA activation: FP32 SiLU and multiply, then one source-dtype round
+    before quantizing. The default retains the existing early SiLU rounding.
+    Dense mode supports flat BF16/FP16 inputs, FP8 output and groups of 128.
+
     ``expected_m`` (masked only) is an optional expected-tokens-per-expert hint.
+
+    ``sorted_token_ids`` selects the sorted layout: ``input`` rows follow
+    ``moe_align_block_size`` (with ``num_tokens_post_padded`` and
+    ``num_valid_tokens = topk_ids.numel()``), and rows the MoE GEMM never reads
+    may be skipped and left unwritten.
 
     Inputs are bf16/fp16; group size is one of 16/32/64/128/256; the quant range
     follows ``output_q.dtype`` (fp8_e4m3: +-448, int8: [-128, 127]).
@@ -219,5 +267,9 @@ def per_token_group_quant(
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
         expected_m=expected_m,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
+        silu_and_mul_mode=silu_and_mul_mode,
     )
     return output_q, output_s

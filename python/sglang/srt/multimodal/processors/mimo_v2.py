@@ -21,12 +21,9 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 )
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -214,8 +211,16 @@ class Content:
                 )
 
 
-_QWEN2VL_PIXEL_MEAN = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-_QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+# OPENAI_CLIP stats, matching Qwen2VLImageProcessor (preprocessor_config.json
+# image_mean/image_std with do_rescale 1/255). Kept in 0-255 space because
+# standardize_batch sees un-rescaled PIL tensors. ImageNet values were wrong
+# for MiMo-VL and scrambled colors.
+_QWEN2VL_PIXEL_MEAN = (
+    torch.Tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1) * 255.0
+)
+_QWEN2VL_PIXEL_STD = (
+    torch.Tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1) * 255.0
+)
 _mean_std_cache = {}
 
 
@@ -516,7 +521,7 @@ class MiMoProcessor:
     def preprocess_for_encoder(self, mm_data, modality):
         # EPD encoder-side features. video_audio_* fields appear when any
         # video has audio; the D side uses them to rebuild input_ids.
-        from sglang.srt.managers.schedule_batch import Modality
+        from sglang.srt.multimodal.modality import Modality
 
         if not isinstance(mm_data, (list, tuple)):
             mm_data = [mm_data]

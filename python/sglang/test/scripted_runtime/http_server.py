@@ -132,7 +132,9 @@ class ScriptedHttpServer:
         fatal_error: Optional[OutOfBandError] = None
         try:
             try:
-                sock_send(self._socket, wrap_as_pickle(Shutdown()))
+                # A PAIR send blocks while no peer is connected, so a dead
+                # server would hang it; NOBLOCK raises zmq.Again instead.
+                sock_send(self._socket, wrap_as_pickle(Shutdown()), flags=zmq.NOBLOCK)
             except zmq.ZMQError:
                 pass
 

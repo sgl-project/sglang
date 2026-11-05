@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import huggingface_hub
 import modelscope
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
@@ -352,6 +353,50 @@ def test_force_diffusers_model_stub_keeps_its_existing_path(
     assert calls == ["probe", "download", "download"]
 
 
+@pytest.mark.parametrize(
+    "cached, expected_downloads",
+    [
+        ("complete", ["model_index.json"]),
+        ("manifest", ["_overlay/overlay_manifest.json"]),
+        ("metadata", ["_overlay/overlay_manifest.json", "model_index.json"]),
+    ],
+)
+def test_complete_cached_checkpoint_skips_overlay_probe(
+    monkeypatch, tmp_path, cached, expected_downloads
+):
+    """hf_hub_download waits out Hub rate limits before reporting a file the repo
+    never had, so a complete cached checkpoint must not probe its overlay manifest.
+    A cached manifest still marks an overlay repo, and a metadata-only snapshot,
+    which an overlay repo leaves, still asks the Hub."""
+    repo_cache = tmp_path / "models--org--repo"
+    snapshot = repo_cache / "snapshots" / ("a" * 40)
+    (snapshot / "_overlay").mkdir(parents=True)
+    (repo_cache / "refs").mkdir()
+    (repo_cache / "refs" / "main").write_text("a" * 40)
+    _write_model_index(snapshot)
+    if cached != "metadata":
+        _populate_components(snapshot, ("scheduler", "tokenizer"), weights=False)
+        _populate_components(snapshot, ("text_encoder", "transformer", "vae"))
+    if cached == "manifest":
+        (snapshot / "_overlay" / "overlay_manifest.json").write_text(
+            '{"source_model_id": "org/source"}'
+        )
+    downloads = []
+
+    def fake_hf_hub_download(repo_id, filename, **kwargs):
+        downloads.append(filename)
+        return str(snapshot / filename)
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", False)
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", fake_hf_hub_download)
+
+    config = hf_diffusers_utils.maybe_download_model_index("org/repo")
+
+    assert config["_class_name"] == "LongLive2Pipeline"
+    assert downloads == expected_downloads
+
+
 def test_modelscope_file_download_preserves_local_dir(monkeypatch, tmp_path):
     calls = []
 
@@ -438,3 +483,80 @@ def test_modelscope_selected_partition_cache_hit_requires_a_file(monkeypatch, tm
         )
 
     assert result == str(tmp_path)
+
+
+def test_unreachable_hub_falls_back_to_cached_model_index(monkeypatch, tmp_path):
+    """An unreachable Hub must fall back to the cached model_index.json."""
+    cached = tmp_path / "model_index.json"
+    cached.write_text("{}")
+
+    def offline(**kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        lambda repo_id, filename: (
+            str(cached) if filename == "model_index.json" else None
+        ),
+    )
+
+    assert hf_diffusers_utils._resolve_remote_repo_model_index_path("org/model") == str(
+        cached
+    )
+
+
+@pytest.mark.parametrize("cached_single_model", [True, False])
+def test_unreachable_hub_model_index(
+    monkeypatch, tmp_path, recording_snapshot_download, cached_single_model
+):
+    """Offline, a cached single model loads; a cache miss is reported, not a -Diffusers hint."""
+
+    def offline(*args, **kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda **k: None)
+
+    if cached_single_model:
+        (tmp_path / "config.json").write_text(json.dumps({"architectures": ["M"]}))
+        calls = recording_snapshot_download(tmp_path)
+        config = hf_diffusers_utils.maybe_download_model_index("org/model")
+        assert config == {"architectures": ["M"]}
+        assert calls == ["probe"]
+    else:
+        monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", offline)
+        with pytest.raises(ValueError, match="not found in local cache"):
+            hf_diffusers_utils.maybe_download_model_index("org/model")
+
+
+def test_component_config_ignores_scheduler_in_parent_directory(tmp_path):
+    """Only the component dir name, not a parent dir, selects scheduler_config.json."""
+    component = tmp_path / "scheduler_ablation" / "unet"
+    component.mkdir(parents=True)
+    (component / "config.json").write_text(json.dumps({"_class_name": "UNet"}))
+
+    config = hf_diffusers_utils.get_diffusers_component_config(str(component))
+
+    assert config["_class_name"] == "UNet"
+
+
+def test_modelopt_config_patch_does_not_write_through_cache_symlink(tmp_path):
+    """Normalizing config.json must not modify the shared HF cache blob."""
+    blob = tmp_path / "blob"
+    original = json.dumps(
+        {"quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}}
+    )
+    blob.write_text(original)
+    component = tmp_path / "snapshot" / "transformer"
+    component.mkdir(parents=True)
+    (component / "config.json").symlink_to(blob)
+
+    hf_diffusers_utils.prepare_diffusers_component_path_for_loading(str(component))
+
+    patched = json.loads((component / "config.json").read_text())
+    assert patched["quantization_config"]["quant_type"] == "FP8"
+    assert blob.read_text() == original

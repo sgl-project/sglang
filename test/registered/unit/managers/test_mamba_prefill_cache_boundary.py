@@ -21,6 +21,10 @@ class Batch:
         self.reqs = [req]
         self.decoding_reqs = None
         self.forward_mode = NS(is_extend=lambda: name == "prefill")
+        self.is_extend_in_batch = name == "prefill"
+
+    def grammar_needs_sync(self):
+        return False
 
     def copy(self):
         return self
@@ -81,8 +85,16 @@ class OverlapHarness:
             self.scheduled += 1
         return NS(batch_to_run=batch, running_batch=running_batch)
 
-    def is_disable_overlap_for_batch(self, batch, *, last_batch):
-        return self.need_overlap_sync and last_batch is not None
+    def increment_scheduler_iterations(self):
+        pass
+
+    def should_process_last_batch_early(self, last_batch):
+        with patch(
+            "sglang.srt.managers.scheduler.envs."
+            "SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get",
+            return_value=self.need_overlap_sync,
+        ):
+            return Scheduler.should_process_last_batch_early(self, last_batch)
 
     def run_batch(self, batch):
         self.events.append("run:" + batch.name)

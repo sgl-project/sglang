@@ -73,7 +73,7 @@ export const config = {
   // exactly rather than drawing a range, so runs stay comparable.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang-oai \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -358,7 +358,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_DEEPEP_V2_EXPAND_PREFILL=1",
         "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048",
         "SGLANG_DEEPEP_V2_MASKED_NUM_MAX_DISPATCH_TOKENS_PER_RANK=384",
         "EP_DISABLE_GIN=1",
@@ -442,7 +441,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_DEEPEP_V2_EXPAND_PREFILL=1",
         "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048",
         "SGLANG_DEEPEP_V2_MASKED_NUM_MAX_DISPATCH_TOKENS_PER_RANK=384",
         "EP_DISABLE_GIN=1",

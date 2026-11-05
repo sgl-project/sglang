@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -15,13 +16,14 @@ from sglang.srt.layers.layer_boundary import (
     NORM_QUANT_READOUT,
     PLAIN_ADD,
     Layout,
+    OutputContract,
     StageKind,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
     complete_owed,
 )
-from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attn_input_fusions,
     ffn_input_fusions,
@@ -30,22 +32,22 @@ from sglang.srt.layers.layer_boundary.fusions.allreduce import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_forward, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _MODULE = "sglang.srt.layers.layer_boundary.fusions.cutedsl"
 _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8))
@@ -179,7 +181,12 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
     ):
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
-                incoming=SimpleNamespace(residual=Layout(frozenset()))
+                incoming=SimpleNamespace(
+                    residual=Layout(frozenset()),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
+                )
             )
         }
         fusions = ffn_input_fusions(comm)
@@ -192,7 +199,10 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
                 incoming=SimpleNamespace(
-                    residual=Layout(frozenset({TokenAxis.ATTN_TP}))
+                    residual=Layout(frozenset({TokenAxis.ATTN_TP})),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
                 )
             )
         }
@@ -238,6 +248,16 @@ def test_finalize_handoff_is_a_producer_capability(eligible):
     fusion.install(SimpleNamespace(), defers_finalize=True)
     with patch.object(CuteDSLFusion, "_finalize_eligible", return_value=True):
         assert fusion.can_defer_finalize(comm, _DECODE)
+
+
+def test_ep_finalize_switch_does_not_bypass_runtime_capability_gate():
+    fusion = CuteDSLFusion()
+    with (
+        envs.SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE.override(True),
+        patch.object(CuteDSLFusion, "_eligible", return_value=False),
+        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=4)),
+    ):
+        assert not fusion._finalize_eligible(object(), _DECODE, 8)
 
 
 def test_install_does_not_require_a_fused_successor():
@@ -415,7 +435,7 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
     finish = MagicMock(return_value=torch.ones(2, 8))
     with (
         # A norm the kernel could fold in, on a batch it does not take.
-        patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
+        patch(f"{_MODULE}.fused_norm_gamma", return_value=torch.ones(8)),
         patch.object(CuteDSLFusion, "_finalize_eligible", return_value=False),
         patch.object(CuteDSLFusion, "_eligible", return_value=False),
     ):
@@ -557,6 +577,44 @@ def test_retargeted_profiles_cover_capacity_and_pass_flashinfer_validation(
             )
 
 
+@pytest.mark.parametrize(
+    ("enabled", "tp_size", "hidden_size", "top_k", "ep_size", "tuned"),
+    [
+        (True, 8, 4096, 10, 8, True),
+        (False, 8, 4096, 10, 8, False),
+        (True, 16, 4096, 10, 8, False),
+        (True, 8, 8192, 10, 8, False),
+        (True, 8, 4096, 8, 8, False),
+        (True, 8, 4096, 10, 1, False),
+    ],
+)
+def test_ep_shape_profile_uses_runtime_tuning_only_at_its_capability_boundary(
+    enabled, tp_size, hidden_size, top_k, ep_size, tuned
+):
+    from flashinfer.comm.mnnvl_cutedsl import ProtocolKind
+
+    module = "sglang.srt.layers.flashinfer_mnnvl_cutedsl"
+    with (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+        patch(
+            f"{module}.get_parallel", return_value=SimpleNamespace(moe_ep_size=ep_size)
+        ) as get_parallel,
+    ):
+        profile = _retargeted_config(tp_size, hidden_size, top_k).profiles[0]
+
+    expect_ep_probe = enabled and (tp_size, hidden_size, top_k) == (8, 4096, 10)
+    assert get_parallel.called is expect_ep_probe
+
+    assert profile.finalize_routes.upper_bounds[2] == (1024 if tuned else 703)
+    for routes in (profile.finalize_routes, profile.all_reduce_routes):
+        bt = [target for target in routes.targets if target.protocol is ProtocolKind.BT]
+        assert bt
+        expected_threads = 512 if tuned else 1024
+        assert all(
+            target.preset.collective.rms_threads == expected_threads for target in bt
+        )
+
+
 class TestDeferredLoraAllReduce(unittest.TestCase):
     def test_installed_cutedsl_provider_restores_deferred_sum(self):
         from types import SimpleNamespace
@@ -574,9 +632,6 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
         for eligible, a2a in ((True, False), (False, False), (True, True)):
             with (
                 patch.object(exits, "_ffn_has_tokens", return_value=True),
-                patch.object(
-                    exits, "post_experts_sum_is_one_all_reduce", return_value=False
-                ),
                 patch.object(
                     exits, "get_lora", return_value=SimpleNamespace(enable_lora=True)
                 ),
@@ -602,8 +657,11 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
                 ) as gate,
             ):
                 # Avoid platform-specific Aiter details: no residual cannot fuse.
+                facts = exits.ExitFacts(
+                    single_sum=False, fused_consumer_sum=exits._fused_consumer_sum()
+                )
                 with patch.object(exits, "_use_aiter", False, create=True):
-                    result = exits._batch_allows_deferred_sum(fb, boundary)
+                    result = exits._batch_allows_deferred_sum(fb, facts, boundary)
                 self.assertEqual(result, eligible and not a2a)
                 if a2a:
                     gate.assert_not_called()
