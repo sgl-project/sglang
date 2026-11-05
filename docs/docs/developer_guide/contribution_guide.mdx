@@ -166,7 +166,7 @@ The "amd" label classifies PRs touching paths containing `amd` or `rocm`. It doe
 
 For an existing PR, update your branch to include the registry, handler, and Extra gate changes, then push to create fresh runs. Reruns keep the original workflow revision, so older runs retain the shared-label behavior.
 
-The `mlu` tier remains registered for `/run-ci mlu` and `/run-mlu-ci`. PPU is not a registered tier: its workflow uses "run-ci" and "run-ci-ppu" labels plus PPU path filters; `/run-ppu-ci` is unavailable.
+The `mlu` tier remains registered for `/run-ci mlu` and `/run-mlu-ci`. The `ppu` tier is registered for `/run-ci ppu` and `/run-ppu-ci`; its existing PPU path filters still apply.
 
 The rerun commands have the following permission rules:
 

@@ -309,6 +309,7 @@ class GroupCoordinator:
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
+        use_quick_allreduce: Optional[bool] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -424,6 +425,9 @@ class GroupCoordinator:
         self.use_pynccl = use_pynccl
         self.use_mscclpp = use_mscclpp
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_quick_allreduce = (
+            use_custom_allreduce if use_quick_allreduce is None else use_quick_allreduce
+        )
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
@@ -516,7 +520,7 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
+            if self.use_quick_allreduce and is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
                     # when rocm >= gfx942. Quick reduce is designed as a
@@ -2177,6 +2181,7 @@ def init_model_parallel_group(
     backend: str,
     use_pynccl: Optional[bool] = None,
     use_custom_allreduce: Optional[bool] = None,
+    use_quick_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp: Optional[bool] = None,
@@ -2204,6 +2209,7 @@ def init_model_parallel_group(
         use_pynccl=use_pynccl,
         use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
+        use_quick_allreduce=use_quick_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
@@ -2220,23 +2226,6 @@ _ATTN_TP: Optional[GroupCoordinator] = None
 _SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
-
-# duplicate GroupCoordinator for prefill in PD-Multiplexing
-_PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
-
-
-@contextmanager
-def pdmux_prefill_tp_group():
-    """Use the duplicate TP communicator for the prefill stream.
-
-    PD multiplexing keeps prefill and decode on separate communicators with
-    the same ranks. Only the TP handle changes within this scope.
-    """
-    assert _PDMUX_PREFILL_TP_GROUP is not None, (
-        "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
-    )
-    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
-        yield
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -2579,7 +2568,6 @@ def init_distributed_environment(
 
 def initialize_model_parallel(
     backend: Optional[str] = None,
-    duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2708,28 +2696,6 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
-    if duplicate_tp_group:
-        global _PDMUX_PREFILL_TP_GROUP
-        assert _PDMUX_PREFILL_TP_GROUP is None, (
-            "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
-        )
-        _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
-            group_name="pdmux_prefill_tp",
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
-        )
-        tp_pynccl_comm = _TP.get_available_pynccl_comm()
-        pdmux_pynccl_comm = _PDMUX_PREFILL_TP_GROUP.get_available_pynccl_comm()
-        if tp_pynccl_comm is not None:
-            tp_pynccl_comm.disabled = False
-        if pdmux_pynccl_comm is not None:
-            pdmux_pynccl_comm.disabled = False
-
     # Build decode context-parallel groups inside each TP group only when DCP is enabled.
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
@@ -2744,6 +2710,10 @@ def initialize_model_parallel(
             dcp_group_ranks,
             get_world_group().local_rank,
             backend,
+            # Current DCP paths use all-gather/reduce-scatter, all-to-all, or
+            # FP32 all-reduce. QuickAllReduce does not serve these collectives,
+            # but its communicator reserves a large workspace on every rank.
+            use_quick_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
@@ -3340,11 +3310,6 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
-
-    global _PDMUX_PREFILL_TP_GROUP
-    if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
-        _PDMUX_PREFILL_TP_GROUP.destroy()
-    _PDMUX_PREFILL_TP_GROUP = None
 
 
 def destroy_distributed_environment():

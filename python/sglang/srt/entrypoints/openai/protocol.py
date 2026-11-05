@@ -230,7 +230,7 @@ class UsageInfo(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
+    include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
 
 
@@ -421,8 +421,9 @@ class CompletionRequest(PDRoutingFields):
     )
 
     images_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
@@ -906,6 +907,17 @@ def _has_message_level_tools(messages: Any) -> bool:
     )
 
 
+class DocSplitOptions(BaseModel):
+    """Options for splitting oversized document requests into page batches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_batch_pages: Optional[int] = Field(default=None, ge=1)
+    overlap_pages: Optional[int] = Field(default=None, ge=0)
+    lookahead_pages: Optional[int] = Field(default=None, ge=0)
+    max_page_tokens: Optional[int] = Field(default=None, ge=1)
+
+
 class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
@@ -953,6 +965,9 @@ class ChatCompletionRequest(PDRoutingFields):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    # Whether the client sent tool_choice, as opposed to the default filled in
+    # by set_tool_choice_default.
+    _tool_choice_explicit: bool = PrivateAttr(default=False)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1026,9 +1041,11 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
+    doc_split_options: Optional[DocSplitOptions] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -1072,17 +1089,22 @@ class ChatCompletionRequest(PDRoutingFields):
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
+    def set_tool_choice_default(cls, values, handler):
+        if not isinstance(values, dict):
+            return handler(values)
+        explicit = values.get("tool_choice") is not None
+        if not explicit:
             if values.get("tools") is None and not _has_message_level_tools(
                 values.get("messages")
             ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
-        return values
+        request = handler(values)
+        request._tool_choice_explicit = explicit
+        return request
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod

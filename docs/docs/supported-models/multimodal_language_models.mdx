@@ -462,6 +462,9 @@ python3 -m sglang.launch_server \
 ```
 
 <Note>
+`SGLANG_VIT_ENABLE_CUDA_GRAPH=1` is not supported because vision graphs do not
+preserve page boundaries.
+
 Some two-column outputs on A100 and H100 differ in formatting or reading order,
 or omit a line. On A100, `--mm-attention-backend sdpa` passed the tested reference
 pages. A reliable H100 workaround has not been confirmed.

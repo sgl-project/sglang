@@ -17,15 +17,12 @@ import asyncio
 import torch
 
 from sglang.srt.managers.mm_utils import hash_feature
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.nemotron_parse import (
     NECK_COMPRESSION,
     RadioMBartPrefixForCausalLM,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,

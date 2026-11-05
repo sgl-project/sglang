@@ -3,16 +3,19 @@
 import asyncio
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.nemotron_parse import (
     NemotronParseVision,
     content_normalized_positions,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.nemotron_parse import NemotronParseProcessor
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -116,7 +119,7 @@ class TestParseProcessor(CustomTestCase):
 
 
 class TestParseVisionBatch(CustomTestCase):
-    def test_sdpa_variable_size_pages_match_separate_encoding(self):
+    def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
         publish(
@@ -124,7 +127,7 @@ class TestParseVisionBatch(CustomTestCase):
             role="test",
             ranks=SpawnRanks(world_rank=0, gpu_id=0),
         )
-        config = SimpleNamespace(
+        self.config = SimpleNamespace(
             encoder=SimpleNamespace(
                 args={"model": "parse_test", "register_multiple": 2},
                 patch_size=2,
@@ -133,36 +136,50 @@ class TestParseVisionBatch(CustomTestCase):
             decoder=SimpleNamespace(d_model=4),
             vision_summary_dim=16,
         )
-        with (
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(
             patch.dict(
                 "sglang.srt.configs.radio.VIT_TIMM_DIM_BY_NAME",
                 {"parse_test": (8, 1, 2, 16)},
-            ),
-            get_parallel().override(tp_group=None, attn_tp_group=None),
+            )
+        )
+        self.stack.enter_context(
+            get_parallel().override(tp_group=None, attn_tp_group=None)
+        )
+        self.stack.enter_context(envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.override(False))
+
+    def test_rejects_vision_cuda_graphs(self):
+        """Vision graphs discard the boundaries between packed pages."""
+        with (
+            patch("sglang.srt.models.internvl._is_cuda", True),
+            envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.override(True),
+            self.assertRaisesRegex(ValueError, "SGLANG_VIT_ENABLE_CUDA_GRAPH"),
         ):
-            vision = NemotronParseVision(config).eval()
-            generator = torch.Generator().manual_seed(123)
-            for parameter in vision.parameters():
-                with torch.no_grad():
-                    parameter.copy_(
-                        torch.randn(parameter.shape, generator=generator) * 0.1
-                    )
-            items = [
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    feature=torch.randn(height * width // 4, 12, generator=generator),
-                    model_specific_data={
-                        "image_size": [height, width],
-                        "content_size": [height - 1, width - 1],
-                    },
-                )
-                for height, width in ((8, 8), (16, 8))
-            ]
-            with torch.inference_mode():
-                actual = vision(items)
-                expected = torch.cat([vision([item]) for item in items])
-            self.assertEqual(actual.shape, (14, 4))
-            torch.testing.assert_close(actual, expected)
+            NemotronParseVision(self.config)
+
+    def test_sdpa_variable_size_pages_match_separate_encoding(self):
+        vision = NemotronParseVision(self.config).eval()
+        generator = torch.Generator().manual_seed(123)
+        for parameter in vision.parameters():
+            with torch.no_grad():
+                parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.1)
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=torch.randn(height * width // 4, 12, generator=generator),
+                model_specific_data={
+                    "image_size": [height, width],
+                    "content_size": [height - 1, width - 1],
+                },
+            )
+            for height, width in ((8, 8), (16, 8))
+        ]
+        with torch.inference_mode():
+            actual = vision(items)
+            expected = torch.cat([vision([item]) for item in items])
+        self.assertEqual(actual.shape, (14, 4))
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

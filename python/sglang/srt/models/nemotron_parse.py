@@ -31,7 +31,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import general_mm_embed_routine, pad_mm_tokens
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.radio import RadioModel
@@ -93,6 +93,11 @@ class NemotronParseVision(nn.Module):
             reg_tokens=encoder.args["register_multiple"],
         )
         self.model_encoder = RadioModel(radio_config)
+        if self.model_encoder.model.encoder.enable_cg:
+            raise ValueError(
+                "Nemotron Parse does not support SGLANG_VIT_ENABLE_CUDA_GRAPH=1: "
+                "vision graphs do not preserve page boundaries"
+            )
         self.pack_pages = (
             self.model_encoder.model.encoder.layers[0].attn.attn.qkv_backend_name
             != "sdpa"
@@ -287,14 +292,6 @@ class NemotronParseDecoder(nn.Module):
 
 
 class RadioMBartPrefixForCausalLM(nn.Module):
-    merge_by_field_config = False
-
-    @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("image"):
-            return None
-        raise ValueError("Nemotron Parse supports document images only")
-
     def __init__(self, *, config, quant_config=None, prefix="", **kwargs):
         super().__init__()
         if not config.legacy_causal_vision_prefix or config.decoder.add_cross_attention:
