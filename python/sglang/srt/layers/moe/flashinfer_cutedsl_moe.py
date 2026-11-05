@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -6,6 +7,19 @@ from flashinfer import (
     silu_and_mul_scaled_nvfp4_experts_quantize,
 )
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+
+_SM100_MOE_DEV_CACHE: dict[int, bool] = {}
+
+
+def _is_sm100_device(dev: torch.device) -> bool:
+    if dev.type != "cuda":
+        return False
+    idx = dev.index or 0
+    ok = _SM100_MOE_DEV_CACHE.get(idx)
+    if ok is None:
+        ok = torch.cuda.get_device_capability(dev)[0] == 10
+        _SM100_MOE_DEV_CACHE[idx] = ok
+    return ok
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -83,9 +97,8 @@ def flashinfer_cutedsl_moe_masked(
     n = w2.shape[-1] * 2  # intermediate dimension
 
     if hidden_states[1] is not None:
-        a_q = hidden_states[0].view(torch.uint8)
-        a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
-        m, k_by_2, num_experts = a_q.shape
+        a_q_check = hidden_states[0].view(torch.uint8)
+        m, k_by_2, num_experts = a_q_check.shape
         k = k_by_2 * 2
     else:
         num_experts, m, k = hidden_states[0].shape
@@ -95,12 +108,6 @@ def flashinfer_cutedsl_moe_masked(
         )
         assert input_global_scale.shape == (num_experts,), (
             f"input_global_scale must be (l,), got {input_global_scale.shape}"
-        )
-
-        a_q, a_q_sf = scaled_fp4_grouped_quantize(
-            hidden_states[0],
-            masked_m,
-            input_global_scale,
         )
 
     if activation == "silu":
@@ -134,6 +141,43 @@ def flashinfer_cutedsl_moe_masked(
     assert w2_alpha.shape == (num_experts,), (
         f"w2_alpha must be (l,), got {w2_alpha.shape}"
     )
+
+    if (
+        os.environ.get("SGLANG_USE_CUTEDSL_NVFP4_GROUPED_MOE", "1") == "1"
+        and down_sm_count is None
+        and down_signals is None
+        and _is_sm100_device(w1.device)
+        and k >= 256
+        and (k % 256 == 0)
+        and n >= 256
+        and (n % 256 == 0)
+    ):
+        from sglang.kernels.ops.moe import nvfp4_masked_grouped_moe
+
+        return nvfp4_masked_grouped_moe(
+            hidden_states,
+            input_global_scale,
+            w1,
+            w1_blockscale,
+            w1_alpha,
+            w2,
+            a2_global_scale,
+            w2_blockscale,
+            w2_alpha,
+            masked_m,
+            down_start_event=down_start_event,
+            activation=activation,
+        )
+
+    if hidden_states[1] is not None:
+        a_q = hidden_states[0].view(torch.uint8)
+        a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
+    else:
+        a_q, a_q_sf = scaled_fp4_grouped_quantize(
+            hidden_states[0],
+            masked_m,
+            input_global_scale,
+        )
 
     # TODO(kaixih@nvidia): dtype should be based on inputs.
     gateup_output = torch.empty(
