@@ -257,6 +257,45 @@ class TestRadixKey(unittest.TestCase):
         long_b[70] = -1
         self._assert_match(long_a, long_b, 64, 64, is_bigram=True)
 
+    def test_offset_match_and_child_key_equal_sliced_key(self):
+        """match(other_start=s) and child_key(start=s) agree with slicing other[s:] first.
+
+        The radix walks advance an offset instead of slicing the query per node; this
+        pins the offset math for bigram keys, a ``limit`` cap, and page rounding.
+        """
+        base = list(range(1, 301))
+        for is_bigram in (False, True):
+            for page_size in (1, 4):
+                for limit in (None, 250):
+                    other = RadixKey(array("q", base), is_bigram=is_bigram, limit=limit)
+                    for s in (0, 1, 7, 64, 128, 249, 250, 260):
+                        sliced = other[s:]
+                        if len(sliced) >= page_size:
+                            self.assertEqual(
+                                other.child_key(page_size, start=s),
+                                sliced.child_key(page_size),
+                            )
+                        for node_len in (1, 3, 64, 100):
+                            for div in (None, 0, 2, 63):
+                                tokens = base[s : s + node_len] or [7]
+                                if div is not None and div < len(tokens):
+                                    tokens[div] = -1
+                                node = RadixKey(array("q", tokens), is_bigram=is_bigram)
+                                with self.subTest(
+                                    is_bigram=is_bigram,
+                                    page_size=page_size,
+                                    limit=limit,
+                                    s=s,
+                                    node_len=node_len,
+                                    div=div,
+                                ):
+                                    self.assertEqual(
+                                        node.match(
+                                            other, page_size=page_size, other_start=s
+                                        ),
+                                        node.match(sliced, page_size=page_size),
+                                    )
+
 
 class TestTreeNode(unittest.TestCase):
     """Test cases for TreeNode class."""

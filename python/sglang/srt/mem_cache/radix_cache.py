@@ -178,25 +178,26 @@ class RadixKey:
                 f"{self.cache_salt=} != {other.cache_salt=}"
             )
 
-    def match(self, other: RadixKey, page_size: int = 1) -> int:
-        """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
+    def match(self, other: RadixKey, page_size: int = 1, other_start: int = 0) -> int:
+        """Logical-unit prefix length shared with ``other[other_start:]`` (no copy), rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
-        n = min(len(t0), len(t1))
+        s = other_start
+        n = min(len(t0), other._raw_len() - s)
 
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
         # holding the divergence -- no per-token Python loop on long shared prefixes.
-        matched_tokens = n
+        matched_tokens = max(n, 0)
         lo = 0
         step = 1
         while lo < n:
             hi = lo + step if lo + step < n else n
-            if t0[lo:hi] != t1[lo:hi]:
+            if t0[lo:hi] != t1[s + lo : s + hi]:
                 while hi - lo > 1:
                     mid = (lo + hi) // 2
-                    if t0[lo:mid] == t1[lo:mid]:
+                    if t0[lo:mid] == t1[s + lo : s + mid]:
                         lo = mid
                     else:
                         hi = mid
@@ -205,25 +206,26 @@ class RadixKey:
             lo = hi
             step *= 2
 
+        other_len = max(len(other) - s, 0)
         if self.is_bigram:
-            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), other_len))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
-        matched_tokens = min(matched_tokens, len(self), len(other))
+        matched_tokens = min(matched_tokens, len(self), other_len)
         if page_size == 1:
             return matched_tokens
         return (matched_tokens // page_size) * page_size
 
-    def child_key(self, page_size: int = 1):
-        """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
+    def child_key(self, page_size: int = 1, start: int = 0):
+        """Hashable dict-key for ``page_size`` logical units from ``start``, namespaced by ``extra_key``."""
         t = self.token_ids
         if self.is_bigram:
             if page_size == 1:
-                plain = (t[0], t[1])
+                plain = (t[start], t[start + 1])
             else:
-                plain = tuple((t[j], t[j + 1]) for j in range(page_size))
+                plain = tuple((t[j], t[j + 1]) for j in range(start, start + page_size))
         else:
-            plain = t[0] if page_size == 1 else tuple(t[:page_size])
+            plain = t[start] if page_size == 1 else tuple(t[start : start + page_size])
         if self.cache_salt is not None:
             return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)
@@ -682,11 +684,14 @@ class RadixCache(BasePrefixCache):
 
         child_key = key.child_key(self.page_size)
 
+        # Walk by offset into key; slicing the remainder per node is O(len * depth).
+        key_len = len(key)
+        pos = 0
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while pos < key_len and child_key in node.children:
             child = node.children[child_key]
             child.last_access_time = access_time
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(key, page_size=self.page_size, other_start=pos)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -695,10 +700,10 @@ class RadixCache(BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                pos += prefix_len
 
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                if pos < key_len:
+                    child_key = key.child_key(self.page_size, start=pos)
 
         return value, node
 
