@@ -473,14 +473,24 @@ def layouts(tn: int, num_warps: int):
 
 def pick_config(n: int, k: int):
     """``(tn, num_warps, split, programs per CU, accumulator chains, prefetch depth)`` by
-    shape, from a config sweep on gfx1151 at M = 8. ``tn = 2`` and ``nch = 4`` spill;
-    three 8-warp programs (35 KB LDS each) fill a WGP's 128 KB. Split-K stays at most 2: two
-    fp32 atomic adds onto zero give the same sum in either order, so results stay
-    deterministic."""
+    shape, from graph-timed sweeps on gfx1151 at M = 8 (distinct weights per call). Split-K 1
+    where it wins: it saves the zero-fill and cast launches around the fp32 atomics, which
+    matter between the ~300 dependent GEMMs of a verify step. Shapes where split 1 measured
+    slower (the 6144 x 5120 drafter qkv, the 248320 x 5120 candidate head) keep split 2.
+    ``tn = 2`` and ``nch = 4`` spill; three 8-warp programs (35 KB LDS each) fill a WGP's
+    128 KB. Split-K stays at most 2: two fp32 atomic adds onto zero give the same sum in
+    either order, so results stay deterministic."""
+    splits_k_by_4 = (k // 128) % 4 == 0
+    if k >= 16384:  # down
+        return 1, 8, 1, 2, 2, 4
+    if 32768 <= n < 65536 and n % 256 == 0 and splits_k_by_4:  # gate_up
+        return 1, 16, 1, 1, 1, 4
+    if 14336 <= n < 32768 and splits_k_by_4:  # in_proj_qkvz, qkv_proj
+        return 1, 8, 1, 4, 1, 4
+    if n <= 8192 and k >= 6144 and n % 256 == 0 and splits_k_by_4:  # out_proj, o_proj
+        return 1, 16, 1, 2, 1, 2
     if n >= 14336 and (k // 128) % 8 == 0:
         return 1, 8, 2, 2, 2, 4
-    if k >= 16384:
-        return 1, 8, 1, 2, 2, 4
     if n <= 8192 and (k // 128) % 8 == 0:
         return 1, 8, 2, 3, 2, 4
     return 1, 8, 1, 2, 2, 4
