@@ -18,8 +18,16 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -37,6 +45,11 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
         s.disaggregation_mode = DisaggregationMode.NULL
@@ -89,6 +102,11 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
 
     def _idle_scheduler(self, materializer):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         scheduler.scheduler_stage_metrics = SchedulerStageMetricsRecorder(enabled=False)
         scheduler.maybe_send_health_check_signal = MagicMock()
         scheduler.is_fully_idle = Scheduler.is_fully_idle.__get__(scheduler)
@@ -96,7 +114,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.metrics_reporter = MagicMock()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
@@ -106,6 +124,14 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.enable_hisparse = False
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        scheduler.running_reqs = []
+        scheduler.dllm_config = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.hisparse_coordinator = None
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_hicache_storage = False
         scheduler.enable_lmcache = False
