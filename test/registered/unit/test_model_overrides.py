@@ -61,6 +61,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     moe_dp_size=1,
                     cp_strategy=None,
                     cp_kv_layout=None,
+                    enable_unified_memory=False,
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
@@ -985,6 +986,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     *qwen4, config_extra=compressed, qsa_indexer_dtype=name
                 )
                 self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), name)
+
+    def test_nemotron3_embedding_rejects_rocm(self):
+        """The ROCm default attention backend ignores ENCODER_ONLY layers, so
+        Nemotron-3-Embed must fail at startup there, not return causal embeddings."""
+        # The checkpoint is a bare Ministral3Model; ModelConfig renames it.
+        nemotron3 = ("Ministral3Model", "ministral3")
+        embedding_fields = {"is_causal": False, "pooling": "avg"}
+        with override_platform(is_cuda=True):
+            self._construct(*nemotron3, config_extra=embedding_fields)
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                self._construct(*nemotron3, config_extra=embedding_fields)
+            # Generative Ministral3 checkpoints are unaffected.
+            self._construct(*nemotron3)
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
@@ -1966,7 +1981,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         view = ResolvedView(
             SimpleNamespace(
-                enable_deterministic_inference=True, attention_backend="flashmla"
+                enable_deterministic_inference=True,
+                attention_backend="flashmla",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
             )
         )
         with self.assertRaises(ValueError):
@@ -1979,16 +1997,67 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # A per-phase backend overrides --attention-backend for its phase, so a
         # non-deterministic one must be refused even when the main backend is fine.
         for field in ("prefill_attention_backend", "decode_attention_backend"):
-            with self.subTest(field=field):
+            with (
+                self.subTest(field=field),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=False,
+                ),
+            ):
+                phases = {
+                    "prefill_attention_backend": None,
+                    "decode_attention_backend": None,
+                    field: "aiter",
+                }
                 view = ResolvedView(
                     SimpleNamespace(
                         enable_deterministic_inference=True,
                         attention_backend="triton",
-                        **{field: "aiter"},
+                        **phases,
                     )
                 )
                 with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
                     _deterministic_attention_backend(view)
+
+    def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
+        """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
+        and its speculative verify path is not; AITER prefill attention never is."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
+
+        cases = [
+            # (gfx950, MLA model, prefill backend, speculative algorithm, accepted)
+            (True, False, "triton", None, True),
+            (False, False, "triton", None, False),
+            (True, True, "triton", None, False),
+            (True, False, "aiter", None, False),
+            (True, False, "triton", "EAGLE", False),
+        ]
+        for gfx950, mla, prefill, spec, accepted in cases:
+            with (
+                self.subTest(gfx950=gfx950, mla=mla, prefill=prefill, spec=spec),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=gfx950,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=mla
+                ),
+            ):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        prefill_attention_backend=prefill,
+                        decode_attention_backend="aiter",
+                        speculative_algorithm=spec,
+                    )
+                )
+                if accepted:
+                    self.assertEqual(_deterministic_attention_backend(view), {})
+                else:
+                    with self.assertRaises(ValueError):
+                        _deterministic_attention_backend(view)
 
     def test_deterministic_compatible_phase_backends_are_accepted(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView

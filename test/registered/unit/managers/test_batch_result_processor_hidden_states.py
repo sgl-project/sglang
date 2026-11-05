@@ -11,7 +11,8 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -19,6 +20,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -56,6 +58,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         logprob_result_processor=None,
         output_streamer=Mock(),
         beam_coordinator=Mock(),
+        request_retirer=release_only_retirer(),
         abort_request=lambda *args, **kwargs: None,
     )
 
@@ -75,6 +78,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 time_stats=Mock(),
                 update_finish_state=Mock(),
                 finished=lambda: True,
+                kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
             )
             for encoding_format, discard_reason in (
                 ("tensor", reason),
@@ -99,8 +103,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
         processor = replace(_make_processor(self), is_generation=False)
 
         with patch(
-            "sglang.srt.managers.scheduler_components."
-            "batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_prefill(batch, result)
 
@@ -257,6 +260,7 @@ class _DecodeReq:
         self.grammar = None
         self.beam_group = None
         self.time_stats = Mock()
+        self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
 
     def finished(self):
         return self.finished_len is not None
@@ -386,7 +390,9 @@ class TestMixedBatchKvRelease(CustomTestCase):
         decode_req = _PrefillReq(rid="decode", return_hidden_states=False)
         for req in (prefill_req, decode_req):
             req.finished = lambda req=req: bool(req.output_ids)
-            req.kv = SimpleNamespace(kv_committed_len=0)
+            req.kv = SimpleNamespace(
+                kv_committed_len=0, holds_kv=True, holds_mamba=False
+            )
         batch = SimpleNamespace(
             reqs=[prefill_req, decode_req],
             chunked_req=None,
@@ -420,7 +426,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
         with (
             patch(
                 "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.release_kv_cache"
+                "request_retirer.release_kv_cache"
             ) as release,
             patch.object(
                 SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
@@ -488,7 +494,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             next_token_ids=torch.tensor([8]),
         )
         with patch(
-            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_decode(batch, result)
 

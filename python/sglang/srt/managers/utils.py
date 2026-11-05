@@ -18,14 +18,19 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.auxiliary_output import append_auxiliary_output
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+from sglang.srt.runtime_context import (
+    get_serving,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 from sglang.srt.utils.common import is_cuda
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
@@ -33,6 +38,7 @@ if TYPE_CHECKING:
         DeviceAuxiliaryOutput,
         HostAuxiliaryOutput,
     )
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,
@@ -514,4 +520,19 @@ def compute_num_reserved_tokens() -> int:
     return max(
         spec.speculative_eagle_topk * spec.speculative_num_steps,
         max_speculative_num_draft_tokens(),
+    )
+
+
+def make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(
+        rid=req.rid,
+        finished_reason=finished_reason,
+        weight_versions=compute_weight_version_spans(
+            req.weight_version_events,
+            current_version=get_serving().weight_version,
+            num_output_tokens=len(req.output_ids),
+        ),
+        prefill_weight_versions=req.prefill_weight_versions,
     )
