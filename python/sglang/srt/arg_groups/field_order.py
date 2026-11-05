@@ -559,5 +559,7 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "lmcache_min_retrieve_tokens",
+    "lmcache_load_cost_profile",
 )
 # fmt: on
