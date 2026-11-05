@@ -44,6 +44,7 @@ def source_method(path, cls, method, namespace):
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.use_paged_mtp = True
+    obj.paged_mtp_attention_decode = Mock()
     obj.use_flash_mla = obj.use_mla = False
     obj.dense_mla_dcp_target = obj.dsa_dcp_target = False
     obj.dcp_size, obj.dcp_rank = 1, 0
@@ -193,7 +194,7 @@ def test_forward_uses_device_lengths_without_host_attention_and_restores_dp_padd
     )
     kernel = Mock(side_effect=lambda **kw: torch.ones_like(kw["query"]))
     with (
-        patch.object(mod, "paged_mtp_attention_decode", kernel),
+        patch.object(backend, "paged_mtp_attention_decode", kernel),
         patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")),
         patch.object(
             torch.Tensor, "item", side_effect=AssertionError("unexpected scalar sync")

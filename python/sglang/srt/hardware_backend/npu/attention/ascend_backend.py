@@ -5,10 +5,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.attention.flash_mla import flash_mla, flash_mla_metadata
-from sgl_kernel_npu.attention.paged_mtp_attention import (
-    paged_mtp_attention_decode,
-)
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
@@ -434,8 +430,16 @@ class AscendAttnBackend(AttentionBackend):
             and get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
         )
         if self.use_flash_mla:
+            from sgl_kernel_npu.attention.flash_mla import flash_mla, flash_mla_metadata
+
             self.flash_mla = flash_mla
             self.flash_mla_metadata = flash_mla_metadata
+        if self.use_paged_mtp:
+            from sgl_kernel_npu.attention.paged_mtp_attention import (
+                paged_mtp_attention_decode,
+            )
+
+            self.paged_mtp_attention_decode = paged_mtp_attention_decode
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -1340,7 +1344,7 @@ class AscendAttnBackend(AttentionBackend):
             query = query[: forward_batch.global_num_token_non_padded_cpu]
         width = self.speculative_num_draft_tokens
         bs = query.shape[0] // width
-        output = paged_mtp_attention_decode(
+        output = self.paged_mtp_attention_decode(
             query=query,
             k_cache=self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim

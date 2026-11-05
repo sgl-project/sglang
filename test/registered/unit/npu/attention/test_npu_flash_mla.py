@@ -382,9 +382,19 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         return original_tensor(*args, **kwargs)
 
     kernel_module = SimpleNamespace(flash_mla=Mock(), flash_mla_metadata=Mock())
+    paged_mtp_module = SimpleNamespace(paged_mtp_attention_decode=Mock())
     with (
-        patch.object(mod, "flash_mla", kernel_module.flash_mla),
-        patch.object(mod, "flash_mla_metadata", kernel_module.flash_mla_metadata),
+        patch.dict(
+            sys.modules,
+            {
+                "sgl_kernel_npu.attention.flash_mla": (
+                    kernel_module if uses_flash_mla else None
+                ),
+                "sgl_kernel_npu.attention.paged_mtp_attention": (
+                    paged_mtp_module if uses_paged_mtp else None
+                ),
+            },
+        ),
         patch.object(mod.torch, "tensor", side_effect=tensor_on_cpu),
         patch.object(mod, "is_deepseek_dsa", return_value=False),
         patch.object(mod, "is_sparsity_driven_kv_offload_enabled", return_value=False),
@@ -443,6 +453,11 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
     if uses_flash_mla:
         assert obj.flash_mla is kernel_module.flash_mla
         assert obj.flash_mla_metadata is kernel_module.flash_mla_metadata
+    if uses_paged_mtp:
+        assert (
+            obj.paged_mtp_attention_decode
+            is paged_mtp_module.paged_mtp_attention_decode
+        )
 
 
 @pytest.mark.parametrize("draft_needs_cpu", [True, False])
