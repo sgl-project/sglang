@@ -54,7 +54,6 @@ class RequestRetirer:
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
-        self.beam_coordinator.retire_group(req)
         self.send_abort_output(
             make_abort_req(req, finished_reason=finished_reason), req
         )
@@ -72,6 +71,8 @@ class RequestRetirer:
     def _release(self, req: Req, *, checkpoint: bool, abandon_attempt: bool) -> None:
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req, abandon_attempt=abandon_attempt)
+            # No-op once the group retired; member rows are not freed here.
+            self.beam_coordinator.retire_group(req)
         discard_kv_cache_backup(req, self.tree_cache)
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:

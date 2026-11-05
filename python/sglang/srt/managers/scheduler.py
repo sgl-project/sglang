@@ -3644,9 +3644,6 @@ class Scheduler(
 
     def retire_unadmitted_request(self, req: Req) -> None:
         """Finish a request the disaggregation queues rejected at their door."""
-        # `beam_coordinator.validate_and_init` counts the group in ahead of the
-        # checks that reject; no-op when the request has no group.
-        self.beam_coordinator.retire_group(req)
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
@@ -4019,8 +4016,6 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        # No member rows exist before the leader's prefill ends.
-        self.beam_coordinator.retire_group(req)
         self.request_retirer.release(req, checkpoint=False)
 
         self.chunked_req = None

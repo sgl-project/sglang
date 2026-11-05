@@ -103,10 +103,16 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def test_aborted_chunked_beam_leader_retires_its_group(self):
         req = _FakeReq("beam_leader")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.request_retirer = Mock()
+        sched.request_retirer = release_only_retirer(
+            beam_coordinator=sched.beam_coordinator
+        )
         sched.ipc_channels = Mock()
 
-        sched.process_pending_chunked_abort()
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache"),
+        ):
+            sched.process_pending_chunked_abort()
 
         sched.beam_coordinator.retire_group.assert_called_once_with(req)
 

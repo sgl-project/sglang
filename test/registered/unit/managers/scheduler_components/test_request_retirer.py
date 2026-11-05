@@ -82,7 +82,12 @@ class TestRelease(CustomTestCase):
             "release_kv_cache",
             side_effect=lambda req, cache, *, checkpoint: calls.append(checkpoint),
         ):
-            release_only_retirer(tree_cache).release(req, checkpoint=checkpoint)
+            release_only_retirer(
+                tree_cache,
+                beam_coordinator=SimpleNamespace(
+                    retire_group=lambda req: calls.append("beam")
+                ),
+            ).release(req, checkpoint=checkpoint)
 
     def test_drops_cache_side_state_before_an_uncached_release(self):
         # A PD transfer or bootstrap failure, or a checksum mismatch, must also
@@ -90,7 +95,8 @@ class TestRelease(CustomTestCase):
         calls = []
         self._release(_req(FINISH_ABORT(), calls), calls)
         self.assertEqual(
-            calls, ["counts", "mm", CacheRequestOutcome.ABORT, "session", False]
+            calls,
+            ["counts", "mm", CacheRequestOutcome.ABORT, "session", "beam", False],
         )
 
     def test_leaves_the_attempt_of_a_checkpointed_release_to_the_cache(self):
@@ -98,7 +104,7 @@ class TestRelease(CustomTestCase):
         # settles the attempt.
         calls = []
         self._release(_req(FINISH_ABORT(), calls), calls, checkpoint=True)
-        self.assertEqual(calls, ["counts", "mm", "session", True])
+        self.assertEqual(calls, ["counts", "mm", "session", "beam", True])
 
     def test_leaves_a_request_that_was_not_aborted_attached(self):
         calls = []

@@ -71,10 +71,13 @@ def _make_scheduler():
     the retirement are only ever tested apart, and a step missing from the
     retirement passes every door test.
     """
+    beam_coordinator = MagicMock()
     sched = SimpleNamespace(
         output_streamer=MagicMock(),
-        beam_coordinator=MagicMock(),
-        request_retirer=release_only_retirer(MagicMock()),
+        beam_coordinator=beam_coordinator,
+        request_retirer=release_only_retirer(
+            MagicMock(), beam_coordinator=beam_coordinator
+        ),
     )
     sched.retire_unadmitted_request = MagicMock(
         side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
