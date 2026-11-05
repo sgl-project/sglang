@@ -506,6 +506,9 @@ class MultiTokenizerRouter:
                     await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
+            if isinstance(recv_obj, FreezeGCReq):
+                freeze_gc("Tokenizer Router", recv_obj.gc_threshold)
+
             await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
@@ -572,10 +575,11 @@ class MultiDetokenizerRouter:
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
 
+            if isinstance(recv_obj, FreezeGCReq):
+                freeze_gc("Detokenizer Router", recv_obj.gc_threshold)
+
             # Control messages must reach every detokenizer process.
             if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
-                if isinstance(recv_obj, FreezeGCReq):
-                    freeze_gc("Detokenizer Router", recv_obj.gc_threshold)
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
                 continue
