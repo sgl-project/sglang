@@ -293,6 +293,10 @@ class TopKConfig:
     _correction_bias_cache_key: Optional[Tuple] = field(
         default=None, init=False, repr=False, compare=False
     )
+    # (layout key, weights, ids) owned by aiter_topk.py; lives as long as the layer.
+    aiter_shared_columns: Optional[Tuple[Tuple, torch.Tensor, torch.Tensor]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def num_shared_topk_slots(self) -> int:

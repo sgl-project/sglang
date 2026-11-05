@@ -7,9 +7,12 @@ writes routed columns into a persistent buffer with pre-filled shared columns.
 GPU runner.
 """
 
+import gc
+import itertools
 import sys
 import types
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
@@ -25,7 +28,6 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.runtime_context import (
     get_context,
     get_flags,
-    get_resources,
     get_schedule,
     reset_context,
 )
@@ -37,14 +39,6 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: only ROCm runs the real AITER kernel through the strided
 # shared-column buffer, including CUDA-graph replay.
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
-
-
-def _shared_column_buffers():
-    return {
-        name: buf
-        for name, buf in get_resources().buffers.items()
-        if name.startswith("aiter_topk_shared_columns:")
-    }
 
 
 def _publish(test):
@@ -281,6 +275,12 @@ class TestAiterSharedColumnsContract(CustomTestCase):
     def test_ineligible_configs_fall_back_without_touching_aiter(self):
         """Every guard in the eligibility predicate returns None, allocates no
         buffer, and never reaches the kernel."""
+        configs = []
+
+        def fuse(config, **kwargs):
+            configs.append(config)
+            return self._fuse(config, **kwargs)
+
         config_cases = {
             "not_grouped_topk": {"use_grouped_topk": False},
             "no_correction_bias": {"correction_bias": None},
@@ -291,7 +291,7 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         }
         for name, overrides in config_cases.items():
             with self.subTest(case=name):
-                self.assertIsNone(self._fuse(self._config(**overrides)))
+                self.assertIsNone(fuse(self._config(**overrides)))
 
         call_cases = {
             "padded_tokens": {
@@ -301,15 +301,15 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         }
         for name, kwargs in call_cases.items():
             with self.subTest(case=name):
-                self.assertIsNone(self._fuse(self._config(), **kwargs))
+                self.assertIsNone(fuse(self._config(), **kwargs))
 
         with self.subTest(case="expert_parallel"):
             with get_context().override_server_args(tp_size=2, ep_size=2):
-                self.assertIsNone(self._fuse(self._config()))
+                self.assertIsNone(fuse(self._config()))
 
         with self.subTest(case="per_rank_shared_slots"):
             with get_flags().moe.override(a2a_backend=MoeA2ABackend.DEEPEP):
-                self.assertIsNone(self._fuse(self._config()))
+                self.assertIsNone(fuse(self._config()))
 
         for setting in (
             envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
@@ -317,27 +317,36 @@ class TestAiterSharedColumnsContract(CustomTestCase):
             envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK,
         ):
             with self.subTest(case=setting.name), setting.override(True):
-                self.assertIsNone(self._fuse(self._config()))
+                self.assertIsNone(fuse(self._config()))
 
         with self.subTest(case="radix4_covers_the_shape"):
             with (
                 envs.SGLANG_K3_RADIX4_TOPK.override(True),
                 patch.object(moe_route_radix4, "available", return_value=True),
                 patch.object(moe_route_radix4, "covered", return_value=True),
+                patch.object(
+                    topk_module,
+                    "aiter_grouped_topk_route_inputs",
+                    wraps=topk_module.aiter_grouped_topk_route_inputs,
+                ) as convert,
             ):
-                self.assertIsNone(self._fuse(self._config()))
+                self.assertIsNone(fuse(self._config()))
+                # Coverage is decided before the logits are cast for routing.
+                convert.assert_not_called()
 
         with self.subTest(case="torch_native"):
             config = self._config()
             config.torch_native = True
-            self.assertIsNone(self._fuse(config))
+            self.assertIsNone(fuse(config))
 
         with self.subTest(case="config_unpublished"):
             reset_context()
-            self.assertIsNone(self._fuse(self._config()))
+            self.assertIsNone(fuse(self._config()))
 
         self.assertEqual(self.fake_kernel.calls, [])
-        self.assertEqual(_shared_column_buffers(), {})
+        self.assertEqual(
+            [c.aiter_shared_columns for c in configs], [None] * len(configs)
+        )
 
     def test_radix4_env_keeps_the_fusion_for_shapes_radix4_does_not_cover(self):
         """SGLANG_K3_RADIX4_TOPK routes only Kimi-K3 shapes; other configs route
@@ -392,7 +401,6 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         self.assertNotEqual(
             first.topk_weights.data_ptr(), third.topk_weights.data_ptr()
         )
-        self.assertEqual(len(_shared_column_buffers()), 2)
 
         # The larger batch reuses the same buffer, so the shared columns of the
         # rows it newly exposes must still hold the prefilled values.
@@ -401,15 +409,67 @@ class TestAiterSharedColumnsContract(CustomTestCase):
             torch.all(second.topk_ids[:, self.TOPK_ROUTED :] == self.NUM_EXPERTS)
         )
 
+    def test_buffer_is_released_with_its_config(self):
+        """A buffer lives as long as its routing config, so dropping a model
+        (reload, teardown) frees its layers' buffers."""
+        config = self._config()
+        output = self._fuse(config)
+        buffers = [
+            weakref.ref(output.topk_ids._base),
+            weakref.ref(output.topk_weights._base),
+        ]
+        del config, output
+        gc.collect()
+        self.assertEqual([ref() for ref in buffers], [None, None])
+
+    def test_radix4_coverage_matches_the_cast_logits(self):
+        """The fusion checks radix4 coverage before casting the logits; it must
+        agree with the ordinary path, which checks the logits after the cast."""
+        device = get_device()
+        num_experts, topk = 896, 16
+
+        def randn(*shape, dtype):
+            return torch.randn(shape, dtype=dtype, device=device)
+
+        layouts = {
+            "contiguous": lambda dtype: randn(37, num_experts, dtype=dtype),
+            "row_strided": lambda dtype: randn(37, 1024, dtype=dtype)[:, :num_experts],
+            "column_major": lambda dtype: randn(num_experts, 37, dtype=dtype).t(),
+            "too_many_tokens": lambda dtype: randn(1025, num_experts, dtype=dtype),
+        }
+        decisions = set()
+        with (
+            envs.SGLANG_K3_RADIX4_TOPK.override(True),
+            patch.object(moe_route_radix4, "available", return_value=True),
+        ):
+            for (name, make), dtype, fp32_bias in itertools.product(
+                layouts.items(), (torch.bfloat16, torch.float16), (True, False)
+            ):
+                with self.subTest(layout=name, dtype=dtype, fp32_bias=fp32_bias):
+                    logits = make(dtype)
+                    bias = randn(
+                        num_experts, dtype=torch.float32 if fp32_bias else dtype
+                    )
+                    route_inputs = topk_module.aiter_grouped_topk_route_inputs(
+                        logits, bias
+                    )
+                    expected = moe_route_radix4.covered(*route_inputs, topk, 1, 1)
+                    actual = aiter_topk._radix4_routes(
+                        logits, bias, routed_k=topk, num_expert_group=1, topk_group=1
+                    )
+                    self.assertEqual(actual, expected)
+                    decisions.add(expected)
+        self.assertEqual(decisions, {True, False})
+
     def test_buffer_height_tracks_the_prefill_budget(self):
-        """Height is the larger prefill budget, floored at 8192 and capped; a
-        batch taller than the buffer falls back."""
+        """Height is the larger prefill budget, floored at 8192 and capped; with
+        no budget it is the floor. A batch taller than the buffer falls back."""
         cap = aiter_topk._MAX_BUFFER_TOKENS
         cases = [
             # (chunked_prefill_size, max_prefill_tokens, expected height)
             (16384, 32768, 32768),
             (2048, 0, 8192),
-            (-1, 0, cap),  # chunked prefill disabled, no prefill budget
+            (-1, 0, 8192),  # chunked prefill disabled, no prefill budget
             (cap * 4, cap * 4, cap),
         ]
         for chunked, max_prefill, height in cases:
@@ -419,9 +479,9 @@ class TestAiterSharedColumnsContract(CustomTestCase):
                     chunked_prefill_size=chunked, max_prefill_tokens=max_prefill
                 ),
             ):
-                get_resources().buffers.clear()
-                self.assertIsNotNone(self._fuse(self._config(), num_tokens=1))
-                ((weights, ids),) = _shared_column_buffers().values()
+                config = self._config()
+                self.assertIsNotNone(self._fuse(config, num_tokens=1))
+                _, weights, ids = config.aiter_shared_columns
                 self.assertEqual(weights.shape[0], height)
                 self.assertEqual(ids.shape[0], height)
 
@@ -429,6 +489,35 @@ class TestAiterSharedColumnsContract(CustomTestCase):
             config = self._config()
             self.assertIsNotNone(self._fuse(config, num_tokens=8192))
             self.assertIsNone(self._fuse(config, num_tokens=8193))
+
+    def test_two_batch_overlap_keeps_each_micro_batch_routing(self):
+        """Two-batch overlap routes one micro-batch through a layer before the
+        other micro-batch's experts read its routing; neither may overwrite the other."""
+        config = self._config()
+        hidden_a, logits_a = self._inputs(37)
+        hidden_b, logits_b = self._inputs(37)
+
+        def ordinary_route(*, gating_output, correction_bias, topk, **_):
+            scores = gating_output.float() + correction_bias.float()
+            weights, ids = torch.topk(scores, topk, dim=-1)
+            return weights, ids.to(torch.int32)
+
+        with (
+            patch.object(topk_module, "_is_hip", True),
+            patch.object(topk_module, "_use_aiter", True),
+            patch.object(
+                topk_module, "biased_grouped_topk", side_effect=ordinary_route
+            ),
+            get_flags().moe.override(tbo_enabled=True),
+        ):
+            first = topk_module.select_experts(hidden_a, logits_a, config)
+            first_ids = first.topk_ids.clone()
+            first_weights = first.topk_weights.clone()
+            second = topk_module.select_experts(hidden_b, logits_b, config)
+
+        self.assertFalse(torch.equal(second.topk_ids, first_ids))
+        self.assertTrue(torch.equal(first.topk_ids, first_ids))
+        self.assertTrue(torch.equal(first.topk_weights, first_weights))
 
     def test_graph_capture_before_first_call_keeps_append_path(self):
         """A capture that would allocate the buffer falls back instead, and the
@@ -441,11 +530,11 @@ class TestAiterSharedColumnsContract(CustomTestCase):
                 hidden_states, router_logits, config
             )
         self.assertIsNone(captured)
-        self.assertEqual(_shared_column_buffers(), {})
+        self.assertIsNone(config.aiter_shared_columns)
         self.assertIsNotNone(
             aiter_topk.try_select_experts(hidden_states, router_logits, config)
         )
-        self.assertEqual(len(_shared_column_buffers()), 1)
+        self.assertIsNotNone(config.aiter_shared_columns)
 
     def test_select_experts_prefers_the_fusion_on_aiter_builds(self):
         """``select_experts`` returns the fused output when the fusion applies,
