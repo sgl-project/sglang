@@ -99,8 +99,12 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
                 and cfg.moe_dp_size == 1
             ):
                 return False
+        # Pipeline stages exchange CP-local rows (see execute_prefill_cp_bcg);
+        # only Kimi-K3.1 replays them so far.
+        is_kimi_k31 = "KimiK31ForConditionalGeneration" in architectures
         return (
             cfg.dp_size == 1
+            and (cfg.pp_size == 1 or is_kimi_k31)
             and view.attn_cp_size > 1
             and any(
                 arch in architectures
