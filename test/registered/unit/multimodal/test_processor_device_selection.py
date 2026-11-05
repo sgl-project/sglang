@@ -116,6 +116,175 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 )
 
 
+class TestForceCpuImagePreprocessing(CustomTestCase):
+    """SGLANG_FORCE_CPU_IMAGE_PREPROCESSING keeps image decode and the fast
+    image processor off the GPU, so tokenizer workers open no CUDA context."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _force(self, on):
+        from sglang.srt.environ import envs
+
+        return envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(on)
+
+    def _cuda(self, nvidia=True):
+        """A CUDA-like platform: NVIDIA CUDA, or ROCm (``nvidia=False``)."""
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: True,
+                is_cuda=lambda: nvidia,
+                device_type="cuda",
+            )
+        )
+        return patch.multiple(
+            BASE,
+            platforms=platforms,
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+        )
+
+    def _with_fast_processor(self, **fields):
+        from transformers import BaseImageProcessor
+
+        processor = _make(base_gpu_id=3, **fields)
+        processor.disable_fast_image_processor = False
+        processor._processor = SimpleNamespace(image_processor=BaseImageProcessor())
+        return processor
+
+    def _construct(self, cls=None, tokenizer_worker_num=1, _processor=None):
+        from unittest.mock import MagicMock
+
+        cls = cls or _StubProcessor
+        server_args = ServerArgs(
+            model_path="dummy",
+            tokenizer_worker_num=tokenizer_worker_num,
+            mm_process_config={},
+        )
+        publish(server_args, role="tokenizer")
+        with patch.object(cls, "__abstractmethods__", set()):
+            processor = cls(
+                hf_config=MagicMock(),
+                server_args=server_args,
+                _processor=_processor if _processor is not None else MagicMock(),
+                transport_mode=None,
+            )
+        self.addCleanup(processor.shutdown)
+        return processor
+
+    def test_fast_processor_runs_on_the_cpu(self):
+        # An explicit "cpu", not None: the processor would follow its input.
+        processor = self._with_fast_processor()
+        with self._cuda():
+            with self._force(False):
+                default = processor._fast_image_processor_device(_Processor())
+            with self._force(True):
+                forced = processor._fast_image_processor_device(_Processor())
+        self.assertEqual(default, "cuda:3")
+        self.assertEqual(forced, "cpu")
+
+    def test_cpu_preprocessing_does_not_compete_with_the_scheduler(self):
+        processor = self._with_fast_processor()
+        with self._cuda():
+            with self._force(False):
+                default = processor._preprocessing_competes_with_the_scheduler()
+            with self._force(True):
+                forced = processor._preprocessing_competes_with_the_scheduler()
+        self.assertTrue(default)
+        self.assertFalse(forced)
+
+    def test_instance_decodes_on_the_cpu(self):
+        with self._cuda():
+            with self._force(False):
+                default = self._construct().gpu_image_decode
+            with self._force(True):
+                forced = self._construct().gpu_image_decode
+        self.assertTrue(default)
+        self.assertFalse(forced)
+        self.assertTrue(_StubProcessor.gpu_image_decode)  # class left alone
+
+    def test_loader_skips_nvjpeg(self):
+        from sglang.srt.multimodal.modality import Modality
+
+        class _FancyDecode(_StubProcessor):
+            gpu_image_decode = "nvjpeg_fancy"
+
+        class _CpuDecode(_StubProcessor):
+            gpu_image_decode = False
+
+        image = SimpleNamespace(mode="RGB", load=lambda: None)
+        calls = {}
+        for force in (False, True):
+            with (
+                self._cuda(),
+                self._force(force),
+                patch(f"{BASE}.load_image", return_value=(image, None)) as load,
+            ):
+                for cls in (_StubProcessor, _FancyDecode, _CpuDecode):
+                    cls._load_single_item(b"jpeg", Modality.IMAGE)
+            calls[force] = [c.args[1] for c in load.call_args_list]
+        self.assertEqual(calls[False], [True, "nvjpeg_fancy", False])
+        self.assertEqual(calls[True], [False, False, False])
+
+    def test_warns_only_when_several_workers_use_the_gpu(self):
+        from transformers import BaseImageProcessor
+
+        class _CpuDecode(_StubProcessor):
+            gpu_image_decode = False
+
+        fast = SimpleNamespace(image_processor=BaseImageProcessor(), tokenizer=None)
+
+        def warnings(force, workers, cls=None, _processor=None):
+            with (
+                self._cuda(),
+                self._force(force),
+                patch(f"{BASE}.logger.warning") as warning,
+            ):
+                self._construct(cls, workers, _processor)
+            return [c.args[0] % c.args[1:] for c in warning.call_args_list]
+
+        decode_only = warnings(False, 8)
+        self.assertEqual(len(decode_only), 1)
+        self.assertIn("8 tokenizer workers each decode JPEG images on", decode_only[0])
+        self.assertNotIn("fast image processor", decode_only[0])
+        self.assertIn("SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1", decode_only[0])
+        fast_only = warnings(False, 8, _CpuDecode, fast)
+        self.assertEqual(len(fast_only), 1)
+        self.assertIn("each run the fast image processor on", fast_only[0])
+        self.assertEqual(warnings(True, 8), [])
+        self.assertEqual(warnings(False, 1), [])
+        with (
+            self._cuda(nvidia=False),
+            self._force(False),
+            patch(f"{BASE}.logger.warning") as warning,
+        ):
+            self._construct(tokenizer_worker_num=8)
+            self._construct(_CpuDecode, 8, fast)
+        self.assertFalse(warning.called)
+
+    def test_other_platforms_keep_their_placement(self):
+        """Honored on NVIDIA CUDA only; e.g. ROCm keeps the device path."""
+        from sglang.srt.multimodal.modality import Modality
+
+        processor = self._with_fast_processor()
+        image = SimpleNamespace(mode="RGB", load=lambda: None)
+        with (
+            self._cuda(nvidia=False),
+            self._force(True),
+            patch(f"{BASE}.load_image", return_value=(image, None)) as load,
+        ):
+            device = processor._fast_image_processor_device(_Processor())
+            competes = processor._preprocessing_competes_with_the_scheduler()
+            decode = self._construct().gpu_image_decode
+            _StubProcessor._load_single_item(b"jpeg", Modality.IMAGE)
+        self.assertEqual(device, "cuda:3")
+        self.assertTrue(competes)
+        self.assertTrue(decode)
+        self.assertEqual(load.call_args.args[1], True)
+
+
 class TestFastImageProcessorMemoryPool(CustomTestCase):
     def setUp(self):
         reset_context()

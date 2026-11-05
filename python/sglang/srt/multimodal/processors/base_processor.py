@@ -63,6 +63,19 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 
+def _force_cpu_image_preprocessing() -> bool:
+    """SGLANG_FORCE_CPU_IMAGE_PREPROCESSING, as this module applies it.
+
+    Honored here on NVIDIA CUDA only, the platform it was validated on; other
+    platforms keep their placement. Kimi-K2.5 and diffusion read the variable
+    themselves, on every platform.
+    """
+    return (
+        envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+        and platforms.current_platform.is_cuda()
+    )
+
+
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
     # input_text with all multimodality placeholder token expanded
@@ -298,6 +311,11 @@ class BaseMultimodalProcessor(ABC):
         if get_mm().disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
+        if _force_cpu_image_preprocessing():
+            # Decode on the CPU too: nvJPEG would still put every tokenizer
+            # worker on the GPU. `_load_single_item` (a classmethod) reads the
+            # variable itself; this keeps the instance and its cache keys honest.
+            self.gpu_image_decode = False
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = get_mm().mm_process_config
@@ -340,6 +358,7 @@ class BaseMultimodalProcessor(ABC):
             )
 
         self._tokenizer = _tokenizer_of(self._processor)
+        self._warn_if_tokenizer_workers_share_the_gpu()
 
         # Same guard as in serving_chat.py against double BOS.
         try:
@@ -759,6 +778,40 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _warn_if_tokenizer_workers_share_the_gpu(self) -> None:
+        """Point at SGLANG_FORCE_CPU_IMAGE_PREPROCESSING when it is likely needed.
+
+        Each tokenizer worker that decodes JPEGs with nvJPEG or runs the fast
+        image processor on the accelerator opens its own device context next to
+        the scheduler's memory pool; with many workers that can exhaust device
+        memory. Placement is left unchanged; this only warns.
+        """
+        workers = get_serving().tokenizer_worker_num
+        if workers <= 1 or not platforms.current_platform.is_cuda():
+            return
+        if _force_cpu_image_preprocessing():
+            return
+        decode_on_gpu = bool(self.gpu_image_decode)
+        fast_on_gpu = self._preprocessing_competes_with_the_scheduler()
+        if not (decode_on_gpu or fast_on_gpu):
+            return
+        on_gpu = " and ".join(
+            part
+            for part, on in (
+                ("decode JPEG images", decode_on_gpu),
+                ("run the fast image processor", fast_on_gpu),
+            )
+            if on
+        )
+        logger.warning(
+            "%d tokenizer workers each %s on the GPU, so each opens its own device "
+            "context next to the model. If image requests fail with out of "
+            "memory, set SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1 to decode and "
+            "preprocess images on the CPU.",
+            workers,
+            on_gpu,
+        )
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         """Whether image preprocessing contends with the serving accelerator.
 
@@ -768,7 +821,7 @@ class BaseMultimodalProcessor(ABC):
         """
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
-        if self.disable_fast_image_processor:
+        if self.disable_fast_image_processor or _force_cpu_image_preprocessing():
             return False
         image_processor = getattr(self._processor, "image_processor", None)
         if not isinstance(image_processor, BaseImageProcessor):
@@ -807,7 +860,13 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+        if (
+            _is_cpu
+            or get_exec().deterministic.rl_on_policy_target is not None
+            or _force_cpu_image_preprocessing()
+        ):
+            # An explicit "cpu": left unset, the processor would follow an
+            # input tensor's device.
             return "cpu"
         if _is_xpu:
             return "xpu"
@@ -1030,7 +1089,11 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                # Not `x and not env`: that would turn "nvjpeg_fancy" into True.
+                gpu_image_decode = (
+                    False if _force_cpu_image_preprocessing() else cls.gpu_image_decode
+                )
+                img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
