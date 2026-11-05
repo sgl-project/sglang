@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from array import array
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -1832,6 +1832,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 (swa_indices > 0).all(),
                 f"unmapped {component.pool_name} window positions for request {req.rid}",
             )
+            if self.token_to_kv_pool_allocator.hands_out_virtual_ids:
+                # The unified pool's window rows go by the owner's ids; the
+                # copy translates them when it is submitted.
+                swa_indices = window_indices
             component_transfers[component.component_type] = [
                 PoolTransfer(
                     name=component.pool_name,
@@ -1929,12 +1933,23 @@ class UnifiedRadixCache(BasePrefixCache):
         # the scheduler on it: the forward is ordered behind this stream.
         device_module.current_stream().wait_event(req.kv.restore_done_event)
 
-    def start_restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
+    def start_restore_kv_cache(
+        self,
+        req: Req,
+        backup: RetractionBackup,
+        *,
+        copy_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         """Start copying ``backup`` into ``req``'s row without ordering later
         work after the copy; the row may be read once ``req.kv.restore_done_event``
         has completed. Page moves and frees wait for the copy as for a HiCache
         load; the host slots stay reserved until finish_restore_kv_cache, or
-        freeing the row (free_kv_row), returns them after the copy."""
+        freeing the row (free_kv_row), returns them after the copy.
+
+        The copy's ids are built, and the copy is recorded, on the current
+        stream, the one page moves read the record on. With ``copy_stream``,
+        only the copy, its index preparation included, runs there, ordered
+        after the current stream's work so far."""
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1972,14 +1987,21 @@ class UnifiedRadixCache(BasePrefixCache):
         load_host, load_device, load_pools = self.cache_controller._move_op_indices(
             operation
         )
-        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
-            self.cache_controller._l2_load_transfers(
-                load_host, load_device, load_pools
-            ),
-            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
+        transfers = self.cache_controller._l2_load_transfers(
+            load_host, load_device, load_pools
         )
-        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
-            (id(self), "restore"), completion.finish_event
+        engine = self.cache_controller.l2_transfer_engine
+        with ExitStack() as placement:
+            if copy_stream is not None:
+                copy_stream.wait_stream(device_module.current_stream())
+                placement.enter_context(device_module.stream(copy_stream))
+                placement.enter_context(engine.on_current_stream())
+            completion = engine.submit_host_to_device(
+                transfers,
+                transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
+            )
+        self.kv_storage().record_host_transfer(
+            completion.finish_event, transfers, writes=True
         )
         req.kv.restore_done_event = completion.finish_event
         self._pending_restore_backups.append((completion.finish_event, backup))
@@ -2277,6 +2299,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_indices, kv_xfer, comp_xfers
             )
         )
+        self.name_loaded_window_rows_by_owner(aux_xfers)
 
         receipt = _OngoingLoadBack(
             node_id,
@@ -2295,6 +2318,32 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_load_back[node_id] = receipt
 
         return True
+
+    def name_loaded_window_rows_by_owner(self, transfers) -> None:
+        """A queued host load reserved window rows and the tree has bound them
+        to owner ids: from now on its transfer names them by those ids, which
+        the copy translates at submission, after any page move."""
+        if not self.token_to_kv_pool_allocator.hands_out_virtual_ids:
+            return
+        windows = {
+            component.pool_name: component
+            for component in self._components_tuple
+            if component.slot.family == TREE_WINDOW
+        }
+        for transfer in transfers or ():
+            component = windows.get(transfer.name)
+            if (
+                component is None
+                or transfer.indices_from_pool is not None
+                or transfer.device_indices is None
+                or transfer.device_indices.numel() == 0
+            ):
+                continue
+            storage, sub_pool = component.storage_and_sub_pool()
+            transfer.device_indices = storage.owner_ids_of_window_rows(
+                sub_pool, transfer.device_indices
+            )
+            storage.end_load_reservation(sub_pool)
 
     def _build_sidecar_transfers(
         self,

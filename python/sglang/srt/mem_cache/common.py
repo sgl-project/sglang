@@ -320,15 +320,21 @@ def restore_kv_cache(
     req.kv.retraction_backup = None
 
 
-def start_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+def start_restore_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, copy_stream=None
+) -> None:
     """``restore_kv_cache`` from the host pool without ordering later work after
-    the copy: ``req`` may run once ``req.kv.restore_done_event`` has completed."""
+    the copy: ``req`` may run once ``req.kv.restore_done_event`` has completed.
+    The copy alone runs on ``copy_stream`` when given (see
+    `UnifiedRadixCache.start_restore_kv_cache`)."""
     if req.seqlen <= 1:
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.start_restore_kv_cache(req, req.kv.retraction_backup)
+    unified_cache.start_restore_kv_cache(
+        req, req.kv.retraction_backup, copy_stream=copy_stream
+    )
     req.kv.retraction_backup = None
 
 
@@ -389,9 +395,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     tree_cache.on_release(req, checkpointed=checkpoint)
 
     kv_storage_of(
-        tree_cache.req_to_token_pool,
-        tree_cache.token_to_kv_pool_allocator,
-        tree_cache=tree_cache,
+        tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
     ).release_row(req)
     req.kv.mark_kv_released()
 

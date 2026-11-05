@@ -79,7 +79,7 @@ def _storage():
         need_sort=False,
         max_num_reqs=4,
         model_context_len=_CONTEXT,
-        lazy_compaction=False,
+        lazy_compaction=True,
     )
     return build_kv_storage(plan, sized, ctx)
 

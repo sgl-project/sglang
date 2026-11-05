@@ -46,11 +46,16 @@ class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     num_virtual_pages: int
     low_page: int = 0  # float only
     high_page: int = 0  # float only
+    # Pages ``[first, end)`` holding every page that cannot move (a load
+    # reservation); the band's extent must keep covering them. None when there
+    # is none.
+    fixed: Optional[Tuple[int, int]] = None
 
     @property
     def transparent(self) -> bool:
-        """An empty float: its neighbours' frontier walks see through it."""
-        return self.grow == "float" and self.live == 0
+        """An empty float, none of its pages fixed: its neighbours' frontier
+        walks see through it. A fixed page keeps a float's span over it."""
+        return self.grow == "float" and self.live == 0 and self.fixed is None
 
     @property
     def drains(self) -> bool:
@@ -87,7 +92,7 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
         bands = self.bands
         for i in range(self.positions[name] - 1, -1, -1):
             band = bands[i]
-            if band.live or band.grow != "float":
+            if not band.transparent:
                 return band.high_byte
         return 0
 
@@ -96,7 +101,7 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
         bands = self.bands
         for i in range(self.positions[name] + 1, len(bands)):
             band = bands[i]
-            if band.live or band.grow != "float":
+            if not band.transparent:
                 return band.low_byte
         return self.total_bytes
 
@@ -134,6 +139,7 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.ids.num_virtual_ids,
         band.low_wm_page if floats else 0,
         band.high_wm_page if floats else 0,
+        band.fixed_extent(),
     )
 
 
@@ -640,7 +646,8 @@ def reclaimed_snapshot(
 
     Unblocked ends can realize their compacted frontiers by an urgent flush.
     Pinned ends retain their spans. Partial float frees remain holes in place;
-    empty floats become transparent. No live float relocation is credited.
+    empty floats become transparent unless a page of theirs is fixed, which
+    keeps the span as holes. No live float relocation is credited.
     """
     bands = []
     for b in snapshot.bands:
@@ -650,7 +657,10 @@ def reclaimed_snapshot(
         live = b.live - reclaimed
         low, high, span = b.low_byte, b.high_byte, b.span
         holes = b.holes + reclaimed
-        if empty_pool or (not live and (b.grow == "float" or not b.blocked)):
+        empties = (
+            b.fixed is None if b.grow == "float" else not b.blocked
+        )  # a float's fixed page keeps its span, as an end's does
+        if empty_pool or (not live and empties):
             span = holes = 0
             low = high = (
                 b.num_pages if b.grow == "down" else b.min_page
@@ -674,6 +684,8 @@ def reclaimed_snapshot(
                     if empty_pool
                     else b.free_virtual_pages + reclaimed
                 ),
+                # An empty pool's floats hold nothing to keep in place.
+                fixed=None if empty_pool and b.grow == "float" else b.fixed,
             )
         )
     return msgspec.structs.replace(snapshot, bands=tuple(bands))

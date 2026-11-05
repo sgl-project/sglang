@@ -54,6 +54,7 @@ from sglang.srt.observability.trace import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -349,6 +350,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        kv_storage: Optional[KVStorage] = None,
     ):
         startup_storage_backend = storage_backend
         self.is_kv_sharded = isinstance(
@@ -378,6 +380,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            kv_storage=kv_storage,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.

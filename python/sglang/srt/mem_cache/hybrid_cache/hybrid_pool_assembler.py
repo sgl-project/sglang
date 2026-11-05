@@ -282,6 +282,7 @@ def _build_cache_controller(
     model_name: Optional[str],
     storage_backend_extra_config: Optional[dict],
     enable_storage_metrics: bool,
+    kv_storage=None,
 ) -> HybridCacheController:
     memory = get_memory()
     return HybridCacheController(
@@ -302,6 +303,7 @@ def _build_cache_controller(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=memory.hicache_host_memory_mode,
+        kv_storage=kv_storage,
     )
 
 
@@ -1477,6 +1479,7 @@ def build_unified_host_stack(
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         enable_storage_metrics=enable_storage_metrics,
+        kv_storage=storage,
     )
     return StackBuildResult(
         host_pool_group=host_pool_group,

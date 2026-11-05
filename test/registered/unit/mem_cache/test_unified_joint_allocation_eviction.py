@@ -80,7 +80,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertFalse(allocator.verify_byte_accounting())
 
     def test_joint_reclaim_stops_after_actual_cascade(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for page_size in (1, 4, 16):
                 for demand, first in ((3, 0), (4, 1), (6, 3), (90, 87)):
                     with self.subTest(lazy=lazy, page_size=page_size, demand=demand):
@@ -95,7 +95,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                         self.check_prefixes(allocator, cache, records, range(first, 96))
 
     def test_impossible_byte_demand_preserves_cache(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 allocator, cache = self.build_cache(lazy=lazy)
                 records = self.mark_prefixes(allocator, cache, 96)
@@ -106,7 +106,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 self.check_prefixes(allocator, cache, records, range(96))
 
     def test_pending_groups_reclaim_without_prefix_eviction(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for mode, page_size in (("ordinary", 1), ("representatives", 4)):
                 with self.subTest(lazy=lazy, mode=mode):
                     allocator, cache = self.build_cache(
@@ -160,7 +160,10 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 method = cache.evict_for_alloc if allocation else cache.evict
                 result = method(EvictParams(num_tokens=2))
                 # Allocation targets availability: a cascaded SWA free also
-                # increases the FULL band's shared-arena borrowing capacity.
+                # increases the FULL band's shared-arena borrowing capacity,
+                # once the freed SWA bytes are compacted away.
+                for band in allocator.members:
+                    band.flush_for_allocation()
                 expected = 1 if allocation else 2
                 self.assertEqual(result.num_tokens_evicted, expected)
                 self.assertGreaterEqual(
@@ -243,7 +246,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 )
 
     def test_pending_full_only_reclaim_is_needed_before_walk(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 allocator, cache = self.build_cache(occupancy=94, lazy=lazy)
                 records = self.mark_prefixes(allocator, cache, 94)

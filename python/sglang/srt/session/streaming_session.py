@@ -257,9 +257,7 @@ class StreamingSession:
         if slot.kv.holds_kv:
             self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
             kv_storage_of(
-                self.cache.req_to_token_pool,
-                self.cache.token_to_kv_pool_allocator,
-                tree_cache=self.cache,
+                self.cache.req_to_token_pool, self.cache.token_to_kv_pool_allocator
             ).release_row(slot)
 
         self._free_slot_mamba(slot)

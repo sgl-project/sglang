@@ -502,9 +502,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         allocator = params.token_to_kv_pool_allocator
         if allocator is not None and TREE_WINDOW in families:
             if allocator.hands_out_virtual_ids:
-                self._swa_backup_index_mapper = (
-                    allocator.translate_swa_indices_for_transfer
-                )
+                # Window rows go by the owner's ids: the copy translates them
+                # when it is submitted, after any page move.
+                self._swa_backup_index_mapper = lambda ids: ids
         self.is_eagle = params.is_eagle and TREE_STATE not in families
 
         # The cache owns allocation; keep its allocator for resolving current

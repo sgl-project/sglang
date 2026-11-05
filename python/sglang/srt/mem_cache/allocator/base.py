@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Protocol, Tuple
 
 import torch
 
@@ -50,9 +50,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     state: Optional[StateStorage] = None
     # A unified pool's sub-pools as host and peer transfers read them.
     storage: Optional[KVStorage] = None
-    # A static pool's window: the tail a running request keeps of it, by the
-    # window pool's name, bound once at startup (`StaticKVStorage`).
-    window_retention: Optional[Dict[str, int]] = None
 
     @property
     def state_slots(self):
@@ -303,10 +300,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError()
-
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        """Record an asynchronous HiCache transfer completion event if needed."""
-        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")
