@@ -57,19 +57,22 @@ class AttnBank:
 
 def _bank_rows(bank: AttnResidual, hidden_states) -> Optional[slice]:
     """The bank rows that go with ``hidden_states``: all of them, or this
-    rank's contiguous attention-TP shard of them, the rows a reduce-scatter
-    over attention TP leaves it."""
+    rank's contiguous attention-TP shard of them (row_shard: the last ranks'
+    shards may be short or empty), the rows a reduce-scatter over attention
+    TP leaves it."""
+    from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import row_shard
+
     total, rows = bank.block_residual.shape[0], hidden_states.shape[0]
     if rows == total:
         return None
     parallel = get_parallel()
-    if rows * parallel.attn_tp_size != total:
+    start, valid = row_shard(total, parallel.attn_tp_size, parallel.attn_tp_rank)
+    if rows != valid:
         raise RuntimeError(
             f"{rows} rows are neither the bank's {total} rows nor an "
             f"attention-TP shard of them over {parallel.attn_tp_size} ranks"
         )
-    rank = parallel.attn_tp_rank
-    return slice(rank * rows, (rank + 1) * rows)
+    return slice(start, start + valid)
 
 
 @dataclass
@@ -105,6 +108,14 @@ class AttnBankState:
     # it, leaving the written residual on the shard for an FFN that consumes
     # it there (K3's row-sharded MoE tail on gfx950), or None.
     ffn_row_shards: Optional[Callable[[int], bool]] = None
+    # With ffn_row_shards: the FFN's own work on this rank's normed rows and the
+    # gather of what it needs, in place of gathering the normed input. Takes the
+    # padded rows and the token count; False leaves the gather to the read.
+    ffn_shard_front: Optional[Callable[[torch.Tensor, int], bool]] = None
+    # With ffn_row_shards: the attention output's complete sum on this rank's
+    # padded rows when the attention produced it there, else None (the read
+    # reduce-scatters its TP-partial output).
+    ffn_attn_rows: Optional[Callable[[int], Optional[torch.Tensor]]] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -137,6 +148,15 @@ class AttnBankState:
             score_norm=self.attn_score_norm,
             write=self.writes_block,
         )
+        total = self.bank.require().block_residual.shape[0]
+        if normed.shape[0] != total and not self.reads_slices:
+            # a stream the MoE tail left on row shards: read here, gather the
+            # attention input; the residual stays on the shard
+            from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
+                gather_row_shards,
+            )
+
+            normed = gather_row_shards(normed, total)
         return normed, None if self.writes_block else residual
 
     def update_and_read_ffn_input(self, contribution, residual, norm):
@@ -345,7 +365,17 @@ class AttnBankOutputRead:
         )
         if read is None:
             read = bank.forward(*read_args, self.norm, rows=rows)
-            if rows is not None:
+            if rows is not None and not self.reads_attn_tp_slices:
+                # a stream the MoE tail left on (possibly short) row shards
+                from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
+                    gather_row_shards,
+                )
+
+                read = (
+                    gather_row_shards(read[0], bank.block_residual.shape[0]),
+                    read[1],
+                )
+            elif rows is not None:
                 read = (self._gather(read[0]), read[1])
         normed, head = read
         return normed if residual is None else (normed, head)

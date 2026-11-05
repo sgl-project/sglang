@@ -24,6 +24,36 @@ def row_shard(num_tokens: int, world: int, rank: int) -> Tuple[int, int]:
     return start, max(0, min(rows, num_tokens - start))
 
 
+def gather_row_shards(rows: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """All num_tokens rows from every rank's row_shard of them (each rank's
+    shard padded to the equal all-gather width)."""
+    group = get_parallel().attn_tp_group
+    width = -(-num_tokens // group.world_size)
+    if rows.shape[0] < width:
+        rows = torch.nn.functional.pad(rows, (0, 0, 0, width - rows.shape[0]))
+    gathered = rows.new_empty(width * group.world_size, rows.shape[1])
+    group.all_gather_into_tensor(gathered, rows.contiguous())
+    return gathered[:num_tokens]
+
+
+def _padded_rows(hidden_states: torch.Tensor, rows: int) -> torch.Tensor:
+    """hidden_states padded to ``rows`` rows for an equal-shard reduce-scatter:
+    in place when its storage already extends that far (an o_proj that wrote
+    into padded rows), else a padded copy. The pad rows only reach rows past
+    the last token, which no read keeps."""
+    hidden_size = hidden_states.shape[1]
+    if hidden_states.is_contiguous() and (
+        hidden_states.untyped_storage().nbytes() // hidden_states.element_size()
+        >= hidden_states.storage_offset() + rows * hidden_size
+    ):
+        return hidden_states.as_strided(
+            (rows, hidden_size), hidden_states.stride(), hidden_states.storage_offset()
+        )
+    return torch.nn.functional.pad(
+        hidden_states, (0, 0, 0, rows - hidden_states.shape[0])
+    )
+
+
 def reduce_scatter_rows_and_read_ffn_input(
     state: "AttnBankState", hidden_states, residual, forward_batch, norm
 ):
@@ -38,21 +68,24 @@ def reduce_scatter_rows_and_read_ffn_input(
     world, rank = group.world_size, group.rank_in_group
     padded = -(-num_tokens // world) * world
     rows = padded // world
-    if padded != num_tokens:
-        hidden_states = torch.nn.functional.pad(
-            hidden_states, (0, 0, 0, padded - num_tokens)
-        )
-    reduced = hidden_states.new_empty(rows, hidden_size)
-    group.reduce_scatter_tensor(reduced, hidden_states.contiguous())
+    reduced = None if state.ffn_attn_rows is None else state.ffn_attn_rows(num_tokens)
+    if reduced is None:
+        if padded != num_tokens:
+            hidden_states = _padded_rows(hidden_states, padded)
+        reduced = hidden_states.new_empty(rows, hidden_size)
+        group.reduce_scatter_tensor(reduced, hidden_states.contiguous())
     start, valid = row_shard(num_tokens, world, rank)
     if valid == 0:
         # this rank's padded rows all lie past the last token
         normed = reduced.new_zeros(rows, hidden_size)
         written = reduced.new_zeros(rows, hidden_size)
     else:
+        if residual is not None and residual.shape[0] == num_tokens:
+            residual = residual[start : start + valid]
+        # else a row-sharded stream already left the residual on this rank's rows
         normed, written = state.bank.require().forward(
             reduced[:valid],
-            None if residual is None else residual[start : start + valid],
+            residual,
             state.ffn_score_proj,
             state.ffn_score_norm,
             norm,
@@ -62,6 +95,9 @@ def reduce_scatter_rows_and_read_ffn_input(
             pad = (0, 0, 0, rows - valid)
             normed = torch.nn.functional.pad(normed, pad)
             written = torch.nn.functional.pad(written, pad)
+    if state.ffn_shard_front is not None and state.ffn_shard_front(normed, num_tokens):
+        # the FFN keeps what it gathered; its input rows are never read
+        return normed.new_empty(1, 1).expand(num_tokens, hidden_size), written
     gathered = normed.new_empty(padded, hidden_size)
     group.all_gather_into_tensor(gathered, normed.contiguous())
     return gathered[:num_tokens], written

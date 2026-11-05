@@ -164,6 +164,7 @@ def _k3_a8w4_moe(
     out: Optional[torch.Tensor],
     block_m: int,
     seg_blocks: int,
+    a_mx: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     num_tokens, hidden = hidden_states.shape
     num_experts = w13.shape[0]
@@ -176,7 +177,7 @@ def _k3_a8w4_moe(
     sorted_ids, expert_ids, num_valid = _sort_routes(
         topk_ids, topk_weights, num_experts=num_experts, hidden=hidden, block_m=block_m
     )
-    a, a_scale = quant_mxfp8(hidden_states)
+    a, a_scale = quant_mxfp8(hidden_states) if a_mx is None else a_mx
     inter, inter_scale = _gateup(
         a,
         a_scale,
@@ -217,10 +218,12 @@ def k3_a8w4_moe(
     beta: float,
     linear_beta: float,
     out: Optional[torch.Tensor] = None,
+    a_mx: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Routed experts of one K3 MoE layer.
 
     hidden_states [T, K] bf16; topk_ids [T, topk] int32; topk_weights [T, topk] fp32;
+    a_mx: hidden_states already through quant_mxfp8 (hidden_states then only gives the shape);
     w13 [E, 2I, K/2] / w13_scale [E * 2I, K/32] in AITER's gate/up-interleaved preshuffle
     (``shuffle_weight_a16w4(w, 16, True)`` / ``shuffle_scale_a16w4(s, E, True)``);
     w2 [E, N, I/2] / w2_scale [E * N, pad8(I/32)] likewise with ``gate_up=False``.
@@ -240,4 +243,5 @@ def k3_a8w4_moe(
         out=out,
         block_m=block_m,
         seg_blocks=_DOWN_SEG_BLOCKS,
+        a_mx=a_mx,
     )
