@@ -1892,6 +1892,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {},
         )
 
+    def test_ricursive_never_resolves_to_flashinfer(self):
+        """flashinfer is the generic default on these GPUs, and its prefill runs
+        Ricursive's sliding layers with no window, silently."""
+        with override_platform(
+            is_cuda=True, is_sm100=False, is_sm90=False, has_flashinfer=True
+        ):
+            server_args = self._construct("RicursiveForCausalLM", "ricursive")
+            self.assertEqual(self._resolved(server_args, "attention_backend"), "triton")
+            with self.assertRaisesRegex(ValueError, "flashinfer"):
+                self._construct(
+                    "RicursiveForCausalLM",
+                    "ricursive",
+                    attention_backend="flashinfer",
+                )
+
+    def test_ricursive_on_policy_target_does_not_resolve_to_trtllm_mha(self):
+        """The target turns deterministic inference on after the override runs,
+        and that path rejects trtllm_mha as if the user had asked for it."""
+        with override_platform(
+            is_cuda=True, is_sm100=True, is_sm90=False, has_flashinfer=True
+        ):
+            server_args = self._construct(
+                "RicursiveForCausalLM", "ricursive", rl_on_policy_target="fsdp"
+            )
+            self.assertEqual(self._resolved(server_args, "attention_backend"), "fa4")
+
     def test_gpt_oss_mxfp4_forces_bfloat16(self):
         from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 

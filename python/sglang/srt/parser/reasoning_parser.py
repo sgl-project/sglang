@@ -1540,6 +1540,106 @@ class _FlintDetector(Qwen3Detector):
         self.reasoning_default = None
 
 
+class RippleDetector(BaseReasoningFormatDetector):
+    """Detector for Ricursive Ripple models.
+    Assumes reasoning format:
+      <think>\n{reasoning}\n</think>\n{content}
+
+    Output is reasoning only when it opens with <think>. The newlines next to the
+    tags come from the chat template, which adds them back when an assistant
+    message is sent again, so they stay out of reasoning and content.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        # The generation prompt never opens <think>, so force_reasoning does not apply.
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=False,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_default="explicit_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+        self._state = "start"  # start -> lead -> think -> after -> content
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        if self.continue_final_message:
+            return super()._detect_and_parse_impl(text)
+        if not text.startswith(self.think_start_token):
+            return StreamingParseResult(normal_text=text)
+        body = text[len(self.think_start_token) :].removeprefix("\n")
+        reasoning, end, content = body.partition(self.think_end_token)
+        if not end:
+            return StreamingParseResult(reasoning_text=reasoning)
+        return StreamingParseResult(
+            normal_text=content.removeprefix("\n"),
+            reasoning_text=reasoning.removesuffix("\n"),
+        )
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        if self.continue_final_message:
+            return super()._parse_streaming_increment_impl(new_text)
+        self._buffer += new_text
+        reasoning, normal = "", ""
+        while self._buffer:
+            buffer = self._buffer
+            if self._state == "start":
+                if buffer.startswith(self.think_start_token):
+                    self._buffer = buffer[len(self.think_start_token) :]
+                    self._state, self._in_reasoning = "lead", True
+                elif self.think_start_token.startswith(buffer):
+                    break
+                else:
+                    self._state = "content"
+            elif self._state == "lead":
+                self._buffer, self._state = buffer.removeprefix("\n"), "think"
+            elif self._state == "think":
+                end = buffer.find(self.think_end_token)
+                if end != -1:
+                    reasoning += buffer[:end].removesuffix("\n")
+                    self._buffer = buffer[end + len(self.think_end_token) :]
+                    self._state, self._in_reasoning = "after", False
+                elif not self.stream_reasoning:
+                    break
+                else:
+                    # A trailing newline may be the one before </think>.
+                    held = max(
+                        self._ends_with_partial_token(
+                            buffer, "\n" + self.think_end_token
+                        ),
+                        self._ends_with_partial_token(buffer, self.think_end_token),
+                    )
+                    reasoning += buffer[: len(buffer) - held]
+                    self._buffer = buffer[len(buffer) - held :]
+                    break
+            elif self._state == "after":
+                self._buffer, self._state = buffer.removeprefix("\n"), "content"
+            else:
+                normal += buffer
+                self._buffer = ""
+        return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
+
+    def finish(self) -> StreamingParseResult:
+        if self.continue_final_message:
+            return super().finish()
+        buffer, self._buffer = self._buffer, ""
+        if self._state not in ("lead", "think"):
+            return StreamingParseResult(normal_text=buffer)
+        if self._force_nonempty_content:
+            text, self._accumulated_reasoning = self._accumulated_reasoning + buffer, ""
+            return StreamingParseResult(normal_text=text)
+        return StreamingParseResult(reasoning_text=buffer)
+
+
 DSV4_EOS_TOKEN = "<｜end▁of▁sentence｜>"
 DSV4_THINK_START_TOKEN = "<think>"
 DSV4_THINK_END_TOKEN = "</think>"
@@ -2347,6 +2447,7 @@ class ReasoningParser:
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1ReasoningDetector,
         "flint": _FlintDetector,
+        "ripple": RippleDetector,
         "cohere_command4": CohereCommand4Detector,
         "response_template": ResponseTemplateReasoningDetector,
         "xing4_0": Xing4_0Detector,

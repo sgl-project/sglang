@@ -19,6 +19,7 @@ from sglang.srt.parser.reasoning_parser import (
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
+    RippleDetector,
 )
 from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1715,6 +1716,60 @@ class TestMuseSparkReasoningParser(CustomTestCase):
             "<|start|>assistant to=user<|message|>No tool needed.<|eot|>",
             (f"Consider {quoted}.", "No tool needed."),
         )
+
+
+class TestRippleDetector(CustomTestCase):
+    """The newlines next to the tags come from the chat template, which adds
+    them back when an assistant message is sent again."""
+
+    CASES = {
+        "<think>\nstep 1\n\nstep 2\n</think>\nThe answer.": (
+            "step 1\n\nstep 2",
+            "The answer.",
+        ),
+        "<think>\nno newline before the tag</think>\nok": (
+            "no newline before the tag",
+            "ok",
+        ),
+        "<think>\n</think>\nempty": ("", "empty"),
+        "<think>\nr\n</think>\n\n<tool_call>": ("r", "\n<tool_call>"),
+        "No reasoning, </think> and <think> are just text.": (
+            "",
+            "No reasoning, </think> and <think> are just text.",
+        ),
+        "<think>\ncut off\n": ("cut off\n", ""),
+        "<thi": ("", "<thi"),
+    }
+
+    def test_streaming_matches_one_shot_at_any_chunk_size(self):
+        for text, (reasoning, content) in self.CASES.items():
+            result = RippleDetector().detect_and_parse(text)
+            self.assertEqual(
+                (result.reasoning_text, result.normal_text), (reasoning, content)
+            )
+            for size in (1, 2, 3, 5, 8, 13, 1000):
+                detector = RippleDetector()
+                parts = [
+                    detector.parse_streaming_increment(text[i : i + size])
+                    for i in range(0, len(text), size)
+                ]
+                parts.append(detector.finish())
+                self.assertEqual(
+                    "".join(part.reasoning_text for part in parts),
+                    reasoning,
+                    (text, size),
+                )
+                self.assertEqual(
+                    "".join(part.normal_text for part in parts), content, (text, size)
+                )
+
+    def test_reasoning_held_until_the_end_tag_without_stream_reasoning(self):
+        detector = RippleDetector(stream_reasoning=False)
+        self.assertEqual(
+            detector.parse_streaming_increment("<think>\nr").reasoning_text, ""
+        )
+        result = detector.parse_streaming_increment("\n</think>\nok")
+        self.assertEqual((result.reasoning_text, result.normal_text), ("r", "ok"))
 
 
 class TestReasoningParserNames(CustomTestCase):
