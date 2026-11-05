@@ -690,27 +690,22 @@ def _dp_gather_via_all_reduce(
             start, length = _cp_shard_rows(forward_batch, cp_shard_counts)
             global_tokens[start : start + length].copy_(local_tokens[:length])
 
-    # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if world_dp_gather_enabled():
         torch.distributed.all_reduce(
             global_tokens,
             op=torch.distributed.ReduceOp.SUM,
             group=torch.distributed.group.WORLD,
         )
+    elif not local_tokens.dtype.is_floating_point:
+        # Integer rows (input ids, Engram hash ids) take the in-place NCCL path:
+        # the custom all-reduce kernels sum floating-point dtypes only.
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+        inplace_all_reduce(
+            global_tokens, group_name=get_parallel().tp_group.unique_name
+        )
     else:
-        NUM_GPUS_PER_NODE = 8
-        if (
-            not local_tokens.dtype.is_floating_point
-            and get_parallel().tp_size <= NUM_GPUS_PER_NODE
-        ):
-            from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-            inplace_all_reduce(
-                global_tokens, group_name=get_parallel().tp_group.unique_name
-            )
-
-        else:
-            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(

@@ -23,7 +23,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
+from sglang.multimodal_gen.runtime.layers.utils import (
+    get_group_rank,
+    get_group_size,
+    register_custom_op,
+)
 
 # yapf: disable
 from sglang.multimodal_gen.runtime.models.parameter import (
@@ -35,17 +39,77 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     RowvLLMParameter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER_GFX1250
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.utils import cpu_has_amx_support, use_intel_amx_backend
 
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
+USE_CPU_AMX = current_platform.is_cpu() and cpu_has_amx_support()
 _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
+# gfx1250 has no tuned hipBLASLt bf16 kernels. For FLUX.2 shapes FlyDSL's a16w16
+# runs 930-960 TFLOPS vs 650-700 for Inductor's templates and ~880 for tgemm.
+if USE_AITER_GFX1250:
+    from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16 as _flydsl_gemm
+
+    @register_custom_op(
+        op_name="flydsl_gfx1250_linear",
+        fake_impl=lambda x, weight, bias=None: x.new_empty(
+            *x.shape[:-1], weight.shape[0]
+        ),
+    )
+    def _flydsl_linear(
+        x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1])
+        m, n = x_2d.shape[0], weight.shape[0]
+        num_cus = torch.cuda.get_device_properties(x.device).multi_processor_count
+        # Measured on FLUX.2 shapes; 128-row tiles only when 256x256 underfills the CUs.
+        tile_m = 256 if -(-m // 256) * -(-n // 256) >= num_cus else 128
+        out = _flydsl_gemm(
+            x_2d,
+            weight,
+            bias=bias,
+            dtype=x.dtype,
+            tile_m=tile_m,
+            tile_n=256,
+            tile_k=64,
+            m_warp=2,
+            n_warp=4,
+            num_buffers=4,
+            variant="compute_bound",
+        )
+        return out.view(*x.shape[:-1], n)
+
+
+# Only M >= 256 was measured; below it torch.compile fuses the small GEMMs into
+# neighbours (modulation mm + SiLU). K must give the 4-stage pipeline 3+ tiles.
+_FLYDSL_MIN_M = 256
+_FLYDSL_MIN_K = 256
+
+
+def _use_flydsl_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> bool:
+    return (
+        USE_AITER_GFX1250
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == x.dtype
+        and (bias is None or bias.dtype == x.dtype)
+        and x.numel() // x.shape[-1] >= _FLYDSL_MIN_M
+        and x.shape[-1] >= _FLYDSL_MIN_K
+        and x.stride(-1) == 1
+        and weight.stride(-1) == 1
+    )
+
+
 # aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.
 _AITER_TGEMM_MAX_NUMEL = 2**31
 WEIGHT_LOADER_V2_SUPPORTED = [
@@ -179,7 +243,9 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 def apply_unquantized_linear(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply a plain linear projection with the runtime's reference semantics."""
     if x.device.type == "mps":
@@ -190,6 +256,9 @@ def apply_unquantized_linear(
             weight.to(torch.float32),
             None if bias is None else bias.to(torch.float32),
         ).to(x.dtype)
+
+    if _use_flydsl_linear(x, weight, bias):
+        return _flydsl_linear(x, weight, bias)
 
     if (
         _USE_AITER_TGEMM
@@ -206,6 +275,18 @@ def apply_unquantized_linear(
         if IS_AMP_SUPPORTED or bias is None
         else F.linear(x, weight, bias.to(x.dtype))
     )
+
+
+def apply_amx_packed_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    output = torch.ops.sgl_kernel.weight_packed_linear(
+        x.reshape(-1, x.shape[-1]).to(weight.dtype),
+        weight,
+        bias,
+        True,  # is_vnni
+    )
+    return output.view(*x.shape[:-1], -1)
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
@@ -233,9 +314,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if USE_CPU_AMX:
+            _amx_process_weight_after_loading(layer, ["weight"])
+
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            return apply_amx_packed_linear(x=x, weight=layer.weight, bias=bias)
         return apply_unquantized_linear(x, layer.weight, bias)
 
 
