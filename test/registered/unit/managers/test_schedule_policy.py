@@ -264,7 +264,7 @@ class TestSkipJoinMlfq(CustomTestCase):
         )
         queue = [long, short, turn]
         with patch.object(policy, "_compute_prefix_matches", return_value=set()):
-            policy.calc_priority(queue)
+            queue = policy.calc_priority(queue)
         self.assertEqual([r.rid for r in queue], ["short", "turn", "long"])
         self.assertEqual([r.priority for r in queue], [-1, -3, -6])
         # Nothing running: the gate is open. A level-3 request running: level 6 waits.
