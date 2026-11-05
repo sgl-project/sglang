@@ -24,8 +24,7 @@ from sglang.srt.layers.muse_spark.muse_spark_navit import (
     get_navit_video_patch_count,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.muse_spark import MuseSparkTextForCausalLM
