@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers.prefill_delayer import (
+    DEFAULT_MAX_DELAY_PASSES,
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
@@ -82,6 +83,7 @@ class TestPrefillDelayerClockSkew(CustomTestCase):
         delayer = PrefillDelayer.__new__(PrefillDelayer)
         delayer.__dict__.update(
             _max_delay_passes=100,
+            _queue_max_delay_passes=None,
             _token_usage_low_watermark=None,
             _queue_min_ratio=0.5,
             _max_delay_ms=500,
@@ -134,10 +136,11 @@ _QUEUE_ONLY_PASS = dict(
 
 class TestPrefillDelayerQueueTrigger(CustomTestCase):
     """A queue-triggered delay holds until the waiting queue reaches
-    running_req * ratio or max_delay_ms elapses, whichever comes first."""
+    running_req * ratio, max_delay_ms elapses, or an explicitly set
+    max_delay_passes runs out, whichever comes first."""
 
     def make_delayer(
-        self, *, queue_min_ratio=0.3, max_delay_passes=30, prefill_max_requests=None
+        self, *, queue_min_ratio=0.3, max_delay_passes=None, prefill_max_requests=None
     ):
         stack = ExitStack()
         self.addCleanup(stack.close)
@@ -201,10 +204,15 @@ class TestPrefillDelayerQueueTrigger(CustomTestCase):
         self.assertEqual(self.negotiate(delayer, **slot_only), (True, "no_wait"))
         self.assertFalse(delayer.skip_first_delayer)
 
-    def test_queue_delay_outlasts_max_delay_passes(self):
-        delayer = self.make_delayer(max_delay_passes=3)
-        for _ in range(8):
+    def test_queue_delay_outlasts_default_max_delay_passes(self):
+        delayer = self.make_delayer()
+        for _ in range(DEFAULT_MAX_DELAY_PASSES + 5):
             self.assertEqual(self.negotiate(delayer), (False, "delay"))
+
+    def test_explicit_max_delay_passes_caps_queue_delay(self):
+        delayer = self.make_delayer(max_delay_passes=3)
+        reasons = [self.negotiate(delayer)[1] for _ in range(3)]
+        self.assertEqual(reasons, ["delay", "delay", "wait_timeout"])
 
     def test_slot_delay_still_capped_by_max_delay_passes(self):
         delayer = self.make_delayer(queue_min_ratio=None, max_delay_passes=3)
